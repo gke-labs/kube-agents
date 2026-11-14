@@ -36,7 +36,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// scopePublisherAgent is a next-mode agent whose scope has a folder, so the
+// scopePublisherAgent is an agent whose scope has a folder, so the
 // publisher has something to resolve.
 func scopePublisherAgent() *agentv1alpha1.PlatformAgent {
 	agent := mcpBrokerAgent()
@@ -402,7 +402,7 @@ func TestTheScopeResolvedCondition(t *testing.T) {
 	}
 }
 
-// The broker's side follows two gates. In every mode it reads the
+// The broker's side follows two gates. It always reads the
 // declaration (the mount and CREDENTIAL_PROXY_SCOPE_FILE), which is where
 // it reads spec.scope.exclude.clusters from. While the
 // operator says the gateway pod admission policy is rendered and the scope
@@ -413,25 +413,22 @@ func TestTheBrokerConfersTheScopeRoleOnlyBehindTheGatewayPodPolicy(t *testing.T)
 	type want struct{ file, role, peer bool }
 	cases := []struct {
 		name   string
-		mode   *string
 		policy string
 		owned  brokerCallerOwnership
 		want   want
 	}{
-		{"next, policy unset", ptr.To("next"), "", allBrokerCallersOwned, want{file: true}},
-		{"next, policy false", ptr.To("next"), "false", allBrokerCallersOwned, want{file: true}},
-		{"next, policy TRUE", ptr.To("next"), "TRUE", allBrokerCallersOwned, want{file: true}},
-		{"next, policy 1", ptr.To("next"), "1", allBrokerCallersOwned, want{file: true}},
-		{"next, policy true", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true, role: true, peer: true}},
-		{"next, policy true, account not ours", ptr.To("next"), "true", brokerCallerOwnership{mcp: true}, want{file: true, peer: true}},
-		{"next, policy true, nothing to resolve", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true}},
-		{"today, policy true", nil, "true", allBrokerCallersOwned, want{file: true}},
+		{"policy unset", "", allBrokerCallersOwned, want{file: true}},
+		{"policy false", "false", allBrokerCallersOwned, want{file: true}},
+		{"policy TRUE", "TRUE", allBrokerCallersOwned, want{file: true}},
+		{"policy 1", "1", allBrokerCallersOwned, want{file: true}},
+		{"policy true", "true", allBrokerCallersOwned, want{file: true, role: true, peer: true}},
+		{"policy true, account not ours", "true", brokerCallerOwnership{mcp: true}, want{file: true, peer: true}},
+		{"policy true, nothing to resolve", "true", allBrokerCallersOwned, want{file: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(a2aGatewayPodPolicyEnvVar, tc.policy)
 			agent := scopePublisherAgent()
-			agent.Spec.Mode = tc.mode
 			if strings.HasSuffix(tc.name, "nothing to resolve") {
 				agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Projects: []string{"team-a"}}
 			}
@@ -494,7 +491,6 @@ func TestTheBrokerDeclarationMountSitsBesideTheForgeCAMounts(t *testing.T) {
 	agent := gitlabAgent("gitlab-forge-token")
 	agent.Spec.Integration.Forges[1].Host = "gitlab.internal.example"
 	agent.Spec.Integration.Forges[1].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca", Key: "root.pem"}
-	agent.Spec.Mode = ptr.To("next")
 	agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Folders: []string{"111111111111"}}
 	mounts := buildCredentialProxyDeploymentForPlugins(agent, "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false).Spec.Template.Spec.Containers[0].VolumeMounts
 
@@ -515,9 +511,9 @@ func TestTheBrokerDeclarationMountSitsBesideTheForgeCAMounts(t *testing.T) {
 	}
 }
 
-// The publisher's ServiceAccount name is reserved in both modes, as the
-// other operator-owned accounts are: neither a profile nor the broker's
-// override may hold it, or a flip to next would find it already taken.
+// The publisher's ServiceAccount name is reserved, as the other
+// operator-owned accounts are: neither a profile nor the broker's override
+// may hold it, or the publisher would find it already taken.
 func TestThePublisherServiceAccountNameIsReserved(t *testing.T) {
 	for _, mode := range []*string{ptr.To("next"), nil} {
 		agent := scopePublisherAgent()
@@ -564,17 +560,17 @@ func TestTheGatewayReadsTheResolvedScopeUnderNextOnly(t *testing.T) {
 
 	agent := scopePublisherAgent()
 	if !hasRule(buildA2AGatewayRole(agent)) {
-		t.Errorf("the gateway Role has no get on the resolved scope under next")
+		t.Errorf("the gateway Role has no get on the resolved scope")
 	}
 	env := buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env
 	if got, found := brokerEnvValue(env, "A2A_RESOLVED_SCOPE_CONFIGMAP"); !found || got != "test-agent-resolved-scope" {
 		t.Errorf("A2A_RESOLVED_SCOPE_CONFIGMAP = %q (found %v)", got, found)
 	}
 
-	today := agent.DeepCopy()
-	today.Spec.Mode = nil
-	if hasRule(buildA2AGatewayRole(today)) {
-		t.Errorf("the gateway Role reads the resolved scope under today")
+	noMode := agent.DeepCopy()
+	noMode.Spec.Mode = nil
+	if !hasRule(buildA2AGatewayRole(noMode)) {
+		t.Errorf("the gateway Role has no get on the resolved scope on a CR with no spec.mode")
 	}
 }
 
@@ -788,8 +784,8 @@ func TestReconcileScopePublisher(t *testing.T) {
 }
 
 // Through the stack: reconcileA2A renders the publisher and carries its
-// condition out, and the flip to today (cleanupA2A) takes it all away.
-func TestTheScopePublisherComesAndGoesWithTheStack(t *testing.T) {
+// condition out.
+func TestTheScopePublisherComesWithTheStack(t *testing.T) {
 	t.Setenv(a2aGatewayPodPolicyEnvVar, "true")
 	ctx := context.Background()
 	agent := a2aTestAgent()
@@ -808,19 +804,6 @@ func TestTheScopePublisherComesAndGoesWithTheStack(t *testing.T) {
 	}
 	if len(scopePublisherJobs(t, cl, agent)) != 1 {
 		t.Fatal("no publisher Job after the first render")
-	}
-
-	if err := r.cleanupA2A(ctx, agent); err != nil {
-		t.Fatalf("cleanupA2A: %v", err)
-	}
-	if err := cl.Get(ctx, key, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the resolved-scope ConfigMap survived the flip (err=%v)", err)
-	}
-	if n := len(scopePublisherJobs(t, cl, agent)); n != 0 {
-		t.Errorf("%d publisher Jobs survived the flip", n)
-	}
-	if err := cl.Get(ctx, types.NamespacedName{Name: scopePublisherName(agent), Namespace: agent.Namespace}, &corev1.ServiceAccount{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the publisher's ServiceAccount survived the flip (err=%v)", err)
 	}
 }
 
@@ -847,8 +830,8 @@ func TestTheScopeResolvedConditionIsCarriedAndRemoved(t *testing.T) {
 }
 
 // kube-proxy reads spec.scope.exclude.clusters from the same scope.json as the broker,
-// in every mode, and checks in-cluster as the cluster the harness names.
-func TestKubeProxyReadsTheScopeDeclarationInEveryMode(t *testing.T) {
+// whatever spec.mode says, and checks in-cluster as the cluster the harness names.
+func TestKubeProxyReadsTheScopeDeclaration(t *testing.T) {
 	for _, mode := range []*string{nil, ptr.To("next")} {
 		agent := scopePublisherAgent()
 		agent.Spec.Mode = mode

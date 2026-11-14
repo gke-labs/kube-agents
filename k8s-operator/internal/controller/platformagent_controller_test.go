@@ -264,10 +264,13 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Fatalf("failed to delete agent: %v", err)
 	}
 
-	// Reconcile after deletion timestamp is set
-	_, err = r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile on delete failed: %v", err)
+	// Reconcile after deletion timestamp is set. Two passes: the first marks
+	// the A2A bus StatefulSet for deletion and requeues so its claims are
+	// reaped only once it is gone; the second releases the finalizer.
+	for i := range 2 {
+		if _, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d on delete failed: %v", i+1, err)
+		}
 	}
 
 	// Verify agent is deleted completely (because finalizer was removed)
@@ -351,7 +354,7 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 }
 
 // TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames (#3871): the legacy
-// cleanup runs on every reconcile in both modes, and a Deployment or
+// cleanup runs on every reconcile, and a Deployment or
 // ServiceAccount named <agent>-sandbox that this PlatformAgent does not
 // control is somebody else's. It is left as found and the cleanup completes;
 // refusing it stopped everything after this step, the status write included.
@@ -789,13 +792,14 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
-	// client either, so telemetry falls through to the managed default and asks to be
-	// re-probed later. The Secret re-read asks sooner, and the pass returns the sooner
-	// of the two — so the telemetry deadline is still met, by a requeue that also
-	// picks up a rotated key.
-	if res.RequeueAfter != secretEnvReprobeInterval {
-		t.Errorf("expected RequeueAfter %v, got %v", secretEnvReprobeInterval, res.RequeueAfter)
+	// There is no collector Service in the fake client, so telemetry falls
+	// through to the managed default and asks to be re-probed later. The A2A
+	// stack is still converging (no controller runs the fake's workloads), and
+	// its pending requeue is the soonest ask, so the pass returns it -- which
+	// still meets the telemetry deadline, by a requeue that also picks up a
+	// rotated key.
+	if res.RequeueAfter != a2aPendingRequeue {
+		t.Errorf("expected RequeueAfter %v, got %v", a2aPendingRequeue, res.RequeueAfter)
 	}
 	if res.RequeueAfter > otelRediscoverAfter {
 		t.Errorf("RequeueAfter %v misses the telemetry re-probe deadline %v", res.RequeueAfter, otelRediscoverAfter)
@@ -1066,26 +1070,9 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	// With every workload ready, Ready is True and the phase Ready while
 	// Degraded still carries the refusal. The workloads' status is written
 	// after the reconciles, and the status writer is driven directly.
-	for _, key := range []client.ObjectKey{
-		{Name: agent.Name + "-gateway", Namespace: agent.Namespace},
-		{Name: credentialBrokerName(agent), Namespace: agent.Namespace},
-	} {
-		d := &appsv1.Deployment{}
-		if err := cl.Get(ctx, key, d); err != nil {
-			t.Fatalf("get %s: %v", key.Name, err)
-		}
-		d.Status.ReadyReplicas = 1
-		if err := cl.Status().Update(ctx, d); err != nil {
-			t.Fatalf("mark %s ready: %v", key.Name, err)
-		}
-	}
-	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: shellSandboxName(agent), Namespace: agent.Namespace}, sts); err != nil {
-		t.Fatalf("get shell sandbox: %v", err)
-	}
-	sts.Status.ReadyReplicas = 1
-	if err := cl.Status().Update(ctx, sts); err != nil {
-		t.Fatalf("mark shell sandbox ready: %v", err)
+	markEveryWorkloadReady(t, ctx, cl, r, req, agent)
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
 	}
 	r.APIReader = cl
 	phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
@@ -1136,6 +1123,83 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		t.Errorf("no Warning %s event naming %s", conditionReasonInvalidCredentialProxyResources, wantField)
 	}
 	return degraded.Message
+}
+
+// markEveryWorkloadReady puts the whole render into the state Ready reads as
+// up: the callout serving so the gateway gate lets the A2A gateway through
+// (two passes), the provision Job complete, and every Deployment and
+// StatefulSet in the namespace reporting its replicas ready. The fake client
+// runs no controllers, so a test that wants the phase to reach Ready drives
+// this itself before reading the status writer.
+func markEveryWorkloadReady(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, req ctrl.Request, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	deps := &appsv1.DeploymentList{}
+	if err := cl.List(ctx, deps, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	for i := range deps.Items {
+		d := &deps.Items[i]
+		want := int32(1)
+		if d.Spec.Replicas != nil {
+			want = *d.Spec.Replicas
+		}
+		d.Status.Replicas = want
+		d.Status.ReadyReplicas = want
+		if err := cl.Status().Update(ctx, d); err != nil {
+			t.Fatalf("mark %s ready: %v", d.Name, err)
+		}
+	}
+	stses := &appsv1.StatefulSetList{}
+	if err := cl.List(ctx, stses, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatalf("list statefulsets: %v", err)
+	}
+	for i := range stses.Items {
+		st := &stses.Items[i]
+		want := int32(1)
+		if st.Spec.Replicas != nil {
+			want = *st.Spec.Replicas
+		}
+		st.Status.Replicas = want
+		st.Status.ReadyReplicas = want
+		if err := cl.Status().Update(ctx, st); err != nil {
+			t.Fatalf("mark %s ready: %v", st.Name, err)
+		}
+	}
+}
+
+// settleA2AStack drives a fake-client install to the state where the A2A
+// stack asks for no sooner pass of its own (a2aProvisionState.wantsRequeue
+// and a2aNATSShort both false): the callout serving so the gateway and the
+// provision Job are created, the Job complete, every bus server and the
+// gateway ready, and one Ready callout pod whose /status reports the rendered
+// identity map taken. The gateway's leader election is off: with it on, a
+// gateway asking for more than one replica rechecks the Lease every minute
+// until a pod this fake never runs has taken it. Nothing runs these
+// controllers in the fake, so a test that reads the steady-state requeue off
+// Reconcile's tail does this first.
+func settleA2AStack(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, req ctrl.Request, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
+	markEveryWorkloadReady(t, ctx, cl, r, req, agent)
+	version := r.renderedAuthMapVersion(ctx, agent)
+	if version == "" {
+		t.Fatal("settleA2AStack: no identity map shard rendered, so no callout answer can match it")
+	}
+	pod := statusCalloutPod(agent, a2aCalloutName(agent)+"-settled", "10.0.0.1", true)
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("settleA2AStack: create the callout pod: %v", err)
+	}
+	if err := cl.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("settleA2AStack: report the callout pod ready: %v", err)
+	}
+	r.calloutStatus = fakeCalloutStatus{pod.Status.PodIP: {Version: version}}
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("settleA2AStack: Reconcile %d: %v", i+1, err)
+		}
+	}
 }
 
 // A memory limit under the floor: rendered, the broker would turn its budget
@@ -1751,8 +1815,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		scrape.From[0].PodSelector != nil {
 		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
 	}
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules (DNS, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules (DNS, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker, A2A bus), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -1885,8 +1949,9 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	// 7. Hindsight memory API (8888)
 	// 8. The shell sandbox's sshd (2222)
 	// 9. The credential broker, which hosts the chat relay (8765)
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 10. The A2A bus (4222)
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -4680,8 +4745,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -4743,8 +4808,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -5260,9 +5325,11 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
 	}
 
+	// And the A2A stack, which Ready waits on as well.
+	objects := append(a2aStackUp(agent), agent, dep, shell, broker, a2aGatewayWorkload(agent, 1))
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, dep, shell, broker).
+		WithObjects(objects...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -5274,7 +5341,7 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	phase, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -6259,10 +6326,6 @@ func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
 	}
 }
 
-// An unrecognized spec.mode can only reach the reconciler through version skew
-// (enum validation rejects it at admission — the fake client, like a newer CRD
-// with an older binary, does not). The contract from the mode spec: Degraded
-// with reason ModeNotRecognized, today's stack still rendered, and a requeue.
 func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t *testing.T) {
 	// A hand-edited list that is not JSON must skip the sync, as it did before
 	// context_repos was read: an error that read as "no repositories" would
@@ -6799,81 +6862,6 @@ func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *
 	}
 }
 
-func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
-	scheme := setupScheme()
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, shellSandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
-	ctx := context.Background()
-
-	// 1st reconcile adds the finalizer, 2nd does the work.
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 1 failed: %v", err)
-	}
-	result, err := r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile 2 failed: %v", err)
-	}
-	if result.RequeueAfter != 30*time.Second {
-		t.Errorf("expected 30s requeue while mode is unrecognized, got %v", result.RequeueAfter)
-	}
-
-	updated := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	if updated.Status.Phase != "Degraded" {
-		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
-	}
-	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
-	if cond == nil {
-		t.Fatal("expected a Ready condition")
-	}
-	if cond.Reason != "ModeNotRecognized" {
-		t.Errorf("expected reason ModeNotRecognized, got %q", cond.Reason)
-	}
-	if !strings.Contains(cond.Message, "quantum") {
-		t.Errorf("condition message must name the unrecognized value, got %q", cond.Message)
-	}
-
-	// Fail-closed means the dark stack stays dark AND today's stack still renders:
-	// the cluster keeps running what it ran, with the skew visible in status.
-	dep := &appsv1.Deployment{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
-		t.Errorf("today's Deployment should still be rendered under an unrecognized mode: %v", err)
-	}
-
-	// Correcting the mode clears the Degraded phase on the next reconcile.
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to refetch agent: %v", err)
-	}
-	updated.Spec.Mode = nil
-	if err := cl.Update(ctx, updated); err != nil {
-		t.Fatalf("failed to update agent: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 3 failed: %v", err)
-	}
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	if updated.Status.Phase == "Degraded" {
-		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
-	}
-}
-
 type mockAutopilotDiscovery struct {
 	discovery.DiscoveryInterface
 	serverVersionErr  error
@@ -7314,7 +7302,7 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To(string(ModeNext))},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("next")},
 	}
 
 	pod := &corev1.Pod{
@@ -7348,45 +7336,6 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	}
 	if !strings.Contains(message, "test-agent-a2a-gateway-7d9f-abc") {
 		t.Errorf("message does not name the faulting pod: %q", message)
-	}
-}
-
-// TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall keeps the
-// dark stack dark, and matches the gate readSplitWorkloads uses. A today install
-// renders no A2A gateway; a pod left behind by a mode flip, or one frozen by
-// version skew, must not turn that CR Degraded for a workload this install does
-// not claim to run.
-func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testing.T) {
-	scheme := setupScheme()
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-	}
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent-a2a-gateway-7d9f-abc",
-			Namespace: "test-ns",
-			Labels:    map[string]string{"app": "test-agent-a2a-gateway"},
-		},
-		Status: corev1.PodStatus{
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "gateway",
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-					Reason:  "ImagePullBackOff",
-					Message: "Back-off pulling image",
-				}},
-			}},
-			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-
-	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
-
-	if phase == "Degraded" {
-		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)
 	}
 }
 

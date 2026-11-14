@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -23,7 +22,7 @@ import (
 // through it.
 func waitRunning(t *testing.T, r *rig) {
 	t.Helper()
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +50,7 @@ func stoppedBatch() []relayItem {
 // batch is dropped with one line before any read, not requeued every
 // requeueDelay for the life of the process.
 func TestAStoppedGatewayDropsABatchWithOneLine(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	r.stop()
@@ -77,6 +77,7 @@ func TestAStoppedGatewayDropsABatchWithOneLine(t *testing.T) {
 // requeueDelay, delivery by delivery, and nothing is acked: the stream, not
 // the process, holds what nobody rendered.
 func TestAFailedRecordReadGivesTheBatchBack(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	// The gateway is running but its client is gone, so the read fails.
@@ -264,6 +265,7 @@ func (f *flakyAck) acked() bool {
 // so the delivery is neither renewed for the life of the gateway nor handed
 // back to render again.
 func TestAFailedAckIsTriedAgain(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	d := &flakyAck{fakeDelivery: fakeDelivery{env: &lib.Envelope{TaskID: "t"}, subj: "s", seq: 1}}
@@ -275,6 +277,7 @@ func TestAFailedAckIsTriedAgain(t *testing.T) {
 // conversation's record, the deposed gateway gives its rendered batch back
 // rather than ack it, so the new leader's record still gets the events.
 func TestAFencedRecordWriteGivesTheBatchBack(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	ctx := context.Background()

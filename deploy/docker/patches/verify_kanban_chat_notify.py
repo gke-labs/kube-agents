@@ -177,6 +177,17 @@ def main() -> None:
     os.environ.pop(NOTIFY_CONVERSATIONS_ENV)
     check(notifier._adapter_for_subscription(runner, GCHAT, conv_sub, None) is None,
           "conversation: without A2A_NOTIFY_CONVERSATIONS a conversation's card gets no stand-in")
+    # A list: every platform it names is served, each with its own home stand-in.
+    os.environ[NOTIFY_PLATFORM_ENV] = "slack,google_chat"
+    collector = notifier._Collector(runner, kb=None, notifier_profile=None, gc_due=False, gc_retention_days=30)
+    check({"slack", "google_chat"} <= collector.active_platforms, "a list: both routed platforms are served")
+    slack_sub = dict(sub, platform="slack", chat_id="C0HOME", thread_id="1700000000.000100")
+    slack_adapter = notifier._adapter_for_subscription(runner, Platform("slack"), slack_sub, None)
+    check(isinstance(slack_adapter, ChatNotifyAdapter) and slack_adapter is not adapter,
+          "a list: slack gets its own home stand-in")
+    check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is adapter,
+          "a list: google_chat keeps its home stand-in across a slack resolve")
+    os.environ[NOTIFY_PLATFORM_ENV] = "google_chat"
     check(notifier._Collector._claim_for_sub.__name__ == "_kage_claim_for_sub",
           "the collector's claim is wrapped to drop stale events")
 

@@ -76,7 +76,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
       "tagPolicy": "release",
       "override": "A2A_GATEWAY_IMAGE",
-      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way.",
+      "pulledBy": "The A2A gateway Deployment the operator renders. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way.",
       "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
     },
     {
@@ -85,7 +85,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
-      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
+      "pulledBy": "The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
       "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, and jq, which the cluster agent's persona requires when the image runs its profile workers."
     },
     {
@@ -93,7 +93,7 @@
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/persona-cluster",
       "tagPolicy": "release",
-      "pulledBy": "The worker pods of the cluster AgentProfile under spec.mode: next, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "pulledBy": "The worker pods of the cluster AgentProfile, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
       "description": "The cluster agent's persona (agents/cluster/persona) as a persona image (a2a/Dockerfile.persona-cluster): the manifest, instructions, MCP servers and skills under /files, on busybox for the staging copy."
     },
     {
@@ -102,7 +102,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
       "tagPolicy": "release",
       "override": "A2A_CALLOUT_IMAGE",
-      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today.",
+      "pulledBy": "The auth callout Deployment the operator renders.",
       "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
     },
     {
@@ -111,7 +111,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
       "tagPolicy": "release",
       "override": "A2A_CONSOLE_IMAGE",
-      "pulledBy": "The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today.",
+      "pulledBy": "The console server Deployment the operator renders.",
       "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
     },
     {
@@ -120,7 +120,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-verifier",
       "tagPolicy": "release",
       "override": "A2A_VERIFIER_IMAGE",
-      "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do.",
+      "pulledBy": "The capability verifier Deployment the operator renders. It resolves the same way the gateway, the worker and the callout do.",
       "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
     },
     {
@@ -129,7 +129,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
       "tagPolicy": "release",
       "override": "A2A_DISPATCHER_IMAGE",
-      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, unless `operator.profileDispatcher.enabled` is `false`. Nothing under spec.mode: today.",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders unless `operator.profileDispatcher.enabled` is `false`.",
       "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
     },
     {
@@ -138,7 +138,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
       "tagPolicy": "release",
       "override": "A2A_BRIDGE_IMAGE",
-      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing under spec.mode: today. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
+      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
       "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
     },
     {
@@ -153,7 +153,7 @@
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.106.0",
+      "tag": "v1.108.6",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -173,8 +173,8 @@
       "repository": "docker.io/library/nats",
       "tag": "2.10-alpine",
       "override": "A2A_NATS_IMAGE",
-      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today.",
-      "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
+      "pulledBy": "The NATS StatefulSet the operator renders.",
+      "description": "The JetStream bus behind the A2A stack, which every install runs. The chart sets the env var from a2aBus.images.nats, under global.thirdPartyImageRegistry when that is set; the operator's compiled default is the same pin, for an operator rendered outside the chart."
     },
     {
       "name": "nats-box",
@@ -182,8 +182,8 @@
       "repository": "docker.io/natsio/nats-box",
       "tag": "0.14.5",
       "override": "A2A_PROVISION_IMAGE",
-      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today.",
-      "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
+      "pulledBy": "The provision Job the operator runs against that NATS.",
+      "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats, from a2aBus.images.natsBox."
     },
     {
       "name": "nats-server-config-reloader",
@@ -191,8 +191,8 @@
       "repository": "docker.io/natsio/nats-server-config-reloader",
       "tag": "0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c",
       "override": "A2A_NATS_RELOADER_IMAGE",
-      "pulledBy": "A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today.",
-      "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats."
+      "pulledBy": "A sidecar in the NATS pod the operator renders.",
+      "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats, from a2aBus.images.configReloader."
     },
     {
       "name": "prometheus-nats-exporter",
@@ -200,8 +200,8 @@
       "repository": "docker.io/natsio/prometheus-nats-exporter",
       "tag": "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255",
       "override": "A2A_NATS_EXPORTER_IMAGE",
-      "pulledBy": "The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today.",
-      "description": "Reads the NATS server's monitor port over the pod's loopback and serves its JetStream stream and storage figures for Managed Prometheus to scrape. Same override arrangement as nats; pinned by digest as well as tag."
+      "pulledBy": "The metrics sidecar in each pod of that NATS StatefulSet.",
+      "description": "Reads the NATS server's monitor port over the pod's loopback and serves its JetStream stream and storage figures for Managed Prometheus to scrape. Same override arrangement as nats, from a2aBus.images.prometheusExporter; pinned by digest as well as tag."
     },
     {
       "name": "k8s",
@@ -224,7 +224,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b",
+      "tag": "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -233,10 +233,10 @@
       "name": "hindsight-postgresql",
       "origin": "third-party",
       "repository": "docker.io/pgvector/pgvector",
-      "tag": "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da",
+      "tag": "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
       "pulledBy": "The chart, alongside the Hindsight API.",
-      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still."
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still. A pgvector version bump changes the library but not an existing database's catalog version; run `ALTER EXTENSION vector UPDATE` when an upgrade script carries more than comments."
     },
     {
       "name": "cert-manager-controller",
@@ -312,7 +312,7 @@
       "name": "node",
       "origin": "build-time",
       "repository": "docker.io/library/node",
-      "tag": "22-slim",
+      "tag": "24-slim",
       "buildArg": "NODE_IMAGE",
       "pulledBy": "a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage.",
       "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary, and the stage that builds the console page."
@@ -339,7 +339,7 @@
       "name": "busybox",
       "origin": "build-time",
       "repository": "docker.io/library/busybox",
-      "tag": "musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8",
+      "tag": "musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6",
       "pulledBy": "agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images.",
       "description": "Minimal userland (sh, cp, ls) base image for plugin and persona images to support staging init containers."
     }

@@ -55,7 +55,6 @@ def _crd_enum() -> list:
 
 
 _OPERATOR_CRD = _REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases" / "kubeagents.x-k8s.io_platformagents.yaml"
-_MODE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "mode.go"
 
 
 class ExistingInstallsKeepTodayTest(unittest.TestCase):
@@ -69,13 +68,13 @@ class ExistingInstallsKeepTodayTest(unittest.TestCase):
     next reconcile, with no upgrade step to stop it.
     """
 
-    def test_neither_crd_copy_defaults_the_mode(self):
+    def test_both_crd_copies_default_the_mode_to_next(self):
         for path in (_CRD, _OPERATOR_CRD):
             with self.subTest(crd=path.relative_to(_REPO_ROOT).as_posix()):
                 crd = yaml.safe_load(path.read_text())
                 version = next(v for v in crd["spec"]["versions"] if v["name"] == "v1alpha1")
                 mode = version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]
-                self.assertNotIn("default", mode)
+                self.assertEqual(mode.get("default"), "next")
 
     def test_the_example_leaves_the_mode_to_the_cluster(self):
         # INSTALL.md copies install.env.example onto running installs too. A
@@ -125,9 +124,9 @@ class ExistingInstallsKeepTodayTest(unittest.TestCase):
             '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"', (_REPO_ROOT / "upgrade.sh").read_text()
         )
 
-    def test_the_operator_reads_an_absent_mode_as_today(self):
-        text = _MODE_GO.read_text()
-        self.assertIn("if agent == nil || agent.Spec.Mode == nil {\n\t\treturn ModeToday, nil", text)
+    def test_the_operator_reads_an_absent_mode_as_next(self):
+        text = (_REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "platformagent_types.go").read_text()
+        self.assertIn("+kubebuilder:default=next", text)
 
 
 class CompositionTextTest(unittest.TestCase):

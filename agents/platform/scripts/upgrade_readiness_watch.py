@@ -37,8 +37,11 @@ and is listed apart; and a ``blocked`` verdict stands whatever the kubectl read 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
 (``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
-``cluster_identity`` names, the roster the cluster reconciler keeps; with
-neither, the sandbox's ``gcloud config get-value project``; and with nothing
+``cluster_identity`` names, the roster the cluster reconciler keeps (under
+``spec.mode: next``, every project the scope publisher's resolved scope
+names instead, read through ``fleet_scope_targets.list_scope_clusters``
+once a tick, #5621: a resolved scope that names no member makes the table
+partial and keeps what the members pended); with neither, the sandbox's ``gcloud config get-value project``; and with nothing
 at all the tick fails closed rather than let the report script fall back to
 its own scope, which on an install that declares none is every project the
 credential can list. Every cluster in those projects is listed and its versions graded,
@@ -191,8 +194,6 @@ ROSTER_SPELLING_DETAIL = (
 )
 PROJECTS_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
-PROFILES_DIR = "profiles"
-IDENTITY_PROJECT_KEY = "project"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 PROJECT_FLAG = "--project"
@@ -675,6 +676,10 @@ ERROR_KIND_KEY = "kind"
 ERROR_KIND_LISTING = "listing failed"
 ERROR_KIND_SERVER_CONFIG = "server config failed"
 ERROR_KIND_READ = "read failed"
+# Under spec.mode: next, a resolved scope that names no member (missing,
+# unparseable, too-large or error) leaves the member projects out of the roster
+# (#5621). The table is then partial, not complete, so nothing is retired.
+ERROR_KIND_RESOLVED_SCOPE_UNREAD = "resolved scope unreadable"
 # Each entry of an ungraded announcement's signature: a project and the kind
 # of its failure.
 SIGNATURE_PAIR_FIELDS = (MEMBER_ID_KEYS[0], ERROR_KIND_KEY)
@@ -803,45 +808,79 @@ def watch_home() -> Path:
 # --- which projects ----------------------------------------------------------
 
 
-def roster_projects() -> set[str]:
-    """The projects the Cluster Agent profiles' identities name, as
-    stall_watch.py reads them; a profile whose identity cannot be read names none."""
-    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity  # lazy, as in stall_watch
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return set()
-    projects: set[str] = set()
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
-            continue
-        try:
-            identity = read_cluster_identity(home)
-        except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
-            identity = None
-        # Stripped as every other roster source is, so the spelling check sees one shape.
-        project = str((identity or {}).get(IDENTITY_PROJECT_KEY) or "").strip()
-        if project:
-            projects.add(project)
-    return projects
+def explicit_projects() -> list[str]:
+    """``UPGRADE_READINESS_PROJECTS``, stripped and sorted: when set, the whole roster."""
+    return sorted({p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()})
 
 
-def projects() -> list[str]:
+def read_cluster_scope() -> fleet_scope_targets.ScopeClusters:
+    """`fleet_scope_targets.list_scope_clusters` on this pod. Under spec.mode:
+    next it reads the operator's scope render, and a render that cannot be
+    read is the same fault ``declared_scope`` reports, not a generic one."""
+    try:
+        return fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    except fleet_scope_targets.ScopeRenderUnreadable as exc:
+        raise ScopeUnreadable(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
+
+
+def cluster_scope() -> fleet_scope_targets.ScopeClusters | None:
+    """The tick's one read of the fleet's cluster lists, which the roster and
+    ``resolved_scope_gap`` both take, so the two cannot see different
+    snapshots of a resolved scope the publisher rewrites mid-tick; None when
+    ``UPGRADE_READINESS_PROJECTS`` names the roster, which reads neither."""
+    return None if explicit_projects() else read_cluster_scope()
+
+
+def roster_projects(scope: fleet_scope_targets.ScopeClusters | None = None) -> set[str]:
+    """The projects `fleet_scope_targets.list_scope_clusters` names (``scope``,
+    else read now): outside
+    spec.mode: next the Cluster Agent profiles' identities, as stall_watch.py
+    reads them (a profile whose identity cannot be read names none); under it
+    every project the resolved scope names, a member nothing listed included,
+    since the report lists each project's clusters itself and records the one
+    it cannot read. Stripped, as every other roster source is, so the
+    spelling check sees one shape."""
+    if scope is None:
+        scope = read_cluster_scope()
+    return {entry.project.strip() for entry in scope.projects
+            if entry.project.strip() and entry.project != fleet_scope_targets.UNRESOLVED_SCOPE_ROW}
+
+
+def resolved_scope_gap(scope: fleet_scope_targets.ScopeClusters | None = None) -> dict | None:
+    """A read error for the member projects an unusable resolved scope leaves
+    out of the roster under spec.mode: next, or None. Without it the table of
+    the live projects alone reads as complete, and every version only member
+    clusters pend would be retired, then come back as new once the document
+    returns. ``scope`` is the read the roster was built from (else read now);
+    an explicit ``UPGRADE_READINESS_PROJECTS`` roster ignores the resolved
+    scope, so it has no gap."""
+    if explicit_projects():
+        return None
+    if scope is None:
+        scope = read_cluster_scope()
+    if not scope.next_mode or not any(e.project == fleet_scope_targets.UNRESOLVED_SCOPE_ROW for e in scope.projects):
+        return None
+    return {MEMBER_ID_KEYS[0]: fleet_scope_targets.UNRESOLVED_SCOPE_ROW, MEMBER_ID_KEYS[1]: None,
+            ERROR_KIND_KEY: ERROR_KIND_RESOLVED_SCOPE_UNREAD, MESSAGE_KEY: scope.note or "the resolved scope names no member project"}
+
+
+def projects(scope: fleet_scope_targets.ScopeClusters | None = None) -> list[str]:
     """The roster, every source of it held to the grammar the refusal parser
     reads (``ROSTER_SPELLING_REFUSED``): a spelling that cannot be a project
-    fails the tick with its remedy before the report is asked for it."""
-    names = roster_names()
+    fails the tick with its remedy before the report is asked for it.
+    ``scope`` is the tick's ``cluster_scope`` read, else read when needed."""
+    names = roster_names(scope)
     refused = [p for p in names if ROSTER_SPELLING_REFUSED.search(p)]
     if refused:
         raise RosterMisspelled(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
     return names
 
 
-def roster_names() -> list[str]:
-    explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
+def roster_names(scope: fleet_scope_targets.ScopeClusters | None = None) -> list[str]:
+    explicit = explicit_projects()
     if explicit:
-        return sorted(set(explicit))
-    found = roster_projects()
+        return explicit
+    found = roster_projects(scope)
     management = os.environ.get(MANAGEMENT_PROJECT_ENV, "").strip()
     if management:
         found.add(management)
@@ -1381,15 +1420,25 @@ def prune_read_projects(ledger: dict, pending: dict[str, list[str]], names: list
         entry[PENDING_KEY] = [key for key in entry.get(PENDING_KEY) or [] if not settled(key) or key in still]
 
 
-def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_errors: list) -> None:
+def carry_forward_unlisted(
+    pending: dict[str, list[str]], ledger: dict, read_errors: list, names: list[str] | None = None, ids: dict[str, str] | None = None
+) -> None:
     """A project whose ``clusters list`` failed (an error with no location),
     or a location whose ``get-server-config`` failed (an error with a location
     and no cluster, which leaves its clusters with no target), contributed no
     pending members, so those clusters would drop out of every version's
     pending set and rejoin a week later under a version already recorded.
     Keep them pending from the ledger instead; the readiness run then counts
-    them as not read, and a version with nothing graded is not recorded."""
-    unlisted = {error.get(MEMBER_ID_KEYS[0]) for error in read_errors if error.get(MEMBER_ID_KEYS[0]) and not error.get(MEMBER_ID_KEYS[1])}
+    them as not read, and a version with nothing graded is not recorded.
+    Under spec.mode: next an unusable resolved scope (``resolved_scope_gap``'s
+    row) leaves the member projects out of ``names`` (the roster, by its
+    spellings) without naming them, so every project outside it is unlisted."""
+    unlisted = unlisted_projects(read_errors)
+    roster = {canonical_project(name, ids or {}) for name in names or []}
+
+    def held(project: str) -> bool:
+        return project in unlisted or (fleet_scope_targets.UNRESOLVED_SCOPE_ROW in unlisted and project not in roster)
+
     unconfigured = {
         (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
         for error in read_errors
@@ -1400,7 +1449,7 @@ def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_err
     for version, entry in ledger[TARGETS_KEY].items():
         kept = [
             key for key in entry.get(PENDING_KEY) or []
-            if project_of(key) in unlisted or tuple(key.split(MEMBER_KEY_SEPARATOR)[:2]) in unconfigured
+            if held(project_of(key)) or tuple(key.split(MEMBER_KEY_SEPARATOR)[:2]) in unconfigured
         ]
         if kept:
             merged = sorted(set(pending.get(version, [])) | set(kept))
@@ -2159,9 +2208,14 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     ledger_path = home / LEDGER_FILE_NAME
     standing = ledger[STANDING_OUTSIDE_KEY]
     scope = declared_scope()
-    names = projects()
+    # One read of the cluster lists for the roster and its gap check (#5621).
+    cluster_lists = cluster_scope()
+    names = projects(cluster_lists)
     deadline = started + TICK_BUDGET_SECONDS
     versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
+    gap = resolved_scope_gap(cluster_lists)
+    if gap is not None:
+        versions[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(gap)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -2169,7 +2223,7 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     complete = not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     prune_read_projects(ledger, pending, names, read_errors, ledger[PROJECT_IDS_KEY])
-    carry_forward_unlisted(pending, ledger, read_errors)
+    carry_forward_unlisted(pending, ledger, read_errors, names, ledger[PROJECT_IDS_KEY])
     if dry_run:
         due, would_retire = decide(ledger, pending, now, days, retire=complete, dry_run=True)
         lines = [DRY_RUN_WOULD_RETIRE.format(version=v) for v in would_retire]

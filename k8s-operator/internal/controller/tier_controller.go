@@ -31,9 +31,13 @@ import (
 // tierReasonRead is the Accepted reason on a tier the operator has read.
 const tierReasonRead = "Read"
 
-// TierReconciler reports each Tier as read (#3659). Nothing consumes a tier
-// yet: the capability verifier and the gateway still use their built-in read
-// and unattended tiers, so this writes status and nothing else. The CRD's
+// tierReasonSkipped is the Accepted reason on a tier the components skip.
+const tierReasonSkipped = "Skipped"
+
+// TierReconciler reports each Tier as read (#3659): Accepted, or False with
+// the reason the components skip it (tierSkipReason). The PlatformAgent and
+// AgentProfile controllers consume tiers; this writes status and nothing
+// else. The CRD's
 // schema already refuses an unknown mode or write mode and a name that isn't
 // a subject token.
 type TierReconciler struct {
@@ -53,10 +57,18 @@ func (r *TierReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		Type:               agentv1alpha1.TierConditionAccepted,
 		Status:             metav1.ConditionTrue,
 		Reason:             tierReasonRead,
-		Message:            "the operator read this tier; no component enforces tiers from CRs yet",
+		Message:            "the verifier, the gateway and the callout load this tier at its mode's verbs",
 		ObservedGeneration: tier.Generation,
 	}
-	if tier.Status.ObservedGeneration == tier.Generation && meta.IsStatusConditionPresentAndEqual(tier.Status.Conditions, cond.Type, cond.Status) {
+	// The components' own skip rules (tierSkipReason, capability.LoadTiers):
+	// a tier they would skip is not Accepted, so status says what they do.
+	if why := tierSkipReason(tier.Name, tier.Spec.Mode); why != "" {
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, tierReasonSkipped, "the components skip this tier: "+why
+	} else if !allowedTierNameRE.MatchString(tier.Name) {
+		cond.Message += "; no AgentProfile can list it, since allowedTiers takes at most 10 lowercase letters or digits"
+	}
+	if old := meta.FindStatusCondition(tier.Status.Conditions, cond.Type); tier.Status.ObservedGeneration == tier.Generation &&
+		old != nil && old.Status == cond.Status && old.Reason == cond.Reason && old.Message == cond.Message {
 		return ctrl.Result{}, nil
 	}
 	meta.SetStatusCondition(&tier.Status.Conditions, cond)

@@ -47,10 +47,10 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 | `MODEL_PROVIDER`       | Default `MODEL_DEFAULT_NAME`   | Notes                                                                                                                                 |
 | ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `gemini` (default)     | `gemini-3.5-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
+| `gemini` (default)     | `gemini-3.8-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
 | `anthropic`            | `claude-opus-5`                | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
 | `openai`               | `gpt-5.4`                      | Uses `OPENAI_API_KEY`.                                                                                                                |
-| `vertex_ai`            | `gemini-3.5-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
+| `vertex_ai`            | `gemini-3.8-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
 | `openai_compatible`    | none; required                 | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
 | `sap`                  | `anthropic--claude-4.5-sonnet` | OAuth2 client credentials from a Secret you create. See [below](#sap-ai-core).                                                        |
 | any other LiteLLM slug | none; required                 | `azure`, `bedrock`, `databricks`, ...; credentials from the same Secret. See [below](#other-litellm-providers).                       |
@@ -63,7 +63,7 @@ To change the default on an installed system, re-run the installer with `--menu`
 
 ```bash
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 make -C k8s-operator deploy-litellm
 ```
 
@@ -77,7 +77,7 @@ Either way the agent picks up the new model on its next request without any chan
 model_list:
   - model_name: model-default
     litellm_params:
-      model: gemini/gemini-3.5-flash
+      model: gemini/gemini-3.8-flash
       max_tokens: 8192
 ```
 
@@ -123,7 +123,7 @@ Two chart blocks, both off by default, add a fallback alias and router retry lim
 
 `litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys).
 
-`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`.
+`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. Measured on Vertex `gemini-3.5-flash`, a `600`-second request cap covered `99.96%` of streams while `300` seconds covers `99.57%`.
 
 The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
 
@@ -166,7 +166,7 @@ A fallback is not silent. The gateway's reply carries `x-litellm-attempted-fallb
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       reasoning_effort: "high"
 ```
 
@@ -223,7 +223,7 @@ Gemini thinks before it answers whether or not a request asks it to, but it retu
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       thinking: { "type": "enabled" }
 ```
 
@@ -346,7 +346,7 @@ Two things differ from the API-key providers:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
-  --model-default-name=gemini-3.5-flash \
+  --model-default-name=gemini-3.8-flash \
   --vertex-project-id=my-gcp-project \
   --vertex-location=us-east4   # both optional: project defaults to the install's, location to "global"
 ```

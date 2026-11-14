@@ -1,5 +1,7 @@
 # Binds the namespaced half of the generated manager role: the Role document
-# in role.yaml, which carries the operator's Secret write verbs in the install
+# in role.yaml, which carries the operator's write verbs on every namespaced
+# kind it renders (Secrets, Deployments, ConfigMaps, Roles, ...), in the
+# install namespace. config/profiles binds the same Role in the profile
 # namespace. The ClusterRole half is bound by role_binding.yaml. Both come
 # from the same +kubebuilder:rbac markers; a marker with `namespace=` lands
 # here, one without lands in the ClusterRole.

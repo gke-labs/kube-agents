@@ -86,8 +86,9 @@ func TestBuildLiteLLMNetworkPolicy(t *testing.T) {
 	// Verify Ingress rules:
 	// Rule 1: same-namespace pods on 8080
 	// Rule 2: gke-gmp-system on 8080
-	if len(netpol.Spec.Ingress) != 2 {
-		t.Fatalf("expected 2 ingress rules, got %d", len(netpol.Spec.Ingress))
+	// Rule 3: the profile namespace's pods on 8080 (TestLiteLLMAdmitsProfilePods)
+	if len(netpol.Spec.Ingress) != 3 {
+		t.Fatalf("expected 3 ingress rules, got %d", len(netpol.Spec.Ingress))
 	}
 	ing0 := netpol.Spec.Ingress[0]
 	if len(ing0.Ports) != 1 || ing0.Ports[0].Port.IntVal != 8080 {

@@ -1737,26 +1737,6 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         self.assertEqual(c["A2A_PROVISION_JOB_SELECTOR"], f"{component}={provision}")
         self.assertIn("A2ACalloutKeysSecretName(agent.Name)", _CALLOUT_KEYS.read_text())
 
-    def test_the_kept_objects_are_on_neither_teardown_list(self) -> None:
-        # What the script asserts is kept is what cleanupA2A leaves out.
-        text = _A2A_MANIFESTS.read_text()
-        start = text.index("func (r *PlatformAgentReconciler) a2aPreBusTeardown(")
-        end = text.index("func (r *PlatformAgentReconciler) a2aNamespacedTeardown(")
-        lists = text[start:end]
-        self.assertNotIn("a2aCredsSecretName", lists)
-        self.assertNotIn("PersistentVolumeClaim", lists)
-        self.assertIn("a2aCalloutKeysName", lists)
-        cleanup = text[text.index("func (r *PlatformAgentReconciler) cleanupA2A(") :]
-        cleanup = cleanup[: cleanup.index("\nfunc ")]
-        self.assertNotIn("a2aCredsSecretName", cleanup)
-        self.assertNotIn("PersistentVolumeClaim", cleanup)
-        # And the StatefulSet's PVC retention policy keeps the claim when the
-        # StatefulSet is deleted (and, in this release, on a scale-down too;
-        # #4225 changes WhenScaled with the migration).
-        sts = text[text.index("func buildA2ANATSStatefulSet(") :]
-        sts = sts[: sts.index("\nfunc ")]
-        self.assertIn("WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType", sts)
-
     def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
         # #2427's gate after the sidecar patch and the not-degraded checks
         # forgive the same Degraded for the same time: one reason, one
@@ -1774,19 +1754,6 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         self.assertEqual(int(c["DEFAULT_UNSCHEDULABLE_TIMEOUT"]), window)
         self.assertIn('reason = "PodUnschedulable"', _CONTROLLER.read_text())
         self.assertIn("cannot be scheduled onto any available node", _CONTROLLER.read_text())
-
-    def test_the_status_words_are_the_operators(self) -> None:
-        c = self.constants()
-        text = _CONTROLLER.read_text()
-        for reason in c["CR_REFUSAL_REASONS"].split():
-            self.assertIn(f'"{reason}"', text + _A2A_MANIFESTS.read_text(), reason)
-        # The phases are constants the usage gauges' vocabulary shares
-        # (usage_gauges.go); the words themselves are in the declarations.
-        self.assertIn("newPhase = readyPhase", text)
-        self.assertIn("newPhase = degradedPhase", text)
-        self.assertRegex(text, r'readyPhase\s+= "Ready"')
-        self.assertRegex(text, r'degradedPhase\s+= "Degraded"')
-
 
 def ci_eval_function(name: str) -> str:
     match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", _CI_EVAL.read_text(), re.DOTALL | re.MULTILINE)

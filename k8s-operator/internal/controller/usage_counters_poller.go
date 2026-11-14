@@ -350,8 +350,7 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 // noteReadings records, per reading, whether this poll's bodies carried it for
 // the CR, and returns each reading's run of misses: a reading read ends its
 // run. The people reading is not counted, and any run it had is dropped,
-// while peopleReadingEnabled is false (no A2A stack, or a chat platform on
-// Hermes): its kind is then absent from the map returned, and
+// while peopleReadingEnabled is false (a chat platform on Hermes): its kind is then absent from the map returned, and
 // usageReadingsForPoll clears its fields without a miss. With the gate open,
 // a poll that reads no A2A gateway body, its pod missing or unreadable, is a
 // miss like any other.
@@ -968,8 +967,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		// The chat listener also serves the origins reading, from the proposals
 		// ledger, on the same gate as its counters.
 		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway, 0, usageMetricsPath},
-		// The A2A gateway, a pod a next-mode install runs and a today install
-		// does not: the chat counter again, from the gateway that owns Chat
+		// The A2A gateway: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod, 0, usageMetricsPath},

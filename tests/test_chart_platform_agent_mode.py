@@ -44,15 +44,22 @@ _REQUIRED = [
 
 
 _PROFILES_SOURCE = "# Source: kube-agents/templates/profiles-namespace.yaml"
+# The operator's Role and RoleBinding rendered into the profile namespace
+# (operator-rbac.yaml) carry this line; nothing else in the render does.
+_PROFILES_NAMESPACE_LINE = "\n  namespace: kubeagents-system-profiles\n"
+
+
+def _is_profile_document(doc: str) -> bool:
+    return _PROFILES_SOURCE in doc or _PROFILES_NAMESPACE_LINE in doc
 
 
 def _split_profiles_namespace(stdout: str) -> tuple:
-    """The render without the profile namespace's document, and that document."""
+    """The render without the profile namespace's documents, and those documents."""
     # Split on the separator lines and keep them with the document after
     # them, so the render's leading "---" survives the round trip.
     docs = re.split(r"(?m)^(?=---$)", stdout)
-    keep = [d for d in docs if _PROFILES_SOURCE not in d]
-    taken = [d for d in docs if _PROFILES_SOURCE in d]
+    keep = [d for d in docs if not _is_profile_document(d)]
+    taken = [d for d in docs if _is_profile_document(d)]
     return "".join(keep), "".join(taken)
 
 
@@ -91,7 +98,7 @@ class ModeTemplateShapeTest(unittest.TestCase):
     def test_the_schema_admits_the_crd_enum_and_unset_only(self):
         schema = json.loads(_SCHEMA.read_text())
         mode = schema["properties"]["platformAgent"]["properties"]["mode"]
-        self.assertEqual(mode, {"enum": [None, "", "today", "next"]})
+        self.assertEqual(mode["enum"], [None, "", "today", "next"])
         # The set values are the CRD's spec.mode enum, read from the CRD the
         # chart ships, so a third mode added there fails here until the schema
         # admits it too.
@@ -124,13 +131,15 @@ class ModeRenderTest(unittest.TestCase):
                 out = _render("--set", f"platformAgent.mode={mode}")
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertEqual(_cr(out.stdout)["spec"]["mode"], mode)
-                # next also renders the AgentProfile namespace (#3655), its own
-                # document; set it aside and the CR's diff is still one line.
+                # next also renders the AgentProfile namespace (#3655) and the
+                # operator's Role and RoleBinding in it, their own documents;
+                # set them aside and the CR's diff is still one line.
                 rendered, profiles = _split_profiles_namespace(out.stdout)
-                self.assertEqual(bool(profiles), mode == "next", profiles)
+                self.assertTrue(profiles, "the profiles namespace renders on every install")
+                default_rendered, _ = _split_profiles_namespace(self.default)
                 changed = [
                     line
-                    for line in difflib.unified_diff(self.default.splitlines(), rendered.splitlines(), lineterm="", n=0)
+                    for line in difflib.unified_diff(default_rendered.splitlines(), rendered.splitlines(), lineterm="", n=0)
                     if line[:1] in "+-" and not line.startswith(("+++", "---"))
                 ]
                 self.assertEqual(changed, [f'+  mode: "{mode}"'])

@@ -110,7 +110,7 @@ func usageGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	}
 }
 
-// usageA2AGatewayPod is a running A2A gateway pod, the one a next-mode
+// usageA2AGatewayPod is a running A2A gateway pod, the one an
 // install runs, with its metrics port on the gateway container.
 func usageA2AGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	agent := usageTestAgent(created)
@@ -372,6 +372,16 @@ func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherF
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Dispatcher = &usageDispatcherReading{Failing: failing}
+	s.readings[addr] = reading
+}
+
+// setDispatcherStuck gives addr's reading the plugin's stuck boards beside the
+// failing ones.
+func (s *stubUsageSource) setDispatcherStuck(addr string, stuck []usageDispatcherStuck, failing ...usageDispatcherFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Dispatcher = &usageDispatcherReading{Failing: failing, Stuck: stuck}
 	s.readings[addr] = reading
 }
 
@@ -1635,7 +1645,7 @@ func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
 	}
 }
 
-// On a next-mode install the A2A gateway owns Chat ingress and counts the
+// The A2A gateway owns Chat ingress and counts the
 // messages it accepts; the poller reads its pod as a fourth target into the
 // same chat counter, with an entry and a streak of its own, beside the
 // plugin's entry on the gateway pod (which counts nothing there: a turn the
@@ -2651,7 +2661,7 @@ func TestUsagePoller_AChatServingCRDWithoutTheFeedbackCounterKeepsTheOthersFlowi
 	}
 }
 
-// On a next-mode install the A2A gateway's answer ratings count too: its
+// The A2A gateway's answer ratings count too: its
 // thumbs-downs join the reaction hook's in negativeFeedbackTotal, and its
 // thumbs-ups are positiveFeedbackTotal. Neither is activity.
 func TestUsagePoller_AnswerRatingsCountFromTheA2AGateway(t *testing.T) {
@@ -4321,11 +4331,10 @@ func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 	}
 }
 
-// usagePeopleTestAgent is a next-mode CR with Chat on and, when slack is set,
-// Slack too; Slack then stays on its legacy consumer, served through Hermes.
+// usagePeopleTestAgent is a CR with Chat on and, when slack is set, Slack
+// too; Slack then stays on its legacy consumer, served through Hermes.
 func usagePeopleTestAgent(created time.Time, slack bool) *agentv1alpha1.PlatformAgent {
 	agent := usageTestAgent(created)
-	agent.Spec.Mode = ptr.To(string(ModeNext))
 	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
 		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 	}
@@ -4497,28 +4506,11 @@ func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 	}
 }
 
-// An install that renders no A2A stack has no people reading to take: the
-// pair stays absent and no miss is counted. A next install whose gateway pod
-// goes missing has a configured target with no body: one poll is a miss and
-// keeps the pair, the second clears it.
-func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGatewayPodIsAMiss(t *testing.T) {
+// An install whose gateway pod goes missing has a configured target with no
+// body: one poll is a miss and keeps the pair, the second clears it.
+func TestUsagePoller_AMissingGatewayPodIsAMiss(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	t.Run("today", func(t *testing.T) {
-		agent := usageTestAgent(created)
-		h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-		h.stub.set(gatewayAddr(), 0, nil)
-		h.stub.set(brokerAddr(), 0, nil)
-		h.poll(5)
-		h.poll(10)
-		h.poll(15)
-		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
-			t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
-		}
-		if misses, ok := h.peopleMisses(agent); ok {
-			t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
-		}
-	})
-	t.Run("next, the gateway pod gone", func(t *testing.T) {
+	t.Run("the gateway pod gone", func(t *testing.T) {
 		agent := usagePeopleTestAgent(created, false)
 		objects := usagePeopleObjects(created)
 		h := newUsageHarness(t, agent, objects...)

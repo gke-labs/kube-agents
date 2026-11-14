@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Hex digits of the normalizer source hash kept in NORMALIZER_VERSION.
@@ -367,6 +367,32 @@ COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
 HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
 # A run of hex with a letter in it: one with digits only is a number, not a commit.
 HEX_LETTER_RE = re.compile(r"[a-f]")
+# submit_suggestion's `prepare` says which closed or merged proposal last used
+# the branch name (agents/platform/skills/submit-suggestion/scripts/
+# submit_suggestion.py `clear_spent_branch`): "'<branch>' was the source of
+# <url>, which is closed. That proposal's last revision, <12 hex>, is not in
+# 'main', ..." and, when it deletes the branch, "Deleted the spent branch at
+# <12 hex>". Every eval run opens proposals of its own, so the number and the
+# revision are an earlier run's and differ between otherwise identical runs.
+# `clear_spent_branch`'s refusals name the revision as "The repository held
+# the branch at <12 hex>" and "The repository still holds the branch at <12
+# hex>". The number and revision are read only in those sentences, the number
+# in a GitHub (`/pull/<n>`) or GitLab (`/-/merge_requests/<n>`) proposal URL,
+# the forms the broker's proposals carry. A refusal also quotes the broker's own
+# error in parentheses, which can repeat the revision ("is at <12 hex>"), name
+# another revision or a proposal URL in other words; that text is left as
+# written, so two runs refused alike still key apart there (a miss, not a
+# wrong answer). The revision is bound as a commit. The
+# number gets a placeholder in the key and is never put back in an answer: it
+# is a bare number, and an unrelated `175` in an answer must not become this
+# run's. An answer that holds it with no digit beside it is not saved instead
+# (Mapping.answer_repeats_bare_number).
+SPENT_PROPOSAL_CLASS = "PULL"
+SPENT_PROPOSAL_RE = re.compile(r"was the source of https?://[^\s,]+/(?:pull|-/merge_requests)/(\d+)(?=, which is )")
+SPENT_REVISION_RE = re.compile(
+    r"(?:That proposal's last revision, |(?:held|holds) the branch at |Deleted the spent branch at )" + COMMIT_HEX)
+PROPOSAL_NUMBER_BEFORE = r"(?<!\d)"
+PROPOSAL_NUMBER_AFTER = r"(?!\d)"
 
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
@@ -377,6 +403,8 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
         r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
     (COMMIT_CLASS, COMMIT_RE, 1),
     (COMMIT_CLASS, COMMIT_URL_RE, 1),
+    (COMMIT_CLASS, SPENT_REVISION_RE, 1),
+    (SPENT_PROPOSAL_CLASS, SPENT_PROPOSAL_RE, 1),
     (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
     # The fleet audit's declared-intent clone directory, a Python tempfile name:
     # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
@@ -424,6 +452,35 @@ RECENT_WORK_ESCAPED_RE = re.compile(
     r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
 )
 
+# Hermes' read_file answers a missing file with `File not found: <path>` and,
+# when the directory holds names like it, `similar_files`: up to five picked
+# from an `ls` of the directory at that moment (hermes-agent v2026.9.14
+# tools/file_operations.py `_suggest_similar_files`; `ReadResult.to_dict` leaves
+# the key out when the list is empty). Whether another agent has written a file
+# there yet changes the list (`/opt/data/INVENTORY.md` listed in one run and
+# not yet in the next), so the key drops it (without_similar_files): only in a
+# not-found result, in a tool message answering a read_file call, found by its
+# tool_call_id. The model sometimes reads a listed file next (about one answer
+# in twenty after such a result, Nov 12 nightlies), so a file named in either
+# run's list never crosses runs (Mapping.answer_names_dropped_file): an answer
+# naming one of the recording's is not saved, and a saved answer naming one of
+# this run's is not served (replay_proxy lookup), since the answer may act on
+# the file being there, or on it not being there (`write_file INVENTORY.md`
+# would overwrite what another agent wrote).
+READ_FILE_TOOL = "read_file"
+READ_FILE_ERROR_KEY = "error"
+READ_FILE_NOT_FOUND_PREFIX = "File not found:"
+SIMILAR_FILES_KEY = "similar_files"
+# A dropped file's name counts in an answer where no word character, `.` or `-`
+# comes before it and no word character, `-`, or `.` and a word character
+# follows it (`config` is not `config.yaml`; a sentence's closing
+# `INVENTORY.md.` still counts). A JSON escape
+# (`\n`, `\t`, `\r`) also counts as a boundary before it: a tool call's
+# `arguments` is a JSON string, so a name starting a line of a `write_file`'s
+# content is written `...\nINVENTORY.md`, with a word character before it.
+DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
+DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
+
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
 # Hash input encoding. A lone surrogate (`"\ud83d"`) is valid in a JSON string
@@ -448,8 +505,9 @@ DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
 # Classes keyed apart and never swapped into an answer by value: opaque fields,
-# bare numbers, and timestamp literals (swapped by their own patterns).
-UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, TIME_LITERAL_CLASS)
+# bare numbers, a spent proposal's number, and timestamp literals (swapped by
+# their own patterns).
+UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, SPENT_PROPOSAL_CLASS, TIME_LITERAL_CLASS)
 
 
 def token_class(token: str) -> str:
@@ -631,6 +689,34 @@ def strip_recent_work(text: str) -> str:
     return RECENT_WORK_ESCAPED_RE.sub("", text)
 
 
+def without_similar_files(text: str) -> Tuple[str, List[str]]:
+    """A read_file not-found result without its `similar_files`, and the files that list held; any other text as it is.
+
+    Returns `text` itself when it holds no list to drop. A result Hermes appended
+    a notice to (its tool-loop warning) is JSON followed by text: its JSON is
+    written in canonical form, with or without a list to drop, so two runs'
+    copies key alike, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, []
+        tail = text.lstrip()[end:]
+    error = parsed.get(READ_FILE_ERROR_KEY) if isinstance(parsed, dict) else None
+    if not (isinstance(error, str) and error.startswith(READ_FILE_NOT_FOUND_PREFIX)):
+        return text, []
+    listed = parsed.pop(SIMILAR_FILES_KEY, None)
+    files = [f for f in listed if isinstance(f, str)] if isinstance(listed, list) else []
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, files
+    if listed is None:
+        return text, files
+    return json.dumps(parsed, ensure_ascii=False), files
+
+
 @dataclass
 class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
@@ -664,6 +750,11 @@ class Mapping:
     dropped_counts: set = field(default_factory=set)
     dropped_count_keys: set = field(default_factory=set)
     dropped_hex: set = field(default_factory=set)
+    # Spent proposals' numbers (SPENT_PROPOSAL_RE), which an answer must not
+    # hold as a number, and the file names of read_file's dropped
+    # `similar_files` (without_similar_files), which an answer must not name.
+    proposal_numbers: set = field(default_factory=set)
+    dropped_files: set = field(default_factory=set)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -682,6 +773,8 @@ class Mapping:
                 self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
+        if cls == SPENT_PROPOSAL_CLASS:
+            self.proposal_numbers.add(value)
         if age:
             self.ages.add(value)
         return self.to_placeholder[key]
@@ -689,7 +782,8 @@ class Mapping:
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
                        set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
-                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
+                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex),
+                       set(self.proposal_numbers), set(self.dropped_files))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -839,6 +933,15 @@ class Mapping:
         return any(run.startswith(kept) or kept.startswith(run)
                    for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
 
+    def answer_names_dropped_file(self, text: str) -> bool:
+        """Whether an answer names, by its file name, a file a dropped read_file `similar_files` listed.
+
+        Read on the answer as written, not normalized: a name holding a bound
+        identifier (`kube-agents-evals-22-notes.md`) would otherwise be read
+        as its placeholder. By file name, so a relative path (`cat INVENTORY.md`) counts too.
+        """
+        return any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files)
+
     @staticmethod
     def has_timestamp(text: str) -> bool:
         """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
@@ -884,6 +987,10 @@ class Mapping:
             if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
                          re.IGNORECASE):
                 return True
+        # Any length, anywhere: `PR #175`, `pull/175` and `proposal view 175` all name it.
+        for value in self.proposal_numbers:
+            if re.search(PROPOSAL_NUMBER_BEFORE + re.escape(value) + PROPOSAL_NUMBER_AFTER, text):
+                return True
         return self.answer_repeats_dropped_count(text)
 
     def answer_repeats_dropped_count(self, text: str) -> bool:
@@ -924,6 +1031,8 @@ class Normalizer:
         # Whether the message being walked is an assistant message (walk_message):
         # then text() also swaps bound values as Mapping.apply_to_answer does.
         self.in_answer = False
+        # The tool_call ids of the read_file calls walked so far (walk_message).
+        self.read_file_calls: Set[str] = set()
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -961,17 +1070,41 @@ class Normalizer:
     def walk_message(self, message: Any) -> Any:
         """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
 
-        An assistant message's skill_view calls are noted, so the tool message
-        answering one is walked with its file listings sorted (sorted_skill_listings).
+        An assistant message's read_file and skill_view calls are noted, so the
+        tool message answering one is walked without a not-found's
+        `similar_files` (without_similar_files), or with its file listings
+        sorted (sorted_skill_listings).
         """
         outer = self.in_answer
         self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
         if self.in_answer:
+            self.note_read_file_calls(message)
             self.note_skill_view_calls(message)
         try:
-            return self.walk(self.skill_listings_sorted(message))
+            return self.walk(self.similar_files_dropped(self.skill_listings_sorted(message)))
         finally:
             self.in_answer = outer
+
+    def note_read_file_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == READ_FILE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.read_file_calls.add(call[ID_KEY])
+
+    def similar_files_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `similar_files` when it is a noted read_file call's not-found result.
+
+        The file name of each dropped entry is noted for the answer guards (Mapping.answer_names_dropped_file).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.read_file_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, files = without_similar_files(message[CONTENT_FIELD])
+        self.mapping.dropped_files.update(name for name in (PurePosixPath(f).name for f in files) if name)
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
 
     def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
         calls = message.get(TOOL_CALLS_KEY)
@@ -1045,6 +1178,7 @@ class Normalizer:
         self.mapping.ages |= other.ages
         self.mapping.dates |= other.dates
         self.mapping.today_dates |= other.today_dates
+        self.mapping.proposal_numbers |= other.proposal_numbers
 
     def note_counts(self, payload: Any, key: Optional[str] = None) -> None:
         """Every integer in a dropped event's payload, with the key it sat under (Mapping.answer_repeats_dropped_count)."""
