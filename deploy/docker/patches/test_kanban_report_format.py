@@ -290,6 +290,15 @@ class StanzaTest(unittest.TestCase):
         )
         self.assertIn("Keep a report under 2,000 characters where the findings allow", " ".join(REPORT_FORMAT_STANZA.split()))
 
+    def test_a_question_names_what_it_found_not_the_commands(self):
+        """#5200: the over-length answers spent their budget naming the commands, context and read time."""
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn("600 characters in all, aiming for under 400,", flat)
+        self.assertIn(
+            "Its evidence says what you found, not how: name no command, script, kube context or the time you ran them.",
+            flat,
+        )
+
     def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""
         self.assertEqual(serious_defects(REPORT_FORMAT_STANZA), ())
