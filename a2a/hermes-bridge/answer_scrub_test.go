@@ -673,6 +673,40 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 }
 
+// A card the task's kanban_create made counts as the task's whatever its
+// title: a create whose title scrubs or shortens to nothing still claims
+// its card's worker deliveries for the set.
+func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-untitled"
+	a.mu.Lock()
+	a.observeWorkerContextLocked(hookDelivery{ToolName: kanbanCreateTool, SessionID: a.sessionID}, json.RawMessage(`{"title":"  "}`), "t_card77")
+	a.mu.Unlock()
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-untitled"}, state: stateRunning}
+	run.act.Store(a)
+	other := newActivityState(false)
+	other.sessionID = "a2a-coord-other"
+	other.waitingCard.Store(true)
+	otherRun := &taskRun{origin: &lib.Envelope{TaskID: "task-other"}, state: stateRunning}
+	otherRun.act.Store(other)
+	runs := []*taskRun{otherRun, run}
+	d := hookDelivery{SessionID: "20990101_120001_worker", Cwd: "/var/lib/hermes/kanban/workspaces/t_card77/repo", ToolName: "terminal"}
+	if got := cardWorkerRun(runs, d); got != run {
+		t.Error("the untitled card's worker was not claimed for the task that filed it")
+	}
+	missed := d
+	missed.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
+	if got := cardWorkerRun(runs, missed); got != nil {
+		t.Error("a card no task filed was claimed")
+	}
+	// Waiting on its cards, the filing task, not another waiting one, takes
+	// the worker's activity.
+	a.waitingCard.Store(true)
+	if got := matchWorkerDeliveryRun(runs, d); got != run {
+		t.Error("the untitled card's worker activity was not attributed to the task that filed it")
+	}
+}
+
 // The pools keep their reserves: shape-caught values leave a Secret value
 // tracked and redacted, and a result holding many of them keeps its newest
 // within its shape allowance; a forged Secret with many values adds at most
