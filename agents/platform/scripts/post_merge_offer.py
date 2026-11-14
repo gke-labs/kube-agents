@@ -38,6 +38,7 @@ sys.path.append(str(Path(__file__).resolve().parent))
 import automation_rules
 import clean_merges
 import post_merge_stepdown
+import repo_ref
 
 OFFER_BRANCH = "platform-agent/automerge-offer-{kind}-{environment}"
 # Auto-merge is offered for dev first; production gets a higher bar later.
@@ -55,18 +56,17 @@ class NoOffer(RuntimeError):
 
 def repo_name(repo: str) -> str:
     """``org/infra`` for ``https://github.com/org/infra.git``: the repository as a person reads it."""
-    text = repo.strip().removesuffix("/").removesuffix(".git")
-    if "://" in text:
-        text = text.split("://", 1)[1].split("/", 1)[-1]
-    elif "@" in text.split("/", 1)[0] and ":" in text:
-        text = text.split(":", 1)[1]
-    return text or repo
+    ref = repo_ref.try_parse(repo)
+    return ref.path if ref is not None else repo
 
 
 def _allow_writer(kind: str, environment: str) -> Callable[[Path, Any, str, str], None]:
     def write(tree: Path, vcs_client: Any, repo: str, branch: str) -> None:
         rules = automation_rules.load(tree)
         path = tree / automation_rules.RULES_FILE
+        if rules.status == automation_rules.ABSENT and (path.exists() or path.parent.is_file()):
+            # `load` reads a directory, or a file where the directory goes, as absent.
+            raise NoOffer(f"{automation_rules.RULES_FILE} is not a file")
         if rules.status == automation_rules.ABSENT:
             path.parent.mkdir(parents=True, exist_ok=True)
             edited = automation_rules.new_file(kind, environment)
@@ -143,7 +143,7 @@ def offer(
             forge, repo, branch, str(fix.get("target") or ""),
             f"Auto-merge {name} in {environment}",
             f"{clean} {name} have merged in {repo_name(repo)} with nobody changing them, passed the after-merge "
-            "check, and were not undone. Merging this pull request adds one allow rule to "
+            "check, and were not undone. Marking this draft ready and merging it adds one allow rule to "
             f"`{automation_rules.RULES_FILE}`, so your pipeline may merge kube-agents' "
             f"`{kind}` fixes on clusters labelled `{environment}` without a review, while "
             "`KUBEAGENTS_AUTOMERGE` is `on`. kube-agents never merges anything itself.\n\n"
@@ -162,7 +162,8 @@ def offer(
     line = (
         f"{name[0].upper()}{name[1:]}: {clean} merged in {repo_name(repo)}, none changed or undone. "
         f"Auto-merge fixes like this in {environment}? I opened a draft pull request that adds them "
-        f"to your rules file: {url}. Merging it turns that on; closing it means no, and I won't ask again."
+        f"to your rules file: {url}. Marking it ready and merging it turns that on; closing it means no, "
+        "and I won't ask again."
     )
     answer = forge("proposal-comment", {"number": number, "body": f"{line}\n\n{MARKER}"})
     return {"action": "offered", "offer": url, "comment": (answer.get("comment") or {}).get("url")}

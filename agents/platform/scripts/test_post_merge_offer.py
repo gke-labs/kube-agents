@@ -104,6 +104,9 @@ class TestOffer(unittest.TestCase):
             with self.subTest(repo):
                 self.assertEqual(pmo.repo_name(repo), "org/infra")
         self.assertEqual(pmo.repo_name("https://gitlab.example.com/group/sub/infra"), "group/sub/infra")
+        for repo in ("github.com/org/infra", "github.com:org/infra.git", "https://github.com/org/infra.git//"):
+            with self.subTest(repo):
+                self.assertEqual(pmo.repo_name(repo), "org/infra")
 
     def test_body_names_the_fix(self):
         opener = FakeOpen()
@@ -173,6 +176,18 @@ class TestAllowWriter(unittest.TestCase):
         self._run()
         self.assertTrue(ar.decide(ar.load(self.tree), "no-pdb", "dev").allowed)
         self.assertTrue(ar.decide(ar.load(self.tree), "no-pdb", "staging").allowed)
+
+    def test_a_rules_path_that_is_not_a_file_is_no_offer(self):
+        for name in ("directory where the file goes", "file where the directory goes"):
+            with self.subTest(name):
+                self.tree = Path(tempfile.mkdtemp())
+                if name.startswith("directory"):
+                    (self.tree / ar.RULES_FILE).mkdir(parents=True)
+                else:
+                    (self.tree / ".kube-agents").write_text("x")
+                with self.assertRaises(pmo.NoOffer):
+                    self._run()
+                self.assertIsNone(self.vcs.committed)
 
     def test_refusals(self):
         for name, text in {
