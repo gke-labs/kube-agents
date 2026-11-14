@@ -863,6 +863,7 @@ API_LANE_EXCLUDED = [
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
     "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
+    "tse-profile-names-the-oom-kill",  # #3842: delegated_to, as above
 ]
 
 

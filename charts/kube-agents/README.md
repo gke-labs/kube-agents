@@ -1540,14 +1540,14 @@ limit. A cluster with bursting admits the manifest as rendered.
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
 (`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
 `profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
-controlling its `AgentProfile` spec. When bound, the operator passes
+controlling its `AgentProfile` spec. Its persona is the `persona-tse` image,
+built from `agents/tse/persona`, which a profile worker pod mounts at
+`/persona`; like the cluster profile below, it takes its target per task through
+the `project`, `cluster` and `location` parameters, fixed in the persona's
+order. When bound, the operator also passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
-scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
-Its default persona image is still a placeholder with no persona payload, and the
-profile dispatcher, on by default, gives every bound profile a warm worker. So until
-tse ships a real persona image, enabling `profiles.tse` leaves a tse warm pod
-crash-looping at its persona step. Handing work to tse through Kanban still works,
-since that runs in the scaffolded profile, not in the worker.
+scaffolds the Hermes profile `/opt/data/profiles/tse` from `/opt/tse-template`
+on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the

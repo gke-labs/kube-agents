@@ -729,6 +729,9 @@ readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
 # context agents/cluster/persona), built beside the A2A images so the lane runs
 # this tree's persona.
 readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
+# The tse AgentProfile's persona image (a2a/Dockerfile.persona-tse, context
+# agents/tse/persona), built the same way (#3842).
+readonly PERSONA_TSE_IMAGE_NAME="persona-tse"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -885,11 +888,10 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the `cluster` AgentProfile, which the profile dispatcher
-# serves (its images are set with the A2A overrides below). Not the optional
-# `tse` one: its chart persona image is a placeholder a dispatched worker can't
-# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
-# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile and the optional `tse` one, which
+# the profile dispatcher serves (their images are set with the A2A overrides
+# below). tse also scaffolds `/opt/data/profiles/tse` for the Kanban case
+# (#3492); its persona image is #3842's. Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -902,6 +904,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.cluster.enabled=true"
+    --set "profiles.tse.enabled=true"
   )
 fi
 
@@ -1884,6 +1887,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
   PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
+  PERSONA_TSE_URI="${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1921,12 +1925,16 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
     # The profiles' images. Unset, the chart takes each from ghcr at the agent
     # image's tag, which on this lane is a CI tag ghcr never has, and the
-    # profile's worker never pulls. The cluster profile runs this build's
-    # persona and worker.
+    # profile's worker never pulls. The cluster and tse profiles run this
+    # build's personas and worker.
     --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
     --set-string "profiles.cluster.persona.image.tag=${TAG}"
     --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
     --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    --set-string "profiles.tse.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}"
+    --set-string "profiles.tse.persona.image.tag=${TAG}"
+    --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.tse.harness.image.tag=${TAG}"
     # The A2A door, for the card-wait stopped ask (above).
     --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
     --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
@@ -1941,7 +1949,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1977,8 +1985,8 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
   # --async, `gcloud builds submit` tails the build log from storage and
