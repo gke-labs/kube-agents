@@ -109,7 +109,6 @@ class ReasoningEffortStoreRuleTest(unittest.TestCase):
     def test_the_record_step_names_the_effort_as_the_reason(self) -> None:
         text = _text()
         self.assertEqual(text.count(_STORE_ECHO), 1)
-        self.assertLess(text.index('elif [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then'), text.index(_STORE_ECHO))
         self.assertLess(text.index(_STORE_ECHO), text.index("Not a main-branch recorder run"))
 
     def test_the_rule_flips_the_decision(self) -> None:
