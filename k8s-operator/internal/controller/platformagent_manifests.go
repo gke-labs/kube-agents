@@ -3485,9 +3485,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// plugin able to supply the URL is that wiring, arriving from a field further
 	// down the same CR.
 	//
-	// This is tidiness, not containment. GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL
-	// above still name the broker, so anything in this container that can form an
-	// HTTP request can still reach it — what stops that being free is the token
+	// This is tidiness, not containment. TEAMS_RELAY_URL above names the broker
+	// when Teams is on, and anything in this container that can form an HTTP
+	// request can reach it anyway — what stops that being free is the token
 	// below, which the broker now checks on every call.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
@@ -4445,8 +4445,8 @@ func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier
 // the same image, with CREDENTIAL_PROXY_ROLE=api-proxy telling
 // deploy/shared/start-services.sh to start neither Envoy nor the executor, and
 // its environment is built here rather than by buildCredentialProxyEnv so that
-// the Slack and Google Chat tokens, the token-broker URL and the gcloud
-// bootstrap stay out of the gateway pod entirely. The agent container cannot
+// the token-broker URL and the gcloud bootstrap stay out of the gateway pod
+// entirely. The agent container cannot
 // reach a credentialed endpoint on this pod's loopback because there is no
 // longer one to reach — which is the property the sandbox split is for.
 //
@@ -7327,8 +7327,8 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 
 	// 12. The credential broker. The gateway holds no credential and calls nothing
 	//     on the broker's credential surface, but the chat relay moved into that
-	//     pod with it, so GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL both address
-	//     this Service now — see credentialProxyBaseURL. Without the rule the
+	//     pod with it, so TEAMS_RELAY_URL addresses this Service — see
+	//     credentialProxyBaseURL. Without the rule the
 	//     gateway's pull against /v1/chat/events is dropped and the agent stops
 	//     receiving chat, while every pod stays Running and the CR reads Ready.
 	//     buildCredentialProxyNetworkPolicy already admits the gateway on this

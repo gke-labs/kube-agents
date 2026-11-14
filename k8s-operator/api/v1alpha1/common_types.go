@@ -3166,8 +3166,8 @@ type AgentUsageStatus struct {
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
-	// chat platform the install enables is served through Hermes (Google Chat
-	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// chat platform the install enables is served through Hermes (Microsoft
+	// Teams), and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

@@ -54,11 +54,9 @@ the entry records:
 chat relay partial: the report did not reach slack. Delivered — do not re-run to resend.
 ```
 
-The home channel is set either by the
-CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. `/sethome`
-does not reach the gateway, so for the platforms the gateway serves the CR field is the only
-way. The operator renders the Google Chat field into the gateway as
+The home channel is the CR field (`spec.integration.googleChat.homeChannel` or
+`spec.integration.slack.homeChannel`) or, for Slack, a channel the gateway learned from a mention.
+`/sethome` does not reach the gateway. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
 `A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
