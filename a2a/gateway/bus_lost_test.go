@@ -243,10 +243,11 @@ func TestARunWithoutALimitWaitsOutTheBus(t *testing.T) {
 
 // A full outage under the election. The leader gives its term up, releases
 // the lease and Run returns a lost leadership, so the process exits as on a
-// lost lease. The restarted container (a fresh gateway here) campaigns, and
-// the lease cycles (retaken, the term start waits out the bus, released)
-// without a term number being written; the first term once the bus is back
-// is the next number, not one per cycle.
+// lost lease. The restarted container (a fresh gateway here) campaigns: it
+// takes the lease, its term start waits out the bus and releases it, and it
+// stands back and campaigns again rather than exiting, all without a term
+// number being written; the first term once the bus is back is the next
+// number, not one per cycle.
 func TestAFullOutageCyclesTheLeaseAndWritesNoTerm(t *testing.T) {
 	shortBusWatch(t, time.Second)
 	r := newBusLostRig(t)
@@ -281,25 +282,26 @@ func TestAFullOutageCyclesTheLeaseAndWritesNoTerm(t *testing.T) {
 
 	second := make(chan error, 1)
 	go func() { second <- elect("pod-a").Run(ctx, g2, g2.RunWith) }()
-	released := 0
-	deadline := time.Now().Add(20 * time.Second)
-	for released < 2 && time.Now().Before(deadline) {
-		for leaseHolder(t, cs) != "" && time.Now().Before(deadline) {
-			time.Sleep(testRetryPeriod / 4)
+	// A real release: a holder seen, then none. g2 takes the empty lease
+	// first, waits out the bus at its term start, and releases it; it then
+	// stands back and campaigns again, so its Run keeps going. A term
+	// start's bus wait retries every termWaitRetry, and each try waits out
+	// the client's request timeout, so one cycle takes several seconds.
+	released, prev := 0, leaseHolder(t, cs)
+	deadline := time.Now().Add(45 * time.Second)
+	for released < 1 && time.Now().Before(deadline) {
+		time.Sleep(testRetryPeriod / 4)
+		cur := leaseHolder(t, cs)
+		if prev != "" && cur == "" {
+			released++
 		}
-		for leaseHolder(t, cs) == "" && time.Now().Before(deadline) {
-			time.Sleep(testRetryPeriod / 4)
-		}
-		released++
+		prev = cur
 	}
-	if released < 2 {
-		t.Fatalf("lease released %d times during the outage, want at least 2", released)
+	if released < 1 {
+		t.Fatalf("the restarted gateway never released the lease during the outage")
 	}
-	select {
-	case err := <-second:
-		t.Fatalf("the restarted gateway's Run returned during the outage: %v", err)
-	default:
-	}
+	// Past a stand-back it is still campaigning, not exited.
+	never(t, second, testLeaseDuration+3*testRetryPeriod, "the restarted gateway's Run returned during the outage")
 
 	r.restart(t)
 	waitFor(t, "a term once the bus is back", func() bool { ready, _ := g2.Readiness(); return ready })
