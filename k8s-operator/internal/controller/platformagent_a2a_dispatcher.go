@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,13 +66,16 @@ const (
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
 
-	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
-	// grants (#5381). With it on, the dispatcher's map entry carries only its
-	// control connection's fixed grants and the draining profiles' names, and
-	// the callout derives each bucket connection's per-profile grants from
-	// the profile entries. Off by default. Turning it on needs a dispatcher
-	// that opens its bucket connections (#5381's second PR): an older one
-	// loses every profile grant.
+	// a2aDispatcherBucketedGrantsEnvVar switches the dispatcher's bucketed
+	// grants (#5381). On (the default), the dispatcher's map entry carries
+	// only its control connection's fixed grants and the draining profiles'
+	// names, the callout derives each bucket connection's per-profile grants
+	// from the profile entries, and the operator renders the same switch onto
+	// the dispatcher, which opens its bucket connections. "false" restores
+	// the single connection with every grant in the map. The dispatcher's
+	// image must move with the operator's: one from before the bucket
+	// connections ignores the switch, binds no durable on its control
+	// connection, and stays not Ready, which is loud, not silent.
 	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
 
 	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
@@ -122,10 +126,10 @@ func a2aDispatcherReleaseImage() string {
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 // a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
-// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
-// string turns it on.
+// on "dispatcher": on unless A2A_DISPATCHER_BUCKETED_GRANTS is exactly
+// "false". Any other value, unset included, is on.
 func a2aDispatcherBucketedGrants() bool {
-	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) != "false"
 }
 
 // dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
@@ -135,7 +139,11 @@ func a2aDispatcherBucketedGrants() bool {
 // control connection, plus the draining profiles' names. The callout derives
 // every per-profile subject from the profile entries (lib.DispatcherGrants),
 // so the entry's size no longer grows with the profile count.
-func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+// held names the bound profiles kept out of the dispatcher
+// (a2aHeldProfileNames). Unbucketed, the entry is built from the dispatchable
+// profiles alone and leaves them out already; bucketed, the callout derives
+// grants from every profile entry, so the entry lists them for it to skip.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile, held []string) a2aAuthMapIdentity {
 	if !a2aDispatcherBucketedGrants() {
 		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
 		return entry
@@ -154,7 +162,30 @@ func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1al
 		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
 		Narrowing:      a2aNarrowingDispatcher,
 		Draining:       drainingNames,
+		Held:           held,
 	}
+}
+
+// a2aHeldProfileNames is the profiles the map renders entries for that are
+// not dispatchable, sorted: the ones the profile hold keeps out of the
+// dispatcher. Read off the rendered profile entries rather than the bound
+// list, so a refused profile (no entry, and out of dispatchable too) is never
+// listed, every name listed has passed its entry's checks, and the list lasts
+// only as long as a hold does. Sorted, so the map's version doesn't move with
+// the order the cache lists profiles in.
+func a2aHeldProfileNames(entries []a2aAuthMapIdentity, dispatchable []agentv1alpha1.AgentProfile) []string {
+	var held []string
+	for _, e := range entries {
+		if e.Narrowing != a2aNarrowingProfile || e.Profile == "" || slices.Contains(held, e.Profile) {
+			continue
+		}
+		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == e.Profile }) {
+			continue
+		}
+		held = append(held, e.Profile)
+	}
+	slices.Sort(held)
+	return held
 }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
@@ -373,6 +404,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							{Name: "DISPATCH_CONFIGMAP", Value: a2aDispatchConfigName(agent)},
 							{Name: a2aTaskSigningSeedFileEnvVar, Value: a2aTaskSigningSeedMountPath + "/" + a2aTaskSigningSeedFile},
 							a2aTaskCredentialMaxLifetimeEnv(agent),
+							// The same switch as the dispatcher's map entry,
+							// so the process opens its bucket connections
+							// exactly when the callout splits its grants.
+							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
 							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},

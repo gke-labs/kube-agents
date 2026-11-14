@@ -406,6 +406,17 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 		"no identities at all": func([]a2aAuthMapIdentity) []a2aAuthMapIdentity {
 			return nil
 		},
+		// Only the dispatcher's entry reads held profiles (#5935).
+		"held profiles on an entry that isn't the dispatcher's": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Held = []string{"newcomer"}
+			return ids
+		},
+		"a held name that is not a subject token": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			return append(ids, a2aTestBucketedDispatcherEntry("a.b"))
+		},
+		"a held name twice": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			return append(ids, a2aTestBucketedDispatcherEntry("a", "a"))
+		},
 	}
 
 	for name, mutate := range cases {
@@ -433,6 +444,8 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	// 7 is #4488's (notAfter); once it merges, 8 is its key set plus held.
+	"8": {"account", "draining", "grants", "held", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -462,7 +475,7 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 	agent := a2aTestAgent()
 
 	// With a profile that has topics, and the dispatcher's bucketed entry
-	// with a draining profile, so every key the renderer can emit is
+	// with a draining profile and a held one, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema
 	// and roll nothing.
 	withDispatcher(t)
@@ -473,7 +486,9 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 	})
 	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
 		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
-	cms, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{auditor}, draining)
+	// And a profile the hold keeps out of the dispatcher, for held.
+	newcomer := testAgentProfile(agent.Namespace, "newcomer")
+	cms, _, err := buildA2AAuthMapConfigMapsHeld(agent, []agentv1alpha1.AgentProfile{auditor, newcomer}, []agentv1alpha1.AgentProfile{auditor}, draining)
 	if err != nil || len(cms) != 1 {
 		t.Fatalf("rendering the auth map: %d shards, %v", len(cms), err)
 	}
@@ -523,4 +538,12 @@ func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
 	if len(dep.Spec.Template.ObjectMeta.Annotations) == 0 {
 		t.Fatal("the callout pod template carries no annotations at all, so no schema change can roll it")
 	}
+}
+
+// a2aTestBucketedDispatcherEntry is a sound bucketed dispatcher entry listing
+// held, for the render-time check's cases.
+func a2aTestBucketedDispatcherEntry(held ...string) a2aAuthMapIdentity {
+	id := dispatcherIdentity(a2aTestAgent(), "kubeagents-system", nil, nil)
+	return a2aAuthMapIdentity{ServiceAccount: id.serviceAccount, User: id.user, Account: id.account,
+		Grants: a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe}, Narrowing: a2aNarrowingDispatcher, Held: held}
 }

@@ -2788,7 +2788,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "1c982ea518e10246",
+      "version": "6968d99c141e670f",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2919,7 +2919,8 @@ data:
               "a2a.cap.reply.dispatcher.>",
               "_INBOX.dispatcher.>"
             ]
-          }
+          },
+          "narrowing": "dispatcher"
         }
       ]
     }
@@ -2928,7 +2929,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 1c982ea518e10246
+    kubeagents.x-k8s.io/a2a-authmap-version: 6968d99c141e670f
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3090,7 +3091,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "6"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "8"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5134,6 +5135,8 @@ spec:
               value: /var/run/kube-agents/task-signing/seed
             - name: A2A_TASK_CREDENTIAL_MAX_LIFETIME
               value: 6h0m0s
+            - name: A2A_DISPATCHER_BUCKETED_GRANTS
+              value: "true"
           image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
           livenessProbe:
             failureThreshold: 6

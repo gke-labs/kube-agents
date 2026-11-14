@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -41,6 +42,12 @@ var dispatcherFixed = Grants{
 func dispatcherEntry(draining ...string) Identity {
 	return Identity{ServiceAccount: dispatcherSA, User: "dispatcher", Account: AccountControl,
 		Narrowing: NarrowingDispatcher, Grants: dispatcherFixed, Draining: draining}
+}
+
+func heldEntry(held ...string) Identity {
+	id := dispatcherEntry()
+	id.Held = held
+	return id
 }
 
 func profileEntry(profile, tier string) Identity {
@@ -177,6 +184,52 @@ func TestABucketConnectionGetsItsProfilesGrantsAndNothingElse(t *testing.T) {
 	}
 }
 
+// A held profile's bucket mints none of the held profile's subjects, though
+// its entries stay in the map, until the hold lifts (#5935): with it listed
+// held the bucket holds only the other profile's grants; unlisted, the next
+// map grants it. Held and draining at once, it keeps a draining profile's
+// grants and none of its durables.
+func TestAHeldProfilesBucketMintsNoneOfItsSubjects(t *testing.T) {
+	const b = 3
+	live, held := profileHashingTo(b), ""
+	held = profileHashingTo(b, live)
+	bucketGrants := func(disp Identity) Grants {
+		t.Helper()
+		svc := newDispatcherTestService(t, renderMap(t, disp, profileEntry(live, "read"), profileEntry(held, "read")), dispatcherTokens())
+		d, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(b))
+		if err != nil {
+			t.Fatalf("refused: %v", err)
+		}
+		return allowed(d)
+	}
+	inbox := fmt.Sprintf("_INBOX.dispatcher-b%d.>", b)
+	expect := func(profiles ...lib.DispatcherGrantProfile) Grants {
+		g := lib.DispatcherGrants(profiles)
+		return Grants{Publish: append(g.Publish, inbox), Subscribe: append(g.Subscribe, inbox)}
+	}
+
+	if got, want := bucketGrants(heldEntry(held)), expect(lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("while held: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+	if got := bucketGrants(heldEntry(held)); slices.ContainsFunc(append(got.Publish, got.Subscribe...), func(s string) bool { return strings.Contains(s, held) }) {
+		t.Errorf("while held: the bucket holds a subject of %s: %v", held, got)
+	}
+	if got, want := bucketGrants(dispatcherEntry()), expect(
+		lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}},
+		lib.DispatcherGrantProfile{Name: held, Tiers: []string{"read"}},
+	); !reflect.DeepEqual(got, want) {
+		t.Errorf("after the hold: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+	heldDraining := heldEntry(held)
+	heldDraining.Draining = []string{held}
+	if got, want := bucketGrants(heldDraining), expect(
+		lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}},
+		lib.DispatcherGrantProfile{Name: held, Draining: true},
+	); !reflect.DeepEqual(got, want) {
+		t.Errorf("held and draining: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+}
+
 // An empty bucket is still a valid connection: its inbox on both sides, so
 // neither side is empty (which the server would read as unrestricted).
 func TestAnEmptyBucketHoldsOnlyItsInbox(t *testing.T) {
@@ -271,6 +324,8 @@ func TestTheMapRefusesAnUnsoundDispatcherEntry(t *testing.T) {
 	profileInTrusted.Account = AccountControl
 	drainingOnGateway := Identity{ServiceAccount: "system:serviceaccount:x:z", User: "z", Account: AccountControl,
 		Grants: Grants{Publish: []string{"a"}, Subscribe: []string{"b"}}, Draining: []string{"p"}}
+	heldOnGateway := Identity{ServiceAccount: "system:serviceaccount:x:h", User: "h", Account: AccountControl,
+		Grants: Grants{Publish: []string{"a"}, Subscribe: []string{"b"}}, Held: []string{"p"}}
 	second := dispatcherEntry()
 	second.ServiceAccount, second.User = "system:serviceaccount:x:d2", "dispatcher2"
 	squatUser := Identity{ServiceAccount: "system:serviceaccount:x:sq", User: "dispatcher-b3", Account: AccountControl,
@@ -286,6 +341,9 @@ func TestTheMapRefusesAnUnsoundDispatcherEntry(t *testing.T) {
 		"a profile named for a bucket user":   {dispatcherEntry(), profileEntry("dispatcher-b3", "read")},
 		"a draining name that is not a token": {dispatcherEntry("a.b")},
 		"a draining name twice":               {dispatcherEntry("a", "a")},
+		"held on a non-dispatcher entry":      {heldOnGateway},
+		"a held name that is not a token":     {heldEntry("a.b")},
+		"a held name twice":                   {heldEntry("a", "a")},
 	} {
 		if _, err := ParseIdentityMap(renderMap(t, ids...)); err == nil {
 			t.Errorf("%s: the map was accepted", name)
@@ -451,4 +509,41 @@ func TestABucketUserNamedForAStaticPrincipalIsRefused(t *testing.T) {
 	if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(4)); err != nil {
 		t.Fatalf("bucket 4 refused: %v", err)
 	}
+}
+
+// The dispatcher's real bucket options (lib.DispatcherBucketNATSOptions: the
+// token from its file, the bucket as the CONNECT password, the bucket user's
+// inbox) against a real server serving the operator's bucketed render: the
+// bucket connection reaches tse's subjects and is refused on another
+// profile's and on the control set.
+func TestTheRealBucketOptionsConnectAgainstTheOperatorsBucketedMap(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "rendered-identity-map-dispatcher-bucketed.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHarness(t, string(raw), map[string]Attested{
+		dispatcherToken: {ServiceAccount: dispatcherSA, PodName: dispatcherPod, PodUID: "uid-d"},
+	})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(dispatcherToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := lib.DispatcherBucket("tse")
+	opts, err := lib.DispatcherBucketNATSOptions(tokenFile, "dispatcher", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := make(chan error, 16)
+	nc, err := nats.Connect(h.url, append([]nats.Option{h.dial, nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { violations <- e })}, opts...)...)
+	if err != nil {
+		t.Fatalf("bucket %d with the real options was refused: %v", b, err)
+	}
+	t.Cleanup(nc.Close)
+	other := profileHashingTo((b + 1) % lib.DispatcherBuckets)
+	checkPublish(t, nc, violations, map[string]bool{
+		lib.TaskSupervisorSubject("tse", "task-1"):                                              false,
+		"$JS.API.CONSUMER.INFO.PROFILE_SUBMITS." + lib.ProfileDurableName("tse", "read", "top"): false,
+		lib.TaskSupervisorSubject(other, "task-1"):                                              true,
+		lib.DispatchSubject("tse", "read", "pod-1"):                                             true,
+	})
 }

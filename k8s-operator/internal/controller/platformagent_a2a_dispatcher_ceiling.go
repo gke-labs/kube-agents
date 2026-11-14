@@ -406,7 +406,9 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 	var entry a2aAuthMapIdentity
 	var n int
 	if a2aDispatcherBucketedGrants() {
-		entry, n = dispatcherMapEntry(agent, profiles, draining), len(profiles)+len(draining)
+		// Held names are left out of the measure: a profile is held only
+		// until the bus loads its config, a few bytes each.
+		entry, n = dispatcherMapEntry(agent, profiles, draining, nil), len(profiles)+len(draining)
 	} else {
 		entry, n = a2aDispatcherMapEntry(agent, profiles, draining)
 	}

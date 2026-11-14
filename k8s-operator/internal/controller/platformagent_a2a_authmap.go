@@ -194,6 +194,13 @@ type a2aAuthMapIdentity struct {
 	// no profile entry for the callout to derive their grants from. Omitted
 	// elsewhere.
 	Draining []string `json:"draining,omitempty"`
+
+	// Held is set only on the dispatcher's entry when it narrows on
+	// "dispatcher": the bound profiles the profile hold keeps out of the
+	// dispatcher (platformagent_a2a_profile_hold.go). The callout derives a
+	// bucket's grants from the profile entries, so it skips these until the
+	// hold lifts (#5935). Omitted elsewhere.
+	Held []string `json:"held,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -274,7 +281,7 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 		if !over {
 			// Bucketed or not (dispatcherMapEntry); unbucketed, it is
 			// a2aDispatcherMapEntry's entry, which the ceiling measured.
-			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining))
+			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining, a2aHeldProfileNames(identities, dispatchable)))
 		}
 	}
 
@@ -522,6 +529,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 		} else if id.Narrowing != "" && id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
 		}
+		if id.Narrowing != a2aNarrowingDispatcher && len(id.Held) > 0 {
+			return fmt.Errorf("identity %d: user %q lists held profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
+		}
 		if id.Narrowing != a2aNarrowingDispatcher && len(id.Draining) > 0 {
 			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
@@ -588,6 +598,15 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee, a principal's or map user's name, or a dispatcher bucket user", i, id.User, p)
 				}
 				seenDraining[p] = true
+			}
+			// The callout's checks on held names (validateDispatcherEntry):
+			// one subject token each, none twice.
+			seenHeld := map[string]bool{}
+			for _, p := range id.Held {
+				if !isDNS1123LabelToken(p) || seenHeld[p] {
+					return fmt.Errorf("identity %d: user %q lists held profile %q, which is not a dot-free DNS-1123 label, or is listed twice", i, id.User, p)
+				}
+				seenHeld[p] = true
 			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)

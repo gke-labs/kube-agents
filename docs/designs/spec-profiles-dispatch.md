@@ -446,10 +446,12 @@ leave open:
   drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
   ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
   target.
-  `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves the dispatcher's per-profile grants
-  out of the identity map and onto per-bucket connections the callout derives
-  (spec-nats-deployment.md); a dispatcher that doesn't open them loses every profile grant, so
-  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the dispatcher's entry is a fixed size whatever the profile count, so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
+  Its per-profile grants are out of the identity map and on 32 bucket connections the callout
+  derives (spec-nats-deployment.md); `A2A_DISPATCHER_BUCKETED_GRANTS=false` on the operator puts
+  them back in the map on one connection. The operator and the dispatcher move together: a
+  dispatcher from before the bucket connections binds nothing under a split map and stays not
+  Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
+  so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`

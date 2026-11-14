@@ -552,8 +552,13 @@ func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
 
 // A held profile keeps its own identities in the map, but the dispatcher's
 // grant leaves out its supervisor subjects until it is dispatchable.
+// The unbucketed shape, where the dispatcher entry carries every profile's
+// subjects. With bucketed grants the callout derives each bucket's grants
+// from the profile entries, and a held profile's are not yet left out
+// (gke-labs/kube-agents#5935); the dispatch config leaves it out either way.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since #5577
 	agent := a2aTestAgent()
 	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
 	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
@@ -580,6 +585,64 @@ func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	}
 	if yIdentities == 0 {
 		t.Error("the held profile lost its own identities")
+	}
+}
+
+// With bucketed grants the callout derives a bucket's grants from the
+// profile entries, which a held profile keeps, so the dispatcher's entry lists
+// it as held for the callout to skip (#5935): listed while held, gone once it
+// is dispatchable, and never on an unbucketed entry, which leaves it out by
+// construction.
+func TestABucketedDispatcherEntryListsTheHeldProfiles(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	agent := a2aTestAgent()
+	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
+	dispatcherOf := func(doc a2aAuthMapDocument) a2aAuthMapIdentity {
+		t.Helper()
+		for _, id := range doc.Identities {
+			if id.User == a2aDispatcherUser {
+				return id
+			}
+		}
+		t.Fatal("no dispatcher in the map")
+		return a2aAuthMapIdentity{}
+	}
+	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y"}) {
+		t.Errorf("held = %v, want [y] while y is held", got)
+	}
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x, y}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v once y is dispatchable, want none", got)
+	}
+
+	// Sorted, whatever order the profiles were bound in; and a refused
+	// profile (no entry, and so never dispatchable) is not held: it would
+	// stay listed for good, and a name the operator refuses is one the
+	// callout refuses too (#5935 review).
+	z, dotted := testAgentProfile(agent.Namespace, "z"), testAgentProfile(agent.Namespace, "dotted.name")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{z, x, y, dotted}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y", "z"}) {
+		t.Errorf("held = %v, want [y z]: sorted, and without the refused profile", got)
+	}
+
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v on an unbucketed entry, want none", got)
 	}
 }
 
