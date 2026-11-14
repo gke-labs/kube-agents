@@ -480,12 +480,6 @@ class TestScrubStepText(unittest.TestCase):
             'mysql DB_PASSWORD=x%s -p"S3cretValue9"\\ -h\\ db',
             'curl TOKEN=x%s -u admin:"S3cretValue9"\\ https://x',
         )
-        # A quoted value with no word character has no spelling after the
-        # marker that ran on to the quote; the one after `user:` masks it.
-        for quoted in ('"#%!!+~"', "'#%!!+~'"):
-            cmd = "curl TOKEN=x\\ -u admin:" + quoted + " https://x"
-            with self.subTest(cmd=cmd):
-                self.assertNotIn("#%!!+~", _scrub("tool_call", cmd))
         for run in (1, 2, 4):
             for shape in shapes:
                 plain = shape % ("\\" * run)
@@ -493,6 +487,21 @@ class TestScrubStepText(unittest.TestCase):
                     for text in (json.dumps({"command": cmd}), cmd):
                         with self.subTest(cmd=cmd, form=text[:1]):
                             self.assertNotIn("S3cretValue9", _scrub("tool_call", text))
+        # A value made of symbols alone is a value too, quoted or after `=`.
+        for shape in (
+            'curl TOKEN=x\\ -u admin:"%s" https://x',
+            "curl TOKEN=x\\ -u admin:'%s' https://x",
+            'DB_PASSWORD=x\\ --password="%s"',
+            'mysql DB_PASSWORD=x\\ -p="%s"',
+            'mysql DB_PASSWORD=x\\ -p"%s"',
+            'curl TOKEN=x\\ --user=admin:"%s" https://x',
+            'curl TOKEN=x\\ -uadmin:"%s" https://x',
+            "DB_PASSWORD=x\\ --password=,%s",
+        ):
+            cmd = shape % "#%!!+~"
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    self.assertNotIn("#%!!+~", _scrub("tool_call", text))
 
     def test_a_bare_user_pass_value_before_a_shell_operator_stays_masked(self):
         # The `user:pass` rule ends its segment at `;`, `|` or `&`, so the
@@ -705,6 +714,10 @@ class TestScrubStepText(unittest.TestCase):
             (
                 "curl -d '{\"password\": \"hunter2\", \"user\": \"bob\"}' TOKEN=x\\ -ua:'\",' https://x",
                 "curl -d '{\"password\": \"" + marker + "\", \"user\": \"bob\"}' TOKEN=" + marker + "'\",' https://x",
+            ),
+            (
+                "python3 -c 'run(\"DB_PASSWORD=abc\") ; run(\"TOKEN=x\\ --password=\")'",
+                "python3 -c 'run(\"DB_PASSWORD=" + marker + "\") ; run(\"TOKEN=" + marker + "\")'",
             ),
             # A shell operator is not a value, and a value ends a word.
             ("TOKEN=x\\ --password && ls", "TOKEN=" + marker + " && ls"),

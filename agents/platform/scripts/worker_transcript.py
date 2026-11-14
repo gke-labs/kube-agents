@@ -132,11 +132,11 @@ SHORT_P_FLAG_WORD_LEN = 2
 REDACTOR_BARE_VALUE_END_RE = re.compile(r"[\s\"',{}\]]|\\[nrt\"/]")
 # The longest text one end of that rule spans, a backslash escape.
 REDACTOR_BARE_VALUE_END_MAX_LEN = 2
-# A word character (a letter, a digit or `_`). The spelling after the
-# redactor's marker is kept only for a value with one outside the ends above:
-# a value made of closing punctuation alone (`",`, `}`, `\n'`) would match
-# what follows other markers in the command.
-VALUE_WORD_CHAR_RE = re.compile(r"\w")
+# Closing punctuation: the ends above, a closing parenthesis and `;`. The
+# spelling after the redactor's marker is kept only for a value with some
+# other character in it: a value made of closing punctuation alone (`",`,
+# `}`, `")`, `\n'`) would match what follows other markers in the command.
+VALUE_CLOSING_PUNCTUATION_RE = re.compile(r"[\s\"',{}\]);]|\\[nrt\"/]")
 # Words a flag rule may read as a value that are shell operators, not
 # values; the after-pipeline mask leaves them alone.
 SHELL_OPERATOR_WORDS = frozenset({"&&", "||", "&", "|", ";"})
@@ -969,7 +969,7 @@ def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[tuple[str, in
         # The redactor's value ends at the first such place in the lead, or
         # where the value starts with one; its marker stands in front of the rest.
         end = REDACTOR_BARE_VALUE_END_RE.search(lead + raw[:REDACTOR_BARE_VALUE_END_MAX_LEN])
-        if end and end.start() <= len(lead) and VALUE_WORD_CHAR_RE.search(REDACTOR_BARE_VALUE_END_RE.sub("", raw)):
+        if end and end.start() <= len(lead) and VALUE_CLOSING_PUNCTUATION_RE.sub("", raw):
             rest = REDACTED_SECRET_MARKER + unfold(lead[end.start() :])
             spellings.append((rest + unfold(raw), len(rest)))
         found.append(tuple(spellings))
