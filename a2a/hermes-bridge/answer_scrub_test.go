@@ -673,6 +673,40 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 }
 
+// A card the task's kanban_create made counts as the task's whatever its
+// title: a create whose title scrubs or shortens to nothing still claims
+// its card's worker deliveries for the set.
+func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-untitled"
+	a.mu.Lock()
+	a.observeWorkerContextLocked(hookDelivery{ToolName: kanbanCreateTool, SessionID: a.sessionID}, json.RawMessage(`{"title":"  "}`), "t_card77")
+	a.mu.Unlock()
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-untitled"}, state: stateRunning}
+	run.act.Store(a)
+	other := newActivityState(false)
+	other.sessionID = "a2a-coord-other"
+	other.waitingCard.Store(true)
+	otherRun := &taskRun{origin: &lib.Envelope{TaskID: "task-other"}, state: stateRunning}
+	otherRun.act.Store(other)
+	runs := []*taskRun{otherRun, run}
+	d := hookDelivery{SessionID: "20990101_120001_worker", Cwd: "/var/lib/hermes/kanban/workspaces/t_card77/repo", ToolName: "terminal"}
+	if got := cardWorkerRun(runs, d); got != run {
+		t.Error("the untitled card's worker was not claimed for the task that filed it")
+	}
+	missed := d
+	missed.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
+	if got := cardWorkerRun(runs, missed); got != nil {
+		t.Error("a card no task filed was claimed")
+	}
+	// Waiting on its cards, the filing task, not another waiting one, takes
+	// the worker's activity.
+	a.waitingCard.Store(true)
+	if got := matchWorkerDeliveryRun(runs, d); got != run {
+		t.Error("the untitled card's worker activity was not attributed to the task that filed it")
+	}
+}
+
 // The pools keep their reserves: shape-caught values leave a Secret value
 // tracked and redacted, and a result holding many of them keeps its newest
 // within its shape allowance; a forged Secret with many values adds at most
@@ -870,6 +904,97 @@ func TestSeenSecrets_RawSecretListItemsAreSecrets(t *testing.T) {
 	c.collectToolResult(terminalResult(t, cut))
 	if !c.has(synthSecretPlain) {
 		t.Error("a raw SecretList cut short: its whole first item's decoded value is not tracked")
+	}
+}
+
+// A raw SecretList whose keys are sorted (jq -S), so its kind comes after
+// its items, still has its items read as Secrets when the text it starts
+// does not parse whole (output after it); a token Secret cut before its type has its
+// namespace left out, since it may be a service-account token's.
+func TestSeenSecrets_JSONKeyOrderDoesNotDecideWhatIsRead(t *testing.T) {
+	sorted := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"data":{"password":%q},"metadata":{"name":"app-db","namespace":"prod"},"type":"Opaque"}],`+
+		`"kind":"SecretList","metadata":{"resourceVersion":"1"}}`, b64(synthSecretPlain))
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, sorted+"\nsecret/app-db listed"))
+	if !s.has(synthSecretPlain) {
+		t.Error("a sorted SecretList's kind-less item was not read as a Secret")
+	}
+
+	list := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"apiVersion":"v1","data":{"password":%q},"kind":"Secret","metadata":{"name":"app-db"},"type":"Opaque"},`+
+		`{"apiVersion":"v1","data":{"ca.crt":%q,"namespace":%q,"token":"c3ludGhldGlj`,
+		b64(synthSecretPlain), b64(synthSecretPlain2), b64(synthSANamespace))
+	var c seenSecrets
+	c.collectToolResult(terminalResult(t, list))
+	if !c.has(synthSecretPlain2) {
+		t.Error("the cut item's whole pairs were not read")
+	}
+	if c.has(synthSANamespace) {
+		t.Error("a Secret cut before its type had its namespace tracked")
+	}
+}
+
+// A comment line inside a YAML list item, at any column, does not end the
+// item: its data block after the comment is still read.
+func TestSeenSecrets_ACommentLineDoesNotEndAYAMLListItem(t *testing.T) {
+	doc := "apiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: Secret\n# the app's database login\n  metadata:\n    name: app-db\n  data:\n    password: " + b64(synthSecretPlain) + "\n"
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, doc))
+	if !s.has(synthSecretPlain) {
+		t.Error("a comment line ended the list item before its data block")
+	}
+}
+
+// A data value with a trailing newline (a file's, echo's) is tracked as
+// its trimmed value's base64 too: an answer re-encoding the value has it.
+func TestSeenSecrets_ATrimmedDataValuesOwnBase64IsTracked(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain + "\n"})))
+	for _, v := range []string{b64(synthSecretPlain + "\n"), synthSecretPlain, b64(synthSecretPlain)} {
+		if !s.has(v) {
+			t.Errorf("%q is not tracked", v)
+		}
+	}
+}
+
+// A JSON tool result's lines are not read as one run of text: a value at
+// a line's end does not run on into the next line, and a key does not take
+// the escape's n, so nothing tracked holds an escaped line break.
+func TestSeenSecrets_RawJSONIsNotReadAsOneLine(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "status: ok\nsvc1_token: "+synthSecretPlain+"\nregion: us-east4\n"))
+	if !s.has(synthSecretPlain) {
+		t.Fatal("the line's own value is not tracked")
+	}
+	for _, v := range s.values() {
+		if strings.Contains(v, `\n`) || strings.Contains(v, "us-east4") {
+			t.Errorf("tracked a run-on value %q", v)
+		}
+	}
+}
+
+// The pairing scan reads JSON in its own key order: an env-like entry
+// whose other keys sort between name and value is still paired, and a long
+// one-line result is scanned in linear time.
+func TestSeenSecrets_JSONPairingKeepsKeyOrderAndScalesLinearly(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"env":[{"name":"DB_PASSWORD","value":"`+synthSecretPlain+`","type":"literal"}],"note":"a\nb"}`))
+	if !s.has(synthSecretPlain) {
+		t.Error("an env entry with a key sorting between name and value was not paired")
+	}
+	var env []map[string]any
+	for i := 0; i < 16000; i++ {
+		env = append(env, map[string]any{"name": fmt.Sprintf("FLAG_%d", i), "value": i%2 == 0})
+	}
+	b, _ := json.Marshal(map[string]any{"env": env})
+	start := time.Now()
+	var big seenSecrets
+	big.collectToolResult(terminalResult(t, string(b)+"\nnote: done"))
+	// Linear is a second or two even under -race; the quadratic scan this
+	// guards against took 7s on a quarter of this input without -race.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line result took %v", len(b), d)
 	}
 }
 

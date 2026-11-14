@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -698,5 +699,115 @@ func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
 	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
 	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
 		t.Errorf("a key/value table leaked: %q", got)
+	}
+}
+
+// A * list bullet is not emphasis: it does not pair with an emphasised
+// label on its line, and a key after markdown line markers (bullets,
+// ordered-list numbers, task boxes, blockquotes) is line-leading, so a
+// passphrase value is redacted whole. Emphasis and plain bullets with no
+// credential stay as written.
+func TestScrubInlineSecretsListBullets(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"* *password*: quietpasture", "* *password*: [redacted]"},
+		{"* The *password* is quietpasture", "* The *password* is [redacted]"},
+		{"  * **Password**: quietpasture", "  * **Password**: [redacted]"},
+		{"* password: correct horse battery staple", "* password: [redacted]"},
+		{"- password: correct horse battery staple", "- password: [redacted]"},
+		{"+ password: correct horse battery staple", "+ password: [redacted]"},
+		{"*\tpassword: correct horse battery staple", "*\tpassword: [redacted]"},
+		{"1. password: correct horse battery staple", "1. password: [redacted]"},
+		{"2) password: correct horse battery staple", "2) password: [redacted]"},
+		{"- [ ] password: correct horse battery staple", "- [ ] password: [redacted]"},
+		{"> - password: correct horse battery staple", "> - password: [redacted]"},
+		{"* * password: correct horse battery staple", "* * password: [redacted]"},
+		{"\t* The *password* is quietpasture", "\t* The *password* is [redacted]"},
+		{"*\tThe *password* is quietpasture", "*\tThe *password* is [redacted]"},
+		{"* item with *emphasis* only", "* item with *emphasis* only"},
+		{"* status: ok, password set", "* status: ok, password set"},
+		{"- note: the password rotation runs nightly", "- note: the password rotation runs nightly"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// An env entry's value is read as YAML reads it: a comment after the name
+// or the value is not part of it, a block value keeps its commas and
+// brackets, a flow mapping still ends a value at , } or ], and a quoted
+// value is tracked as written and with its escapes read.
+func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
+	cases := []struct {
+		in, want string
+		tracked  []string
+	}{
+		{"- name: DB_PASSWORD # rotated\n  value: synth-pass-0001\n", "- name: DB_PASSWORD # rotated\n  value: [redacted]\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # rotated monthly\n", "- name: DB_PASSWORD\n  value: [redacted] # rotated monthly\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth,pass]0001\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth,pass]0001"}},
+		{"env: [{name: A_PASSWORD, value: synth-a-0001}, {name: B_TOKEN, value: synth-b-0001}]", "env: [{name: A_PASSWORD, value: [redacted]}, {name: B_TOKEN, value: [redacted]}]", []string{"synth-a-0001", "synth-b-0001"}},
+		{`{"name": "DB_PASSWORD", "value": "synth\"pass\"0001"}`, `{"name": "DB_PASSWORD", "value": "[redacted]"}`, []string{`synth\"pass\"0001`, `synth"pass"0001`}},
+		{"- name: DB_PASSWORD\n  value: # none\n", "- name: DB_PASSWORD\n  value: # none\n", nil},
+		{"- name: LOG_LEVEL\n  value: debug # verbose\n", "- name: LOG_LEVEL\n  value: debug # verbose\n", nil},
+	}
+	var long strings.Builder
+	long.WriteString("env: [")
+	for i := 0; i < 20000; i++ {
+		fmt.Fprintf(&long, "{name: FLAG_%d, value: %d}, ", i, i)
+	}
+	long.WriteString("]")
+	start := time.Now()
+	scrubEnvNameValuePairs(long.String(), nil)
+	// Linear: about 3s under -race with the whole suite running; the
+	// quadratic scan this guards against took minutes on this input.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line flow list took %v", long.Len(), d)
+	}
+	for _, tc := range cases {
+		var got []string
+		if out := scrubEnvNameValuePairs(tc.in, func(v string) { got = append(got, v) }); out != tc.want {
+			t.Errorf("scrubEnvNameValuePairs(%q)\n got %q\nwant %q", tc.in, out, tc.want)
+		}
+		if strings.Join(got, "\x00") != strings.Join(tc.tracked, "\x00") {
+			t.Errorf("%q: tracked %q, want %q", tc.in, got, tc.tracked)
+		}
+	}
+}
+
+// A table's value cell is read as a value under a key is: an auth-scheme
+// word stays, and a code-spanned value is bounded by its backticks unless
+// only the whole cell reads as a value. Rows are split both with a pipe
+// inside a code span as content and at every pipe, and both splits'
+// spans are redacted, so backticks pairing across cells cannot move a value
+// out from under its header.
+func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"| Key | Value |\n|---|---|\n| api_token | Bearer `synthtoken0001abcd` |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `quietpasture` (rotated) |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` (rotated) |\n"},
+		// The every-pipe split also redacts a fragment, as before: fail
+		// closed, the value itself gone either way.
+		{"| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | quietpasture |\n", "| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | [redacted] | [redacted] |\n"},
+		{"| Key | Value | Notes |\n|---|---|---|\n| password | `synth|pass|0001` | rotated |\n", "| Key | Value | Notes |\n|---|---|---|\n| password | [redacted]` | rotated |\n"},
+		// Backticks pairing across cells merge them under the code-aware
+		// split; the every-pipe split still finds the value's column.
+		{"| Note | Password | Extra |\n|---|---|---|\n| see `x | quietpasture | y` |\n", "| Note | Password | Extra |\n|---|---|---|\n| see `x | [redacted] | y` |\n"},
+		// Two code spans in the cell: not the first alone, the whole cell.
+		{"| Key | Value |\n|---|---|\n| password | `appuser` / `quietpasture0001` |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` |\n"},
+		// A code span that does not read as a value, a value after it:
+		// the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `none` quietpasture0001 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code-spanned value with punctuation and a note glued after it,
+		// under a bare noun (a value must be token-shaped): the whole cell
+		// does not read as a value, the span does.
+		{"| Name | Token |\n|---|---|\n| ci | `abcd1234efgh5678wxyz`, rotated |\n", "| Name | Token |\n|---|---|\n| ci | `[redacted]`, rotated |\n"},
+		// A code span holding only part of the value, text running on
+		// after it: the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `sy`nthpass0001x |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
 	}
 }
