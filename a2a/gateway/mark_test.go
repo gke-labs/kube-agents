@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -400,8 +401,8 @@ func TestMarkExpiredHoldIsToldWithoutAChangingDraw(t *testing.T) {
 func TestMarkArrivalDrawsTheAsksKindAtOnce(t *testing.T) {
 	g, obs := markRig()
 	rec := &SessionRecord{Key: "slack:C1/20.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "20.0"}}}
-	if !g.drawArrivalMark(rec, "h", "<@UBOT> are all my clusters on the latest version?") {
-		t.Fatal("the arrival drew nothing")
+	if drawn, landed := g.drawArrivalMark(rec, "h", "<@UBOT> are all my clusters on the latest version?"); !drawn || !landed {
+		t.Fatalf("the arrival drew %v, landed %v; want both", drawn, landed)
 	}
 	// The executor's first heartbeat carries the same kind: nothing to redraw.
 	g.applyTaskMark(rec, "h", MarkState{Ask: "upgrade"})
@@ -426,11 +427,27 @@ func TestMarkArrivalLeavesAnythingButAFreshAsk(t *testing.T) {
 	}}
 	rec2 := chainRecord()
 	rec3 := &SessionRecord{Key: "slack:C1/40.0", Tasks: []TaskRef{{ID: "n", RootTaskID: "n"}}}
-	if g.drawArrivalMark(rec, "a", "why is checkout slow?") || g.drawArrivalMark(rec2, "h", "x") ||
-		g.drawArrivalMark(rec3, "n", "why?") {
+	drew := func(rec *SessionRecord, id, text string) bool { d, _ := g.drawArrivalMark(rec, id, text); return d }
+	if drew(rec, "a", "why is checkout slow?") || drew(rec2, "h", "x") || drew(rec3, "n", "why?") {
 		t.Fatal("drew on something that is not a fresh ask")
 	}
 	if got := obs.reactionCalls(); len(got) != 0 {
 		t.Errorf("reactions = %v, want none (a held mark, a minting turn, no ask message)", got)
+	}
+}
+
+// refusingReactions is an adapter whose reactions calls fail, as a missing
+// reactions:write scope does.
+type refusingReactions struct{ *fakeAdapter }
+
+func (refusingReactions) React(string, string, string) error { return errors.New("missing_scope") }
+
+// A reaction whose call failed is drawn in the record (the state advances, as
+// for every mark) but has not landed, so it is not counted as a receipt.
+func TestMarkArrivalReportsAReactionThatDidNotLand(t *testing.T) {
+	g := &Gateway{adapter: refusingReactions{newFakeAdapter()}, log: slog.Default(), metrics: NewMetrics()}
+	rec := &SessionRecord{Key: "slack:C1/50.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "50.0"}}}
+	if drawn, landed := g.drawArrivalMark(rec, "h", "what is 2 + 3?"); !drawn || landed {
+		t.Fatalf("drawn %v, landed %v; want drawn and not landed", drawn, landed)
 	}
 }

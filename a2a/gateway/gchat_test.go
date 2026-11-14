@@ -1065,6 +1065,7 @@ func startGchatRigWith(t *testing.T, spawn spawner, allowed []string, allowAll b
 // identically as principal and as backend subject, so the cross-surface
 // audit join holds — and verifiedBy names the mechanism, not the backend.
 func TestGchatTurnCarriesVerifiedEmailPrincipal(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"U1@Example.com"}, false)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "gchat:spaces/S1/threads/T1", Kind: "group",
@@ -1094,6 +1095,7 @@ func TestGchatTurnCarriesVerifiedEmailPrincipal(t *testing.T) {
 // sender's own id in the sender's own conversation is not an oracle; the
 // email is already on the message above the notice.)
 func TestGchatUnlistedSenderDropsVisiblyOnce(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"u1@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T1"
 	for _, id := range []string{"spaces/S1/messages/M1", "spaces/S1/messages/M2"} {
@@ -1122,6 +1124,7 @@ func TestGchatUnlistedSenderDropsVisiblyOnce(t *testing.T) {
 }
 
 func TestGchatAllowAllResolvesAnySender(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "gchat:dm/spaces/D1", Kind: "dm",
@@ -1144,6 +1147,7 @@ func TestGchatAllowAllResolvesAnySender(t *testing.T) {
 // Debug — the gateway's historical behaviour, and the zero value — is pinned
 // by TestReplyRelayAndRollingProgressLine.
 func TestGchatDefaultDisplayModeQuietsProgressNarration(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
 	conv := "gchat:spaces/S1/threads/T2"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M1", Text: "do the thing"}
@@ -1484,6 +1488,7 @@ func TestGchatDMThreadsMatchSlack(t *testing.T) {
 // steers that ask's task, and a second top-level ask starts a task of its
 // own on a separate record.
 func TestGchatDMThreadReplyContinuesTheAsk(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true)
 	a := newTestGchatAdapter(t)
 	classify := func(ev *gchatEvent) InboundMessage {
@@ -1553,6 +1558,7 @@ func TestGchatDMThreadReplyContinuesTheAsk(t *testing.T) {
 // messages.patch, and re-sending the same line per artifact is the
 // rate-limit stampede the relay's coalescing exists to avoid.
 func TestGchatDefaultDisplayModeDoesNotReEditAnUnchangedLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
 	conv := "gchat:spaces/S1/threads/T3"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M2", Text: "do the thing"}
@@ -1604,6 +1610,7 @@ func TestGchatDefaultDisplayModeDoesNotReEditAnUnchangedLine(t *testing.T) {
 // The terminal edit is gated the same way as the rolling line: under default
 // a canceled or failed task ends on its state, not on the last narration.
 func TestGchatDefaultDisplayModeQuietsTheTerminalLineToo(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
 	conv := "gchat:spaces/S1/threads/T4"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M3", Text: "do the thing"}
@@ -1641,6 +1648,7 @@ func TestGchatDefaultDisplayModeQuietsTheTerminalLineToo(t *testing.T) {
 // listed sender. (The principal itself stays case-preserved; see
 // resolvePrincipal.)
 func TestGchatAllowlistFoldsTheAuthorCase(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "gchat:dm/spaces/D5", Kind: "dm", AuthorID: "User@Example.com", MessageID: "spaces/D5/messages/M1", Text: "hello"}
 	origin := r.awaitTask(t, "platform")
@@ -1708,6 +1716,7 @@ func TestGchatAddonSenderEmailFallsBackToChatUser(t *testing.T) {
 // A failed state edit must not be remembered as sent: under default mode
 // every later artifact renders the same line, so the next one is the retry.
 func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
 	conv := "gchat:spaces/S1/threads/T5"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M4", Text: "do the thing"}
@@ -1888,6 +1897,7 @@ func TestGchatRunNamesTheRelayAndTheSubscription(t *testing.T) {
 // TestGchatRunRelogsAChangedSubscription: a proxy restarted onto another
 // subscription while the gateway keeps running is named again, once.
 func TestGchatRunRelogsAChangedSubscription(t *testing.T) {
+	t.Parallel()
 	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/first"}
 	srv := f.start(t)
 	a, logs := newLegibilityAdapter(t, srv.URL)
@@ -1931,6 +1941,7 @@ func TestGchatRunRelogsAChangedSubscription(t *testing.T) {
 // count of events in the interval, zero included, which is how "nothing in
 // the last hour" becomes visible.
 func TestGchatRunLogsTheEventCountEachInterval(t *testing.T) {
+	t.Parallel()
 	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
 	f := &gchatLegibilityRelay{
 		subscription: "projects/p/subscriptions/s",
@@ -2030,6 +2041,7 @@ func TestGchatPullFailureNamesTheSubscriptionAndTheRefusal(t *testing.T) {
 // 503 as well. The gateway has to record it from that answer, or the summary
 // says "not reported" about a subscription every warning just named.
 func TestGchatRefusedPullRecordsTheSubscription(t *testing.T) {
+	t.Parallel()
 	f := &gchatLegibilityRelay{
 		pullStatus: http.StatusServiceUnavailable,
 		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
@@ -2097,6 +2109,7 @@ func gchatSummaries(t *testing.T, out string) []gchatSummaryCounts {
 // every summary window holds at least one pull: the assertion is >0 versus
 // =0, not an exact count, and does not depend on pacing.
 func TestGchatEmptyPullsCountAsEmptyNotFailed(t *testing.T) {
+	t.Parallel()
 	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
 	srv := f.start(t)
 	a, logs := newLegibilityAdapter(t, srv.URL)
@@ -2119,6 +2132,7 @@ func TestGchatEmptyPullsCountAsEmptyNotFailed(t *testing.T) {
 // flip a summary has to show the old kind at zero, which a count carried
 // over from the previous interval never does.
 func TestGchatPullCountsResetEachInterval(t *testing.T) {
+	t.Parallel()
 	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
 	srv := f.start(t)
 	a, logs := newLegibilityAdapter(t, srv.URL)

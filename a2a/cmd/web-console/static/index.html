@@ -3091,8 +3091,11 @@
           >
             <input type="checkbox" id="feedback-include-context" checked />
             Attach environment context: versions, install and upgrade dates,
-            node/namespace/workload counts, skills seen. No names (cluster,
-            project, namespace, workload, user) are included.
+            node/namespace/workload counts, skills seen, and the agent's usage
+            block from the PlatformAgent status: usage counters, proposal
+            origins, top tools, token and spend totals, the enabled chat
+            interfaces and the times the agent and a person were last active. No
+            names (cluster, project, namespace, workload, user) are included.
           </label>
           <div
             class="skill-card"
@@ -6324,7 +6327,12 @@
         }
 
         const u = data.usage || {};
-        if (!u.replicas_read) {
+        // The headline is the operator's totals since install when the
+        // PlatformAgent status carries them (source "platformagent"), which
+        // survive a LiteLLM restart; else the replicas' counters since each
+        // last restarted (source "litellm").
+        const sinceInstall = u.source === "platformagent";
+        if (!sinceInstall && !u.replicas_read) {
           setText("ins-tokens", "Not available", u.error);
           setText("ins-tokens-split", u.error || "", u.error);
           setText("ins-cost", "Not available", u.error);
@@ -6338,13 +6346,27 @@
           setText(
             "ins-cost",
             formatUSD(u.spend_usd),
-            "Estimated by LiteLLM from its price table",
+            sinceInstall
+              ? "Estimated by LiteLLM from its price table; the operator polls it every few minutes and keeps the total across its restarts"
+              : "Estimated by LiteLLM from its price table",
           );
           const partial = u.replicas_read < u.replicas_found;
+          const replicas = u.replicas_found
+            ? `${u.replicas_read} of ${u.replicas_found} replicas`
+            : "no replica read";
+          // The tile clips its note to one line, so the since-install note
+          // keeps the live replica reading in its tooltip.
+          const liveNote = u.live
+            ? `Live LiteLLM reading since its last restart: ${formatCount(u.live.total_tokens)} tokens, ${formatUSD(u.live.spend_usd)} · ${replicas}`
+            : `Live LiteLLM reading: ${replicas}`;
           const note = setText(
             "ins-usage-note",
-            `Since LiteLLM last restarted · ${u.replicas_read} of ${u.replicas_found} replicas`,
-            u.error,
+            sinceInstall
+              ? "Since install, as of the operator's last poll"
+              : `Since LiteLLM last restarted · ${replicas}`,
+            sinceInstall
+              ? [liveNote, u.error].filter(Boolean).join(" · ")
+              : u.error,
           );
           note.classList.toggle("warn", partial);
         }
@@ -8915,7 +8937,7 @@
               : "?";
 
         const lines = [
-          "## Environment (no identifying names; counts, versions and dates only)",
+          "## Environment (no identifying names; counts, versions, dates and usage counters only)",
           "",
         ];
         lines.push("**kube-agents**");
@@ -8937,6 +8959,16 @@
           lines.push(
             `- Model: ${model.name}${model.provider ? ` via ${model.provider}` : ""}`,
           );
+        // The enabled chat interfaces, off status.usage.activeInterfaces as
+        // GET /api/environment copies and sorts it: the gateway's block
+        // prints them in its environment section, so they sit with the
+        // versions here, not in the Agent usage section below.
+        const interfaces =
+          env.usage && env.usage.fields
+            ? env.usage.fields.activeInterfaces
+            : undefined;
+        if (Array.isArray(interfaces))
+          lines.push(`- Chat interfaces: ${interfaces.join(", ") || "none"}`);
         const consoleBuild =
           [
             v.image_tag && `image ${v.image_tag}`,
@@ -8992,6 +9024,25 @@
         const missing = Object.keys(unavailable);
         if (missing.length)
           lines.push(`- Not readable by the console: ${missing.join(", ")}`);
+        // The PlatformAgent's status.usage block as GET /api/environment
+        // renders it: the usage, tools and performance lines of the block
+        // "/feedback summary" prints in chat. Counters, proposal origins, the
+        // broker's tool vocabulary, totals and the two last-active timestamps;
+        // the interface words are the Chat interfaces line above, and the
+        // server copies nothing else off the status.
+        if (
+          env.usage &&
+          Array.isArray(env.usage.lines) &&
+          env.usage.lines.length
+        ) {
+          lines.push("");
+          lines.push(
+            "**Agent usage** (PlatformAgent status: counters, proposal origins, tool vocabulary, totals and last-active times; no names)",
+          );
+          lines.push("```");
+          lines.push(...env.usage.lines);
+          lines.push("```");
+        }
         return lines.join("\n");
       }
 
@@ -9018,7 +9069,18 @@
       function usageStatsMarkdown() {
         const u = (lastInsights && lastInsights.usage) || {};
         const lines = ["## Usage statistics", ""];
-        if (u.replicas_read) {
+        if (u.source === "platformagent") {
+          lines.push(
+            `- Tokens since install (PlatformAgent status, as of the operator's last poll): ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out)`,
+          );
+          lines.push(
+            `- Estimated spend since install (LiteLLM price table, same reading): ${formatUSD(u.spend_usd)}`,
+          );
+          if (u.live && u.replicas_read)
+            lines.push(
+              `- Tokens since LiteLLM last restarted: ${formatCount(u.live.total_tokens)} (${formatCount(u.live.input_tokens)} in / ${formatCount(u.live.output_tokens)} out) across ${u.replicas_read} of ${u.replicas_found} replicas`,
+            );
+        } else if (u.replicas_read) {
           lines.push(
             `- Tokens since LiteLLM last restarted: ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out) across ${u.replicas_read} of ${u.replicas_found} replicas`,
           );

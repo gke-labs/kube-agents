@@ -286,9 +286,14 @@ func dispatcherCeilingCut(agent *agentv1alpha1.PlatformAgent, bound []*agentv1al
 	cfgBase := cfgUsed
 	cut = dispatcherCut{fit: len(bound)}
 	for i, p := range bound {
-		idShare, err := dispatcherIdentityShare(agent, idBase, p)
-		if err != nil {
-			return dispatcherCut{}, err
+		// With bucketed grants the entry is its fixed size, whatever the
+		// profile count (dispatcherMapEntry, #5381), so only the config's
+		// budget cuts, and the identity share isn't measured.
+		idShare := 0
+		if !a2aDispatcherBucketedGrants() {
+			if idShare, err = dispatcherIdentityShare(agent, idBase, p); err != nil {
+				return dispatcherCut{}, err
+			}
 		}
 		if idUsed+idShare > a2aDispatcherProfileBudget {
 			cut.fit, cut.limit = i, dispatcherCeilingLimitIdentity
@@ -395,7 +400,16 @@ func dispatcherCeilingStanding(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // past the ceiling, in which case the dispatcher isn't run. Only meaningful
 // while the dispatcher is switched on.
 func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (condition metav1.Condition, over bool, err error) {
-	entry, n := a2aDispatcherMapEntry(agent, profiles, draining)
+	// The entry the map carries: with bucketed grants, its fixed size, and
+	// the profile count taken without building the unbucketed grant list
+	// that bucketing exists to avoid.
+	var entry a2aAuthMapIdentity
+	var n int
+	if a2aDispatcherBucketedGrants() {
+		entry, n = dispatcherMapEntry(agent, profiles, draining), len(profiles)+len(draining)
+	} else {
+		entry, n = a2aDispatcherMapEntry(agent, profiles, draining)
+	}
 	size, err := a2aAuthMapEntryBytes(entry)
 	if err != nil {
 		return metav1.Condition{}, false, fmt.Errorf("measuring the dispatcher's identity entry: %w", err)

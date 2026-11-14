@@ -195,8 +195,9 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. The Secret write verbs are also probed in the namespace of each
-`PlatformAgent` once the controller has reconciled it. A denial there is learned after startup,
+`Degraded` for another reason. The namespaced write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it, and in its profile namespace once that
+namespace exists. A denial there is learned after startup,
 logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
 the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and

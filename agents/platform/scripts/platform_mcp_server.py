@@ -877,9 +877,10 @@ def send_notification(message: str, session_id: str = "") -> str:
     # token by design and a home channel rendered regardless, which is why it
     # could name Slack on a pod whose CR had turned Slack off (#743). Every other
     # reader of this question already reads the managed scope first. That copy
-    # also appended `chat_notify.routed_platform()` after its environment
-    # fallback; `enabled_chat_platforms` covers the routed platform itself, per
-    # platform rather than as an append, so nothing is lost with the copy.
+    # also appended the routed platform (now `chat_notify.routed_platforms()`)
+    # after its environment fallback; `enabled_chat_platforms` covers each
+    # routed platform itself, per platform rather than as an append, so nothing
+    # is lost with the copy.
     enabled_platforms = enabled_chat_platforms()
     threaded_targets = []
     chat_id = None

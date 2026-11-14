@@ -148,10 +148,11 @@ class ApplierTest(unittest.TestCase):
         # The failure is recorded after the corrupt-board branch has returned.
         self.assertLess(source.index("is_corrupt_board_db_error(exc)"), source.index("record_tick(slug, exc)"))
         # The tick's start comes before connect(), and its end opens the finally block.
-        self.assertLess(source.index("record_tick_start(slug)"), source.index("_kbc().connect(board=slug)"))
+        self.assertLess(source.index("record_tick_start(slug, tick=True)"), source.index("_kbc().connect(board=slug)"))
         self.assertIn("finally:\n            _kage_dispatch_failures.record_tick_end(slug)", source)
-        # The ready probe and auto-decompose mark their per-board connects as tries too.
-        self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_start(slug)"))
+        # The ready probe and auto-decompose mark their per-board connects as tries too, not as ticks.
+        self.assertEqual(1, source.count("_kage_dispatch_failures.record_tick_start(slug, tick=True)"))
+        self.assertEqual(2, source.count("_kage_dispatch_failures.record_tick_start(slug)"))
         self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_end(slug)"))
         compile(source, str(self.dispatcher), "exec")
 
@@ -188,7 +189,7 @@ class PatchedTickTest(unittest.TestCase):
         helper = _module(
             "gateway.kanban_dispatch_failures",
             record_tick=lambda board, exc=None: self.recorded.append((board, type(exc).__name__ if exc else None)),
-            record_tick_start=lambda board: self.recorded.append(("start", board)),
+            record_tick_start=lambda board, tick=False: self.recorded.append(("tick start" if tick else "start", board)),
             record_tick_end=lambda board: self.recorded.append(("end", board)),
         )
         common = _module("gateway.kanban_watchers_common", _board_slugs=None, _positive_int_setting=None, logger=logging.getLogger("dispatcher-under-test"))
@@ -221,13 +222,13 @@ class PatchedTickTest(unittest.TestCase):
     def test_a_good_tick_is_recorded_and_its_result_returned(self):
         self.outcome = "spawned"
         self.assertEqual("spawned", self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([("start", "default"), ("default", None), ("end", "default")], self.recorded)
+        self.assertEqual([("tick start", "default"), ("default", None), ("end", "default")], self.recorded)
 
     def test_a_failed_tick_is_recorded_with_its_class(self):
         self.outcome = OSError("disk I/O error")
         with self.assertLogs("dispatcher-under-test", level=logging.ERROR):
             self.assertIsNone(self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([("start", "default"), ("default", "OSError"), ("end", "default")], self.recorded)
+        self.assertEqual([("tick start", "default"), ("default", "OSError"), ("end", "default")], self.recorded)
 
     def test_the_ready_probe_on_a_locked_board_is_a_try_with_no_failure(self):
         self.outcome = OSError("database is locked")
@@ -244,7 +245,7 @@ class PatchedTickTest(unittest.TestCase):
         self.outcome = ValueError("database disk image is malformed")
         with self.assertLogs("dispatcher-under-test", level=logging.ERROR):
             self.assertIsNone(self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
+        self.assertEqual([("tick start", "default"), ("end", "default")], self.recorded)
 
 
 class HelperTest(unittest.TestCase):
@@ -276,10 +277,53 @@ class HelperTest(unittest.TestCase):
     def test_a_ticks_start_and_end_reach_the_registry(self):
         registry = mock.Mock()
         with self._with_registry(registry):
+            self.helper.record_tick_start("default", tick=True)
             self.helper.record_tick_start("default")
             self.helper.record_tick_end("default")
-        registry.record_dispatch_tick_start.assert_called_once_with("default")
+        self.assertEqual([mock.call("default", tick=True), mock.call("default")], registry.record_dispatch_tick_start.call_args_list)
         registry.record_dispatch_tick_end.assert_called_once_with("default")
+
+    def test_a_lock_failure_reaches_the_registry_marked_as_a_lock(self):
+        registry = mock.Mock()
+        locked = type("OperationalError", (Exception,), {})("database is locked")
+        busy = type("OperationalError", (Exception,), {})("database is busy")
+        other = type("OperationalError", (Exception,), {})("no such table: tasks")
+        with self._with_registry(registry):
+            self.helper.record_tick("default", locked)
+            self.helper.record_tick("default", busy)
+            self.helper.record_tick("default", other)
+            self.helper.record_tick("default", OSError("database is locked"))
+        self.assertEqual(
+            [
+                mock.call("default", "OperationalError", locked=True),
+                mock.call("default", "OperationalError", locked=True),
+                mock.call("default", "OperationalError"),
+                mock.call("default", "OSError"),
+            ],
+            registry.record_dispatch_tick.call_args_list,
+        )
+
+    def test_a_registry_without_the_lock_mark_still_records_the_failure(self):
+        calls = []
+
+        class OldRegistry:
+            def record_dispatch_tick(self, board, error_class):
+                calls.append((board, error_class))
+
+        with self._with_registry(OldRegistry()):
+            self.helper.record_tick("default", type("OperationalError", (Exception,), {})("database is locked"))
+        self.assertEqual([("default", "OperationalError")], calls)
+
+    def test_a_registry_without_the_tick_mark_still_records_the_try(self):
+        calls = []
+
+        class OldRegistry:
+            def record_dispatch_tick_start(self, board):
+                calls.append(board)
+
+        with self._with_registry(OldRegistry()):
+            self.helper.record_tick_start("default", tick=True)
+        self.assertEqual(["default"], calls)
 
     def test_a_gateway_without_the_plugin_records_nothing(self):
         temp = tempfile.TemporaryDirectory()

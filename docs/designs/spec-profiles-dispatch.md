@@ -409,7 +409,8 @@ leave open:
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.
 - **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
-  name each durable and each profile's `.supervisor`. When the config adds a durable or a profile
+  name each durable and each profile's `.supervisor` (with bucketed grants, on its bucket
+  connections). When the config adds a durable or a profile
   the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
   it holds keep running across the reconnect, which drains the old connection so answers it
   had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
@@ -444,6 +445,10 @@ leave open:
   drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
   ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
   target.
+  `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves the dispatcher's per-profile grants
+  out of the identity map and onto per-bucket connections the callout derives
+  (spec-nats-deployment.md); a dispatcher that doesn't open them loses every profile grant, so
+  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the dispatcher's entry is a fixed size whatever the profile count, so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
@@ -589,7 +594,8 @@ The build PRs amend these; this list is what they must cover.
   by the install-wide profile ceiling: while both exist, the ceiling defaults to
   `maxInProgress`'s value so an install's footprint doesn't jump, and `maxInProgress` is
   deprecated once `platform` is off kanban.
-- **Callout narrowing** (`profile_narrowing.go`) and the CRD's identity rendering: one
+- **Callout narrowing** (`profile_narrowing.go`; the dispatcher's bucket connections in
+  `dispatcher_narrowing.go` and `a2a/lib/dispatchgrants.go`) and the CRD's identity rendering: one
   ServiceAccount and identity-map entry per (profile, tier); workers get no fetch grant on the
   shared durables and no verifier grant; the dispatcher gets both.
 

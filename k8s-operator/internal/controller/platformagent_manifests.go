@@ -60,8 +60,13 @@ const (
 	// agent use on kind.
 	inClusterContextName = "in-cluster"
 	// inClusterAPIServer is the in-cluster API server address; its certificate
-	// carries this name, so no IP has to be read at render time.
-	inClusterAPIServer = "https://kubernetes.default.svc"
+	// carries this name, so no IP has to be read at render time. The full
+	// name, because the pods that dial it run with ndots:2
+	// (publicAPICallerPodNdots), where the 2-dot kubernetes.default.svc would
+	// be asked of the upstream resolver before the search list resolves it.
+	// It needs the cluster.local DNS domain, as the Service URLs the operator
+	// renders already do.
+	inClusterAPIServer = "https://kubernetes.default.svc.cluster.local"
 
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
@@ -3588,6 +3593,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The kube-api proxy's URL, under a name nothing in this container acts on,
+	// so no shim or kubectl behaviour here changes. The scripts here that hop
+	// into the shell sandbox for a get-credentials (stall_watch,
+	// platform_mcp_server) read it to know the sandbox's shim writes a kube-proxy
+	// kubeconfig, which the sandbox always does (buildShellSandboxStatefulSet sets
+	// KUBE_PROXY_URL there), and so skip choosing endpoint flags that would not
+	// reach it (gke_endpoint.KUBE_PROXY_ENVS). When the shim cannot answer and the
+	// broker runs the fetch, the broker decides the endpoint for a fetch that
+	// names none (credential_proxy's _decision_for_callers_fetch).
+	envVars = append(envVars, corev1.EnvVar{Name: kubeProxyInUseURLEnv, Value: kubeProxyURL(agent)})
 	// Unconditional and in both modes, unlike the chat relay URLs: the remote
 	// MCP servers are in every profile that runs here, and mcp-remote presents
 	// the token above to reach them. A plugin cannot redirect it; the operator
@@ -3946,6 +3961,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
+			// ndots:3, see brokerCallerPodDNSConfig: the relay clients here
+			// dial the broker by its 4-dot Service name.
+			DNSConfig: brokerCallerPodDNSConfig(),
 			// No ShareProcessNamespace, and under mode: next the field is
 			// load-bearing rather than a default. The agent container holds
 			// the A2A bus credential — since A5 not as NATS_PASSWORD in its
