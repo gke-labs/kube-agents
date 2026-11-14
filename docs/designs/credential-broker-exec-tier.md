@@ -191,11 +191,11 @@ Two route groups need the single pod: the chat relays' event, ack and nack route
 workspace's handles were a third group; the content workspace is retired (#4243). The rest
 stay on it as a first step, not because they keep state:
 
-- **The A2A Google Chat relay stays a broker route in `next` mode.** With Chat on, the install's
+- **The A2A Google Chat relay stays a broker route.** With Chat on, the install's
   subscription goes to the broker's A2A relay instance, and the legacy instance is not built
   (`platformagent_manifests.go:4587-4597`). The consumer moved to the A2A gateway; the Pub/Sub pull
-  and its receipt map did not. So the stateful pod stays in both modes.
-- **Slack leaves the broker only in `next` mode with Slack on and Chat off**
+  and its receipt map did not. So the stateful pod stays with Chat on or off.
+- **Slack leaves the broker only with Slack on and Chat off**
   (`a2aSlackArmed`, `platformagent_a2a_manifests.go:1398-1399`). With both on, Slack stays on the
   broker's relay.
 - **The watchers keep no broker state.** The event watcher and the drift detector run in the
@@ -758,7 +758,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
 | Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 10, slot cap 8)                                    | No burst above the requests                                                               | Not yet                                                                                                             |
-| Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
+| Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Dropped: `spec.mode: today` went on 2026-11-12, and every install runs the A2A stack                                |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |
 
@@ -788,7 +788,7 @@ What they mean for this design:
 - **Interactive bursts meet the agent's 10 run slots first** (#3724), as §2.3 said.
 - **Memory is not a limit at these sizes:** at most 775 MiB of 2 GiB.
 
-Not measured yet: 16 and 32 clusters, Autopilot, `spec.mode: today`, the exec tier itself, and the
+Not measured yet: 16 and 32 clusters, Autopilot, the exec tier itself, and the
 peak slots in use (the 2026-10-28 cluster stored no series for the gauge).
 
 ### 8.4 Footprint at 250 / 1,000 / 2,500 clusters

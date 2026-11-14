@@ -1,10 +1,11 @@
 # `/feedback`: file a kube-agents report from chat
 
 > **STATUS — design of record; implemented.** Written 2026-10-19 with the change that built it.
-> The behaviour it designs works under `spec.mode: next`, where a chat message reaches the
+> The behaviour it designs works where a chat message reaches the
 > A2A gateway and the bridge runs it as a Planning Agent turn
-> ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)), and under `today` for a message
-> that reaches the Planning Agent as text. The form it files to is
+> ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)), and for a message
+> that reaches the Planning Agent as text through a Hermes chat platform (Slack, on an
+> install that also has Google Chat enabled). The form it files to is
 > [`scripts/feedback_form/README.md`](../../scripts/feedback_form/README.md). An earlier
 > attempt at the agent half, gke-labs/kube-agents#1415, was closed unmerged; its persona text,
 > filing script and tests are reused here.
@@ -14,10 +15,10 @@
 A person using a running install finds a problem with kube-agents itself and wants to
 report it without leaving the chat. Today the personas tell them where reports go (the
 tracker, and the public feedback form for an account that cannot open an issue), and
-nothing more. A typed `/feedback` gets "Unknown command" from the Hermes gateway under
-`today` and, under `next`, a model's guess at what the person meant.
+nothing more. A typed `/feedback` gets "Unknown command" from a Hermes chat
+platform and, through the A2A gateway, a model's guess at what the person meant.
 
-After this change, under `next`:
+After this change, through the A2A gateway:
 
 - `/feedback` on its own tells the person where reports go and how to have one filed.
 - `/feedback <text>` has the Planning Agent write the exact report, show it, and, once the
@@ -42,11 +43,11 @@ After this change, under `next`:
 
 ## Non-goals
 
-- **The Hermes chat gateway's slash parsing under `today`.** It answers an unknown slash with
+- **The Hermes chat gateway's slash parsing.** It answers an unknown slash with
   "Unknown command", and this change adds no `legacy_slash_commands` rewrite for `/feedback`.
-  Everything else here is mode-agnostic: an ask in words ("file this for me") takes the same
-  path in either mode, and the bench harness's api transport reaches the Planning Agent
-  without that gateway, so one case grades both lanes.
+  Everything else here is the same on both paths: an ask in words ("file this for me") takes the same
+  path on either, and the bench harness's api transport reaches the Planning Agent
+  without that gateway, so one case grades both.
 - **The session route.** A conversation on `/session` is answered by the session persona.
   The gateway's bare `/feedback` answer is the same on every route; `/feedback <text>` there
   is an ordinary turn.
@@ -55,7 +56,7 @@ After this change, under `next`:
 - **Filing to GitHub directly.** The form needs no credential and works when the install's
   GitHub credential path is degraded. The tracker is read, unauthenticated, to find the
   filed issue; it is never written.
-- **Rating an answer.** 👍/👎 on a next-mode answer is gke-labs/kube-agents#3423.
+- **Rating an answer.** 👍/👎 on a gateway answer is gke-labs/kube-agents#3423.
 
 ## Anti-goals
 
@@ -71,7 +72,7 @@ After this change, under `next`:
 - The gateway resolves a slash command before status, stop and steer, and it owns one today
   (`/session`). A second one follows the same shape: `a2a/lib/chattext`, the chat message
   validator's `IsCommand`, and the chatops page's command table all read one definition.
-- Under `next` the bridge's `api` executor runs a platform-routed task as a turn under the
+- The bridge's `api` executor runs a platform-routed task as a turn under the
   Hermes `default` profile, the Planning Agent (`a2a/hermes-bridge/api.go`; the Platform Agent
   only under the experimental `platformFrontDoor`). Every task of one conversation is a turn
   in one Hermes session, so a question asked in one turn is in context when the answer
@@ -148,8 +149,8 @@ reworded: `/feedback <text>`, and any ask in words to file a kube-agents report,
 5. The worker reports the skill's status in the card result: the issue URL on `SUBMITTED` or
    `ALREADY_SUBMITTED`; on `BLOCKED` or `UNCONFIRMED`, that nothing was filed (or that the
    filing is unconfirmed), the composed text, and the two links the status line carries.
-   Under `next` the result posts into the thread through the gateway's relay; under `today`
-   the front door relays it.
+   Through the A2A gateway the result posts into the thread through the gateway's relay; on a
+   Hermes chat platform the front door relays it.
 
 Under `platformFrontDoor` the Platform Agent faces the person and does both halves; the
 bullets are written so that whoever faces the person composes and confirms, and whoever

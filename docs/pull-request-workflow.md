@@ -825,8 +825,8 @@ request. The sweep puts it back once after the first such removal since the last
 one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
 fresh green. `/retest` is fine: it reruns only failed contexts.
 
-No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
-changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
+No verdict carries across a change to what the job grades. When the blocking job's install or
+transport changes in `oss-test-infra`, set the repository
 variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
 timeout (a run in flight at the change reports afterwards). `Smoke gate` then stays pending on a
 green whose build first reported before that time, until a run from after it replaces it, and its
