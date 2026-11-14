@@ -4303,6 +4303,9 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; printf ', 1),
         (_INSTALLER_COMMON, 'PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values ', 1),
         (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
+        (_INSTALLER_COMMON, 'constraint="$(trap - ERR; _scope_policy_denying_asset_api ', 1),
+        (_INSTALLER_COMMON, 'reason="$(trap - ERR; _scope_container_can_set_iam ', 6),
+        (_INSTALLER_COMMON, 'token="$(trap - ERR; _scope_terraform_access_token)"', 2),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
