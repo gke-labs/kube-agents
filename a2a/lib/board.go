@@ -57,6 +57,12 @@ type BoardCluster struct {
 	// (the findings queue's critical, major or minor) and title; empty with no findings.
 	Severity string `json:"severity,omitempty"`
 	Top      string `json:"top,omitempty"`
+	// Unlisted marks a row that stands for projects whose clusters the sender
+	// holds no list for (under spec.mode: next, the projects listed live and
+	// the unread ones; the Name says which). It has no findings because
+	// nothing read it, so it is never drawn as a healthy cluster. Absent from
+	// an older sender and from every real cluster row.
+	Unlisted bool `json:"unlisted,omitempty"`
 }
 
 // BoardCard is one card in flight.

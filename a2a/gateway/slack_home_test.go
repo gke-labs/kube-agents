@@ -349,6 +349,27 @@ func TestSlackHomeBeforeTheFirstReportIsNotAHealthyFleet(t *testing.T) {
 	}
 }
 
+func TestSlackHomeAnUnlistedRowIsNeverDrawnHealthy(t *testing.T) {
+	// A row for projects whose clusters the board holds no list for (#3658,
+	// spec.mode: next) has no findings because nobody read it: never green,
+	// before or after the first report. A real clean cluster stays green.
+	for _, pending := range []bool{false, true} {
+		for _, name := range []string{"mgmt (clusters not listed here)", "member-b (clusters unread)"} {
+			line := clusterLine(lib.BoardCluster{Name: name, Unlisted: true}, pending)
+			if strings.Contains(line, slackHomeHealthy) || strings.Contains(line, slackHomeNoFindings) {
+				t.Errorf("unlisted row drawn healthy (pending=%v): %q", pending, line)
+			}
+			want := slackHomeNeutral + " *" + slackEscaper.Replace(name) + "*  " + slackHomeUnlisted
+			if line != want {
+				t.Errorf("clusterLine = %q, want %q", line, want)
+			}
+		}
+	}
+	if got, want := clusterLine(lib.BoardCluster{Name: "web"}, false), slackHomeHealthy+" *web*  "+slackHomeNoFindings; got != want {
+		t.Errorf("a clean cluster = %q, want %q", got, want)
+	}
+}
+
 func TestSlackHomeCachesTheBoardAcrossOpens(t *testing.T) {
 	a, api, reads := homeAdapter(t, homeBoardFixture(), nil)
 	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})

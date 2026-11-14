@@ -411,6 +411,18 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         names = [c["name"] for c in self.snap()["clusters"]]
         self.assertEqual(names, ["db", "mgmt (clusters not listed here)", "member-b (clusters unread)", "web"])
 
+    def test_only_the_unlisted_rows_carry_the_flag(self):
+        # The gateway draws an unlisted row neutral, never "no open findings"
+        # in green (a2a/lib/board.go, BoardCluster.Unlisted); a real cluster
+        # row leaves the field out, so its bytes are as before.
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        })
+        rows = {r["name"]: r for r in self.snap()["clusters"]}
+        self.assertIs(rows["mgmt (clusters not listed here)"]["unlisted"], True)
+        self.assertIs(rows["member-b (clusters unread)"]["unlisted"], True)
+        self.assertEqual(rows["web"], {"name": "web", "findings": 0})
+
     def test_a_running_card_on_a_clusters_profile_still_names_its_cluster(self):
         # Until routing moves to the cluster profile, a card may still be
         # assigned to the per-cluster profile name, derived from the scope's

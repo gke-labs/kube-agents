@@ -98,6 +98,11 @@ const (
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
 
+	// slackHomeUnlisted follows an unlisted row's name, which already says
+	// whether its clusters were not listed here or unread; what both kinds
+	// share is that nothing vouches for their health.
+	slackHomeUnlisted = "health unknown"
+
 	// slackHomeFeedbackWeek is the answer ratings line, over the last
 	// slackHomeFeedbackWindow, drawn when answer feedback is on.
 	slackHomeFeedbackWeek   = "This week: %d 👍, %d 👎"
@@ -565,9 +570,13 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 
 // clusterLine is one cluster: a dot for its worst open finding, its name,
 // that finding's title and how many more there are. Before the first report,
-// no finding means not checked yet, so it is not drawn green.
+// no finding means not checked yet, so it is not drawn green; nor is a row
+// for projects whose clusters the board holds no list for (Unlisted).
 func clusterLine(c lib.BoardCluster, firstReportPending bool) string {
 	name := "*" + slackEscaper.Replace(c.Name) + "*"
+	if c.Unlisted {
+		return slackHomeNeutral + " " + name + "  " + slackHomeUnlisted
+	}
 	if c.Findings == 0 && firstReportPending {
 		return slackHomeNeutral + " " + name + "  " + slackHomeNotYet
 	}

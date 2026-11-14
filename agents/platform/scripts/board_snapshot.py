@@ -84,7 +84,8 @@ CONFIG_NAME = "config.yaml"
 IDENTITY_KEY = "cluster_identity"
 # Under spec.mode: next, the rows for the projects the resolved scope holds no
 # cluster list for. The wire shape has no field for "not listed" (a2a/lib/board.go),
-# so the row's name says it; each kind is one row, naming the first few projects.
+# so the row's name says it; each kind is one row, naming the first few projects,
+# and carries `unlisted`, which the gateway draws neutral rather than healthy.
 LIVE_ROW = "{projects} (clusters not listed here)"
 UNREAD_ROW = "{projects} (clusters unread)"
 UNLISTED_NAMED_MAX = 3
@@ -198,7 +199,7 @@ def unlisted_rows(scope: fleet_scope_targets.ScopeClusters) -> list[dict]:
         if e.status == fleet_scope_targets.STATUS_UNREAD
     ]
     return [
-        {"name": template.format(projects=_named(projects)), "findings": 0}
+        {"name": template.format(projects=_named(projects)), "findings": 0, "unlisted": True}
         for projects, template in ((live, LIVE_ROW), (unread, UNREAD_ROW))
         if projects
     ]
