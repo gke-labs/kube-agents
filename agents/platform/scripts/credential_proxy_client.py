@@ -275,6 +275,18 @@ KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 # so any later edit to the file, or a new proxy URL, CA file or token file, runs the merge once more.
 REGISTERED_MARKER_NAME = ".{name}.contexts-registered"
 REGISTERED_MARKER_ENV_SEPARATOR = "\n"
+# The merge's lock beside a kubeconfig `<dir>/<name>`. sandbox-entrypoint removes the default
+# kubeconfig's at pod start (KUBECONFIG_LOCK_NAME in deploy/sandbox/entrypoint.sh).
+KUBECONFIG_LOCK_NAME = ".{name}.lock"
+KUBECONFIG_LOCK_MODE = 0o600
+# What the kubeconfig's owner is told when the lock cannot be opened. The merge needs the lock, so
+# the file is not read: a context that is missing from it stays missing, and kubectl then says the
+# context does not exist. The owner note is left out when the lock is not there to ask.
+KUBECONFIG_LOCK_UNOPENABLE_NOTICE = (
+    "credential proxy: cannot open the kubeconfig lock {lock}{owner}: {reason}; "
+    "context {context} was not checked or registered in {kubeconfig}"
+)
+KUBECONFIG_LOCK_OWNER_NOTE = " (owned by uid {uid})"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -1181,6 +1193,22 @@ def _record_registered_context(
     _replace_file(marker, "\n".join([*kept, f"{context} {file_digest} {env_digest}"]) + "\n")
 
 
+def _report_unopenable_lock(lock_path: Path, kubeconfig: Path, context: str, reason: OSError) -> None:
+    """Say that the kubeconfig's owner could not open its lock. Before the owner check came first
+    in the merge, a root `kubectl --context` left a lock the agent user could not open, and the
+    merge returned without a word."""
+    try:
+        owner = KUBECONFIG_LOCK_OWNER_NOTE.format(uid=lock_path.lstat().st_uid)
+    except OSError:
+        owner = ""
+    print(
+        KUBECONFIG_LOCK_UNOPENABLE_NOTICE.format(
+            lock=lock_path, owner=owner, reason=reason.strerror or reason, context=context, kubeconfig=kubeconfig
+        ),
+        file=sys.stderr,
+    )
+
+
 def _merge_context_into_kubeconfig_file(
     path: Path,
     context: str,
@@ -1208,10 +1236,19 @@ def _merge_context_into_kubeconfig_file(
                 ),
             )
             return
-        lock_path = path.with_name(f".{path.name}.lock")
-        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        lock_fd = os.open(lock_path, lock_flags, 0o600)
+        # Only the kubeconfig's owner can change it (the check under the lock, below, says so
+        # again), so only the owner makes the lock: one that root made is one the owner cannot open.
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            return
     except OSError:
+        return
+    lock_path = path.with_name(KUBECONFIG_LOCK_NAME.format(name=path.name))
+    lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, lock_flags, KUBECONFIG_LOCK_MODE)
+    except OSError as exc:
+        _report_unopenable_lock(lock_path, path, context, exc)
         return
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
