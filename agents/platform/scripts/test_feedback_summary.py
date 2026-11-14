@@ -29,7 +29,7 @@ CR = {
         "creationTimestamp": "2026-10-01T12:00:00Z",
     },
     "spec": {
-        "mode": "today",
+        "mode": "next",
         "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1", "memory": {"memoryEnabled": "false", "provider": "multiuser_memory"}},
         "scope": {"projects": ["acme-scope-dev"], "exclude": {"clusters": ["old-cluster"]}},
         "integration": {"gitops": {"repository": "acme/gitops"}},
@@ -205,7 +205,7 @@ class RenderTest(unittest.TestCase):
         # The full fixture fills the block: a new line moves the cap with it.
         self.assertEqual(len(lines), fs.SUMMARY_MAX_LINES)
         self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
-        self.assertIn("mode: today", text)
+        self.assertIn("mode: next", text)
         self.assertIn(f"version: {TAG}", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
         self.assertIn("kubernetes: v1.33.4-gke.1234000", text)
@@ -249,7 +249,7 @@ class RenderTest(unittest.TestCase):
 
     def test_audit_matches_whole_tokens_only(self):
         text = fs.render(full_snapshot())
-        self.assertEqual(fs.audit(text, ["kube-agents", "today", "usage", "0.14"]), [])
+        self.assertEqual(fs.audit(text, ["kube-agents", "next", "usage", "0.14"]), [])
         self.assertEqual(fs.audit("version: 0.14.0-rc", ["0.14.0"]), [])
         self.assertEqual(fs.audit("cluster prod-eu-1 here", ["prod-eu-1"]), ["prod-eu-1"])
 
@@ -258,12 +258,12 @@ class RenderTest(unittest.TestCase):
         for expected in (CLUSTER, PROJECT, NAMESPACE, "us-central1", "acme-scope-dev", "old-cluster", "acme/gitops", "platform-agent"):
             self.assertIn(expected, ids)
         self.assertNotIn(TAG, ids)
-        self.assertNotIn("today", ids)
+        self.assertNotIn("next", ids)
 
     def test_a_namespace_named_kube_agents_is_not_a_leak(self):
         cr = json.loads(json.dumps(CR))
         cr["metadata"]["namespace"] = "kube-agents"
-        cr["spec"]["harness"]["clusterName"] = "today"
+        cr["spec"]["harness"]["clusterName"] = "next"
         snapshot = full_snapshot(cr=cr)
         self.assertEqual(fs.audit(fs.render(snapshot), snapshot.identifiers), [])
 
@@ -495,13 +495,19 @@ class RenderTest(unittest.TestCase):
             [f"proposalsFrom{origin}" for origin in ("Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other")],
         )
 
-    def test_next_mode_and_interfaces_are_printed_as_enums(self):
+    def test_the_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
-        cr["spec"]["mode"] = "next"
         cr["status"]["usage"]["activeInterfaces"] = ["slack", "googlechat"]
         text = fs.render(full_snapshot(cr=cr))
         self.assertIn("mode: next", text)
         self.assertIn("interfaces: googlechat, slack", text)
+
+    def test_an_absent_mode_prints_next(self):
+        # The deprecated field defaults to `next` in the CRD; a CR read before
+        # the default applied prints the same.
+        cr = json.loads(json.dumps(CR))
+        del cr["spec"]["mode"]
+        self.assertIn("mode: next", fs.render(full_snapshot(cr=cr)))
 
 
 class ParsingTest(unittest.TestCase):
@@ -864,7 +870,7 @@ class MainTest(unittest.TestCase):
         self.assertIn(f"hosted_vllm/{CLUSTER}/llama-8b", out.getvalue())
 
     def test_the_audit_skips_the_model_line_and_nothing_else(self):
-        text = f"```\n  mode: today\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        text = f"```\n  mode: next\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
         stripped = fs._without_fixed_lines(text)
         self.assertNotIn("model:", stripped)
         self.assertIn(f"  kubernetes: {CLUSTER}", stripped)

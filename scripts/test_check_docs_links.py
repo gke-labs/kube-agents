@@ -1113,7 +1113,7 @@ class RealRepoTest(unittest.TestCase):
         )
         chatops = REPO / SITE / "concepts/chatops.md"
         self.assertIn(cdl.SITE_TITLE_ANCHOR, cdl.page_anchors(chatops, site=True))
-        self.assertIn("what-carries-over-from-today", cdl.page_anchors(chatops))
+        self.assertIn("what-the-gateway-changes-on-slack", cdl.page_anchors(chatops))
 
     def test_this_module_contains_no_literal_citation(self) -> None:
         """The guard behind the module docstring: a literal here would fail docs-check."""

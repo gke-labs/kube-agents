@@ -32,8 +32,8 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   anything is left below the headline.
 
 A finished answer that ends by asking which of its options to take gets the same
-option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
-and ``chat_message.answer_message`` under next. One that declares its next step on a last
+option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` on the Hermes
+Slack adapter and ``chat_message.answer_message`` through the gateway. One that declares its next step on a last
 line of its own (:func:`next_step`) gets that step as its one choice button instead.
 
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it

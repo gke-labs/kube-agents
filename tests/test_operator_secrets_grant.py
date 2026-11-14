@@ -22,7 +22,7 @@ two documents of `role.yaml` by what they do:
   verbs on a managed `ClusterRole`.
 - `ensureKubeProxyTLSSecret` needs `create` and `update` to manage the
   `<agent>-kube-proxy-tls` Secret on every install.
-- The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
+- The A2A render needs `create`/`update`/`patch`/`delete`. The
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
   `today`; all of them are owner-referenced to the `PlatformAgent`.
@@ -44,7 +44,7 @@ Every other namespaced kind the operator renders is split the same way
 ClusterRole for the informers and for escalation prevention, the writes are the
 Role document, and the Role document names exactly that set. The Role is bound
 in the install namespace on both delivery paths and in the profile namespace
-(`<install namespace>-profiles`) as well: by the chart under `mode: next`, and
+(`<install namespace>-profiles`) as well: by the chart on every install, and
 by `k8s-operator/config/profiles` on the kustomize path, whose `role.yaml` is a
 copy of the Role document that `make chart-sync` writes and this file holds to
 the source.
@@ -118,12 +118,11 @@ SECRETS_MISCONFIG_ID = "KSV-0041"
 INSTALL_NAMESPACE = "kubeagents-system"
 KUSTOMIZE_DEFAULT_DIR = REPO_ROOT / "k8s-operator" / "config" / "default"
 # The profile namespace and the kustomization that renders the Role copy there;
-# the chart renders the same under mode next.
+# the chart renders the same on every install.
 PROFILE_NAMESPACE_SUFFIX = "-profiles"
 PROFILE_NAMESPACE = INSTALL_NAMESPACE + PROFILE_NAMESPACE_SUFFIX
 KUSTOMIZE_PROFILES_DIR = REPO_ROOT / "k8s-operator" / "config" / "profiles"
 PROFILE_ROLE_COPY = KUSTOMIZE_PROFILES_DIR / "role.yaml"
-HELM_MODE_NEXT_SETS = ["--set", "platformAgent.mode=next"]
 # Every namespaced kind the operator renders, as (apiGroup, resource). The Role
 # document names exactly this set and the ClusterRole grants no write verb on
 # any of it; every kind's reads stay in the ClusterRole (the informers,
@@ -422,21 +421,26 @@ class OperatorSecretsGrantTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_to_the_operator_on_both_delivery_paths(self):
-        # The Role's verbs are pinned above; this pins that something binds it,
-        # in the install namespace alone on a stock render.
-        for path, documents in (("helm", _render_helm()), ("kustomize", _render_kustomize())):
+        # The Role's verbs are pinned above; this pins that something binds it.
+        # A stock chart render creates the profile namespace and binds the Role
+        # there too; the kustomize default directory covers the install
+        # namespace alone (config/profiles adds the other, below).
+        for path, documents, namespaces in (
+            ("helm", _render_helm(), {INSTALL_NAMESPACE, PROFILE_NAMESPACE}),
+            ("kustomize", _render_kustomize(), {INSTALL_NAMESPACE}),
+        ):
             with self.subTest(path=path):
-                self._assert_role_bound_in(path, documents, {INSTALL_NAMESPACE})
+                self._assert_role_bound_in(path, documents, namespaces)
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_in_the_profile_namespace_too(self):
-        # Under mode next the chart creates the profile namespace and renders
+        # The chart creates the profile namespace on every install and renders
         # the Role and its binding there as well; the kustomize path's
         # config/profiles does the same beside config/default. The subject is
         # still the operator's ServiceAccount in the install namespace.
         both = {INSTALL_NAMESPACE, PROFILE_NAMESPACE}
         for path, documents in (
-            ("helm", _render_helm(*HELM_MODE_NEXT_SETS)),
+            ("helm", _render_helm()),
             ("kustomize", _render_kustomize(KUSTOMIZE_DEFAULT_DIR, KUSTOMIZE_PROFILES_DIR)),
         ):
             with self.subTest(path=path):

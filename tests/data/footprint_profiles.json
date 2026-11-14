@@ -108,8 +108,7 @@
         "platformAgent.harness.memory.provider=kube_agents_memory",
         "platformAgent.harness.hermes.dashboardEnabled=false",
         "webConsole.enabled=true",
-        "githubMinter.enabled=true",
-        "platformAgent.mode=next"
+        "githubMinter.enabled=true"
       ],
       "autopilot": true,
       "requirements": {
@@ -139,8 +138,7 @@
         "platformAgent.harness.memory.provider=kube_agents_memory",
         "platformAgent.harness.hermes.dashboardEnabled=false",
         "webConsole.enabled=true",
-        "githubMinter.enabled=true",
-        "platformAgent.mode=next"
+        "githubMinter.enabled=true"
       ],
       "autopilot": false,
       "requirements": {

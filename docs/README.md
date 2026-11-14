@@ -295,7 +295,7 @@ identifier appears, add its source here.
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |
 | RBAC bindings and KSA defaults laid down per agent | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | `app.kubernetes.io/*` label values on installed objects | `k8s-operator/internal/controller/manifest_helpers.go`, each `kustomization.yaml`, and `a2a/gateway/spawn.go` (gateway-spawned session pods) |
-| The retired mode switch's managed key (`KUBEAGENTS_MODE`, pinned to `next` until no supported agent image predates the removal, so an older image reads the right value) | `k8s-operator/internal/controller/platformagent_manifests.go` (writer); `agents/platform/scripts/runtime_mode.py` (reader, which gates the entrypoint's A2A overlay) |
+| The retired mode switch's managed key (`KUBEAGENTS_MODE`, pinned to `next` until no supported agent image predates the removal, so an older image reads the right value) | `k8s-operator/internal/controller/platformagent_manifests.go` (writer); the agent image has no reader left |
 | Controller permissions | `k8s-operator/config/rbac/` |
 | The operator RBAC self-check: the `RBACIncomplete` reason, its re-check interval and condition message; the floating tags `make deploy` refuses and `ALLOW_MUTABLE_IMG` | `k8s-operator/internal/controller/rbac_selfcheck.go`; `k8s-operator/Makefile` |
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
@@ -367,7 +367,7 @@ identifier appears, add its source here.
 | Memory bank name, scope-tag spelling, and provider name | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py` |
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
-| Gateway rollout budgets: `StartupProbe` (`agentAPIProbe`), `gatewayProgressDeadlineSeconds`, and the rollout gates in `upgrade.sh` and `scripts/release/wait_for_gke_readiness.sh` (`GATEWAY_READINESS_TIMEOUT`) | `k8s-operator/internal/controller/platformagent_manifests.go`, `upgrade.sh`, `scripts/release/wait_for_gke_readiness.sh`, and `scripts/release/platform_agent_mode.sh` (`PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS`), held in order by `tests/test_gateway_rollout_budgets.py` |
+| Gateway rollout budgets: `StartupProbe` (`agentAPIProbe`), `gatewayProgressDeadlineSeconds`, and the rollout gates in `upgrade.sh` and `scripts/release/wait_for_gke_readiness.sh` (`GATEWAY_READINESS_TIMEOUT`) | `k8s-operator/internal/controller/platformagent_manifests.go`, `upgrade.sh`, `scripts/release/wait_for_gke_readiness.sh`, and `scripts/release/a2a_readiness.sh` (`A2A_READINESS_GATE_TIMEOUT_SECONDS`), held in order by `tests/test_gateway_rollout_budgets.py` |
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, install-configuration keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |

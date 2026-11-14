@@ -6,12 +6,15 @@ a post made with a user token through an app to that app (bot_id), which the A2A
 drops as bot traffic unless the install lists the test user in A2A_SLACK_TEST_USERS (the
 chart's operator.slackTestUsers); a preflight reads the posted ask back and fails at
 once, naming that, when the install does not. The test polls the thread, fails at once
-when the bot's first reply is a refusal or a not-started notice, or on next when the turn
-fails (quoting it), and asserts an answer saying 5 arrived in time and, on next, that it
-opens on a bold headline; it records Slack's timestamps for each leg.
+when the bot's first reply is a refusal or a not-started notice, or, when the A2A
+gateway holds Slack, when the turn fails (quoting it), and asserts an answer saying 5
+arrived in time and, on the gateway, that it opens on a bold headline; it records
+Slack's timestamps for each leg.
 
-The bot's reaction on the ask is asserted in both modes: today's Slack adapter and next's
-A2A gateway each draw it the moment they accept the ask, and take it off once the answer
+Two paths serve Slack. The A2A gateway holds it unless Google Chat is enabled beside
+it, in which case Slack stays on the Hermes Slack platform in the agent pod. The bot's
+reaction on the ask is asserted on both paths: the Hermes Slack adapter and the A2A
+gateway each draw it the moment they accept the ask, and take it off once the answer
 posts.
 
 It skips while the user token, the channel or the bot's member id is unset. The Slack
@@ -50,11 +53,17 @@ USER_TOKEN_ENV = "E2E_SLACK_USER_TOKEN"
 CHANNEL_ENV = "E2E_SLACK_CHANNEL_ID"
 BOT_USER_ENV = "E2E_SLACK_BOT_USER_ID"
 REQUIRED_ENV = (USER_TOKEN_ENV, CHANNEL_ENV, BOT_USER_ENV)
-# "next" where the install runs spec.mode next (e2e-run.yml sets it there): the answer is
-# the gateway's Block Kit, so its headline is asserted. Unset, the PlatformAgent's spec.mode is read with
-# kubectl, so a manual run against any cluster asserts what its mode promises.
-MODE_ENV = "E2E_SLACK_MODE"
-MODE_NEXT = "next"
+# Which path serves Slack: "gateway" (the A2A gateway; the answer is its Block Kit, so
+# its headline is asserted) or "hermes" (the Hermes Slack platform in the agent pod,
+# which the operator keeps when Google Chat is enabled beside Slack). Unset, the
+# PlatformAgent's chat integrations are read with kubectl, so a manual run against any
+# cluster asserts what its install promises.
+PATH_ENV = "E2E_SLACK_PATH"
+# The two values PATH_ENV takes; anything else is a typo the run refuses rather than a silent
+# fall-through to the Hermes branch.
+SLACK_PATHS = frozenset({"gateway", "hermes"})
+PATH_GATEWAY = "gateway"
+PATH_HERMES = "hermes"
 
 TEST_TIMEOUT_SEC = int(os.environ.get("TEST_TIMEOUT_SEC", "120"))
 POLL_INTERVAL_SEC = float(os.environ.get("SLACK_POLL_INTERVAL_SEC", "1.5"))
@@ -113,14 +122,21 @@ def _kubectl_json(*args: str) -> dict | None:
     return json.loads(res.stdout)
 
 
-def install_mode() -> str | None:
-    """E2E_SLACK_MODE when set, else the PlatformAgent's spec.mode ("" reads as today), or
-    None when neither says, in which case the mode's own checks are skipped."""
-    if os.environ.get(MODE_ENV):
-        return os.environ[MODE_ENV]
+def slack_path() -> str | None:
+    """E2E_SLACK_PATH when set, else the path the PlatformAgent's integrations put Slack
+    on (the gateway, unless Google Chat is enabled beside Slack, as the operator's
+    a2aSlackArmed decides), or None when neither says, in which case the path's own
+    checks are skipped."""
+    if os.environ.get(PATH_ENV):
+        path = os.environ[PATH_ENV]
+        if path not in SLACK_PATHS:
+            pytest.fail(f"{PATH_ENV}={path!r}: set it to one of {sorted(SLACK_PATHS)}, or unset it to read the PlatformAgent")
+        return path
     agents = _kubectl_json(PLATFORM_AGENT_RESOURCE)
     for item in (agents or {}).get("items") or []:
-        return (item.get("spec") or {}).get("mode", "")
+        integration = (item.get("spec") or {}).get("integration") or {}
+        gchat = (integration.get("googleChat") or {}).get("enabled", False)
+        return PATH_HERMES if gchat else PATH_GATEWAY
     return None
 
 
@@ -198,14 +214,14 @@ def _thread(client, channel: str, ts: str) -> list[dict]:
     return client.call("conversations.replies", channel=channel, ts=ts, limit=REPLIES_PAGE_LIMIT).get("messages") or []
 
 
-def _turn(replies: list[dict], next_mode: bool) -> tuple[dict, str] | None:
+def _turn(replies: list[dict], on_gateway: bool) -> tuple[dict, str] | None:
     """The bot's reply to the ask and its kind, once there is one, from its messages oldest
-    first. On next, the gateway's grammar decides (harness.read_turn): a refusal, a
+    first. On the gateway, its grammar decides (harness.read_turn): a refusal, a
     not-started notice or a failed status line ends the turn, and the answer is the post
     after the status line once it reads completed, so a status line quoting the result is
     never taken for it. Elsewhere, the first-reply check stands and any bot message
     containing the expected answer is the answer."""
-    if next_mode:
+    if on_gateway:
         if any(live.status_state(m.get("text", "")) for m in replies):
             return live.read_turn(replies, live.WAIT_ANSWER)
         # No status line (the gateway keeps none in a Slack thread): a notice or an
@@ -248,19 +264,19 @@ def preflight_ask(client, channel: str, ask_ts: str) -> None:
             f"the ask carries bot_id={ask['bot_id']} (a user-token post through an app), and the gateway's "
             f"{TEST_USERS_ENV_ON_GATEWAY} does not list its author {ask.get('user')}, so the gateway drops it as "
             "bot traffic. Either the install does not list the test user in operator.slackTestUsers, or the "
-            "A2A gateway is not running Slack: under next, Google Chat holds the gateway when both are enabled, "
+            "A2A gateway is not running Slack: Google Chat holds the gateway when both are enabled, "
             "and Slack then stays on the Hermes path, which has no such list"
         )
 
 
 def test_slack_agent_math_response(slack_settings) -> None:
     client, channel, bot_user = slack_settings
-    mode = install_mode()
-    next_mode = mode == MODE_NEXT
+    path = slack_path()
+    on_gateway = path == PATH_GATEWAY
     prompt = PROMPT_TEMPLATE.format(bot=bot_user, stamp=datetime.now(timezone.utc).strftime("%H:%M:%S UTC"))
-    print(f"\n[E2E Slack] channel={channel} bot={bot_user} mode={mode!r}")
-    if mode is None:
-        print(f"[E2E Slack] {MODE_ENV} is unset and kubectl cannot read the PlatformAgent, so the mode's "
+    print(f"\n[E2E Slack] channel={channel} bot={bot_user} path={path!r}")
+    if path is None:
+        print(f"[E2E Slack] {PATH_ENV} is unset and kubectl cannot read the PlatformAgent, so the path's "
               "own checks (headline, reaction) are skipped")
     print(f"[E2E Slack] prompt: {prompt!r}")
 
@@ -295,12 +311,12 @@ def test_slack_agent_math_response(slack_settings) -> None:
                 timeline.first_reply = live.ts_value(replies[0].get("ts"))
                 timeline.ack_kind = live.classify(replies[0].get("text", ""))
                 print(f"[E2E Slack] first bot reply is a {timeline.ack_kind}: {replies[0].get('text', '')[:120]!r}")
-                # On next a failed status line is left to _turn, which quotes the
-                # failure notice that follows it rather than the bare line.
-                if timeline.ack_kind in ACK_REFUSED_KINDS and not (next_mode and timeline.ack_kind == live.KIND_FAILURE):
+                # On the gateway a failed status line is left to _turn, which quotes
+                # the failure notice that follows it rather than the bare line.
+                if timeline.ack_kind in ACK_REFUSED_KINDS and not (on_gateway and timeline.ack_kind == live.KIND_FAILURE):
                     pytest.fail(f"The bot's first reply is a {timeline.ack_kind}, so the turn never ran: "
                                 f"{replies[0].get('text', '')[:300]!r}")
-            turn = _turn(replies, next_mode)
+            turn = _turn(replies, on_gateway)
             if turn is not None:
                 msg, kind = turn
                 if kind != live.KIND_ANSWER:
@@ -316,9 +332,9 @@ def test_slack_agent_math_response(slack_settings) -> None:
 
     assert answer is not None, f"No answer in the thread within {TEST_TIMEOUT_SEC}s"
     assert EXPECTED_ANSWER_PATTERN.search(timeline.answer_text), f"The answer does not say 5: {timeline.answer_text[:300]!r}"
-    if mode is None:
+    if path is None:
         pass
-    elif next_mode:
+    elif on_gateway:
         assert timeline.answer_headline, f"The answer does not open on a bold headline: blocks={json.dumps(answer.get('blocks'))[:400]}"
         assert timeline.reaction, "The bot never reacted to the ask"
     else:

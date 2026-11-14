@@ -2110,9 +2110,9 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
     def test_a_mounted_projection_outranks_the_config_files(self):
-        # Under `next` the operator projects the home channel into a file the
-        # kubelet refreshes in place, and the gateway posts into that value. A
-        # `/sethome` channel left in the data volume by today mode must not
+        # The operator projects the home channel into a file the kubelet
+        # refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel the Hermes Slack adapter left in the data volume must not
         # make the agent name a different channel than the gateway, so a
         # mounted file decides, empty or not; the config files count only
         # where no file is mounted.
@@ -4201,7 +4201,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
 
     def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
-        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # A /sethome through the Hermes Slack adapter left SLACK_HOME_CHANNEL in the PVC .env. With
         # the operator's projection mounted the file is the home channel the
         # gateway posts into, so the mirror is skipped; without it, it loads.
         with tempfile.TemporaryDirectory() as directory:

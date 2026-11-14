@@ -18,7 +18,7 @@ filed it by POSTing to the in-pod API server (``gateway/wake.py``,
 it reads "Check the result or decide the next step ... Inspect the current
 board before creating follow-up tasks", followed by the worker's result.
 
-Under ``spec.mode: next`` the hermes-bridge drives each gateway conversation
+The hermes-bridge drives each gateway conversation
 as an ``api_server`` session named ``a2a-ctx-<context id>``. On main's
 periodic next lane (issue #2610) a front-door session's first card carried the
 request's limit ("Do not open a PR"), the worker answered with a proposed fix,
@@ -92,7 +92,7 @@ WAKE_HEADER = "X-Kube-Agents-Wake-Turn"
 SESSION_HEADER = "X-Hermes-Session-Id"
 
 #: The sessions this guard covers: the hermes-bridge's per-conversation
-#: sessions under ``spec.mode: next``.
+#: sessions.
 GATEWAY_SESSION_PREFIX = "a2a-ctx-"
 
 #: How far back the compression walk goes. A long thread compresses a

@@ -1,4 +1,4 @@
-"""Every shared kube-agents.chat/v1 case through the next-mode emitter. No Hermes install required.
+"""Every shared kube-agents.chat/v1 case through the chat-message emitter. No Hermes install required.
 
 Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 
