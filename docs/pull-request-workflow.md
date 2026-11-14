@@ -281,7 +281,9 @@ alert closing: a pull-request run reports changed lines only, and an absent anno
 evidence. To show an alert closing, or to see one before the pull request opens, reproduce it
 locally: install the CLI as a `gh` extension, pin it to the version the alert's `tool.version`
 reports, and build a database once before the change and once after. For Python the database is
-over a scratch tree holding the flagged file at its repository path. For Go it is over the module
+over a scratch tree holding the flagged file at its repository path, or over the whole tree when the
+alert's source is in another file (a `py/polynomial-redos` alert's user-provided value can be): the
+flagged file alone then reports nothing. For Go it is over the module
 that holds the file, because a Go database is built rather than read, and the build is named rather
 than left to the autobuilder, which runs whatever build file its source root holds (from the
 repository root, `make`, whose default target is the platform image's Docker build; it fails
@@ -290,7 +292,8 @@ fast on a runner where the image tag is empty and runs for real where it is not)
 ```bash
 gh extension install github/gh-codeql
 gh codeql set-version 2.27.3 # the alert's tool.version
-# Python: the flagged file alone, at its repository path under /tmp/cq/tree
+# Python: the flagged file alone, at its repository path under /tmp/cq/tree,
+# or --source-root . from the repository root when the source is in another file
 gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
 gh codeql database analyze /tmp/cq/db \
   codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
