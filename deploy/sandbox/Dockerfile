@@ -630,7 +630,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          automation_rules, kubeagents_switches and vcs_client
 #   post_merge_offer.py    opens the draft rules-file pull request that offers
 #                          auto-merge for a kind of fix; imports post_merge_stepdown,
-#                          repo_ref and clean_merges, whose thresholds it checks again
+#                          repo_ref and clean_merges, whose thresholds it states
 #   clean_merges.py        the clean-merge threshold; imports repo_ref
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)

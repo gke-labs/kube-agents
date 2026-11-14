@@ -43,10 +43,8 @@ class FakeOpen:
         return "https://x/pull/10"
 
 
-def run(forge, opener=None, *, automerge="practice", environment="dev", clean=5, days=2, kind="no-pdb"):
-    return pmo.offer(
-        REPO, 9, kind, environment, clean, days, automerge=automerge, forge=forge, open_proposal=opener or FakeOpen()
-    )
+def run(forge, opener=None, *, automerge="practice", environment="dev", kind="no-pdb"):
+    return pmo.offer(REPO, 9, kind, environment, automerge=automerge, forge=forge, open_proposal=opener or FakeOpen())
 
 
 class TestOffer(unittest.TestCase):
@@ -69,16 +67,14 @@ class TestOffer(unittest.TestCase):
                 self.assertEqual(len(comments), 1)
                 self.assertEqual(comments[0]["number"], 9)
                 body = comments[0]["body"]
-                self.assertTrue(body.startswith("Disruption-budget fixes: 5 merged in acme/gitops, none changed or undone."))
-                self.assertIn("have merged in acme/gitops with nobody changing them", opened["body"])
+                self.assertTrue(body.startswith("Disruption-budget fixes: at least 5 merged in acme/gitops, none changed or undone."))
+                self.assertIn("At least 5 disruption-budget fixes have merged on 2 or more days in acme/gitops", opened["body"])
                 self.assertIn("https://x/pull/10", body)
                 self.assertIn(pmo.MARKER, body)
 
     def test_gates(self):
         cases = {
             "prod": dict(environment="prod"),
-            "not enough": dict(clean=4),
-            "one day": dict(days=1),
             "unknown kind": dict(kind="no-hpa"),
         }
         for name, kwargs in cases.items():
@@ -153,6 +149,12 @@ class TestOffer(unittest.TestCase):
 
 def _git(cwd, *args):
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
+
+
+class TestCountsAreNotAnArgument(unittest.TestCase):
+    def test_the_cli_takes_no_counts(self):
+        with self.assertRaises(SystemExit):
+            pmo.main(["--repo", REPO, "--number", "9", "--kind", "no-pdb", "--environment", "dev", "--clean", "99"])
 
 
 class FakeVcs:

@@ -2,15 +2,16 @@
 """Offer auto-merge for a kind of fix once it has earned it in one repository's dev.
 
 For the post-merge driver to run in the shell sandbox once a fix's check
-passes and `clean_merges.ready_in` says the kind has enough clean merges in the
-fix's own repository and environment, with the fix's repository, number, kind,
-environment and that entry's clean and days counts. Trust is per repository:
-merges in one repository never make an offer in another. This opens a
-DRAFT pull request in the fix's repository adding an allow rule for that kind
-and environment to its `.kube-agents/automation.yaml` (creating the file when
-absent), and comments once on the fix to link it. Both say how many merged in
-that repository. Merging the draft is how the customer says yes; closing it
-says no.
+passes and `clean_merges.ready_in`, read in the agent pod from Session KV, says
+the kind is ready in the fix's own repository and environment. The counts are
+never taken from the caller: the sandbox cannot read Session KV, and an
+argument from it is model-controlled. So the text states the bar the kind met
+(`clean_merges.CLEAN_MERGES_NEEDED` merges on `DAYS_NEEDED` days), which holds
+whenever the driver calls this. Trust is per repository. This opens a DRAFT
+pull request in the fix's repository adding an allow rule for that kind and
+environment to its `.kube-agents/automation.yaml` (creating the file when
+absent), and comments once on the fix to link it. Marking the draft ready and
+merging it is how the customer says yes; closing it says no.
 
 Only when `KUBEAGENTS_AUTOMERGE` is not `off`, and only in an environment in
 `OFFER_ENVIRONMENTS`. Never twice for one kind and environment in a repository:
@@ -99,8 +100,6 @@ def offer(
     number: int,
     kind: str,
     environment: str,
-    clean: int,
-    days: int,
     *,
     automerge: str | None = None,
     forge: Forge | None = None,
@@ -108,8 +107,8 @@ def offer(
 ) -> dict:
     """Make the offer on fix `number`, if it is due. Returns what was done, as the CLI prints it.
 
-    `clean` and `days` are `clean_merges.ready_in`'s counts for the kind in
-    `repo` and `environment`; both thresholds are checked here as well as there.
+    The driver checks `clean_merges.ready_in` before calling this; see the
+    module docstring for why the counts are not an argument.
     """
     if automerge is None:
         import kubeagents_switches
@@ -121,18 +120,13 @@ def offer(
         return {"action": "none", "reason": f"auto-merge is offered in {', '.join(sorted(OFFER_ENVIRONMENTS))} only"}
     if kind not in automation_rules.KNOWN_FIX_TYPES:
         return {"action": "none", "reason": f"{kind} is not a fix kube-agents opens"}
-    if clean < clean_merges.CLEAN_MERGES_NEEDED or days < clean_merges.DAYS_NEEDED:
-        return {
-            "action": "none",
-            "reason": f"{clean} clean merges on {days} days; {clean_merges.CLEAN_MERGES_NEEDED} on "
-            f"{clean_merges.DAYS_NEEDED} needed",
-        }
     forge = forge or post_merge_stepdown._forge(repo)
     open_proposal = open_proposal or post_merge_stepdown._open
     branch = OFFER_BRANCH.format(kind=kind, environment=environment)
     fix = forge("proposal-view", {"number": number}).get("proposal") or {}
     fix_url = str(fix.get("url") or f"#{number}")
     name = automation_rules.FIX_TYPE_NAMES.get(kind, f"{kind} fixes")
+    bar = f"{clean_merges.CLEAN_MERGES_NEEDED} {name} have merged on {clean_merges.DAYS_NEEDED} or more days"
 
     if post_merge_stepdown._existing_proposal(forge, branch):
         return {"action": "none", "reason": "already offered"}
@@ -146,7 +140,7 @@ def offer(
         url = open_proposal(
             forge, repo, branch, str(fix.get("target") or ""),
             f"Auto-merge {name} in {environment}",
-            f"{clean} {name} have merged in {repo_name(repo)} with nobody changing them, passed the after-merge "
+            f"At least {bar} in {repo_name(repo)} with nobody changing them, passed the after-merge "
             "check, and were not undone. Marking this draft ready and merging it adds one allow rule to "
             f"`{automation_rules.RULES_FILE}`, so your pipeline may merge kube-agents' "
             f"`{kind}` fixes on clusters labelled `{environment}` without a review, while "
@@ -164,7 +158,8 @@ def offer(
             return {"action": "none", "reason": "already offered"}
         raise
     line = (
-        f"{name[0].upper()}{name[1:]}: {clean} merged in {repo_name(repo)}, none changed or undone. "
+        f"{name[0].upper()}{name[1:]}: at least {clean_merges.CLEAN_MERGES_NEEDED} merged in {repo_name(repo)}, "
+        "none changed or undone. "
         f"Auto-merge fixes like this in {environment}? I opened a draft pull request that adds them "
         f"to your rules file: {url}. Marking it ready and merging it turns that on; closing it means no, "
         "and I won't ask again."
@@ -179,10 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--number", required=True, type=int, help="the merged fix to comment on")
     parser.add_argument("--kind", required=True)
     parser.add_argument("--environment", required=True)
-    parser.add_argument("--clean", required=True, type=int, help="clean merges of the kind in this repository there")
-    parser.add_argument("--days", required=True, type=int, help="the distinct days they merged on")
     args = parser.parse_args(argv)
-    print(json.dumps(offer(args.repo, args.number, args.kind, args.environment, args.clean, args.days), indent=2))
+    print(json.dumps(offer(args.repo, args.number, args.kind, args.environment), indent=2))
     return 0
 
 
