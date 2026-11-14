@@ -48,6 +48,14 @@ class BrokerChecksParityTest(unittest.TestCase):
             item["metadata"].update(extra)
             return item
 
+        def expr_pdb(key, operator, values=None):
+            item = pdb(f"expr-{key}-{operator.lower()}", labels={})
+            expression = {"key": key, "operator": operator}
+            if values is not None:
+                expression["values"] = values
+            item["spec"]["selector"] = {"matchExpressions": [expression]}
+            return item
+
         null_pdb, all_pdb = pdb("null"), pdb("all")
         null_pdb["spec"]["selector"], all_pdb["spec"]["selector"] = None, {}
         stale = ready(deployment())
@@ -78,6 +86,16 @@ class BrokerChecksParityTest(unittest.TestCase):
             "owned by a custom resource": [meta(ownerReferences=[{"apiVersion": "example.com/v1", "kind": "Rollout", "name": "x"}])],
             "scaled to zero": [ready(deployment(replicas=0))],
             "missing workload": [],
+            # Live budgets selecting by expression: each operator, and NotIn
+            # and DoesNotExist where the pods carry no such key.
+            "budget In, matching": [ready(deployment()), expr_pdb("app", "In", ["checkout", "x"])],
+            "budget In, not matching": [ready(deployment()), expr_pdb("app", "In", ["cart"])],
+            "budget NotIn, key present": [ready(deployment()), expr_pdb("app", "NotIn", ["checkout"])],
+            "budget NotIn, key absent": [ready(deployment()), expr_pdb("tier", "NotIn", ["batch"])],
+            "budget Exists, present": [ready(deployment()), expr_pdb("app", "Exists")],
+            "budget Exists, absent": [ready(deployment()), expr_pdb("tier", "Exists")],
+            "budget DoesNotExist, absent": [ready(deployment()), expr_pdb("tier", "DoesNotExist")],
+            "budget DoesNotExist, present": [ready(deployment()), expr_pdb("app", "DoesNotExist")],
         }
         for case, items in cases.items():
             with self.subTest(case=case):

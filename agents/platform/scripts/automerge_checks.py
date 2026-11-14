@@ -6,9 +6,13 @@ the pull request's body itself, on one namespace read with its own credential,
 because nothing the sandbox reports can be trusted for that: `replicas-ready`
 (with an autoscaler's floor), `no-overlapping-budget` and `selector-matches`
 (Jobs and CronJobs included), behind the audit's scope rules S1-S5
-(`in_scope`): a workload the audit would not read is never eligible. Whether
-the cluster itself is inside the install's declared scope is the caller's to
-establish before it reads anything; nothing here sees the scope.
+(`in_scope`): a workload the audit would not read is never eligible. The
+caller owns two things this cannot see. Whether the cluster is inside the
+install's declared scope, before it reads anything. And whether the read is
+whole: `judge` cannot tell "no budgets or autoscalers" from "not read", so a
+partial read (a failed or forbidden kind) must be refused before it gets here,
+as the sandbox's `recheck._gate` does. The budget file's own shape is
+`automerge_eligibility.parse_budget`'s.
 
 One deliberate difference from the sandbox: a live budget whose selector this
 cannot read (an operator it does not know) counts as overlapping, where

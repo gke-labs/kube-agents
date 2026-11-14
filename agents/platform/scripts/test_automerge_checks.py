@@ -78,6 +78,21 @@ class JudgeTest(unittest.TestCase):
     def test_a_missing_workload_fails_everything(self):
         self.assertFalse(any(r["passed"] for r in self.judge().values()))
 
+    def test_each_selector_operator_reads_as_kubernetes_does(self):
+        labels = {"app": "checkout"}
+        for expression, matched in (
+            ({"key": "app", "operator": "In", "values": ["checkout", "x"]}, True),
+            ({"key": "app", "operator": "In", "values": ["cart"]}, False),
+            ({"key": "app", "operator": "NotIn", "values": ["checkout"]}, False),
+            ({"key": "tier", "operator": "NotIn", "values": ["batch"]}, True),
+            ({"key": "app", "operator": "Exists"}, True),
+            ({"key": "tier", "operator": "Exists"}, False),
+            ({"key": "tier", "operator": "DoesNotExist"}, True),
+            ({"key": "app", "operator": "DoesNotExist"}, False),
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(ac.selector_matches({"matchExpressions": [expression]}, labels), matched)
+
     def test_an_unknown_selector_operator_matches_nothing(self):
         self.assertFalse(ac.selector_matches({"matchExpressions": [{"key": "app", "operator": "Like"}]}, LABELS))
 
