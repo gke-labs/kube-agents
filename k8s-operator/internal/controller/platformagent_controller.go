@@ -80,10 +80,12 @@ const (
 	// prunedUsageStatus). The RBAC self-check's cadence, for the same reason:
 	// the condition changes when someone applies something, not on a schedule,
 	// and one status write per interval is a cost nobody notices.
-	usageStatusReprobeInterval = 5 * time.Minute
-	minIPv4CIDRPrefix          = 12
-	minIPv6CIDRPrefix          = 48
-	maxCIDRsPerAnnotation      = 50
+	usageStatusReprobeInterval  = 5 * time.Minute
+	observedVersionPrunedLogMsg = "API server pruned status.observedVersion from PlatformAgent status update; CRD may be older than the operator, pausing writes for this field"
+	reprobeInLogKey             = "reprobeIn"
+	minIPv4CIDRPrefix           = 12
+	minIPv6CIDRPrefix           = 48
+	maxCIDRsPerAnnotation       = 50
 
 	// The two keys of the <agent>-gitops-state ConfigMap the minter policy is
 	// synced from: managed_repos renders write policies, context_repos read-only
@@ -530,6 +532,12 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// prunedObservedVersion records, per CR, when a status write was last
+	// seen to come back without status.observedVersion: an operator rolled
+	// ahead of the CRD that adds the field. While fresh, updateStatusReady
+	// leaves ObservedVersion out of its unchanged check so the write the API
+	// server prunes does not repeat on every pass.
+	prunedObservedVersion sync.Map
 
 	// busConversionAllowed lets resolveA2ABusReplicas convert an existing bus
 	// between one server and three. Off in every operator: a conversion
@@ -1660,11 +1668,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
-// whole usage block's or status.inference's. With no
-// record it returns the secret re-read's interval, the ceiling the caller
-// already applies, so the min it feeds leaves the caller's value alone.
+// whole usage block's, status.busReplicas', status.inference's, or
+// status.observedVersion's. With no record it returns the secret re-read's
+// interval, the ceiling the caller already applies, so the min it feeds leaves
+// the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -4908,6 +4917,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	ctx = withA2AGatewayLeaderMemo(ctx)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
+	newObservedVersion := ""
 	var errWorkload error
 
 	// Whether the gateway workload may still be running Pods from a revision
@@ -4939,6 +4949,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
 			newDeploymentStatusReadyReplicas = sts.Status.ReadyReplicas
+			newObservedVersion = workloadObservedVersion(sts.Spec.Template.Spec.Containers)
 			// The ordered roll has the same window: replicas > 1 over RWO
 			// storage takes this path, and the StatefulSet controller replaces
 			// Pods one at a time.
@@ -4953,6 +4964,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
 			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
+			newObservedVersion = workloadObservedVersion(dep.Spec.Template.Spec.Containers)
 			workloadRollIncomplete = deploymentRollIncomplete(dep)
 		}
 	}
@@ -5309,6 +5321,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// on the pruned copy, an operator rolled ahead of its CRD would write on
 	// every pass, and each write wakes the next through the unfiltered watch.
 	if agent.Status.Phase == newPhase &&
+		(r.observedVersionPruned(agent) || agent.Status.ObservedVersion == newObservedVersion) &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
 		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
@@ -5342,6 +5355,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Apply updates
 	agent.Status.Phase = newPhase
 	agent.Status.ObservedGeneration = agent.Generation
+	agent.Status.ObservedVersion = newObservedVersion
 	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
 	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
@@ -5435,6 +5449,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
+	r.noteObservedVersionEcho(ctx, agent, newObservedVersion)
 	return newPhase, a2aTasksWaitRequeue, nil
 }
 
@@ -5514,11 +5529,55 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 	}
 }
 
+// observedVersionPruned reports whether this CR was recently seen to drop
+// status.observedVersion on write (an operator rolled ahead of the CRD).
+// Returning true pauses repeat writes for usageStatusReprobeInterval so the
+// unchanged check skips status updates until the CRD is updated.
+func (r *PlatformAgentReconciler) observedVersionPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	if r == nil || agent == nil {
+		return false
+	}
+	v, ok := r.prunedObservedVersion.Load(client.ObjectKeyFromObject(agent))
+	if !ok {
+		return false
+	}
+	at, ok := v.(time.Time)
+	if !ok {
+		return false
+	}
+	if time.Since(at) < usageStatusReprobeInterval {
+		return true
+	}
+	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
+	return false
+}
+
+// noteObservedVersionEcho compares the non-empty ObservedVersion we wrote
+// against what the API server returned. An older CRD that omits
+// status.observedVersion strips it on write; recording that suppresses repeat
+// status updates for usageStatusReprobeInterval.
+func (r *PlatformAgentReconciler) noteObservedVersionEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, written string) {
+	if r == nil || agent == nil || written == "" {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.ObservedVersion == written {
+		r.prunedObservedVersion.Delete(key)
+		return
+	}
+	alreadyNoted := r.observedVersionPruned(agent)
+	r.prunedObservedVersion.Store(key, time.Now())
+	if !alreadyNoted {
+		logf.FromContext(ctx).Info(observedVersionPrunedLogMsg, reprobeInLogKey, usageStatusReprobeInterval.String())
+	}
+}
+
 // forgetUsageStatus drops the CR's pruning records when the CR goes away, so the
 // maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()

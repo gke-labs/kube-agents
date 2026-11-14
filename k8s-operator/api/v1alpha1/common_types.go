@@ -2754,6 +2754,12 @@ type AgentStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ObservedVersion is the image tag or digest from the reconciled gateway
+	// workload's platform-agent container (for example, "v0.12.3", "sha-abc1234",
+	// or "sha256:..."), stripped of any registry host and repository path.
+	// +optional
+	ObservedVersion string `json:"observedVersion,omitempty"`
+
 	// Address is the fully qualified domain name (FQDN) of the agent service.
 	// +optional
 	Address string `json:"address,omitempty"`
