@@ -1144,7 +1144,7 @@ sandbox is on — which is the same condition under which `terminal.backend` bec
 
 The managed scope carries the whole block or none of it. With the sandbox off the
 key is absent, Hermes' own default (`local`) applies, and nothing about an existing
-install changes. With it on, six keys are Hermes' and one is this design's:
+install changes. With it on, seven keys are Hermes' and one is this design's:
 
 | Key                                | Value                                                                                           |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------- |
@@ -1152,6 +1152,7 @@ install changes. With it on, six keys are Hermes' and one is this design's:
 | `ssh_host`, `ssh_user`, `ssh_port` | the sandbox's Service, `agent`, 2222                                                            |
 | `ssh_key`                          | where the init container stages the private half                                                |
 | `lifetime_seconds`                 | 30 days — see [One connection under every environment](#one-connection-under-every-environment) |
+| `timeout`                          | 180, the terminal tool's per-call limit; see below                                              |
 | `workspace_root`                   | `/opt/data`, the sandbox's data path                                                            |
 
 `workspace_root` is not a Hermes key. It is published so that the agent-side
@@ -1170,7 +1171,11 @@ resolves the managed backend without it. The same check reads the terminal tool'
 default call timeout out of that Hermes and fails the build when the Cluster Agent
 preflight's mirror of it (`TERMINAL_TOOL_TIMEOUT_SECONDS` in `cluster_preflight.sh`,
 which budgets the preflight's brokered calls under it) disagrees; the identifier
-sources table in [`docs/README.md`](../README.md) names both.
+sources table in [`docs/README.md`](../README.md) names both. The operator publishes
+that same default as `timeout` because Hermes' first boot seeds `.env` from its
+`.env.example`, whose `TERMINAL_TIMEOUT=60` would otherwise outrank it; the copy
+replaces that line, and `tests/test_terminal_env_pin.py` holds the published value
+to the preflight's mirror.
 
 #### Two sharp edges left
 
@@ -1344,7 +1349,7 @@ the model can rename it aside and put its own in its place until the next start.
 `/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
 one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
 forge verb into this container rather than holding a forge CLI themselves, the Cluster
-Agent reconcile sends its GKE reads to `gke_cluster_reads.py` here, and running
+Agent reconcile and stall_watch send their GKE reads to `gke_cluster_reads.py` here, and running
 the data volume's copy over that session would hand the credential to whatever sits at
 that path. The read-only mount narrows that to the fallback, and the second copy stays
 as defence in depth. The whole import closure is staged, because `sys.path[0]` is the

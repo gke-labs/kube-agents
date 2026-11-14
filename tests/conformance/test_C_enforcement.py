@@ -1765,8 +1765,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
         holds the same cap", because the adapter's check is bypassable by
         anything that can reach the bus directly, so this is a second,
-        independent line of defence rather than a redundant one). Both call
-        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        independent line of defence rather than a redundant one). The
+        gateway's half runs through `lib.ValidateDelegateRequest`, which
+        caps the single task's text and every batch entry's (#5682). Both
+        reach `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
         side compiles, passes every Go suite today, and silently stops
         agreeing with lib.DelegateTextCap's definition the day someone edits
         only that constant.
@@ -1779,16 +1781,42 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
         # Scoped to the function that makes the check, and to its code
-        # without comments (_go_code): elsewhere in delegation.go the wake's
-        # budget and two comments name the constant too, and a comment inside
-        # the function could name it beside a hand-spelled check.
-        for key, function, what in (
-            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
-            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
-        ):
-            body = _go_code(h.text(key), function)
-            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
-            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
+        # without comments (_go_code): elsewhere the wake's budget and some
+        # comments name the constant too, and a comment inside a function
+        # could name it beside a hand-spelled check.
+        adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
+        self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
+        self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+
+        # The gateway's half is lib's shared validator, since a request may be
+        # one task or a batch (#5682): handleDelegateRequest ignores any
+        # request lib.ValidateDelegateRequest refuses, and the validator caps
+        # the single task's text and every batch entry's.
+        gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        self.assertRegex(
+            gateway,
+            r"lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil",
+            "the gateway's handleDelegateRequest no longer refuses a request lib.ValidateDelegateRequest refuses",
+        )
+        self.assertNotRegex(gateway, magic_number, "the gateway's handleDelegateRequest hand-spells the delegate text cap")
+
+        validate = _go_code(payload, "ValidateDelegateRequest")
+        self.assertIn(
+            "validateDelegateText(r.Text)", validate,
+            "lib.ValidateDelegateRequest no longer caps a single task's text",
+        )
+        self.assertRegex(
+            validate,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+r\.Tasks\s*\{[^}]*validateDelegateText\(\1\.Text\)",
+            "lib.ValidateDelegateRequest no longer caps every batch entry's text",
+        )
+        text_check = _go_code(payload, "validateDelegateText")
+        self.assertRegex(
+            text_check,
+            r"len\(text\)\s*>\s*DelegateTextCap\b",
+            "lib's validateDelegateText no longer compares the text with DelegateTextCap",
+        )
+        self.assertNotRegex(text_check, magic_number, "lib's validateDelegateText hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
         """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
@@ -1811,27 +1839,48 @@ class C1IsolationIsStructural(unittest.TestCase):
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
         # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
         all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
+        # Named in full, so a fifth field fails here rather than slipping past:
+        # one task's three fields, and `tasks`, the batch (#5682).
         self.assertEqual(
-            ["addressee", "parameters", "text"],
+            ["addressee", "parameters", "tasks", "text"],
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        entry_tags = [t for t in all_tags if t != "tasks"]
+        task = payload.split("type DelegateTask struct {")[1].split("\n}")[0]
+        self.assertEqual(
+            entry_tags,
+            sorted(re.findall(r'`json:"(\w+)[,"]', task)),
+            "lib.DelegateTask's fields no longer match a single request's",
+        )
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
-        # A property opens its own line; `additionalProperties` inside one doesn't.
+        # One task's properties are built once (entry) and used both at the
+        # top and as each batch item's. A property opens its own line;
+        # `additionalProperties` inside one doesn't.
         properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            all_tags,
+            entry_tags,
             properties,
-            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+            "the tool schema's task properties no longer match lib.DelegateRequest's json tags",
+        )
+        self.assertRegex(
+            schema,
+            r'props\["tasks"\]\s*=\s*map\[string\]any\{\s*"type":\s*"array"',
+            "the tool schema no longer offers the batch under lib.DelegateRequest's `tasks` tag",
+        )
+        self.assertRegex(
+            schema,
+            r'"items":\s*map\[string\]any\{[^}]*"properties":\s*entry\(\)',
+            "a batch item's properties are no longer one task's",
         )
         # `parameters` is optional on both sides: platform takes none, and the
         # wire struct's tag is omitempty.
-        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        required_block = re.search(r'required\s*:=\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            [t for t in all_tags if t != "parameters"],
+            [t for t in entry_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )
@@ -2194,6 +2243,68 @@ class C1IsolationIsStructural(unittest.TestCase):
             "shares with the agent container, so both would resolve to one map "
             "entry holding the union of their grants, which is `worker` rebuilt",
         )
+
+    def test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone(self) -> None:
+        """No value set for the gateway's sake unguards the Hindsight database.
+
+        hindsight-postgresql takes no password; its NetworkPolicy, which admits
+        the hindsight-api pod on 5432 and nobody else, is the whole of its
+        access control. The chart renders that policy and hindsight-api's
+        under separate guards because a bring-your-own gateway install has to
+        widen or drop the api policy, and one boolean over both would take the
+        database guard along with it. The refusal asserted: the guard on this
+        policy is built from hindsight.networkPolicy and
+        hindsight.postgresql.networkPolicy.enabled and nothing else -- not
+        litellm.enabled, not the api toggle, not additionalEgress -- and the
+        block it opens holds the policy that admits only the api component, so
+        no other peer is rendered into it.
+
+        The template carries multi-line Helm comments, which helm_documents()
+        cannot read, so the policy's block is sliced out by its guard and
+        stripped of directive lines the way tests/test_hindsight_network_policy.py
+        does; that file holds the rendered-output tests behind a helm binary.
+        """
+        template = h.text("chart_hindsight")
+        umbrella = self._one_match(
+            r"\{\{-\s*\$hindsightNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the umbrella definition"
+        )
+        self.assertEqual(".Values.hindsight.networkPolicy", umbrella)
+        guard = self._one_match(
+            r"\{\{-\s*\$postgresqlNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the postgres guard definition"
+        )
+        self.assertEqual(
+            "and $hindsightNetworkPolicy .Values.hindsight.postgresql.networkPolicy.enabled",
+            guard,
+            "the postgres guard reads a value set for another component's sake",
+        )
+        block = self._one_match(
+            r"(?s)\{\{-\s*if \$postgresqlNetworkPolicy\s*\}\}\n(.*?)\n\{\{-\s*end\s*\}\}",
+            template,
+            "the postgres policy block",
+        )
+        body = "\n".join(line for line in block.splitlines() if "{{" not in line)
+        documents = [d for d in yaml.safe_load_all(body) if isinstance(d, dict)]
+        self.assertEqual(["hindsight-postgresql"], [d["metadata"]["name"] for d in documents])
+        (policy,) = documents
+        self.assertEqual("NetworkPolicy", policy["kind"])
+        spec = policy["spec"]
+        self.assertIn("Ingress", spec["policyTypes"])
+        self.assertTrue(spec["ingress"], "the policy admits no peer at all; the invariant is exactly one peer, not none")
+        for rule in spec["ingress"]:
+            self.assertEqual([{"port": 5432, "protocol": "TCP"}], rule["ports"])
+            for peer in rule["from"]:
+                self.assertEqual(
+                    {
+                        "podSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": "hindsight",
+                                "app.kubernetes.io/component": "api",
+                            }
+                        }
+                    },
+                    peer,
+                    "a peer other than the hindsight-api pod reaches the passwordless database",
+                )
 
 
 class C2FailClosed(unittest.TestCase):
@@ -2757,6 +2868,188 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     #   comparing a secret. Deliberately this rather than binding
     #   system:auth-delegator, which carries subjectaccessreviews too.
     WRITE_CAPABLE_ROLE_PREFIXES = ("kubeagents:leader:", "kubeagents:tokenreview:")
+
+    # The write half of the operator's Secret grant, the namespaced Role's:
+    # by-name writes in the two namespaces are the whole grant. The reads are
+    # the ClusterRole's (READ_VERBS above): escalation prevention needs the
+    # operator to hold what the agent's `minimal` role grants.
+    OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
+
+    # Every namespaced kind the operator renders, as (apiGroup, resource): the
+    # Secret split applied to all of them. The ClusterRole holds the reads of
+    # each (the informers, escalation prevention) and no write verb; the Role
+    # document names exactly this set, with write verbs only: a read in the
+    # Role is a 403 wherever the Role is not bound, and the teardown reads
+    # the dispatcher's params in a profile namespace a mode-today install
+    # never binds it in. docs/designs/operator-namespaced-write-verbs.md.
+    OPERATOR_NAMESPACED_WRITE_KINDS = frozenset({
+        ("", "configmaps"),
+        ("", "events"),
+        ("", "persistentvolumeclaims"),
+        ("", "pods"),
+        ("", "podtemplates"),
+        ("", "resourcequotas"),
+        ("", "secrets"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("batch", "jobs"),
+        ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
+        ("networking.gke.io", "fqdnnetworkpolicies"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    })
+    OPERATOR_NAMESPACED_READ_KINDS = frozenset()
+    # The two namespaces the chart binds the Role in under mode next: the
+    # release namespace and its profile namespace.
+    OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
+    HELM_MODE_NEXT = "platformAgent.mode=next"
+
+    def test_C5_the_operators_write_verbs_are_namespaced(self) -> None:
+        """The operator writes in its install namespace and its profile namespace, and nowhere else.
+
+        The operator is the most privileged identity an install puts on a
+        cluster, and the write verbs on its ClusterRole were what made it
+        cluster-admin in effect: `create`, `update`, `patch` and `delete` on
+        every Secret in every namespace is every ServiceAccount token and every
+        credential on the cluster, and `create` on every Pod or ServiceAccount
+        is the same by another route. Every object the operator writes is in
+        the namespace of the PlatformAgent it reconciles or that namespace's
+        profile namespace, so the write verbs are a Role, bound in each. The
+        reads stay cluster-wide, because the informers watch every rendered
+        kind for drift and the agent's `minimal` ClusterRole grants reads the
+        API server will not let the operator grant without holding them.
+
+        Asserted on both delivery paths, as the refusal rather than the
+        presence of the control: no ClusterRole in `role.yaml` or in the
+        rendered chart grants a verb beyond the three reads on any kind in
+        OPERATOR_NAMESPACED_WRITE_KINDS, or a wildcard that reaches one; and
+        the Role that names `secrets` names exactly that set of kinds, with
+        write verbs only. Equality
+        rather than a subset, so a kind dropped from the Role is red here and
+        not first at runtime; the Secret rule's verbs are pinned as before.
+
+        The chart is read rendered (`helm template`, mode next), not as text:
+        the text reader drops template lines, so the `range` that renders the
+        Role once per namespace collapses to one object and rules that came
+        through an `include` would vanish. Rendered, the Role and its
+        RoleBinding must appear in the release namespace and the profile
+        namespace, each binding the operator's ServiceAccount.
+        """
+
+        def rule_kinds(rule: dict) -> set[tuple[str, str]]:
+            return {
+                (group, resource)
+                for group in (rule.get("apiGroups") or [])
+                for resource in (rule.get("resources") or [])
+            }
+
+        def secret_rules(role: dict) -> list[dict]:
+            return [
+                rule
+                for rule in role.get("rules") or []
+                if "secrets" in (rule.get("resources") or [])
+                or "*" in (rule.get("resources") or [])
+            ]
+
+        for source, documents, namespaces in (
+            ("operator_clusterrole", h.yaml_documents("operator_clusterrole"), None),
+            ("chart_rendered_mode_next", h.helm_rendered(self.HELM_MODE_NEXT), self.OPERATOR_ROLE_NAMESPACES),
+        ):
+            with self.subTest(source=source):
+                cluster_roles = [
+                    role for role in h.objects_of_kind(documents, "ClusterRole")
+                    if "operator" in role["metadata"]["name"] or role["metadata"]["name"].endswith("manager-role")
+                ]
+                self.assertTrue(cluster_roles, f"{source} renders no operator ClusterRole")
+                for role in cluster_roles:
+                    for rule in role.get("rules") or []:
+                        # A wildcard counts for the kinds it reaches: `*` as the
+                        # resource reaches every inventory kind in that group,
+                        # `*` as the group reaches the inventory kinds of that
+                        # name in any group. A wildcard that reaches none is A4's
+                        # to judge, not this test's.
+                        reached = {
+                            kind
+                            for kind in self.OPERATOR_NAMESPACED_WRITE_KINDS
+                            for group in (rule.get("apiGroups") or [])
+                            for resource in (rule.get("resources") or [])
+                            if group in ("*", kind[0]) and resource in ("*", kind[1])
+                        }
+                        if not reached:
+                            continue
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= self.READ_VERBS,
+                            f"{source}: ClusterRole {role['metadata']['name']} grants "
+                            f"{sorted(set(rule.get('verbs') or []) - self.READ_VERBS)} on {sorted(reached)} "
+                            "cluster-wide; the write verbs belong in the namespaced Role",
+                        )
+                granting = [
+                    (role, secret_rules(role))
+                    for role in h.objects_of_kind(documents, "Role")
+                    if secret_rules(role)
+                ]
+                self.assertTrue(
+                    granting,
+                    f"{source}: no Role names secrets; the Role document is missing or lost its Secret rule",
+                )
+                expected = namespaces or {granting[0][0]["metadata"].get("namespace")}
+                self.assertEqual(
+                    expected,
+                    {role["metadata"].get("namespace") for role, _ in granting},
+                    f"{source}: expected the namespaced Role granting secrets in {sorted(expected)}, "
+                    f"found {[(r['metadata'].get('namespace'), r['metadata']['name']) for r, _ in granting]}",
+                )
+                self.assertEqual(len(expected), len(granting), f"{source}: a namespace carries the Role twice")
+                for role, rules in granting:
+                    self.assertTrue(
+                        role["metadata"].get("namespace"),
+                        f"{source}: the Role granting secrets carries no namespace",
+                    )
+                    self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
+                    self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+                    self.assertEqual(
+                        self.OPERATOR_NAMESPACED_WRITE_KINDS,
+                        {kind for rule in role.get("rules") or [] for kind in rule_kinds(rule)},
+                        f"{source}: the Role document must name exactly the namespaced kinds",
+                    )
+                    for rule in role.get("rules") or []:
+                        kinds = rule_kinds(rule)
+                        allowed = self.OPERATOR_SECRET_WRITE_VERBS | (
+                            self.READ_VERBS if kinds <= self.OPERATOR_NAMESPACED_READ_KINDS else frozenset()
+                        )
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= allowed,
+                            f"{source}: the Role document grants {sorted(set(rule.get('verbs') or []) - allowed)} "
+                            f"on {sorted(kinds)}; reads stay in the ClusterRole",
+                        )
+                    if namespaces is None:
+                        continue
+                    bindings = [
+                        b for b in h.objects_of_kind(documents, "RoleBinding")
+                        if b["metadata"].get("namespace") == role["metadata"]["namespace"]
+                        and (b.get("roleRef") or {}).get("kind") == "Role"
+                        and (b.get("roleRef") or {}).get("name") == role["metadata"]["name"]
+                    ]
+                    self.assertEqual(
+                        1, len(bindings),
+                        f"{source}: expected one RoleBinding to {role['metadata']['name']} in "
+                        f"{role['metadata']['namespace']}, found {len(bindings)}",
+                    )
+                    subjects = bindings[0].get("subjects") or []
+                    self.assertTrue(
+                        any(
+                            s.get("kind") == "ServiceAccount" and s.get("namespace") == h.HELM_RENDER_NAMESPACE
+                            and "operator" in s.get("name", "")
+                            for s in subjects
+                        ),
+                        f"{source}: the RoleBinding in {role['metadata']['namespace']} does not bind the "
+                        f"operator's ServiceAccount in {h.HELM_RENDER_NAMESPACE}; subjects={subjects}",
+                    )
 
     def test_C5_no_minted_role_grants_a_write_verb(self) -> None:
         """The agent-side half of A2's intersection, asserted on rendered output.

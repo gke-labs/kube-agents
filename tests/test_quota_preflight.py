@@ -330,6 +330,27 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
         self.assertEqual(totals["80Gi"], 162 * 1024**3)
 
+    def test_an_expected_profile_count_raises_the_agent_claim_alone(self) -> None:
+        """expectedClusterProfiles raises the agent's data claim to 8Gi + N x 400Mi, rounded
+        up to whole GiB, and only when that is above the size; the sandbox claim stays.
+
+        200 profiles is 87Gi: 102Gi + (87 - 50)Gi = 139Gi. 10 profiles is under the
+        default and adds nothing. With size 20Gi, both claims drop 30Gi and the agent's
+        rises back to 87Gi: 102 - 60 + 67 = 109Gi.
+        """
+        gib = 1024**3
+        for sets, want in (
+            (["platformAgent.storage.expectedClusterProfiles=200"], 139 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=10"], _OPERATOR_STORAGE_BYTES),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 109 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=500Gi"],
+             _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (500 - 50) * gib),
+        ):
+            with self.subTest(sets=sets):
+                req = self._requirements(sets)
+                self.assertEqual(req["requestsStorage"], want)
+                self.assertEqual(req["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)
+
     def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
         # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
         quota = [{
@@ -356,7 +377,7 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_exec_tier_replicas_add_one_replica_each(self) -> None:
         """platformAgent.deployment.credentialProxy.exec.replicas adds that many exec-tier
         pods, each at the footprint's per-replica entry (2 CPU and 2Gi requests and limits,
-        and the broker's ephemeral storage); 0 adds nothing."""
+        and the tier's own 2Gi of ephemeral storage); 0 adds nothing."""
         base = self._requirements()
         self.assertEqual(self._requirements([f"{_EXEC_VALUE}=0"]), base)
         three = self._requirements([f"{_EXEC_VALUE}=3"])
@@ -369,35 +390,35 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(per["cpuMillisRequest"], 2000)
         self.assertEqual(three["persistentVolumeClaims"], base["persistentVolumeClaims"])
 
-    def test_exec_tier_follows_a_broker_ephemeral_storage_override(self) -> None:
-        """The operator gives the tier the broker's other resource keys, so a broker
-        ephemeral-storage limit moves every replica (request and limit, as the API server
-        defaults the request to it); the tier's cpu and memory do not move with a cpu or
-        memory override."""
-        ten_gib = 10 * 1024**3
+    def test_a_broker_ephemeral_storage_override_does_not_reach_the_exec_tier(self) -> None:
+        """The tier's ephemeral storage is its own and fixed (#4536), so a broker
+        ephemeral-storage limit leaves every replica at the footprint's 2Gi, request and
+        limit; nor does a cpu or memory override move the tier's cpu and memory."""
+        two_gib = 2 * 1024**3
         override = [f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
         base = self._requirements(override)
         three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
-        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
-        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * two_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         cpu_override = [f"{_PROXY_VALUE}.limits.cpu=3", f"{_PROXY_VALUE}.limits.memory=4Gi"]
         cpu_base = self._requirements(cpu_override)
         cpu_three = self._requirements(cpu_override + [f"{_EXEC_VALUE}=3"])
         self.assertEqual(cpu_three["limitsCpu"] - cpu_base["limitsCpu"], 3 * 2000)
         self.assertEqual(cpu_three["limitsMemory"] - cpu_base["limitsMemory"], 3 * 2 * 1024**3)
 
-    def test_exec_tier_follows_an_ephemeral_storage_override_the_sizing_row_admits(self) -> None:
+    def test_an_ephemeral_storage_override_the_sizing_row_admits_does_not_reach_the_exec_tier(self) -> None:
         """Under fleet, a broker override with a memory request alone above the small
-        row's 2Gi limit (admitted on the fleet row) and an ephemeral-storage limit: the
-        operator gives each exec replica that ephemeral-storage, so the preflight counts
-        it, rather than treating the override as refused against the small row."""
-        ten_gib = 10 * 1024**3
+        row's 2Gi limit (admitted on the fleet row) and an ephemeral-storage limit: each
+        exec replica still counts the footprint's 2Gi of ephemeral storage and 2Gi of
+        memory, and the override is not refused against the small row on the tier's
+        account."""
+        two_gib = 2 * 1024**3
         override = [f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.memory=4Gi",
                     f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
         base = self._requirements(override)
         three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
-        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
-        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * two_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         self.assertEqual(three["limitsMemory"] - base["limitsMemory"], 3 * 2 * 1024**3)
 
     def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
@@ -1015,6 +1036,24 @@ class PreflightDecisionTest(unittest.TestCase):
             delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
         return delta
 
+    def test_a_single_server_bus_is_counted_as_one_server(self) -> None:
+        """footprint.yaml counts the bus at three NATS servers; with
+        platformAgent.harness.tuning.busReplicas: 1 the preflight counts one, so a
+        one-server install is not asked for two more pods' and claims' room."""
+        nats = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aNats"]
+        claims = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["storage"]
+        n = int(nats["pods"])
+        self.assertEqual(n, 3)
+        three = self._requirements(["platformAgent.mode=next"])
+        one = self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=1"])
+        self.assertEqual(three["pods"] - one["pods"], n - 1)
+        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], int(claims["persistentVolumeClaims"]) - 1)
+        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(claims["storageBytesRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsCpu"] - one["requestsCpu"], int(nats["cpuMillisRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsMemory"] - one["requestsMemory"], int(nats["memoryBytesRequest"]) * (n - 1) // n)
+        # Set to 3, or unset, it counts three.
+        self.assertEqual(self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=3"]), three)
+
     def test_mode_next_adds_the_next_mode_footprint(self) -> None:
         """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
         base = self._requirements()
@@ -1024,7 +1063,8 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(following[key] - base[key], value)
         # Not a vacuous zero: the stack is several pods and a JetStream claim.
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
-        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 1)
+        # One JetStream claim per NATS server, three by default.
+        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
 
     def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
         """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
@@ -1167,42 +1207,27 @@ class PreflightDecisionTest(unittest.TestCase):
         door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
         self.assertEqual(self._requirements(values=door), self._requirements())
 
-    def test_mode_next_counts_the_profile_dispatcher_when_its_image_is_set(self) -> None:
-        """The operator renders the dispatcher, in the release namespace, while
-        A2A_DISPATCHER_IMAGE is non-blank (#4808)."""
-        dispatcher = self._flagged()["dispatcher"]
-        self.assertGreater(dispatcher["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
-        for name, env in (
-            ("an image", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/dispatcher:1"}]),
-            ("padded", [{"name": "A2A_DISPATCHER_IMAGE", "value": " example.com/d:1 "}]),
-            ("by valueFrom", [{"name": "A2A_DISPATCHER_IMAGE",
-                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "image"}}}]),
-            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""},
-                             {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]),
-        ):
-            with self.subTest(name):
-                self._assert_counts(self._flagged_delta(env), dispatcher)
+    def test_mode_next_counts_the_profile_dispatcher_by_default(self) -> None:
+        """The operator renders the dispatcher by default under next, so the next-mode golden
+        carries it, footprint.yaml counts it, and files/flagged-pods.yaml no longer lists it."""
+        footprint = yaml.safe_load((_CHART / "files" / "footprint.yaml").read_text())
+        self.assertIn("a2aDispatcher", footprint["nextMode"])
+        self.assertNotIn("dispatcher", self._flagged())
 
-    def test_the_profile_dispatcher_is_not_counted_without_an_image(self) -> None:
-        for name, env in (
-            ("empty", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
-            ("blank, which the operator trims", [{"name": "A2A_DISPATCHER_IMAGE", "value": "   "}]),
-            ("tab and newline", [{"name": "A2A_DISPATCHER_IMAGE", "value": "\t\n"}]),
-            ("no value", [{"name": "A2A_DISPATCHER_IMAGE"}]),
-            ("a null value", [{"name": "A2A_DISPATCHER_IMAGE", "value": None}]),
-            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"},
-                             {"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
-        ):
-            with self.subTest(name):
-                self.assertEqual(set(self._flagged_delta(env).values()), {0})
+    def test_the_profile_dispatcher_count_does_not_follow_its_image_or_its_switch(self) -> None:
+        """An image override changes nothing it counts, and switching the dispatcher off
+        (operator.profileDispatcher.enabled=false) still counts its one pod: an over-count, in the
+        safe direction, which the chart's values comment states."""
+        base = self._requirements(["platformAgent.mode=next"])
         image = {"operator": {"extraEnv": [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]}}
-        self.assertEqual(self._requirements(values=image), self._requirements())
+        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=image), base)
+        off = {"operator": {"profileDispatcher": {"enabled": False}}}
+        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=off), base)
 
-    def test_mode_next_counts_both_flagged_pods_together(self) -> None:
+    def test_mode_next_counts_the_mcp_server_beside_the_dispatcher(self) -> None:
         pods = self._flagged()
-        env = [{"name": "A2A_MCP_DOOR", "value": "true"},
-               {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
-        self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
+        env = [{"name": "A2A_MCP_DOOR", "value": "true"}]
+        self._assert_counts(self._flagged_delta(env), pods["mcp"])
 
     def _scope_publisher(self) -> dict:
         """files/transient-pods.yaml's entry; TestTheChartCountsTheScopePublishersJobPod holds it to the operator."""

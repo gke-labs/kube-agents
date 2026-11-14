@@ -8,49 +8,23 @@ rules:
       - ""
     resources:
       - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
       - persistentvolumeclaims
+      - persistentvolumes
       - pods
+      - pods/log
       - resourcequotas
       - secrets
       - serviceaccounts
       - services
     verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - endpoints
-      - limitranges
-      - namespaces
-      - nodes
-      - persistentvolumes
-      - pods/log
-    verbs:
       - get
       - list
       - watch
-  - apiGroups:
-      - ""
-    resources:
-      - events
-    verbs:
-      - create
-      - get
-      - list
-      - patch
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - podtemplates
-    verbs:
-      - create
   - apiGroups:
       - admissionregistration.k8s.io
     resourceNames:
@@ -72,23 +46,12 @@ rules:
       - apps
     resources:
       - daemonsets
-      - replicasets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - apps
-    resources:
       - deployments
+      - replicasets
       - statefulsets
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - argoproj.io
@@ -116,21 +79,10 @@ rules:
       - batch
     resources:
       - cronjobs
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - batch
-    resources:
       - jobs
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - configsync.gke.io
@@ -146,17 +98,14 @@ rules:
     resources:
       - leases
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - tiers
     verbs:
       - get
       - list
@@ -165,15 +114,36 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins/status
-      - agentprofiles/status
     verbs:
       - get
       - patch
-      - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
       - agentprofiles
+    verbs:
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agentprofiles/status
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - dispatchjobtemplates
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - platformagents
       - platformagents/status
     verbs:
       - get
@@ -184,33 +154,17 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - agentprofiles/finalizers
       - platformagents/finalizers
     verbs:
       - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - dispatchjobtemplates
+      - tiers/status
     verbs:
-      - create
-      - delete
       - get
-      - list
       - patch
       - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
-      - platformagents
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
   - apiGroups:
       - kustomize.toolkit.fluxcd.io
     resources:
@@ -233,32 +187,17 @@ rules:
     resources:
       - fqdnnetworkpolicies
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - networking.k8s.io
     resources:
       - ingresses
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - networking.k8s.io
-    resources:
       - networkpolicies
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - node.k8s.io
@@ -273,20 +212,14 @@ rules:
     resources:
       - poddisruptionbudgets
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - rbac.authorization.k8s.io
     resources:
       - clusterrolebindings
       - clusterroles
-      - rolebindings
-      - roles
     verbs:
       - create
       - delete
@@ -304,6 +237,15 @@ rules:
     verbs:
       - bind
   - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - rolebindings
+      - roles
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - source.toolkit.fluxcd.io
     resources:
       - gitrepositories
@@ -318,3 +260,112 @@ rules:
       - storageclasses
     verbs:
       - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manager-role
+  namespace: kubeagents-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - persistentvolumeclaims
+      - pods
+      - resourcequotas
+      - secrets
+      - serviceaccounts
+      - services
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - podtemplates
+    verbs:
+      - create
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - statefulsets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - dispatchjobtemplates
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - networking.gke.io
+    resources:
+      - fqdnnetworkpolicies
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - rolebindings
+      - roles
+    verbs:
+      - create
+      - delete
+      - patch
+      - update

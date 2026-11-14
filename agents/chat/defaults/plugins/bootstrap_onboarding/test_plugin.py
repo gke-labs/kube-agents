@@ -1009,6 +1009,20 @@ class ConversationPrimingTest(unittest.TestCase):
         record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["conversation"], "gchat:spaces/S/threads/T")
 
+    def test_a_gateway_serving_a_list_primes_a_google_chat_route_on_it(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "google_chat",
+                                     "conversation": "gchat:spaces/S/threads/T"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack,google_chat"}):
+            self.assertIsNotNone(self._bridge_call())
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], "gchat:spaces/S/threads/T")
+
+    def test_a_gateway_serving_a_list_primes_a_slack_route_on_it(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack,google_chat"}):
+            self.assertIsNotNone(self._bridge_call())
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], SLACK_ROUTE["conversation"])
+
     def test_an_api_server_turn_with_no_route_is_ignored(self):
         # The bench, curl, and the inject and A2A doors: no chat conversation behind the session.
         self.assertIsNone(self._bridge_call(session_id="a2a-ctx-inject-only"))
@@ -1031,6 +1045,23 @@ class ConversationPrimingTest(unittest.TestCase):
             with self.subTest(served=served), mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": served}):
                 self.assertIsNone(self._bridge_call())
                 self._assert_unprimed()
+
+    def test_a_gateway_serving_only_slack_leaves_a_google_chat_route_unprimed(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "google_chat",
+                                     "conversation": "gchat:spaces/S/threads/T"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack"}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+        warning = next(line for line in logs.output if "does not serve" in line)
+        self.assertIn("A2A_NOTIFY_CONVERSATIONS=slack)", warning, "the warning names the served list")
+
+    def test_an_empty_served_list_logs_as_unset(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": ""}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._bridge_call())
+        warning = next(line for line in logs.output if "does not serve" in line)
+        self.assertIn("A2A_NOTIFY_CONVERSATIONS=<unset>)", warning)
 
     def test_chat_notify_is_loaded_once(self):
         with mock.patch.object(plugin, "_load_image_module", wraps=plugin._load_image_module) as load:

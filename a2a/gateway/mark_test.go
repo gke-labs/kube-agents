@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -391,5 +392,62 @@ func TestMarkExpiredHoldIsToldWithoutAChangingDraw(t *testing.T) {
 	g.applyTerminalMark(rec, "b", lib.StateCompleted)
 	if want := []string{"slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
 		t.Errorf("MarkChanged = %v, want %v (the expired hold told)", obs.changes, want)
+	}
+}
+
+// An ask is marked with its kind the moment its task is accepted, so a turn
+// that answers before the executor's first heartbeat still shows it, and the
+// terminal's default takes it off as before.
+func TestMarkArrivalDrawsTheAsksKindAtOnce(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/20.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "20.0"}}}
+	if drawn, landed := g.drawArrivalMark(rec, "h", "<@UBOT> are all my clusters on the latest version?"); !drawn || !landed {
+		t.Fatalf("the arrival drew %v, landed %v; want both", drawn, landed)
+	}
+	// The executor's first heartbeat carries the same kind: nothing to redraw.
+	g.applyTaskMark(rec, "h", MarkState{Ask: "upgrade"})
+	g.applyTerminalMark(rec, "h", lib.StateCompleted)
+	want := []string{"slack:C1/20.0 +upgrade@20.0", "slack:C1/20.0 -upgrade@20.0"}
+	if got := obs.reactionCalls(); !slices.Equal(got, want) {
+		t.Errorf("reactions = %v, want %v", got, want)
+	}
+	if want := []string{"slack:C1/20.0 upgrade/", "slack:C1/20.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v", obs.changes, want)
+	}
+}
+
+// A continued chain keeps the mark it carried, and a task with no ask
+// message draws nothing. (A child or a wake never calls it: startTaskWith
+// draws only for a task with no role.)
+func TestMarkArrivalLeavesAnythingButAFreshAsk(t *testing.T) {
+	g, obs := markRig()
+	held := &MarkState{Ask: "question", Settle: markSettleBlocked}
+	rec := &SessionRecord{Key: "slack:C1/30.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "30.0", Mark: held},
+	}}
+	rec2 := chainRecord()
+	rec3 := &SessionRecord{Key: "slack:C1/40.0", Tasks: []TaskRef{{ID: "n", RootTaskID: "n"}}}
+	drew := func(rec *SessionRecord, id, text string) bool { d, _ := g.drawArrivalMark(rec, id, text); return d }
+	if drew(rec, "a", "why is checkout slow?") || drew(rec2, "h", "x") || drew(rec3, "n", "why?") {
+		t.Fatal("drew on something that is not a fresh ask")
+	}
+	if got := obs.reactionCalls(); len(got) != 0 {
+		t.Errorf("reactions = %v, want none (a held mark, a minting turn, no ask message)", got)
+	}
+}
+
+// refusingReactions is an adapter whose reactions calls fail, as a missing
+// reactions:write scope does.
+type refusingReactions struct{ *fakeAdapter }
+
+func (refusingReactions) React(string, string, string) error { return errors.New("missing_scope") }
+
+// A reaction whose call failed is drawn in the record (the state advances, as
+// for every mark) but has not landed, so it is not counted as a receipt.
+func TestMarkArrivalReportsAReactionThatDidNotLand(t *testing.T) {
+	g := &Gateway{adapter: refusingReactions{newFakeAdapter()}, log: slog.Default(), metrics: NewMetrics()}
+	rec := &SessionRecord{Key: "slack:C1/50.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "50.0"}}}
+	if drawn, landed := g.drawArrivalMark(rec, "h", "what is 2 + 3?"); !drawn || landed {
+		t.Fatalf("drawn %v, landed %v; want drawn and not landed", drawn, landed)
 	}
 }

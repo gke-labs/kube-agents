@@ -25,6 +25,7 @@ import functools
 import json
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -212,8 +213,15 @@ SOURCES: dict[str, Source] = {
         # (system:auth-delegator), and A4 is once again a statement about how
         # that bind is bounded rather than about its absence. Deleting the
         # scoping is the mutation this anchor exists to make loud.
+        #
+        # "kind: Role" is the second document: the operator's write verbs on
+        # every namespaced kind it renders, rendered as a namespaced Role by
+        # the markers that carry `namespace=`. C5 asserts the ClusterRole
+        # grants no write verb on any of them,
+        # and that assertion is vacuous the day the Role document disappears
+        # with the grant moved back.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings", "resourceNames"),
+        ("clusterrolebindings", "resourceNames", "kind: Role"),
     ),
     # The other Role a kustomize install ships. role.yaml is the operator's
     # ClusterRole and was for a long time the only RBAC A4 read; this one is
@@ -230,7 +238,9 @@ SOURCES: dict[str, Source] = {
         # is anchored too because it is the chart's RBAC object OUTSIDE that
         # block -- the one `make chart-sync` does not manage and a
         # block-scoped parse never reached.
-        ("END GENERATED RULES", "operator-leader-election-role"),
+        # The namespaced block is the chart's copy of role.yaml's Role
+        # document (the write verbs on every rendered kind); C5 reads it.
+        ("END GENERATED RULES", "operator-leader-election-role", "END GENERATED NAMESPACED RULES"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -248,6 +258,19 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
         ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
     ),
+    # C1 reads the guard on the hindsight-postgresql NetworkPolicy, the only
+    # thing between a passwordless Postgres and the namespace. The template
+    # carries multi-line Helm comments, which helm_documents() cannot read, so
+    # the test slices the policy's block by these anchors instead.
+    "chart_hindsight": Source(
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "$postgresqlNetworkPolicy :=",
+            "{{- if $postgresqlNetworkPolicy }}",
+            "name: hindsight-postgresql",
+            "POSTGRES_HOST_AUTH_METHOD",
+        ),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",
@@ -260,6 +283,16 @@ SOURCES: dict[str, Source] = {
     "golden_default": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
+    ),
+    # The spec.mode: next fixture: the only golden that renders the roles the
+    # operator mints for the A2A stack (the A2A gateway's and the auth
+    # callout's, and the dispatcher's once it renders by default). Not in
+    # _GOLDEN_KEYS: the today-mode invariants that walk those don't hold for
+    # next by design, so a test that wants it reads it by name.
+    "golden_next": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-next.yaml",
+        ("name: platformagent-a2a-gateway", "name: platformagent-a2a-callout"),
     ),
     "golden_scoped_sa": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
@@ -623,7 +656,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("func delegateToolSchema(", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", 'required := []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the
@@ -815,6 +848,20 @@ def site_pages() -> list[Path]:
 
 _HELM_DIRECTIVE = re.compile(r"^\s*\{\{-?.*-?\}\}\s*$")
 
+# A rendered chart, for the assertions a text read of a template cannot make:
+# `helm_documents` drops every template line, so a `range` collapses to one
+# object and rules that arrive through an `include` vanish. The release name
+# and namespace are the install defaults; the three harness values are the
+# ones the chart's schema requires before it renders at all.
+HELM_CHART_DIR = "charts/kube-agents"
+HELM_RELEASE_NAME = "kube-agents"
+HELM_RENDER_NAMESPACE = "kubeagents-system"
+HELM_REQUIRED_SETS = (
+    "platformAgent.harness.clusterName=ci-cluster",
+    "platformAgent.harness.location=us-central1",
+    "platformAgent.harness.projectId=ci-project",
+)
+
 
 @functools.lru_cache(maxsize=None)
 def yaml_documents(name: str) -> tuple[dict, ...]:
@@ -870,6 +917,27 @@ def helm_documents(name: str) -> tuple[dict, ...]:
     )
     body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
+@functools.lru_cache(maxsize=None)
+def helm_rendered(*sets: str) -> tuple[dict, ...]:
+    """Every object `helm template` renders for the chart, with `sets` as extra `--set` values.
+
+    The rendered form, where the text reader above cannot see: a Role rendered
+    once per namespace from a `range`, or rules that come through an `include`.
+    Raises rather than returning () when helm is missing or refuses the values,
+    so a test asserting on the render never passes on nothing.
+    """
+    command = ["helm", "template", HELM_RELEASE_NAME, str(REPO_ROOT / HELM_CHART_DIR), "-n", HELM_RENDER_NAMESPACE]
+    for value in (*HELM_REQUIRED_SETS, *sets):
+        command += ["--set", value]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(f"helm template failed ({proc.returncode}): {proc.stderr.strip()}")
+    documents = tuple(d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict))
+    if not documents:
+        raise AssertionError("helm template rendered no object; the chart is empty or the values gate everything off")
+    return documents
 
 
 def golden_documents() -> dict[str, tuple[dict, ...]]:

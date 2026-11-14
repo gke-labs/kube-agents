@@ -78,7 +78,7 @@ func observedGenerationReconciler(agent *agentv1alpha1.PlatformAgent, counter *s
 func settleReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRBACSkewConditionCarriesTheGenerationButDoesNotClaimIt(t *testing.T) {
 	agent := observedGenerationAgent(4)
 	r := observedGenerationReconciler(agent, &statusWriteCounter{})
 	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
-	r.RBAC = NewRBACChecker(authorizer.reviews())
+	r.RBAC = NewRBACChecker(authorizer.reviews(), "")
 	ctx := context.Background()
 	if _, err := r.RBAC.Probe(ctx); err != nil {
 		t.Fatalf("boot probe: %v", err)

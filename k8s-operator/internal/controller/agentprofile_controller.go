@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -101,6 +102,9 @@ const (
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
 	reasonAgentProfileNamespaceAbsent = "ProfileNamespaceAbsent"
+	// reasonAgentProfileDispatcherCeiling: the profile is newer than the ones
+	// the dispatcher's identity can carry (refuseOverDispatcherCeiling).
+	reasonAgentProfileDispatcherCeiling = "DispatcherCeiling"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.
@@ -114,9 +118,16 @@ type AgentProfileReconciler struct {
 	Cards cardPublisher
 }
 
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/finalizers,verbs=update
+// Every verb has a caller (tests/test_operator_secrets_grant.py names them): the reads are the
+// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch,
+// the one write to the profile itself (an Update would drop spec fields a newer CRD added,
+// which is why there is no `update` here); the status is written with Status().Update. There
+// is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
+// reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
+// owner-references admission never asks for it, and the finalizer itself is a field of the
+// main resource, written by the merge patch above.
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -166,11 +177,10 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !profile.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, &profile, agent)
 	}
-	if controllerutil.AddFinalizer(&profile, agentProfileFinalizer) {
-		if err := r.Update(ctx, &profile); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+	if added, err := r.patchFinalizers(ctx, &profile, func(o client.Object) bool {
+		return controllerutil.AddFinalizer(o, agentProfileFinalizer)
+	}); err != nil || added {
+		return ctrl.Result{Requeue: added}, err
 	}
 
 	var all agentv1alpha1.AgentProfileList
@@ -182,7 +192,14 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
 		return ctrl.Result{}, err
 	}
-	resolution := resolveAgentProfileIdentities(agent, all.Items)[profile.Name]
+	// Resolved over the same set the PlatformAgent renders from, so the two
+	// controllers cut at the same profile. This profile, if foreign, isn't in
+	// it and gets its refusal just below.
+	bound, err := withoutForeignServiceAccounts(ctx, r.Client, all.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resolution := resolveAgentProfileIdentities(agent, bound)[profile.Name]
 	profilesNS := profileNamespaceOf(&profile)
 	if resolution.refused == nil {
 		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
@@ -309,10 +326,10 @@ func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1al
 		return err
 	}
 	if !p.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(p, agentProfileFinalizer) {
-			return r.Update(ctx, p)
-		}
-		return nil
+		_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+			return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+		})
+		return err
 	}
 	return r.writeStatus(ctx, p, agent, "", reason, msg, reason, msg, false)
 }
@@ -337,8 +354,24 @@ func (r *AgentProfileReconciler) finalize(ctx context.Context, p *agentv1alpha1.
 	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
 		return ctrl.Result{}, err
 	}
-	controllerutil.RemoveFinalizer(p, agentProfileFinalizer)
-	return ctrl.Result{}, r.Update(ctx, p)
+	_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+		return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+	})
+	return ctrl.Result{}, err
+}
+
+// patchFinalizers applies change to p's finalizers and, when it changed them,
+// writes them alone as a merge patch. An Update would send back the whole
+// object as this operator's Go type knows it, and so drop any spec field a
+// newer CRD added: an older operator adding its finalizer to a profile created
+// in the same upgrade stripped yieldToPinned that way (#5435). The optimistic
+// lock keeps Update's conflict on a stale read.
+func (r *AgentProfileReconciler) patchFinalizers(ctx context.Context, p *agentv1alpha1.AgentProfile, change func(client.Object) bool) (bool, error) {
+	before := p.DeepCopy()
+	if !change(p) {
+		return false, nil
+	}
+	return true, r.Patch(ctx, p, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *AgentProfileReconciler) cards() cardPublisher {
@@ -499,6 +532,24 @@ func (r *AgentProfileReconciler) deleteProfileServiceAccounts(ctx context.Contex
 	return nil
 }
 
+// profileServiceAccountRequests is what a ServiceAccount event in a profile
+// namespace re-reconciles. One named like a profile's (the per-tier prefix)
+// may be one a profile would land on and doesn't own, whatever its labels say
+// (agentProfileServiceAccountIsForeign checks the name label and the UID
+// annotation), and that refuses the profile and so moves the dispatcher
+// ceiling's cut for every newer one: it re-reconciles every profile in the
+// agent's namespace, as the PlatformAgent's watch re-reconciles its agent.
+// Any other name maps to its labelled profile, if any.
+func profileServiceAccountRequests(ctx context.Context, c client.Reader, obj client.Object) []reconcile.Request {
+	if strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix) {
+		if agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace()); ok {
+			return agentProfileRequestsIn(ctx, c, agentNS)
+		}
+		return nil
+	}
+	return profileServiceAccountRequest(obj)
+}
+
 // profileServiceAccountRequest maps a ServiceAccount in a profile namespace,
 // labelled with a profile's name, to that profile in the agent's namespace.
 // Anything else maps to nothing. A label someone copied only costs a
@@ -646,11 +697,14 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// The legacy agent-namespace ServiceAccount (deleteOwnServiceAccount).
 		Owns(&corev1.ServiceAccount{}).
 		// The per-tier ServiceAccounts carry no owner reference, so they map
-		// back to their profile by name label and namespace.
+		// back to their profile by namespace; one named like a profile's may be
+		// a foreign one that refuses a profile and moves the dispatcher
+		// ceiling's cut, so it re-reconciles every profile in the namespace
+		// (profileServiceAccountRequests).
 		Watches(
 			&corev1.ServiceAccount{},
-			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-				return profileServiceAccountRequest(obj)
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return profileServiceAccountRequests(ctx, mgr.GetClient(), obj)
 			}),
 		).
 		Watches(

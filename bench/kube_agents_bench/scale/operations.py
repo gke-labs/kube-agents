@@ -144,10 +144,13 @@ JOB_UNCLAIMED = "unclaimed"
 # A run line's fields after the job id (status, finished, started), and how Python prints a missing one.
 JOB_RUN_FIELDS = 3
 PYTHON_NONE = "None"
-# What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
-RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
-RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
-NATS_POD = "platform-agent-a2a-nats-0"
+# The bus runs up to three NATS servers (one with spec.harness.tuning.busReplicas: 1).
+NATS_PODS = tuple(f"platform-agent-a2a-nats-{i}" for i in range(3))
+NATS_POD = NATS_PODS[0]
+# What a new install starts without: the agent's data and session metadata, the shell's data, every bus server's data.
+RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0",
+                *(f"data-{pod}" for pod in NATS_PODS))
+RESET_STATEFUL_PODS = ("platform-agent-shell-0",)
 PROVISION_JOB_FRAGMENT = "a2a-provision"
 
 
@@ -497,16 +500,22 @@ def reset(context: str, namespace: str) -> None:
     """
     for claim in RESET_CLAIMS:
         kube.kubectl(context, "delete", "pvc", claim, "-n", namespace, "--wait=false", "--ignore-not-found")
-    has_bus = bool(kube.kubectl(context, "get", "pod", NATS_POD, "-n", namespace, "--ignore-not-found", "-o", "name").strip())
+    servers = [pod for pod in NATS_PODS
+               if kube.kubectl(context, "get", "pod", pod, "-n", namespace, "--ignore-not-found", "-o", "name").strip()]
     for pod in RESET_STATEFUL_PODS:
         kube.kubectl(context, "delete", "pod", pod, "-n", namespace, "--wait=true", "--ignore-not-found",
                      timeout=RESET_TIMEOUT_SECONDS)
-    if not has_bus:  # a mode-today install runs no bus
+    if not servers:  # a mode-today install runs no bus
         restart(context, namespace)
         return
+    # Every server at once: one left running would copy its streams back to the emptied ones, and the
+    # "first run" would start on the previous run's state.
+    kube.kubectl(context, "delete", "pod", *servers, "-n", namespace, "--wait=true", "--ignore-not-found",
+                 timeout=RESET_TIMEOUT_SECONDS)
     # An empty bus has none of its JetStream buckets; the install creates them with a provision Job,
     # which the operator renders again once the completed one is deleted.
-    _wait_pod_ready(context, namespace, NATS_POD)
+    for pod in servers:
+        _wait_pod_ready(context, namespace, pod)
     jobs = kube.kubectl(context, "get", "jobs", "-n", namespace, "--no-headers", "-o", "name")
     for job in (line.strip() for line in jobs.splitlines()):
         if PROVISION_JOB_FRAGMENT in job:

@@ -47,8 +47,9 @@ limitations under the License.
 // those, through a route limited to this console's own session IDs.
 //
 // Three read routes sit beside the chat. GET /api/insights (insights.go)
-// returns the model, LiteLLM's token and spend counters, the agent's identity
-// as recorded at install, and the cluster. GET /api/sessions/{id}/transcript
+// returns the model, the token and spend totals (the operator's since-install
+// figures off the PlatformAgent status when readable, LiteLLM's own counters
+// otherwise), the agent's identity as recorded at install, and the cluster. GET /api/sessions/{id}/transcript
 // (activity.go) returns the text of an event triage, scheduled check or
 // console session, and refuses every other session, Slack and Google Chat
 // included. GET /api/channels/{name}/posts (channels.go) lists the event
@@ -123,6 +124,13 @@ const (
 	envGitOpsRepos = "GITOPS_REPOS"
 	// maxGitOpsRepos bounds the list read from the environment.
 	maxGitOpsRepos = 50
+	// The Bitbucket providers repositoryURL browses on their own rules:
+	// Bitbucket Cloud on bitbucket.org, and Data Center, which has no default
+	// host, on its project and repository path.
+	providerBitbucket           = "bitbucket"
+	providerBitbucketDataCenter = "bitbucket-datacenter"
+	bitbucketCloudHost          = "bitbucket.org"
+	bitbucketDataCenterRepoPath = "/projects/%s/repos/%s"
 
 	// turnTimeout matches the in-tree callers of the same endpoint
 	// (session_kv_server.py's _start_agent_turn): a diagnostic turn that
@@ -375,30 +383,41 @@ func parseRepositories(raw string) []repositoryInfo {
 // ssh:// or git:// remote, an scp remote (git@host:owner/repo) and a
 // schemeless host/owner/repo are reduced to host and path and browsed over
 // https; owner/name goes on the declared host or the provider's default.
+// Bitbucket Data Center has no default host and browses at
+// /projects/<PROJECT>/repos/<repo>; no link when either is missing.
 func repositoryURL(r repositoryInfo) string {
 	repo := strings.TrimSuffix(r.Repository, ".git")
-	host := r.Host
+	host := browseHost(r.Provider, r.Host)
+	browseScheme := ""
 	if scheme, _, isURL := strings.Cut(repo, "://"); isURL {
-		if browseSchemes[strings.ToLower(scheme)] {
+		web := browseSchemes[strings.ToLower(scheme)]
+		if web && r.Provider != providerBitbucketDataCenter {
 			return repo
 		}
 		u, err := url.Parse(repo)
 		if err != nil || u.Hostname() == "" {
 			return ""
 		}
-		host, repo = u.Hostname(), u.Path
+		host, repo = browseHost(r.Provider, u.Hostname()), u.Path
+		if web {
+			// A Data Center clone URL (https://<host>/<PROJECT>/<repo>) is
+			// browsed on the same scheme and port, at its browse path.
+			browseScheme, host = strings.ToLower(u.Scheme), strings.ToLower(u.Host)
+		}
 	} else if m := scpRemotePattern.FindStringSubmatch(repo); m != nil && !portPathPattern.MatchString(m[2]) {
-		host, repo = m[1], m[2]
-	} else if first, rest, ok := strings.Cut(repo, "/"); ok && strings.Contains(first, ".") && strings.Contains(rest, "/") && (host == "" || first == host) {
-		host, repo = first, rest
+		host, repo = browseHost(r.Provider, m[1]), m[2]
+	} else if first, rest, ok := strings.Cut(repo, "/"); ok && strings.Contains(first, ".") && strings.Contains(rest, "/") && (host == "" || browseHost(r.Provider, first) == host) {
+		host, repo = browseHost(r.Provider, first), rest
 	}
 	scheme := "https"
 	if host == "" {
 		switch r.Provider {
 		case "gitlab":
 			host = "gitlab.com"
-		case "gitea":
+		case "gitea", providerBitbucketDataCenter:
 			return ""
+		case providerBitbucket:
+			host = bitbucketCloudHost
 		default:
 			host = "github.com"
 		}
@@ -406,7 +425,46 @@ func repositoryURL(r repositoryInfo) string {
 	if strings.HasSuffix(host, ".svc.cluster.local") || strings.Contains(host, ".svc.cluster.local:") {
 		scheme = "http"
 	}
+	if browseScheme != "" {
+		scheme = browseScheme
+	}
+	if r.Provider == providerBitbucketDataCenter {
+		// Data Center browses a repository by project key and slug, so the
+		// path has to be exactly those two.
+		project, slug, ok := strings.Cut(strings.Trim(repo, "/"), "/")
+		if !ok || project == "" || slug == "" || strings.Contains(slug, "/") {
+			return ""
+		}
+		return scheme + "://" + host + fmt.Sprintf(bitbucketDataCenterRepoPath, project, slug)
+	}
 	return scheme + "://" + host + "/" + strings.Trim(repo, "/")
+}
+
+// providerHostSpellings are each provider's own host spellings; the first is
+// its default host. They are the Hosts and DefaultHost tables of the
+// operator's k8s-operator/api/v1alpha1/gitprovider.go, which folds a host the
+// same way (canonicalHost): keep the two in step.
+var providerHostSpellings = map[string][]string{
+	"github":          {"github.com", "www.github.com", "ssh.github.com"},
+	"gitlab":          {"gitlab.com", "www.gitlab.com"},
+	providerBitbucket: {bitbucketCloudHost, "www.bitbucket.org"},
+}
+
+// browseHost is host as the operator reads it for provider: lowercased (a
+// port stays), and one of the provider's own spellings folded to its default
+// host. An empty provider is github, as on the PlatformAgent.
+func browseHost(provider, host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if provider == "" {
+		provider = "github"
+	}
+	spellings := providerHostSpellings[provider]
+	for _, h := range spellings {
+		if host == h {
+			return spellings[0]
+		}
+	}
+	return host
 }
 
 // splitList splits a separated list, trimming each item and dropping empty
@@ -450,8 +508,9 @@ type server struct {
 
 	summaries summaryCache
 
-	// kube reads the Kubernetes API for /api/environment; nil when the pod
-	// has no service account token. environment caches the last read.
+	// kube reads the Kubernetes API for /api/environment and the
+	// PlatformAgent's usage totals for /api/insights; nil when the pod has no
+	// service account token. environment caches the last read.
 	kube        *kubeClient
 	environment environmentCache
 
@@ -1419,7 +1478,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 		}
 		reader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader) // #nosec G704 -- the host is HERMES_URL, the console's own gateway address; a request-supplied path segment is PathEscape'd by its caller
 	if err != nil {
 		return nil, err
 	}
@@ -1429,7 +1488,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 	if s.cfg.APIServerKey != "" {
 		req.Header.Set("Authorization", bearerPrefix+s.cfg.APIServerKey)
 	}
-	return s.client.Do(req)
+	return s.client.Do(req) // #nosec G704 -- same URL as above
 }
 
 type upstreamError struct {

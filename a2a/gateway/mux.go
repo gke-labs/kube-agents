@@ -20,13 +20,40 @@ const (
 	// token settles into one attempt a minute.
 	muxRestartBase = time.Second
 	muxRestartMax  = time.Minute
+
+	// muxUnknownBackendFormat refuses a direct-message user id whose
+	// backend prefix names no backend the mux runs.
+	muxUnknownBackendFormat = "multi adapter: no backend %q for a direct message"
 )
+
+// errNoPrimaryBackend refuses a bare direct-message user id when the mux runs
+// more than one real backend and so has no primary to send it to.
+var errNoPrimaryBackend = errors.New("multi adapter: a direct message needs a backend-qualified user id (<backend>:<id>) when no single backend is primary")
+
+// knownBackendName reports whether name is a backend prefix OpenDirect
+// refuses by name when the mux does not run it, rather than hand the id whole
+// to the primary. The names are backendArms' rows plus the console.
+func knownBackendName(name string) bool {
+	if name == consoleBackend {
+		return true
+	}
+	for _, arm := range backendArms {
+		if arm.name == name {
+			return true
+		}
+	}
+	return false
+}
 
 // MultiAdapter presents several backends to the gateway as one Adapter.
 // Conversation ids are backend-qualified by convention (discord:…, gchat:…,
 // console:…), so every per-conversation operation dispatches on the prefix.
-// OpenDirect takes a user id with no prefix and goes to the primary backend,
-// the one the process was configured for.
+// OpenDirect takes a backend-qualified user id (slack:U1) and goes to that
+// backend with the bare id. A prefix that names a chat backend the mux does
+// not run is refused by name. Any other id goes whole to the primary
+// backend, the one real backend when the process runs only one, and is
+// refused when there is no primary. Run stamps every inbound message that
+// names no backend with the key of the backend that delivered it.
 //
 // One backend is essential: when it stops, Run returns and the process
 // restarts. Every other backend is contained: when it stops, Run logs it and
@@ -44,10 +71,10 @@ type MultiAdapter struct {
 	after                   func(time.Duration) <-chan time.Time
 }
 
-// NewMultiAdapter builds the mux. primary and essential must both be keys of
-// byPrefix.
+// NewMultiAdapter builds the mux. essential must be a key of byPrefix, and so
+// must primary unless it is "", which means no single backend is primary.
 func NewMultiAdapter(primary, essential string, byPrefix map[string]Adapter, log *slog.Logger) (*MultiAdapter, error) {
-	if _, ok := byPrefix[primary]; !ok {
+	if _, ok := byPrefix[primary]; primary != "" && !ok {
 		return nil, fmt.Errorf("multi adapter: primary backend %q is not configured", primary)
 	}
 	if _, ok := byPrefix[essential]; !ok {
@@ -99,11 +126,17 @@ func (m *MultiAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 		wg.Add(1)
 		go func(name string, a Adapter) {
 			defer wg.Done()
+			stamped := func(msg InboundMessage) {
+				if msg.Backend == "" {
+					msg.Backend = name
+				}
+				handler(msg)
+			}
 			if name == m.essential {
-				essentialDone <- stopped(ctx, name, a.Run(ctx, handler))
+				essentialDone <- stopped(ctx, name, a.Run(ctx, stamped))
 				return
 			}
-			m.runContained(ctx, name, a, handler)
+			m.runContained(ctx, name, a, stamped)
 		}(name, a)
 	}
 	var err error
@@ -209,7 +242,31 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 	return a.Roster(conversation)
 }
 
+// OpenDirect opens a direct message with a backend-qualified user id
+// (<backend>:<id>) on that backend, with the bare id. A prefix that names a
+// chat backend the mux knows (gchat, slack, discord, console) but does not
+// run (slack:U1 on a gateway without Slack) is refused by name, on any mux.
+// On a mux with several real backends a caller must qualify the id: a bare
+// id, or one whose prefix names no backend the mux runs, is refused. A mux
+// with a single real backend takes any id that backend understands: an id
+// whose prefix is no backend name (a Slack guest id from another workspace is
+// itself T…:U…) goes whole to the primary, as a bare id does.
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
+	backend, id, qualified := strings.Cut(userID, ":")
+	if qualified {
+		if a, armed := m.byPrefix[backend]; armed {
+			return a.OpenDirect(id)
+		}
+		if knownBackendName(backend) {
+			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
+		}
+	}
+	if m.primary == "" {
+		if qualified {
+			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
+		}
+		return "", errNoPrimaryBackend
+	}
 	return m.byPrefix[m.primary].OpenDirect(userID)
 }
 
@@ -263,6 +320,32 @@ func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
 	}
 	shower, ok := a.(StatusShower)
 	return ok && shower.ShowsTaskStatus(conversation)
+}
+
+// PostPrivate goes to the backend that owns the conversation
+// (PrivatePoster); one that has no private post answers errNoPrivatePosts.
+func (m *MultiAdapter) PostPrivate(conversation, viewer, text string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(PrivatePoster)
+	if !ok {
+		return errNoPrivatePosts
+	}
+	return poster.PostPrivate(conversation, viewer, text)
+}
+
+// AnswersOnLine answers for the backend that owns the conversation
+// (LineAnswerer); one that does not implement it keeps the post and the
+// terminal edit.
+func (m *MultiAdapter) AnswersOnLine(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	answerer, ok := a.(LineAnswerer)
+	return ok && answerer.AnswersOnLine(conversation)
 }
 
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {

@@ -160,6 +160,7 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	cfg := &Config{
 		NATSURL:          s.ClientURL(),
 		PrincipalMapPath: filepath.Join(t.TempDir(), "absent"),
+		DiscordToken:     "x",
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
@@ -176,6 +177,7 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 // out as a notice on chat.console.<token>.out. Here the backend takes no
 // terminal frames, so the answer goes nowhere on the console subject at all.
 func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
@@ -212,6 +214,7 @@ func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 // learn the task died. The notice goes out whatever the backend does with
 // terminal frames; this one takes none.
 func TestConsoleStillGetsTerminalNotices(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
@@ -237,6 +240,7 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 // task, so a console client (the MCP server) reads it there. It is
 // still never a notice.
 func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -272,6 +276,7 @@ func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 // one that did not leaves the field off (TestAConsoleAnswerIsATerminalFrame
 // pins that), and the client need not wait.
 func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -295,6 +300,7 @@ func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
 // A failure on a console conversation is a terminal frame too, carrying the
 // notice text.
 func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -322,6 +328,7 @@ func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
 // the relay saw it too, so the heal's frame repeats the relay's for the same
 // task, which a client drops on its repeated id.
 func TestAHealedConsoleTaskIsAFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -355,6 +362,7 @@ func TestAHealedConsoleTaskIsAFrame(t *testing.T) {
 // that delegated or for its child, and one for the wake's end, under the task
 // the turn started (observedAs), as every observer is told.
 func TestAConsoleDelegationChainEndsInOneFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-chain"
@@ -376,6 +384,7 @@ func TestAConsoleDelegationChainEndsInOneFrame(t *testing.T) {
 // reason, though its executor said completed: the hand-off line ("delegated
 // to ...") is never an answer (handOffEnd).
 func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-handoff"
@@ -393,7 +402,8 @@ func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
 	waitFor(t, "the frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
 	got := r.adapter.terminalPosts()
 	if len(got) != 1 || got[0].TaskID != origin.TaskID || got[0].State != lib.StateFailed ||
-		!strings.HasPrefix(got[0].Text, "❌ failed: ") || !strings.Contains(got[0].Text, "delegation refused") ||
+		got[0].Text != "❌ failed — "+reasonSentences["delegation-refused"] ||
+		strings.Contains(got[0].Text, reasonPrefix) ||
 		strings.Contains(got[0].Text, "delegated to nobody-here") {
 		t.Fatalf("terminal frames = %+v, want one failed frame for %s with the reason", got, origin.TaskID)
 	}
@@ -402,6 +412,7 @@ func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
 // A chat conversation's terminals are notices as before: the relay asks for
 // a terminal frame only on a console conversation.
 func TestAChatConversationGetsNoTerminalFrames(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	conv := "discord:g1/c-terminal"
@@ -419,6 +430,7 @@ func TestAChatConversationGetsNoTerminalFrames(t *testing.T) {
 // back from the stream: the render state that held it is gone, and the frame
 // carries the answer, not the non-text stand-in.
 func TestAConsoleAnswerSurvivesLostRenderState(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	r.adapter.roster = []string{consoleAuthor}
 	conv := "console:tab-lost"
@@ -612,6 +624,7 @@ func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
 // report's replyTo is mapped to the root. A task the record does not hold
 // passes through unchanged.
 func TestAConsoleReportFromADelegatedChildRepliesToTheRoot(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := consoleKeyPrefix + "t-replyto"
 	origin, _, child := delegated(t, r, spawn, conv, "")
@@ -657,6 +670,7 @@ func TestAConsoleGatewayDeclaredEndIsWordedBySource(t *testing.T) {
 // handoff marks the chain's root, and the chain's one frame (the wake's end,
 // under the root) carries cardsPending.
 func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-chain-cards"
@@ -680,6 +694,7 @@ func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
 // The heal reads the task's fold from the stream, handoff included, so a
 // frame it produces carries cardsPending as the relay's does.
 func TestAHealedConsoleTaskThatFiledCardsSaysSo(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}

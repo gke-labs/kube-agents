@@ -86,11 +86,9 @@ default, set something distinctly different, then revert and confirm it goes bac
 Say plainly what you could NOT cover and why, and confirm any test artifacts were
 cleaned up.
 
-For a genuinely graphical surface (admin console, docs site, chat), capture and link a
-screenshot with `scripts/pr_evidence_screenshot.sh` — it publishes the image and prints
-Markdown stamped with the commit and capture time. Command output stays as fenced text
-transcripts, not screenshots, for runtime changes; an eval run's output stays in its run
-directory (.agents/rules/public_surfaces.md).
+Command output stays as fenced text transcripts, not screenshots, for runtime changes; an
+eval run's output stays in its run directory (.agents/rules/public_surfaces.md). Screenshots
+of a changed surface go under UX change below.
 
 If the install is shared with other agents, take the lease first: see
 docs/designs/live-test-lease.md.
@@ -103,6 +101,25 @@ for the mechanics.
 -->
 
 -
+
+### UX change
+
+<!--
+Required when this PR changes what a user sees: a chat reply or card in Slack or Google Chat,
+the docs site's rendering, the web console or the A2A console, or an installer prompt. Paste at least one
+screenshot of the new UX, and a before shot beside it when the PR changes output that exists
+today; `scripts/pr_evidence_screenshot.sh` publishes one and prints the Markdown, or drag the
+image into the editor. Otherwise write "[x]" in the box below.
+
+The `UX change has a screenshot` check fails a PR that changes a user-facing path when the body
+has neither an image nor the ticked box, and editing the body re-runs it. A tick on a change a
+user can see is a finding.
+
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md, "UX
+change", for the mechanics.
+-->
+
+- [ ] No user-visible change
 
 ## Self-Review
 

@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/a2a/authcallout"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -69,7 +70,7 @@ const (
 	// doesn't set it. Optional; unset means the callout's 6h default, which
 	// matches #4121's. See
 	// authcallout.Config.TaskCredentialMaxLifetime.
-	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
@@ -117,6 +118,9 @@ func main() {
 func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The install's Tier resources, rendered by the operator (#3659): a
+	// profile entry may name any tier the table holds.
+	capability.StartTierFile(ctx, os.Getenv, log)
 
 	namespace := os.Getenv(envNamespace)
 	if namespace == "" {

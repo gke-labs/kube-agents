@@ -564,12 +564,12 @@
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
-# onboarding scan settles, four fleet audits start instead of waiting for their
-# schedules, one after another. The stack arms the stage with two archived
-# stand-in cards, the scan marker and the hand-off's record, and puts back the
-# oobe job the image ships;
-# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
-# because each repetition runs four real audits back to back. Off the infra
+# onboarding scan settles, four fleet audits and the upgrade retrospective start
+# instead of waiting for their schedules, one after another. On the lease's fresh
+# install the case grades the install's own chain and arms nothing (on a long-lived
+# install the stack arms a stand-in); the verifier reads the Platform Agent's cron
+# runs. Nightly from its registration; its first repetition waits out the
+# install's own chain, up to about two hours after the fan-out. Off the infra
 # lock (the 2026-10-15 paragraph of nightly-budget-history.txt).
 ./tasks/oobe-first-run-audits/task.yaml
 
@@ -948,6 +948,16 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The "/feedback <text>" draft offers to add the install's usage summary
+# before the yes (docs/designs/chat-feedback-command.md §8, #4723): the
+# Planning Agent's first reply carries the composed submission, the warning,
+# the offer in the skill's words and a question, and files no card. Graded on
+# the reply, which both lanes carry; the opt-in turn reads a card and the
+# filing turn would file a public issue, so neither is in the case.
+# deployer: noop, no fixtures. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/chat-feedback-offers-usage-summary/task.yaml
+
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
 # question, and its "To resolve" line is not obeyed. deployer: noop; reads the
@@ -1002,6 +1012,13 @@
 # crashloop-workload role, one front-door turn plus the card round trip.
 ./tasks/chat-shortcut-alert-is-checked-not-obeyed/task.yaml
 
+# #5407: an A2A caller's tasks/cancel, sent while the door turn holds for the
+# card it filed (stop_hook.py's card-wait directive), stops the card before it
+# writes. Next lane only (api-lane-exclusions.txt), sent through the A2A door
+# hack/ci-deploy.sh turns on there. deployer: noop, the no-pdb-workload
+# fixture, one door turn and at most one card, a 900s observation window.
+./tasks/chat-stop-during-card-wait-a2a-door/task.yaml
+
 # gke-labs#3263, Slack Stop step 1: a `stop` typed after the Planning Agent
 # filed a card stops the card before it opens its pull request. Next lane
 # only (api-lane-exclusions.txt): the harness sends the stop through the
@@ -1044,6 +1061,13 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An answer the front door draws from a card that already finished names the
+# count and when it was taken, never the card's id: a task id is plumbing
+# outside a board read (.agents/rules/chat_ux.md, "No plumbing in user text").
+# deployer: noop, read-only, one front-door turn, with a card round trip when
+# the board holds no earlier count.
+./tasks/chat-voice-reused-answer-no-card-id/task.yaml
+
 # An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
 # normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
 # documentation/web search loops (#3141). deployer: noop, read-only, no fixture,
@@ -1051,9 +1075,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
-# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
-# polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-b;
+# seeded-c's ComputeClass workloads sit Unschedulable on some pool projects,
+# #5684) finishes without polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly
@@ -1109,6 +1133,12 @@
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
 
+# A fan-out's polling sleep and every worker command finish inside the terminal
+# limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
+# Worker-scope check, so it grades on the api lanes and on an inject record
+# that carries the workers' calls; no fixture.
+./tasks/fanout-commands-outlast-terminal-limit/task.yaml
+
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
 # message has named is not dismissed, and the other lines stay open.
@@ -1132,6 +1162,21 @@
 # only when its answer reads the managed clusters as excluded (the case header
 # says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
 ./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
+
+# A stockout fix of a pool whose declaration Config Connector does not apply
+# says so in the ledger (#4594). prebuilt/kcc-stalled-declaration plants one
+# stalled ContainerNodePool on seeded-a, which runs Config Connector in
+# namespaced mode (the config-connector-namespaced role), and commits its
+# declaration to the GitOps repository with the stack write token; it removes
+# both at destroy. Fixture: hpa-saturated. The fixture-state scan of
+# 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
+# projects. writes_alone, because the stack writes to the GitOps repository's
+# default branch: it runs alone in the writers part (writers-c), after a
+# repository reset that deletes a declaration a failed teardown left. It has
+# a stack and is not in infra_lock_exempt, so it also holds the infra lock.
+# Priced at the stockout audit's band plus the stack's waits. It has no
+# FIXTURE_NOT_READY entry.
+./tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
@@ -1174,9 +1219,10 @@
 # The GCE compute stream's chat route (#2386): a plain question about the
 # fleet's VMs runs the collector once and answers in chat, with no ledger run.
 # Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
-# every boot; deployer: noop, read-only. The fixture-state scan of 2026-11-06
-# reads the role healthy on all 40 pool projects. Nightly from the merge that
-# removes its FIXTURE_NOT_READY entry.
+# every boot; deployer: noop, read-only. The fixture-state scan checks the
+# failure line on its serial console, and each reconcile's reset of the VM
+# keeps it there. Nightly from the merge that removes its FIXTURE_NOT_READY
+# entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
 # The GCE compute audit end to end over the same standing plant (#2483): the
@@ -1284,6 +1330,15 @@
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
+# A card that asks only for the install's usage summary is answered by the
+# kube-agents-feedback skill's summary subcommand (docs/designs/
+# chat-feedback-command.md §8, #4723): the result carries the script's
+# audited block, rating form cut, and nothing is filed. The worker's half of
+# the opt-in, measured as a plain ask. deployer: noop, no fixtures, one
+# resource read. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
+./tasks/platform-feedback-usage-summary-card/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits
@@ -1291,12 +1346,31 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# A change request whose fix lives in a repository the agent reads and does
+# not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
+# into the platform charts context repository, names the chart template
+# there and completes the card; no pull request, no decryption attempt.
+# prebuilt/context-repository-owns-the-fix plants the three-part fixture
+# for each run (the HelmRelease directory with the stack write token, the
+# payments-api workload on the agent host, the context_repos registration)
+# and removes it at destroy (#5213), so the case has no pool fixture: its
+# first nightly run is the pool proof of the plant and the teardown. The
+# chart repository is public and read with no credential. writes_alone, so
+# it runs alone in the writers part.
+./tasks/remediation-context-repository-owns-the-fix/task.yaml
+
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
 # seeded-b (#3081, #3100). The runner excludes slot b for this case's
 # repetitions alone, after every other unit, and restores the scope after them
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
+
+# #5191: a /session turn that asks for a profile by name delegates to it,
+# graded by delegated_to (#5194 moved it to the cluster profile). Inject lane
+# only (hack/eval/api-lane-exclusions.txt). Needs the AgentProfile dispatcher,
+# which the CI next lane runs, with profiles.cluster, from #5394.
+./tasks/session-delegates-to-the-profile-asked-for/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
@@ -1330,16 +1404,6 @@
 # twenty triage cards and takes about 25 minutes; ten back-to-back runs beside
 # three other cases came back green on a dev install (2026-10-22).
 ./tasks/triage-start-burst/task.yaml
-
-# Optional GKE Support Agent (tse) specialist delegation and 5-section Google
-# Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
-# a node NotReady (PLEG is not healthy) escalation request via
-# kanban_create(assignee="tse") and the tse specialist returns a redacted
-# 5-section escalation bundle with read-only Cloud Logging and Compute Engine
-# get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
-# enabled on the next-mode eval install via profiles.tse.enabled=true in
-# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
-./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # The API deprecation scan reads a repository over the broker's snapshot
 # ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops

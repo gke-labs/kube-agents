@@ -477,6 +477,19 @@ class ReleasesAndPendingTest(unittest.TestCase):
         self.assertEqual(release["duration_s"], 15006)
         self.assertNotIn("tasks", release)
 
+    def test_a_release_in_a_private_bucket_links_the_console(self):
+        """Deck cannot read the bucket the lane moved to, so the row links the
+        Console's bucket browser: from `gcs_base` when the collector recorded
+        it, and from a Spyglass `artifacts_url` into that bucket for a record
+        written before the field. A release in the old bucket keeps its link."""
+        base = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224/"
+        console = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224"
+        recorded = self.brief_with(releases=[dict(RC_RELEASE, gcs_base=base, artifacts_url=console)])["releases"][0]
+        self.assertEqual(recorded["artifacts_url"], console)
+        stale = self.brief_with(releases=[dict(RC_RELEASE, artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224")])["releases"][0]
+        self.assertEqual(stale["artifacts_url"], console)
+        self.assertNotIn("gcs_base", recorded)
+
     def test_a_non_https_artifacts_url_never_reaches_the_page(self):
         release = self.brief_with(releases=[dict(RC_RELEASE, artifacts_url="javascript:alert(1)")])["releases"][0]
         self.assertIsNone(release["artifacts_url"])

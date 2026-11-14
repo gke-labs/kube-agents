@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 )
 
 // The mark: reaction state for the human message that started a chain
@@ -146,6 +147,26 @@ func (rec *SessionRecord) markingRootIndex(taskID string) int {
 // writes the record after.
 func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkState) {
 	g.drawMark(rec, rec.markingRootIndex(taskID), next)
+}
+
+// drawArrivalMark draws the ask's kind (askkind.Kind, the keyword match the
+// executor's heartbeats mark with too) on the ask a task just accepted, so
+// the reaction is there before any model call, as under today, rather than
+// waiting for the executor's first heartbeat, which a fast turn never sends.
+// Only an ask's own first task draws it (startTaskWith calls it for a task
+// with no role that is neither a click nor an answer): a task whose ask
+// already carries a mark keeps it, and a task with no ask message draws
+// nothing. Every route's asks get it, the session route's and a profile's
+// included, whose executors mark nothing of their own. The executor's marks
+// and the terminal take over from there. It reports whether anything was
+// drawn, and whether the reaction landed (its call succeeded); the caller
+// holds the session lock.
+func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) (drawn, landed bool) {
+	i := rec.markingRootIndex(taskID)
+	if i < 0 || rec.Tasks[i].Mark != nil {
+		return false, false
+	}
+	return g.drawMarkLanded(rec, i, MarkState{Ask: askkind.Kind(text)})
 }
 
 // applyTerminalMark is the default for the newest task ending with no mark
@@ -367,8 +388,16 @@ func (rec *SessionRecord) sessionMarkHeld(bounded bool) MarkState {
 // state still advances, so a reaction refused once (a missing scope) is not
 // retried on every event.
 func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
+	changed, _ := g.drawMarkLanded(rec, i, next)
+	return changed
+}
+
+// drawMarkLanded is drawMark, also reporting whether every reaction call it
+// made succeeded (false when one failed; true when it changed nothing).
+func (g *Gateway) drawMarkLanded(rec *SessionRecord, i int, next MarkState) (changed, landed bool) {
+	landed = true
 	if i < 0 || i >= len(rec.Tasks) || rec.Tasks[i].AskMessageID == "" {
-		return false
+		return false, landed
 	}
 	ref := &rec.Tasks[i]
 	prev := MarkState{}
@@ -376,17 +405,19 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 		prev = *ref.Mark
 	}
 	if prev == next {
-		return false
+		return false, landed
 	}
 	session := rec.sessionMark()
 	remove, add := markDiff(prev, next)
 	for _, t := range remove {
 		if err := g.adapter.RemoveReaction(rec.Key, ref.AskMessageID, t); err != nil {
+			landed = false
 			g.log.Warn("mark: removing a reaction failed", "conversation", rec.Key, "token", t, "err", err)
 		}
 	}
 	for _, t := range add {
 		if err := g.adapter.React(rec.Key, ref.AskMessageID, t); err != nil {
+			landed = false
 			g.log.Warn("mark: adding a reaction failed", "conversation", rec.Key, "token", t, "err", err)
 		}
 	}
@@ -404,5 +435,5 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 			observer.MarkChanged(rec.Key, now.Ask, now.Settle)
 		}
 	}
-	return true
+	return true, landed
 }

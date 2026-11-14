@@ -106,8 +106,19 @@ const (
 // tests can shorten it.
 var termWaitBusMax = 60 * time.Second
 
+// busWatchEvery is how often a run with a BusDownLimit looks at the
+// connection. A var so tests can shorten it.
+var busWatchEvery = time.Second
+
 // errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
 var errTermBusGaveUp = errors.New("the bus didn't answer")
+
+// ErrTermBusLost is a term under way whose connection was down for
+// termWaitBusMax (RunOptions.BusDownLimit). It is a lost leadership, not a
+// term-start give-up: the campaign releases the lease, and the process exits
+// as on a lost lease, so the restarted container stands by with fresh
+// adapters and doors (a gateway's run closes them for good when it stops).
+var ErrTermBusLost = fmt.Errorf("%w: its connection to the bus was down mid-term", ErrLeadershipLost)
 
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
@@ -219,6 +230,9 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
+	// nil when none is configured.
+	resolvedScope resolvedScopeSource
 	// relayInFlight counts the relay batches rendering (relayBatch), which a
 	// stop waits for.
 	relayInFlight inFlight
@@ -323,11 +337,9 @@ type Gateway struct {
 	steersRefusedBy map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
-	// message that names none is attributed to. Since the mux and the side
-	// door there are ingresses that name their own - the console adapter
-	// stamps console on every frame it delivers, the inject door stamps
-	// inject - so this is the answer for the configured backend's own
-	// messages rather than for all of them (backendFor).
+	// message that names none is attributed to (backendFor). Behind the mux
+	// every chat message is stamped with its adapter's key, so empty means a
+	// hand-built single-adapter gateway with no mux.
 	backend string
 	// injectAudience is injectPM's inject: section with the prefix removed
 	// and only eval: values kept -- the shape BuildAuthority and hashRoster
@@ -474,12 +486,12 @@ func New(o Options) (*Gateway, error) {
 	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
-	// keep working.
-	switch {
-	case backend == discordBackend && pm.Len() == 0:
+	// keep working. Each armed backend gets its own line, so both can fire.
+	if o.Config.DiscordToken != "" && pm.Len() == 0 {
 		log.Warn("principal map is empty; every discord message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
-	case backend == slackBackend && pm.Len() == 0:
+	}
+	if o.Config.SlackBotToken != "" && pm.Len() == 0 {
 		// Not a warning since the map became an override: every listed
 		// sender is admitted and attributed by member id.
 		log.Info("the Slack principal map is empty; listed senders are attributed by their Slack member id",
@@ -525,7 +537,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
 		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
-	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
+	if o.Config.GchatRelayURL != "" && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	ps := NewPseudonymizer(o.Config.AttributionSalt)
@@ -545,7 +557,7 @@ func New(o Options) (*Gateway, error) {
 			slackAllowed[u] = true
 		}
 	}
-	if backend == slackBackend && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
+	if o.Config.SlackBotToken != "" && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
 		log.Warn("slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	if o.RelayDurable == "" {
@@ -558,6 +570,9 @@ func New(o Options) (*Gateway, error) {
 	}
 	if o.Config.DelegationDepthMax <= 0 {
 		o.Config.DelegationDepthMax = defaultDelegationDepthMax
+	}
+	if o.Config.DelegationWidthMax <= 0 {
+		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
@@ -696,8 +711,11 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // Readiness reports whether Run has bound the event relay, and why not. The
 // adapters and doors start only after the bind, so until then the gateway
 // takes no turns (its chat.notify routes are already up). The metrics
-// listener answers ReadyzPath from it. It latches: once bound it stays ready,
-// and a later loss of TASKS is the rebuild path's to recover, as before.
+// listener answers ReadyzPath from it. The bind latches, and a later loss of
+// TASKS is the rebuild path's to recover, as before; but a bound relay whose
+// NATS connection is down delivers nothing, so readiness also needs the
+// connection. Off the bus for longer than termWaitBusMax, an elected gateway
+// gives its term up (RunOptions.BusDownLimit).
 func (g *Gateway) Readiness() (bool, string) {
 	if g.termWaiting.Load() {
 		if g.termWaitBus.Load() {
@@ -706,6 +724,9 @@ func (g *Gateway) Readiness() (bool, string) {
 		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
 	}
 	if g.relayBound.Load() {
+		if g.client != nil && !g.client.Connected() {
+			return false, fmt.Sprintf("waiting for the bus: the NATS connection is down, so the bound event relay durable %s can't deliver", g.relayDurable)
+		}
 		return true, "ready"
 	}
 	if g.relayHeldBack.Load() {
@@ -766,6 +787,46 @@ type RunOptions struct {
 	// relay batches still rendering; nil means relayStopDrainTimeout. A
 	// lost lease has less time than SIGTERM.
 	StopDrain func() time.Duration
+	// BusDownLimit, when positive, ends the run with ErrTermBusLost once
+	// the NATS connection has been down that long without a break, so an
+	// elected gateway whose own path to the bus failed mid-term gives the
+	// lease to a replica whose bus may answer, as a term start already does
+	// (BeginTerm). A reconnect starts the count again. The election sets it
+	// to termWaitBusMax; zero, the default, never gives up.
+	BusDownLimit time.Duration
+}
+
+// watchBus ends the run with ErrTermBusLost, through cancel, once the
+// connection has been down for limit without a break. It returns when ctx
+// ends or it has given up, and reports the error it ended the run with.
+func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
+	t := time.NewTicker(busWatchEvery)
+	defer t.Stop()
+	var downSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		if g.client.Connected() {
+			downSince = time.Time{}
+			continue
+		}
+		now := time.Now()
+		if downSince.IsZero() {
+			downSince = now
+			continue
+		}
+		if down := now.Sub(downSince); down >= limit {
+			// Once per give-up, at Info: during a full outage the lease
+			// cycles between replicas, and each cycle logs this once.
+			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
+			err := fmt.Errorf("%w for %s, so the lease goes to a replica whose bus may", ErrTermBusLost, down.Round(time.Second))
+			cancel(err)
+			return err
+		}
+	}
 }
 
 // RunWith is Run with the elected gateway's options.
@@ -775,6 +836,17 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	g.runCtx = ctx
+	// busErr is the bus watchdog's give-up, read once watched is closed.
+	var busErr error
+	watched := make(chan struct{})
+	if o.BusDownLimit > 0 && g.client != nil {
+		go func() {
+			defer close(watched)
+			busErr = g.watchBus(ctx, o.BusDownLimit, cancel)
+		}()
+	} else {
+		close(watched)
+	}
 	// Its first try before the relay starts, so on an install with the
 	// bucket every answer the relay posts is marked alike. Their retries
 	// start once the relay binds (afterBind): the provision Job creates both
@@ -798,6 +870,13 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	if o.RelayBindDelay <= 0 {
 		var err error
 		if sub, err = g.bindRelay(ctx); err != nil {
+			// A bind still waiting when the watchdog gave up fails on the
+			// cancel; the give-up is the reason.
+			cancel(nil)
+			<-watched
+			if busErr != nil {
+				return busErr
+			}
 			return err
 		}
 		afterBind()
@@ -834,6 +913,11 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if o.StopDrain != nil {
 			drain = o.StopDrain()
 		}
+		// A run that gave up on the bus can't ack what it renders anyway,
+		// and the lease is waiting: the lost-lease bound.
+		if errors.Is(context.Cause(ctx), ErrTermBusLost) {
+			drain = min(drain, lostLeaseRelayDrain)
+		}
 		g.relayInFlight.drain(drain)
 		if sub != nil {
 			sub.Stop()
@@ -852,9 +936,15 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	// not the backend's.
 	err := g.adapter.Run(ctx, g.enqueueInbound)
 	// Ingress has stopped, so a bind still held back won't happen; once the
-	// bind goroutine is done, bindErr is safe to read.
+	// bind goroutine is done, bindErr is safe to read, and busErr once the
+	// watchdog is.
 	cancel(nil)
 	<-bound
+	<-watched
+	// The adapter's own failure wins over a give-up that raced it.
+	if busErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+		return busErr
+	}
 	if bindErr != nil {
 		return bindErr
 	}
@@ -1177,9 +1267,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of Slack's Stop button: it asked the bot for
-		// nothing, and the notice would land in a thread the channel reads.
-		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
+		// Nor for a press of a Stop button, Slack's or Google Chat's: it
+		// asked the bot for nothing, and the notice, which names the
+		// presser, would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -1380,9 +1471,16 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
 		// button, Slack's native one or the one drawn on Google Chat
-		// (stopgate.go). Anyone else's press cancels nothing and posts
-		// nothing. A typed `stop` keeps the rule below.
+		// (stopgate.go). Anyone else's press cancels nothing; on Google
+		// Chat, in a space, the presser alone is told so. A typed `stop`
+		// keeps the rule below.
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
+		// A task a requester has already asked to stop (Detached) is
+		// settling: its line reads "cancel sent", and a line telling the
+		// presser to type stop would be stale advice, so nothing is said.
+		if active := rec.ActiveTask; active == nil || !active.Detached {
+			g.tellRefusedPresser(rec.Key, msg, backend)
+		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
@@ -1620,12 +1718,12 @@ func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
 	}
 }
 
-// backendFor names the ingress one message arrived through. A message that
-// names none is the configured backend's, which is the Discord and Google
-// Chat adapters' case; the inject door and the console adapter stamp their
-// own, because either can be armed beside a real backend and the authority
-// block must say which door a task came in through rather than which backend
-// the process was configured with.
+// backendFor names the ingress one message arrived through. Behind the mux
+// every chat message is stamped with its adapter's key, and the inject door
+// stamps its own; a message that names none comes from a hand-built
+// single-adapter gateway with no mux and is the configured backend's. The
+// authority block says which door a task came in through rather than which
+// backend the process was configured with.
 func (g *Gateway) backendFor(msg InboundMessage) string {
 	if msg.Backend != "" {
 		return msg.Backend
@@ -2605,6 +2703,27 @@ func (g *Gateway) showsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// tellRefusedPresser posts refusedPressNotice to the presser of msg alone,
+// in conversation, where tellsRefusedPresser says so (stopgate.go), through
+// the backend's private post (PrivatePoster). A post that fails is logged
+// and nothing more: the press cancelled nothing either way, and the typed
+// stop the notice names still works.
+func (g *Gateway) tellRefusedPresser(conversation string, msg InboundMessage, backend string) {
+	if !tellsRefusedPresser(msg, backend) {
+		return
+	}
+	poster, ok := g.adapter.(PrivatePoster)
+	if !ok {
+		g.log.Warn("refused stop press: the adapter posts no private message", "backend", backend, "conversation", conversation)
+		return
+	}
+	if err := poster.PostPrivate(conversation, msg.Viewer, refusedPressNotice); err != nil {
+		g.log.Warn("refused stop press: the presser's notice was not posted", "backend", backend, "conversation", conversation, "err", err)
+		return
+	}
+	g.log.Info("refused stop press: the presser was told privately", "backend", backend, "conversation", conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -2916,6 +3035,9 @@ type taskStart struct {
 	// names no message of its own; an answer with no earlier chain marks
 	// itself.
 	Click, Answer bool
+	// ArrivedAt is InboundMessage's: when the adapter received the turn, the
+	// start of the first-ack time; zero where the adapter does not set it.
+	ArrivedAt time.Time
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -2952,6 +3074,16 @@ type taskStart struct {
 	// stored record holds the child without its parent's link (observedAs
 	// and chainLast read the link). Set for a child only.
 	LinkParent bool
+	// Addressee, when set, is where the task goes instead of rec.Addressee,
+	// which is left as it is: a batch child's (mintBatch). Empty for every
+	// other task, which goes to rec.Addressee.
+	Addressee string
+	// KeepActive mints the task beside the conversation's active task
+	// rather than in its place: rec.ActiveTask is left alone, and the
+	// task's rolling line is kept on its own entry (TaskRef.StatusMsgID),
+	// where the relay closes it on the task's terminal. Set for a batch
+	// child only.
+	KeepActive bool
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -2971,6 +3103,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
+		ArrivedAt: msg.ArrivedAt,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -2984,6 +3117,13 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // or failed before that.
 func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts taskStart) (string, bool) {
 	taskID := "task-" + randHex(taskIDHexWidth)
+	// The task's addressee: the record's, unless the caller names its own
+	// and leaves the record's in place (a batch child).
+	addressee := rec.Addressee
+	if ts.Addressee != "" {
+		addressee = ts.Addressee
+	}
+	ownSession := rec.BusSession != "" && addressee == rec.BusSession
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule). A turn opened on another
 	// turn's behalf carries that turn's instead.
@@ -3001,7 +3141,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"backendMessageId", ts.MessageID,
 		"principal", ts.Principal,
 		"conversation", rec.Key,
-		"addressee", rec.Addressee)
+		"addressee", addressee)
 
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
@@ -3012,9 +3152,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A mint that fails refuses the turn. The alternative is a submission
 	// with no capability, which the executor refuses anyway, one round trip
 	// and a pod later, with the reason in a different component's log.
-	capRef, err := g.mintTaskCapability(ctx, taskID, rec.Addressee, ts.Route)
+	capRef, err := g.mintTaskCapability(ctx, taskID, addressee, ts.Route)
 	if err != nil {
-		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
+		g.log.Error("capability mint failed", "taskId", taskID, "addressee", addressee, "err", err)
 		// A profile task never goes without its grant, whatever the switch
 		// says: the grant carries the tier and the target the dispatcher
 		// admits it on.
@@ -3030,7 +3170,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// executor with grants null. Loud: an install left here has the
 		// control switched off on both sides at once.
 		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending this task with no capability",
-			"taskId", taskID, "addressee", rec.Addressee)
+			"taskId", taskID, "addressee", addressee)
 		capRef = nil
 	}
 
@@ -3039,7 +3179,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// turn, so a reused pod sees profiles as they come and go.
 	// A wake runs without the tool, so it carries none.
 	var extra []lib.Part
-	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
+	if ts.Route == nil && ts.Role != taskRoleWake && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
@@ -3058,7 +3198,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		return "", false
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
-		lib.WithTo(lib.Party{Session: rec.Addressee}),
+		lib.WithTo(lib.Party{Session: addressee}),
 		lib.WithAuthority(ts.Authority.Render(capRef)))
 	if err != nil {
 		g.log.Error("envelope build failed", "err", err)
@@ -3096,17 +3236,24 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// terminal edit finds the active task or a delegating parent, and after
 	// this write the task is neither. Its line closes here, as the record
 	// already counts the task (MarkCanceled), with no Stop control on it.
-	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
+	if old := rec.ActiveTask; !ts.KeepActive && old != nil && old.Detached && old.StatusMsgID != "" {
 		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
+	}
+	// A detached task superseded here may never send its terminal: its ask
+	// takes the canceled end's mark, so no reaction is left on it.
+	if old := rec.ActiveTask; old != nil && old.Detached {
+		g.applyTerminalMark(rec, old.TaskID, lib.StateCanceled)
 	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
-	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
+	if !ts.KeepActive {
+		rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
+			Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
+	}
 	requester := ts.Requester
 	ref := TaskRef{
-		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
+		ID: taskID, Addressee: addressee, CorrelationID: correlationID, Capability: capRef,
 		Requester:    &requester,
 		Attribution:  ts.Authority.Attribution(),
 		StartedAt:    time.Now().UTC(),
@@ -3118,6 +3265,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
+	}
+	if ts.KeepActive {
+		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
@@ -3145,7 +3295,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	// Text published to the conversation's own incarnation joins its author
 	// set; a child to platform does not reach the incarnation.
-	if rec.AddressedToOwnSession() {
+	if ownSession {
 		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
 	}
 	rec.LastTaskActivity = time.Now().UTC()
@@ -3169,7 +3319,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// per-subject cap, and past that cap a worker scanning the subject
 	// cannot tell the evicted submission's replacement from the real thing
 	// (lib.EnvOriginSeq).
-	originSeq, err := g.client.PublishSeq(ctx, submissionSubject(rec.Addressee, taskID, ts.Route), env)
+	originSeq, err := g.client.PublishSeq(ctx, submissionSubject(addressee, taskID, ts.Route), env)
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
@@ -3179,7 +3329,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			// went nowhere.
 			g.post(rec.Key, noticeBusUnreachable)
 		}
-		rec.ActiveTask = nil
+		if !ts.KeepActive {
+			rec.ActiveTask = nil
+		}
 		g.mu.Lock()
 		delete(g.taskSessions, taskID)
 		delete(g.relays, taskID)
@@ -3195,7 +3347,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// what the chain's root is owed (handleDelegateRequest leaves the
 		// parent to end as itself, wakeSession ends the root). Every task
 		// is logged, though: each wrote its ingress line above.
-		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
+		g.logTaskTerminal(rec, addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
 			g.observeTaskTerminal(rec, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}
@@ -3222,8 +3374,25 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// have one before the pod is created. The spec's ordering rule ("the pod
 	// exists because the message is already durable") is now load-bearing
 	// rather than an optimisation.
-	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
+	if g.spawner != nil && ownSession {
 		g.ensureSessionPod(ctx, rec, taskID, originSeq)
+	}
+	// The ask's reaction, drawn now rather than at the executor's first
+	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
+	// slow reactions call never delays it. A click or an answer continues an
+	// earlier ask, whose mark is the executor's to redraw.
+	if ts.Role == "" && !ts.Click && !ts.Answer {
+		drawn, landed := g.drawArrivalMark(rec, taskID, ts.Text)
+		if drawn && landed {
+			// The ask's first receipt is on Slack: the reactions call succeeded.
+			g.metrics.slackFirstAck(ts.ArrivedAt, time.Now())
+		}
+		if !drawn {
+			return taskID, true
+		}
+		if err := g.reg.Put(ctx, rec); err != nil {
+			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+		}
 	}
 	return taskID, true
 }

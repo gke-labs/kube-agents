@@ -90,7 +90,7 @@ const (
 	// slackShortcutCredit names the clicker in the thread as the shortcut's
 	// task starts, so the channel sees who asked: a small line just above the
 	// bot's first reply, the clicker by their Slack name, never a mention.
-	slackShortcutCredit = "%s asked me to look at this"
+	slackShortcutCredit = "%s asked me to look at this" // #nosec G101 -- a message format, not a credential
 )
 
 // slackShortcutPlaceholderNames are the names Slack gives a conversation that
@@ -237,6 +237,8 @@ func slackIsShortcut(raw json.RawMessage) bool {
 // a private note to the clicker, or nothing. Run calls it off the event pump,
 // since it reads from Slack before it can hand anything over.
 func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handler func(InboundMessage)) {
+	// Taken before the Slack calls below, so the first-ack time starts at arrival.
+	arrived := time.Now()
 	var p slackShortcutPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		s.log.Warn("slack: unreadable shortcut payload", "err", err)
@@ -302,7 +304,8 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 		MessageID:    p.Message.TS,
 		Text: fmt.Sprintf(slackShortcutAsk, slackShortcutWhere(p.Channel.Name),
 			shortcutAskQuoted(s.shortcutAuthor(ctx, p.Message), quoted)),
-		Shortcut: true,
+		Shortcut:  true,
+		ArrivedAt: arrived,
 	}
 	clicker := s.slackUserNameContext(ctx, p.User.ID)
 	if runCtx.Err() != nil {

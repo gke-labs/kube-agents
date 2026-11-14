@@ -40,7 +40,7 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
-	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
 	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and
@@ -213,7 +213,10 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		ServiceAccountName:           serviceAccount,
 		AutomountServiceAccountToken: ptr.To(false),
 		RestartPolicy:                restart,
-		RuntimeClassName:             shellSandboxRuntimeClassName(agent),
+		// ndots:3, see brokerCallerPodDNSConfig: the Job template and the
+		// warm pool both use this pod spec.
+		DNSConfig:        brokerCallerPodDNSConfig(),
+		RuntimeClassName: shellSandboxRuntimeClassName(agent),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   ptr.To(true),
 			RunAsUser:      ptr.To(int64(profileWorkerUID)),

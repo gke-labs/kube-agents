@@ -1,10 +1,13 @@
 """The replay lane's report: what was served, and whether replayed runs got the verdicts the nightly did.
 
 The lane (examples/inference-replay/eval-design.md, Rollout step 2) runs a
-roster of cases on main's code with the proxy in replay mode, served from what
-recent nightlies recorded (fetch_cache.py). collect_shadow.py keeps the lane's
-lines and stored text on the job's machine and calls this from its last pass.
-It writes, into `--out`:
+roster of cases with the proxy in replay mode, served from what recent
+nightlies recorded (fetch_cache.py), on the commit the newest recording night
+ran (fetch_cache.py --print-commit), or on main when no record names one.
+collect_shadow.py keeps the lane's lines and stored text on the job's machine
+and calls this from its last pass, with that commit and where it came from
+(`--commit`, `--commit-source`: hack/ci-env.sh reads REPLAY_LANE_COMMIT_SOURCE,
+which the Prow job exports). It writes, into `--out`:
 
 - `replay.json`: analyze_replay.py's report over the lane's lines: per
   conversation, what was served before the first miss, and the first-miss
@@ -21,7 +24,21 @@ It writes, into `--out`:
   `unknown_reasons`. The recording night is the one that first wrote the
   answer, which can be as old as the bucket's lifecycle; the fetch reads runs
   that far back;
-- `summary.txt`: the counts, for the job log.
+- `summary.txt`: the commit replayed and the counts. Its lines also go to the job log, where the
+  collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
+
+The lane's safety cases run a live arm before the cache is seeded, then a
+replayed one (hack/ci-eval-pr.sh, case_repetitions). The script names them in
+`replay-lane-arms.json` beside the case files (`ARMS_FILE`): the cases, how
+many leading repetitions were live, and when replay began. Each such case in
+`verdicts.json` gets `arms`: per arm its passes, scored and run counts, the
+share of its prompt tokens served, and each run's served share (a live arm's
+should be 0). `replay.json` counts only lines from after replay began, so the
+live arm's misses don't dilute it. `summary.txt` gets one line per safety case.
+
+`verdicts.json` and `summary.txt` both name the commit replayed (`commit`,
+empty when git could not say) and its source (`commit_source`: `recording`,
+`main`, or empty when the job did not say).
 
 Both JSON files hold hashes and scrubbed snippets of requests, so they go to the
 private bucket only. The summary holds case names and counts.
@@ -36,6 +53,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 import analyze_replay
+import collect_shadow as CS
 import publish_cache as P
 import run_attribution as RA
 
@@ -49,6 +67,22 @@ UNKNOWN = analyze_replay.VERDICT_UNKNOWN
 RUN_UNATTRIBUTED = "run_unattributed"
 RECORDING_BUILD_UNRECORDED = "recording_build_unrecorded"
 NO_VERDICT = "no_verdict"
+# The report's commit fields, and how the summary reads each source.
+REPORT_COMMIT = "commit"
+REPORT_COMMIT_SOURCE = "commit_source"
+UNKNOWN_COMMIT = "an unknown commit"
+COMMIT_SOURCE_TEXT = {
+    CS.COMMIT_SOURCE_RECORDING: "the commit the newest recording night ran",
+    CS.COMMIT_SOURCE_MAIN: "main, as a fallback: no recording named a commit, or it could not be fetched",
+    "": "where it came from was not stated",
+}
+# The script's note of the live arm (write_replay_lane_arms in hack/ci-eval-pr.sh).
+ARMS_FILE = "replay-lane-arms.json"
+ARMS_LIVE_REPS = "live_reps"
+ARMS_REPLAYED_FROM = "replayed_from"
+ARMS_CASES = "cases"
+ARM_LIVE = "live"
+ARM_REPLAYED = "replayed"
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
 TEXT_ENCODING = "utf-8"
@@ -56,6 +90,42 @@ TEXT_ENCODING = "utf-8"
 
 def percent(part: float, whole: float) -> float:
     return round(PERCENT * part / whole, PERCENT_DECIMALS) if whole else 0.0
+
+
+def read_arms(verdicts_dir: str) -> Dict[str, Any]:
+    """The live arm's note, or an empty one when the lane ran none (or the note is unreadable)."""
+    arms = RA.read_json(os.path.join(verdicts_dir, ARMS_FILE))
+    if not isinstance(arms, dict) or not isinstance(arms.get(ARMS_LIVE_REPS), int) \
+            or not isinstance(arms.get(ARMS_CASES), list):
+        return {}
+    return arms
+
+
+def arm_counts(runs: List[Dict[str, Any]], tokens: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One arm of a safety case: passes, scored and runs, and how much of its prompt tokens was served."""
+    scored = [r for r in runs if r["outcome"] in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL)]
+    return {
+        "passes": sum(1 for r in scored if r["outcome"] == RA.REP_OUTCOME_PASS), "scored": len(scored),
+        "runs": len(runs), "reps": [r["rep"] for r in runs],
+        "served_token_percent": percent(sum(t.get("served_tokens", 0) for t in tokens),
+                                        sum(t.get("prompt_tokens", 0) for t in tokens)),
+        "run_served_token_percent": [r["served_token_percent"] for r in runs],
+    }
+
+
+def add_arms(cases: Dict[str, Any], per_run: Dict[str, Dict[str, Any]], arms: Dict[str, Any]) -> None:
+    """Split each safety case's lane runs into its live and replayed arms (read_arms)."""
+    live_reps = arms.get(ARMS_LIVE_REPS, 0)
+    for name in arms.get(ARMS_CASES, []):
+        case = cases.get(name)
+        if case is None:
+            continue
+        split: Dict[str, Any] = {}
+        for arm, in_arm in ((ARM_LIVE, lambda rep: rep <= live_reps), (ARM_REPLAYED, lambda rep: rep > live_reps)):
+            runs = [r for r in case["lane"]["runs"] if in_arm(r["rep"])]
+            tokens = [per_run.get(f"{name}{RA.RUN_KEY_SEPARATOR}{r['rep']}", {}) for r in runs]
+            split[arm] = arm_counts(runs, tokens)
+        case["arms"] = split
 
 
 def lane_segments(keep_dir: str) -> List[str]:
@@ -160,6 +230,7 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             conversation_counts[MISMATCH] += 1
             mismatched.append({"run": key, "outcome": run.outcome, "recorded_build": recorded,
                                "first_request_id": conv.lines[0].request_id})
+    add_arms(cases, per_run, read_arms(verdicts_dir))
     return {
         "cases": cases,
         "served_conversations": conversation_counts,
@@ -170,8 +241,15 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
     }
 
 
+def commit_line(report: Dict[str, Any]) -> str:
+    source = str(report.get(REPORT_COMMIT_SOURCE) or "")
+    return (f"replayed on {report.get(REPORT_COMMIT) or UNKNOWN_COMMIT}:"
+            f" {COMMIT_SOURCE_TEXT.get(source, COMMIT_SOURCE_TEXT[''])}")
+
+
 def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     out = [
+        commit_line(report),
         f"replay lane: {replay['requests']} requests in {replay['conversations']} conversations;"
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
@@ -186,15 +264,33 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
             f"{build}: {v['passes']}/{v['scored']}" if isinstance(v, dict) else f"{build}: {v}"
             for build, v in sorted(case["nightly"].items())) or "served nothing"
         out.append(f"  {name}: lane {lane['passes']}/{lane['scored']} ({served}); nightly {nightly}")
+    safety = sorted((name, case["arms"]) for name, case in report["cases"].items() if "arms" in case)
+    if safety:
+        out.append("safety cases, live before the cache was seeded, then replayed:")
+    for name, arms in safety:
+        live, replayed = arms[ARM_LIVE], arms[ARM_REPLAYED]
+        line = (f"  {name}: live {live['passes']}/{live['scored']}, replayed {replayed['passes']}/{replayed['scored']}"
+                f" (served {replayed['served_token_percent']}%)")
+        if live["served_token_percent"]:
+            line += f"; the live arm was served {live['served_token_percent']}%, so it was not live"
+        out.append(line)
     return "\n".join(out) + "\n"
 
 
-def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_dir: str) -> str:
+def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_dir: str,
+                 commit: str = "", commit_source: str = "") -> str:
     nightly_runs = RA.read_json(nightly_runs_path) if nightly_runs_path else None
     if not isinstance(nightly_runs, dict):
         nightly_runs = {}
-    replay = analyze_replay.summarize(analyze_replay.load(lane_segments(keep_dir)))
+    lines = analyze_replay.load(lane_segments(keep_dir))
+    # Only what was asked once replay began: the live arm misses by design.
+    replayed_from = read_arms(verdicts_dir).get(ARMS_REPLAYED_FROM)
+    if isinstance(replayed_from, (int, float)):
+        lines = [line for line in lines if line.ts >= replayed_from]
+    replay = analyze_replay.summarize(lines)
     report = verdicts(keep_dir, verdicts_dir, nightly_runs)
+    report[REPORT_COMMIT] = commit
+    report[REPORT_COMMIT_SOURCE] = commit_source
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, REPLAY_REPORT), "w", encoding=TEXT_ENCODING) as handle:
         json.dump(replay, handle, indent=2, sort_keys=True)
@@ -212,8 +308,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verdicts-dir", required=True, help="where bench-gate wrote case-<name>.json")
     parser.add_argument("--nightly-runs", default="", help="fetch_cache.py's runs per recording build")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--commit", default="", type=CS._shaped(CS.COMMIT_SHAPE, "commit id"),
+                        help="the commit the lane replayed on")
+    parser.add_argument("--commit-source", default="", choices=CS.COMMIT_SOURCES,
+                        help="whether that commit is the recording night's or main")
     args = parser.parse_args(argv)
-    sys.stdout.write(write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, args.out))
+    sys.stdout.write(write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, args.out,
+                                  commit=args.commit, commit_source=args.commit_source))
     return 0
 
 

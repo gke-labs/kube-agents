@@ -293,8 +293,11 @@ echo -e "\n==> [Step 0/5] Checking preconditions..."
 # -- swapping a binary would point it at state the other wrote. Checked here for
 # the reason at the top of Step 0: without it, a missing `tofu` surfaces as
 # "command not found" at Step 2.2, twelve minutes and two applies in.
+# gke-gcloud-auth-plugin because the fleet stack's Kubernetes providers run it
+# on every call: without it the second Step 2.2 apply fails at its first
+# in-cluster read, after the clusters are up.
 MISSING_TOOLS=()
-for tool in gcloud gh git go jq python3 terraform tofu; do
+for tool in gcloud gh git gke-gcloud-auth-plugin go jq python3 terraform tofu; do
   command -v "${tool}" >/dev/null 2>&1 || MISSING_TOOLS+=("${tool}")
 done
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
@@ -302,7 +305,7 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo "       This script needs terraform and tofu both; see the comment above." >&2
   exit 1
 fi
-echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
+echo "✓ Toolchain present (gcloud, gh, git, gke-gcloud-auth-plugin, go, jq, python3, terraform, tofu)"
 
 # Step 2.1's post-apply `clusters update --managed-otel-scope` is issued on the
 # GA surface, which gcloud grew in MIN_GCLOUD_VERSION; an older SDK fails the
@@ -880,8 +883,10 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # resources read the Gateway API CRDs at plan time, and those exist only
     # once GKE has created seeded-a with gateway_api_config. The first apply
     # creates that cluster on its own; on a project that has it, it changes
-    # nothing.
-    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
+    # nothing. The ComputeClass fixture's kubernetes_manifest (defects-c.tf)
+    # reads the ComputeClass CRD the same way, which GKE installs with
+    # seeded-c, so the first apply targets that cluster too.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a -target=google_container_cluster.seeded_c
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else
