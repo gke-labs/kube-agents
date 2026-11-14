@@ -568,9 +568,15 @@ func TestReconcileReportsAnOutOfDateClusterRoleAndKeepsGoing(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	// The A2A stack's own pending requeue is sooner than the RBAC re-probe
+	// until the stack has settled; the interval under test is read after.
+	settleA2AStack(t, ctx, cl, r, req, agent)
 	result, err := r.Reconcile(ctx, req)
 	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+		t.Fatalf("settled Reconcile failed: %v", err)
 	}
 	// Re-applying the manifests triggers no reconcile, so while the condition
 	// stands the controller has to come back on its own to notice the fix.

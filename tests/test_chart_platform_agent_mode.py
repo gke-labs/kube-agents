@@ -98,7 +98,7 @@ class ModeTemplateShapeTest(unittest.TestCase):
     def test_the_schema_admits_the_crd_enum_and_unset_only(self):
         schema = json.loads(_SCHEMA.read_text())
         mode = schema["properties"]["platformAgent"]["properties"]["mode"]
-        self.assertEqual(mode, {"enum": [None, "", "today", "next"]})
+        self.assertEqual(mode["enum"], [None, "", "today", "next"])
         # The set values are the CRD's spec.mode enum, read from the CRD the
         # chart ships, so a third mode added there fails here until the schema
         # admits it too.
@@ -135,10 +135,11 @@ class ModeRenderTest(unittest.TestCase):
                 # operator's Role and RoleBinding in it, their own documents;
                 # set them aside and the CR's diff is still one line.
                 rendered, profiles = _split_profiles_namespace(out.stdout)
-                self.assertEqual(bool(profiles), mode == "next", profiles)
+                self.assertTrue(profiles, "the profiles namespace renders on every install")
+                default_rendered, _ = _split_profiles_namespace(self.default)
                 changed = [
                     line
-                    for line in difflib.unified_diff(self.default.splitlines(), rendered.splitlines(), lineterm="", n=0)
+                    for line in difflib.unified_diff(default_rendered.splitlines(), rendered.splitlines(), lineterm="", n=0)
                     if line[:1] in "+-" and not line.startswith(("+++", "---"))
                 ]
                 self.assertEqual(changed, [f'+  mode: "{mode}"'])

@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -179,19 +178,5 @@ func TestUserAuthoredVolumesCannotCarryTheBusCredentialBySource(t *testing.T) {
 	}
 	if n := len(agent.Spec.Deployment.SidecarVolumes) + len(agent.Spec.Deployment.ExtraVolumes); n != 5 {
 		t.Errorf("the CR has %d user volumes after the render, want 5; the strip edited the cached CR", n)
-	}
-
-	// Gated on the surface, like the name half: a today install has no bus,
-	// so a token for its audience and a Secret that does not exist are the
-	// author's business, and dropping them would be one more way to tell the
-	// next stack exists.
-	today := a2aTestAgent()
-	today.Spec.Mode = ptr.To("today")
-	today.Spec.Deployment = busSourceDeploymentSpec()
-	todayPT := buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{})
-	for _, name := range []string{busSourceStolenProjection, busSourceStolenSecret, busSourceStolenBundle} {
-		if podVolume(todayPT, name) == nil {
-			t.Errorf("a today install lost user volume %q; the source strip is not gated on the surface", name)
-		}
 	}
 }

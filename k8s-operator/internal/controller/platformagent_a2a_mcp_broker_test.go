@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -37,11 +36,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// mcpBrokerAgent is a mode-next agent with Chat off, so the callers list is
-// about the MCP flag alone.
+// mcpBrokerAgent is an agent with Chat off, so the callers list is about the
+// MCP flag alone.
 func mcpBrokerAgent() *agentv1alpha1.PlatformAgent {
 	agent := brokerPodAgent()
-	agent.Spec.Mode = ptr.To("next")
 	if agent.Spec.Integration != nil {
 		agent.Spec.Integration.GoogleChat = nil
 	}
@@ -115,26 +113,6 @@ func TestTheMCPPodCarriesTheBrokerTokenOnlyUnderItsFlag(t *testing.T) {
 	}
 	if tokenFile != path.Join(mount.MountPath, proj.Path) {
 		t.Errorf("%s = %q, want %q: the env and the projection must name one file", a2aMCPBrokerTokenFileEnvVar, tokenFile, path.Join(mount.MountPath, proj.Path))
-	}
-}
-
-// The broker renders in both modes; the MCP server only under next. The flag
-// on a today install must confer nothing.
-func TestTheMCPBrokerAccessIsInertOutsideModeNext(t *testing.T) {
-	t.Setenv(a2aMCPDoorEnvVar, "true")
-	agent := brokerPodAgent() // mode unset: today
-	if a2aMCPBrokerEnabled(agent) {
-		t.Fatal("enabled outside mode next")
-	}
-	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), a2aMCPName(agent)) {
-		t.Error("MCP caller named on a today install")
-	}
-	broker := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
-	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPAudienceEnvVar); found {
-		t.Error("MCP audience rendered on a today install")
-	}
-	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPCallersEnvVar); found {
-		t.Error("MCP callers rendered on a today install")
 	}
 }
 

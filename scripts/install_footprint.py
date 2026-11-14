@@ -11,9 +11,9 @@ copy of their arithmetic:
   which ``make chart-sync`` sums from the operator's goldens, ``flagged-pods.yaml``
   and ``transient-pods.yaml``), emitted by the same render, so nothing here parses
   YAML;
-- the next-mode session quota from the ``ResourceQuota`` the operator's next-mode
-  golden renders, which counts the operator's default chart pods; a profile whose
-  chart runs more pods moves it by the difference the chart stamps;
+- the session quota from the ``ResourceQuota`` the operator's golden renders, which
+  counts the operator's default chart pods; a profile whose chart runs more pods moves
+  it by the difference the chart stamps;
 - the session pod from ``a2a/gateway/spawn.go``'s constants.
 
 Standard library only, like ``generate_docs.py``, which imports this. The one tool it
@@ -57,7 +57,9 @@ PROBE = """\
       "transientPods" (.Files.Get "files/transient-pods.yaml" | fromYaml) }}
 {{ toJson (dict "apiVersion" "v1" "kind" "ConfigMap" "metadata" (dict "name" "docs-footprint-probe") "data" (dict "probe" (toJson $probe))) }}
 """
-NEXT_GOLDEN = REPO / "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml"
+# The settled golden footprint.yaml is summed from: the default example CR reconciled
+# until the bus is provisioned.
+SETTLED_GOLDEN = REPO / "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml"
 SESSION_QUOTA_NAME = "platformagent-a2a-session-quota"
 A2A_MANIFESTS_GO = REPO / "k8s-operator/internal/controller/platformagent_a2a_manifests.go"
 SPAWN_GO = REPO / "a2a/gateway/spawn.go"
@@ -74,12 +76,7 @@ class Profile:
     sets: tuple[str, ...]
     autopilot: bool = False
 
-    @property
-    def next_mode(self) -> bool:
-        return "platformAgent.mode=next" in self.sets
 
-
-_NEXT = ("platformAgent.mode=next",)
 # platformAgent.harness.tuning.busReplicas, the bus's server count; unset runs
 # the golden's (three).
 BUS_REPLICAS_KEY = "platformAgent.harness.tuning.busReplicas"
@@ -94,15 +91,14 @@ INSTALLER_SETS = (
     "platformAgent.harness.hermes.dashboardEnabled=false",
     "webConsole.enabled=true",
     "githubMinter.enabled=true",
+    # The installer still passes the deprecated key until the installer piece.
     "platformAgent.mode=next",
 )
 PROFILES = (
-    Profile("today-standard", "`today`, GKE Standard", ()),
-    Profile("today-autopilot", "`today`, GKE Autopilot", (), autopilot=True),
-    Profile("next-standard", "`next`, GKE Standard", _NEXT),
-    Profile("next-autopilot", "`next`, GKE Autopilot", _NEXT, autopilot=True),
-    Profile("next-one-server", "`next` with one NATS server, GKE Standard", _NEXT + _ONE_SERVER),
-    Profile("next-hindsight-minter", "`next` with Hindsight and the GitHub minter, GKE Standard", _NEXT + _HINDSIGHT_MINTER),
+    Profile("standard", "GKE Standard", ()),
+    Profile("autopilot", "GKE Autopilot", (), autopilot=True),
+    Profile("one-server", "One NATS server, GKE Standard", _ONE_SERVER),
+    Profile("hindsight-minter", "Hindsight and the GitHub minter, GKE Standard", _HINDSIGHT_MINTER),
     Profile("installer-autopilot", "", INSTALLER_SETS, autopilot=True),
     Profile("installer-standard", "", INSTALLER_SETS),
 )
@@ -115,10 +111,11 @@ WORKLOADS_HEADER = (
     "| Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |",
     "| -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |",
 )
-# footprint.yaml's nextMode workloads, in the order the page lists them, with what
-# the Runs cell says. A workload the data file adds and this table lacks fails the
-# render, so a new one cannot go unlisted.
-NEXT_WORKLOADS = (
+# footprint.yaml's A2A workloads (the operatorRendered keys with the a2a prefix), in
+# the order the page lists them, with what the Runs cell says. A workload the data file
+# adds and this table lacks fails the render, so a new one cannot go unlisted.
+A2A_KEY_PREFIX = "a2a"
+A2A_WORKLOADS = (
     ("a2aNats", "NATS server", "Standing, each on its own node, with one JetStream claim each ({claim}); one with `spec.harness.tuning.busReplicas: 1`"),
     ("a2aCallout", "Auth callout", "Standing"),
     ("a2aVerifier", "Capability verifier", "Standing"),
@@ -127,8 +124,6 @@ NEXT_WORKLOADS = (
     ("a2aDispatcher", "Profile dispatcher", "Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it"),
     ("a2aProvision", "Bus provisioning Job", "At install, again whenever its spec changes, and about daily"),
 )
-# footprint.yaml nextMode keys that are not a workload row of their own.
-NEXT_NON_WORKLOADS = ("agentPod", "storage")
 FLAGGED_LABELS = {
     "mcp": "MCP server",
 }
@@ -198,14 +193,14 @@ def _go_string_constant(source: str, name: str, path: Path) -> str:
 
 @functools.lru_cache(maxsize=1)
 def golden_session_quota() -> int:
-    """The pods the operator's next-mode golden puts in the session quota."""
-    text = NEXT_GOLDEN.read_text(encoding="utf-8")
+    """The pods the operator's golden puts in the session quota."""
+    text = SETTLED_GOLDEN.read_text(encoding="utf-8")
     for document in text.split("\n---\n"):
         if f"name: {SESSION_QUOTA_NAME}\n" in document and "kind: ResourceQuota" in document:
             match = re.search(r'^\s+pods: "(\d+)"$', document, re.M)
             if match:
                 return int(match.group(1))
-    raise SystemExit(f"{NEXT_GOLDEN.relative_to(REPO)}: no {SESSION_QUOTA_NAME} ResourceQuota with a pods figure")
+    raise SystemExit(f"{SETTLED_GOLDEN.relative_to(REPO)}: no {SESSION_QUOTA_NAME} ResourceQuota with a pods figure")
 
 
 @functools.lru_cache(maxsize=1)
@@ -223,8 +218,8 @@ def quota_constants() -> dict[str, int]:
     }
 
 
-def session_quota(profile: Profile) -> int | None:
-    """The next-mode session quota's pods for a profile; None under today.
+def session_quota(profile: Profile) -> int:
+    """The session quota's pods for a profile.
 
     The golden counts the operator's default chart pods, which is what a default
     chart stamps; a profile whose chart stamps more moves the quota by as many.
@@ -232,10 +227,8 @@ def session_quota(profile: Profile) -> int | None:
     standing pod the quota counts, so a profile with fewer servers moves it by
     the difference.
     """
-    if not profile.next_mode:
-        return None
     probe = run_probe(profile)
-    golden_servers = probe["footprint"]["nextMode"]["a2aNats"]["pods"]
+    golden_servers = probe["footprint"]["operatorRendered"]["a2aNats"]["pods"]
     servers = next(
         (int(item.split("=", 1)[1]) for item in profile.sets if item.startswith(f"{BUS_REPLICAS_KEY}=")),
         golden_servers,
@@ -283,7 +276,7 @@ def _totals_row(profile: Profile) -> str:
         f" | {cpu(r['limitsCpu'])} | {memory(r['limitsMemory'])}"
         f" | {memory(r['requestsEphemeral'])} / {memory(r['limitsEphemeral'])}"
         f" | {r['persistentVolumeClaims']} | {memory(r['requestsStorage'])}"
-        f" | {NONE_CELL if quota is None else quota} |"
+        f" | {quota} |"
     )
 
 
@@ -332,21 +325,21 @@ def _session_pod() -> dict:
 
 
 def workloads_rows() -> list[str]:
-    """One row per next-mode workload, one pod's requests and limits."""
-    default_next = next(p for p in PROFILES if p.key == "next-standard")
-    probe = run_probe(default_next)
-    following = probe["footprint"]["nextMode"]
-    listed = {key for key, _, _ in NEXT_WORKLOADS} | set(NEXT_NON_WORKLOADS)
-    unlisted = sorted(set(following) - listed)
+    """One row per A2A workload, one pod's requests and limits."""
+    default = next(p for p in PROFILES if p.key == "standard")
+    probe = run_probe(default)
+    following = probe["footprint"]["operatorRendered"]
+    listed = {key for key, _, _ in A2A_WORKLOADS}
+    unlisted = sorted(key for key in following if key.startswith(A2A_KEY_PREFIX) and key not in listed)
     if unlisted:
         raise SystemExit(
-            f"charts/kube-agents/files/footprint.yaml nextMode has {unlisted}, which the footprint "
-            f"table does not list; add each to NEXT_WORKLOADS in {Path(__file__).relative_to(REPO)}."
+            f"charts/kube-agents/files/footprint.yaml operatorRendered has {unlisted}, which the footprint "
+            f"table does not list; add each to A2A_WORKLOADS in {Path(__file__).relative_to(REPO)}."
         )
     storage = following["storage"]
-    claim = memory(storage["storageBytesRequest"] // storage["persistentVolumeClaims"])
+    claim = memory(storage["busClaimBytesRequest"] // storage["busClaims"])
     rows = []
-    for key, label, runs in NEXT_WORKLOADS:
+    for key, label, runs in A2A_WORKLOADS:
         entry = following[key]
         pods = entry["pods"]
         if key == "a2aGateway":
@@ -354,7 +347,7 @@ def workloads_rows() -> list[str]:
             # that starts rendering it would be counted twice.
             if pods != 1:
                 raise SystemExit(
-                    f"footprint.yaml nextMode.a2aGateway has {pods} pods; the footprint table adds the "
+                    f"footprint.yaml operatorRendered.a2aGateway has {pods} pods; the footprint table adds the "
                     "election's standby to a golden that renders one gateway. Drop that addition in "
                     f"{Path(__file__).relative_to(REPO)} if the golden now renders the standby."
                 )
@@ -416,7 +409,7 @@ def render_tables() -> str:
         f" chart's count), and a margin of {constants['margin']} for the operator's rollout surges,"
         " its Jobs and the gateway's count-then-create overshoot.",
         "",
-        "Under `spec.mode: next`, per pod:",
+        "The A2A stack, per pod:",
         "",
         *WORKLOADS_HEADER,
         *workloads_rows(),
