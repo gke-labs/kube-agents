@@ -1543,7 +1543,7 @@ limit. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. Its persona is the `persona-tse` image,
 built from `agents/tse/persona`, which a profile worker pod mounts at
 `/persona`; like the cluster profile below, it takes its target per task through
-the `project`, `location` and `cluster` parameters, fixed in the persona's
+the `project`, `cluster` and `location` parameters, fixed in the persona's
 order. When bound, the operator also passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds the Hermes profile `/opt/data/profiles/tse` from `/opt/tse-template`

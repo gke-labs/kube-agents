@@ -27,9 +27,9 @@
 # DISPATCHER: the tse child runs only where the AgentProfile dispatcher does
 # (on by default on `mode: next` since #5394), with `profiles.tse` enabled and
 # the fleet's projects in scope. The CI next lane enables profiles.tse with
-# this tree's persona image (hack/ci-deploy.sh). A profile pinned to the
-# fixture's cluster would take the delegation instead (#5435), and the first
-# check would fail on that.
+# this tree's persona image (hack/ci-deploy.sh). A cluster with a pinned
+# profile no longer takes a delegation named for tse (#5435), so the first
+# check holds the delegation to tse alone.
 id: tse-profile-names-the-oom-kill
 name: The GKE Support Agent, asked through a session, names the OOM kill on the cluster it was given
 prompt: >-

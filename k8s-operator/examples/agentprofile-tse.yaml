@@ -7,7 +7,7 @@
 # ServiceAccount, its bus identity and its agent card. Under the AgentProfile
 # dispatcher, a profile worker pod runs each task with the persona-tse image
 # mounted at /persona (agents/tse/persona). A task names its target cluster with
-# the project, location and cluster parameters, in the persona's order, and the
+# the project, cluster and location parameters, in the persona's order, and the
 # credential broker holds the task's kubectl and gcloud calls to it.
 # Project-wide questions wait on #5424.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
