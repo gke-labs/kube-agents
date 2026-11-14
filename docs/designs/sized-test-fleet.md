@@ -1,0 +1,369 @@
+# A sized test fleet and its nightly run
+
+**Status:** design, not built.
+
+## High level summary
+
+A test fleet is a set of GKE clusters that a kube-agents install watches during a test. This
+design defines three fleet sizes, S, M and L, and a nightly run that builds one fleet, installs
+kube-agents on it, and checks the result.
+
+Size M has 250 nodes in 8 clusters. It has 8 node pools in total and 2,000 workloads. A workload is
+one Deployment or one CronJob. The workloads use little CPU and memory; the test needs many of
+them, not large ones. A quarter of them are CronJobs: each run starts a Pod that sends a few
+requests to a service and stops. This gives a high rate of Pod churn. Pod churn is the creation and
+deletion of Pods. Size L doubles each count of size M. Size S halves each count of size M. M is the
+default size.
+
+The nodes are real GKE nodes, not simulated nodes. The run builds size M on six nights a week and
+size L on one night. An audit is a scheduled agent job that checks the fleet and writes a report.
+Each run has two measurement windows:
+
+- the burst window: about 1 hour from the install's start. The install does its first-run flow
+  (OOBE, the out-of-box experience). Beside it, each audit that the first-run flow does not run
+  also runs once.
+- the soak window: the next 1 hour. No audit runs; the watchers run, and a few scripted chat
+  questions are asked.
+
+A run passes when no container crashes, every audit finishes, and the first-run flow finishes. Each
+run writes logs of its cost and its resource use. A second design, the capability usage
+attribution design, uses the same two windows to divide memory and model tokens among the agent's
+capabilities.
+
+## Success criteria
+
+Ten questions define success for this design and the capability usage attribution design together.
+They are numbered C1 to C10 in both. This design owns C5, C6 and C7; the attribution design owns
+the other seven, which are about cost and use. A criterion is met when the reports answer it for M
+on 7 nights in a row and for L on 4 weeks in a row, from runs that the verdict marks sound.
+
+| #   | Question                                                                     | The report shows                                                                                                                                                  |
+| --- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C5  | Does the install fit its documented container sizes, and with what headroom? | For each container and size, the peak memory and CPU in each window against its limit, as a percentage. A container above 80 % of its limit at a size is flagged. |
+| C6  | Does every audit still finish, and does nothing crash, at each size?         | The verdict for each run: each check passed or failed, with the audits' end times and any restart, OOMKill or node OOM kill named.                                |
+| C7  | How long does a new install take to deliver its first reports, at each size? | From the install's start: the inventory scan's settle time, each first-run audit's end time, and the burst window's length, for each size.                        |
+
+## Why
+
+The scale work in [`agent-harness-bottlenecks.md`](agent-harness-bottlenecks.md) measured limits
+with one-off runs of the scale runner (`bench/kube_agents_bench/scale/`). Nothing measures them
+again after a change merges. The two existing recurring checks do not cover the install:
+
+- `scale-lane.yml` seeds one KWOK cluster nightly and measures two binaries, the event watcher
+  and the k8s-api-proxy. It runs no agent.
+- The eval nightlies grade agent behaviour on the small seeded fleet of the evaluation pool
+  projects. That fleet has a few small clusters, and no fleet-scale load.
+
+A crash, an audit that no longer finishes, or a first-run flow that stalls at fleet scale therefore
+ships without a signal. [#2348](https://github.com/gke-labs/kube-agents/issues/2348) asks for a
+nightly scale run over the pool projects; this design gives it a fixed, reproducible fleet instead.
+
+## Fleet sizes
+
+One table holds size M. S and L are derived from it: every count is multiplied by 0.5 or 2,
+rounded up. The per-node and per-Pod shapes stay the same, so the density of each cluster does not
+change between sizes; only the number of clusters, nodes and workloads does.
+
+| Parameter                            | S     | **M (default)** | L     |
+| ------------------------------------ | ----- | --------------- | ----- |
+| Clusters                             | 4     | **8**           | 16    |
+| Nodes, in total                      | 125   | **250**         | 500   |
+| Node pools, in total (one a cluster) | 4     | **8**           | 16    |
+| Workloads                            | 1,000 | **2,000**       | 4,000 |
+| Long-running Deployments             | 750   | **1,500**       | 3,000 |
+| Short-lifecycle CronJobs             | 250   | **500**         | 1,000 |
+| Pods started a minute (churn)        | 50    | **100**         | 200   |
+| Pods failing at any time             | 3     | **5**           | 10    |
+
+The rules behind the numbers:
+
+- **Node pools.** Each cluster has one node pool, so 8 node pools exist in total at M. A cluster
+  is created with that pool as its only pool, so no default pool adds nodes outside the count. The
+  250 nodes divide as 32, 32 and six pools of 31.
+- **Many small workloads.** The test measures how the agent copes with the number of objects and
+  their churn, not with heavy applications, so every container is small: a request of 10m CPU and
+  16 MiB. At M, about 3,200 Pods run at once, about 13 a node.
+- **Simple traffic.** Each Deployment has two replicas of a small HTTP server (`busybox httpd`)
+  behind a Service. Each CronJob runs every 5 minutes; its Pod sends a few HTTP requests to one of
+  its cluster's Services and exits, after 60 to 180 seconds. The traffic is light, but it is real:
+  Pods start, serve, log and end, and Endpoints change.
+- **Churn.** The CronJobs' start minutes are spread evenly over the 5 minutes (`0-59/5`, `1-59/5`,
+  and so on), so 500 CronJobs give 100 Pod starts in every minute, about 12 a minute in each
+  cluster. Five identical `*/5` schedules would start all 500 Pods in the same minute. The
+  real-install test ran 3 a minute across 40 clusters for its soak
+  (`bench/scale/real-install.yaml`) and about 800 a minute in a short stress stage
+  (`bench/scale/real-install-results.md`); this design holds a rate about 30 times its soak rate
+  for a whole run.
+- **Lifetime is not doubled.** Doubling a lifetime would lower the churn. L doubles the number of
+  CronJobs, which doubles the churn rate, and keeps each Pod's lifetime.
+- **Failing Pods.** A few Pods fail on purpose (an image that does not exist, a command that exits
+  1), so the audits and the stall watch have real findings. M has 5, as the real-install test did.
+  At 20 failing Pods that test measured $69.5 of triage tokens in one hour, so the count stays low.
+- **Machine type.** `n1-standard-1` (1 vCPU, 3.75 GB) for every node, at every size, so only the
+  counts change between sizes. The workloads need little CPU, and N1 machines draw on the general
+  CPU quota: 500 vCPU at L fits it, where 500 nodes of a 2-vCPU E2 type would need 1,000 vCPU of
+  the separate, smaller E2 quota.
+
+The sizes live in one file, `bench/scale/fleet-sizes.yaml`, as M's values and the two multipliers.
+The runner reads the size from `SCALE_FLEET_SIZE` (`S`, `M` or `L`, default `M`).
+
+## The install under test
+
+One install on the scale host cluster, which is outside the fleet. It runs the build under test:
+the nightly's images from `main`.
+
+- **Container sizes.** The [fleet sizing page](../site/src/content/docs/deploy/fleet-sizing.md)
+  picks a tier by the largest row any metric lands in. On the fleet-controllers row, S (1,000) and M
+  (2,000) land in `medium` and L (4,000) in `fleet`, so S and M run the `medium` sizes and L the
+  `fleet` sizes and host-cluster pools. The run tests the documented answer.
+- **No GitOps repository and no chat channel.** Each audit then runs without a forge and keeps its
+  findings in the report store ([`oobe.md`](oobe.md) section 4.4). It opens no pull request and
+  writes no ledger issue. `KUBEAGENTS_AUDIT_AUTO_PROMOTE` is set to `false` as well. A reset install
+  has no home channel, so no report reaches a chat; the verdict reads the run records and the
+  report store instead. The scripted chat questions reach the agent through the eval harness, as
+  the eval nightlies' questions do.
+- **A reset before each run.** The install's state volumes are reset before the burst window, so
+  the first-run flow starts as on a new install. The runner already does this reset (`reset_soak`).
+
+## The nightly run
+
+One run, in five steps:
+
+| Step | What happens                                                                                       | Time      |
+| ---- | -------------------------------------------------------------------------------------------------- | --------- |
+| 1    | Delete any test cluster an earlier run left (by its label). Create the fleet in parallel.          | 30 – 45 m |
+| 2    | Apply the workloads and start the churn. Wait until the Deployments are ready.                     | 15 m      |
+| 3    | Reset the install's state and start it. **Burst window**: the first-run flow and the other audits. | about 1 h |
+| 4    | **Soak window**: the watchers, the churn, and the scripted chat questions.                         | 1 h       |
+| 5    | Write the verdict, the measurements and the cost record. Delete the fleet.                         | 15 m      |
+
+About 3 to 3.5 hours in total at M. The churn runs from step 2 to step 5.
+
+**The burst window.** The audits are the jobs in `agents/platform/cron/jobs.json` that carry the
+`fleet-audit` skill, ten today. The first-run flow (`agents/chat/scripts/oobe.py`,
+[`oobe.md`](oobe.md) section 4) runs the inventory scan, then five of them one after another:
+`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention` and
+`upgrade-retrospective`. The other five (`security-patch-orchestrator` and
+`fleet-consistency-drift`, which are weekly, and three daily audits) wait for their schedules, so
+the runner starts them: it marks one due every 5 minutes from 5 minutes after the install starts,
+through the same `cron.jobs.trigger_job` call the first-run flow uses. Production staggers audits
+30 minutes apart; a 5-minute stagger packs the same ten runs into the hour, so the burst is denser
+than a real morning. The burst window therefore holds one run of all ten audits.
+
+**The window's length.** The burst window is 1 hour nominal. It ends when the last of the ten
+audits ends, but not before 1 hour and not after 3 hours from the install's start, so the soak
+window that follows is quiet. Single audit runs on the CI install have reached 2,739 s (`oobe.py`,
+`RUN_LIMIT_SECONDS`), so a slow first-run chain can pass 1 hour; at 40 clusters the real-install test
+measured 63 minutes for the whole first-run flow. The burst window's real length is recorded with
+the run. An audit that has not ended at 3 hours turns the verdict red.
+
+**The soak window.** 1 hour, starting when the burst window ends. No audit is scheduled in it (see
+the start time below), so it holds the install's quiet work: the script watchers on their schedules
+(the stall watch every 30 minutes, the hourly ones), the event watcher, the churn, and the scripted
+chat questions below.
+
+**The scripted chat questions.** Three eval cases that need no planted fixture also run against
+the sized fleet's install in the soak window, once each, through the eval harness:
+
+| Case                                  | Question, in short                                                    |
+| ------------------------------------- | --------------------------------------------------------------------- |
+| `chat-routing-fleet-question`         | How many clusters are in the fleet, and which versions do they run.   |
+| `agent-kanban-smoke`                  | Which GKE clusters run in this project now.                           |
+| `upgrade-chat-request-runs-collector` | Whether the clusters are patched and set to stay current on upgrades. |
+
+`upgrade-chat-request-runs-collector` checks the commands the agent runs, so it runs as it is. The
+other two check that the answer names the pool's clusters (`seeded-a`, `seeded-b`, `seeded-c`), so
+the lane runs a variant of each, `chat-routing-fleet-question-sized` and `agent-kanban-smoke-sized`,
+whose checks address the sized fleet by its fixture role (`sized-fleet-m`) instead, as the case
+format asks ([`bench-case-format.md`](bench-case-format.md)): the runner resolves the role to the
+size's cluster names from the fixture catalogue.
+The originals stay on the eval nightlies; this lane is one more run of each question, at fleet scale. A file,
+`hack/eval/sized-fleet-cases.txt`, lists them, so a case joins or leaves in one line. Their results
+are eval records, in the eval dashboard under their own lane; they do not change the scale verdict.
+They also give the capability usage attribution design a measured chat load.
+
+**When it starts.** At 00:00 UTC. The daily audits run between 06:20 and 09:20 UTC, the weekly ones on Monday
+mornings and on Sunday at 18:00 (`agents/platform/cron/jobs.json`), so a run that ends by about
+04:00 UTC never meets a scheduled audit, and the soak window holds none. L runs on Wednesday, the
+one night M does not, so the two never share the install or the project:
+
+| Night | Sun | Mon | Tue | Wed | Thu | Fri | Sat |
+| ----- | --- | --- | --- | --- | --- | --- | --- |
+| Run   | M   | M   | M   | L   | M   | M   | M   |
+
+S has no scheduled run; it is for a run by hand on a smaller budget.
+
+**Where it runs.** Two Prow periodics in `oss-test-infra`, one for M and one for L, in the scale
+project rather than the eval pool: L needs 16 clusters and 500 vCPU, and the eval jobs lease the
+pool's projects. This repository holds the script they run, `hack/ci-scale-nightly.sh`.
+
+**Quota and network.** At L: 16 clusters, 500 nodes, 500 vCPU of the general CPU quota, 500 node IP
+addresses. Each
+cluster gets its own subnet and small Pod and Service ranges, as Phase 4 did
+(`bench/scale/phase4.yaml`), so the project's default network does not cap the cluster count.
+
+## The verdict
+
+The run writes `scale-verdict.json`. It is red when any check fails:
+
+| Check                   | Passes when                                                                                                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No crash                | No install container restarts or is OOMKilled; no `SandboxChanged` event on an install Pod; no `OOMKilling` line on the host cluster's nodes, in both windows. |
+| Every audit finishes    | Each of the ten audits has a run that ended without error within 3 hours of the install's start, with a report in the report store.                            |
+| The first-run flow ends | The inventory scan settles and each audit in `FIRST_RUN_AUDITS` has an ended run within 3 hours of the install's start, as `oobe.py` records them.             |
+| The run itself is sound | The fleet reached its size, the churn ran at its rate (within 10 %), and the teardown deleted every test cluster.                                              |
+
+A red run goes to haoxuw, the owner of the `harness-scale` row in `docs/designs/domains.yaml`.
+The last check keeps a broken fixture from reading as a pass or as a regression. Kubernetes keeps an
+event for about an hour, so the runner reads `SandboxChanged` events and the nodes' `OOMKilling`
+lines from Cloud Logging over the whole run, not from the API at the end. Restarts and OOMKilled
+terminations come from the Pods' status, which the runner already collects.
+
+## How the fleet is built, and who may build it
+
+The sized fleet follows the seeded fleet's pattern (`bench/tf/fleet/`, `docs/ci-pool-projects.md`
+section 6), with one difference: the seeded fleet stands, and the sized fleet is built and deleted
+on every run, because 250 nodes standing all month would cost about 25 times a nightly's nodes.
+
+| Part                | Seeded fleet                                                                                           | Sized fleet                                                                                                                                                                                                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Declaration         | An OpenTofu stack, `bench/tf/fleet/`                                                                   | An OpenTofu stack, `bench/tf/sized-fleet/`: the subnets, the clusters and their one node pool each, sized by a `size` variable from `bench/scale/fleet-sizes.yaml`. The runner applies the workloads with `kubectl`, because their count is in the thousands. |
+| State               | Remote, in the project's `<project>-tf-state` bucket, prefix `seeded-fleet`                            | The same bucket, prefix `sized-fleet-<size>`                                                                                                                                                                                                                  |
+| The only writer     | `hack/fleet_reconcile.py`, from a `main` checkout                                                      | `hack/sized_fleet.py up` and `down`, from a `main` checkout; a run by hand goes through it too                                                                                                                                                                |
+| Who runs it         | `seeded-fleet-reconciler`, its own identity, in `main`-only Prow jobs                                  | `sized-fleet-runner`, its own identity, in the two `main`-only periodics. No presubmit runs as it, because a presubmit runs a pull request's code.                                                                                                            |
+| Job logs            | `kube-agents-periodic-logs`, a bucket kube-agents owns                                                 | The same bucket                                                                                                                                                                                                                                               |
+| Labels              | `managed-by=kube-agents-seeded-fleet`, apart from the bench clusters' label                            | `managed-by=kube-agents-sized-fleet`, apart from both, so neither the bench sweep nor the seeded fleet's tooling matches a sized cluster                                                                                                                      |
+| Fixture catalogue   | Roles in `bench/tf/fleet/fixtures.json`, each with a designed state that a scan checks                 | Roles `sized-fleet-s`, `sized-fleet-m` and `sized-fleet-l`, with their designed state (cluster count, node count, workloads ready, churn rate); the run's soundness check is that scan                                                                        |
+| Kubeconfigs by role | `hack/fleet-kubeconfigs.sh`                                                                            | The same script, which learns the sized roles, so the eval harness reaches the sized fleet by role                                                                                                                                                            |
+| Orphans             | The standing fleet has none                                                                            | `down` runs in the script's exit trap, and a sweep at the start of each run deletes any cluster with the sized label older than 8 hours                                                                                                                       |
+| Watching            | The CI health bot reads each run and posts a failed or overdue one ([`ci-health.md`](../ci-health.md)) | The same bot watches the two periodics                                                                                                                                                                                                                        |
+
+**The identity.** `sized-fleet-runner` is set up as the seeded fleet's reconciler and the eval
+baseline recorder were ([`eval-scorer.md`](eval-scorer.md) has the recipe): a service account in the
+Prow project, a Kubernetes service account of the same name in the build cluster's `test-pods`
+namespace bound to it through Workload Identity, and object admin on `kube-agents-periodic-logs`. On
+the scale project it holds only what a run needs:
+
+| Role                                                                          | Why                                                                                 |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `roles/container.admin`                                                       | Create and delete the test clusters; reset the install's state on the host cluster. |
+| `roles/compute.networkAdmin`                                                  | Create and delete each cluster's subnet.                                            |
+| `roles/iam.serviceAccountUser`, on the nodes' service account                 | Create node pools that run as that account.                                         |
+| `roles/logging.viewer`, `roles/monitoring.viewer`                             | Read the events, node OOM kills and container figures the verdict and records use.  |
+| `roles/serviceusage.serviceUsageConsumer`                                     | Bill its API calls, such as the Catalog API's price reads, to the project.          |
+| Object admin under `sized-fleet-` in the state bucket, and list on the bucket | Keep the OpenTofu state, and nothing else in that bucket.                           |
+| Object admin on the results bucket                                            | Write the verdict, the measurements and the cost record.                            |
+
+Like the reconciler, the identity could do more on the scale project than one run needs; what
+bounds it is that only `main`-only jobs run as it.
+
+## Logs and records
+
+Each run writes three records to a results bucket, one folder a run, as the eval dashboards' data
+does, and prints a one-line summary of each to the job's log:
+
+- **The verdict:** `scale-verdict.json`, above.
+- **The measurements:** container peaks and memory-time, broker waits, token counts, the burst
+  window's real length. Each record's key gains the fleet size and the window, beside its commit,
+  mode, factor, level, operation and run. `bench/scale/harness-limits.json` stays the file a person
+  merges chosen runs into.
+- **The cost record:** `scale-cost.json`, computed by the run's own code. The run reads no billing
+  data: the project has no billing export, so the code measures the inputs and prices them.
+
+  | Input                      | Measured from                                                                                | Priced from                                      |
+  | -------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+  | Node-hours                 | Each node's create and delete time, from the Compute Engine instances the run's clusters own | The machine type's on-demand price in the region |
+  | Cluster-hours              | Each cluster's create and delete time, from its GKE operations                               | The GKE cluster fee                              |
+  | Disk-hours                 | Each node's boot disk size and lifetime                                                      | The disk type's price                            |
+  | Model tokens               | LiteLLM's token counters for each window, by model and kind (input, cached input, output)    | The model's price per token                      |
+  | Model spend, a cross-check | LiteLLM's own spend counter for each window (`litellm_spend_metric`)                         | LiteLLM's price map                              |
+
+  The infrastructure prices come from the Cloud Billing Catalog API, which publishes list prices
+  by SKU and needs no billing account access; the run stores the prices it used and their date in
+  the record. The model prices are a table in the repository, with its source and date. The record
+  gives each input, its price and its cost, and their sum for the run, so a reader can check the
+  arithmetic. When the run's token cost and LiteLLM's spend counter differ by more than 10 %, the
+  record says so.
+
+Every test cluster also carries two GCP resource labels, `kube-agents-scale-run=<run id>` and
+`kube-agents-scale-size=<S, M or L>`. The run finds its own instances, disks and clusters by them,
+and they keep any later billing data attributable to a run.
+
+## Cost
+
+List prices, which the cost record replaces with the Catalog API's figures from the first run: an
+on-demand `n1-standard-1` node is about $0.048 an hour in us-central1, and a GKE cluster fee is $0.10
+an hour.
+
+| Size | Runs a month | Nodes | Hours a run | Node cost a run | Cluster fees a run | Infrastructure a month |
+| ---- | ------------ | ----- | ----------- | --------------- | ------------------ | ---------------------- |
+| M    | about 26     | 250   | about 3.5   | ≈ $42           | ≈ $3               | ≈ $1,150               |
+| L    | about 4.3    | 500   | about 4     | ≈ $95           | ≈ $6               | ≈ $440                 |
+
+Model tokens come on top. At 40 clusters the real-install test measured $111 of tokens in its first
+5 hours; M has 8 clusters and a 2-hour run, so its tokens should cost much less. The cost record
+gives the real figure for every run.
+
+## Rollout
+
+The sized fleet starts in one project of its own and reaches the shared eval projects in stages,
+and the presubmit last, because the eval pool's projects are shared with every pull request's
+presubmit.
+
+**Stage 1: one scale project.** The two periodics build the fleet in a single project that no other
+job uses, with its own kube-agents install as the host. A project of its own keeps the fleet's
+quota, IAM and network apart from people's work. Until such a project exists, a developer's project
+stands in. Runs by hand come first (`hack/sized_fleet.py run --down`), then the periodics.
+
+**Stage 2: the nightly eval projects.** The eval nightlies lease pool projects through Boskos, the
+same projects the presubmit leases. The lease is what keeps the two apart:
+
+1. A nightly sized lane leases a pool project, builds the sized fleet in it, runs, and deletes the
+   fleet before it releases the lease. A presubmit that leases the same project later finds no
+   trace of it.
+2. Each pool project is provisioned for it as for the seeded fleet:
+   `scripts/provision_ci_pool_project.sh` creates the nodes' service account and the state prefix,
+   and checks the CPU quota for M (250 vCPU of N1); `scripts/verify_ci_pool_project.py` checks
+   them, so a project without them fails verification before it is leased.
+3. `sized-fleet-runner` holds its roles on every pool project, as `seeded-fleet-reconciler` does.
+4. A case that needs the sized fleet names the fixture role `sized-fleet-m` and is registered in
+   the nightly lists only.
+
+This gives every contributor a shared test bed for scaling evals: a nightly lane's records, and
+a pool project that can build the fleet for a run by hand under a lease.
+
+**Stage 3: the presubmit, last,** once the nightly lane has a clean record (two weeks green). Even S
+adds about 20 minutes of build and the run's windows to a presubmit, so the first step is a few
+sized-fleet cases on the blocking roster, admitted by the roster's own rules
+([`eval-gate-roster.md`](../eval-gate-roster.md)), rather than a sized run on every pull request.
+
+## What is built, in order
+
+Each item is its own pull request after this design merges.
+
+1. **Sizes and the fleet stack.** `bench/scale/fleet-sizes.yaml`; `bench/tf/sized-fleet/` (the
+   subnets, the clusters, one node pool of `n1-standard-1` nodes each, the labels) and
+   `hack/sized_fleet.py up` and `down`; `fixtures.py` gains the HTTP Deployments with their
+   Services, the CronJob clients with spread start minutes, and the failing Pods; the
+   `sized-fleet-*` roles in the fixture catalogue and in `hack/fleet-kubeconfigs.sh`. One live M
+   run by hand is the evidence.
+2. **The run plan and the verdict.** `bench/scale/nightly.yaml` (the five steps and the two
+   windows) and `bench/kube_agents_bench/scale/verdict.py`, with unit tests for each check. The
+   runner already has `reset_soak` and `trigger_soak`, and in `operations.py` `trigger_jobs`,
+   `job_statuses`, `job_seconds` and `unfinished_jobs`; this item reuses them. `trigger_jobs` marks
+   every job at once, so the 5-minute stagger is new. The Cloud Logging reads for events and node
+   OOM kills are new.
+3. **The records.** The upload to the results bucket, the size and window in the record key, the
+   cost record with its price table.
+4. **The chat cases.** The two `-sized` variants, `hack/eval/sized-fleet-cases.txt`, and the soak
+   window's call to the eval harness against the sized install.
+5. **The nightly.** `hack/ci-scale-nightly.sh`, the `sized-fleet-runner` identity and its grants,
+   the two periodics in `oss-test-infra`, and the CI health bot's watch on them. The script always
+   runs `down`, also when a step fails, and the sweep in step 1 deletes clusters an aborted run
+   left.
+
+## Open questions
+
+- **The Prow job's time limit.** A run takes 3 to 4 hours, longer than most eval nightlies.
+- **Typical runs.** The install is reset each night, so every audit run is a first run, which reads
+  every cluster as new. A weekly run without the reset would measure typical runs.
