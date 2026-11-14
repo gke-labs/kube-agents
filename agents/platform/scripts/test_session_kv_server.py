@@ -10913,6 +10913,10 @@ class TestCardStop(unittest.TestCase):
         self.addCleanup(modules.stop)
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        # Each test is its own conversation's stops: no joined result carries
+        # over from another test's stop on the same session (#5528).
+        session_kv_server._card_stop_flights.clear()
+        self.addCleanup(session_kv_server._card_stop_flights.clear)
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
 
     # -- the stub Hermes ---------------------------------------------------
@@ -11335,14 +11339,201 @@ class TestCardStop(unittest.TestCase):
         body = self.stop().json()
         self.assertEqual((body["stopped"], body["rounds"], self.sleeps), ([], 0, []))
 
-    def test_a_second_call_stops_nothing(self):
+    def test_a_second_call_past_the_join_window_stops_nothing(self):
         self.the_tree()
         first = self.stop().json()
         self.assertEqual(len(first["stopped"]), 4)
-        second = self.stop()
+        with patch.object(session_kv_server, "CARD_STOP_JOIN_WINDOW_S", 0.0):
+            second = self.stop()
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()["stopped"], [])
         self.assertEqual(second.json()["rounds"], 0)
+        self.assertNotIn("joined", second.json())
+
+    def test_a_second_call_inside_the_join_window_gets_the_first_answer(self):
+        # #5528: the gateway's card-stop control and the bridge's cancel
+        # archive both stop one session; the later one must not read
+        # "stopped 0" against the cards the earlier one stopped.
+        # Filed a while before the stop, as real cards are: one filed in the
+        # stop's own second counts as possibly new (whole-second stamps).
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        self.card("t_b", "todo", session=self.SESSION, created=time.time() - 10)
+        first = self.stop().json()
+        self.assertEqual(self.stopped_ids(first), ["t_a", "t_b"])
+        second = self.stop()
+        self.assertEqual(second.status_code, 200)
+        body = second.json()
+        self.assertTrue(body["joined"])
+        self.assertEqual(self.stopped_ids(body), self.stopped_ids(first))
+        self.assertNotIn("joined", first)
+
+    def test_a_card_filed_after_the_first_stop_began_gets_a_fresh_stop(self):
+        # The planner's correction to #5528: a joined answer is stale once the
+        # conversation has a card the first scan could not have seen.
+        self.the_tree()
+        first = self.stop().json()
+        self.card("t_new", "running", session=self.SESSION, created=time.time() + 1)
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_new"])
+        self.assertEqual(self.status("t_new"), "archived")
+        self.assertNotIn("t_new", self.stopped_ids(first))
+
+    def test_a_card_filed_in_the_same_second_the_first_stop_began_gets_a_fresh_stop(self):
+        # Hermes stamps created_at in whole seconds, so a card filed just
+        # after the first scan began can carry a stamp below it. It is open,
+        # and an open card after a complete stop is new: a fresh stop.
+        import math
+
+        self.the_tree()
+        first_stamp = math.floor(time.time())
+        self.stop()
+        self.card("t_same_second", "running", session=self.SESSION, created=first_stamp)
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_same_second"])
+
+    def test_a_done_card_filed_just_before_the_first_stop_still_joins(self):
+        # As verify_card_stop.py runs it against real Hermes: an earlier
+        # answer's card, done, filed in the first stop's own second. It is
+        # not open, so a second stop at once joins the first.
+        self.card("t_earlier", "done", session=self.SESSION, created=time.time())
+        first = self.stop().json()
+        second = self.stop().json()
+        self.assertTrue(second.get("joined"), second)
+        self.assertEqual(second["settled"], first["settled"])
+
+    def test_concurrent_stops_for_one_conversation_scan_once_and_answer_alike(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            entered.set()
+            release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        a = _threading.Thread(target=caller, args=("a",))
+        a.start()
+        self.assertTrue(entered.wait(5))
+        b = _threading.Thread(target=caller, args=("b",))
+        b.start()
+        time.sleep(0.2)
+        release.set()
+        a.join(5)
+        b.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["a"]["stopped"], out["b"]["stopped"])
+        self.assertNotIn("joined", out["a"])
+        self.assertTrue(out["b"]["joined"])
+
+    def test_a_partial_first_stop_is_never_reused(self):
+        # A card archived mid-claim (unresolved) may still get a worker: the
+        # second stop runs afresh rather than repeating a partial answer.
+        self.card("t_claimed", "running", session=self.SESSION, created=time.time() - 10)
+        first = self.stop().json()
+        self.assertEqual([c["id"] for c in first["unresolved"]], ["t_claimed"])
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+
+    def test_joining_a_running_stop_rescans_when_a_card_was_filed_since(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": f"t_{len(calls)}"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_tree_has_open_card", lambda *a: True):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            release.set()
+            a.join(5)
+            b.join(5)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_join_and_its_own_stop_share_one_deadline(self):
+        # A call that joins a running stop whose answer can't be reused stops
+        # for itself on what is left of its own deadline, not a fresh one, so
+        # the whole call stays inside CARD_STOP_JOIN_WORST_CASE_S.
+        import threading as _threading
+
+        clock = [1000.0]
+        release, entered = _threading.Event(), _threading.Event()
+        deadlines = []
+
+        def run(deadline=None):
+            deadlines.append(deadline)
+            if len(deadlines) == 1:
+                entered.set()
+                release.wait(5)
+                return {"session_id": self.SESSION, "stopped": [], "unresolved": [{"id": "t_1"}]}
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_clock", lambda: clock[0]):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            clock[0] = 1005.0
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            clock[0] = 1015.0
+            release.set()
+            a.join(5)
+            b.join(5)
+        deadline = session_kv_server.CARD_STOP_DEADLINE_S
+        self.assertEqual(deadlines, [1000.0 + deadline, 1005.0 + deadline])
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_joined_stop_answers_inside_the_bridges_timeout(self):
+        # The bridge's POST bound, DefaultCardStopTimeout in
+        # a2a/hermes-bridge/cardstop.go (35 s), must cover a joined stop.
+        self.assertLess(session_kv_server.CARD_STOP_JOIN_WORST_CASE_S, 35.0)
+
+    def test_a_truncated_tree_read_counts_as_a_new_card(self):
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        truncated = session_kv_server._CardTree({}, [], True)
+        with patch.object(session_kv_server, "_collect_card_tree", lambda *a, **k: truncated):
+            self.assertTrue(session_kv_server._card_stop_tree_has_open_card(self.SESSION, self.CONVERSATION))
+
+    def test_another_conversation_never_joins(self):
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            return {"stopped": []}
+
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/1", run)
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/2", run)
+        self.assertEqual(len(calls), 2)
 
     def test_the_set_is_capped_and_says_so(self):
         import sqlite3

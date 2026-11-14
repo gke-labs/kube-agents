@@ -42,8 +42,10 @@ import (
 // capability check (capability.DefaultTimeout, 5 s), the wait for the
 // session's turn (cardStopTurnWait, 20 s), and the POST
 // (DefaultCardStopTimeout, 35 s), about 60 s at worst. session-kv answers
-// inside its CARD_STOP_WORST_CASE_S (24 s), so the POST's bound is that plus
-// room; the gateway's wait for the control (A2A_CARD_STOP_TIMEOUT) sits
+// inside its CARD_STOP_WORST_CASE_S (24 s), or CARD_STOP_JOIN_WORST_CASE_S
+// (28 s) for a stop that joined one already running (its card stop is
+// single-flight per conversation), so the POST's bound is that plus room;
+// the gateway's wait for the control (A2A_CARD_STOP_TIMEOUT) sits
 // above the whole, at 75 s. Raise them together.
 //
 // A cancel ends the bridge's wait, not session-kv's work: the route is a
@@ -57,8 +59,8 @@ const (
 	// cardStopPathFormat is the stop endpoint under Config.RouteURL.
 	cardStopPathFormat = "/v1/sessions/%s/cards/stop"
 	// DefaultCardStopTimeout is Config.CardStopTimeout's default, the bound
-	// on the POST: session-kv's CARD_STOP_WORST_CASE_S (24 s) plus room (the
-	// budget above). The daemon reads BRIDGE_CARD_STOP_TIMEOUT_SECONDS, and
+	// on the POST: session-kv's CARD_STOP_JOIN_WORST_CASE_S (28 s) plus room
+	// (the budget above). The daemon reads BRIDGE_CARD_STOP_TIMEOUT_SECONDS, and
 	// its defaultCardStopTimeoutSeconds must equal this.
 	DefaultCardStopTimeout = 35 * time.Second
 	// cardStopResponseCap bounds the answer read. A conversation's cards

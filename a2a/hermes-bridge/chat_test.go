@@ -702,7 +702,8 @@ c.commit()
 
 // A stop that lands while a console or A2A door turn holds for its cards
 // (#5407) ends the hold: the task goes canceled, and the bridge asks
-// session-kv to stop the session's cards (markSessionCanceled). The cancel
+// session-kv to stop the session's cards (finalizeWaitCanceled, or
+// markRunCanceled for a cancel outside the wait). The cancel
 // arrives as KindCancel on the task's .in, which is what the gateway sends
 // for a console or MCP typed stop and for an A2A door tasks/cancel. That
 // archive does not follow A2A_CARD_STOP (#4999 item 2): a stop of a turn

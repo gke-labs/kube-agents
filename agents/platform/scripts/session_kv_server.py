@@ -10071,6 +10071,13 @@ CARD_STOP_BUSY_TIMEOUT_S = 3.0
 # The bound on the answer: see the section comment. The bridge's request
 # timeout and the gateway's wait for the control task sit above it.
 CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+# The bound on a call that joins a running stop (_card_stop_single_flight):
+# the call's one deadline covers both its wait and, when the joined answer
+# can't be reused, its own stop, which then runs on what is left of it; each
+# can overrun the deadline by a board busy timeout and a second. Under the
+# bridge's 35 s request timeout (DefaultCardStopTimeout in
+# a2a/hermes-bridge/cardstop.go), so a joined stop still answers the cancel.
+CARD_STOP_JOIN_WORST_CASE_S = CARD_STOP_WORST_CASE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
 # Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
 CARD_STOP_KILL_GRACE_SECONDS = 3.0
 CARD_STOP_KILL_POLL_SECONDS = 0.1
@@ -10119,8 +10126,8 @@ def _card_stop_clock() -> float:
 class _Budget:
     """The call's deadline. `hit` records that something was not started for it."""
 
-    def __init__(self) -> None:
-        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+    def __init__(self, deadline: Optional[float] = None) -> None:
+        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S if deadline is None else deadline
         self.hit = False
 
     def left(self) -> float:
@@ -10643,8 +10650,12 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
     was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
-    an archived card is not open.
+    within CARD_STOP_WORST_CASE_S, or CARD_STOP_JOIN_WORST_CASE_S for a call that
+    joins a running stop. A call while another for the same session
+    and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one, with no
+    card open in the conversation's tree now, answers with that stop's result marked
+    `joined` (_card_stop_single_flight). Past that, calling it again stops
+    nothing new, since an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
@@ -10656,8 +10667,166 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         raise HTTPException(status_code=400, detail="conversation or context_id is too long")
     if session_id != _conversation_session_id(context_id):
         raise HTTPException(status_code=400, detail="context_id is not this session's")
+    return _card_stop_single_flight(
+        session_id, conversation, lambda deadline: _stop_session_cards_now(session_id, conversation, deadline)
+    )
 
-    budget = _Budget()
+
+# A conversation's card stop is single-flight (#5528). With the gateway's
+# card-stop control armed, a typed console or MCP stop runs two stops on one
+# session at once: the control's and the hermes-bridge's cancel archive. The
+# second to arrive would find the cards archived and answer "stopped 0", and
+# the caller would read the two answers as contradicting each other. So a stop
+# that arrives while one for the same session and conversation is running
+# waits for it, and one that arrives within CARD_STOP_JOIN_WINDOW_S of a
+# finished stop looks at it; either answers with that stop's result, marked
+# `joined`, only when the result is complete (nothing failed, pending,
+# unresolved, past the deadline or truncated) and no card in the
+# conversation's tree is open now. A complete stop left nothing open, so an
+# open card is one filed since: real new work, which gets a fresh stop, as
+# does anything a partial stop may have left running. Read by status, not by
+# created_at, whose whole-second stamps can't tell a card filed just before
+# the stop from one filed just after. Anything uncertain scans afresh.
+CARD_STOP_JOIN_WINDOW_S = 60.0
+
+
+class _CardStopFlight:
+    """One stop for a (session, conversation): its result or error, and when
+    it ended."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.finished_at: Optional[float] = None  # monotonic
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[HTTPException] = None
+
+
+_card_stop_flights_lock = threading.Lock()
+_card_stop_flights: Dict[tuple, _CardStopFlight] = {}
+
+
+def _joined(flight: _CardStopFlight) -> Dict[str, Any]:
+    if flight.error is not None:
+        raise flight.error
+    out = dict(flight.result or {})
+    out["joined"] = True
+    return out
+
+
+def _card_stop_result_complete(result: Optional[Dict[str, Any]]) -> bool:
+    """Whether a stop's result can stand in for another stop: everything it
+    found stopped or settled, nothing failed, pending, unresolved or past the
+    deadline, and the set not truncated. A partial stop is never reused."""
+    if not result:
+        return False
+    return not (
+        result.get("failed")
+        or result.get("pending")
+        or result.get("unresolved")
+        or result.get("errors")
+        or result.get("deadline")
+        or result.get("truncated")
+    )
+
+
+def _card_stop_reusable(flight: _CardStopFlight, session_id: str, conversation: str) -> bool:
+    """A finished flight's result answers this call only when it is complete
+    and no card in the conversation's tree is open now (CARD_STOP_JOIN_WINDOW_S's
+    comment); anything else needs a fresh stop (fail closed)."""
+    return (
+        flight.error is None
+        and _card_stop_result_complete(flight.result)
+        and not _card_stop_tree_has_open_card(session_id, conversation)
+    )
+
+
+def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[str, Any]:
+    # One deadline for the whole call, so a call that joins a running stop
+    # and then has to stop for itself still answers within
+    # CARD_STOP_JOIN_WORST_CASE_S: run(deadline) gets what is left of it.
+    deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+    key = (session_id, conversation)
+    with _card_stop_flights_lock:
+        flight = _card_stop_flights.get(key)
+        recent = (
+            flight
+            if flight is not None
+            and flight.done.is_set()
+            and flight.finished_at is not None
+            and time.monotonic() - flight.finished_at < CARD_STOP_JOIN_WINDOW_S
+            else None
+        )
+    if recent is not None and _card_stop_reusable(recent, session_id, conversation):
+        return _joined(recent)
+    # Register this stop, unless one is running for the conversation: then
+    # wait for it and take its answer only if it is reusable, else register
+    # afresh. Checked and registered under one lock, so two callers that
+    # arrive together never both scan. Bounded: a racing stop is joined at
+    # most twice before this call scans for itself regardless.
+    for attempt in range(3):
+        own: Optional[_CardStopFlight] = _CardStopFlight()
+        with _card_stop_flights_lock:
+            racing = _card_stop_flights.get(key)
+            if attempt < 2 and racing is not None and not racing.done.is_set():
+                own = None
+            else:
+                _card_stop_flights[key] = own
+                # Bounded: drop finished flights past the window.
+                now = time.monotonic()
+                for k in [
+                    k
+                    for k, f in _card_stop_flights.items()
+                    if f.finished_at is not None and now - f.finished_at >= CARD_STOP_JOIN_WINDOW_S
+                ]:
+                    del _card_stop_flights[k]
+        if own is not None:
+            break
+        # Waited on until this call's own deadline, plus the slack a busy
+        # board connection adds; a stop still running past that (it can't
+        # be, but a wedged board connection is not ours to trust) gets this
+        # call a 503 rather than a longer wait.
+        wait = max(0.0, deadline - _card_stop_clock()) + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+        if not racing.done.wait(wait):
+            raise HTTPException(status_code=503, detail="a card stop for this conversation is still running")
+        if _card_stop_reusable(racing, session_id, conversation):
+            return _joined(racing)
+    try:
+        own.result = run(deadline)
+        return own.result
+    except HTTPException as exc:
+        own.error = exc
+        raise
+    except Exception:
+        own.error = HTTPException(status_code=500, detail="the card stop failed")
+        raise
+    finally:
+        own.finished_at = time.monotonic()
+        own.done.set()
+
+
+def _card_stop_tree_has_open_card(session_id: str, conversation: str) -> bool:
+    """Whether the conversation's card tree holds a card that is not done or
+    archived (CARD_STOP_SETTLED_STATUSES). Any failure to read it, or a tree
+    too large to read whole, answers True, so the caller scans afresh."""
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return False
+    try:
+        _, connect_tracked = _hermes_kanban()
+        conn = _card_stop_connect(connect_tracked, board)
+        with closing(conn):
+            sessions = [session_id, *_compression_descendants(session_id)]
+            tree = _collect_card_tree(conn, sessions, session_id, conversation, _Budget())
+    except Exception:
+        return True
+    if tree.truncated:
+        return True  # a tree too large to read whole may hold an open card
+    return any(card.get("status") not in CARD_STOP_SETTLED_STATUSES for card in tree.cards.values())
+
+def _stop_session_cards_now(session_id: str, conversation: str, deadline: Optional[float] = None) -> Dict[str, Any]:
+    """One stop of the conversation's cards: the route's body, run through
+    _card_stop_single_flight, on the call's deadline (_Budget)."""
+    budget = _Budget(deadline)
     result: Dict[str, Any] = {
         "session_id": session_id,
         "board": False,
