@@ -405,12 +405,16 @@ class SandboxKubectlTest(unittest.TestCase):
 
 class ReconcilersForTest(unittest.TestCase):
     def test_matches_the_repository_whatever_its_spelling(self):
-        for repo in (REPO, REPO + ".git", REPO + "/", "git@github.com:acme/fleet.git", "HTTPS://GitHub.com/acme/fleet"):
+        for repo in (REPO, REPO + ".git", REPO + "/", "git@github.com:acme/fleet.git", "HTTPS://GitHub.com/acme/fleet",
+                     "ssh://git@github.com:22/acme/fleet.git", "github.com:acme/fleet.git", "https://www.github.com/acme/fleet"):
             with self.subTest(repo=repo):
                 lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo=repo)]}}
                 self.assertEqual(len(post_merge_check.reconcilers_for(REPO, "shop", lists)), 1)
         lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo="https://github.com/acme/other")]}}
         self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists), [])
+        # A record with no repository matches nothing, not every source with a missing url.
+        lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo="")]}}
+        self.assertEqual(post_merge_check.reconcilers_for("", "shop", lists), [])
 
     def test_only_objects_delivering_into_the_namespace_on_this_cluster_count(self):
         elsewhere = argo_app()
