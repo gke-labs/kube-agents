@@ -824,7 +824,7 @@ func TestAProfileOutsideAutopilotsRatioIsFlagged(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&p).WithStatusSubresource(&agentv1alpha1.AgentProfile{}).Build()
 	ar := &AgentProfileReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if err := ar.writeStatus(ctx, &p, agent, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
+	if err := ar.writeStatus(ctx, &p, agent, nil, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
 		t.Fatal(err)
 	}
 	cond := meta.FindStatusCondition(p.Status.Conditions, agentv1alpha1.AgentProfileConditionJobResourcesFit)
@@ -833,7 +833,7 @@ func TestAProfileOutsideAutopilotsRatioIsFlagged(t *testing.T) {
 	}
 	fine := p.DeepCopy()
 	fine.Spec.Resources.Requests.Memory = resource.MustParse("512Mi")
-	if err := ar.writeStatus(ctx, fine, agent, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
+	if err := ar.writeStatus(ctx, fine, agent, nil, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
 		t.Fatal(err)
 	}
 	if cond := meta.FindStatusCondition(fine.Status.Conditions, agentv1alpha1.AgentProfileConditionJobResourcesFit); cond == nil || cond.Status != metav1.ConditionTrue {

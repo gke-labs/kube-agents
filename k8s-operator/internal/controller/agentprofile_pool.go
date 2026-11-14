@@ -40,7 +40,7 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
-	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
 	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and
@@ -346,10 +346,11 @@ func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1
 	}
 }
 
-// interactiveTier reports whether a tier runs on a warm pool. The unattended
-// tier runs as a Job per task (PR 6).
-func interactiveTier(tier string) bool {
-	return tier == agentv1alpha1.AgentProfileTierRead
+// interactiveTier reports whether a profile's tier runs on a warm pool: one
+// whose mode is interactive (read, or a Tier resource of that mode, #3659).
+// An unattended-mode tier runs as a Job per task (PR 6).
+func interactiveTier(p *agentv1alpha1.AgentProfile, tier string) bool {
+	return tierModeOf(p, tier) == tierModeInteractive
 }
 
 // profileCABundleComponent labels the NATS CA bundle's copy in the profile
@@ -390,7 +391,7 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 			continue
 		}
 		for _, id := range res.identities {
-			if !interactiveTier(id.tier) {
+			if !interactiveTier(&profiles[i], id.tier) {
 				continue
 			}
 			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)

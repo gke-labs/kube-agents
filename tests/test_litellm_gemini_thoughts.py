@@ -4,7 +4,7 @@ Gemini thinks by default but returns its thoughts only when the request sets
 thinkingConfig.includeThoughts; with it off, Gemini 3.x sometimes writes its
 reasoning into the answer under a first line `thought`. The chart renders
 `thinking: {"type": "enabled"}` under every model_list alias for a Gemini 2.5
-or 3.x model through gemini or vertex_ai, which LiteLLM v1.106.0 maps to
+or 3.x model through gemini or vertex_ai, which LiteLLM v1.108.6 maps to
 includeThoughts and nothing else. Three things have to hold: the key is on
 every alias of such a model; it is absent for every other model, because
 LiteLLM refuses it on a model it does not treat as a reasoning model and on

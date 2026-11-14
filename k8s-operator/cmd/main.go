@@ -364,6 +364,12 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// The A2A bus-stream check, read from the bus's metrics exporter on the
+	// leader; see internal/controller/platformagent_a2a_bus_streams.go.
+	if err := mgr.Add(controller.NewBusStreamPoller(reconciler)); err != nil {
+		setupLog.Error(err, "Failed to add the bus stream poller to the manager")
+		os.Exit(1)
+	}
 
 	// The AgentProfile reconciler, when the CRD is installed. An operator
 	// upgraded ahead of its CRDs keeps running everything else. Only a real
@@ -385,6 +391,9 @@ func main() {
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
 			APIReader: mgr.GetAPIReader(),
+			// A role that can't read Tiers lists none: a cached list would
+			// start an informer that never syncs (#3659, #1009's case).
+			TiersUnreadable: len(controller.TierAccessDenied(rbacChecker)) > 0,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)

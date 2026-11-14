@@ -88,6 +88,8 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The install's Tier resources, rendered by the operator (#3659).
+	capability.StartTierFile(ctx, os.Getenv, log)
 
 	// Buffered by close() and fired at most once: the deferred Close below
 	// also runs the handler, and a clean shutdown must not look like a

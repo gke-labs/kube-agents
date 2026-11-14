@@ -96,3 +96,12 @@ jobs:
       # tagged, the row must be in it, and a `pending` row must be relabelled.
       - name: Upgrade-table rows name a release that contains them
         run: make docs-check-upgrade-releases
+
+      # Every Hermes cron job is migrating to profiles and dispatch (#4685),
+      # and its plan is one row of the scheduling inventory. A pull request
+      # that adds, removes, or changes a roster job's schedule, script,
+      # no_agent or deliver has to update that row (#5626). The script reads
+      # its comparison base from the event; on a push to main only the
+      # job-to-row comparison runs.
+      - name: Cron roster changes update the scheduling inventory
+        run: make docs-check-cron-inventory

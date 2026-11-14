@@ -108,6 +108,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
+# The namespace whose events the k8s event watcher does not forward on an eval
+# install (spec.harness.eventWatcher.alertExclude, a namespace rule on every
+# cluster). bench/tf/prebuilt/kcc-stalled-declaration plants a
+# ContainerNodePool there that Config Connector holds at DependencyNotFound
+# for the whole run. DependencyNotFound is on the watcher's reason list, so
+# without this rule an event on the object opens an incident and a triage card
+# in the middle of the case, and the card can stay for later cases on the same
+# install. The stall watch has its own opt-out, an annotation the stack sets.
+# Equal to the stack's kcc_namespace; tests/test_ci_deploy_mode_next.py holds
+# the two equal.
+readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -394,6 +406,16 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
+# The NATS StatefulSet mode: next renders, and the claims its
+# volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
+# (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
+# claim left by an earlier lease pins its server to the old disk's zone, where
+# topology spread can leave it unschedulable (#5658); 5b″ and 6b delete such
+# claims while no StatefulSet owns them. The delete is bounded like the
+# teardown's.
+readonly A2A_NATS_STATEFULSET_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+readonly A2A_NATS_CLAIM_NAME_RE="^persistentvolumeclaim/data-${A2A_NATS_STATEFULSET_NAME}-[0-9]+\$"
+readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the main nightly's
@@ -422,7 +444,19 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane ci-kube-agents-eval-nightly-slack"
+
+# The Slack lane's nightly (EVAL_SLACK_LANE=1 on ci-kube-agents-eval-nightly-slack,
+# beside EVAL_MODE_NEXT=1): the install gets Slack through the eval Slack app, and
+# hack/ci-eval-pr.sh runs hack/slack-lane/run.sh in place of the matrix. The app's
+# tokens, the CI channel and the test user's member id live in Secret Manager in
+# SLACK_LANE_SECRETS_PROJECT, where the runner reads the GitLab pair too; with any
+# of them unreadable the install keeps Slack off and the lane logs its skip.
+readonly SLACK_LANE_SECRETS_PROJECT="${SLACK_LANE_SECRETS_PROJECT:-kube-agents-prow}"
+readonly SLACK_LANE_BOT_TOKEN_SECRET="slack-eval-bot-token"
+readonly SLACK_LANE_APP_TOKEN_SECRET="slack-eval-app-token"
+readonly SLACK_LANE_CHANNEL_SECRET="slack-eval-channel-id"
+readonly SLACK_LANE_TEST_USER_SECRET="slack-eval-test-user-id"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -529,6 +563,15 @@ readonly A2A_GATEWAY_ELECTION_ON="true"
 # it onto the gateway from its own environment; only an exact "true" arms it.
 readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
 readonly A2A_CARD_STOP_ON="true"
+# The gateway's A2A door (k8s-operator platformagent_a2a_manifests.go,
+# a2aAgentDoorEnvVar): on for the next lane, so the card-wait stopped ask
+# (bench stop_hook.CARD_WAIT_DIRECTIVE, #5407) can stop a turn while it holds
+# for its cards, which only console, MCP and A2A door turns do. A default
+# install leaves the door off; the lane diverges here on purpose. The door
+# authenticates every call with its own per-install token, which
+# hack/ci-eval-pr.sh reads from the Secret the operator renders.
+readonly A2A_AGENT_DOOR_ENV_VAR="A2A_AGENT_DOOR"
+readonly A2A_AGENT_DOOR_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -1102,6 +1145,52 @@ export MEMORY_ENABLED="false"
 export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
+
+# ─── 2a. The Slack lane's Slack (EVAL_SLACK_LANE=1) ──────────────────────────
+# Slack on, through the eval app, with Google Chat off so Slack holds the A2A
+# gateway; the CI channel as the home channel; the test user on the allowlist
+# and on operator.slackTestUsers, so the gateway reads its user-token posts as
+# its own. The tokens reach Helm as --set-file from a 0700 directory, never on
+# argv, removed beside the sandbox key once the release is in. Any secret
+# unreadable: Slack stays off, the error's class (not found, permission denied)
+# is logged, and hack/ci-eval-pr.sh, which checks the installed CR, skips the
+# lane. Empty on every other run.
+SLACK_LANE_HELM_ARGS=()
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    echo "ERROR: EVAL_SLACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane's test user reaches a turn only through the A2A gateway's Slack adapter, which only next renders." >&2
+    exit 1
+  fi
+  SLACK_LANE_DIR="$(mktemp -d)"
+  chmod 700 "${SLACK_LANE_DIR}"
+  slack_lane_missing=()
+  for slack_lane_secret in "${SLACK_LANE_BOT_TOKEN_SECRET}" "${SLACK_LANE_APP_TOKEN_SECRET}" "${SLACK_LANE_CHANNEL_SECRET}" "${SLACK_LANE_TEST_USER_SECRET}"; do
+    slack_lane_value="$(gcloud secrets versions access latest --secret="${slack_lane_secret}" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>"${SLACK_LANE_DIR}/err" | tr -d '[:space:]')" || slack_lane_value=""
+    if [ -z "${slack_lane_value}" ]; then
+      # gcloud's error names the failure, never the value: NOT_FOUND until the
+      # secret exists, PERMISSION_DENIED while the runner lacks the grant.
+      slack_lane_missing+=("${slack_lane_secret} ($(grep -oE 'NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED' "${SLACK_LANE_DIR}/err" | head -n 1 || true))")
+      continue
+    fi
+    printf '%s' "${slack_lane_value}" >"${SLACK_LANE_DIR}/${slack_lane_secret}"
+  done
+  unset slack_lane_value
+  if [ "${#slack_lane_missing[@]}" -gt 0 ]; then
+    echo "Slack lane: ${slack_lane_missing[*]} not readable in ${SLACK_LANE_SECRETS_PROJECT}; installing without Slack, and the lane will skip"
+  else
+    SLACK_LANE_CHANNEL="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_CHANNEL_SECRET}")"
+    SLACK_LANE_TEST_USER="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_TEST_USER_SECRET}")"
+    SLACK_LANE_HELM_ARGS=(
+      --set "platformAgent.integration.slack.enabled=true"
+      --set-file "platformAgent.credentials.data.SLACK_BOT_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_BOT_TOKEN_SECRET}"
+      --set-file "platformAgent.credentials.data.SLACK_APP_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_APP_TOKEN_SECRET}"
+      --set-string "platformAgent.integration.slack.homeChannel=${SLACK_LANE_CHANNEL}"
+      --set-string "platformAgent.integration.slack.allowedUsers[0]=${SLACK_LANE_TEST_USER}"
+      --set-string "operator.slackTestUsers[0]=${SLACK_LANE_TEST_USER}"
+    )
+    echo "Slack lane: Slack on through the eval app, home channel ${SLACK_LANE_CHANNEL}, test user ${SLACK_LANE_TEST_USER} allowed and listed in operator.slackTestUsers"
+  fi
+fi
 
 # ─── 2b. GitOps Repository for This Run ───────────────────────────────────────
 # Every GitHub-writing eval scenario begins by reading the registered repositories
@@ -1896,6 +1985,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "profiles.cluster.persona.image.tag=${TAG}"
     --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
     --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    # The A2A door, for the card-wait stopped ask (above).
+    --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
+    --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
   )
 fi
 
@@ -2185,6 +2277,47 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-s
 kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
 echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 
+# ─── 5b″. Delete NATS claims no StatefulSet owns ───────────────────────────
+# Teardown deletes them (hack/ci-teardown.sh Step 6), but a pool project that
+# already holds one, or a run killed before its teardown, would fail this
+# deploy's NATS gate on it. With no StatefulSet the claims are unowned and
+# unmounted; with one, they are its data and stay. Never fatal: a failure here
+# leaves the run where it was, and the NATS gate reports it.
+#
+# Called twice. Here it takes claims a teardown left. A next-mode run killed
+# before its teardown leaves its StatefulSet standing, so this call skips;
+# 5c's install then renders mode today, cleanupA2A deletes the StatefulSet and
+# keeps its claims (WhenDeleted: Retain), and 6b's flip back to next would
+# bind them. 6b calls it again before that flip, once the StatefulSet is gone.
+delete_orphaned_nats_claims() {
+  local sts claims
+  if ! sts="$(kubectl get statefulset "${A2A_NATS_STATEFULSET_NAME}" -n "${NAMESPACE}" \
+    --ignore-not-found -o name 2>&1)"; then
+    echo "WARNING: could not check for statefulset/${A2A_NATS_STATEFULSET_NAME} (${sts}); leaving any NATS claims in place."
+    return 0
+  fi
+  if [ -n "${sts}" ]; then
+    echo "statefulset/${A2A_NATS_STATEFULSET_NAME} exists; leaving its claims in place."
+    return 0
+  fi
+  if ! claims="$(kubectl get persistentvolumeclaims -n "${NAMESPACE}" -o name 2>&1)"; then
+    echo "WARNING: could not list claims in ${NAMESPACE} (${claims}); leaving any NATS claims in place."
+    return 0
+  fi
+  claims="$(grep -E "${A2A_NATS_CLAIM_NAME_RE}" <<<"${claims}" || true)"
+  if [ -z "${claims}" ]; then
+    return 0
+  fi
+  while IFS= read -r claim; do
+    echo "WARNING: ${claim} outlived its StatefulSet (a previous lease left it, #5658); deleting it."
+    if ! kubectl delete -n "${NAMESPACE}" "${claim}" --ignore-not-found \
+      --timeout="${A2A_NATS_CLAIM_DELETE_TIMEOUT}"; then
+      echo "WARNING: could not delete ${claim}; the NATS server that mounts it may not schedule."
+    fi
+  done <<<"${claims}"
+}
+delete_orphaned_nats_claims
+
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
@@ -2204,6 +2337,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     "${FORGE_ARGS[@]}" \
     "${GITHUB_MINTER_ARGS[@]}" \
+    ${SLACK_LANE_HELM_ARGS[@]+"${SLACK_LANE_HELM_ARGS[@]}"} \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
     --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \
@@ -2228,6 +2362,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
     --set-string "platformAgent.deployment.env[3].value=off" \
+    --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
@@ -2281,6 +2416,7 @@ rm -f "${HELM_INSTALL_OUT}"
 # A failed install leaves the directory behind in a pod prow destroys with the
 # lease, and nothing uploads it — /logs/artifacts is the only path off this box.
 rm -rf "${SANDBOX_KEY_DIR}"
+if [ -n "${SLACK_LANE_DIR:-}" ]; then rm -rf -- "${SLACK_LANE_DIR}"; fi
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
@@ -2936,6 +3072,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # Claims a killed next-mode lease left, which 5c's flip to today released
+  # from their StatefulSet but kept (5b″ says why), before next binds them.
+  delete_orphaned_nats_claims
   # The mode and the session cap in one values document, so the first render
   # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
   # the budget that Job measures, which counts the rendered bridge's workers,

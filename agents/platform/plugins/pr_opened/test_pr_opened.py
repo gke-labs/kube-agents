@@ -33,9 +33,10 @@ REPOSITORY = "https://github.com/acme/fleet-config"
 REPO_NAME = "acme/fleet-config"
 TASK = "t_9f2a"
 TITLE = "Raise the checkout memory limit"
+TARGET = {"finding_id": "no-pdb.prod.shop.Deployment/checkout", "cluster": "prod", "namespace": "shop", "object": "Deployment/checkout"}
 
 
-def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
+def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None, target=None):
     """The stderr line ``vcs_client.call`` writes for a proposal it opened, with ``claim`` as its token.
 
     ``repo`` is the answer's top-level repository; None writes the line an older client wrote.
@@ -47,7 +48,7 @@ def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
     if repo is not None:
         answer["repo"] = repo
     with mock.patch.object(vcs_client, "_call", lambda verb, payload: answer), mock.patch("sys.stderr", stderr):
-        vcs_client.call("proposal-create", {})
+        vcs_client.call("proposal-create", {}, target=target)
     return stderr.getvalue()
 
 
@@ -108,8 +109,8 @@ class _Broker:
         self.live[token] = url
         return token
 
-    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME):
-        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo)
+    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME, target=None):
+        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo, target=target)
 
     def module(self):
         forge = types.ModuleType("forge")
@@ -144,12 +145,22 @@ def _tokens(text):
 class PrOpenedTest(unittest.TestCase):
     def setUp(self):
         self.ledger = []
+        # The switch's root-owned files win over the variable; on a pod or in
+        # the sandbox the host's own files would decide these tests.
+        plugin._on_scripts_path()
+        import kubeagents_switches
+
+        missing = Path(tempfile.mkdtemp()) / "absent"
+        for name in ("MANAGED_DOTENV_PATH", "SWITCH_DIR"):
+            patcher = mock.patch.object(kubeagents_switches, name, missing)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_hook(self, output, kanban, task=TASK, broker=None, origins=None):
         env = {plugin.TASK_ENV: task} if task else {}
         modules = {**kanban.modules(), "forge": (broker or _Broker()).module(), "kanban_origin": origins}
 
-        def post(path, payload):
+        def post(path, payload, **_):
             self.ledger.append((path, payload))
             return {"recorded": True}
 
@@ -174,6 +185,80 @@ class PrOpenedTest(unittest.TestCase):
         self.ledger.clear()
         self.run_hook(broker.line(), _Kanban(), task="", broker=broker, origins=origins)
         self.assertEqual(self.ledger, [("/v1/proposals/opened", {"url": URL, "origin": "chat", "platform": "slack"})])
+
+    def test_a_no_pdb_fix_is_recorded_for_the_post_merge_check_only_with_the_switch_on(self):
+        thread = ("slack", "C123", "1700000000.1")
+        with mock.patch.object(plugin, "card_thread", return_value=thread):
+            broker = _Broker()
+            self.run_hook(broker.line(target=TARGET), _Kanban(), broker=broker)
+            self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+            self.ledger.clear()
+            with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+                self.run_hook(broker.line(target=TARGET), _Kanban(), broker=broker)
+        self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened", "/v1/post-merge/records"])
+        self.assertEqual(
+            self.ledger[1][1],
+            {"url": URL, "number": 99, **TARGET, "origin": "other", "platform": "", "task_id": TASK,
+             "thread_platform": "slack", "thread_chat_id": "C123", "thread_id": "1700000000.1"},
+        )
+
+    def test_a_proposal_with_no_known_finding_is_not_recorded_for_the_post_merge_check(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD):
+            for target in (None, dict(TARGET, finding_id="no-hpa.prod.shop.Deployment/checkout"),
+                           dict(TARGET, object=""), {"finding_id": "no-pdb.x"}):
+                with self.subTest(target=target):
+                    self.ledger.clear()
+                    broker = _Broker()
+                    self.run_hook(broker.line(target=target), _Kanban(), broker=broker)
+                    self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+
+    def test_no_post_merge_record_when_the_claim_left_too_little_time(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD), \
+                mock.patch.object(plugin, "POST_MERGE_COST_SECONDS", plugin.HOOK_CALLBACK_SECONDS):
+            broker = _Broker()
+            self.run_hook(broker.line(target=TARGET), _Kanban(), broker=broker)
+        self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+
+    def test_a_target_that_is_not_a_finding_is_ignored_not_raised(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "_session_kv_post", side_effect=AssertionError("posted")):
+            for target in (["no-pdb"], "no-pdb", 7, dict(TARGET, cluster=["x"])):
+                with self.subTest(target=target):
+                    plugin.write_post_merge_record({"url": URL, "number": 99}, target, ("audit", ""), TASK)
+
+    def test_a_scheduled_run_records_with_no_thread(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+            broker = _Broker()
+            self.run_hook(broker.line(target=TARGET), _Kanban(), task="", broker=broker)
+        [(path, payload)] = [entry for entry in self.ledger if entry[0] == "/v1/post-merge/records"]
+        self.assertEqual((payload["task_id"], payload["thread_platform"], payload["thread_chat_id"], payload["thread_id"]),
+                         ("", "", "", ""))
+
+    def test_an_unclaimed_record_is_never_recorded_for_the_post_merge_check(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+            self.run_hook(_vcs_record(claim="forged", repo=REPO_NAME, target=TARGET), _Kanban())
+        self.assertEqual(self.ledger, [])
+
+    def test_the_switch_is_read_through_kubeagents_switches(self):
+        for value, on in (("", False), ("off", False), ("silent", True), ("report", True), ("bogus", False)):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"KUBEAGENTS_POST_MERGE_CHECK": value}):
+                self.assertEqual(plugin.post_merge_check_on(), on)
+
+    def test_card_thread_reads_the_card_s_first_subscription(self):
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
+        db.execute("INSERT INTO kanban_notify_subs VALUES (?, 'slack', 'C1', NULL)", (TASK,))
+        connect = types.ModuleType("hermes_cli.kanban_db_connect")
+        connect.connect_closing = contextlib.contextmanager(lambda: (yield db))
+        with mock.patch.dict(sys.modules, {"hermes_cli": types.ModuleType("hermes_cli"),
+                                           "hermes_cli.kanban_db_connect": connect}):
+            self.assertEqual(plugin.card_thread(TASK), ("slack", "C1", ""))
+            self.assertEqual(plugin.card_thread("t_other"), plugin.NO_THREAD)
+            self.assertEqual(plugin.card_thread(""), plugin.NO_THREAD)
 
     def test_a_non_worker_process_claims_and_keeps_the_line_without_its_token(self):
         kanban, broker = _Kanban(), _Broker()
@@ -794,7 +879,7 @@ class SandboxClaimTimeoutTest(unittest.TestCase):
         broker, kanban, ledger = _Broker(), _Kanban(), []
         output = "".join(broker.line(url=f"{REPOSITORY}/pull/{n}", number=n) for n in (1, 2))
 
-        def post(path, payload):
+        def post(path, payload, **_):
             ledger.append((path, payload))
             return {"recorded": True}
 

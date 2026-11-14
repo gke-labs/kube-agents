@@ -206,7 +206,7 @@ const (
 	// the callout under 20Mi; the provisioning Job a short nats CLI run) with
 	// headroom for an eval run's traffic, not from a load measurement. NATS
 	// gets the most: JetStream keeps stream indexes in memory and the TASKS
-	// stream is sized at 20GiB on disk. Named constants so the next
+	// stream is capped at 8GiB on disk (a2aTasksMaxBytes). Named constants so the next
 	// measurement changes one line.
 	a2aNATSCPURequest    = "250m"
 	a2aNATSMemoryRequest = "512Mi"
@@ -686,8 +686,8 @@ const (
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
 	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
-	// gateway_platform) reads it too, to name the platform whose home channel
-	// is missing when it refuses a report.
+	// gateway_platforms) reads it too, as a comma-separated list, to name the
+	// platforms whose home channel is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -774,8 +774,17 @@ const (
 	// is longer than this render's a2aProfileSubmitMaxAge: a stream an older
 	// operator created, which provisioning never edits (#4948).
 	a2aProvisionReportSubmitMaxAgeKey = "submit_max_age"
-	a2aProvisionReportMissingKey      = "missing"
-	a2aTopologySkewSubject            = "a2a.topics.agent.platform.topology-skew"
+	// The byte-cap findings (#4476): a stream above this render's cap, under
+	// a2aProvisionReportLiveKey (its max_bytes, -1 for none), HeldKey (the
+	// bytes it held when read, the re-read when a lower was attempted),
+	// WantKey (the render's cap), and SafeKey (1 when it held under half the
+	// new cap, so lowering it evicts nothing; 0 otherwise).
+	a2aProvisionReportTasksMaxBytesKey         = "tasks_max_bytes"
+	a2aProvisionReportTopicsJournalMaxBytesKey = "topics_journal_max_bytes"
+	a2aProvisionReportHeldKey                  = "held"
+	a2aProvisionReportSafeKey                  = "safe"
+	a2aProvisionReportMissingKey               = "missing"
+	a2aTopologySkewSubject                     = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -812,7 +821,7 @@ const (
 	// number.
 	reasonTasksSubjectCapMissing = "TasksSubjectCapMissing"
 	tasksSubjectCapEventMessage  = "provision Job %s found the TASKS stream with max_msgs_per_subject=%d (no per-subject limit); " +
-		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
+		"this render creates it at %d and provisioning does not change this limit on an existing stream, so one task's events can still evict another session's history. " +
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
 	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
 	// reasonTopicsStateSubjectMissing is the Warning Event's reason when the
@@ -822,8 +831,21 @@ const (
 	// subject list is not quoted from the pod: the operator reads it with
 	// `nats stream info TOPICS-STATE` and appends to it, and the Event says so.
 	reasonTopicsStateSubjectMissing = "TopicsStateSubjectMissing"
-	topicsStateSubjectEventMessage  = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
-		"this render creates the stream with it and provisioning does not edit an existing stream, so nothing can publish to that topic " +
+	// The byte-cap finding's Event (#4476): a Warning naming the stream, its
+	// live max_bytes, this render's cap and what it held, and the exact edit
+	// to apply, which names this binary's cap, never the pod's want, on the
+	// same rule as the TASKS per-subject remedy. Provisioning does not edit
+	// an existing stream. The safe wording is for a stream holding under half
+	// the new cap, where the lower evicts nothing. Format arguments, both
+	// forms: Job name, stream, live, this render's cap, held, then the edit's
+	// stream and cap.
+	reasonStreamCapAboveRender = "A2ABusStreamCapAboveRender"
+	streamCapSafeMessage       = "provision Job %s found stream %s at max_bytes %s, above this render's %d bytes; it holds %d bytes, under half the new cap, " +
+		"so lowering it evicts nothing. Provisioning does not edit an existing stream; to apply it: nats stream edit %s --max-bytes=%d"
+	streamCapUnsafeMessage = "provision Job %s found stream %s at max_bytes %s, above this render's %d bytes; it holds %d bytes, half the new cap or more, " +
+		"and a lower that close to what a stream holds can evict. Provisioning does not edit an existing stream; once it holds less: nats stream edit %s --max-bytes=%d"
+	topicsStateSubjectEventMessage = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
+		"this render creates the stream with it and provisioning does not change an existing stream's subjects, so nothing can publish to that topic " +
 		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
 		"nats stream edit TOPICS-STATE --subjects=\"<current subjects>,%s\""
 
@@ -1226,6 +1248,18 @@ const (
 	// script's TASKS block argues the number, what it bounds, and what it
 	// deliberately does not.
 	a2aTasksMaxMsgsPerSubject = 4096
+
+	// The byte caps of the two largest streams (#4476). NATS reserves every
+	// stream's and bucket's max_bytes against max_file_store when the stream
+	// is created, so the caps together are the room the store has left;
+	// TestProvisionedJetStreamCapsFitTheStore holds their sum under it. TASKS
+	// was 20 GiB and TOPICS-JOURNAL 5 GiB, which with the rest reserved
+	// 28.875 of the 32 GiB store; at 8 and 1 the reservation is 12.875. 8 GiB
+	// on TASKS is not yet from a busy install's measured use; it can be raised
+	// once #4477 measures one. An existing stream above its cap keeps it;
+	// the provision Job reports it with the edit (a2aProvisionCapLowerBlock).
+	a2aTasksMaxBytes         int64 = 8 << 30
+	a2aTopicsJournalMaxBytes int64 = 1 << 30
 )
 
 // a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
@@ -2505,8 +2539,9 @@ websocket {
 
 jetstream {
   store_dir: /data
-  # Under the 40Gi PV; the stream max_bytes caps (20+5+1+1 GiB) plus KV live
-  # inside this.
+  # Under the 40Gi PV. Every stream's and bucket's max_bytes is reserved
+  # against this at create; TestProvisionedJetStreamCapsFitTheStore holds
+  # their sum under it, with room for the next one.
   max_file_store: 34359738368
 }
 accounts {
@@ -3308,7 +3343,8 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // grants: 4222 from exactly the enumerated bus clients (and every pod in the
 // AgentProfile namespace, once that namespace's own fence is in place), 9222 from exactly the
 // console server, the exporter sidecar's a2aNATSMetricsPort from the
-// managed-Prometheus collector's namespace, nothing else.
+// managed-Prometheus collector's namespace and the operator's own pod (the
+// bus-stream check), nothing else.
 //
 // 8222 (monitor) gets one peer, the operator's own pod, which reads
 // config_load_time there to confirm a config reload (planA2ABusReload). It's
@@ -3435,17 +3471,21 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 				},
 			}, {
 				// The exporter sidecar's port from the managed-Prometheus
-				// collector's namespace alone, the shape of the A2A
-				// gateway's metrics rule (buildA2AGatewayNetworkPolicy).
+				// collector's namespace, the shape of the A2A gateway's
+				// metrics rule (buildA2AGatewayNetworkPolicy), and from the
+				// operator's own pod (below).
 				// The exporter reads 8222 over loopback, so this rule is
 				// what the scrape needs, and the collector gets nothing on
 				// 8222, whose one peer is the operator's (planA2ABusReload).
+				// The operator's own pod is the other peer here: the
+				// bus-stream check reads the stream list on this port
+				// (BusStreamPoller).
 				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSMetricsPort)},
-				From: []networkingv1.NetworkPolicyPeer{{
+				From: append([]networkingv1.NetworkPolicyPeer{{
 					NamespaceSelector: &metav1.LabelSelector{
 						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
 					},
-				}},
+				}}, a2aOperatorNATSPeers()...),
 			}},
 		},
 	}
@@ -3695,14 +3735,14 @@ NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile(
 # route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the stream's own
 # config), so the bit the grant rests on is set here, not inherited.
 
-# TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
+# TASKS: a2a.tasks.>, 72h dev window, 8GiB cap (a2aTasksMaxBytes).
 #
 # max_msgs_per_subject bounds ONE SUBJECT, which on this stream is one class of
 # one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}. Read what it
 # does and does not buy, because the two are easy to swap.
 #
 # It buys: a runaway executor - a loop, a harness streaming forever - can no
-# longer push 20GiB through the stream on one task and, with discard=old, evict
+# longer push the whole cap through the stream on one task and, with discard=old, evict
 # every other session's history on the way. The runaway now pays for its own
 # runaway and nobody else's.
 #
@@ -3716,7 +3756,7 @@ NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile(
 #
 # 4096, sized against the publisher that means it rather than the well-behaved
 # one: the render sets no max_payload, so NATS' 1MiB default is the per-message
-# ceiling and 4096 messages is a ~4GiB worst case on one subject, a fifth of the
+# ceiling and 4096 messages is a ~4GiB worst case on one subject, half the
 # stream. The worker adapter's own result chunks are resultChunkSize (256 KiB),
 # so a task built out of those reaches nearer 1GiB at the same count - but that
 # is a property of one publisher and not a bound the bus enforces. A chat-driven
@@ -3748,7 +3788,7 @@ NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile(
 # fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas="${STREAM_REPLICAS}" \
+  --max-age=72h --max-bytes=` + strconv.FormatInt(a2aTasksMaxBytes, 10) + ` --discard=old --replicas="${STREAM_REPLICAS}" \
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
@@ -3811,11 +3851,11 @@ $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE 
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
-# TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
+# TOPICS-JOURNAL: append-only, ages out at 30d. 1GiB cap (a2aTopicsJournalMaxBytes).
 # Journal-class topics: annotations.
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
-  --max-age=720h --max-bytes=5368709120 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
+  --max-age=720h --max-bytes=` + strconv.FormatInt(a2aTopicsJournalMaxBytes, 10) + ` --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
@@ -3946,7 +3986,7 @@ report_findings=''
 if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
   report_findings="\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}"
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
-  echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
+  echo "  The stream predates the limit and provisioning does not change it on an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
   echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
   echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
@@ -3955,7 +3995,7 @@ if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
 elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  Bounded either way, so no task can evict another session's history - this is drift between" >&2
-  echo "  the stream and the render, not the unbounded gap. Provisioning does not edit an existing" >&2
+  echo "  the stream and the render, not the unbounded gap. Provisioning does not change this limit on an existing" >&2
   echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
@@ -3980,14 +4020,14 @@ fi
 if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
   report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportTopicsStateSubjectKey + `\":{\"` + a2aProvisionReportMissingKey + `\":1}"
   echo "NOTE: TOPICS-STATE does not carry subject ` + a2aTopologySkewSubject + `." >&2
-  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "  Provisioning does not change an existing stream's subjects; to append the subject to its current subjects:" >&2
   echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
 fi
 #
 # PROFILE_SUBMITS older than this render: read its live max age back. The
 # dispatcher keeps a finished task's tombstone for the max age the operator
 # renders, and a submission still on the stream past its tombstone would be
-# run again; provisioning never edits the stream (lowering a max age evicts
+# run again; provisioning never changes its max age (lowering a max age evicts
 # queued submissions), so a stream an older operator created longer than this
 # render's ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s is reported, and the operator
 # renders the longer one (#4948). 0 is no age limit. Same stance as the
@@ -4005,7 +4045,31 @@ if [ "${live_submit_max_age_ns}" = "0" ] || [ "${live_submit_max_age}" -gt ` + s
   echo "NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s (0 is no limit); this render creates it at ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s." >&2
   echo "  The dispatcher is told the longer one, so a finished task's tombstone outlives its submission." >&2
 fi
-report="{${report_findings}}"
+# TASKS and TOPICS-JOURNAL above this render's byte caps (#4476). An existing
+# stream keeps the cap it was created with: this principal cannot edit a
+# stream (no STREAM.UPDATE; see the provision identity), so the gap is
+# reported with the edit that closes it and whether applying it now is safe.
+# max_bytes with discard=old evicts only what is over it, so a lower is safe
+# while the stream holds under half the new cap, which leaves room for writes
+# between the read and the edit. A stream at or under the cap is left alone,
+# whoever sized it. An unreadable answer FAILS, like the extractors above.
+cap_check() { # stream want
+  cap_stream=$1
+  cap_want=$2
+  cap_over=0
+  cap_json="$($NATS stream info "${cap_stream}" --json | tr -d ' \t\r\n')"
+  cap_live="$(printf '%s' "${cap_json}" | grep -o '"max_bytes":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+  cap_held="$(printf '%s' "${cap_json}" | grep -o '"bytes":[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+  if [ -z "${cap_live}" ] || [ -z "${cap_held}" ]; then
+    echo "could not read max_bytes and bytes off the ${cap_stream} stream; refusing to report this install as provisioned" >&2
+    exit 1
+  fi
+  if [ "${cap_live}" = "-1" ] || [ "${cap_live}" -gt "${cap_want}" ]; then
+    cap_over=1
+  fi
+}
+` + a2aProvisionCapLowerBlock(a2aTasksStream, a2aProvisionReportTasksMaxBytesKey, a2aTasksMaxBytes) +
+		a2aProvisionCapLowerBlock(a2aTopicsJournalStream, a2aProvisionReportTopicsJournalMaxBytesKey, a2aTopicsJournalMaxBytes) + `report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
 # provisioned bus. Nor is a write that fails (a full or faulting disk under
@@ -4030,7 +4094,7 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session creates ` + perSession + ` consumers on TASKS," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
-` + bridgeNote + `  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
@@ -4084,6 +4148,33 @@ echo "a2a provisioning complete"
 `
 }
 
+// a2aProvisionCapLowerBlock is the provision script's report for one
+// stream's byte cap, after cap_check has read it (#4476). Provisioning does
+// not edit an existing stream: the provision principal holds no
+// STREAM.UPDATE, since UPDATE can tighten any limit and evict, which is the
+// PURGE that principal refuses itself (spec-nats-deployment.md). So a stream
+// above this render's cap is reported, and the report says whether lowering
+// it now is safe: under half the new cap held, the lower evicts nothing.
+func a2aProvisionCapLowerBlock(stream, key string, want int64) string {
+	w := strconv.FormatInt(want, 10)
+	return `cap_check ` + stream + ` ` + w + `
+if [ "${cap_over}" = "1" ]; then
+  cap_safe=0
+  if [ "${cap_held}" -lt $((` + w + ` / 2)) ]; then
+    cap_safe=1
+    echo "NOTE: ` + stream + ` carries max_bytes=${cap_live}, above this render's ` + w + `. It holds ${cap_held} bytes, under half" >&2
+    echo "  the new cap, so lowering it now evicts nothing. Provisioning does not edit an existing stream:" >&2
+  else
+    echo "NOTE: ` + stream + ` carries max_bytes=${cap_live}, above this render's ` + w + `. It holds ${cap_held} bytes, half the" >&2
+    echo "  new cap or more, and a lower that close to what it holds could evict. Once it holds less:" >&2
+  fi
+  echo "    nats stream edit ` + stream + ` --max-bytes=` + w + `" >&2
+  report_findings="${report_findings}${report_findings:+,}\"` + key + `\":{\"` + a2aProvisionReportLiveKey + `\":${cap_live},\"` +
+		a2aProvisionReportHeldKey + `\":${cap_held},\"` + a2aProvisionReportWantKey + `\":` + w + `,\"` + a2aProvisionReportSafeKey + `\":${cap_safe}}"
+fi
+`
+}
+
 // buildA2AProvisionJob runs the provisioning script against the rendered NATS.
 // The name carries a digest of the rendered spec (a2aProvisionJobName) so a
 // changed render is a new Job — Jobs are immutable — and completed runs clean
@@ -4124,7 +4215,9 @@ echo "a2a provisioning complete"
 // What the digest does not cover is what is on the bus. Creation is
 // create-only convergence: the script's `info || add` lines make re-runs
 // clean but do NOT edit a stream that already exists, so a retention or
-// subject change in a later payload reaches fresh installs only. Migrating an
+// subject change in a later payload reaches fresh installs only. A byte cap
+// above the render's is reported with the edit and whether applying it is
+// safe (a2aProvisionCapLowerBlock, #4476). Migrating an
 // existing install is a manual `nats stream edit` — stage 1 accepts that and
 // says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
@@ -4350,6 +4443,14 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
 			outcome = a2aProvisionReportOutcomeReported
 		}
+		for _, f := range []*streamCapFinding{findings.tasksMaxBytes, findings.topicsJournalMaxBytes} {
+			if f == nil {
+				continue
+			}
+			eventType, reason, message := f.event(job.Name)
+			r.recordEvent(agent, eventType, reason, message)
+			outcome = a2aProvisionReportOutcomeReported
+		}
 		r.recordProfileSubmitMaxAge(ctx, agent, findings.submitMaxAge)
 	}
 	patch := client.MergeFrom(job.DeepCopy())
@@ -4418,6 +4519,52 @@ type a2aProvisionFindings struct {
 	// submitMaxAge is PROFILE_SUBMITS' live max age in seconds when the
 	// script found it longer than this render's (0: no age limit), else nil.
 	submitMaxAge *int64
+	// tasksMaxBytes and topicsJournalMaxBytes are the byte-cap findings,
+	// present when the stream was above the pod's cap (#4476).
+	tasksMaxBytes         *streamCapFinding
+	topicsJournalMaxBytes *streamCapFinding
+}
+
+// streamCapFinding is one stream's byte-cap finding. live is the max_bytes
+// the script read (-1 for none), held the bytes it held, want the render's
+// cap the pod's script compared against, safe whether it held under half of
+// it. render is this binary's cap for the stream, which the remedy names.
+type streamCapFinding struct {
+	stream string
+	live   int64
+	held   int64
+	want   int64
+	safe   bool
+	render int64
+}
+
+// event is the finding's Warning Event, with the edit naming this render's
+// cap.
+func (f *streamCapFinding) event(jobName string) (string, string, string) {
+	live := strconv.FormatInt(f.live, 10)
+	if f.live == -1 {
+		live = "no limit"
+	}
+	format := streamCapUnsafeMessage
+	if f.safe {
+		format = streamCapSafeMessage
+	}
+	return corev1.EventTypeWarning, reasonStreamCapAboveRender, fmt.Sprintf(format, jobName, f.stream, live, f.render, f.held, f.stream, f.render)
+}
+
+// parseStreamCapFinding reads one byte-cap finding: every field present, a
+// live max_bytes that is none (-1) or positive, bytes held not negative, a
+// positive want, and safe 0 or 1. Anything else is not a report the script
+// writes.
+func parseStreamCapFinding(message, key, stream string, render int64, fields map[string]int64) (*streamCapFinding, error) {
+	live, okLive := fields[a2aProvisionReportLiveKey]
+	held, okHeld := fields[a2aProvisionReportHeldKey]
+	want, okWant := fields[a2aProvisionReportWantKey]
+	safe, okSafe := fields[a2aProvisionReportSafeKey]
+	if !okLive || !okHeld || !okWant || !okSafe || (live != -1 && live <= 0) || held < 0 || want <= 0 || (safe != 0 && safe != 1) {
+		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding the script does not write", message, key)
+	}
+	return &streamCapFinding{stream: stream, live: live, held: held, want: want, safe: safe == 1, render: render}, nil
 }
 
 // parseA2AProvisionReport reads the termination message and returns the
@@ -4473,6 +4620,20 @@ func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
 			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without a %s longer than %ds or 0; not a report the script writes", message, a2aProvisionReportSubmitMaxAgeKey, a2aProvisionReportLiveKey, int64(a2aProfileSubmitMaxAge/time.Second))
 		}
 		findings.submitMaxAge = &live
+	}
+	if fields, present := report[a2aProvisionReportTasksMaxBytesKey]; present {
+		f, err := parseStreamCapFinding(message, a2aProvisionReportTasksMaxBytesKey, a2aTasksStream, a2aTasksMaxBytes, fields)
+		if err != nil {
+			return findings, err
+		}
+		findings.tasksMaxBytes = f
+	}
+	if fields, present := report[a2aProvisionReportTopicsJournalMaxBytesKey]; present {
+		f, err := parseStreamCapFinding(message, a2aProvisionReportTopicsJournalMaxBytesKey, a2aTopicsJournalStream, a2aTopicsJournalMaxBytes, fields)
+		if err != nil {
+			return findings, err
+		}
+		findings.topicsJournalMaxBytes = f
 	}
 	return findings, nil
 }
@@ -6635,7 +6796,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -6652,6 +6813,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig: brokerCallerPodDNSConfig(),
 					// The gateway runs as its own ServiceAccount with the
 					// narrow Role above - the token this automounts is
 					// exactly that grant, nothing ambient.
@@ -6708,6 +6871,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	return dep
 }
 
 // a2aProvisionState reports where the provision Job stands, because nothing
@@ -6720,6 +6885,10 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// busMeta is the JetStream meta group check's finding on a pass that
+	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
+	busMeta a2aBusMetaState
 
 	// homeRecord is the home-channel record the reconcile read once
 	// (platformagent_home_channel_record.go), carried to the projection and
@@ -7007,7 +7176,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	var profiles []agentv1alpha1.AgentProfile
 	if !r.agentProfilesUnreadable {
 		var err error
-		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
 		}
 	}
@@ -7033,6 +7202,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// .supervisor grant exactly as long as the dispatch config lists them.
 	draining, err := r.dispatchDraining(ctx, agent, profiles)
 	if err != nil {
+		return state, err
+	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't
+	// matter), before the identity map that may name one of them: an early
+	// return between the two then never leaves a map naming a tier whose
+	// file was not written.
+	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
 		return state, err
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
@@ -7331,14 +7508,42 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if hold := calloutHold || busHold || state.busHeld; hold {
+		// The JetStream meta group (#5708): with every other hold clear, a
+		// multi-server bus's provisioning waits until each server agrees on
+		// one meta leader that lists the rest as current, and a server left
+		// outside is restarted once (platformagent_a2a_nats_meta.go).
+		metaHold := false
+		// A pass that doesn't look clears the condition: on one server it
+		// doesn't apply, and while another hold applies (a roll, the
+		// restart itself) a server's absence isn't the meta group's, so the
+		// restart's clock starts again once the bus is back.
+		state.busMeta = a2aBusMetaState{checked: true}
+		if !calloutHold && !busHold && !state.busHeld && a2aNATSReplicas(agent) > 1 {
+			live := &appsv1.StatefulSet{}
+			if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, live); err != nil {
+				if !errors.IsNotFound(err) {
+					return state, err
+				}
+			} else {
+				metaHold, state.busMeta, err = r.checkA2ABusMeta(ctx, agent, live, a2aNATSReplicas(agent), time.Now())
+				if err != nil {
+					return state, fmt.Errorf("checking the A2A bus's JetStream meta group: %w", err)
+				}
+			}
+		}
+		if hold := calloutHold || busHold || state.busHeld || metaHold; hold {
 			state.jobHeld = true
 			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config and rolled out",
-				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld)
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMetaGroup", metaHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
 	} else {
+		// With the Job created, the condition no longer says anything about
+		// provisioning, whatever it says: the Job is created only past the
+		// check (or on an unknown verdict), and a pass that created it but
+		// failed later never wrote the clear.
+		state.busMeta = a2aBusMetaState{checked: true}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
@@ -8423,6 +8628,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The tiers file the gateway, the verifier and the callout mount
+		// (platformagent_a2a_tiers.go); its volume is optional.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aTiersName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find

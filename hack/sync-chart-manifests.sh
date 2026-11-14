@@ -6,6 +6,9 @@
 #     config/rbac/role.yaml: the ClusterRole document between the GENERATED RULES
 #     markers, the namespaced Role document between the GENERATED NAMESPACED RULES
 #     markers.
+#   - k8s-operator/config/profiles/role.yaml is the Role document of config/rbac/role.yaml,
+#     copied whole for the profile namespace's kustomization (kustomize refuses a resource
+#     above its own directory). The one destination under k8s-operator/config/.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
@@ -35,6 +38,7 @@ CRD_SRC=k8s-operator/config/crd/bases
 CRD_DST=charts/kube-agents/crds
 ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
+readonly PROFILE_ROLE_DST=k8s-operator/config/profiles/role.yaml
 VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
 readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
@@ -81,8 +85,9 @@ for dst in "$CRD_DST"/*.yaml; do
 done
 
 # RBAC rules: role.yaml carries two documents, the ClusterRole from the
-# markers without `namespace=` and the Role from the one with it (the Secret
-# write verbs, in the install namespace). Each document's rules block is spliced
+# markers without `namespace=` and the Role from the ones with it (the write
+# verbs on every kind the operator renders, bound in the install namespace and
+# the profile namespace). Each document's rules block is spliced
 # between its own pair of markers: GENERATED RULES for the ClusterRole,
 # GENERATED NAMESPACED RULES for the Role. Without the BEGIN markers the awk
 # pass would copy the template unchanged and both modes would silently pass
@@ -128,6 +133,30 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$RBAC_TPL"
+fi
+
+# The profile namespace's copy of the Role document, for the kustomize path.
+# config/profiles is its own kustomization (config/default's `namespace:`
+# would rewrite the Role into the install namespace), and kustomize refuses a
+# resource above its own directory, so the Role document is copied there
+# whole, under a header, and held to role.yaml here the way the chart's
+# spliced block is. The kustomization's namespace and prefix do the rest.
+tmp=$(mktemp)
+{
+  echo "# GENERATED from $ROLE_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo "# The Role document of that file (the +kubebuilder:rbac markers with"
+  echo "# \`namespace=\`), rendered into the profile namespace by this kustomization."
+  # Records are the `---`-separated documents; the one whose kind line reads
+  # `kind: Role` (and not `kind: ClusterRole`) is the namespaced document.
+  awk 'BEGIN { RS = "---\n"; ORS = "" } /\nkind: Role\n/ { print "---\n" $0 }' "$ROLE_SRC"
+} >"$tmp"
+grep -q '^kind: Role$' "$tmp" || { rm -f "$tmp"; fail "no Role document found in $ROLE_SRC for $PROFILE_ROLE_DST"; }
+if $check; then
+  [[ -f "$PROFILE_ROLE_DST" ]] || { rm -f "$tmp"; fail "profile Role copy missing: $PROFILE_ROLE_DST"; }
+  diff -u "$PROFILE_ROLE_DST" "$tmp" >&2 || { rm -f "$tmp"; fail "profile Role copy out of date vs $ROLE_SRC: $PROFILE_ROLE_DST"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$PROFILE_ROLE_DST"
 fi
 
 # Admission policies: the whole template is generated, so there is nothing in it

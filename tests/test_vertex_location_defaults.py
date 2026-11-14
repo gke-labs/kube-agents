@@ -1,8 +1,8 @@
 """The Vertex AI serving location must not default to a cluster location.
 
 A Vertex model is only callable from a location that serves it, and the
-cluster's region need not be one of them -- `gemini-3.5-flash`, the `vertex_ai`
-default model, is not served from `us-central1`, which is `DEFAULT_REGION`. On
+cluster's region need not be one of them -- the `vertex_ai` default model is
+not guaranteed to be served from `us-central1`, which is `DEFAULT_REGION`. On
 a zonal Standard cluster the cluster location is a zone (`us-central1-a`) and
 is not a valid Vertex location at all. Every surface that establishes this
 default therefore resolves to `global` rather than inheriting a cluster
