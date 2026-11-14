@@ -390,7 +390,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
 `pkg/upstream` implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
 
 1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME`)**:
-   - Uses `https://kubernetes.default.svc` with the mounted CA certificate (`CREDENTIAL_PROXY_KUBE_CA_FILE`, `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`) and the proxy pod's projected Kubernetes API `ServiceAccount` token (`CREDENTIAL_PROXY_KUBE_TOKEN_FILE`, `/var/run/secrets/kubeagents/kube-api/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
+   - Uses `https://kubernetes.default.svc.cluster.local` (`CREDENTIAL_PROXY_KUBE_API_SERVER`, which the operator sets; the proxy's own default is `https://kubernetes.default.svc`) with the mounted CA certificate (`CREDENTIAL_PROXY_KUBE_CA_FILE`, `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`) and the proxy pod's projected Kubernetes API `ServiceAccount` token (`CREDENTIAL_PROXY_KUBE_TOKEN_FILE`, `/var/run/secrets/kubeagents/kube-api/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
 2. **Fleet GKE clusters (`gke_<project>_<location>_<cluster>`)**:
    - Validates `<project>`, `<location>`, and `<cluster>` against `^[a-z0-9][a-z0-9-]*\z`.
    - Calls `GET https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}` using the proxy pod's `GCPTokenSource` (Workload Identity Federation via `CREDENTIAL_PROXY_WIF_AUDIENCE`, `CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT`, and `CREDENTIAL_PROXY_WIF_TOKEN_FILE`, or the GCE metadata server).
