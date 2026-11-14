@@ -224,7 +224,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b",
+      "tag": "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -312,7 +312,7 @@
       "name": "node",
       "origin": "build-time",
       "repository": "docker.io/library/node",
-      "tag": "22-slim",
+      "tag": "24-slim",
       "buildArg": "NODE_IMAGE",
       "pulledBy": "a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage.",
       "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary, and the stage that builds the console page."
@@ -339,7 +339,7 @@
       "name": "busybox",
       "origin": "build-time",
       "repository": "docker.io/library/busybox",
-      "tag": "musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8",
+      "tag": "musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6",
       "pulledBy": "agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images.",
       "description": "Minimal userland (sh, cp, ls) base image for plugin and persona images to support staging init containers."
     }

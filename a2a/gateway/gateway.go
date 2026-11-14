@@ -337,11 +337,9 @@ type Gateway struct {
 	steersRefusedBy map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
-	// message that names none is attributed to. Since the mux and the side
-	// door there are ingresses that name their own - the console adapter
-	// stamps console on every frame it delivers, the inject door stamps
-	// inject - so this is the answer for the configured backend's own
-	// messages rather than for all of them (backendFor).
+	// message that names none is attributed to (backendFor). Behind the mux
+	// every chat message is stamped with its adapter's key, so empty means a
+	// hand-built single-adapter gateway with no mux.
 	backend string
 	// injectAudience is injectPM's inject: section with the prefix removed
 	// and only eval: values kept -- the shape BuildAuthority and hashRoster
@@ -488,12 +486,12 @@ func New(o Options) (*Gateway, error) {
 	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
-	// keep working.
-	switch {
-	case backend == discordBackend && pm.Len() == 0:
+	// keep working. Each armed backend gets its own line, so both can fire.
+	if o.Config.DiscordToken != "" && pm.Len() == 0 {
 		log.Warn("principal map is empty; every discord message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
-	case backend == slackBackend && pm.Len() == 0:
+	}
+	if o.Config.SlackBotToken != "" && pm.Len() == 0 {
 		// Not a warning since the map became an override: every listed
 		// sender is admitted and attributed by member id.
 		log.Info("the Slack principal map is empty; listed senders are attributed by their Slack member id",
@@ -539,7 +537,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
 		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
-	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
+	if o.Config.GchatRelayURL != "" && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	ps := NewPseudonymizer(o.Config.AttributionSalt)
@@ -559,7 +557,7 @@ func New(o Options) (*Gateway, error) {
 			slackAllowed[u] = true
 		}
 	}
-	if backend == slackBackend && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
+	if o.Config.SlackBotToken != "" && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
 		log.Warn("slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	if o.RelayDurable == "" {
@@ -804,23 +802,14 @@ type RunOptions struct {
 func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
 	t := time.NewTicker(busWatchEvery)
 	defer t.Stop()
-	var downSince time.Time
+	var tracker busDownTracker
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
 		}
-		if g.client.Connected() {
-			downSince = time.Time{}
-			continue
-		}
-		now := time.Now()
-		if downSince.IsZero() {
-			downSince = now
-			continue
-		}
-		if down := now.Sub(downSince); down >= limit {
+		if down, giveUp := tracker.observe(g.client.Connected(), time.Now(), limit); giveUp {
 			// Once per give-up, at Info: during a full outage the lease
 			// cycles between replicas, and each cycle logs this once.
 			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
@@ -829,6 +818,29 @@ func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel cont
 			return err
 		}
 	}
+}
+
+// busDownTracker is watchBus's count of how long the connection has been
+// down without a break, separate from the ticker and the client so the
+// count itself can be tested on a clock the test steps.
+type busDownTracker struct {
+	downSince time.Time
+}
+
+// observe takes one look at the connection at now. A connected look starts
+// the count again; the first disconnected look starts it. It reports how
+// long the connection has been down and whether that reaches limit.
+func (b *busDownTracker) observe(connected bool, now time.Time, limit time.Duration) (time.Duration, bool) {
+	if connected {
+		b.downSince = time.Time{}
+		return 0, false
+	}
+	if b.downSince.IsZero() {
+		b.downSince = now
+		return 0, false
+	}
+	down := now.Sub(b.downSince)
+	return down, down >= limit
 }
 
 // RunWith is Run with the elected gateway's options.
@@ -1720,12 +1732,12 @@ func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
 	}
 }
 
-// backendFor names the ingress one message arrived through. A message that
-// names none is the configured backend's, which is the Discord and Google
-// Chat adapters' case; the inject door and the console adapter stamp their
-// own, because either can be armed beside a real backend and the authority
-// block must say which door a task came in through rather than which backend
-// the process was configured with.
+// backendFor names the ingress one message arrived through. Behind the mux
+// every chat message is stamped with its adapter's key, and the inject door
+// stamps its own; a message that names none comes from a hand-built
+// single-adapter gateway with no mux and is the configured backend's. The
+// authority block says which door a task came in through rather than which
+// backend the process was configured with.
 func (g *Gateway) backendFor(msg InboundMessage) string {
 	if msg.Backend != "" {
 		return msg.Backend
@@ -3037,6 +3049,9 @@ type taskStart struct {
 	// names no message of its own; an answer with no earlier chain marks
 	// itself.
 	Click, Answer bool
+	// ArrivedAt is InboundMessage's: when the adapter received the turn, the
+	// start of the first-ack time; zero where the adapter does not set it.
+	ArrivedAt time.Time
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -3102,6 +3117,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
+		ArrivedAt: msg.ArrivedAt,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -3379,7 +3395,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
 	// slow reactions call never delays it. A click or an answer continues an
 	// earlier ask, whose mark is the executor's to redraw.
-	if ts.Role == "" && !ts.Click && !ts.Answer && g.drawArrivalMark(rec, taskID, ts.Text) {
+	if ts.Role == "" && !ts.Click && !ts.Answer {
+		drawn, landed := g.drawArrivalMark(rec, taskID, ts.Text)
+		if drawn && landed {
+			// The ask's first receipt is on Slack: the reactions call succeeded.
+			g.metrics.slackFirstAck(ts.ArrivedAt, time.Now())
+		}
+		if !drawn {
+			return taskID, true
+		}
 		if err := g.reg.Put(ctx, rec); err != nil {
 			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 		}

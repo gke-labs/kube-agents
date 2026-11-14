@@ -2869,34 +2869,84 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     #   system:auth-delegator, which carries subjectaccessreviews too.
     WRITE_CAPABLE_ROLE_PREFIXES = ("kubeagents:leader:", "kubeagents:tokenreview:")
 
-    # The two halves of the operator's Secret grant. The reads are the
-    # ClusterRole's: escalation prevention needs the operator to hold what the
-    # agent's `minimal` role grants. The writes are the namespaced Role's:
-    # by-name writes in one namespace are the whole grant.
-    OPERATOR_SECRET_READ_VERBS = frozenset({"get", "list", "watch"})
+    # The write half of the operator's Secret grant, the namespaced Role's:
+    # by-name writes in the two namespaces are the whole grant. The reads are
+    # the ClusterRole's (READ_VERBS above): escalation prevention needs the
+    # operator to hold what the agent's `minimal` role grants.
     OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
 
-    def test_C5_the_operators_secret_grant_is_namespaced(self) -> None:
-        """The operator writes Secrets in its install namespace and nowhere else.
+    # Every namespaced kind the operator renders, as (apiGroup, resource): the
+    # Secret split applied to all of them. The ClusterRole holds the reads of
+    # each (the informers, escalation prevention) and no write verb; the Role
+    # document names exactly this set, with write verbs only: a read in the
+    # Role is a 403 wherever the Role is not bound, and the teardown reads
+    # the dispatcher's params in a profile namespace a mode-today install
+    # never binds it in. docs/designs/operator-namespaced-write-verbs.md.
+    OPERATOR_NAMESPACED_WRITE_KINDS = frozenset({
+        ("", "configmaps"),
+        ("", "events"),
+        ("", "persistentvolumeclaims"),
+        ("", "pods"),
+        ("", "podtemplates"),
+        ("", "resourcequotas"),
+        ("", "secrets"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("batch", "jobs"),
+        ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
+        ("networking.gke.io", "fqdnnetworkpolicies"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    })
+    OPERATOR_NAMESPACED_READ_KINDS = frozenset()
+    # The two namespaces the chart binds the Role in under mode next: the
+    # release namespace and its profile namespace.
+    OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
+    HELM_MODE_NEXT = "platformAgent.mode=next"
+
+    def test_C5_the_operators_write_verbs_are_namespaced(self) -> None:
+        """The operator writes in its install namespace and its profile namespace, and nowhere else.
 
         The operator is the most privileged identity an install puts on a
-        cluster, and the Secret write verbs on its ClusterRole were one of the
-        rules that made it cluster-admin in effect: `create`, `update`, `patch`
-        and `delete` on every Secret in every namespace is every ServiceAccount
-        token and every credential on the cluster. Every Secret the operator
-        writes is in the namespace of the PlatformAgent it reconciles, so the
-        write verbs are a Role there. The reads stay cluster-wide, because the
-        agent's `minimal` ClusterRole grants them and the API server refuses a
-        grant the grantor does not hold; the operator itself reads by name.
+        cluster, and the write verbs on its ClusterRole were what made it
+        cluster-admin in effect: `create`, `update`, `patch` and `delete` on
+        every Secret in every namespace is every ServiceAccount token and every
+        credential on the cluster, and `create` on every Pod or ServiceAccount
+        is the same by another route. Every object the operator writes is in
+        the namespace of the PlatformAgent it reconciles or that namespace's
+        profile namespace, so the write verbs are a Role, bound in each. The
+        reads stay cluster-wide, because the informers watch every rendered
+        kind for drift and the agent's `minimal` ClusterRole grants reads the
+        API server will not let the operator grant without holding them.
 
         Asserted on both delivery paths, as the refusal rather than the
         presence of the control: no ClusterRole in `role.yaml` or in the
-        chart's RBAC template grants a Secret verb beyond the three reads, or
-        a wildcard that reaches it, and the one Role that names `secrets`
-        carries exactly the four write verbs. The positive half keeps the test
-        from passing on an operator that lost the grant altogether, which
-        would be a different bug.
+        rendered chart grants a verb beyond the three reads on any kind in
+        OPERATOR_NAMESPACED_WRITE_KINDS, or a wildcard that reaches one; and
+        the Role that names `secrets` names exactly that set of kinds, with
+        write verbs only. Equality
+        rather than a subset, so a kind dropped from the Role is red here and
+        not first at runtime; the Secret rule's verbs are pinned as before.
+
+        The chart is read rendered (`helm template`, mode next), not as text:
+        the text reader drops template lines, so the `range` that renders the
+        Role once per namespace collapses to one object and rules that came
+        through an `include` would vanish. Rendered, the Role and its
+        RoleBinding must appear in the release namespace and the profile
+        namespace, each binding the operator's ServiceAccount.
         """
+
+        def rule_kinds(rule: dict) -> set[tuple[str, str]]:
+            return {
+                (group, resource)
+                for group in (rule.get("apiGroups") or [])
+                for resource in (rule.get("resources") or [])
+            }
 
         def secret_rules(role: dict) -> list[dict]:
             return [
@@ -2906,20 +2956,36 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                 or "*" in (rule.get("resources") or [])
             ]
 
-        for source, documents in (
-            ("operator_clusterrole", h.yaml_documents("operator_clusterrole")),
-            ("chart_operator_rbac", h.helm_documents("chart_operator_rbac")),
+        for source, documents, namespaces in (
+            ("operator_clusterrole", h.yaml_documents("operator_clusterrole"), None),
+            ("chart_rendered_mode_next", h.helm_rendered(self.HELM_MODE_NEXT), self.OPERATOR_ROLE_NAMESPACES),
         ):
             with self.subTest(source=source):
-                cluster_roles = h.objects_of_kind(documents, "ClusterRole")
-                self.assertTrue(cluster_roles, f"{source} renders no ClusterRole")
+                cluster_roles = [
+                    role for role in h.objects_of_kind(documents, "ClusterRole")
+                    if "operator" in role["metadata"]["name"] or role["metadata"]["name"].endswith("manager-role")
+                ]
+                self.assertTrue(cluster_roles, f"{source} renders no operator ClusterRole")
                 for role in cluster_roles:
-                    for rule in secret_rules(role):
-                        self.assertNotIn("*", rule.get("resources") or [])
+                    for rule in role.get("rules") or []:
+                        # A wildcard counts for the kinds it reaches: `*` as the
+                        # resource reaches every inventory kind in that group,
+                        # `*` as the group reaches the inventory kinds of that
+                        # name in any group. A wildcard that reaches none is A4's
+                        # to judge, not this test's.
+                        reached = {
+                            kind
+                            for kind in self.OPERATOR_NAMESPACED_WRITE_KINDS
+                            for group in (rule.get("apiGroups") or [])
+                            for resource in (rule.get("resources") or [])
+                            if group in ("*", kind[0]) and resource in ("*", kind[1])
+                        }
+                        if not reached:
+                            continue
                         self.assertTrue(
-                            set(rule.get("verbs") or []) <= self.OPERATOR_SECRET_READ_VERBS,
+                            set(rule.get("verbs") or []) <= self.READ_VERBS,
                             f"{source}: ClusterRole {role['metadata']['name']} grants "
-                            f"{sorted(set(rule.get('verbs') or []) - self.OPERATOR_SECRET_READ_VERBS)} on secrets "
+                            f"{sorted(set(rule.get('verbs') or []) - self.READ_VERBS)} on {sorted(reached)} "
                             "cluster-wide; the write verbs belong in the namespaced Role",
                         )
                 granting = [
@@ -2927,20 +2993,63 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                     for role in h.objects_of_kind(documents, "Role")
                     if secret_rules(role)
                 ]
-                self.assertEqual(
-                    1,
-                    len(granting),
-                    f"{source}: expected exactly one namespaced Role granting secrets, "
-                    f"found {[r['metadata']['name'] for r, _ in granting]}",
-                )
-                role, rules = granting[0]
                 self.assertTrue(
-                    role["metadata"].get("namespace"),
-                    f"{source}: the Role granting secrets carries no namespace",
+                    granting,
+                    f"{source}: no Role names secrets; the Role document is missing or lost its Secret rule",
                 )
-                self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
-                self.assertEqual(["secrets"], rules[0].get("resources"))
-                self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+                expected = namespaces or {granting[0][0]["metadata"].get("namespace")}
+                self.assertEqual(
+                    expected,
+                    {role["metadata"].get("namespace") for role, _ in granting},
+                    f"{source}: expected the namespaced Role granting secrets in {sorted(expected)}, "
+                    f"found {[(r['metadata'].get('namespace'), r['metadata']['name']) for r, _ in granting]}",
+                )
+                self.assertEqual(len(expected), len(granting), f"{source}: a namespace carries the Role twice")
+                for role, rules in granting:
+                    self.assertTrue(
+                        role["metadata"].get("namespace"),
+                        f"{source}: the Role granting secrets carries no namespace",
+                    )
+                    self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
+                    self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+                    self.assertEqual(
+                        self.OPERATOR_NAMESPACED_WRITE_KINDS,
+                        {kind for rule in role.get("rules") or [] for kind in rule_kinds(rule)},
+                        f"{source}: the Role document must name exactly the namespaced kinds",
+                    )
+                    for rule in role.get("rules") or []:
+                        kinds = rule_kinds(rule)
+                        allowed = self.OPERATOR_SECRET_WRITE_VERBS | (
+                            self.READ_VERBS if kinds <= self.OPERATOR_NAMESPACED_READ_KINDS else frozenset()
+                        )
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= allowed,
+                            f"{source}: the Role document grants {sorted(set(rule.get('verbs') or []) - allowed)} "
+                            f"on {sorted(kinds)}; reads stay in the ClusterRole",
+                        )
+                    if namespaces is None:
+                        continue
+                    bindings = [
+                        b for b in h.objects_of_kind(documents, "RoleBinding")
+                        if b["metadata"].get("namespace") == role["metadata"]["namespace"]
+                        and (b.get("roleRef") or {}).get("kind") == "Role"
+                        and (b.get("roleRef") or {}).get("name") == role["metadata"]["name"]
+                    ]
+                    self.assertEqual(
+                        1, len(bindings),
+                        f"{source}: expected one RoleBinding to {role['metadata']['name']} in "
+                        f"{role['metadata']['namespace']}, found {len(bindings)}",
+                    )
+                    subjects = bindings[0].get("subjects") or []
+                    self.assertTrue(
+                        any(
+                            s.get("kind") == "ServiceAccount" and s.get("namespace") == h.HELM_RENDER_NAMESPACE
+                            and "operator" in s.get("name", "")
+                            for s in subjects
+                        ),
+                        f"{source}: the RoleBinding in {role['metadata']['namespace']} does not bind the "
+                        f"operator's ServiceAccount in {h.HELM_RENDER_NAMESPACE}; subjects={subjects}",
+                    )
 
     def test_C5_no_minted_role_grants_a_write_verb(self) -> None:
         """The agent-side half of A2's intersection, asserted on rendered output.

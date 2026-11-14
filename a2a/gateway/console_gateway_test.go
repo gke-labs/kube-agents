@@ -160,6 +160,7 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	cfg := &Config{
 		NATSURL:          s.ClientURL(),
 		PrincipalMapPath: filepath.Join(t.TempDir(), "absent"),
+		DiscordToken:     "x",
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),

@@ -241,6 +241,12 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 // draining (drainingDispatchProfiles): the dispatcher keeps their names, so
 // their .supervisor and stop-record grants, and none of their durables.
 func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
+	return renderA2AAuthMapHeld(agent, profiles, profiles, draining)
+}
+
+// renderA2AAuthMapHeld is renderA2AAuthMapDraining with the dispatcher's
+// grant built from dispatchable alone.
+func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatchable []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
 	for _, id := range calloutIdentities(agent) {
 		identities = append(identities, a2aAuthMapIdentity{
@@ -261,14 +267,14 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 	// can carry it is left out, and the operator runs no dispatcher
 	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
 	if a2aDispatcherEnabled() {
-		_, over, err := a2aDispatcherCeiling(agent, profiles, draining)
+		_, over, err := a2aDispatcherCeiling(agent, dispatchable, draining)
 		if err != nil {
 			return a2aAuthMapDocument{}, err
 		}
 		if !over {
 			// Bucketed or not (dispatcherMapEntry); unbucketed, it is
 			// a2aDispatcherMapEntry's entry, which the ceiling measured.
-			identities = append(identities, dispatcherMapEntry(agent, profiles, draining))
+			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining))
 		}
 	}
 
@@ -375,7 +381,15 @@ func a2aAuthMapEntryBytes(id a2aAuthMapIdentity) (int, error) {
 }
 
 func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
-	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
+	return buildA2AAuthMapConfigMapsHeld(agent, profiles, profiles, draining)
+}
+
+// buildA2AAuthMapConfigMapsHeld is buildA2AAuthMapConfigMaps with the
+// dispatcher's grant built from dispatchable, the profiles every bus server
+// has loaded (a2aDispatchableProfiles), while every bound profile keeps its
+// own identities.
+func buildA2AAuthMapConfigMapsHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatchable []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
+	doc, err := renderA2AAuthMapHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
 		return nil, "", err
 	}

@@ -222,11 +222,13 @@ infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
-Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
-exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
+Chat; a localhost door has no silent-stop failure mode, so it was a side door that could sit beside
+exactly one real backend then, and the guard refused two real ones at the time. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and meets the A2A owner's condition that the guard change
-be coordinated with the Slack adapter in flight.
+be coordinated with the Slack adapter in flight. The guard was narrowed on 2026-11-12, so the
+gateway now runs every armed backend (the gateway spec's "Every armed backend in one gateway
+process").
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
@@ -234,7 +236,7 @@ the guard say so in code and in the gateway spec's test-backend section. What th
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
 guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
-door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+door beside it, which shares the exemption), and kept the two-backend refusal then. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
@@ -574,9 +576,10 @@ allowed-users gate are exactly as "The Google Chat adapter" section has them, th
 as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
-armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
+armed, the relay URL beside a Slack credential was the gateway's refusal at the time, and the inject door
 beside the relay URL is not one (stage 1), so the install this stage wires runs both
-transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+transports. The gateway's guard was narrowed on 2026-11-12 to run every armed backend (the
+gateway spec's "Every armed backend in one gateway process"). A render that drops the relay URL still leaves a gateway on the door alone, which
 the read route reports as inject-only and the stage's preflight fails as infrastructure before
 any case runs.
 
@@ -752,8 +755,8 @@ listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking 
 the batch runs Tide started, the main nightly's eight parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
 `ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
-under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
+under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+install gets, the replay lane (`ci-kube-agents-eval-replay-lane`) and the Slack lane's nightly (`ci-kube-agents-eval-nightly-slack`)), and refuses it on any other Prow run, so the flag mis-set on another periodic or
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the

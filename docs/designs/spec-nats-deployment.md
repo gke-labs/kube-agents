@@ -48,6 +48,39 @@ with an `A2ABusConversionRefused` condition and Warning, and the admission webho
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
 
+**Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
+The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
+leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
+Standard, the third never joined although every server held its routes. The leader then refused
+every R3 stream with a bare "no suitable peers for placement", and the provision Job retried until
+the run timed out. So before the provision Job is created, the operator reads each server's `/jsz`
+at its pod IP: the bus pods have no per-pod DNS names, and the client Service would answer from one
+server at random. The group counts as formed when a quorum of servers report one leader and that
+leader lists every other server as a current peer. Until then the Job waits, and the
+`A2ABusMetaGroup` condition names the server outside.
+
+A server still outside after 3 minutes is restarted once, under every one of these guards:
+
+- it is the only server outside;
+- the rest are a quorum without it;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
+- the bus StatefulSet doesn't already record it as restarted.
+
+The record is an annotation the operator writes before the delete, with its own patch, so the
+StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
+its one restart stays named in the condition, for a person.
+
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -381,8 +414,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. The gateway's per-profile deny is left out of
-that hash, since a reload applies it (below).
+without a credential reaching the digest. On a single server the gateway's per-profile
+deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
+profile change rolls the servers (below).
 
 Layout:
 
@@ -1150,13 +1184,31 @@ The pod template's config hash leaves out the per-profile gateway deny, so an Ag
 added, removed or done draining changes the config Secret and not the template: the bus is
 reloaded, not rolled. Every other config change still rolls it. The operator records the
 reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. If it hasn't moved within three minutes, or
-can't be read, the operator deletes the bus pod so it restarts onto the new config, and
-writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+and confirms the reload when that value moves. A config written while a reload is still
+pending can't be confirmed by that move, which may be the earlier write landing, so the move
+restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
+kubelet write, so a restarted wait usually sees no further move, and nothing the server
+reports says whether the newest write was in the one it saw. If the value hasn't moved
+within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
+the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+`BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
+restart is kept even then: confirming by the absence of a move would admit a profile whose
+deny the server might not hold. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after
 the profile does. On the roll path it landed when the new pod came up, tens of seconds
 later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
+
+**A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
+grant and the agent card take a newly bound AgentProfile only once every bus server has
+loaded the config carrying its deny; until then the profile's `CardPublished` condition is
+`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
+servers, the pod template records the profile list, and the operator reads the revision
+each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
+them). On one server the config Secret records the previous list while a reload is pending
+or the pod restarts, and the profile counts as loaded once the server is on the new config.
+Only the way in waits: a profile the dispatch config already lists live, or whose card is
+already published, stays, and a removed profile keeps its deny while it drains, as before.
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the

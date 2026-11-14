@@ -690,8 +690,8 @@ const (
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
 	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
-	// gateway_platform) reads it too, to name the platform whose home channel
-	// is missing when it refuses a report.
+	// gateway_platforms) reads it too, as a comma-separated list, to name the
+	// platforms whose home channel is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -2823,7 +2823,7 @@ func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
 func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
 	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSConfigSecretName(agent),
@@ -2832,6 +2832,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 		},
 		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
+	// The profiles this config carries, for the single server's loaded set
+	// (a2aServerLoadedProfiles).
+	secret.Annotations = map[string]string{a2aConfigProfilesAnnotation: encodeA2AConfigProfiles(profiles)}
+	return secret
 }
 
 // a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
@@ -6800,7 +6804,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -6817,6 +6821,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig: brokerCallerPodDNSConfig(),
 					// The gateway runs as its own ServiceAccount with the
 					// narrow Role above - the token this automounts is
 					// exactly that grant, nothing ambient.
@@ -6873,6 +6879,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	return dep
 }
 
 // a2aProvisionState reports where the provision Job stands, because nothing
@@ -6885,6 +6893,10 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// busMeta is the JetStream meta group check's finding on a pass that
+	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
+	busMeta a2aBusMetaState
 
 	// homeRecord is the home-channel record the reconcile read once
 	// (platformagent_home_channel_record.go), carried to the projection and
@@ -6972,6 +6984,10 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// profileHoldRequeue is when to check again on a newly bound profile
+	// held until every bus server has loaded its config
+	// (a2aDispatchableProfiles). Zero when none is held.
+	profileHoldRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -7172,7 +7188,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	var profiles []agentv1alpha1.AgentProfile
 	if !r.agentProfilesUnreadable {
 		var err error
-		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
 		}
 	}
@@ -7193,14 +7209,44 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	// The profiles still draining (#5074), read once from the applied
-	// dispatch config for both renders: the identity map keeps their
-	// .supervisor grant exactly as long as the dispatch config lists them.
-	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	// The profiles the dispatcher may take: a newly bound one waits until
+	// every bus server has loaded its config entry, the gateway's deny on its
+	// supervisor subjects (platformagent_a2a_profile_hold.go). The bus config
+	// below carries every bound profile; the dispatcher's grant here and its
+	// dispatch config carry only these. While any waits, the pass looks again
+	// at the reload's recheck.
+	dispatchable, held, err := r.a2aDispatchableProfiles(ctx, agent, profiles)
 	if err != nil {
 		return state, err
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	// Against the dispatchable set, not every bound profile: a draining
+	// profile bound again before the bus has loaded it is held, so it keeps
+	// draining until it is dispatchable.
+	draining, err := r.dispatchDraining(ctx, agent, dispatchable)
+	if err != nil {
+		return state, err
+	}
+	if len(held) > 0 {
+		state.profileHoldRequeue = a2aBusReloadRecheck
+		// With the dispatcher off, only the card waits.
+		what := "holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config"
+		if !a2aDispatcherEnabled() {
+			what = "holding newly bound AgentProfiles' cards until every A2A bus server has loaded their config"
+		}
+		logf.FromContext(ctx).Info(what, "profiles", held)
+	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't
+	// matter), before the identity map that may name one of them: an early
+	// return between the two then never leaves a map naming a tier whose
+	// file was not written.
+	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
+		return state, err
+	}
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -7264,6 +7310,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
+	annotateA2ABusProfiles(agent, sts, profileNames)
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7279,6 +7326,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
+		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {
 			return state, err
 		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
@@ -7431,16 +7481,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// Past the size one identity-map shard can carry, the dispatcher's entry
 	// is left out of the map, so it is torn down as though switched off, and
 	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
-	// The step itself tears the dispatcher down past the ceiling.
+	// The step itself tears the dispatcher down past the ceiling. Both take
+	// the profiles every bus server has loaded (dispatchable, above), as the
+	// identity map's entry does, so the three agree on the ceiling.
 	state.dispatcherCeiling = dispatcherCeilingRemoved
 	if a2aDispatcherEnabled() {
-		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, dispatchable, draining)
 		if cerr != nil {
 			return state, cerr
 		}
 		state.dispatcherCeiling = &ceiling
 	}
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err
@@ -7496,14 +7548,42 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if hold := calloutHold || busHold || state.busHeld; hold {
+		// The JetStream meta group (#5708): with every other hold clear, a
+		// multi-server bus's provisioning waits until each server agrees on
+		// one meta leader that lists the rest as current, and a server left
+		// outside is restarted once (platformagent_a2a_nats_meta.go).
+		metaHold := false
+		// A pass that doesn't look clears the condition: on one server it
+		// doesn't apply, and while another hold applies (a roll, the
+		// restart itself) a server's absence isn't the meta group's, so the
+		// restart's clock starts again once the bus is back.
+		state.busMeta = a2aBusMetaState{checked: true}
+		if !calloutHold && !busHold && !state.busHeld && a2aNATSReplicas(agent) > 1 {
+			live := &appsv1.StatefulSet{}
+			if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, live); err != nil {
+				if !errors.IsNotFound(err) {
+					return state, err
+				}
+			} else {
+				metaHold, state.busMeta, err = r.checkA2ABusMeta(ctx, agent, live, a2aNATSReplicas(agent), time.Now())
+				if err != nil {
+					return state, fmt.Errorf("checking the A2A bus's JetStream meta group: %w", err)
+				}
+			}
+		}
+		if hold := calloutHold || busHold || state.busHeld || metaHold; hold {
 			state.jobHeld = true
 			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config and rolled out",
-				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld)
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMetaGroup", metaHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
 	} else {
+		// With the Job created, the condition no longer says anything about
+		// provisioning, whatever it says: the Job is created only past the
+		// check (or on an unknown verdict), and a pass that created it but
+		// failed later never wrote the clear.
+		state.busMeta = a2aBusMetaState{checked: true}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
@@ -8588,6 +8668,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The tiers file the gateway, the verifier and the callout mount
+		// (platformagent_a2a_tiers.go); its volume is optional.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aTiersName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find
