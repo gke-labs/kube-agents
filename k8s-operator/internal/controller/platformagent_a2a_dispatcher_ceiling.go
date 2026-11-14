@@ -23,11 +23,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -156,10 +154,11 @@ func dispatcherIdentityShare(agent *agentv1alpha1.PlatformAgent, base int, p *ag
 
 // a2aDispatchConfigShares is the dispatch config's size with no profiles,
 // and the bytes each of these profiles' entries adds to it, as
-// buildA2ADispatchConfigMapWith writes it (compact JSON). A profile that allows
-// unattended under Job mode carries its Job template; measured both with and
-// without image volumes, it is charged the larger, since which one the
-// cluster takes isn't known here. Each share is measured alone and charged
+// buildA2ADispatchConfigMapWith writes it (compact JSON): no durables and a
+// Job template referenced by its hash alone, which the dispatcher resolves
+// (#5479). A profile with a live unattended-mode tier under Job mode carries
+// that reference, whose hash is fixed-width, so which rendering the cluster
+// takes doesn't change its size. Each share is measured alone and charged
 // one more byte for the comma it takes in the array: exact for every entry
 // after the first, one over for the first, never under.
 func a2aDispatchConfigShares(agent *agentv1alpha1.PlatformAgent, profiles []*agentv1alpha1.AgentProfile) (base int, shares []int, err error) {
@@ -206,17 +205,18 @@ func (m dispatchConfigMeasure) bytes(entries []a2aDispatchProfile) (int, error) 
 	return len(body), err
 }
 
-// share is the bytes p's entry adds over base, with its comma.
+// share is the bytes p's entry adds over base, with its comma. A profile
+// takes a Job template reference when dispatchJobTemplates renders it a
+// template: under Job mode, for its live unattended-mode tier
+// (unattendedTierOf), the built-in or a Tier resource's, and none while that
+// tier drains. Only the reference's hash is written, so a placeholder of the
+// same width measures it without rendering the template.
 func (m dispatchConfigMeasure) share(base int, p *agentv1alpha1.AgentProfile) (int, error) {
-	var tmpl *corev1.PodTemplateSpec
-	if m.jobMode && slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
-		with, without := buildProfileJobTemplate(m.agent, p, true), buildProfileJobTemplate(m.agent, p, false)
-		tmpl = with
-		if a, b := jsonLen(with), jsonLen(without); b > a {
-			tmpl = without
-		}
+	entry := dispatchProfileEntry(m.agent, p, nil)
+	if m.jobMode && unattendedTierOf(p) != "" {
+		entry.JobTemplateRef = &a2aDispatchJobTemplateRef{Hash: strings.Repeat("0", dispatchJobTemplateHashLength)}
 	}
-	n, err := m.bytes([]a2aDispatchProfile{dispatchProfileEntry(m.agent, p, tmpl)})
+	n, err := m.bytes([]a2aDispatchProfile{entry})
 	return n - base + 1, err
 }
 
@@ -236,8 +236,8 @@ type dispatcherCut struct {
 
 // dispatcherCutCache holds recent cuts by their inputs' fingerprint. Every
 // identity resolution makes the cut, and callers resolve many times a
-// reconcile, so without it each would rebuild and marshal every profile's Job
-// template again.
+// reconcile, so without it each would marshal every profile's entry and
+// grants again.
 var dispatcherCutCache = struct {
 	sync.Mutex
 	cuts map[string]dispatcherCut
@@ -453,7 +453,7 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear
 		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles is %d bytes, %d%% of the %d bytes one ConfigMap can hold; "+
-			"past it the operator binds no newer profiles (about 200 profiles that allow unattended under Job mode). Lifting the ceiling is %s",
+			"past it the operator binds no newer profiles. Lifting the ceiling is %s",
 			fit, configBytes, configPct, a2aDispatchConfigLimitBytes, dispatchConfigCeilingIssue)
 	case size >= a2aDispatcherWarnBytes:
 		condition.Status = metav1.ConditionTrue

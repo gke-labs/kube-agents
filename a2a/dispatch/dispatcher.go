@@ -317,7 +317,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
 		d.grantedProfiles[p.Name] = true
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			d.granted[dur.Name] = true
 		}
 	}
@@ -426,7 +426,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 		if !d.grantedProfiles[p.Name] {
 			addedProfiles = append(addedProfiles, p.Name)
 		}
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
 				added = append(added, dur.Name)
@@ -755,7 +755,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+	if h.unattended && d.jobs != nil && prof.HasJobTemplate() {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
@@ -1942,14 +1942,14 @@ func submitRetention(cfg lib.DispatchConfig) time.Duration {
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
-// config lists is bound. Callers hold d.mu.
+// config derives is bound. Callers hold d.mu.
 func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier string) bool {
 	prof, ok := profileOf(cfg, profile)
 	if !ok {
 		return false
 	}
 	n := 0
-	for _, dur := range prof.Durables {
+	for _, dur := range prof.DerivedDurables() {
 		if dur.Tier != tier {
 			continue
 		}

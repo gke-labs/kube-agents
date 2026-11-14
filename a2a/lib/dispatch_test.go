@@ -355,7 +355,7 @@ func TestTheOperatorsDispatchConfigDecodesAndValidates(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("the operator's dispatch config fails the dispatcher's checks: %v", err)
 	}
-	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "tse" || len(cfg.Profiles[0].Parameters) != 3 || len(cfg.Profiles[0].Durables) != 2 {
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "tse" || len(cfg.Profiles[0].Parameters) != 3 || len(cfg.Profiles[0].DerivedDurables()) != 2 {
 		t.Errorf("profiles = %+v", cfg.Profiles)
 	}
 	if cfg.Version == "" || cfg.Namespace == "" || cfg.ProfileNamespace != cfg.Namespace+"-profiles" {
@@ -458,17 +458,21 @@ func TestDispatchConfigRefusesARetentionOutOfRange(t *testing.T) {
 // profile needs a durable; a draining one has none.
 func TestADrainingProfileHasNoDurablesAndALiveOneDoes(t *testing.T) {
 	durable := DispatchDurable{Tier: "read", Kind: SubmitKindTop, Name: ProfileDurableName("tse", "read", SubmitKindTop)}
-	profile := DispatchProfile{Name: "tse", Tiers: []string{"read"}, Concurrency: 2, Durables: []DispatchDurable{durable}}
+	child := DispatchDurable{Tier: "read", Kind: SubmitKindChild, Name: ProfileDurableName("tse", "read", SubmitKindChild)}
+	profile := DispatchProfile{Name: "tse", Tiers: []string{"read"}, Concurrency: 2, Durables: []DispatchDurable{durable, child}}
 	until := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	for name, tc := range map[string]struct {
 		durables []DispatchDurable
 		until    time.Time
 		ok       bool
 	}{
-		"live with a durable":     {[]DispatchDurable{durable}, time.Time{}, true},
-		"live with none":          {nil, time.Time{}, false},
-		"draining with none":      {nil, until, true},
-		"draining with a durable": {[]DispatchDurable{durable}, until, false},
+		// From #5479 a live profile lists none (the dispatcher derives them),
+		// or, for one release, exactly the derived set.
+		"live listing the derived set": {[]DispatchDurable{durable, child}, time.Time{}, true},
+		"live listing none":            {nil, time.Time{}, true},
+		"live listing a partial set":   {[]DispatchDurable{durable}, time.Time{}, false},
+		"draining with none":           {nil, until, true},
+		"draining with a durable":      {[]DispatchDurable{durable}, until, false},
 	} {
 		p := profile
 		p.Durables, p.DrainingUntil = tc.durables, tc.until
@@ -513,5 +517,45 @@ func TestTheOperatorsDrainingDispatchConfigDecodesAndValidates(t *testing.T) {
 	}
 	if draining != 1 || live != 1 {
 		t.Errorf("%d draining and %d live profiles, want one each", draining, live)
+	}
+}
+
+// A profile names its Job template by reference or carries it inline, never
+// both, and a reference needs an object name and a hash.
+// A hash-only ref is valid from #5479 (TestAJobTemplateRefMayCarryOnlyItsHash).
+func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
+	base := func() DispatchConfig {
+		cfg := validDispatchConfig()
+		return cfg
+	}
+	ref := &DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "06ecfba171668118"}
+	ok := base()
+	ok.Profiles[0].JobTemplateRef = ref
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("a well-formed reference was refused: %v", err)
+	}
+	if !ok.Profiles[0].HasJobTemplate() {
+		t.Error("a profile naming a template doesn't run as Jobs")
+	}
+	for name, mutate := range map[string]func(*DispatchProfile){
+		"no hash": func(p *DispatchProfile) { p.JobTemplateRef = &DispatchJobTemplateRef{Name: ref.Name} },
+		"bad name": func(p *DispatchProfile) {
+			p.JobTemplateRef = &DispatchJobTemplateRef{Name: "Not_A_Name", Hash: ref.Hash}
+		},
+		"inline too": func(p *DispatchProfile) {
+			p.JobTemplateRef = ref
+			p.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base()
+			mutate(&cfg.Profiles[0])
+			if err := cfg.Validate(); err == nil {
+				t.Error("refused nothing")
+			}
+		})
+	}
+	if (DispatchProfile{}).HasJobTemplate() {
+		t.Error("a profile with no template runs as Jobs")
 	}
 }

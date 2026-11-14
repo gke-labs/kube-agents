@@ -382,10 +382,10 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 
 // The dispatch config at N=2,500 with the dispatcher's own ceiling switched
 // off (fleetScaleProfileFixtures), so every profile is rendered: one compact
-// profile block per profile with its tiers, parameters and a durable per
-// (tier, kind). Writing it compact brought it under the limit; Job templates,
-// which this fixture's profiles don't carry, are gke-labs/kube-agents#5479's,
-// and the dispatcher's ceiling refuses the profiles they would push past it.
+// profile block per profile with its tiers and parameters, and no durables,
+// which the dispatcher derives (#5479). Job templates, which this fixture's
+// profiles don't carry, are named by hash only, and the dispatcher's ceiling
+// refuses the profiles they would push past it.
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
@@ -402,4 +402,31 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	t.Logf("%s at N=%d: %d profile blocks rendered", cm.Name, fleetScaleProfiles, len(cfg.Profiles))
 
 	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), "")
+}
+
+// jobModeScaleProfiles is past where an inline Job template per profile put
+// the dispatch config over the ConfigMap limit (about 240 two-tier
+// unattended profiles).
+const jobModeScaleProfiles = 600
+
+// Under Job mode each unattended profile names its DispatchJobTemplate
+// rather than carrying its pod template, so the dispatch config stays under
+// the limit well past where the inline copies passed it.
+func TestTheDispatchConfigMapUnderJobModeAtScale(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := make([]agentv1alpha1.AgentProfile, 0, jobModeScaleProfiles)
+	for i := 0; i < jobModeScaleProfiles; i++ {
+		profiles = append(profiles, unattendedProfile(agent, fmt.Sprintf("u%04d", i)))
+	}
+	templates := dispatchJobTemplates(agent, profiles, false)
+	if len(templates) != jobModeScaleProfiles {
+		t.Fatalf("%d Job templates rendered for %d unattended profiles", len(templates), jobModeScaleProfiles)
+	}
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d unattended profiles under Job mode", jobModeScaleProfiles), "")
 }
