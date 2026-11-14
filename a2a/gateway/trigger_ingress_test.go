@@ -130,7 +130,7 @@ func TestATriggerSubmissionStartsATaskWithTheTriggerBound(t *testing.T) {
 	if reply.Refused != nil || reply.TaskID == "" {
 		t.Fatalf("reply = %+v", reply)
 	}
-	if reply.TaskID != triggerTaskID(s.IdempotencyKey) {
+	if reply.TaskID != triggerTaskID(s.IdempotencyKey, 0) {
 		t.Errorf("task %s is not the key's", reply.TaskID)
 	}
 	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
@@ -175,8 +175,12 @@ func TestATriggerSubmissionStartsATaskWithTheTriggerBound(t *testing.T) {
 	if rec.Delivery == nil || *rec.Delivery != s.Delivery {
 		t.Errorf("recorded delivery = %+v", rec.Delivery)
 	}
-	if len(rec.TriggerRuns) != 1 || rec.TriggerRuns[0] != (TriggerRun{Key: s.IdempotencyKey, Task: reply.TaskID}) {
+	if len(rec.TriggerRuns) != 1 || rec.TriggerRuns[0].Key != s.IdempotencyKey || rec.TriggerRuns[0].Task != reply.TaskID ||
+		!rec.TriggerRuns[0].Published || rec.TriggerRuns[0].Capability == nil || *rec.TriggerRuns[0].Capability != ref {
 		t.Errorf("recorded runs = %+v", rec.TriggerRuns)
+	}
+	if rec.LastActivity.IsZero() {
+		t.Error("the trigger record's LastActivity was not stamped")
 	}
 	if entry.Scope != capability.NamespaceScope("kubeagents-system") {
 		t.Errorf("grant scope = %q, want the install namespace's", entry.Scope)
@@ -390,5 +394,86 @@ func TestATriggerSubmissionWithAReplyOutsideItsNamespaceStartsNothing(t *testing
 	time.Sleep(200 * time.Millisecond)
 	if n := len(tr.submissions()); n != 0 {
 		t.Fatalf("%d submissions published", n)
+	}
+}
+
+// streamCount is how many messages PROFILE_SUBMITS holds on subject.
+func streamCount(t *testing.T, url, subject string) uint64 {
+	t.Helper()
+	nc, err := connectTest(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, lib.ProfileSubmitStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(subject))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.State.Subjects[subject]
+}
+
+// TestAPendingTriggerRunIsPublishedAgainNotMintedAgain: a run recorded but
+// not marked published (its publish failed, or the gateway stopped) is
+// published again under the same task and grant when the key repeats; the
+// stream keeps one copy, and no second grant is minted.
+func TestAPendingTriggerRunIsPublishedAgainNotMintedAgain(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	first := tr.submit(t, "schedule", s)
+	if first.Refused != nil {
+		t.Fatalf("refused: %+v", first.Refused)
+	}
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec, err := tr.g.reg.Get(ctx, key)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	rec.TriggerRuns[0].Published = false
+	if err := tr.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	again := tr.submit(t, "schedule", s)
+	if again.Refused != nil || again.TaskID != first.TaskID {
+		t.Fatalf("the pending run's repeat = %+v, want task %s", again, first.TaskID)
+	}
+	subject := lib.TaskSubmitSubject("fleet-audit", "unattended", lib.SubmitKindTop, first.TaskID)
+	if n := streamCount(t, tr.url, subject); n != 1 {
+		t.Fatalf("PROFILE_SUBMITS holds %d copies of the run, want 1", n)
+	}
+	if rec, _ = tr.g.reg.Get(ctx, key); rec == nil || !rec.TriggerRuns[0].Published {
+		t.Fatalf("the run is not marked published: %+v", rec)
+	}
+}
+
+// TestATriggerKeyAnUnrecordedAttemptMintedTakesTheNextTask: a grant left by
+// an attempt that failed before it was recorded (so never published) takes
+// the run's first task id; the cap bucket refuses a second write to it, and
+// the run takes the next attempt's id instead of being refused for good.
+func TestATriggerKeyAnUnrecordedAttemptMintedTakesTheNextTask(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	if _, err := capability.NewMinter(tr.g.client.JetStream()).Mint(context.Background(), triggerTaskID(s.IdempotencyKey, 0), capability.Entry{
+		Tier: capability.TierUnattended, Scope: capability.NamespaceScope("kubeagents-system"), Profile: "fleet-audit", Delegate: profileGrantDelegate,
+		Trigger: &capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: s.Trigger.Stream},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	if reply.TaskID != triggerTaskID(s.IdempotencyKey, 1) {
+		t.Fatalf("task = %s, want the second attempt's", reply.TaskID)
 	}
 }

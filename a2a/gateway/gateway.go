@@ -3228,7 +3228,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
 	// None on a backend that shows the task's status itself (StatusShower).
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
-	if !lineless {
+	// A trigger's conversation has no chat backend: no placeholder there
+	// (unpostableTrigger), for a child or a wake started on its record.
+	if !lineless && !g.unpostableTrigger(rec.Key) {
 		var err error
 		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
 		if err != nil {

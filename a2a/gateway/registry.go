@@ -189,6 +189,13 @@ type SessionRecord struct {
 type TriggerRun struct {
 	Key  string `json:"key"`
 	Task string `json:"task"`
+	// Capability is the run's grant, pinned when it was minted, and
+	// CorrelationID its envelope's: a run recorded but not yet published is
+	// published again with both, never minted again.
+	Capability    *capability.Ref `json:"capability,omitempty"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	// Published says the run's submission is on the bus.
+	Published bool `json:"published,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,
