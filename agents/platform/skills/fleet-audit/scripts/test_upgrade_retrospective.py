@@ -44,6 +44,10 @@ import upgrade_retrospective as ur  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 import audit_report  # noqa: E402
 
+# The test-support guards live beside the Platform Agent's shared scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+import no_live_google_auth  # noqa: E402
+
 # The longest identifiers a recorded command can carry in its kubeconfig path
 # under the shipped platform profile: a 30-character project id, a 40-character
 # cluster name, GCP's longest location. A collector's recorded chain is held
@@ -61,14 +65,42 @@ LONGEST_LOCATION = "northamerica-northeast1-a"
 _PAGED_DUMP = mock.patch.object(ur, "paged_dump", _shared_run_tests.paged_dump_over())
 
 
+# `main` opens the gate's Cloud Monitoring session with `default_monitoring_session`, which is
+# `google.auth.default()`. The test requirements hold no google-auth (protobuf is their only
+# Google package), so in CI that import fails and the run goes on with no session. On a machine
+# that has google-auth, the same tests read the developer's credentials and called Cloud
+# Monitoring. Every `main` in this module gets the error CI gives; a test that wants a session
+# passes one to `collect`.
+_NO_MONITORING_SESSION = mock.patch.object(
+    ur, "default_monitoring_session", side_effect=ModuleNotFoundError("No module named 'google.auth'", name="google.auth")
+)
+
+
 def setUpModule():
+    # No test here loads google.auth: an import that a test leaves unstubbed fails as it does in
+    # CI, and fails the module.
+    global _NO_GOOGLE_AUTH
+    _NO_GOOGLE_AUTH = no_live_google_auth.install()
+    _NO_MONITORING_SESSION.start()
     _PAGED_DUMP.start()
 
 
 def tearDownModule():
     _PAGED_DUMP.stop()
+    _NO_MONITORING_SESSION.stop()
+    _NO_GOOGLE_AUTH.uninstall()
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
+
+class TestNoLiveGoogleAuth(unittest.TestCase):
+    def test_no_test_in_this_module_can_load_google_auth(self):
+        no_live_google_auth.assert_in_force(self, _NO_GOOGLE_AUTH)
+
+    def test_main_gets_no_monitoring_session(self):
+        with self.assertRaises(ModuleNotFoundError):
+            ur.default_monitoring_session()
+
 
 FIXTURES = Path(__file__).parent / "testdata" / "upgrade_retrospective"
 PROJECT = "example-project"
