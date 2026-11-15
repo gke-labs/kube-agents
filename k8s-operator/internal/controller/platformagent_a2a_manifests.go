@@ -8613,13 +8613,6 @@ func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, age
 	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
 }
 
-// deleteA2AAuthMapShards removes every identity-map object, the unsharded
-// legacy one and every shard. Only tests call it since the flip-to-today
-// teardown went; CR deletion leaves the objects to their owner reference.
-func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
-}
-
 // deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns
 // except the names in keep. Found by label rather than by walking the names
 // up from the count: every identity-map object, legacy or shard, carries

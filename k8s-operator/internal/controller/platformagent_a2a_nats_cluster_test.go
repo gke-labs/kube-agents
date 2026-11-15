@@ -1284,8 +1284,8 @@ func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
 // OrderedReady creates server 1 and its claim only once server 0 is Ready, so
 // a new cluster's StatefulSet deleted before then leaves only claim 0, as a
 // single server does. The recorded count tells them apart; with nothing
-// recorded (a record lost to a served CRD that prunes it; a flip to today
-// keeps it since #5451) the lone claim reads as one server.
+// recorded (a record lost to a served CRD that prunes it) the lone claim
+// reads as one server.
 func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	for _, tc := range []struct {
 		recorded, want int32

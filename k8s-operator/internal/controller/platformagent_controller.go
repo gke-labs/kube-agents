@@ -822,13 +822,12 @@ type PlatformAgentReconciler struct {
 // nothing. The writes are namespaced like every other rendered kind's. The
 // reads stay cluster-wide, like every other kind's, for the teardown walk:
 // deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
-// deletion and every flip to today, before any check that the namespace or
-// a RoleBinding in it exists, and a Helm install in mode today binds the
-// Role in the install namespace only, so a namespaced read would be a 403
-// there (the API server authorises a namespaced list before it looks for
+// deletion, before any check that the namespace or a RoleBinding in it
+// exists, so a namespaced read would be a 403 wherever that RoleBinding is
+// absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
-// namespaced Role there in the same apply (the chart under mode next,
-// config/profiles under make deploy), which is what lets the namespaced
+// namespaced Role there in the same apply (the chart, config/profiles under
+// make deploy), which is what lets the namespaced
 // writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
 // and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
@@ -1078,7 +1077,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// It was at the bottom, under everything, which meant a reconcile that
 	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
 	// just after the bus step fixed two of those parks and left four: the
-	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// refusals at 9b, 9c, 10 and 11e all return above the bus
 	// step, and the bus step cannot move above them because it renders on top
 	// of what they withhold. There is no position in the sequence that works,
 	// so this is not a position in the sequence.

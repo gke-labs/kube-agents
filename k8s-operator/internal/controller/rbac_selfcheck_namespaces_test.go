@@ -173,8 +173,7 @@ func TestReconcileReportsAMissingRoleBindingInTheProfileNamespace(t *testing.T) 
 
 // The fence pass is where the reconcile learns the profile namespace exists,
 // so it is where the self-check starts probing it, and the pass that finds
-// it gone (a flip to today removes it with its RoleBinding) is where the
-// probing stops, or the agent would carry a denial for a namespace it no
+// it gone (deleted with its RoleBinding) is where the probing stops, or the agent would carry a denial for a namespace it no
 // longer writes in.
 func TestTheProfileFenceObservesAndForgetsTheProfileNamespace(t *testing.T) {
 	const operatorNamespace = "kubeagents-system"
