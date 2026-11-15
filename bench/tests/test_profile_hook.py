@@ -43,8 +43,15 @@ def test_a_profile_with_no_parameters_carries_none() -> None:
         ("[bench:profile name=cluster project=a project=b] ask", "given twice"),
         ("[bench:profile name=cluster 9x=a] ask", "not a parameter's name"),
         ("[bench:profile name=cluster]   ", "nothing to ask"),
+        ("[bench:profile name=My_Prof] ask", "not a profile's name"),
+        ("[bench:profile name=cluster] [bench:stop-in-card-wait] ask", "can't follow"),
     ],
 )
 def test_a_malformed_directive_is_refused(prompt: str, why: str) -> None:
     with pytest.raises(ValueError, match=why):
         profile_hook.parse(prompt)
+
+
+def test_is_profile_ask_reads_only_an_opening_directive() -> None:
+    assert profile_hook.is_profile_ask("  [bench:profile name=cluster] ask")
+    assert not profile_hook.is_profile_ask("[bench:stop-after-first-card]\n[bench:profile name=cluster] ask")

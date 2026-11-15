@@ -3167,6 +3167,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if profile_hook.is_profile_ask(prompt):
+            return AgentResult.errored(
+                f"{profile_hook.PROFILE_DIRECTIVE} ...] needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)

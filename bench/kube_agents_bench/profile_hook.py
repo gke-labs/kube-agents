@@ -18,8 +18,11 @@ harness's ``{{AGENT_CLUSTER_*}}`` and ``{{FLEET_CLUSTER_*}}`` placeholders,
 expanded before this runs. Values hold no spaces: a field is ``key=value``,
 split on whitespace.
 
-Only the inject transport reads it; the api transport has no way to address a
-profile, and a case using it belongs on the inject lanes alone.
+Only the inject transport reads it. The api transport refuses a prompt that
+opens with it (it has no way to address a profile), so a case using it is listed
+in hack/eval/api-lane-exclusions.txt, which scripts/test_eval_rosters.py checks.
+It must open the prompt: a stop directive may follow it, except the card-wait
+stop, whose A2A door can't address a profile.
 """
 
 from __future__ import annotations
@@ -33,9 +36,13 @@ DIRECTIVE_END = "]"
 #: The field naming the profile; every other field is a parameter.
 NAME_FIELD = "name"
 FIELD_SEPARATOR = "="
-#: A profile name the gateway accepts as a subject token: no spaces, dots or
-#: NATS wildcards. The gateway checks it again; this catches a typo in a case.
-PROFILE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+#: A profile name the gateway accepts: a DNS-1123 label, which is what its
+#: ValidSubjectToken holds a profile name to (a2a/lib/envelope.go). The
+#: gateway checks it again; this catches a typo in a case before a run.
+PROFILE_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+#: The card-wait stop goes through the A2A door, which can't address a profile,
+#: so it can't follow this directive (stop_hook.CARD_WAIT_DIRECTIVE).
+CARD_WAIT_DIRECTIVE = "[bench:stop-in-card-wait]"
 PARAMETER_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
@@ -47,6 +54,12 @@ class ProfileAsk:
     name: str
     prompt: str
     parameters: dict[str, str] = field(default_factory=dict)
+
+
+def is_profile_ask(prompt: str) -> bool:
+    """Whether ``prompt`` opens with the directive: the test the harness's api
+    path refuses on, and the roster test reads, so they can't disagree."""
+    return prompt.lstrip().startswith(PROFILE_DIRECTIVE)
 
 
 def parse(prompt: str) -> ProfileAsk | None:
@@ -82,4 +95,6 @@ def parse(prompt: str) -> ProfileAsk | None:
             raise ValueError(f"{PROFILE_DIRECTIVE}: {key!r} is not a parameter's name")
     if not ask:
         raise ValueError(f"{PROFILE_DIRECTIVE}: nothing to ask after the directive")
+    if ask.startswith(CARD_WAIT_DIRECTIVE):
+        raise ValueError(f"{CARD_WAIT_DIRECTIVE} can't follow {PROFILE_DIRECTIVE}: the A2A door it runs through can't address a profile")
     return ProfileAsk(name=name, prompt=ask, parameters=fields)

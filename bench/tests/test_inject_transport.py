@@ -4607,3 +4607,11 @@ def test_a_malformed_profile_directive_errors_and_sends_nothing(stub_gateway: _S
 
     assert result.errors and "name= is required" in result.errors[0]
     assert stub_gateway.submissions == []
+
+
+def test_the_api_transport_refuses_a_profile_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the inject door can address a profile; over api the directive would
+    reach the agent as text and be graded, so the run errors instead."""
+    monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_API)
+    result = KubeAgentsHarness().run("[bench:profile name=cluster project=p1 location=l cluster=c] ask")
+    assert result.errors and "needs AGENT_TRANSPORT=inject" in result.errors[0]

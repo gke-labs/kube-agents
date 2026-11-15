@@ -1034,6 +1034,7 @@ class TestTheRulesReject(unittest.TestCase):
         self.assertEqual(self._validate(prompt=good), [])
         self._only("name= is required", prompt="[bench:profile project=p1] what is failing")
         self._only("no closing", prompt="[bench:profile name=cluster what is failing")
+        self._only("must open the prompt", prompt="what is failing [bench:profile name=cluster] here")
 
     def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
         # world-open-ingress is in the catalogue with cluster_slot: null: the

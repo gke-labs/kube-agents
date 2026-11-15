@@ -935,6 +935,22 @@ class ApiLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
+    def test_every_registered_profile_ask_is_excluded(self):
+        # A [bench:profile ...] ask errors on the api transport (#5945), so an
+        # unlisted one would error there every repetition. Read from the
+        # harness's own module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.profile_hook import is_profile_ask
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_profile_ask(str(doc.get("prompt") or "")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a profile ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
     def test_every_registered_reply_under_pushed_report_is_excluded(self):
         # The same rule for the pushed-report replay: it errors on the api
         # transport, and its directive is read from the harness's module.

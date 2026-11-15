@@ -87,9 +87,12 @@ A prompt that starts with `[bench:profile name=<profile> <key>=<value> ...]` sen
 AgentProfile as a new top task, with the other fields as the task's parameters, rather than to the
 platform agent ([`bench/kube_agents_bench/profile_hook.py`](../../bench/kube_agents_bench/profile_hook.py),
 #5945). The directive ends at its first `]`, so the ask may follow on the same line, and its values
-take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. A stop directive may follow it.
-It runs only over the inject transport (the door's `profile` and `parameters`), so the case needs
-an entry in `hack/eval/api-lane-exclusions.txt`.
+take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. It must open the prompt, and the
+lint refuses one that doesn't. A stop directive may follow it, except `[bench:stop-in-card-wait]`, whose A2A door can't
+address a profile.
+It runs only over the inject transport (the door's `profile` and `parameters`); the api transport
+errors on it, so the case needs an entry in `hack/eval/api-lane-exclusions.txt`, which
+`scripts/test_eval_rosters.py` checks.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -115,4 +116,13 @@ func TestAnInjectProfileTurnWithAnUndeclaredParameterSubmitsNothing(t *testing.T
 	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">"); len(envs) != 0 {
 		t.Fatalf("%d submission(s) for a refused profile turn", len(envs))
 	}
+	// The refusal is the shared path's, posted to the conversation.
+	waitFor(t, "the undeclared-parameter refusal on the conversation", func() bool {
+		for _, e := range r.conversation(t, out.Conversation, 0, "", 0).Entries {
+			if strings.Contains(e.Text, `doesn't take parameter "zone"`) {
+				return true
+			}
+		}
+		return false
+	})
 }

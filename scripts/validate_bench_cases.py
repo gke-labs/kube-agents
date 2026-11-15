@@ -992,6 +992,9 @@ def _profile_directive(spec: dict[str, Any], problems: list[str]) -> None:
     if not isinstance(prompt, str):
         return
     hook = profile_hook_reader()
+    if hook.PROFILE_DIRECTIVE in prompt and not hook.is_profile_ask(prompt):
+        problems.append(f"prompt: {hook.PROFILE_DIRECTIVE} ...] must open the prompt, or it reaches the agent as text")
+        return
     try:
         hook.parse(prompt)
     except ValueError as exc:

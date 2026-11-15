@@ -1211,8 +1211,7 @@ not be silent about it.
   `parameters` without a `profile` (platform takes none), each with a 400. Everything else goes
   down the one profile path every door takes: the profile resolved (a generic one yields to the one
   pinned to the target), its card, tier, parameters and target scope checked, and a refusal posted
-  to the conversation. It reaches nothing the same eval identity can't already reach by asking a
-  session to delegate to the profile: the same tier (read) and the same checks. The adapter prefixes the key
+  to the conversation. It reaches nothing the same eval identity can't already reach by asking a session to delegate to the profile: the same tier (read) and the same profile checks. Neither path checks the target's allowed-users list for a profile today, since only `platform` renders one (#5947). The adapter prefixes the key
   with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
