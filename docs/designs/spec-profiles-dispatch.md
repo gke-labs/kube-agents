@@ -405,6 +405,7 @@ leave open:
   turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
   refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
   SIGTERM ends it as `worker-evicted`.
+
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
