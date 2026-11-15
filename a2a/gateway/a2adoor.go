@@ -908,8 +908,8 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	// ends the claim; the wait below stays on the request's context.
 	//
 	// A call queued behind another cancel for this task (a client that timed
-	// out and retried, #5777) looks again when the slot frees, in the claim's
-	// own critical section: the first may have put the cancel on the bus, or
+	// out and retried, #5777) looks again on every pass of its wait, in the
+	// claim's critical section: the first may have put the cancel on the bus, or
 	// the task may have ended, and a second stop would be answered without a
 	// publish and read as a refusal.
 	var gone, done, ended bool
@@ -967,8 +967,8 @@ const (
 	turnRefused turnClaim = iota
 	// turnClaimed: the slot is this caller's, until TurnFinished.
 	turnClaimed
-	// turnNotNeeded: the slot came free, but stillWanted said the turn was
-	// no longer needed, so nothing was claimed.
+	// turnNotNeeded: stillWanted said the turn was no longer needed, on some
+	// pass of the wait, so nothing was claimed.
 	turnNotNeeded
 )
 
