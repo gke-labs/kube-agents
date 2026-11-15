@@ -42,9 +42,12 @@ def test_a_profile_with_no_parameters_carries_none() -> None:
         ("[bench:profile name=cluster project] ask", "is not key=value"),
         ("[bench:profile name=cluster project=a project=b] ask", "given twice"),
         ("[bench:profile name=cluster 9x=a] ask", "not a parameter's name"),
+        ("[bench:profile name=cluster Project=p1] ask", "not a parameter's name"),
+        ("[bench:profile name=cluster " + "k" * 64 + "=a] ask", "not a parameter's name"),
         ("[bench:profile name=cluster]   ", "nothing to ask"),
         ("[bench:profile name=My_Prof] ask", "not a profile's name"),
-        ("[bench:profile name=cluster] [bench:stop-in-card-wait] ask", "can't follow"),
+        ("[bench:profile name=cluster] [bench:stop-in-card-wait] ask", "may follow"),
+        ("[bench:profile name=cluster]\n[bench:stop-after-first-card] ask", "may follow"),
     ],
 )
 def test_a_malformed_directive_is_refused(prompt: str, why: str) -> None:

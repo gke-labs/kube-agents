@@ -3880,7 +3880,8 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
-            # Read first, so a stop or pushed-report directive can follow it.
+            # Read first. No other directive may follow it (profile_hook), so
+            # the stop and pushed-report reads below find nothing behind one.
             target = None if follow_up else profile_hook.parse(prompt)
             if target is not None:
                 prompt = target.prompt

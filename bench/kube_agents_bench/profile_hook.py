@@ -21,8 +21,10 @@ split on whitespace.
 Only the inject transport reads it. The api transport refuses a prompt that
 opens with it (it has no way to address a profile), so a case using it is listed
 in hack/eval/api-lane-exclusions.txt, which scripts/test_eval_rosters.py checks.
-It must open the prompt: a stop directive may follow it, except the card-wait
-stop, whose A2A door can't address a profile.
+It must open the prompt, and no other ``[bench:...]`` directive may follow it:
+the readers that schedule a stopped ask or a replay (stop_hook, hack/ci-eval-pr.sh,
+lane.runs_alone) read only a prompt's first line, so a combined case would run in
+the wrong phase. Combining one is a later change, made when a case needs it.
 """
 
 from __future__ import annotations
@@ -40,10 +42,11 @@ FIELD_SEPARATOR = "="
 #: ValidSubjectToken holds a profile name to (a2a/lib/envelope.go). The
 #: gateway checks it again; this catches a typo in a case before a run.
 PROFILE_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
-#: The card-wait stop goes through the A2A door, which can't address a profile,
-#: so it can't follow this directive (stop_hook.CARD_WAIT_DIRECTIVE).
-CARD_WAIT_DIRECTIVE = "[bench:stop-in-card-wait]"
-PARAMETER_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+#: The opening every bench directive shares; none may follow this one.
+BENCH_DIRECTIVE = "[bench:"
+#: A parameter name the gateway accepts: TaskParameterNameRE in
+#: a2a/lib/payload.go (lower-case, at most 63 characters).
+PARAMETER_KEY = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,7 @@ def parse(prompt: str) -> ProfileAsk | None:
             raise ValueError(f"{PROFILE_DIRECTIVE}: {key!r} is not a parameter's name")
     if not ask:
         raise ValueError(f"{PROFILE_DIRECTIVE}: nothing to ask after the directive")
-    if ask.startswith(CARD_WAIT_DIRECTIVE):
-        raise ValueError(f"{CARD_WAIT_DIRECTIVE} can't follow {PROFILE_DIRECTIVE}: the A2A door it runs through can't address a profile")
+    if ask.startswith(BENCH_DIRECTIVE):
+        raise ValueError(f"no other {BENCH_DIRECTIVE}...] directive may follow {PROFILE_DIRECTIVE}: "
+                         "its scheduling readers see only a prompt's first line")
     return ProfileAsk(name=name, prompt=ask, parameters=fields)
