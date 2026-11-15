@@ -532,6 +532,9 @@ def _trigger(claim: Any) -> TaskTrigger:
     script = _string(claim, "script", "nats.trigger") if "script" in claim else ""
     if script and not _is_label(script):
         raise TaskCredentialError("task credential trigger script is not a DNS-1123 label")
+    # As with stream: only a schedule's trigger names a script.
+    if script and source != TRIGGER_SCHEDULE_SOURCE:
+        raise TaskCredentialError("task credential trigger script is not on a schedule's trigger")
     return TaskTrigger(name=name, origin=origin, stream=stream, script=script)
 
 

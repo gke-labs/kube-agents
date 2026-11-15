@@ -62,4 +62,8 @@ func TestValidateTriggerHoldsAScriptToALabel(t *testing.T) {
 			t.Errorf("%s: accepted script %q", name, script)
 		}
 	}
+	// Only a schedule's trigger names a script, as only it binds a stream.
+	if err := ValidateTrigger("stall-watch", TriggerOriginBuiltin, "", "stall-watch"); err == nil {
+		t.Error("accepted a script on a collector trigger")
+	}
 }

@@ -23,10 +23,11 @@ type Trigger struct {
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
 	// Script, on a built-in schedule's run, names the profile script the run
-	// executes (#5622): an entry in AgentProfile.spec.scripts, which the
-	// dispatcher resolves to a path from the operator's render, never from
-	// the task. Bound in the grant, so the whole-trigger equality the verifier
-	// requires covers it. Empty on every other trigger.
+	// executes (#5622): a label, never a path, and only on a schedule's
+	// trigger. The profile allowlist that resolves it to a path is a later
+	// change. Bound in the grant, so the whole-trigger equality the verifier
+	// requires covers it. Empty on every other trigger, and nothing writes it
+	// yet.
 	Script string `json:"script,omitempty"`
 }
 

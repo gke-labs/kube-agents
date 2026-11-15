@@ -32,10 +32,14 @@ func ValidateTrigger(name, origin, stream, script string) error {
 	if stream != "" && (source != triggerScheduleSource || rest != stream) {
 		return fmt.Errorf("trigger stream %q is not the trigger's own schedule name (%s/<stream>)", stream, triggerScheduleSource)
 	}
-	// script names an entry in the profile's script allowlist (#5622): a
-	// DNS-1123 label, which the dispatcher looks up and never reads as a path.
+	// script names a profile script for a built-in schedule's run (#5622):
+	// a DNS-1123 label, never a path, and only on a schedule's trigger, as
+	// with stream.
 	if script != "" && !ValidSubjectToken(script) {
 		return fmt.Errorf("trigger script %q is not a DNS-1123 label", script)
+	}
+	if script != "" && source != triggerScheduleSource {
+		return fmt.Errorf("trigger script %q is on a %q trigger; only a %s/<name> trigger names one", script, source, triggerScheduleSource)
 	}
 	return nil
 }
