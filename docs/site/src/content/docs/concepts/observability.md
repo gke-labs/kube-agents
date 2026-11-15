@@ -146,7 +146,7 @@ The nine origin fields are the chat plugin's ledger counts, which fall when a ne
 
 After a broker restart the three details fields (`remediationsClosedUnmergedTotal`, `proposalHumanTouches`, `proposalsMergedUntouched`) clear once two polls in a row find no details reading. They return when the broker has read every proposal again: within the first sweep on a small install, after hours on a large one. The outcomes fields return on the first sweep. That is where an install without a collector sees the counts and how much of its fleet is being watched ([CRD reference](/kube-agents/operator/platformagent-crd/)).
 
-The people fields (`peopleSeen7d`, `peopleSeen30d`) clear once two polls in a row find no people reading, including polls that find no running gateway pod. They are absent while a chat platform the install enables is served through Hermes: Google Chat or Slack on its legacy consumer, or Teams. They are also absent on an install that does not run the A2A gateway.
+The people fields (`peopleSeen7d`, `peopleSeen30d`) clear once two polls in a row find no people reading, including polls that find no running gateway pod. They are absent while a chat platform the install enables is served through Hermes, that is, Microsoft Teams. They are also absent on an install that does not run the A2A gateway.
 
 `topTools` is the credential broker's five most-invoked tool and subcommand pairs since its pod started, so a broker restart starts it over. It clears once two polls in a row find no broker body, and is absent while the broker has run nothing.
 
