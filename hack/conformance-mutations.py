@@ -2276,6 +2276,43 @@ Mutation(
         "server reports that as success",
     ),
     Mutation(
+        "C1-report-store-admits-every-pod",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("    - from:\n        - podSelector:\n            matchLabels:\n"
+         "              app: platformagent-credential-proxy\n"
+         "              kubeagents.x-k8s.io/component: credential-proxy\n"
+         "      ports:\n        - port: 8700\n",
+         "    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8700\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "admit every pod in the namespace to the report store, since the "
+        "listener checks the broker's token anyway -- the sandbox and every "
+        "session pod then reach the fleet-audit memory on the pod network",
+    ),
+    Mutation(
+        "C1-report-store-range-takes-in-8700",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("      ports:\n        - port: 8700\n          protocol: TCP\n",
+         "      ports:\n        - port: 8700\n          protocol: TCP\n"
+         "    - ports:\n        - endPort: 65535\n          port: 1\n          protocol: TCP\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "add the keep-everything-else-open rule with one range, 1-65535, "
+        "instead of two that step over 8700 -- added to the gateway policy's "
+        "allowlist, it opens the store and every other port to every source",
+    ),
+    Mutation(
+        "C1-report-store-renders-under-today",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("---\napiVersion: v1\nkind: Service\n",
+         "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: platformagent-report-store\n"
+         "  namespace: kubeagents-system\nspec:\n  ports:\n    - port: 8700\n"
+         "  selector:\n    app: platformagent-gateway\n"
+         "---\napiVersion: v1\nkind: Service\n"),
+        "test_C1_today_renders_no_audit_report_store",
+        "render the report-store Service in every mode, since it is inert "
+        "without the listener -- until a today pod's port answers on it",
+    ),
+    Mutation(
         "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",

@@ -1021,6 +1021,141 @@ class C1IsolationIsStructural(unittest.TestCase):
                         "a peer is admitted to a port other than the metrics listener's",
                     )
 
+    # The audit-report store listener (#5619): its port, the Service and
+    # NetworkPolicy it renders under, and the audience its token is bound to.
+    _REPORT_STORE_PORT = 8700
+    _REPORT_STORE_PORT_NAME = "report-store"
+    _REPORT_STORE_AUDIENCE = "kubeagents-audit-report-store"
+
+    @staticmethod
+    def _rule_reaches(rule: dict, port: int, port_name: str) -> bool:
+        """Whether an ingress rule admits TCP to `port` (or its name) at all.
+
+        No `ports` is every port, a port entry with no `port` is every port of
+        its protocol, an absent protocol is TCP, and `endPort` makes a range.
+        """
+        ports = rule.get("ports")
+        if not ports:
+            return True
+        for entry in ports:
+            if (entry.get("protocol") or "TCP") != "TCP":
+                continue
+            value = entry.get("port")
+            if value is None or value == port_name:
+                return True
+            if isinstance(value, int) and value <= port <= entry.get("endPort", value):
+                return True
+        return False
+
+    def test_C1_only_the_broker_reaches_the_audit_report_store_listener(self) -> None:
+        """Under next, the store's port on the gateway pod admits the broker's pods alone.
+
+        The listener reads and writes the fleet-audit report store, which is a
+        profile worker's memory of what the last run found. It checks the
+        broker's token as well, but on the pod network nothing but the broker
+        should reach it: a rule from any other peer that covers the port --
+        a port range that takes 8700 in, or a rule with no ports -- is the
+        store reachable from every pod beside it.
+
+        NetworkPolicies selecting one pod are additive, so this reads every
+        policy that selects the gateway pod and isolates it for ingress, and
+        every rule in them that reaches the port: each must admit exactly the
+        broker's pod selector. And at least one must, or the store is reached
+        by nobody, which is no listener.
+        """
+        documents = h.yaml_documents("golden_next")
+        port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
+        services = [s for s in h.objects_of_kind(documents, "Service") if s["metadata"]["name"].endswith("-report-store")]
+        self.assertEqual(len(services), 1, "the next golden renders no report-store Service")
+        selector = services[0]["spec"]["selector"]
+        self.assertTrue(selector, "the report-store Service selects every pod")
+        # The pod behind the Service: the Hermes gateway, not the A2A gateway.
+        gateways = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if selector == {k: d["spec"]["template"]["metadata"]["labels"].get(k) for k in selector}
+        ]
+        self.assertEqual(
+            [d["metadata"]["name"] for d in gateways], ["platformagent-gateway"],
+            "the report-store Service does not select the gateway pod alone",
+        )
+        gateway = gateways[0]
+        pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        declared = [
+            (c["name"], p["containerPort"])
+            for c in h.containers_of(gateway)
+            for p in c.get("ports") or []
+            if p.get("name") == port_name
+        ]
+        self.assertEqual(declared, [("agent-api-auth", port)], "the store's port is not agent-api-auth's alone")
+
+        brokers = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if d["metadata"]["name"].endswith("-credential-proxy")
+        ]
+        self.assertEqual(len(brokers), 1, "the next golden no longer renders one broker Deployment")
+        broker_labels = brokers[0]["spec"]["template"]["metadata"]["labels"]
+        broker_selector = {
+            "app": brokers[0]["metadata"]["name"],
+            "kubeagents.x-k8s.io/component": "credential-proxy",
+        }
+        self.assertEqual(broker_selector, {k: broker_labels.get(k) for k in broker_selector})
+
+        def selects_gateway(policy: dict) -> bool:
+            chosen = policy["spec"].get("podSelector") or {}
+            labels = chosen.get("matchLabels") or {}
+            return not chosen.get("matchExpressions") and labels == {k: pod_labels.get(k) for k in labels}
+
+        isolating = [
+            p for p in h.objects_of_kind(documents, "NetworkPolicy")
+            if selects_gateway(p) and "Ingress" in (p["spec"].get("policyTypes") or [])
+        ]
+        self.assertTrue(isolating, "nothing isolates the gateway pod for ingress, so every pod reaches the store")
+        reaching = []
+        for policy in isolating:
+            for rule in policy["spec"].get("ingress") or []:
+                if self._rule_reaches(rule, port, port_name):
+                    reaching.append((policy["metadata"]["name"], rule.get("from")))
+        self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
+        for name, peers in reaching:
+            with self.subTest(policy=name):
+                self.assertEqual(
+                    peers, [{"podSelector": {"matchLabels": broker_selector}}],
+                    "a rule reaching the store's port admits a peer other than the broker's pods",
+                )
+
+    def test_C1_today_renders_no_audit_report_store(self) -> None:
+        """Under today the listener, its Service, its policy and its token are absent.
+
+        The store listener is next-mode only. A today install that rendered its
+        port, switch or token would run a listener nothing fences, and a
+        today install with the Service would publish the gateway pod on a port
+        its policy does not expect.
+        """
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                named = [
+                    (d["kind"], d["metadata"]["name"]) for d in documents
+                    if d.get("kind") in ("Service", "NetworkPolicy")
+                    and d["metadata"]["name"].endswith("-report-store")
+                ]
+                self.assertEqual(named, [], "a today golden renders the report store's objects")
+                for workload in h.objects_of_kind(documents, "Deployment"):
+                    spec = workload["spec"]["template"]["spec"]
+                    audiences = {
+                        (source.get("serviceAccountToken") or {}).get("audience")
+                        for v in spec.get("volumes", [])
+                        for source in (v.get("projected") or {}).get("sources", [])
+                    }
+                    self.assertNotIn(self._REPORT_STORE_AUDIENCE, audiences, workload["metadata"]["name"])
+                    for container in h.containers_of(workload):
+                        ports = {(p.get("name"), p.get("containerPort")) for p in container.get("ports") or []}
+                        self.assertFalse(
+                            {p for p in ports if self._REPORT_STORE_PORT_NAME in p or self._REPORT_STORE_PORT in p},
+                            "%s/%s declares the store's port" % (workload["metadata"]["name"], container["name"]),
+                        )
+                        env = [e["name"] for e in container.get("env") or [] if e["name"].startswith("AUDIT_REPORT_STORE_")]
+                        self.assertEqual(env, [], "%s/%s" % (workload["metadata"]["name"], container["name"]))
+
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
