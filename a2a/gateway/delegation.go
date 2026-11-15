@@ -32,6 +32,23 @@ const (
 	// ruleDelegationChildSteer refuses a steer into a delegated child from
 	// an author the target's list refuses (gke-labs#2531 item 5).
 	ruleDelegationChildSteer = "delegation.child-steer"
+	// The profile parent's own rules (spec-profiles-dispatch.md, "Scale
+	// rules" and "Replacing kanban's plumbing" item 3; #5686).
+	// ruleDelegationProfileCycle refuses a child whose resolved profile is
+	// already on the parent's chain, the chain head's one self-nest aside.
+	ruleDelegationProfileCycle = "delegation.profile-cycle"
+	// ruleDelegationParentScope refuses a child whose target lies outside
+	// its profile parent's scope.
+	ruleDelegationParentScope = "delegation.parent-scope"
+	// ruleDelegationParentScopeUnknown refuses when the profile parent's
+	// scope and chain aren't on its record: failing closed, not open.
+	ruleDelegationParentScopeUnknown = "delegation.parent-scope-unknown"
+	// ruleDelegationParentChainMismatch refuses when an ancestor the record
+	// still holds contradicts the parent's carried chain.
+	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
+	// ruleDelegationUnattendedParent refuses a child of an unattended task:
+	// the child's grant would not carry the parent's trigger binding.
+	ruleDelegationUnattendedParent = "delegation.unattended-parent"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -238,6 +255,12 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationNoRequester, noticeDelegationNoRequester)
 		return
 	}
+	if profileParent {
+		if rule, notice := profileParentRefusal(parent); rule != "" {
+			refuse(rule, noticeDelegationRefusedFor+notice)
+			return
+		}
+	}
 	// Each child the request asks for meets the same checks, all of them
 	// before any is minted, so one entry that fails refuses the request with
 	// nothing minted. check refuses (with the notice a single child would
@@ -272,6 +295,12 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 				return nil, false
+			}
+			if profileParent {
+				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
+					refuse(rule, noticeDelegationRefusedFor+notice, "child", route.Profile)
+					return nil, false
+				}
 			}
 		}
 		// The lists are the target's: the profile the address resolved to, so a
@@ -365,6 +394,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		Depth:                parent.Depth + 1,
 		LineNote:             lineNote,
 		Route:                route,
+		ProfileChain:         childProfileChain(parent, profileParent),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
