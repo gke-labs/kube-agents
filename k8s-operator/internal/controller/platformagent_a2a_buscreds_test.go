@@ -284,9 +284,8 @@ func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testi
 
 // The two above were only two of the parks, and moving the write up the
 // sequence fixed those two rather than the class. Four refusals return above
-// the bus step and cannot be moved below it -- they are refusals of today's
-// stack, and the bus step is at the end because it renders on top of what they
-// withhold. So the condition cannot be written in sequence at all: it has to be
+// the bus step and cannot be moved below it, and the bus step is at the end
+// because it renders on top of what they withhold. So the condition cannot be written in sequence at all: it has to be
 // written on the way out, whichever exit the reconcile takes.
 //
 // ShellSandboxCannotBeDisabled stands for all four here. It is a hard refusal:

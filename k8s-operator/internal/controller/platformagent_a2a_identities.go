@@ -1088,8 +1088,8 @@ func bridgeIdentity() a2aIdentity {
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit
 // records it as the artifact nobody owns — referenced by no chart, no kustomize
-// path, no Makefile target and no operator code, and it survives a flip to
-// today until someone deletes it by hand.
+// path, no Makefile target and no operator code, and it stays until someone
+// deletes it by hand.
 //
 // It keeps its password because it is APPLIED rather than rendered. It exists on
 // the demo install right now, so dropping its user from nats.conf would refuse
