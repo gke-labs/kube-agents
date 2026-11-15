@@ -173,8 +173,8 @@ func TestReconcileReportsAMissingRoleBindingInTheProfileNamespace(t *testing.T) 
 
 // The fence pass is where the reconcile learns the profile namespace exists,
 // so it is where the self-check starts probing it, and the pass that finds
-// it gone (deleted with its RoleBinding) is where the probing stops, or the agent would carry a denial for a namespace it no
-// longer writes in.
+// it gone (deleted with its RoleBinding) is where the probing stops, or the
+// agent would carry a denial for a namespace it no longer writes in.
 func TestTheProfileFenceObservesAndForgetsTheProfileNamespace(t *testing.T) {
 	const operatorNamespace = "kubeagents-system"
 	scheme := setupScheme()
@@ -310,10 +310,10 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
-	// A today agent writes nothing in its profile namespace, so a reconcile
-	// under today forgets one the checker was told about (a flip from next,
-	// whose chart upgrade removes the namespace and its RoleBinding), or the
-	// agent would carry a denial for a namespace it no longer writes in.
+	// This agent's profile namespace does not exist, so a reconcile forgets
+	// one the checker was told about (the namespace and its RoleBinding are
+	// gone together), or the agent would carry a denial for a namespace it
+	// does not write in.
 	checker.Observe(profileNamespaceName(agent))
 
 	// The first reconcile tells the checker about team-a, and the status
@@ -325,7 +325,7 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 		t.Fatalf("first reconcile: %v", err)
 	}
 	if slices.Contains(checker.sortedAgentNamespaces(), profileNamespaceName(agent)) {
-		t.Errorf("a reconcile under today must forget the profile namespace; probed: %v", checker.sortedAgentNamespaces())
+		t.Errorf("a reconcile with the profile namespace absent must forget it; probed: %v", checker.sortedAgentNamespaces())
 	}
 
 	stored := &agentv1alpha1.PlatformAgent{}

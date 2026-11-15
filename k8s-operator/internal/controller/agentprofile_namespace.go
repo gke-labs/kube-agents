@@ -357,8 +357,8 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
-			// Nothing is written there while it is absent (the namespace and
-			// its RoleBinding come with it), so its denials must not stand
+			// Nothing is written there while it is absent (its RoleBinding is
+			// absent with it), so its denials must not stand
 			// against this agent; Observe adds it back the pass it returns.
 			r.RBAC.Forget(profileNamespaceName(agent))
 		}

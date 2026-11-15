@@ -295,8 +295,8 @@ func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testi
 
 // First direction: a next CR refused before the bus step ever runs. The callout
 // does not exist because nothing rendered it, and saying so is the whole point
-// -- a CR with no BusCredentialsReady at all is indistinguishable from a today
-// install to anything reading conditions.
+// -- a CR with no BusCredentialsReady at all is indistinguishable from one the
+// operator never reconciled, to anything reading conditions.
 func TestBusCredentialsReadyIsWrittenWhenARefusalReturnsAboveTheBusStep(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()

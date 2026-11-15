@@ -243,7 +243,7 @@ var requiredPermissions = []requiredPermission{
 	// dispatchjobtemplates: the dispatcher Job admission policy's params in
 	// the profile namespace, which the operator alone writes. The reads stay
 	// cluster-wide (no watch; the teardown lists the kind in the profile
-	// namespace before checking that the Role is bound there), the writes
+	// namespace without checking that the Role is bound there), the writes
 	// are namespaced. podtemplates: create only, the dry run that
 	// defaults them.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list"}},

@@ -822,7 +822,7 @@ type PlatformAgentReconciler struct {
 // nothing. The writes are namespaced like every other rendered kind's. The
 // reads stay cluster-wide, like every other kind's, for the teardown walk:
 // deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
-// deletion, before any check that the namespace or a RoleBinding in it
+// deletion, without checking that the namespace or a RoleBinding in it
 // exists, so a namespaced read would be a 403 wherever that RoleBinding is
 // absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
