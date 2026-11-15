@@ -655,11 +655,11 @@ litellm:
   # Moving a live release from operator-managed back to the static copy needs
   # a handoff first (chart README, "Handing litellm-policy back to Helm"):
   # Helm refuses to adopt an object the operator has labelled as its own.
-  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
-  # helm template/lint cannot catch its absence: a non-GKE install fails at
-  # apply time.
   networkPolicy: true
-  podMonitoring: true
+  # Tri-state, matching platformAgent.podMonitoring: null (default) renders
+  # litellm-monitoring when the cluster serves monitoring.googleapis.com/v1/PodMonitoring
+  # and nothing elsewhere; true forces it on (fails apply without the CRD); false disables.
+  podMonitoring: null
   # Redaction of every request body the gateway forwards to a provider. Off by
   # default: on, the ConfigMap also carries the shared redactor module and the
   # redaction pre-call hook, mounted beside /app/config.yaml, and the hook runs
@@ -904,8 +904,8 @@ hindsight:
   # gateway egress rule selects app: litellm / app: standalone-replay pods in
   # the release namespace).
   networkPolicy: true
-  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
-  podMonitoring: true
+  # Tri-state, matching litellm.podMonitoring and platformAgent.podMonitoring.
+  podMonitoring: null
   podDisruptionBudget:
     # Renders maxUnavailable: 1 for both store workloads. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
@@ -1110,8 +1110,8 @@ platformAgent:
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a
   # cluster without the CRD upgrades without setting anything. true renders
-  # them regardless and fails at apply time where the CRD is absent, the caveat
-  # litellm.podMonitoring carries; false never renders them. helm template
+  # them regardless and fails at apply time where the CRD is absent; false
+  # never renders them. helm template
   # alone has no cluster to ask: pass
   # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
   # default render.

@@ -325,9 +325,10 @@ metadata:
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
-  {{- with $vertex.serviceAccountAnnotations }}
+  {{- $vertexAnnotations := include "kube-agents.nonEmptyStringMap" $vertex.serviceAccountAnnotations }}
+  {{- if $vertexAnnotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- $vertexAnnotations | nindent 4 }}
   {{- end }}
 {{- end }}
 ---
@@ -1081,7 +1082,7 @@ spec:
     - Ingress
     - Egress
 {{- end }}
-{{- if .Values.litellm.podMonitoring }}
+{{- if include "kube-agents.litellmPodMonitoring" . }}
 ---
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring

@@ -250,7 +250,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "projectId": {
               "type": "string"
@@ -385,7 +385,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "redaction": {
           "type": "object",
@@ -786,7 +786,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "podDisruptionBudget": {
           "type": "object",
@@ -1703,7 +1703,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "scopedServiceAccountPool": {
               "type": "object",
