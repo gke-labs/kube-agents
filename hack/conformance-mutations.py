@@ -373,11 +373,11 @@ MUTATIONS: list[Mutation] = [
         "reach tiers through a wildcard resource, which a resource-name match misses",
     ),
     Mutation(
-        # Next mode reads tiers through an operator-rendered ConfigMap, so no
-        # role it mints needs them. A builder that grants them shows up in the
-        # next golden when it is regenerated, which is what this edits.
-        "A4-next-gateway-reads-tiers",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        # The A2A stack reads tiers through an operator-rendered ConfigMap, so
+        # no role it mints needs them. A builder that grants them shows up in
+        # the settled golden when it is regenerated, which is what this edits.
+        "A4-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
         ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
          "      - create\n      - get\n      - list\n      - watch\n      - delete",
          "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
@@ -385,12 +385,12 @@ MUTATIONS: list[Mutation] = [
          "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
          "      - create\n      - get\n      - list\n      - watch\n      - delete"),
         "test_A4_only_cluster_administrators_write_tiers",
-        "let the next-mode A2A gateway read tiers directly, as tier-aware "
+        "let the A2A gateway read tiers directly, as tier-aware "
         "routing might, instead of through the operator's ConfigMap",
     ),
     Mutation(
-        "A4-next-callout-wildcard-resource",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        "A4-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
         ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
          "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
          "    verbs:\n      - get\n"
@@ -744,6 +744,23 @@ Mutation(
         "bind the gateway to the broker's TokenReview role too -- the agent can then "
         "validate any bearer token it gets hold of, a grant its own token use never "
         "asked for",
+    ),
+    Mutation(
+        # The callout's Role reads the bus identity map, and its name carries
+        # no tier. Before the parse learned to pass a tierless name through
+        # whole, this edit crashed the test with an IndexError rather than
+        # failing it -- red for the wrong reason.
+        "C1-gateway-identity-reads-the-identity-map",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "let the gateway resolve a principal itself by reading the identity "
+        "map the callout serves, saving a bus round trip -- the model's pod "
+        "gains a read on the table that joins chat identities to bus "
+        "principals, which is what the callout exists to keep behind a "
+        "TokenReview",
     ),
     Mutation(
         "C1-broker-keeps-the-leader-binding",
@@ -1697,6 +1714,37 @@ Mutation(
         "cannot see it",
     ),
     Mutation(
+        # The one binding allowed to name system:auth-delegator is the
+        # callout's, and the test pins its subject list. A second subject
+        # on that binding is the cheapest way to hand another identity a
+        # TokenReview and SubjectAccessReview oracle without a new object.
+        "C5-callout-binding-gains-the-sandbox",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-shell\n    namespace: kubeagents-system\n'),
+        "test_C5_no_agent_binding_names_the_auth_delegator_role",
+        "let the sandbox's tooling validate bearer tokens itself instead of "
+        "asking the callout, by adding it to the binding that already exists "
+        "-- the roleRef is unchanged, so a test that checks roleRefs alone "
+        "sees nothing, and the pod where model-authored shell runs gains a "
+        "TokenReview and SubjectAccessReview oracle over the cluster",
+    ),
+    Mutation(
+        # The spawner's pod rule is the one place a write verb already sits,
+        # so one more verb there reads as housekeeping. patch on pods is a
+        # route into a running session: labels off the fence's selector, an
+        # ephemeral container, a changed image.
+        "C5-spawner-role-gains-pod-patch",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n',
+         '      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n      - patch\n'),
+        "test_C5_the_spawner_role_holds_exactly_its_audited_rules",
+        "let the gateway relabel a session pod it owns, so a stuck session can "
+        "be taken out of the fence's selector for debugging -- which is also "
+        "what a compromised gateway would do to a session it wants unfenced",
+    ),
+    Mutation(
         "C5-leader-reaches-configmaps",
         # platformagent-ha.yaml: the fixture that asks for more than one
         # replica. Since the operator caps the gateway at one replica (#3027),
@@ -1761,9 +1809,13 @@ Mutation(
         "stretch the projection to a day to stop a rotation warning",
     ),
     Mutation(
+        # Anchored at the line's own indentation: a shorter prefix matches the
+        # same line as a substring, leaves four stray spaces behind and breaks
+        # the golden's YAML parse, which fails every golden reader at once --
+        # a kill for the wrong reason that hid whether D4 saw the audience go.
         "D4-audience-dropped",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("              audience: kubeagents-credential-proxy\n", ""),
+        ("                  audience: kubeagents-credential-proxy\n", ""),
         "test_D4_the_broker_token_is_audience_bound",
         "drop the audience, making the broker's token a general-purpose "
         "cluster bearer token and TokenReview a formality",
@@ -1987,7 +2039,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
         "test_A3_the_inject_door_renders_only_under_the_operator_flag",
         "render the eval door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door has no customer-facing purpose and maps a principal out of a "
         "request body, so an install that never asked for it must not carry "
         "it. The operator's own flag-off render test "
@@ -2041,7 +2093,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = append(injectEnv,"),
         "test_A3_the_a2a_door_renders_only_under_the_operator_flag",
         "render the A2A door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door resolves a caller the request names into an eval identity, so "
         "an install that never asked for it must not carry it; the "
         "conformance test is the one that has to notice, from the source, "
@@ -2792,8 +2844,8 @@ Mutation(
     Mutation(
         "C1-bus-token-file-reservation-spelled-by-hand",
         "k8s-operator/internal/controller/platformagent_manifests.go",
-        ('\t\t\t\t\te.Name == a2aBusTokenFileEnv ||',
-         '\t\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
+        ('\t\t\t\te.Name == a2aBusTokenFileEnv ||',
+         '\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
         "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
         "inline the constant at the plugin-env drop, which changes no "
         "behaviour today and is the shape a reviewer waves through. It costs "

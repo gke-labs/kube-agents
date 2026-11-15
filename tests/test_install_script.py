@@ -7979,7 +7979,7 @@ class PlatformAgentModeTest(unittest.TestCase):
     def test_the_switch_notice_says_whether_it_named_a_switch(self):
         cases = (
             ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "next", "true"),
-            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "false"),
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "true"),
             ("", "", "next", "false"),
         )
         for record, live, key, expected in cases:
@@ -8510,7 +8510,6 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     def test_a_recovered_single_token_or_chat_holding_the_gateway_goes_on(self):
         for keys in (
-            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true"},
         ):
             with self.subTest(keys=keys):

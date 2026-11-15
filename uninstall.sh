@@ -983,6 +983,13 @@ main() {
   # destroy has no use for it. Blank, the generator writes the default name,
   # which passes; terraform destroys what is in state either way.
   export GITHUB_MINTER_KSA_NAME=""
+  # The agent's KSA name, for the same reason: the composition validates its
+  # shape (DNS-1123 label ending in -agent), and an operator sets it in
+  # install.env as TF_VAR_agent_ksa_name. Unset rather than blanked because the
+  # generator writes no agent_ksa_name and an empty TF_VAR_ fails both
+  # validations; unset, the variable's default passes and terraform destroys
+  # what is in state either way.
+  unset TF_VAR_agent_ksa_name
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

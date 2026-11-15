@@ -3,18 +3,18 @@
 The gateway pod, where the k8s-event-watcher serves its metrics on the
 agent-api-auth sidecar; the credential-proxy pod, where the broker serves its
 own on a metrics-only listener; the kube-proxy pod, where k8s-api-proxy serves its
-own on a metrics-only listener; the A2A gateway pod a `spec.mode: next`
-install runs, which serves its own on a metrics-only listener too; and the
-same install's NATS pods, where an exporter sidecar serves the bus's JetStream
-figures. The NATS row is held to the next-mode golden, which renders the
-bus, and has a PodMonitoring alone (no ServiceMonitor or VMPodScrape). For each,
+own on a metrics-only listener; the A2A gateway pod, which serves its own on
+a metrics-only listener too; and the NATS pods, where an exporter sidecar
+serves the bus's JetStream figures. The NATS row is held to the operator's
+golden, which renders the bus, and has a PodMonitoring alone (no ServiceMonitor
+or VMPodScrape). For each,
 three things have to agree for the scrape to work: the port the operator
 declares on the container, the number in the PodMonitoring, and the labels the
 operator puts on the pod. The chart cannot read the operator, so the structural
 tests hold the template to the operator's golden manifest instead. No golden
-renders mode next with both doors armed (the next-mode golden is the example
-CR, which arms neither), so the A2A gateway's row is held to the rendered A2A
-ingress fixture (k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
+renders both doors armed (the golden is the example CR, which arms neither),
+so the A2A gateway's row is held to the rendered A2A ingress fixture
+(k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
 Whether they render at all follows the cluster by
 default: helm template has no cluster, so the render tests hand it the
 PodMonitoring API with --api-versions where they mean a cluster that serves it.
@@ -39,7 +39,6 @@ _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _GOLDEN = (
     _REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected" / "platformagent.yaml"
 )
-_NEXT_GOLDEN = _GOLDEN.with_name("platformagent-next.yaml")
 _OPERATOR_A2A_SOURCE = (
     _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 )
@@ -125,12 +124,12 @@ _SCRAPES = (
 )
 
 
-# The NATS exporter's row: a StatefulSet in the next-mode golden, scraped by a
+# The NATS exporter's row: a StatefulSet in the golden, scraped by a
 # PodMonitoring with no ServiceMonitor or VMPodScrape beside it, so it sits
 # outside _SCRAPES (whose rows all carry both).
 _NATS_SCRAPE = {
     "suffix": "-a2a-nats-monitoring",
-    "fixture": _NEXT_GOLDEN,
+    "fixture": _GOLDEN,
     "deployment": "platformagent-a2a-nats",
     "container": "nats-exporter",
     "port_name": "nats-metrics",

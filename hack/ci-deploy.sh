@@ -508,6 +508,14 @@ readonly WEB_CONSOLE_DIAG_LOG_LINES=100
 # status on its next pass, which the agent Deployment's status moving starts.
 # A read that returns no phase spends one of them too and never passes.
 readonly WEB_CONSOLE_CR_ATTEMPTS=12
+# Compatibility shim (the CI lane piece removes this phase): the operator
+# renders the NATS bus from its first pass, and on an Autopilot pool a server
+# can wait for a node past the reads above. A Degraded whose Ready reason is
+# PodUnschedulable on a bus pod is transient for this many more reads,
+# WEB_CONSOLE_POLL_SECONDS apart (ten minutes); after them it fails as any
+# other Degraded. The pod pattern is the bus StatefulSet's (a2aNATSName).
+readonly WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS=120
+readonly WEB_CONSOLE_BUS_POD_RE='Pod [^ ]*-a2a-nats-[0-9]+ '
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
 # the second for every relayed pull. The route is the stockout investigator's
@@ -2616,12 +2624,25 @@ gate_web_console() {
   # gate_cr_not_degraded; phase and pair keep the last read that answered,
   # so a window that ends unread fails on that answer, or, with none, as
   # unread.
-  for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
+  local reads=0 bus_wait=0
+  while :; do
+    reads=$((reads + 1))
     read_pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
     if [ -n "${read_pair%%$'\t'*}" ]; then
       pair="${read_pair}"
       phase="${pair%%$'\t'*}"
       [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    fi
+    if [ "${reads}" -ge "${WEB_CONSOLE_CR_ATTEMPTS}" ]; then
+      # Past the window, only a bus server still waiting for a node earns
+      # more reads (the shim above); anything else is judged now.
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [[ "${pair#*$'\t'}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] \
+        && [[ "${pair}" =~ ${WEB_CONSOLE_BUS_POD_RE} ]] && [ "${bus_wait}" -lt "${WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS}" ]; then
+        bus_wait=$((bus_wait + 1))
+        [ "${bus_wait}" -eq 1 ] && echo "${PLATFORM_AGENT_CR_NAME} is Degraded while a NATS server waits for a node (${pair#*$'\t'}); waiting up to $((WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS * WEB_CONSOLE_POLL_SECONDS))s more for it to schedule"
+      else
+        break
+      fi
     fi
     sleep "${WEB_CONSOLE_POLL_SECONDS}"
   done
@@ -3084,6 +3105,10 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
   # shellcheck disable=SC2059
   printf -v MODE_NEXT_HELM_VALUES "${MODE_NEXT_HELM_VALUES_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
+  # Compatibility shim (the CI lane piece removes the flip): an operator whose
+  # CRD defaults spec.mode to next rendered the stack in step 5, and the
+  # upgrade below rolls the agent Deployment only when it changes the mode.
+  MODE_BEFORE="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.mode}' 2>/dev/null || true)"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   # --reuse-values keeps everything step 5 set (the images, the credentials,
   # the operator's extraEnv) and adds the document on stdin, which is JSON and
@@ -3092,7 +3117,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   printf '%s\n' "${MODE_NEXT_HELM_VALUES}" | helm upgrade "${HELM_RELEASE_NAME}" ./charts/kube-agents \
     --namespace "${NAMESPACE}" --reuse-values --values - \
     --wait --timeout "${MODE_NEXT_HELM_TIMEOUT}"
-  wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
+  if [ "${MODE_BEFORE}" = "next" ]; then
+    echo "spec.mode read next before the upgrade (the CRD defaults it), so the agent Deployment is not owed a roll"
+  else
+    wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
+  fi
   echo "managed .env now reads:"
   # Whole, not grepped for the mode key: the key is named in exactly two
   # places by design (tests/test_mode_grep.py), and this script is not one.
