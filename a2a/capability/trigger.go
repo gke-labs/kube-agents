@@ -22,10 +22,16 @@ type Trigger struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
+	// Script, on a built-in schedule's run, names the profile script the run
+	// executes (#5622): an entry in AgentProfile.spec.scripts, which the
+	// dispatcher resolves to a path from the operator's render, never from
+	// the task. Bound in the grant, so the whole-trigger equality the verifier
+	// requires covers it. Empty on every other trigger.
+	Script string `json:"script,omitempty"`
 }
 
 func (t *Trigger) validate() error {
-	return lib.ValidateTrigger(t.Name, t.Origin, t.Stream)
+	return lib.ValidateTrigger(t.Name, t.Origin, t.Stream, t.Script)
 }
 
 // equal reports whether t and o name the same trigger, nil equal only to nil.
@@ -39,7 +45,7 @@ func (t *Trigger) equal(o *Trigger) bool {
 // The authority block's key for the claimed trigger, and the trigger's own keys.
 const authorityTriggerKey = "trigger"
 
-var triggerKeys = []string{"name", "origin", "stream"}
+var triggerKeys = []string{"name", "origin", "stream", "script"}
 
 // TriggerFromAuthority pulls the trigger a submission claims out of an
 // envelope's authority block. The gateway writes it there on a trigger's
@@ -156,7 +162,7 @@ func readTrigger(dec *json.Decoder) (*Trigger, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, err
 	}
-	t := &Trigger{Name: values["name"], Origin: values["origin"], Stream: values["stream"]}
+	t := &Trigger{Name: values["name"], Origin: values["origin"], Stream: values["stream"], Script: values["script"]}
 	if err := t.validate(); err != nil {
 		return nil, err
 	}

@@ -249,8 +249,10 @@ narrows only to itself, and a hop (a child entry a broker writes) carries its pa
 unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
 chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
 the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
-crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream}`, added
-11/11, #4685): the unattended trigger whose submission the gateway minted it for. Only that tier
+crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream, script}`, added
+11/11, #4685): the unattended trigger whose submission the gateway minted it for. `script`, on a
+built-in schedule's run, names the profile script it executes, a label the dispatcher looks up in
+the profile's allowlist; the readers accept it, and nothing writes it yet. Only that tier
 carries one, and a hop carries it unchanged, as it does `profile`. The dispatcher asks the verb
 `profile.run` with three request fields of its own, `profile`, `tier` and an optional `trigger`
 (the one the submission claims), and a target scope (`project/P/location/L/cluster/C`, or the install's

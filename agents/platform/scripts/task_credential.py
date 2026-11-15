@@ -106,7 +106,7 @@ NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "p
 # audience and required here (stricter), and trigger is optional in both.
 NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
-TRIGGER_CLAIMS = frozenset({"name", "origin", "stream"})
+TRIGGER_CLAIMS = frozenset({"name", "origin", "stream", "script"})
 TRIGGER_REQUIRED = frozenset({"name", "origin"})
 # taskcred.TriggerOriginBuiltin: the one origin a trigger may name today (#4685).
 TRIGGER_ORIGINS = frozenset({"builtin"})
@@ -162,6 +162,9 @@ class TaskTrigger:
     name: str
     origin: str
     stream: str = ""
+    # The profile script a built-in schedule's run executes (taskcred.Trigger's
+    # script, #5622); empty on every other trigger.
+    script: str = ""
 
 
 @dataclass(frozen=True)
@@ -526,7 +529,10 @@ def _trigger(claim: Any) -> TaskTrigger:
     # prefix stripping, so nothing but schedule/<stream> can bind <stream>.
     if stream and (source != TRIGGER_SCHEDULE_SOURCE or rest != stream):
         raise TaskCredentialError("task credential trigger stream is not the trigger's own schedule name")
-    return TaskTrigger(name=name, origin=origin, stream=stream)
+    script = _string(claim, "script", "nats.trigger") if "script" in claim else ""
+    if script and not _is_label(script):
+        raise TaskCredentialError("task credential trigger script is not a DNS-1123 label")
+    return TaskTrigger(name=name, origin=origin, stream=stream, script=script)
 
 
 # ---------------------------------------------------------------------------

@@ -189,7 +189,7 @@ func credentialTrigger(t *capability.Trigger) *taskcred.Trigger {
 	if t == nil {
 		return nil
 	}
-	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream}
+	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream, Script: t.Script}
 }
 
 // permit is a verifier permit admission reuses: when it was given, and the
