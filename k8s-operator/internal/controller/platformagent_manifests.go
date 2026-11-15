@@ -4650,11 +4650,13 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports: []corev1.ContainerPort{
+		Ports: append([]corev1.ContainerPort{
 			{Name: "proxy-api", ContainerPort: 8643},
 			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
 			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
-		},
+			// And under next the audit-report store listener's, which the
+			// Service <agent>-report-store targets by name.
+		}, auditReportStoreSidecarPorts(agent)...),
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
 		// whether the pod is healthy or not, and there is no /healthz to ask
@@ -4747,6 +4749,10 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
 		)
 	}
+	// The audit-report store listener's switch and subject, under next only
+	// (audit_report_store.go). This container runs it: the PVC and the pod's
+	// API-audience token, which the listener reads the JWKS with, are here.
+	envVars = append(envVars, auditReportStoreSidecarEnv(agent)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
@@ -5309,6 +5315,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {
+		reserved[name] = struct{}{}
+	}
+	// The audit-report store's four, in every mode (auditReportStoreEnvNames).
+	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
 

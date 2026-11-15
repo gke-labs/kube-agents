@@ -1373,6 +1373,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
 		return ctrl.Result{}, err
 	}
+	// The audit-report store's Service and NetworkPolicy, under next
+	// (audit_report_store.go). The policy's shape turns on whether the gateway
+	// policy just reconciled isolates the gateway pod for ingress.
+	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil, netpolProf.Generated); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
