@@ -296,6 +296,7 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a non-ASCII trigger name", withTrigger(`{"name":"schedule/caf\u00e9","origin":"builtin"}`)))
 	add(refused("a trigger script that is a path", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"/opt/scripts/run.sh"}`)))
 	add(refused("a trigger script on a collector trigger", withTrigger(`{"name":"stall-watch","origin":"builtin","script":"stall-watch"}`)))
+	add(refused("a trigger script on a bare schedule trigger", withTrigger(`{"name":"schedule","origin":"builtin","script":"compliance-audit"}`)))
 	add(refused("an upper-case trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"Run"}`)))
 	add(refused("a dotted trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"run.sh"}`)))
 	add(refused("a non-ASCII trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"caf\u00e9"}`)))

@@ -66,4 +66,7 @@ func TestValidateTriggerHoldsAScriptToALabel(t *testing.T) {
 	if err := ValidateTrigger("stall-watch", TriggerOriginBuiltin, "", "stall-watch"); err == nil {
 		t.Error("accepted a script on a collector trigger")
 	}
+	if err := ValidateTrigger("schedule", TriggerOriginBuiltin, "", "compliance-audit"); err == nil {
+		t.Error("accepted a script on a bare schedule trigger, which names no schedule")
+	}
 }
