@@ -1857,8 +1857,6 @@ spec:
               value: /etc/a2a-nats-ca/ca.crt
             - name: A2A_BUS_USER
               value: agent
-            - name: A2A_NOTIFY_PLATFORM
-              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: A2A_ACTIVITY_SECRET
@@ -2142,8 +2140,6 @@ spec:
               value: example-project
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
-            - name: A2A_NOTIFY_PLATFORM
-              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: PATH
@@ -2941,6 +2937,30 @@ metadata:
 ---
 apiVersion: v1
 data:
+  tiers.json: |
+    {
+      "tiers": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: tiers
+  name: platformagent-a2a-tiers
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
   identities.json: |
     {
       "version": "1c982ea518e10246",
@@ -3446,6 +3466,8 @@ subjects:
 apiVersion: v1
 kind: Secret
 metadata:
+  annotations:
+    kubeagents.x-k8s.io/a2a-config-profiles: ""
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -4228,6 +4250,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5534,30 +5557,6 @@ metadata:
       name: platformagent
       uid: ""
 spec: {}
----
-apiVersion: v1
-data:
-  tiers.json: |
-    {
-      "tiers": []
-    }
-kind: ConfigMap
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: tiers
-  name: platformagent-a2a-tiers
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
 ---
 apiVersion: batch/v1
 kind: Job

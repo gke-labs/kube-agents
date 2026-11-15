@@ -3,8 +3,9 @@ remain on upstream registries when thirdPartyImageRegistry is unset/empty, even
 when imageRegistry is set (#3503).
 
 A custom first-party imageRegistry must not rewrite third-party images (LiteLLM,
-fluent-bit, cleanup hook, GitHub token minter, Hindsight) onto the first-party
-prefix, where an operator who only mirrored kube-agents images never mirrored them.
+fluent-bit, the NATS bus's four, cleanup hook, GitHub token minter, Hindsight) onto
+the first-party prefix, where an operator who only mirrored kube-agents images never
+mirrored them.
 
 When global.imageRegistry is set without global.thirdPartyImageRegistry, the chart's
 NOTES.txt warns operators that third-party images will still pull from upstream public
@@ -33,6 +34,30 @@ _REQUIRED = [
     "--set", "platformAgent.harness.location=us-central1",
     "--set", "platformAgent.harness.projectId=ci-project",
 ]
+
+# The operator env vars the chart renders an image reference into: the images
+# the operator pulls at reconcile time that appear in no chart template.
+_IMAGE_ENV_NAMES = (
+    "PLATFORM_AGENT_IMAGE",
+    "FLUENT_BIT_IMAGE",
+    "AGENT_SANDBOX_IMAGE",
+    "OPERATOR_IMAGE",
+    "A2A_NATS_IMAGE",
+    "A2A_PROVISION_IMAGE",
+    "A2A_NATS_RELOADER_IMAGE",
+    "A2A_NATS_EXPORTER_IMAGE",
+)
+
+# The NATS bus's four images, pulled by the operator-rendered bus of every
+# install: the trailing name `make mirror-images` writes each copy under, and
+# the upstream repository. Two are pinned by digest as well as tag upstream;
+# the mirror holds them by tag alone, so under a prefix the digest has to go.
+_BUS_IMAGES = {
+    "nats": "docker.io/library/nats:2.10-alpine",
+    "nats-box": "docker.io/natsio/nats-box:0.14.5",
+    "nats-server-config-reloader": "docker.io/natsio/nats-server-config-reloader:0.25.0@sha256:",
+    "prometheus-nats-exporter": "docker.io/natsio/prometheus-nats-exporter:0.20.3@sha256:",
+}
 
 
 def _render_chart(*args) -> list[dict]:
@@ -84,6 +109,49 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
         self.assertTrue(any("ghcr.io/berriai/litellm" in img for img in rendered_images))
         self.assertTrue(any("docker.io/fluent/fluent-bit" in img for img in rendered_images))
         self.assertTrue(any("docker.io/alpine/k8s" in img for img in rendered_images))
+        # The bus's four, at the inventory's full pin, digest included.
+        for name, upstream in _BUS_IMAGES.items():
+            with self.subTest(name=name):
+                self.assertTrue(
+                    any(img.startswith(upstream) for img in rendered_images),
+                    f"Expected {upstream} in the default render, got: {rendered_images}",
+                )
+
+    def test_the_bus_images_are_rendered_from_a2a_bus_values(self):
+        """Each of the four env vars follows its own a2aBus.images key, so an
+        install can place one image without a prefix over the rest."""
+        docs = _render_chart(
+            "--set", "a2aBus.images.nats.repository=registry.example.invalid/one/nats",
+            "--set", "a2aBus.images.nats.tag=2.11",
+            "--set", "a2aBus.images.natsBox.repository=registry.example.invalid/two/nats-box",
+            "--set", "a2aBus.images.configReloader.repository=registry.example.invalid/three/nats-server-config-reloader",
+            "--set", "a2aBus.images.prometheusExporter.repository=registry.example.invalid/four/prometheus-nats-exporter",
+        )
+        env = self._operator_env(docs)
+        self.assertEqual(env["A2A_NATS_IMAGE"], "registry.example.invalid/one/nats:2.11")
+        self.assertTrue(env["A2A_PROVISION_IMAGE"].startswith("registry.example.invalid/two/nats-box:0.14.5"))
+        self.assertTrue(env["A2A_NATS_RELOADER_IMAGE"].startswith("registry.example.invalid/three/nats-server-config-reloader:0.25.0@sha256:"))
+        self.assertTrue(env["A2A_NATS_EXPORTER_IMAGE"].startswith("registry.example.invalid/four/prometheus-nats-exporter:0.20.3@sha256:"))
+
+    def test_extra_env_that_sets_only_the_bus_image_keeps_the_exporter_omitted(self):
+        """A mirrored install from before the exporter existed set A2A_NATS_IMAGE
+        through operator.extraEnv and nothing for the exporter, and the operator
+        served it without the exporter sidecar. The chart's own exporter pin stays
+        out of that install's env, so the sidecar is not re-added from an image the
+        mirror may not hold; an extraEnv that sets the exporter too renders it."""
+        only_bus = self._operator_env(_render_chart(
+            "--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE",
+            "--set", "operator.extraEnv[0].value=registry.example.invalid/mirror/nats:2.10",
+        ))
+        self.assertEqual(only_bus["A2A_NATS_IMAGE"], "registry.example.invalid/mirror/nats:2.10")
+        self.assertNotIn("A2A_NATS_EXPORTER_IMAGE", only_bus)
+        both = self._operator_env(_render_chart(
+            "--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE",
+            "--set", "operator.extraEnv[0].value=registry.example.invalid/mirror/nats:2.10",
+            "--set", "operator.extraEnv[1].name=A2A_NATS_EXPORTER_IMAGE",
+            "--set", "operator.extraEnv[1].value=registry.example.invalid/mirror/prometheus-nats-exporter:0.20.3",
+        ))
+        self.assertEqual(both["A2A_NATS_EXPORTER_IMAGE"], "registry.example.invalid/mirror/prometheus-nats-exporter:0.20.3")
 
     def test_image_registry_only_does_not_rewrite_third_party_images(self):
         mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
@@ -133,6 +201,13 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
             any(img.startswith(f"{mirror}/pgvector") for img in rendered_images),
             f"pgvector should not be rewritten to first-party mirror, got: {rendered_images}",
         )
+        for name, upstream in _BUS_IMAGES.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    any(img.startswith(f"{mirror}/{name}:") for img in rendered_images),
+                    f"{name} should not be rewritten to first-party mirror, got: {rendered_images}",
+                )
+                self.assertTrue(any(img.startswith(upstream) for img in rendered_images))
 
         self.assertTrue(any("ghcr.io/berriai/litellm" in img for img in rendered_images))
         self.assertTrue(any("docker.io/fluent/fluent-bit" in img for img in rendered_images))
@@ -156,6 +231,45 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
         self.assertTrue(any(img.startswith(f"{third_mirror}/litellm") for img in rendered_images))
         self.assertTrue(any(img.startswith(f"{third_mirror}/fluent-bit") for img in rendered_images))
         self.assertTrue(any(img.startswith(f"{third_mirror}/k8s") for img in rendered_images))
+        # The bus's four: <prefix>/<name>:<tag>, the digest dropped, which is
+        # the copy `make mirror-images` pushes.
+        env = self._operator_env(docs)
+        self.assertEqual(env["A2A_NATS_IMAGE"], f"{third_mirror}/nats:2.10-alpine")
+        self.assertEqual(env["A2A_PROVISION_IMAGE"], f"{third_mirror}/nats-box:0.14.5")
+        self.assertEqual(env["A2A_NATS_RELOADER_IMAGE"], f"{third_mirror}/nats-server-config-reloader:0.25.0")
+        self.assertEqual(env["A2A_NATS_EXPORTER_IMAGE"], f"{third_mirror}/prometheus-nats-exporter:0.20.3")
+
+    def test_third_party_registry_alone_mirrors_the_bus_images(self):
+        """The failure the bus values exist for: a mirror that holds only
+        third-party images still pulls the bus from it, whether or not the
+        first-party prefix is set."""
+        third_mirror = "registry.example.invalid/mirror"
+        env = self._operator_env(_render_chart("--set", f"global.thirdPartyImageRegistry={third_mirror}"))
+        for name in _IMAGE_ENV_NAMES[4:]:
+            with self.subTest(name=name):
+                self.assertTrue(env[name].startswith(f"{third_mirror}/"), env[name])
+                self.assertNotIn("@sha256:", env[name])
+
+    def test_a_render_without_a2a_bus_values_omits_the_four_and_still_renders(self):
+        """`helm upgrade --reuse-values` from a release before a2aBus existed
+        renders against values with no a2aBus key; the template must not
+        abort on it. The operator then runs on its compiled defaults, the same
+        pins, as that release already did."""
+        env = self._operator_env(_render_chart("--set", "a2aBus=null"))
+        for name in _IMAGE_ENV_NAMES[4:]:
+            self.assertNotIn(name, env)
+        self.assertIn("FLUENT_BIT_IMAGE", env)
+
+    def _operator_env(self, docs: list[dict]) -> dict[str, str]:
+        """The controller manager's env, last entry for a name winning as it
+        does in the container."""
+        for doc in docs:
+            if doc.get("kind") != "Deployment":
+                continue
+            for c in doc["spec"]["template"]["spec"]["containers"]:
+                if c.get("name") == "manager":
+                    return {e["name"]: e.get("value") for e in c.get("env", [])}
+        self.fail("no manager container in the render")
 
     def test_notes_warns_when_first_party_registry_set_and_third_party_empty(self):
         mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
@@ -189,7 +303,7 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
                 if "image" in c:
                     images.append(c["image"])
                 for env in c.get("env", []):
-                    if env.get("name") in ("PLATFORM_AGENT_IMAGE", "FLUENT_BIT_IMAGE", "AGENT_SANDBOX_IMAGE", "OPERATOR_IMAGE"):
+                    if env.get("name") in _IMAGE_ENV_NAMES:
                         if "value" in env:
                             images.append(env["value"])
             if kind == "PlatformAgent":
