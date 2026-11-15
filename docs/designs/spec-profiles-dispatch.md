@@ -365,7 +365,13 @@ leave open:
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
+  found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
+  the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
+  each script's path and timeout. A script-run task's path comes from that render, never from the
+  task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
+  worker image. The CRD and the dispatcher's config check both hold paths to it, and
+  `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
+  group- or world-writable (#5622). Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -461,7 +467,8 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
+  `verifier-refused`, `parameters-invalid`, `queue-timeout`, `script-not-allowed` (the trigger names a
+  script its profile's `spec.scripts` doesn't list, #5622), and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`

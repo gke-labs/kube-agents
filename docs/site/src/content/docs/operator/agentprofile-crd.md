@@ -52,6 +52,10 @@ spec:
   parameters: # optional; the task parameters the persona declares
     - name: cluster
       required: true
+  scripts: # optional; helper scripts a built-in schedule may run with no model
+    - name: stall-watch
+      path: /opt/kube-agents/scripts/stall_watch.py
+      timeoutSeconds: 300
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
@@ -111,6 +115,8 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 Before `yieldToPinned`, every profile that takes a target handed off to a pinned profile: a generic profile you created yourself, not the chart's, needs `yieldToPinned: true` for its pinned profiles to keep receiving its tasks. The chart refuses to render its `cluster` profile against an AgentProfile CRD that predates the field, since the API server would drop it silently; apply `charts/kube-agents/crds/` first, as `upgrade.sh` does.
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
+
+`scripts` lists the helper scripts the profile may run as a script-run task: a built-in schedule's run that execs one of them with no model turn (#5622). There are at most 16, each with a unique `name` that is a DNS-1123 label. Each `path` lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the worker image. Its segments start with a letter, digit or underscore and hold only those, dots and hyphens, so a path has no `..`, no empty segment and no shell metacharacter. `timeoutSeconds` may not exceed `lifecycle.activeDeadlineSeconds`, and the operator lowers it to the install's task-deadline cap when that is lower. The dispatcher refuses a task naming a script the list doesn't hold, as `script-not-allowed`. The path comes from this list, never from the task.
 
 Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates (and a kustomize `make deploy` creates). The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
 

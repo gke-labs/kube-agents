@@ -38,6 +38,9 @@ const (
 	// ReasonOutsideParentScope: the child's target lies outside its parent's
 	// scope.
 	ReasonOutsideParentScope = "outside-parent-scope"
+	// ReasonScriptNotAllowed: the submission's trigger names a script its
+	// profile's spec.scripts doesn't list (#5622).
+	ReasonScriptNotAllowed = "script-not-allowed"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
