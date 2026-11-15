@@ -91,6 +91,9 @@ const (
 	shellSandboxSshdVolume     = "sshd"
 	shellSandboxKeysVolume     = "authorized-keys"
 	shellSandboxSettingsVolume = "settings"
+	// Hyperdisk Balanced (hyperdisk-balanced) rejects disks under 4 GB with HTTP 400
+	// InvalidArgument instead of rounding up; shares systemMetadataStorageSize.
+	shellSandboxSshdStorageSize = systemMetadataStorageSize
 
 	// The token the shell presents to the credential runtime. It mounts at
 	// credentialProxyTokenMountPath, the same path the agent pod uses, because a
@@ -737,15 +740,15 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					},
 				},
 				{
-					// Two host keys and nothing else, so this is a minimum-size
-					// request rather than a sized one; the CSI driver rounds it up
-					// to whatever the storage class's disk type allows.
+					// Two host keys and nothing else, sized at the 4Gi Hyperdisk Balanced
+					// minimum because pd.csi.storage.gke.io rejects smaller hyperdisk-balanced
+					// claims with InvalidArgument rather than rounding them up.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxSshdVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
+								corev1.ResourceStorage: resource.MustParse(shellSandboxSshdStorageSize),
 							},
 						},
 					},
