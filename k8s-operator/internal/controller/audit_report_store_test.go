@@ -60,6 +60,9 @@ func TestAuditReportStoreSidecarRendersUnderNextOnly(t *testing.T) {
 			if subject != "system:serviceaccount:test-ns:test-agent" {
 				t.Errorf("mode %q: subject %q is not the broker's ServiceAccount", tc.mode, subject)
 			}
+			if prefix, _ := storeEnvValue(sidecar.Env, auditReportStoreAllowedPodPrefixEnv); prefix != "test-agent-credential-proxy-" {
+				t.Errorf("mode %q: pod prefix %q is not the broker Deployment's", tc.mode, prefix)
+			}
 		}
 	}
 }
@@ -78,17 +81,34 @@ func TestAuditReportStoreSubjectIsTheBrokersServiceAccount(t *testing.T) {
 
 // A CR cannot set the store's names through spec.deployment.env in any mode.
 func TestAuditReportStoreEnvIsReserved(t *testing.T) {
-	agent := reportStoreAgent("today")
+	for _, mode := range []string{"today", "next"} {
+		testAuditReportStoreEnvIsReservedIn(t, mode)
+	}
+}
+
+func testAuditReportStoreEnvIsReservedIn(t *testing.T, mode string) {
+	agent := reportStoreAgent(mode)
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
 		{Name: auditReportStoreEnabledEnv, Value: "1"},
 		{Name: auditReportStoreAllowedSubjectEnv, Value: "system:serviceaccount:test-ns:attacker"},
 		{Name: auditReportStoreURLEnv, Value: "http://elsewhere"},
 		{Name: auditReportStoreTokenFileEnv, Value: "/tmp/x"},
+		{Name: auditReportStoreAllowedPodPrefixEnv, Value: "test-agent-credential-proxy-exec-"},
+		{Name: "FLEET_AUDIT_REPORTS_DIR", Value: "/etc"},
+		{Name: "AUDIT_REPORT_STORE_API_SERVER", Value: "https://attacker.example"},
+		{Name: "AUDIT_REPORT_STORE_SA_DIR", Value: "/tmp/sa"},
 	}}
 	for _, env := range [][]corev1.EnvVar{buildAgentAPIAuthEnv(agent), buildCredentialProxyContainer(agent).Env} {
-		for _, name := range auditReportStoreEnvNames {
-			if _, ok := storeEnvValue(env, name); ok {
-				t.Errorf("spec.deployment.env set %s on a today install", name)
+		for _, e := range env {
+			for _, name := range auditReportStoreEnvNames {
+				if e.Name != name {
+					continue
+				}
+				if e.Value == "/etc" || e.Value == "https://attacker.example" || e.Value == "/tmp/sa" ||
+					e.Value == "http://elsewhere" || e.Value == "/tmp/x" || e.Value == "test-agent-credential-proxy-exec-" ||
+					e.Value == "system:serviceaccount:test-ns:attacker" || (mode == "today" && name == auditReportStoreEnabledEnv) {
+					t.Errorf("mode %s: spec.deployment.env set %s=%q", mode, name, e.Value)
+				}
 			}
 		}
 	}
@@ -245,7 +265,7 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	// Skew: nothing deleted.
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc.DeepCopy(), np.DeepCopy()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("later"), false); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("later"), false, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
@@ -253,7 +273,7 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	}
 
 	// Today: both owned objects go.
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); !apierrors.IsNotFound(err) {
@@ -267,7 +287,7 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	foreign := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
 	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
 	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
@@ -319,7 +339,7 @@ func TestAuditReportStorePolicyReadsTheNamespacesPolicies(t *testing.T) {
 			}
 			cl := builder.Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-			if err := r.reconcileAuditReportStore(ctx, agent, true); err != nil {
+			if err := r.reconcileAuditReportStore(ctx, agent, true, true); err != nil {
 				t.Fatal(err)
 			}
 			var got networkingv1.NetworkPolicy
@@ -342,7 +362,7 @@ func TestAuditReportStorePolicyIsRecomputedEachPass(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	key := types.NamespacedName{Namespace: "test-ns", Name: "test-agent-report-store"}
 	rules := func() int {
-		if err := r.reconcileAuditReportStore(ctx, agent, true); err != nil {
+		if err := r.reconcileAuditReportStore(ctx, agent, true, true); err != nil {
 			t.Fatal(err)
 		}
 		var np networkingv1.NetworkPolicy
@@ -366,5 +386,72 @@ func TestAuditReportStorePolicyIsRecomputedEachPass(t *testing.T) {
 	}
 	if n := rules(); n != 1 {
 		t.Errorf("after a foreign ingress policy: %d rules, want the broker rule alone", n)
+	}
+}
+
+// spec.networkPolicy.enabled false: no store policy, an owned one deleted,
+// and the Service still rendered.
+func TestAuditReportStorePolicyWithheldWhenPoliciesAreOff(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := reportStoreAgent("next")
+	existing := buildAuditReportStoreNetworkPolicy(agent, true)
+	if err := ctrl.SetControllerReference(agent, existing, scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existing).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileAuditReportStore(ctx, agent, true, false); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: "test-ns", Name: "test-agent-report-store"}
+	if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the store policy survived spec.networkPolicy.enabled false: %v", err)
+	}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Errorf("the Service is not rendered: %v", err)
+	}
+}
+
+// Doubt counts as isolating: a selector on a label no gateway label set
+// carries, one that cannot be evaluated, and one matching a live pod's label.
+func TestAuditReportStoreDoubtfulPoliciesDropTheCatchAll(t *testing.T) {
+	ctx := context.Background()
+	ingress := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway-abc", Namespace: "test-ns",
+		Labels: map[string]string{"app": "test-agent-gateway", "team": "platform"}}}
+	for _, tc := range []struct {
+		name     string
+		selector metav1.LabelSelector
+		pods     bool
+		want     bool
+	}{
+		{"a label nobody can see", metav1.LabelSelector{MatchLabels: map[string]string{"role": "db"}}, false, true},
+		{"a selector that cannot be evaluated", metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "app", Operator: "Sometimes", Values: []string{"x"}}}}, false, true},
+		{"a live pod's own label", metav1.LabelSelector{MatchLabels: map[string]string{"team": "platform"}}, true, true},
+		// The live pod makes the key known, so the selector is evaluated
+		// rather than doubted: another value selects other pods.
+		{"a seen label with another value", metav1.LabelSelector{MatchLabels: map[string]string{"team": "data"}}, true, false},
+		{"the same, with no pod to read", metav1.LabelSelector{MatchLabels: map[string]string{"team": "data"}}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := reportStoreAgent("next")
+			np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "test-ns"},
+				Spec: networkingv1.NetworkPolicySpec{PodSelector: tc.selector, PolicyTypes: ingress}}
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, np)
+			if tc.pods {
+				builder = builder.WithObjects(pod)
+			}
+			r := &PlatformAgentReconciler{Client: builder.Build(), Scheme: scheme}
+			isolated, err := r.gatewayPodIngressIsolated(ctx, agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if isolated != tc.want {
+				t.Errorf("isolating %v, want %v", isolated, tc.want)
+			}
+		})
 	}
 }

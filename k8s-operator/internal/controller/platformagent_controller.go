@@ -1376,8 +1376,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The audit-report store's Service and NetworkPolicy, under next
 	// (audit_report_store.go). After the gateway policy: the store policy's
 	// shape turns on whether any policy, that one included, isolates the
-	// gateway pod for ingress.
-	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil); err != nil {
+	// gateway pod for ingress, and spec.networkPolicy.enabled false withholds
+	// it as it withholds the gateway policy.
+	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil, netpolProf.Generated); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {

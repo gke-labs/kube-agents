@@ -2375,6 +2375,8 @@ spec:
               value: "1"
             - name: AUDIT_REPORT_STORE_ALLOWED_SUBJECT
               value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent
+            - name: AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX
+              value: platformagent-credential-proxy-
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME

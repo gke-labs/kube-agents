@@ -54,6 +54,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -83,6 +84,11 @@ const (
 	// subject the listener accepts.
 	auditReportStoreEnabledEnv        = "AUDIT_REPORT_STORE_ENABLED"
 	auditReportStoreAllowedSubjectEnv = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
+	// And the name prefix of the broker Deployment's pods, which the token's
+	// kubernetes.io.pod.name claim must carry: the broker's ServiceAccount is
+	// shared with the exec tier and kube-proxy, so the subject alone is not
+	// the broker.
+	auditReportStoreAllowedPodPrefixEnv = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
 	// On the broker: where the listener is, and the token it presents.
 	auditReportStoreURLEnv       = "AUDIT_REPORT_STORE_URL"
 	auditReportStoreTokenFileEnv = "AUDIT_REPORT_STORE_TOKEN_FILE" // #nosec G101 -- Environment variable name, not a credential
@@ -92,11 +98,20 @@ const (
 // mode: rendered only under next, a CR could otherwise set them on a today
 // install and start a listener nobody declared, or point the broker's token at
 // a listener of its choosing.
+//
+// The last three are names the listener no longer reads, reserved anyway: an
+// image or a hand edit that read them would let a CR move the store's root,
+// or point the JWKS fetch at a server of its choosing with the pod's own token
+// and have it vouch for any token it signs.
 var auditReportStoreEnvNames = []string{
 	auditReportStoreEnabledEnv,
 	auditReportStoreAllowedSubjectEnv,
+	auditReportStoreAllowedPodPrefixEnv,
 	auditReportStoreURLEnv,
 	auditReportStoreTokenFileEnv,
+	"FLEET_AUDIT_REPORTS_DIR",
+	"AUDIT_REPORT_STORE_API_SERVER",
+	"AUDIT_REPORT_STORE_SA_DIR",
 }
 
 // auditReportStoreRendered is whether the listener and its objects render:
@@ -130,6 +145,7 @@ func auditReportStoreSidecarEnv(agent *agentv1alpha1.PlatformAgent) []corev1.Env
 	return []corev1.EnvVar{
 		{Name: auditReportStoreEnabledEnv, Value: "1"},
 		{Name: auditReportStoreAllowedSubjectEnv, Value: auditReportStoreAllowedSubject(agent)},
+		{Name: auditReportStoreAllowedPodPrefixEnv, Value: credentialProxyName(agent) + "-"},
 	}
 }
 
@@ -274,7 +290,14 @@ func portRange(protocol corev1.Protocol, from, to int32) networkingv1.NetworkPol
 // makes that the pass right after it. The known limit is the window between
 // the foreign policy landing and that pass applying: for those seconds rule
 // (b) is in the union with it.
-func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool) error {
+//
+// With spec.networkPolicy.enabled false (policiesManaged false) the policy is
+// not rendered and an owned one is deleted, as the operator's other managed
+// policies are: that switch hands ingress to the install's own policies. The
+// Service, the listener and the broker's token still render, and the
+// listener's token check (audience, issuer, subject, broker pod name) is then
+// the whole control.
+func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool, policiesManaged bool) error {
 	if !modeOK {
 		return nil
 	}
@@ -284,11 +307,17 @@ func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context,
 		}
 		return r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{})
 	}
-	gatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)
-	if err != nil {
+	objs := []client.Object{buildAuditReportStoreService(agent)}
+	if policiesManaged {
+		gatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)
+		if err != nil {
+			return err
+		}
+		objs = append(objs, buildAuditReportStoreNetworkPolicy(agent, gatewayIngressIsolated))
+	} else if err := r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{}); err != nil {
 		return err
 	}
-	for _, obj := range []client.Object{buildAuditReportStoreService(agent), buildAuditReportStoreNetworkPolicy(agent, gatewayIngressIsolated)} {
+	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on audit-report store %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
@@ -317,24 +346,43 @@ func policyIsolatesIngress(np *networkingv1.NetworkPolicy) bool {
 // gatewayPodIngressIsolated is whether any NetworkPolicy in the namespace but
 // the store's own selects the gateway pod and isolates it for ingress.
 //
-// The pod's labels are the live gateway Deployment's template labels, or the
-// operator's own if the Deployment is not there yet, plus the leader label,
-// which leader_elect.py stamps on one pod above one replica. Counting a
-// policy that selects only the leader as isolating errs toward rule (a)
-// alone: a non-leader pod could then lose ingress it had, where the other way
-// round every port on the leader would open.
+// The gateway pod's labels are read three ways and a policy counts if it
+// selects any of them: the live gateway Deployment's template (or the
+// operator's own labels before it exists), with the leader label that
+// leader_elect.py stamps on one pod above one replica, and each live gateway
+// pod's labels as they are now. Every doubt counts as isolating, so the doubt
+// costs the catch-all rule rather than reopening a port someone closed: a
+// selector this cannot evaluate, and one that requires a label none of those
+// label sets carries, which another controller may stamp on the pod later.
+// The cost of the doubt is the other direction: a namespace with such a
+// policy for unrelated pods gets the broker rule alone, which isolates the
+// gateway pod where nothing else did.
 func (r *PlatformAgentReconciler) gatewayPodIngressIsolated(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
-	podLabels := commonLabels(agent)
-	podLabels["app"] = agent.Name + "-gateway"
+	template := commonLabels(agent)
+	template["app"] = agent.Name + "-gateway"
 	var gateway appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, &gateway); err == nil {
 		for k, v := range gateway.Spec.Template.Labels {
-			podLabels[k] = v
+			template[k] = v
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("failed to read the gateway Deployment for the audit-report store policy: %w", err)
 	}
-	podLabels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	template[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	labelSets := []labels.Set{labels.Set(template)}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
+		return false, fmt.Errorf("failed to list the gateway pods for the audit-report store policy: %w", err)
+	}
+	for i := range pods.Items {
+		labelSets = append(labelSets, labels.Set(pods.Items[i].Labels))
+	}
+	known := map[string]bool{}
+	for _, set := range labelSets {
+		for k := range set {
+			known[k] = true
+		}
+	}
 	var policies networkingv1.NetworkPolicyList
 	if err := r.List(ctx, &policies, client.InNamespace(agent.Namespace)); err != nil {
 		return false, fmt.Errorf("failed to list NetworkPolicies for the audit-report store policy: %w", err)
@@ -346,12 +394,22 @@ func (r *PlatformAgentReconciler) gatewayPodIngressIsolated(ctx context.Context,
 		}
 		selector, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
 		if err != nil {
-			// The API server refuses a selector this cannot parse, so this
-			// is a policy that selects nothing.
-			continue
-		}
-		if selector.Matches(labels.Set(podLabels)) {
 			return true, nil
+		}
+		for _, set := range labelSets {
+			if selector.Matches(set) {
+				return true, nil
+			}
+		}
+		requirements, _ := selector.Requirements()
+		for _, req := range requirements {
+			if known[req.Key()] {
+				continue
+			}
+			switch req.Operator() {
+			case selection.Equals, selection.DoubleEquals, selection.In, selection.Exists:
+				return true, nil
+			}
 		}
 	}
 	return false, nil
