@@ -387,7 +387,7 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 		{
 			name: "the credential broker", ns: agent.Namespace,
 			labels: map[string]string{"app": credentialBrokerName(agent)}, port: credentialProxyPort,
-			why: "CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all address it (credentialProxyBaseURL)",
+			why: "CREDENTIAL_PROXY_URL and, with Teams on, TEAMS_RELAY_URL address it (credentialProxyBaseURL)",
 		},
 		{
 			name: "the shell sandbox's sshd", ns: agent.Namespace,
