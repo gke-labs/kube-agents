@@ -1148,10 +1148,60 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the policies are not listed whole: a label or owner filter misses a customer's policy",
         )
         self.assertIn("np.Name == auditReportStoreName(agent) || !policyIsolatesIngress(np)", isolated)
-        self.assertIn("selector.Matches(labels.Set(podLabels))", isolated)
+        self.assertIn("selector.Matches(set)", isolated)
+        # Doubt counts as isolating: a selector it cannot evaluate.
+        self.assertRegex(isolated, r"LabelSelectorAsSelector\(&np\.Spec\.PodSelector\)\s*if err != nil \{\s*return true, nil")
         # An empty policyTypes is Ingress, as the API server defaults it.
         ingress = _go_code(source, "policyIsolatesIngress")
         self.assertRegex(ingress, r"len\(np\.Spec\.PolicyTypes\) == 0 \{\s*return true")
+
+    def test_C1_the_report_store_listener_reads_only_reserved_env(self) -> None:
+        """Every environment variable the store listener reads is one a CR cannot set.
+
+        agent-api-auth takes spec.deployment.env through
+        mergeCredentialProxyEnv, which drops only reserved names. A name the
+        listener reads that is not reserved is a CR choosing it: its subject
+        check, its root, or the API server it fetches the JWKS from with the
+        pod's own token, which would then vouch for any token the CR signs.
+        So the names the listener reads, each spelled through a module
+        constant, must all be in the operator's auditReportStoreEnvNames, and
+        the API server, the ServiceAccount directory and the root must come
+        from no environment variable at all.
+        """
+        listener = h.text("audit_report_store_listener")
+        tree = ast.parse(listener)
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        }
+        read = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "getenv")
+                and ast.unparse(node.func.value) in ("os.environ", "os") and node.args
+            ):
+                arg = node.args[0]
+                read.add(constants.get(arg.id) if isinstance(arg, ast.Name) else ast.unparse(arg))
+            if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                read.add(ast.unparse(node.slice))
+        self.assertTrue(read, "the listener reads no environment at all, so its subject check has no subject")
+        self.assertNotIn(None, read, "the listener reads an environment name not spelled through a module constant")
+
+        operator = h.text("audit_report_store_operator")
+        block = self._one_match(r"(?s)var auditReportStoreEnvNames = \[\]string\{(.*?)\n\}", operator, "auditReportStoreEnvNames")
+        go_constants = dict(re.findall(r"^\s*(auditReportStore\w+Env)\s*=\s*\"([^\"]+)\"", operator, re.MULTILINE))
+        reserved = set()
+        for line in re.sub(r"//[^\n]*", "", block).split(","):
+            item = line.strip()
+            if not item:
+                continue
+            reserved.add(item.strip('"') if item.startswith('"') else go_constants.get(item, item))
+        self.assertLessEqual(read, reserved, "the listener reads a name a CR can set through spec.deployment.env")
+        for name in ("FLEET_AUDIT_REPORTS_DIR", "AUDIT_REPORT_STORE_API_SERVER", "AUDIT_REPORT_STORE_SA_DIR"):
+            self.assertNotIn(name, read, f"the listener takes {name} from the environment")
+            self.assertIn(name, reserved, f"{name} is not reserved, so an image that read it would let a CR set it")
 
     def test_C1_today_renders_no_audit_report_store(self) -> None:
         """Under today the listener, its Service, its policy and its token are absent.

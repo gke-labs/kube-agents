@@ -2303,8 +2303,8 @@ Mutation(
     Mutation(
         "C1-report-store-catch-all-reads-only-the-operators-policy",
         "k8s-operator/internal/controller/audit_report_store.go",
-        ("\tgatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)\n",
-         "\tgatewayIngressIsolated, err := r.gatewayNetpolGenerated(ctx, agent)\n"),
+        ("\t\tgatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)\n",
+         "\t\tgatewayIngressIsolated, err := r.gatewayNetpolGenerated(ctx, agent)\n"),
         "test_C1_the_report_store_catch_all_yields_to_any_ingress_policy",
         "decide the catch-all from whether the operator rendered its own gateway "
         "policy -- a customer's lockdown with spec.networkPolicy off then gets "
@@ -2318,6 +2318,25 @@ Mutation(
         "test_C1_the_report_store_catch_all_yields_to_any_ingress_policy",
         "list only the operator's labelled policies, which is what the cache "
         "already holds warm -- a customer's isolating policy is then invisible",
+    ),
+    Mutation(
+        "C1-report-store-pod-prefix-unreserved",
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("\tauditReportStoreAllowedSubjectEnv,\n\tauditReportStoreAllowedPodPrefixEnv,\n",
+         "\tauditReportStoreAllowedSubjectEnv,\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "leave the pod-prefix name off the reserved list since only the "
+        "operator renders it -- a CR then sets it to the exec tier's prefix and "
+        "every exec pod's token passes as the broker",
+    ),
+    Mutation(
+        "C1-report-store-api-server-from-env",
+        "agents/platform/scripts/audit_report_store.py",
+        ("    base = api_server.rstrip(\"/\")\n",
+         "    base = (os.environ.get(\"AUDIT_REPORT_STORE_API_SERVER\") or api_server).rstrip(\"/\")\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "let an install point the JWKS fetch at a proxy -- a CR then points it at "
+        "a server of its own, hands it the pod's token, and signs broker tokens",
     ),
     Mutation(
         "C1-report-store-renders-under-today",
