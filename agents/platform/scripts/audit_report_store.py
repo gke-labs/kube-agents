@@ -123,6 +123,7 @@ DEPLOYMENT_POD_SUFFIX_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+\Z")
 # API server would be handed the pod's own token and could answer with a JWKS
 # of its own, which would pass any token it signs.
 DEFAULT_API_SERVER = "https://kubernetes.default.svc"
+JWKS_ACCEPT = "application/jwk-set+json, application/json"
 DEFAULT_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 # The port. start-services.sh runs this module as a script, which binds it.
 LISTEN_PORT = 8700
@@ -167,7 +168,10 @@ def _b64url_int(text: object) -> int:
 
 
 def _http_get_json(url: str, token: str | None, ca_file: str | None) -> dict:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    # The API server serves /openid/v1/jwks as application/jwk-set+json and
+    # answers 406 to an Accept that names only application/json (seen live on
+    # GKE); discovery is application/json. Name both.
+    request = urllib.request.Request(url, headers={"Accept": JWKS_ACCEPT})
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     context = None

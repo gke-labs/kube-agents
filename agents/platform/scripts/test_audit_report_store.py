@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -689,6 +690,39 @@ class TokenCheckAloneTests(StoreTestCase):
     def test_no_pod_prefix_configured_refuses_everyone(self) -> None:
         with mock.patch.dict(os.environ, {store.ALLOWED_POD_PREFIX_ENV: ""}):
             self.assertEqual(403, self.call("GET", f"{STREAM}/runs").status_code)
+
+
+class JWKSRequestTests(unittest.TestCase):
+    """The key fetch asks for the media type the API server serves the JWKS as."""
+
+    def test_the_fetch_accepts_a_jwk_set(self):
+        seen = []
+
+        class Answer:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, limit=-1):
+                return self.body
+
+        def fake_urlopen(request, timeout=None, context=None):
+            seen.append((request.full_url, request.get_header("Accept")))
+            if request.full_url.endswith("/openid/v1/jwks"):
+                if "application/jwk-set+json" not in (request.get_header("Accept") or ""):
+                    raise urllib.error.HTTPError(request.full_url, 406, "Not Acceptable", {}, None)
+                return Answer(b'{"keys": []}')
+            return Answer(b'{"issuer": "https://issuer.example"}')
+
+        with mock.patch.object(store.urllib.request, "urlopen", fake_urlopen):
+            issuer, keys = store.fetch_cluster_keys("https://api.example", "/nonexistent")
+        self.assertEqual(("https://issuer.example", []), (issuer, keys))
+        self.assertIn("application/jwk-set+json", dict(seen)["https://api.example/openid/v1/jwks"])
 
 
 if __name__ == "__main__":
