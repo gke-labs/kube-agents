@@ -79,12 +79,12 @@ const (
 	// issue time are allowed against this callout's clock: the dispatcher
 	// that signed it runs on another node. The dispatcher adds the same
 	// allowance to a task's deadline when it mints the credential.
-	TaskCredentialSkew = 30 * time.Second
+	TaskCredentialSkew = taskcred.Skew
 
 	// DefaultTaskCredentialMaxLifetime bounds how far out a task
 	// credential's expiry may be. See Config.TaskCredentialMaxLifetime. The
 	// dispatcher caps the expiries it mints at the same default.
-	DefaultTaskCredentialMaxLifetime = 6 * time.Hour
+	DefaultTaskCredentialMaxLifetime = taskcred.DefaultMaxLifetime
 
 	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
 	// be set to; see ParseTaskCredentialMaxLifetime.
@@ -206,32 +206,12 @@ func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
 	return d, nil
 }
 
-// taskSigningKeySeparator separates the keys in ParseTaskSigningKeys' input.
-const taskSigningKeySeparator = ","
-
 // ParseTaskSigningKeys reads the task-signing public keys the operator renders
 // for the callout, comma separated. Empty is allowed and means none (no task
 // connection is honoured); an empty element, a key that is not a task-signing
 // public key, or more than taskcred.MaxTrustedKeys is refused.
 func ParseTaskSigningKeys(raw string) ([]string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, nil
-	}
-	var keys []string
-	for _, field := range strings.Split(raw, taskSigningKeySeparator) {
-		key := strings.TrimSpace(field)
-		if key == "" {
-			return nil, fmt.Errorf("the task-signing key list %q has an empty element", raw)
-		}
-		if !taskcred.ValidPublicKey(key) {
-			return nil, fmt.Errorf("%q is not a task-signing public key (C...)", key)
-		}
-		keys = append(keys, key)
-	}
-	if len(keys) > taskcred.MaxTrustedKeys {
-		return nil, fmt.Errorf("%d task-signing keys; at most %d (the current one and the one it replaces)", len(keys), taskcred.MaxTrustedKeys)
-	}
-	return keys, nil
+	return taskcred.ParseTrustedKeys(raw)
 }
 
 // Service answers the server's authorization requests.

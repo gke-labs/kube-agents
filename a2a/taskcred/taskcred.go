@@ -30,6 +30,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -71,6 +72,19 @@ const (
 	// during a rotation.
 	MaxTrustedKeys = 2
 
+	// Skew is the clock skew a credential's expiry and issue time are
+	// allowed against a verifier's clock: the dispatcher that signed it runs
+	// on another node, and adds the same allowance to a task's deadline when
+	// it mints. DefaultMaxLifetime bounds how far out an expiry may be where
+	// no lower ceiling is configured. The callout, the dispatcher and the
+	// worker share both.
+	Skew               = 30 * time.Second
+	DefaultMaxLifetime = 6 * time.Hour
+
+	// trustedKeySeparator separates the keys in a trusted-key list
+	// (A2A_TASK_SIGNING_PUBLIC_KEYS).
+	trustedKeySeparator = ","
+
 	// maxPodUID and maxTargetField bound the claims that aren't subject
 	// tokens. A Kubernetes UID is 36 bytes; a GCP project id is at most 30
 	// and a cluster name 40.
@@ -102,6 +116,55 @@ const (
 // signs one thing in this deployment, and a seed leaked from the dispatcher
 // can't be mistaken for, or configured as, anything with more reach.
 const keyPrefix = nkeys.PrefixByteCluster
+
+// ParseTrustedKeys reads a comma-separated list of task-signing public keys,
+// as A2A_TASK_SIGNING_PUBLIC_KEYS carries it: empty is none, and an empty
+// element, a malformed key or more than MaxTrustedKeys is an error.
+func ParseTrustedKeys(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var keys []string
+	for _, field := range strings.Split(raw, trustedKeySeparator) {
+		key := strings.TrimSpace(field)
+		if key == "" {
+			return nil, fmt.Errorf("the task-signing key list %q has an empty element", raw)
+		}
+		if !ValidPublicKey(key) {
+			return nil, fmt.Errorf("%q is not a task-signing public key (C...)", key)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) > MaxTrustedKeys {
+		return nil, fmt.Errorf("%d task-signing keys; at most %d (the current one and the one it replaces)", len(keys), MaxTrustedKeys)
+	}
+	return keys, nil
+}
+
+// UnverifiedTrigger is the trigger a credential's claims name, read without
+// checking its signature, nil when they name none. It is for refusing
+// only: a worker that can't run a task as a model turn when its credential
+// names a script asks it, and an unsigned or forged claim can only make it
+// refuse more. Nothing may grant on what it returns.
+func UnverifiedTrigger(token string) (*Trigger, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("a task credential is three dot-separated parts")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't base64url: %w", err)
+	}
+	var claims struct {
+		Nats struct {
+			Trigger *Trigger `json:"trigger"`
+		} `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't JSON: %w", err)
+	}
+	return claims.Nats.Trigger, nil
+}
 
 // NewSigningKey generates a task-signing keypair.
 func NewSigningKey() (nkeys.KeyPair, error) {

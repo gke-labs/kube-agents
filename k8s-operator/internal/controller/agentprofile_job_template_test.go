@@ -318,7 +318,7 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 			t.Errorf("%T %s survived the signal going away: %v", o.obj, o.name, err)
 		}
 	}
-	cfg, err := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	cfg, err := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, ""), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,8 @@ func TestRenderedDispatchJobFixture(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	// With a key, as production renders one: the worker reads it.
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +359,7 @@ func TestADrainingProfileHasNoJobTemplate(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, "")
 	applied, err := desiredDispatchConfigWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -472,7 +473,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		// Settled, the index lists exactly the accounts the templates run
 		// as, so every unattended profile's Jobs are admitted.
 		var want []string
-		for _, tmpl := range dispatchJobTemplates(agent, profiles, false) {
+		for _, tmpl := range dispatchJobTemplates(agent, profiles, false, "") {
 			want = append(want, tmpl.Spec.ServiceAccountName)
 		}
 		sort.Strings(want)
@@ -716,7 +717,7 @@ func TestTheJobTeardownToleratesAnUnservedTemplateKind(t *testing.T) {
 func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
 	agent := a2aTestAgent()
 	p := unattendedProfile(agent, "tse")
-	tmpl := buildProfileJobTemplate(agent, &p, false)
+	tmpl := buildProfileJobTemplate(agent, &p, false, "")
 	all := append(append([]corev1.Container{}, tmpl.Spec.Containers...), tmpl.Spec.InitContainers...)
 	if len(tmpl.Spec.InitContainers) == 0 {
 		t.Fatal("the template has no init container, so this checks only the worker")
@@ -1231,5 +1232,78 @@ func TestAProfilePastTheToolLimitGetsNoJobTemplateWithoutImageVolumes(t *testing
 	}
 	if err := param("big"); err != nil {
 		t.Errorf("with image volumes the profile got no Job template: %v", err)
+	}
+}
+
+// A profile's Job template carries the task-signing public key, read from
+// the Secret the callout and the credential proxy are rendered from, so a
+// script-run task's worker can verify its credential (#5622). A rotated key
+// reaches the template, in the dispatch config and the policy's param alike,
+// on the next pass.
+func TestTheJobTemplateCarriesTheTaskSigningKeyAndFollowsARotation(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	reconcileAndRead := func(what string) (string, string) {
+		t.Helper()
+		if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+			t.Fatalf("%s: %v / %v", what, err, profileErr)
+		}
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
+			t.Fatal(err)
+		}
+		var cfg a2aDispatchConfig
+		if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.Profiles) != 1 || cfg.Profiles[0].JobTemplate == nil {
+			t.Fatalf("%s: no Job template in the dispatch config", what)
+		}
+		var param agentv1alpha1.DispatchJobTemplate
+		if err := c.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: dispatchJobTemplatePrefix + "tse"}, &param); err != nil {
+			t.Fatal(err)
+		}
+		held, ok := dispatchJobParamTemplate(&param)
+		if !ok {
+			t.Fatalf("%s: the param holds no template", what)
+		}
+		return envOf(cfg.Profiles[0].JobTemplate.Spec.Containers[0])[profileWorkerTaskSigningKeysEnvVar],
+			envOf(held.Spec.Containers[0])[profileWorkerTaskSigningKeysEnvVar]
+	}
+	secretKey := func() (*corev1.Secret, string) {
+		t.Helper()
+		var s corev1.Secret
+		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-a2a-task-signing-key"}, &s); err != nil {
+			t.Fatalf("the task-signing Secret: %v", err)
+		}
+		key, ok := readA2ATaskSigningKey(&s)
+		if !ok {
+			t.Fatal("the task-signing Secret doesn't read back")
+		}
+		return &s, key.Public
+	}
+
+	inConfig, inParam := reconcileAndRead("first pass")
+	secret, first := secretKey()
+	if inConfig != first || inParam != first || first == "" {
+		t.Fatalf("the Job template carries %q (config) and %q (param); want the Secret's public key %q", inConfig, inParam, first)
+	}
+
+	rotated, data, err := generateA2ATaskSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.Data = data
+	if err := c.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	inConfig, inParam = reconcileAndRead("after the rotation")
+	if _, now := secretKey(); now != rotated.Public || now == first {
+		t.Fatalf("the Secret holds %q after the rotation; want %q", now, rotated.Public)
+	}
+	if inConfig != rotated.Public || inParam != rotated.Public {
+		t.Errorf("after the rotation the Job template carries %q (config) and %q (param); want %q", inConfig, inParam, rotated.Public)
 	}
 }

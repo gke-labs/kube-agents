@@ -382,6 +382,29 @@ leave open:
   pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
   or holds another key type stops the dispatcher at startup. The dispatcher logs a
   credential's `jti`, never the token.
+- **Script-run tasks.** A script must run in Job mode: admission refuses `script-not-allowed` where the
+  profile has no Job template at an unattended tier. The dispatcher resolves the script from the config
+  snapshot it admitted the task on, and the confirm carries `script` (`{name, path, timeoutSeconds}`).
+  Only the dispatcher may publish on a dispatch subject (`TestOnlyTheDispatcherPublishesAConfirm`). The
+  one-shot worker runs the script in place of the harness when all of these hold:
+  - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
+    each Job template from the key the callout and the proxy use;
+  - the credential names this task and pod, and a trigger whose `script` is the confirm's;
+  - the path resolves, symlinks included, to a regular file under the script root, owned by root and
+    writable by no group or other, in directories that are the same, and the worker isn't its owner.
+
+  The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
+  broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
+  its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
+  stdout, capped at 64 KiB, is the text result. Its stderr, capped at 16 KiB, goes to the log. Exit 0
+  completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
+  A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
+  name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have
+  63), and a confirm with no `script` whose credential names one: a script task never runs as a model
+  turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
+  refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
+  SIGTERM ends it as `worker-evicted`.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -468,7 +491,8 @@ leave open:
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
   `verifier-refused`, `parameters-invalid`, `queue-timeout`, `script-not-allowed` (the trigger names a
-  script its profile's `spec.scripts` doesn't list, #5622), and for a child of an AgentProfile task
+  script its profile's `spec.scripts` doesn't list, or one where the profile has no Job mode at an
+  unattended tier, #5622), and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`

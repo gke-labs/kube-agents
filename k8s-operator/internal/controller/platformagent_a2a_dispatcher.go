@@ -997,7 +997,14 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 	// dispatch config and into the admission policy's params, so the two
 	// never differ.
 	imageVolumes := r.imageVolumeSupported(agent)
-	jobTemplates := dispatchJobTemplates(agent, profiles, imageVolumes)
+	// The task-signing key first: the Job templates carry its public half,
+	// and the Deployment below mounts its seed, which the pod can't start
+	// without. #4130 made the key; this only ensures it exists.
+	signingKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
+	}
+	jobTemplates := dispatchJobTemplates(agent, profiles, imageVolumes, signingKey.Public)
 	// Wanted: the chart's signal, and the policy in the cluster as
 	// rendered. A read that answers neither way changes nothing.
 	signal := dispatcherJobPolicyRendered()
@@ -1124,13 +1131,6 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 				"AgentProfile %s: spec.lifecycle.activeDeadlineSeconds %d is clamped to %ds by the install's task deadline cap (spec.harness.tuning.profiles.maxTaskDeadlineSeconds), so its tasks end at %ds",
 				profiles[i].Name, profiles[i].Spec.Lifecycle.ActiveDeadlineSeconds, d, d))
 		}
-	}
-	// The task-signing key before the Deployment that mounts its seed: the
-	// pod can't start on a Secret that isn't there. #4130 made the key; this
-	// only ensures it exists.
-	signingKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
-	if err != nil {
-		return jobModeVerdict, nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	// The seed is a file mount, so a repaired key wouldn't reach a running

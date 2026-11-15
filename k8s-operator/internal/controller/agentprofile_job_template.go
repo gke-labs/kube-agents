@@ -64,6 +64,10 @@ const (
 	// dispatchJobLabel marks a Job the dispatcher created (lib.DispatchJobLabel),
 	// so a teardown can find them.
 	dispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
+
+	// profileWorkerTaskSigningKeysEnvVar is the callout's and the proxy's
+	// variable, read the same way by the worker (#5622).
+	profileWorkerTaskSigningKeysEnvVar = a2aCalloutTaskSigningKeysEnvVar
 )
 
 // profileWorkerPodSpecForJob is the worker pod a profile's Job runs: the warm
@@ -79,7 +83,13 @@ func profileWorkerPodSpecForJob(agent *agentv1alpha1.PlatformAgent, p *agentv1al
 // must not restart, and a PodTemplate defaults it to Always, which would
 // break the policy's exact comparison), with the worker labels for the
 // profile's unattended tier.
-func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool) *corev1.PodTemplateSpec {
+//
+// taskSigningPublic is the task-signing public key, the one the callout and
+// the credential proxy are rendered from: a script-run task's worker
+// verifies its task credential against it before it runs a script (#5622),
+// and refuses without it. Public, so a plain value, and a rotated key
+// changes the template, as it rolls the proxy.
+func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool, taskSigningPublic string) *corev1.PodTemplateSpec {
 	// The profile's one unattended-mode tier (unattendedTierOf): unattended
 	// itself, or a Tier resource whose mode is unattended (#3659).
 	tier := unattendedTierOf(p)
@@ -87,6 +97,9 @@ func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha
 		tier = agentv1alpha1.AgentProfileTierUnattended
 	}
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
+	if taskSigningPublic != "" {
+		spec.Containers[0].Env = append(spec.Containers[0].Env, corev1.EnvVar{Name: profileWorkerTaskSigningKeysEnvVar, Value: taskSigningPublic})
+	}
 	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
@@ -231,7 +244,7 @@ func dispatcherJobPolicyRendered() bool {
 // config admits that allows the unattended tier, by profile name. A profile
 // whose worker would never schedule (profileWorkerToolsProblem) gets none,
 // as it gets no pool; dispatchJobToolsProblems says why.
-func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]*corev1.PodTemplateSpec {
+func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool, taskSigningPublic string) map[string]*corev1.PodTemplateSpec {
 	if !dispatcherJobPolicyRendered() {
 		return nil
 	}
@@ -243,7 +256,7 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 			profileWorkerToolsProblem(p, imageVolumes) != "" {
 			continue
 		}
-		out[p.Name] = buildProfileJobTemplate(agent, p, imageVolumes)
+		out[p.Name] = buildProfileJobTemplate(agent, p, imageVolumes, taskSigningPublic)
 	}
 	return out
 }

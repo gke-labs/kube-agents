@@ -79,7 +79,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
 
-	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false, a2aTaskSigningKeyPlaceholder)
 	// A PodTemplate already under a param's name: the operator's dry run
 	// generates its name, so it doesn't collide.
 	mustCreate(ctx, t, admin, &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + "tse", Namespace: pns}, Template: *tse.DeepCopy()})
@@ -178,7 +178,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	for i, name := range names {
 		profile := fmt.Sprintf("s%d", i)
 		staticProfile[name] = profile
-		tmpl := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, profile)), false)
+		tmpl := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, profile)), false, a2aTaskSigningKeyPlaceholder)
 		static[name].mutate(&tmpl.Spec)
 		templates[profile] = tmpl
 	}
@@ -514,7 +514,7 @@ func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
-	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false, a2aTaskSigningKeyPlaceholder)
 	wrong := tse.DeepCopy()
 	wrong.Spec.Containers[0].Image = "registry.example/evil:1"
 

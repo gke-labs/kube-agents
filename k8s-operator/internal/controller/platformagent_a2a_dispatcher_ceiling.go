@@ -210,7 +210,9 @@ func (m dispatchConfigMeasure) bytes(entries []a2aDispatchProfile) (int, error) 
 func (m dispatchConfigMeasure) share(base int, p *agentv1alpha1.AgentProfile) (int, error) {
 	var tmpl *corev1.PodTemplateSpec
 	if m.jobMode && slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
-		with, without := buildProfileJobTemplate(m.agent, p, true), buildProfileJobTemplate(m.agent, p, false)
+		// A real key's length, so the share counts the variable the
+		// render adds.
+		with, without := buildProfileJobTemplate(m.agent, p, true, a2aTaskSigningKeyPlaceholder), buildProfileJobTemplate(m.agent, p, false, a2aTaskSigningKeyPlaceholder)
 		tmpl = with
 		if a, b := jsonLen(with), jsonLen(without); b > a {
 			tmpl = without
@@ -500,3 +502,8 @@ func (r *PlatformAgentReconciler) syncDispatcherCeiling(ctx context.Context, age
 	}
 	return r.Status().Update(ctx, agent)
 }
+
+// a2aTaskSigningKeyPlaceholder stands in for the task-signing public key
+// where a Job template is measured rather than applied: an nkey public key
+// is 56 characters.
+var a2aTaskSigningKeyPlaceholder = strings.Repeat("C", 56)
