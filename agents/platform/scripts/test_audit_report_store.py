@@ -141,7 +141,9 @@ class FakeAPIServer:
 
 class StoreTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp())
+        # Resolved: the store refuses a symlink anywhere on its root's path, and
+        # macOS puts the temp dir under /var, a symlink to /private/var.
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.root = self.tmp / "reports"
         self.sa_dir = self.tmp / "sa"
         self.sa_dir.mkdir()
@@ -232,7 +234,7 @@ class RouteTests(StoreTestCase):
     def test_a_failed_prune_does_not_fail_the_write(self) -> None:
         for day in range(1, 15):
             self.put_run(f"202611{day:02d}T000000.000000Z")
-        with mock.patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
+        with mock.patch.object(store.os, "unlink", side_effect=PermissionError("read-only")):
             self.assertEqual(204, self.put_run("20261120T000000.000000Z").status_code)
 
     def test_latest_must_equal_a_ring_entry(self) -> None:
@@ -327,21 +329,83 @@ class ValidationTests(StoreTestCase):
             with self.subTest(stamp=stamp):
                 self.assertRefused("PUT", f"{STREAM}/runs/{stamp}")
 
-    def test_a_symlink_escaping_the_root_is_refused(self) -> None:
+    def assertNothingOutside(self, outside: Path) -> None:
+        self.assertEqual([], sorted(p.name for p in outside.iterdir() if p.name != "secret.json"))
+
+    def test_a_symlinked_path_component_is_refused(self) -> None:
         outside = self.tmp / "outside"
         outside.mkdir()
         (self.root / "compliance-audit").mkdir(parents=True)
         os.symlink(outside, self.root / "compliance-audit" / "acme")
-        self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}")
-        self.assertRefused("GET", f"{STREAM}/runs")
-        self.assertEqual([], list(outside.iterdir()))
-        # A planted latest.json symlink too.
-        good = self.root / "compliance-audit" / "corp" / "gitops"
-        good.mkdir(parents=True)
+        self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 409)
+        self.assertRefused("GET", f"{STREAM}/runs", 409)
+        self.assertRefused("GET", f"{STREAM}/latest", 409)
+        self.assertRefused("DELETE", f"{STREAM}/latest", 409)
+        self.assertNothingOutside(outside)
+        # And the listing does not walk into it.
+        self.assertEqual([], self.call("GET", "/v1/audit-reports").json())
+
+    def test_a_symlinked_audit_directory_is_refused(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        self.root.mkdir()
+        os.symlink(outside, self.root / "compliance-audit")
+        self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 409)
+        self.assertNothingOutside(outside)
+
+    def test_a_symlinked_latest_json_is_refused(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
         secret = outside / "secret.json"
-        secret.write_text("{}")
+        secret.write_text('{"secret": 1}')
+        good = self.root / "compliance-audit" / "acme" / "gitops"
+        (good / "runs").mkdir(parents=True)
         os.symlink(secret, good / "latest.json")
-        self.assertRefused("GET", "/v1/audit-reports/compliance-audit/corp%2Fgitops/latest")
+        self.assertRefused("GET", f"{STREAM}/latest", 409)
+        # A write replaces the link itself and never writes through it.
+        self.put_run(STAMP_1, {"run": 1})
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", json.dumps({"run": 1}).encode()).status_code)
+        self.assertEqual('{"secret": 1}', secret.read_text())
+        self.assertFalse((good / "latest.json").is_symlink())
+        # A DELETE of a link removes the link, not its target.
+        os.unlink(good / "latest.json")
+        os.symlink(secret, good / "latest.json")
+        self.assertEqual(204, self.call("DELETE", f"{STREAM}/latest").status_code)
+        self.assertTrue(secret.exists())
+
+    def test_a_symlinked_runs_directory_is_refused(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / f"{STAMP_1}.json").write_text("{}")
+        good = self.root / "compliance-audit" / "acme" / "gitops"
+        good.mkdir(parents=True)
+        os.symlink(outside, good / "runs")
+        self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_2}", 409)
+        self.assertRefused("GET", f"{STREAM}/runs/{STAMP_1}", 409)
+        self.assertRefused("GET", f"{STREAM}/runs", 409)
+        self.assertRefused("PUT", f"{STREAM}/latest", 409, b"{}")
+        self.assertEqual([f"{STAMP_1}.json"], [p.name for p in outside.iterdir()])
+
+    def test_a_symlinked_ring_entry_is_not_a_ring_entry(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "x.json").write_text("{}")
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        os.symlink(outside / "x.json", runs / f"{STAMP_1}.json")
+        self.assertEqual([], self.call("GET", f"{STREAM}/runs").json())
+        self.assertRefused("GET", f"{STREAM}/runs/{STAMP_1}", 409)
+        # latest may not copy a linked entry either.
+        self.assertRefused("PUT", f"{STREAM}/latest", 409, b"{}")
+
+    def test_a_symlink_on_the_roots_own_path_is_refused(self) -> None:
+        real = self.tmp / "real"
+        real.mkdir()
+        link = self.tmp / "link"
+        os.symlink(real, link)
+        with mock.patch.dict(os.environ, {store.REPORTS_DIR_ENV: str(link / "reports")}):
+            self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 409)
+        self.assertEqual([], list(real.iterdir()))
 
     def test_bodies(self) -> None:
         self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 400, b"not json")

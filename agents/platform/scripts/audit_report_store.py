@@ -43,13 +43,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import json
 import logging
 import os
 import re
+import secrets
 import ssl
+import stat
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -404,75 +406,140 @@ def _validate_stamp(stamp: str) -> str:
     return stamp
 
 
-def _inside(root: Path, path: Path) -> bool:
-    real_root = os.path.realpath(root)
-    real = os.path.realpath(path)
-    return real != real_root and os.path.commonpath([real_root, real]) == real_root
+# Every filesystem step below is fd-relative and refuses a symlink. The tree
+# is on the agent's data volume, which the platform-agent container beside
+# this one writes as the same uid, so a path checked and then used could be a
+# symlink by the time it is used. Each directory is opened from its parent's
+# fd with O_NOFOLLOW, each file is opened, created, renamed and unlinked by
+# name relative to its directory's fd, and modes are set with fchmod on the
+# open fd. A symlink anywhere on the path, the root's own path included, is
+# answered 409 and never followed.
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_SYMLINK_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
 
 
-def _store_dir(audit_id: str, key: str) -> Path:
-    root = reports_root()
-    owner, name = store_dirs_for_key(key)
-    directory = root / _validate_audit_id(audit_id) / owner / name
-    if not _inside(root, directory):
-        raise Refused(400, "the store key resolves outside the store")
-    return directory
+class _Missing(Exception):
+    """A directory on the path does not exist (and was not to be created)."""
 
 
-def _checked_file(directory: Path, name: str) -> Path:
-    path = directory / name
-    if not _inside(reports_root(), path):
-        raise Refused(400, "the path resolves outside the store")
-    return path
+def _symlink_refusal(where: str) -> Refused:
+    LOGGER.warning("refused a symlink or non-directory on the report store path at %s", _sanitize(where))
+    return Refused(409, "a symlink or a non-directory is on the store path")
 
 
-def _make_dirs(directory: Path) -> None:
-    root = reports_root()
-    if not root.exists():
-        root.mkdir(mode=REPORT_DIR_MODE, parents=True, exist_ok=True)
-    missing = []
-    current = directory
-    while not current.exists() and current != root and current != current.parent:
-        missing.append(current)
-        current = current.parent
-    for path in reversed(missing):
-        try:
-            path.mkdir(mode=REPORT_DIR_MODE)
-        except FileExistsError:
-            pass
-        os.chmod(path, REPORT_DIR_MODE)
-    if not _inside(root, directory):
-        raise Refused(400, "the store key resolves outside the store")
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    handle = tempfile.NamedTemporaryFile("wb", dir=str(path.parent), suffix=".tmp", delete=False)
+def _open_child_dir(parent_fd: int, name: str, create: bool) -> int:
     try:
-        with handle:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise _Missing(name) from None
+    except OSError as exc:
+        if exc.errno in _SYMLINK_ERRNOS:
+            raise _symlink_refusal(name) from None
+        raise
+    try:
+        os.mkdir(name, REPORT_DIR_MODE, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        created = False
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in _SYMLINK_ERRNOS:
+            raise _symlink_refusal(name) from None
+        raise
+    if created:
+        os.fchmod(fd, REPORT_DIR_MODE)
+    return fd
+
+
+class _DirChain:
+    """The directories root/<parts...>, opened fd by fd; `fd` is the last."""
+
+    def __init__(self, parts: list[str], create: bool) -> None:
+        self._fds: list[int] = []
+        root = os.path.abspath(reports_root())
+        components = [part for part in root.split(os.sep) if part] + parts
+        try:
+            self._fds.append(os.open(os.sep, _DIR_FLAGS & ~os.O_NOFOLLOW))
+            for name in components:
+                self._fds.append(_open_child_dir(self._fds[-1], name, create))
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def fd(self) -> int:
+        return self._fds[-1]
+
+    def close(self) -> None:
+        for fd in reversed(self._fds):
+            os.close(fd)
+        self._fds = []
+
+    def __enter__(self) -> "_DirChain":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _read_at(dir_fd: int, name: str) -> bytes:
+    """A regular file's bytes, opened without following a symlink. 404 if absent."""
+    try:
+        fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise Refused(404, "not found") from None
+    except OSError as exc:
+        if exc.errno in _SYMLINK_ERRNOS:
+            raise _symlink_refusal(name) from None
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise _symlink_refusal(name)
+        return handle.read()
+
+
+def _write_at(dir_fd: int, name: str, data: bytes) -> None:
+    """Replace `name` in one step from a temp file created in the same directory."""
+    tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, _CREATE_FLAGS, REPORT_FILE_MODE, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
-        os.chmod(handle.name, REPORT_FILE_MODE)
-        os.replace(handle.name, path)
+            os.fchmod(handle.fileno(), REPORT_FILE_MODE)
+        # rename(2) replaces a symlink at `name` itself; it never follows one.
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
-        Path(handle.name).unlink(missing_ok=True)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
         raise
 
 
-def _ring(runs: Path) -> list[Path]:
-    """The ring's entries, oldest first: files named by a valid stamp."""
+def _ring_names(runs_fd: int) -> list[str]:
+    """The ring's entries, oldest first: regular files named by a valid stamp."""
+    names = []
+    for name in os.listdir(runs_fd):
+        if not (name.endswith(".json") and STAMP_RE.match(name[: -len(".json")])):
+            continue
+        try:
+            if stat.S_ISREG(os.stat(name, dir_fd=runs_fd, follow_symlinks=False).st_mode):
+                names.append(name)
+        except FileNotFoundError:
+            continue
+    return sorted(names)
+
+
+def _ring_of(parts: list[str]) -> list[str]:
     try:
-        entries = [p for p in runs.iterdir() if p.suffix == ".json" and STAMP_RE.match(p.stem)]
-    except (FileNotFoundError, NotADirectoryError):
+        with _DirChain(parts + [REPORT_RUNS_DIR], create=False) as runs:
+            return _ring_names(runs.fd)
+    except _Missing:
         return []
-    return sorted(entries, key=lambda p: p.name)
-
-
-def _read_file(path: Path) -> bytes:
-    if not path.is_file():
-        raise Refused(404, "not found")
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        raise Refused(404, "not found") from None
 
 
 def _validated_body(body: bytes) -> bytes:
@@ -487,35 +554,59 @@ def _validated_body(body: bytes) -> bytes:
     return body
 
 
+def _child_dirs(dir_fd: int) -> list[str]:
+    """The real (not symlinked) subdirectories of a directory, sorted."""
+    names = []
+    for name in os.listdir(dir_fd):
+        try:
+            if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                names.append(name)
+        except FileNotFoundError:
+            continue
+    return sorted(names)
+
+
 def list_streams() -> list[dict]:
-    root = reports_root()
     streams = []
     try:
-        audits = sorted(p for p in root.iterdir() if p.is_dir() and not p.is_symlink() and AUDIT_ID_RE.match(p.name))
-    except (FileNotFoundError, NotADirectoryError):
+        root = _DirChain([], create=False)
+    except _Missing:
         return []
+    with root:
+        audits = [name for name in _child_dirs(root.fd) if AUDIT_ID_RE.match(name)]
     for audit in audits:
-        for owner in sorted(p for p in audit.iterdir() if p.is_dir() and not p.is_symlink()):
-            for store in sorted(p for p in owner.iterdir() if p.is_dir() and not p.is_symlink()):
-                key = store_key_for_dirs(owner.name, store.name)
+        try:
+            with _DirChain([audit], create=False) as chain:
+                owners = _child_dirs(chain.fd)
+        except (_Missing, Refused):
+            continue
+        for owner in owners:
+            try:
+                with _DirChain([audit, owner], create=False) as chain:
+                    stores = _child_dirs(chain.fd)
+            except (_Missing, Refused):
+                continue
+            for name in stores:
+                key = store_key_for_dirs(owner, name)
                 try:
-                    if store_dirs_for_key(key) != (owner.name, store.name):
+                    if store_dirs_for_key(key) != (owner, name):
                         continue
+                    ring = _ring_of([audit, owner, name])
                 except Refused:
                     continue
-                ring = _ring(store / REPORT_RUNS_DIR)
                 finished = None
                 try:
-                    latest = json.loads((store / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+                    with _DirChain([audit, owner, name], create=False) as chain:
+                        latest = json.loads(_read_at(chain.fd, REPORT_LATEST_NAME))
                     if isinstance(latest, dict) and isinstance(latest.get("finished_at"), str):
                         finished = latest["finished_at"]
-                except (OSError, ValueError):
+                except (_Missing, Refused, OSError, ValueError):
                     pass
                 streams.append(
                     {
-                        "audit_id": audit.name,
+                        "audit_id": audit,
                         "key": key,
-                        "newest_run": ring[-1].stem if ring else None,
+                        "newest_run": ring[-1][: -len(".json")] if ring else None,
                         "latest_finished_at": finished,
                     }
                 )
@@ -537,45 +628,58 @@ def handle(method: str, segments: list[str], body: bytes) -> tuple[int, bytes | 
     audit_id, key, *rest = segments
     if rest not in (["latest"], ["runs"]) and not (len(rest) == 2 and rest[0] == "runs"):
         raise Refused(404, "no such route")
-    directory = _store_dir(audit_id, key)
-    runs = directory / REPORT_RUNS_DIR
+    owner, name = store_dirs_for_key(key)
+    store = [_validate_audit_id(audit_id), owner, name]
+    try:
+        return _handle_store(method, audit_id, store, rest, body)
+    except _Missing:
+        raise Refused(404, "not found") from None
+
+
+def _handle_store(method: str, audit_id: str, store: list[str], rest: list[str], body: bytes) -> tuple[int, bytes | list | None]:
     if rest == ["latest"]:
-        latest = _checked_file(directory, REPORT_LATEST_NAME)
         if method == "GET":
-            return 200, _read_file(latest)
+            with _DirChain(store, create=False) as chain:
+                return 200, _read_at(chain.fd, REPORT_LATEST_NAME)
         if method == "PUT":
             data = _validated_body(body)
-            if not any(_checked_file(runs, entry.name).read_bytes() == data for entry in _ring(runs)):
-                raise Refused(409, "latest must be a copy of a run in the ring")
-            _atomic_write(latest, data)
+            try:
+                runs = _DirChain(store + [REPORT_RUNS_DIR], create=False)
+            except _Missing:
+                raise Refused(409, "latest must be a copy of a run in the ring") from None
+            with runs:
+                if not any(_read_at(runs.fd, entry) == data for entry in _ring_names(runs.fd)):
+                    raise Refused(409, "latest must be a copy of a run in the ring")
+            with _DirChain(store, create=False) as chain:
+                _write_at(chain.fd, REPORT_LATEST_NAME, data)
             return 204, None
         if method == "DELETE":
             try:
-                latest.unlink()
-            except FileNotFoundError:
+                with _DirChain(store, create=False) as chain:
+                    os.unlink(REPORT_LATEST_NAME, dir_fd=chain.fd)
+            except (_Missing, FileNotFoundError):
                 pass
             return 204, None
         raise Refused(405, "method not allowed")
     if rest == ["runs"]:
         if method != "GET":
             raise Refused(405, "method not allowed")
-        return 200, [entry.stem for entry in reversed(_ring(runs))]
-    if len(rest) == 2 and rest[0] == "runs":
-        stamp = _validate_stamp(rest[1])
-        if method == "GET":
-            return 200, _read_file(_checked_file(runs, f"{stamp}.json"))
-        if method == "PUT":
-            data = _validated_body(body)
-            _make_dirs(runs)
-            _atomic_write(_checked_file(runs, f"{stamp}.json"), data)
+        return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(store))]
+    stamp = _validate_stamp(rest[1])
+    if method == "GET":
+        with _DirChain(store + [REPORT_RUNS_DIR], create=False) as runs:
+            return 200, _read_at(runs.fd, f"{stamp}.json")
+    if method == "PUT":
+        data = _validated_body(body)
+        with _DirChain(store + [REPORT_RUNS_DIR], create=True) as runs:
+            _write_at(runs.fd, f"{stamp}.json", data)
             try:
-                for stale in _ring(runs)[:-REPORT_HISTORY]:
-                    stale.unlink()
+                for stale in _ring_names(runs.fd)[:-REPORT_HISTORY]:
+                    os.unlink(stale, dir_fd=runs.fd)
             except Exception as exc:  # noqa: BLE001 - the entry is written; a long ring costs disk only
                 LOGGER.warning("report store prune failed for %s: %s", audit_id, exc)
-            return 204, None
-        raise Refused(405, "method not allowed")
-    raise Refused(404, "no such route")
+        return 204, None
+    raise Refused(405, "method not allowed")
 
 
 def _raw_segments(raw_path: bytes) -> list[str] | None:
