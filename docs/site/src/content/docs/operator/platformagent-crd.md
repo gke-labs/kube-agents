@@ -1322,7 +1322,7 @@ Configures the operator-generated egress `NetworkPolicy`.
 - `enabled` (bool, optional) — toggle operator-managed NetworkPolicy generation. Default `true` (unset
   means on). Setting `false` stops generation and deletes the policies the operator manages for this
   agent: `<name>-gateway-netpol`, the `<name>-fqdn-netpol` `FQDNNetworkPolicy`, the shared
-  `litellm-policy` (if LiteLLM is present), and, under `spec.mode: next`, `<name>-report-store`. Deletions check ownership / managed labels first, so a
+  `litellm-policy` (if LiteLLM is present). Under `spec.mode: next` the gateway policy also carries the audit-report store's rule, which goes with it. Deletions check ownership / managed labels first, so a
   policy that the operator did not create survives. To opt only LiteLLM out of operator NetworkPolicy
   management while keeping the agent pod's policies managed, set the annotation
   `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` on the `PlatformAgent`. When opted out, the operator deletes any managed copy of `litellm-policy`, leaving LiteLLM unselected (fail-open) unless a replacement policy is provided and managed out-of-band.

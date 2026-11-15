@@ -209,14 +209,12 @@ that the token is bound to a pod of the broker's Deployment (the ServiceAccount 
 exec tier). A failed check is 401, a wrong subject or pod 403, and a JWKS it cannot read 503, never
 an accept. The API server, the token it reads the JWKS with and the store's root are fixed in the
 listener, not read from the environment, which `spec.deployment.env` reaches. The
-NetworkPolicy `<agent>-report-store` admits only the broker's pods to the port. Where any other
-policy in the namespace already isolates the gateway pod for ingress (the operator's gateway policy,
-or one a customer applied), that one rule is the whole policy. Where none does, the policy also
-admits every source on every other port, so the pod is no more closed than it was. The operator
-reads the namespace's policies again on every reconcile, and a policy change enqueues one, so a
-lockdown applied later drops that rule on the next pass. With `spec.networkPolicy.enabled: false`
-the policy is not rendered, as the operator's other policies are not, and the token check is the
-whole control. The routes take the store key as one path
+A rule in the gateway policy `<agent>-gateway-netpol` admits only the broker's pods to the port.
+It is a rule there rather than a policy of its own, so an operator rollback, which renders that
+policy without it, drops it and leaves nothing isolating the pod. With
+`spec.networkPolicy.enabled: false` it goes with the gateway policy, and the token check is the
+whole control. A rollback leaves the `<agent>-report-store` Service behind, which is inert:
+nothing listens on 8700 without this listener. The routes take the store key as one path
 segment, the repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to
 an empty, `.` or `..` part, a control character or a path outside the root. Every file and
 directory step is relative to an open directory and refuses a symlink (409), because the

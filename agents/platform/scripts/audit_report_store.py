@@ -19,9 +19,9 @@ the audience AUDIENCE. It is verified offline against the cluster's JWKS,
 which the API server publishes to every ServiceAccount through the default
 `system:service-account-issuer-discovery` binding, so the listener needs no
 RBAC of its own. The subject must be the broker's ServiceAccount
-(ALLOWED_SUBJECT_ENV). The NetworkPolicy `<agent>-report-store` admits only
-the broker's pods on the port; this check holds where that policy is not
-enforced.
+(ALLOWED_SUBJECT_ENV). A rule in the gateway NetworkPolicy
+`<agent>-gateway-netpol` admits only the broker's pods on the port; this
+check holds where that policy is off or not enforced.
 
 Routes (the store key is ONE path segment: the file store's repository
 directory with its `/` escaped as `%2F`; a non-GitHub `host/<path with %2F>`
