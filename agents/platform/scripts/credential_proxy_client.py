@@ -89,6 +89,19 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
 
+# Google Cloud universe domain (`googleapis.com` in commercial GCP, or a
+# partner/sovereign domain such as Google Cloud Dedicated). Kept in this module
+# because `gke_cluster_reads.py` and the sandbox collectors import it from the
+# root-owned `/opt/vcs/libexec/platform` closure.
+DEFAULT_UNIVERSE_DOMAIN = "googleapis.com"
+GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+CLOUDSDK_UNIVERSE_DOMAIN_ENV = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+MAX_UNIVERSE_DOMAIN_LENGTH = 253
+_GOOGLE_API_SUFFIX = "." + DEFAULT_UNIVERSE_DOMAIN
+_UNIVERSE_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z"
+)
+
 # The exec tier's shared names, here for the same reason as the relay prefix:
 # the broker and the shim both spell them, and this is the module both import.
 # docs/designs/credential-broker-exec-tier.md §12 is the contract, and
@@ -335,6 +348,55 @@ _SHELL_CONTEXT_FILE = re.compile(r"^([0-9]+)-([0-9]+)\.context\Z")
 END_OF_FLAGS = "--"
 CONTEXT_FLAG = "--context"
 KUBECONFIG_FLAG = "--kubeconfig"
+
+
+def normalize_universe_domain(raw: str | None) -> str:
+    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return DEFAULT_UNIVERSE_DOMAIN
+    cleaned = trimmed.removesuffix(".").lower()
+    if (
+        not cleaned
+        or len(cleaned) > MAX_UNIVERSE_DOMAIN_LENGTH
+        or not _UNIVERSE_DOMAIN_RE.fullmatch(cleaned)
+    ):
+        raise ValueError(
+            f"universe domain {raw!r} must be a lowercase DNS domain with at least two labels"
+        )
+    return cleaned
+
+
+def google_universe_domain(environ=os.environ) -> str:
+    """Return the active Google Cloud universe domain from the process environment."""
+    for name in (GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+        raw = environ.get(name, "").strip()
+        if raw:
+            return normalize_universe_domain(raw)
+    return DEFAULT_UNIVERSE_DOMAIN
+
+
+def google_api_host(service: str, universe_domain: str | None = None) -> str:
+    """Return `<service>.<universe_domain>` for the active or explicit universe domain."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    return f"{service}.{domain}"
+
+
+def rewrite_google_api_host(host: str, universe_domain: str | None = None) -> str:
+    """Rewrite `<service>.googleapis.com` to `<service>.<universe_domain>` when custom."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    lowered = host.lower()
+    if domain != DEFAULT_UNIVERSE_DOMAIN and lowered.endswith(_GOOGLE_API_SUFFIX):
+        return lowered[: -len(_GOOGLE_API_SUFFIX)] + "." + domain
+    return host
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -2244,7 +2306,8 @@ class ApiSession:
     def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        host = rewrite_google_api_host(parsed.netloc)
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{host}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed

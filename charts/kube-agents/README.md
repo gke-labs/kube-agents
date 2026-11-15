@@ -992,12 +992,18 @@ is canonical for the behaviour.
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
-`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+`platformAgent.harness.driftDetector`, `platformAgent.harness.universeDomain`, and
+`platformAgent.deployment.availability`
 expose the remaining PlatformAgent CR fields, so a chart install can reach every
 field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
-means zero rather than unset.
+means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
+`helm upgrade` on an install whose served `PlatformAgent` CRD predates
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+to a domain other than `googleapis.com`, the chart also sets
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
+renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.

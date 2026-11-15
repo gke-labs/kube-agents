@@ -86,6 +86,7 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # share, and importing them keeps the context-name grammar -- and where the
 # `--kubeconfig` scan stops -- in one place. Nothing else in
 # credential_proxy_client runs on import.
+import credential_proxy_client
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
@@ -666,6 +667,16 @@ EXEC_SHUTDOWN_DRAIN_SECONDS = 360
 # (#4536). The caller still gets the command's stderr and the audit line; only
 # the pod's own log files, for debugging a gcloud failure on the pod, are lost.
 GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
+CLOUDSDK_CLIENT_CERT_ENV = "CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE"
+CLIENT_CERT_DISABLED_VALUE = "false"
+GCE_UNIVERSE_METADATA_URL = "http://169.254.169.254/computeMetadata/v1/universe/universe-domain"
+GCE_METADATA_FLAVOR_HEADER = "Metadata-Flavor"
+GCE_METADATA_FLAVOR_VALUE = "Google"
+GCE_METADATA_TIMEOUT_SECONDS = 0.5
+GCE_METADATA_MAX_BYTES = 512
+_METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
+_METADATA_UNIVERSE_LOCK = threading.Lock()
 # kubectl's disk cache under the command HOME (discovery and HTTP responses),
 # which kubectl rebuilds on the next command. On an exec pod nothing else
 # frees it: a sweep reaches every cluster on every replica, at about 0.3 MiB a
@@ -1453,6 +1464,76 @@ EXIT_STARTUP_FAILURE = 1
 # format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
 LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
+
+
+def probe_gce_universe_domain_status(
+    metadata_url: str = GCE_UNIVERSE_METADATA_URL,
+    timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
+    opener: Any = None,
+) -> tuple[str, bool]:
+    """Probe the GCE/GKE metadata server, returning `(domain, determined)`.
+
+    Only HTTP 200 (with a valid DNS domain) and HTTP 404 (authoritative non-GCE
+    or older emulator) return `determined=True`; timeouts, connection errors,
+    and 5xx responses return `(googleapis.com, False)` so callers never cache a
+    transient metadata blip as commercial Google Cloud.
+    """
+    request = urllib.request.Request(
+        metadata_url,
+        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
+        method="GET",
+    )
+    active_opener = _METADATA_OPENER if opener is None else opener
+    try:
+        with active_opener.open(request, timeout=timeout) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
+            if response.status != HTTPStatus.OK:
+                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
+            if not raw:
+                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+            return credential_proxy_client.normalize_universe_domain(raw), True
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTPStatus.NOT_FOUND:
+            return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
+        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+    except (OSError, ValueError, http.client.HTTPException):
+        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+
+
+def _cached_metadata_universe_domain() -> tuple[str, bool]:
+    global _CACHED_METADATA_UNIVERSE_DOMAIN
+    with _METADATA_UNIVERSE_LOCK:
+        if _CACHED_METADATA_UNIVERSE_DOMAIN is not None:
+            return _CACHED_METADATA_UNIVERSE_DOMAIN, True
+        domain, determined = probe_gce_universe_domain_status()
+        if determined:
+            _CACHED_METADATA_UNIVERSE_DOMAIN = domain
+            if domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
+                os.environ.setdefault(
+                    credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, domain
+                )
+        return domain, determined
+
+
+def resolve_universe_domain(
+    *,
+    environ: Any = os.environ,
+    probe_metadata: bool = False,
+) -> str:
+    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+    for name in (
+        credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
+        credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
+    ):
+        raw = environ.get(name, "").strip()
+        if raw:
+            return credential_proxy_client.normalize_universe_domain(raw)
+    if probe_metadata:
+        domain, _ = _cached_metadata_universe_domain()
+        return domain
+    return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -8976,6 +9057,8 @@ class CommandExecutor:
         metrics: "ProxyMetrics | None" = None,
         gcloud_file_logging: bool = True,
         exclusions: "scope_exclude.Exclusions | None" = None,
+        universe_domain: str | None = None,
+        probe_metadata_universe: bool = False,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         # spec.scope.exclude.clusters, from the scope.json the operator mounts
@@ -9271,6 +9354,25 @@ class CommandExecutor:
         # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
         if not gcloud_file_logging:
             self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
+        # Prevent workstation/host mTLS client-certificate env vars from
+        # rewriting Google API endpoints to *.mtls.<universe_domain> inside
+        # brokered gcloud invocations, and propagate non-default universe
+        # domains to both Google Cloud SDKs and gcloud CLI children.
+        self._explicit_universe_domain = universe_domain
+        self._probe_metadata_universe = probe_metadata_universe
+        self.universe_domain = (
+            credential_proxy_client.normalize_universe_domain(universe_domain)
+            if universe_domain is not None
+            else resolve_universe_domain(probe_metadata=probe_metadata_universe)
+        )
+        self.environment[CLOUDSDK_CLIENT_CERT_ENV] = CLIENT_CERT_DISABLED_VALUE
+        if self.universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
+            self.environment[credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV] = (
+                self.universe_domain
+            )
+            self.environment[credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV] = (
+                self.universe_domain
+            )
         # Read here rather than forwarded into `self.environment`: this decides
         # which kubeconfig a request resolves to, and a subprocess has no
         # business reading it or overriding it.
@@ -11694,6 +11796,18 @@ class CommandExecutor:
                 }.get(root, str(root))
                 raise ValueError(f"working directory is outside {named}")
             command_cwd = requested_cwd
+        if (
+            self._explicit_universe_domain is None
+            and self._probe_metadata_universe
+            and self.universe_domain == credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
+        ):
+            refreshed = resolve_universe_domain(probe_metadata=True)
+            if refreshed != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
+                self.universe_domain = refreshed
+                self.environment[credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV] = (
+                    refreshed
+                )
+                self.environment[credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV] = refreshed
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
             command_environment.pop("KUBECONFIG", None)
@@ -13238,6 +13352,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
+    universe_domain: str | None = None
+    probe_metadata_universe: bool = False
     chat_relay: GoogleChatRelay | None = None
     # The A2A gateway's relay instance. Two consumers on one subscription
     # split deliveries randomly, so the operator arms exactly one instance per
@@ -14416,6 +14532,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return None
 
+    def _active_universe_domain(self) -> str:
+        if self.universe_domain is not None:
+            return self.universe_domain
+        return resolve_universe_domain(probe_metadata=self.probe_metadata_universe)
+
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
@@ -14463,7 +14584,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
         # below log it as-is; `path` is never logged again.
-        decision = api_policy.evaluate(self.command, host, path, parts.query)
+        decision = api_policy.evaluate(
+            self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
+        )
         if not decision.allowed:
             LOGGER.warning("api blocked request_id=%s rule=%s", request_id, decision.rule_id)
             self._json(
@@ -14602,7 +14725,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         principal = self.principal
         request_id = str(uuid.uuid4())
         server_name = urllib.parse.urlsplit(self.path).path[len(mcp_policy.MCP_RELAY_PREFIX) :]
-        entry = mcp_policy.server(server_name)
+        entry = mcp_policy.server(server_name, universe_domain=self._active_universe_domain())
         LOGGER.info(
             "mcp request_id=%s principal=%s server=%s",
             request_id,
@@ -14760,7 +14883,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             "watcher gcp",
             watcher_policy.WATCHER_GCP_PREFIX,
             lambda host, path, body: watcher_policy.evaluate_gcp(
-                self.command, host, path, body, self.watcher_subscription
+                self.command,
+                host,
+                path,
+                body,
+                self.watcher_subscription,
+                universe_domain=self._active_universe_domain(),
             ),
         )
 
@@ -14777,7 +14905,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             "platform pubsub",
             watcher_policy.PLATFORM_PUBSUB_PREFIX,
             lambda host, path, body: watcher_policy.evaluate_pubsub(
-                self.command, host, path, body, self.platform_pubsub_subscriptions
+                self.command,
+                host,
+                path,
+                body,
+                self.platform_pubsub_subscriptions,
+                universe_domain=self._active_universe_domain(),
             ),
             family="platform Pub/Sub relay",
         )
@@ -14853,7 +14986,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        if host == watcher_policy.PUBSUB_HOST:
+        if host == watcher_policy.pubsub_host(self._active_universe_domain()):
             extra["max_bytes"] = PUBSUB_RELAY_MAX_RESPONSE_BYTES
         upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
@@ -14920,7 +15053,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if authorization is None:
             return None
         describe = f"/v1/projects/{key[0]}/locations/{key[1]}/clusters/{key[2]}"
-        upstream = self._relay_fetch("watcher k8s", request_id, watcher_policy.GKE_HOST, describe, authorization)
+        upstream = self._relay_fetch(
+            "watcher k8s",
+            request_id,
+            watcher_policy.gke_host(self._active_universe_domain()),
+            describe,
+            authorization,
+        )
         if upstream is None:
             return None
         try:
@@ -16637,6 +16776,14 @@ def serve(args: argparse.Namespace) -> None:
     )
 
     CredentialProxyHandler.policy = Policy.load(args.policy)
+    CredentialProxyHandler.probe_metadata_universe = True
+    universe_domain = resolve_universe_domain(probe_metadata=True)
+    if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
+        os.environ.setdefault(
+            credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, universe_domain
+        )
+        CredentialProxyHandler.universe_domain = universe_domain
+    LOGGER.info("Google Cloud universe_domain=%s", universe_domain)
     executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
@@ -16654,6 +16801,7 @@ def serve(args: argparse.Namespace) -> None:
         # An exec pod's state volume is sized for no gcloud log files
         # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
         gcloud_file_logging=role != EXEC_ROLE,
+        probe_metadata_universe=True,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     memory_reader = MemoryReader(executor.child_peaks)

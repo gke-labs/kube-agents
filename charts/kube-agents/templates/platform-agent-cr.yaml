@@ -149,6 +149,10 @@ spec:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
     projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
+    {{- with .Values.platformAgent.harness.universeDomain }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.universeDomain" "path" (list "harness") "field" "universeDomain") }}
+    universeDomain: {{ . | quote }}
+    {{- end }}
     {{- /*
       Every optional field below goes through kube-agents.compactFields, which
       drops null and "" but keeps `false` and `0`, and which renders nothing at

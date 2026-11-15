@@ -342,6 +342,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// The API token is for its two watches: the dispatch
 					// ConfigMap and the worker pods (its Roles). The bus

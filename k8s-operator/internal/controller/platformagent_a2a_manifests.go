@@ -296,7 +296,9 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
+	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep    = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -3017,6 +3019,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					Annotations: map[string]string{a2aConfigHashAnnotation: confHash},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 					AutomountServiceAccountToken: ptr.To(false),
 					// The reloader signals nats-server by PID.
 					ShareProcessNamespace: ptr.To(true),
@@ -4249,7 +4252,8 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					RestartPolicy:    corev1.RestartPolicyNever,
 					// Its own ServiceAccount, holding no RBAC at all: the
 					// token exists to authenticate to the bus, not to talk to
 					// the API server. Automount stays off and the bus token is
@@ -6499,6 +6503,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if credentialProxyExecTierEnabled(agent) {
 			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 		}
+		if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+		}
 	}
 
 	// The chat backends. The Discord reference is the default for a gateway
@@ -6776,6 +6783,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
+	if len(pullRefs) > 0 {
+		refNames := make([]string, 0, len(pullRefs))
+		for _, ref := range pullRefs {
+			refNames = append(refNames, ref.Name)
+		}
+		env = append(env, corev1.EnvVar{
+			Name:  a2aImagePullRefsEnvVar,
+			Value: strings.Join(refNames, a2aImagePullRefsSep),
+		})
+	}
 
 	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -6794,6 +6812,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: pullRefs,
 					// ndots:3, see brokerCallerPodDNSConfig.
 					DNSConfig: brokerCallerPodDNSConfig(),
 					// The gateway runs as its own ServiceAccount with the

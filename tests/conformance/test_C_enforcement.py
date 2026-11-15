@@ -2501,6 +2501,63 @@ class C2FailClosed(unittest.TestCase):
                 "present, so a missing key degrades to an unauthenticated request",
             )
 
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
+            )
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
