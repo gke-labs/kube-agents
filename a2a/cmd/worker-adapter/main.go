@@ -134,6 +134,12 @@ const (
 	// checks that the variable is non-empty.
 	defaultModelBaseURL = "http://inference-gateway"
 	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
+
+	// The env names that tell the harness how to reach the model.
+	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
+	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"
+	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
+	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
 func main() {
@@ -615,7 +621,8 @@ var busCredentialEnv = []string{"NATS_PASSWORD", "NATS_USER", "NATS_URL"}
 // credential, plus model-auth defaults. With nothing configured, the harness
 // talks to the install's own LiteLLM - Vertex-backed via the install's
 // credentials, no per-worker key (playground posture; the deployment spec's
-// auth story replaces this).
+// auth story replaces this). The placeholder key goes in whenever the pod
+// sets no key, no bearer token and no Vertex, so a pod spec never needs one.
 func harnessEnv() []string {
 	withheld := make(map[string]bool, len(busCredentialEnv))
 	for _, key := range busCredentialEnv {
@@ -631,12 +638,17 @@ func harnessEnv() []string {
 	has := func(key string) bool {
 		return os.Getenv(key) != ""
 	}
-	if !has("ANTHROPIC_BASE_URL") && !has("CLAUDE_CODE_USE_VERTEX") && !has("ANTHROPIC_API_KEY") {
-		env = append(env,
-			"ANTHROPIC_BASE_URL="+defaultModelBaseURL,
-			// LiteLLM here runs keyless; the value only satisfies the
-			// harness's "an API key exists" check.
-			"ANTHROPIC_API_KEY="+defaultModelAPIKey)
+	if !has(modelBaseURLEnv) && !has(modelUseVertexEnv) && !has(modelAPIKeyEnv) {
+		env = append(env, modelBaseURLEnv+"="+defaultModelBaseURL)
+	}
+	// The gateway runs keyless. The placeholder only satisfies the harness's
+	// "an API key exists" check. The adapter adds it here, in the child env,
+	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
+	// the full gateway name). Thus a pod spec does not need a literal model
+	// key, which the AI workload audit (fleet-audit check 3.5) flags. Vertex
+	// and a bearer token do not use the key, so the adapter does not add it.
+	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
+		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
 	}
 	for _, kv := range []string{
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
