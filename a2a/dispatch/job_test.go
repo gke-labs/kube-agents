@@ -634,3 +634,44 @@ func TestAnUnreadableJobAtItsStartLimitKeepsTheTaskQueued(t *testing.T) {
 		t.Errorf("Health.Waiting %v: the task stays queued, so it shows as waiting", h.Waiting)
 	}
 }
+
+// A script-run task's confirm carries the script its trigger names, as the
+// profile's spec.scripts lists it in the config the dispatcher admitted the
+// task on (#5622): the worker takes the path from here, never from the task.
+// A model task's confirm carries none.
+func TestAScriptTasksConfirmCarriesTheProfilesScript(t *testing.T) {
+	b := newBus(t, "job-task-1", "job-task-2")
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, 200*time.Millisecond)
+	w2 := b.worker("inv", "unattended", "job-task-2", answerAccept, 200*time.Millisecond)
+	want := lib.DispatchScript{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 30}
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].Scripts = []lib.DispatchScript{want} })
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, newFakeJobs(100*time.Millisecond))
+
+	env := triggeredEnv(t, "inv", "task-1", "cap-ok", `{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}`, map[string]string{})
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("inv", "unattended", lib.SubmitKindTop, "task-1"), env); err != nil {
+		t.Fatal(err)
+	}
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v, want completed", ts)
+	}
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-2")
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("model task terminal %+v, want completed", ts)
+	}
+
+	scripts := map[string]*lib.DispatchScript{}
+	for _, wk := range []*fakeWorker{w, w2} {
+		wk.mu.Lock()
+		for _, m := range wk.confirms {
+			scripts[m.TaskID] = m.Script
+		}
+		wk.mu.Unlock()
+	}
+	if got := scripts["task-1"]; got == nil || *got != want {
+		t.Errorf("the script task's confirm carried script %+v; want %+v", got, want)
+	}
+	if got, ok := scripts["task-2"]; !ok || got != nil {
+		t.Errorf("the model task's confirm (seen %v) carried script %+v; want none", ok, got)
+	}
+}
