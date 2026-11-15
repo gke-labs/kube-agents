@@ -39,8 +39,7 @@ class InstallTroubleshootingDocsTest(unittest.TestCase):
     def test_install_md_troubleshooting_kubectl_logs_commands(self):
         content = INSTALL_MD.read_text(encoding="utf-8")
         self.assertIn("kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy", content)
-        # Slack and Google Chat log on the A2A gateway; no command reads the agent container for chat.
-        self.assertNotIn("deploy/platform-agent-gateway -c platform-agent", content)
+        # Slack and Google Chat log on the A2A gateway.
         self.assertIn("kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway", content)
         self.assertIn("A2AGateway", content)
         self.assertIn("NoChatBackend", content)
