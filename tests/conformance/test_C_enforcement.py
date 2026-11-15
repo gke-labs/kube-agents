@@ -1061,7 +1061,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         policy that selects the gateway pod and isolates it for ingress, and
         every rule in them that reaches the port: each must admit exactly the
         broker's pod selector. And at least one must, or the store is reached
-        by nobody, which is no listener.
+        by nobody, which is no listener. The rule lives in the gateway policy,
+        and no policy of the store's own is rendered: an operator rollback
+        rewrites the gateway policy without the rule, where a separate policy
+        would be left behind isolating the pod to the broker alone.
         """
         documents = h.yaml_documents("golden_next")
         port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
@@ -1116,44 +1119,21 @@ class C1IsolationIsStructural(unittest.TestCase):
                 if self._rule_reaches(rule, port, port_name):
                     reaching.append((policy["metadata"]["name"], rule.get("from")))
         self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
+        self.assertEqual(
+            {name for name, _ in reaching}, {"platformagent-gateway-netpol"},
+            "the store's rule is not in the gateway policy",
+        )
+        self.assertEqual(
+            [p["metadata"]["name"] for p in h.objects_of_kind(documents, "NetworkPolicy")
+             if p["metadata"]["name"].endswith("-report-store")],
+            [], "a NetworkPolicy of the store's own is rendered, which an operator rollback leaves behind",
+        )
         for name, peers in reaching:
             with self.subTest(policy=name):
                 self.assertEqual(
                     peers, [{"podSelector": {"matchLabels": broker_selector}}],
                     "a rule reaching the store's port admits a peer other than the broker's pods",
                 )
-
-    def test_C1_the_report_store_catch_all_yields_to_any_ingress_policy(self) -> None:
-        """The store policy's open-everything-but-8700 rule renders only where no policy isolates the pod.
-
-        NetworkPolicies are a union: next to any policy that isolates the
-        gateway pod for ingress, a rule admitting every source on every other
-        port reopens what that policy closed. The goldens hold only the
-        operator's own gateway policy, so what keeps a customer's lockdown
-        intact is the reconcile reading every policy in the namespace, not
-        just the operator's, and handing that answer to the builder. Read
-        from the operator's source, as no golden renders a foreign policy.
-        """
-        source = h.text("audit_report_store_operator")
-        reconcile = _go_code(source, "reconcileAuditReportStore")
-        self.assertIn("r.gatewayPodIngressIsolated(ctx, agent)", reconcile)
-        self.assertRegex(
-            reconcile, r"buildAuditReportStoreNetworkPolicy\(agent, gatewayIngressIsolated\)",
-            "the policy is not built from the namespace's answer",
-        )
-        isolated = _go_code(source, "gatewayPodIngressIsolated")
-        lists = re.findall(r"r\.List\(ctx, &policies,(.*?)\); err", isolated)
-        self.assertEqual(
-            [part.strip() for part in lists], ["client.InNamespace(agent.Namespace)"],
-            "the policies are not listed whole: a label or owner filter misses a customer's policy",
-        )
-        self.assertIn("np.Name == auditReportStoreName(agent) || !policyIsolatesIngress(np)", isolated)
-        self.assertIn("selector.Matches(set)", isolated)
-        # Doubt counts as isolating: a selector it cannot evaluate.
-        self.assertRegex(isolated, r"LabelSelectorAsSelector\(&np\.Spec\.PodSelector\)\s*if err != nil \{\s*return true, nil")
-        # An empty policyTypes is Ingress, as the API server defaults it.
-        ingress = _go_code(source, "policyIsolatesIngress")
-        self.assertRegex(ingress, r"len\(np\.Spec\.PolicyTypes\) == 0 \{\s*return true")
 
     def test_C1_the_report_store_listener_reads_only_reserved_env(self) -> None:
         """Every environment variable the store listener reads is one a CR cannot set.

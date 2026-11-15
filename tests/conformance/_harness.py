@@ -423,11 +423,11 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
-    # The audit-report store's operator half (#5619): whether its NetworkPolicy
-    # carries the catch-all rule turns on every ingress policy in the namespace.
+    # The audit-report store's operator half (#5619): the env names it
+    # reserves, and the gateway-policy rule.
     "audit_report_store_operator": Source(
         "k8s-operator/internal/controller/audit_report_store.go",
-        ("gatewayPodIngressIsolated(", "policyIsolatesIngress(", "buildAuditReportStoreNetworkPolicy("),
+        ("auditReportStoreEnvNames", "auditReportStoreIngressRule("),
     ),
     # The listener itself, read as text: the suite does not import it (it
     # needs FastAPI and cryptography).
