@@ -2301,6 +2301,25 @@ Mutation(
         "allowlist, it opens the store and every other port to every source",
     ),
     Mutation(
+        "C1-report-store-catch-all-reads-only-the-operators-policy",
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("\tgatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)\n",
+         "\tgatewayIngressIsolated, err := r.gatewayNetpolGenerated(ctx, agent)\n"),
+        "test_C1_the_report_store_catch_all_yields_to_any_ingress_policy",
+        "decide the catch-all from whether the operator rendered its own gateway "
+        "policy -- a customer's lockdown with spec.networkPolicy off then gets "
+        "every port reopened beside it",
+    ),
+    Mutation(
+        "C1-report-store-lists-only-owned-policies",
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("r.List(ctx, &policies, client.InNamespace(agent.Namespace))",
+         "r.List(ctx, &policies, client.InNamespace(agent.Namespace), client.MatchingLabels(commonLabels(agent)))"),
+        "test_C1_the_report_store_catch_all_yields_to_any_ingress_policy",
+        "list only the operator's labelled policies, which is what the cache "
+        "already holds warm -- a customer's isolating policy is then invisible",
+    ),
+    Mutation(
         "C1-report-store-renders-under-today",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("---\napiVersion: v1\nkind: Service\n",

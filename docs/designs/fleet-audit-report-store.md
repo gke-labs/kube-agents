@@ -206,12 +206,16 @@ against the cluster's JWKS, which it reads with the pod's own API-audience token
 `system:service-account-issuer-discovery` binding allows that, so the listener needs no new RBAC.
 It checks the issuer, the audience, the expiry and that the subject is the broker's ServiceAccount.
 A failed check is 401, a wrong subject 403, and a JWKS it cannot read 503, never an accept. The
-NetworkPolicy `<agent>-report-store` admits only the broker's pods to the port. Where the gateway
-policy already isolates the pod, that one rule is the whole policy. Where nothing does
-(`spec.networkPolicy.enabled: false`), the policy also admits every source on every other port, so
-the pod is no more closed than it was. The routes take the store key as one path segment, the
-repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to an empty,
-`.` or `..` part, a control character or a path outside the root. A ring write prunes to 14, and
+NetworkPolicy `<agent>-report-store` admits only the broker's pods to the port. Where any other
+policy in the namespace already isolates the gateway pod for ingress (the operator's gateway policy,
+or one a customer applied), that one rule is the whole policy. Where none does, the policy also
+admits every source on every other port, so the pod is no more closed than it was. The operator
+reads the namespace's policies again on every reconcile, and a policy change enqueues one, so a
+lockdown applied later drops that rule on the next pass. The routes take the store key as one path
+segment, the repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to
+an empty, `.` or `..` part, a control character or a path outside the root. Every file and
+directory step is relative to an open directory and refuses a symlink (409), because the
+`platform-agent` container writes the same volume as the same user. A ring write prunes to 14, and
 `latest` must be a byte-identical copy of a ring entry. Today mode renders none of this.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`

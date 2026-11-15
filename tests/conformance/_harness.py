@@ -423,6 +423,12 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
+    # The audit-report store's operator half (#5619): whether its NetworkPolicy
+    # carries the catch-all rule turns on every ingress policy in the namespace.
+    "audit_report_store_operator": Source(
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("gatewayPodIngressIsolated(", "policyIsolatesIngress(", "buildAuditReportStoreNetworkPolicy("),
+    ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("operatorPodNameLabel", "operatorPodNameValue"),

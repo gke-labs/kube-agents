@@ -1123,6 +1123,36 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "a rule reaching the store's port admits a peer other than the broker's pods",
                 )
 
+    def test_C1_the_report_store_catch_all_yields_to_any_ingress_policy(self) -> None:
+        """The store policy's open-everything-but-8700 rule renders only where no policy isolates the pod.
+
+        NetworkPolicies are a union: next to any policy that isolates the
+        gateway pod for ingress, a rule admitting every source on every other
+        port reopens what that policy closed. The goldens hold only the
+        operator's own gateway policy, so what keeps a customer's lockdown
+        intact is the reconcile reading every policy in the namespace, not
+        just the operator's, and handing that answer to the builder. Read
+        from the operator's source, as no golden renders a foreign policy.
+        """
+        source = h.text("audit_report_store_operator")
+        reconcile = _go_code(source, "reconcileAuditReportStore")
+        self.assertIn("r.gatewayPodIngressIsolated(ctx, agent)", reconcile)
+        self.assertRegex(
+            reconcile, r"buildAuditReportStoreNetworkPolicy\(agent, gatewayIngressIsolated\)",
+            "the policy is not built from the namespace's answer",
+        )
+        isolated = _go_code(source, "gatewayPodIngressIsolated")
+        lists = re.findall(r"r\.List\(ctx, &policies,(.*?)\); err", isolated)
+        self.assertEqual(
+            [part.strip() for part in lists], ["client.InNamespace(agent.Namespace)"],
+            "the policies are not listed whole: a label or owner filter misses a customer's policy",
+        )
+        self.assertIn("np.Name == auditReportStoreName(agent) || !policyIsolatesIngress(np)", isolated)
+        self.assertIn("selector.Matches(labels.Set(podLabels))", isolated)
+        # An empty policyTypes is Ingress, as the API server defaults it.
+        ingress = _go_code(source, "policyIsolatesIngress")
+        self.assertRegex(ingress, r"len\(np\.Spec\.PolicyTypes\) == 0 \{\s*return true")
+
     def test_C1_today_renders_no_audit_report_store(self) -> None:
         """Under today the listener, its Service, its policy and its token are absent.
 
