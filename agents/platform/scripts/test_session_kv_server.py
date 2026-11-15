@@ -1269,6 +1269,77 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         self.assertTrue(any("slack will not receive it" in line for line in logs.output), logs.output)
 
 
+class TestAlertGoesToTheFirstHomePostPlatform(unittest.TestCase):
+    """The alert picks the first platform chat_notify.routed_platforms()
+    names, Chat first: Slack alone when no CR home is set and the projected
+    file names a channel, and Chat (kept for its digest) when no platform
+    has a home."""
+
+    def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_register_session_routing", "_record_alert_title", "mark_delivery_failed"):
+            p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_create_gateway_session", "_start_agent_turn"):
+            p = patch.object(session_kv_server, name, return_value=STARTED)
+            p.start()
+            self.addCleanup(p.stop)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        p = patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        p.start()
+        self.addCleanup(p.stop)
+        env = patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "SLACK_RELAY_URL", "SLACK_BOT_TOKEN"):
+            os.environ.pop(name, None)
+
+    def _run(self, notify):
+        argvs = []
+
+        def run(argv, **_kwargs):
+            argvs.append(argv)
+            return notify(argv)
+
+        pool = park_triage_starts()
+        with patch.object(session_kv_server.subprocess, "run", side_effect=run):
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        return [argv[:4] for argv in argvs]
+
+    def _write_home_file(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_projected_slack_channel_takes_the_alert_when_no_cr_home_is_set(self):
+        self._write_home_file("C1\n")
+        legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"message_id": "1712345678.000100", "thread_id": "1712345678.000100"}), stderr=""))
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "slack"]])
+        session_kv_server._register_session_routing.assert_called_once()
+        self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], "slack")
+
+    def test_with_no_home_the_alert_goes_to_chat_and_is_kept(self):
+        self._write_home_file("")
+
+        def kept(argv):
+            raise session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, argv, stderr="kept")
+
+        legs = self._run(kept)
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_not_called()
+
+
 class TestAlertTitleRecord(unittest.TestCase):
     def setUp(self):
         import sqlite3
@@ -5249,8 +5320,9 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
 
     The case that found it: `spec.mode: next`, the gateway holding Slack, no
     home channel. The managed scope turns both Hermes platforms off and
-    `A2A_NOTIFY_PLATFORM` is absent, so the platform walk resolves nothing and
-    the fallback used to post the report to Google Chat.
+    `A2A_NOTIFY_PLATFORM` is absent; the fallback used to post the report to
+    Google Chat. Now every armed route takes the home posts when no platform
+    has a home, so only an install with no armed route reaches the refusal.
     """
 
     SLACK_REFUSAL = (
@@ -5308,24 +5380,15 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
                 patcher.stop()
         return response, mocks
 
-    def test_slack_with_no_home_channel_sends_nothing_and_names_the_field(self):
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
-        response, mocks = self._post()
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["detail"], f"chat relay failed: {self.SLACK_REFUSAL}")
-        for name, mock in mocks.items():
-            mock.assert_not_called()
-
-    def test_google_chat_with_no_home_channel_names_its_own_field(self):
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
-        response, mocks = self._post()
-        self.assertEqual(response.status_code, 502)
-        self.assertIn(
-            "composed but not delivered to google_chat (no home channel: set "
-            "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)",
-            response.json()["detail"],
-        )
-        mocks["_send_to_chat"].assert_not_called()
+    def test_an_armed_route_with_no_home_channel_takes_the_report(self):
+        # No platform has a home, so every armed route takes the home posts:
+        # the report goes to the gateway, which keeps it for its digest.
+        for platform in ("slack", "google_chat"):
+            with self.subTest(platform=platform):
+                os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = platform
+                _, mocks = self._post()
+                mocks["_send_to_chat"].assert_called_once()
+                self.assertEqual(mocks["_send_to_chat"].call_args.args[0], platform)
 
     def test_no_gateway_backend_gets_the_neutral_refusal(self):
         """No chat at all and a malformed home channel both leave the variable
@@ -12560,17 +12623,16 @@ class TestDriftBacklog(unittest.TestCase):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         stamp.assert_called_once_with("t_digest1", "drift", "")
 
-    def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
+    def test_a_next_install_with_no_armed_route_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
-        the gateway holding Slack with no home channel. The operator renders
-        both Hermes platforms off and `A2A_NOTIFY_CONVERSATIONS` without
-        `A2A_NOTIFY_PLATFORM`, which it sets only with a home channel."""
+        both Hermes platforms off, and no route armed on the gateway, so
+        neither notify variable is rendered. An armed route with no home
+        channel is not headless: it takes the home posts for the digest."""
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for key in PLATFORM_SIGNAL_KEYS + (chat_notify.NOTIFY_PLATFORM_ENV,):
+        for key in PLATFORM_SIGNAL_KEYS + (chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV):
             os.environ.pop(key, None)
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         managed = os.path.join(tmp.name, "config.yaml")

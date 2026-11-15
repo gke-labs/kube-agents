@@ -111,6 +111,10 @@ readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
 readonly MINTER_GSA_ID_MAX_LEN=30
 readonly MINTER_GSA_CLUSTER_PREFIX_LEN=18
 readonly MINTER_GSA_HASH_LEN=4
+# The platform names the home-channel warning uses, as the operator's
+# HomeChannelUnset condition spells them.
+readonly NEXT_HOME_CHANNEL_GCHAT_PLATFORM="Google Chat"
+readonly NEXT_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 
 # ─── Release footprint summary ────────────────────
 # What install.sh's pre-flight summary prints about the cluster footprint and
@@ -1296,7 +1300,7 @@ announce_platform_agent_mode_switch() {
   PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat and Slack, either or both."
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
@@ -1327,11 +1331,12 @@ note_platform_agent_mode_not_applied() {
 
 # Whether Slack is consumed by the A2A gateway after this apply: the
 # operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
-# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
-# the gateway when both are on, and Slack stays on the today path. $1 the
-# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+# which is Slack enabled; the mode argument is the shim part 2 of the
+# today removal deletes. The gateway runs Google Chat beside it, so Chat
+# does not change the answer. $1 the mode the apply
+# renders, $2 SLACK_ENABLED.
 slack_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
 }
 
 # Whether Google Chat is consumed by the A2A gateway after this apply: the
@@ -1457,8 +1462,8 @@ slack_bot_token_has_separator() {
 # returns 0.
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via keep_today say=print_error lead=""
-  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+  local emails bad_home count refused=false via say=print_error lead=""
+  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
@@ -1479,14 +1484,9 @@ refuse_next_slack_gateway_settings() {
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
-    if [ "$flags" = "flags" ]; then
-      via="install.env or --slack-bot-token"
-      # A first install is next by default, so the flag is the way to stay on today.
-      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
-    fi
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
+    print_info "The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or turn Slack off (SLACK_ENABLED=false)."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -1511,41 +1511,71 @@ refuse_next_slack_gateway_settings_from_env() {
 # proactive posts (alerts, drift reports, scheduled reports), and it arms them
 # only on a home channel. A reply in a conversation still arrives without one,
 # so an install with none looks healthy while every unprompted post is refused
-# by the gateway and kept for one digest (#3320). The front doors warn rather than refuse: some installs want chat
-# with no posts, and a CI install never posts. The operator reports the same
+# by the gateway and kept for one digest (#3320). With two platforms on the
+# gateway and one home set, the agent sends home posts to that home instead.
+# The front doors warn rather than refuse: some installs want chat with no
+# posts, and a CI install never posts. The operator reports the same
 # state as the HomeChannelUnset condition.
 #
-# The install.env key of the home channel the gateway's chat backend lacks,
-# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
-# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
-# The backend follows the operator: Chat holds the gateway when enabled, and
-# Slack only when Chat is not (slack_moves_to_a2a_gateway).
+# The install.env keys of the home channels the gateway's chat backends lack,
+# one per line, Google Chat first as in the operator's condition, or nothing:
+# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED, $4
+# SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL. The backends follow the
+# operator: the gateway holds each platform that is enabled
+# (google_chat_moves_to_a2a_gateway, slack_moves_to_a2a_gateway).
 next_home_channel_unset_key() {
   local home
-  [ "${1:-}" = "next" ] || return 0
-  if is_truthy "${3:-}"; then
+  if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
     home="${5:-}"
     home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
-    return 0
+    [ -n "$home" ] || printf '%s\n' GOOGLE_CHAT_HOME_CHANNEL
   fi
-  if is_truthy "${2:-}"; then
+  if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
     home="${4:-}"
     home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
+    [ -n "$home" ] || printf '%s\n' SLACK_HOME_CHANNEL
   fi
   return 0
 }
 
-# The warning for that key ($1), one line.
-next_home_channel_unset_message() {
-  local meanwhile="it refuses them and keeps them for one digest"
-  # Only the Chat key can have Slack beside it: Slack holds the gateway only
-  # with Chat off, so with the Slack key the posts are kept, never sent on.
-  if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
-    meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
+# The gateway platform that has a home channel, as the operator names it in
+# the HomeChannelUnset condition, or nothing: next_home_channel_unset_key's
+# five arguments. Google Chat first, as the agent picks where home posts go
+# (chat_notify.routed_platforms). A Chat home counts only as a space name, and
+# a Slack home only as a channel id: the gateway arms no route for anything
+# else (the operator's slackChannelID). It cannot see a Slack channel
+# the gateway learned from a mention, which only the cluster records: with
+# that channel learned, the warning for Google Chat still says the gateway
+# keeps its posts, while the agent sends them to Slack. Called when a key is
+# unset, so the platform it prints is the other one.
+next_home_channel_set_platform() {
+  local home
+  if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
+    home="$(trim_go_space "${5:-}")"
+    if [ -n "$home" ] && [ -z "$(gchat_home_channel_not_a_space_name "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_GCHAT_PLATFORM"
+      return 0
+    fi
   fi
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
+    home="$(trim_go_space "${4:-}")"
+    if [ -n "$home" ] && [ -z "$(slack_home_channel_not_an_id "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_SLACK_PLATFORM"
+    fi
+  fi
+  return 0
+}
+
+# The warning for one of those keys ($1), one line. $2 is
+# next_home_channel_set_platform's answer: the agent sends home posts to every
+# routed platform with a home channel, so with one set the posts go there, and
+# the gateway keeps them only when no platform has one.
+next_home_channel_unset_message() {
+  if [ -n "${2:-}" ]; then
+    printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set they go to ${2}'s home channel meanwhile; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+    return 0
+  fi
+  printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set it refuses them and keeps them for one digest; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
@@ -1566,18 +1596,23 @@ next_home_channel_unset_remedy() {
 
 # Set by warn_next_home_channel_unset, and again by install.sh from the mode
 # after the apply, so the front door's closing summary can say it again where
-# the reader of a non-interactive run's log will see it.
+# the reader of a non-interactive run's log will see it. One key per line.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
+# Set beside it: next_home_channel_set_platform's answer for the same apply.
+NEXT_HOME_CHANNEL_SET_PLATFORM=""
 
-# Warns when the apply leaves the gateway's chat backend without a home
-# channel, and records the key for the closing summary. Takes
+# Warns for each of the gateway's chat backends the apply leaves without a
+# home channel, and records the keys for the closing summary. Takes
 # next_home_channel_unset_key's five arguments, then "flags" as $6. Never
 # refuses.
 warn_next_home_channel_unset() {
+  local key
   NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
-  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+  NEXT_HOME_CHANNEL_SET_PLATFORM="$(next_home_channel_set_platform "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "$(next_home_channel_unset_message "$key" "$NEXT_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${6:-}")"
+  done
   return 0
 }
 
@@ -1588,13 +1623,16 @@ warn_next_home_channel_unset_from_env() {
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
 
-# The closing summary's block, when warn_next_home_channel_unset found the
-# key empty: printed last, so a non-interactive log ends on it. $1 "flags".
+# The closing summary's block, when warn_next_home_channel_unset found a key
+# empty: printed last, so a non-interactive log ends on it. $1 "flags".
 print_next_home_channel_unset_summary() {
+  local key
   [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
   echo ""
-  print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$key" "$NEXT_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${1:-}")"
+  done
 }
 
 # Set by print_chat_setup_checklists: "true" when it printed a checklist.
@@ -1629,6 +1667,8 @@ print_chat_setup_checklists() {
   CHAT_SETUP_CHECKLIST_PRINTED="false"
   NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
     "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  NEXT_HOME_CHANNEL_SET_PLATFORM="$(next_home_channel_set_platform "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
   # --dry-run: a printer changes nothing, yet load_state would otherwise ask
   # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
   # vars.sh, which no front door writes.
@@ -1650,7 +1690,6 @@ print_chat_setup_checklists() {
     KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
       SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
       SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
-      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
       SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
       SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
