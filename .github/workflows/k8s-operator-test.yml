@@ -47,6 +47,9 @@ on:
       # tests), so a change to them must run this job too, or a stale fixture
       # reds main while every PR that touches only it skips the check.
       - "a2a/authcallout/testdata/**"
+      # agentprofile_model_key_test.go reads the AI workload audit's patterns
+      # from this file.
+      - "agents/platform/skills/fleet-audit/scripts/collect.py"
       - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
@@ -96,6 +99,7 @@ jobs:
             operator:
               - "k8s-operator/**"
               - "a2a/authcallout/testdata/**"
+              - "agents/platform/skills/fleet-audit/scripts/collect.py"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go

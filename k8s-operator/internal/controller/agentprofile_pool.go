@@ -134,8 +134,9 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		// in the profile namespace, where the session worker's short default
 		// doesn't resolve. The gateway runs keyless. Do not set
 		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
-		// key in a pod spec (check 3.5), also a placeholder. worker-adapter
-		// adds the placeholder to the harness env (harnessEnv).
+		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
+		// a placeholder. worker-adapter adds the placeholder to the harness
+		// env (harnessEnv).
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},

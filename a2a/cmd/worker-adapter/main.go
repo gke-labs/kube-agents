@@ -645,8 +645,9 @@ func harnessEnv() []string {
 	// "an API key exists" check. The adapter adds it here, in the child env,
 	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
 	// the full gateway name). Thus a pod spec does not need a literal model
-	// key, which the AI workload audit (fleet-audit check 3.5) flags. Vertex
-	// and a bearer token do not use the key, so the adapter does not add it.
+	// key, which the AI workload audit flags (fleet-audit check 3.5,
+	// model-credential-plaintext-env). Vertex and a bearer token do not use
+	// the key, so the adapter does not add it.
 	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
 		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
 	}
