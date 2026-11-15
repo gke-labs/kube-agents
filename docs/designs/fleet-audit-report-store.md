@@ -196,6 +196,24 @@ its own, separate from the gateway's; without it, the gateway pod's `platform-ag
 in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make fleet-audit-view`
 probes the agent pods for both containers and reads the sandbox first.
 
+Under `mode: next` a profile worker runs in a pod with no PVC, so the store is also served over the
+network, to the credential broker and to nothing else (#5619). `audit_report_store.py` listens on
+port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
+volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
+store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
+bound to the audience `kubeagents-audit-report-store`. The listener verifies that token offline
+against the cluster's JWKS, which it reads with the pod's own API-audience token: the default
+`system:service-account-issuer-discovery` binding allows that, so the listener needs no new RBAC.
+It checks the issuer, the audience, the expiry and that the subject is the broker's ServiceAccount.
+A failed check is 401, a wrong subject 403, and a JWKS it cannot read 503, never an accept. The
+NetworkPolicy `<agent>-report-store` admits only the broker's pods to the port. Where the gateway
+policy already isolates the pod, that one rule is the whole policy. Where nothing does
+(`spec.networkPolicy.enabled: false`), the policy also admits every source on every other port, so
+the pod is no more closed than it was. The routes take the store key as one path segment, the
+repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to an empty,
+`.` or `..` part, a control character or a path outside the root. A ring write prunes to 14, and
+`latest` must be a byte-identical copy of a ring entry. Today mode renders none of this.
+
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
 creates to the owner of the nearest directory that already existed. Mode alone would not do: the
