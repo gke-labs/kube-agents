@@ -1511,7 +1511,6 @@ print_chat_setup_checklists() {
       GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
       GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
       GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
-      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
     CHAT_SETUP_CHECKLIST_PRINTED="true"
   fi

@@ -357,7 +357,7 @@ On Google Chat, the agent's answer is one formatted text message. Its first sent
 
 A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
-A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack under `next`.
+A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack.
 
 A link button opens its link. A choice button is your reply: clicking it sends the button's answer as your message in the conversation, checked against the allowed-users list like a typed one. A click from someone the gateway would not answer changes nothing. The question then loses its choice buttons and shows `✓ <your name>: <the button>`, by your Chat display name (or "Someone" when Chat gives none), never an @-mention.
 

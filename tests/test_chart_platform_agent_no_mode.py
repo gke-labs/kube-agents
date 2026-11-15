@@ -83,7 +83,6 @@ class NoModeTemplateShapeTest(unittest.TestCase):
                 self.assertNotIn("platformAgent.mode", template.read_text())
 
 
-@unittest.skipUnless(shutil.which("helm"), "needs a helm binary")
 class CrdDefaultTest(unittest.TestCase):
     """With the chart writing no spec.mode, the CRD default is what persists `next`
     on a fresh object, and a rollback to a release that reads the field leans on it."""
@@ -104,6 +103,7 @@ class CrdDefaultTest(unittest.TestCase):
         self.assertIn("+kubebuilder:default=next", text)
 
 
+@unittest.skipUnless(shutil.which("helm"), "needs a helm binary")
 class NoModeRenderTest(unittest.TestCase):
     def setUp(self):
         default = _render()

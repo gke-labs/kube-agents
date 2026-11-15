@@ -816,7 +816,8 @@ the script can end before chat is back.
 
 During the restart:
 
-- **Google Chat, and Slack where the A2A gateway holds it.** Google Chat retries a message the gateway did not acknowledge, so a message sent while the gateway pod restarts arrives once the new pod answers; a turn the gateway's session pod was running ends without an answer.
+- **Google Chat.** Google Chat retries a message the gateway did not acknowledge, so a message sent while the gateway pod restarts arrives once the new pod answers. A turn the gateway's session pod was running ends without an answer.
+- **Slack.** The gateway confirms each Slack event when it arrives, and nothing retries one it could not confirm. While the gateway pod restarts, Slack has no connection to deliver to: a message sent in that gap is lost, so ask its sender to send it again. A turn the gateway's session pod was running ends without an answer.
 - **Board cards.** The board is on the agent's volume, so the cards stay. A card that was running
   usually goes back to `ready` soon after the new pod starts, and runs again from the start. This
   does not count against the card's retries. If the old worker's process ID is in use in the new

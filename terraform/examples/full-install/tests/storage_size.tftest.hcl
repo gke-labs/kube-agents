@@ -1,6 +1,6 @@
 # The data volume size: the default passes the chart no platformAgent.storage
-# key, a raised size reaches the release values as platformAgent.storage.size
-# beside the mode, and the variable refuses a value that is not a whole number
+# key, a raised size reaches the release values as platformAgent.storage.size,
+# and the variable refuses a value that is not a whole number
 # of Mi, Gi or Ti above zero and at most 64Ti. Providers mocked and the cluster
 # module's outputs fixed, as in alert_daily_limits.tftest.hcl; nothing here
 # reaches a cloud.

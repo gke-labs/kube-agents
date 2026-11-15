@@ -419,8 +419,7 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "GCHAT_STEPS_GOOGLE_CHAT_ENABLED=true",
                      "GCHAT_STEPS_HOME_CHANNEL=\n", "GCHAT_STEPS_ALLOWED_USERS=a@example.com",
-                     "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012",
-                     "GCHAT_STEPS_NAMESPACE=custom-ns"):
+                     "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012"):
             with self.subTest(line=line):
                 self.assertIn(line, handoff)
         self.assertNotIn("PLATFORM_AGENT_MODE", handoff)
