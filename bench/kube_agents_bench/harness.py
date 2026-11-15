@@ -4208,6 +4208,9 @@ class KubeAgentsHarness(AgentHarness):
                 return "cancelled"
             return "no cancel was published (see the log), so it may still be running"
 
+        # The profile fields go only on a turn addressed to a profile, so every
+        # other turn is built exactly as it was before #5945.
+        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -4215,8 +4218,7 @@ class KubeAgentsHarness(AgentHarness):
             token=token,
             author=author,
             message_id=message_id,
-            profile=target.name if target is not None else "",
-            parameters=target.parameters if target is not None else None,
+            **addressed,
         )
 
         # A stopped ask waits on nothing it filed: the stop is the point. Sent
