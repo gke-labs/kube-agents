@@ -45,7 +45,7 @@ The operator also renders the A2A stack ([Architecture → Deployment topology](
 ```mermaid
 flowchart TB
     subgraph GW["<name>-gateway Pod"]
-        AGENT["platform-agent<br/>model, skills, chat adapters<br/>broker-audience token only"]
+        AGENT["platform-agent<br/>model, skills, chat adapters<br/>broker-audience token and bus token"]
     end
     subgraph SH["<name>-shell Pod"]
         SHELL["sshd + tools + stock kubectl + CLI wrappers<br/>no credentials, no cloud identity"]

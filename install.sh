@@ -9042,8 +9042,8 @@ main() {
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
-        # After the lines above: the printers read the mode and the toggles
-        # from install.env, which this route leaves as it found it.
+        # After the lines above: the printers read the chat toggles from
+        # install.env, which this route leaves as it found it.
         if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
           print_info "After the apply, set up the chat app with the checklist these print:"
           print_chat_checklist_commands

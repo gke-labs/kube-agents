@@ -1072,9 +1072,9 @@ leaves the ingress running, still exporting and still billing.
   (if it stays blank, Chat silently delivers no events). That address is the
   Workspace Add-ons service agent,
   `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
-  the agent's own GSA. Then DM the bot; on
-  first contact, optionally approve the pairing code via
-  `hermes pairing approve google_chat <CODE>` in the gateway pod.
+  the agent's own GSA. Then DM the bot. The A2A gateway has no pairing: it
+  answers the addresses in `google_chat_allowed_users`, or everyone the app is
+  visible to when that list is empty.
 - **Slack:** create the Slack app and its tokens as the site's Slack app setup
   page describes (`docs/site/src/content/docs/install/slack-app.md`), pass the
   tokens as `slack_bot_token` / `slack_app_token`, and set

@@ -303,7 +303,7 @@ repository code, and none of it happens automatically.
 
 Slack runs the other way. `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN` and the three `E2E_SLACK_*` values would belong on `rc` only, for the optional
-`slack` suite on the RC pipeline's `next` leg, and are left unset there for now: the installer has no variable yet for the chart's
+`slack` suite on the RC pipeline, and are left unset there for now: the installer has no variable yet for the chart's
 `operator.slackTestUsers`, without which the A2A gateway drops the suite's posts
 ([`tests/e2e/README.md`](../../tests/e2e/README.md#-slack-e2e-test-testse2eslack_agent_testpy)). The
 `nightly` suite does not include it.

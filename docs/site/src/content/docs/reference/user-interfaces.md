@@ -5,7 +5,7 @@ sidebar:
   order: 9
 ---
 
-Chat is the primary way to talk to kube-agents ([ChatOps](/kube-agents/concepts/chatops/)). Beside it, an install can offer the browser pages below. One is on by default on a first install; the others are opt-in or run on your own machine. None is published outside the cluster: every in-cluster page is reached through `kubectl`, and the local one binds loopback.
+Chat is the primary way to talk to kube-agents ([ChatOps](/kube-agents/concepts/chatops/)). Beside it, an install can offer the browser pages below. One is on by default; the others are opt-in or run on your own machine. None is published outside the cluster: every in-cluster page is reached through `kubectl`, and the local one binds loopback.
 
 ## The surfaces
 
