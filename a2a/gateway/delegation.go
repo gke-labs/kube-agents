@@ -363,6 +363,10 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		routes = append(routes, route)
 	}
 	authority.Via = &AuthorityVia{TaskID: taskID, Session: session}
+	if profileParent {
+		// What the dispatcher re-checks the child against (#5686).
+		authority.Via.ProfileChain, authority.Via.Scope = parent.ProfileChain, parent.Scope
+	}
 	if len(routes) > 1 {
 		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
 		return

@@ -461,7 +461,10 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
+  `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
+  `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
+  gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
+  admission, and `lease-expired`
   and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
   profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
