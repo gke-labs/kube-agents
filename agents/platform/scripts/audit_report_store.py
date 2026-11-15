@@ -43,12 +43,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import errno
+import fcntl
 import json
 import logging
 import os
 import re
 import secrets
+import socket
 import ssl
 import stat
 import sys
@@ -72,9 +75,10 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("audit_report_store")
 
-# The tree audit_report.py writes (its REPORTS_DIR), re-read per request as
-# that module's writer and readers do.
-REPORTS_DIR_ENV = "FLEET_AUDIT_REPORTS_DIR"
+# The tree audit_report.py writes (its REPORTS_DIR default). Not read from
+# the environment here: spec.deployment.env reaches this container, and a root
+# a CR could move is a store a CR could point anywhere. The tests pass another
+# root to create_app.
 DEFAULT_REPORTS_DIR = "/opt/data/fleet-audit/reports"
 # These mirror audit_report.py's constants of the same names. That module is a
 # skill script and is not importable from here; test_audit_report_store.py
@@ -103,13 +107,25 @@ _SEPARATOR_RE = re.compile(re.escape(STORE_PATH_SEPARATOR), re.IGNORECASE)
 # passes nowhere else. The operator renders the same string
 # (auditReportStoreAudience in k8s-operator).
 AUDIENCE = "kubeagents-audit-report-store"
+# The two caller checks the operator renders (auditReportStoreSidecarEnv),
+# both names reserved there in every mode so spec.deployment.env cannot set
+# them: the broker's ServiceAccount as a subject, and the name prefix of the
+# broker Deployment's pods. The broker's ServiceAccount is shared with other
+# pods (the exec tier among them), so the subject alone is not the broker.
 ALLOWED_SUBJECT_ENV = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
-API_SERVER_ENV = "AUDIT_REPORT_STORE_API_SERVER"
+ALLOWED_POD_PREFIX_ENV = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
+# What a Deployment pod's name adds to its Deployment's: `<rs hash>-<suffix>`.
+# Exactly two segments, so `<agent>-credential-proxy-exec-<hash>-<suffix>`,
+# the exec tier's, does not pass under the broker's prefix.
+DEPLOYMENT_POD_SUFFIX_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+\Z")
+# Where the JWKS comes from and the token it is read with: fixed, never from
+# the environment, for the same reason as the root. A CR that could move the
+# API server would be handed the pod's own token and could answer with a JWKS
+# of its own, which would pass any token it signs.
 DEFAULT_API_SERVER = "https://kubernetes.default.svc"
-# The pod's own API-audience token and the cluster CA: what lets it read the
-# discovery document and the JWKS.
-SA_DIR_ENV = "AUDIT_REPORT_STORE_SA_DIR"
 DEFAULT_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+# The port. start-services.sh runs this module as a script, which binds it.
+LISTEN_PORT = 8700
 DISCOVERY_PATH = "/.well-known/openid-configuration"
 JWKS_PATH = "/openid/v1/jwks"
 JWKS_TTL_SECONDS = 300.0
@@ -117,6 +133,9 @@ JWKS_TTL_SECONDS = 300.0
 # caller sending random kids cannot turn each request into an API call.
 JWKS_FORCED_REFRESH_SECONDS = 10.0
 JWKS_FETCH_TIMEOUT_SECONDS = 5.0
+# A failed fetch is remembered this long: requests in the window are answered
+# 503 at once instead of each waiting out the fetch timeout again.
+JWKS_FAILURE_HOLD_SECONDS = 10.0
 JWKS_MAX_BYTES = 1 << 20
 CLOCK_SKEW_SECONDS = 30
 MAX_TOKEN_BYTES = 16 * 1024
@@ -170,14 +189,14 @@ def _http_get_json(url: str, token: str | None, ca_file: str | None) -> dict:
     return document
 
 
-def fetch_cluster_keys() -> tuple[str, list[dict]]:
+def fetch_cluster_keys(api_server: str = DEFAULT_API_SERVER, sa_dir_path: str = DEFAULT_SA_DIR) -> tuple[str, list[dict]]:
     """The issuer and the signing keys, read from the API server.
 
     Authenticated with the pod's own token, read fresh each time because the
-    kubelet rotates it.
+    kubelet rotates it. The two arguments are for the tests.
     """
-    base = (os.environ.get(API_SERVER_ENV) or DEFAULT_API_SERVER).rstrip("/")
-    sa_dir = Path(os.environ.get(SA_DIR_ENV) or DEFAULT_SA_DIR)
+    base = api_server.rstrip("/")
+    sa_dir = Path(sa_dir_path)
     try:
         token = (sa_dir / "token").read_text(encoding="utf-8").strip()
     except OSError:
@@ -210,31 +229,46 @@ class TokenVerifier:
         self._keys: dict[str, dict] = {}
         self._fetched_at: float | None = None
         self._forced_at: float | None = None
-
-    def _refresh_locked(self) -> None:
-        issuer, keys = self._fetch()
-        self._issuer = issuer
-        self._keys = {key["kid"]: key for key in keys if isinstance(key.get("kid"), str)}
-        self._fetched_at = self._monotonic()
+        self._failed_at: float | None = None
 
     def _keyset(self, kid: str) -> tuple[str, dict | None]:
         """The issuer and the key named `kid`, refetching as the cache needs.
 
-        Raises JWKSUnavailable when a fetch it needs fails: an expired cache
-        is not trusted past its TTL.
+        Raises JWKSUnavailable when a fetch it needs fails, and for
+        JWKS_FAILURE_HOLD_SECONDS after one without trying again: an expired
+        cache is not trusted past its TTL. The lock guards the cache only; the
+        fetch runs outside it, so one slow API server call does not hold every
+        other request, cached kid or not.
         """
         with self._lock:
             now = self._monotonic()
-            if self._fetched_at is None or now - self._fetched_at >= JWKS_TTL_SECONDS:
-                self._refresh_locked()
-            elif kid not in self._keys and (
+            expired = self._fetched_at is None or now - self._fetched_at >= JWKS_TTL_SECONDS
+            # An unknown kid is the API server rotating its signing key:
+            # refetch once, not once per request.
+            forced = not expired and kid not in self._keys and (
                 self._forced_at is None or now - self._forced_at >= JWKS_FORCED_REFRESH_SECONDS
-            ):
-                # An unknown kid is the API server rotating its signing key:
-                # refetch once, not once per request.
+            )
+            if not expired and not forced:
+                assert self._issuer is not None
+                return self._issuer, self._keys.get(kid)
+            if self._failed_at is not None and now - self._failed_at < JWKS_FAILURE_HOLD_SECONDS:
+                if expired:
+                    raise JWKSUnavailable("the last JWKS fetch failed moments ago")
+                assert self._issuer is not None
+                return self._issuer, self._keys.get(kid)
+            if forced:
                 self._forced_at = now
-                self._refresh_locked()
-            assert self._issuer is not None
+        try:
+            issuer, keys = self._fetch()
+        except JWKSUnavailable:
+            with self._lock:
+                self._failed_at = self._monotonic()
+            raise
+        with self._lock:
+            self._issuer = issuer
+            self._keys = {key["kid"]: key for key in keys if isinstance(key.get("kid"), str)}
+            self._fetched_at = self._monotonic()
+            self._failed_at = None
             return self._issuer, self._keys.get(kid)
 
     def verify(self, authorization: str | None) -> str:
@@ -297,6 +331,18 @@ class TokenVerifier:
         allowed = os.environ.get(ALLOWED_SUBJECT_ENV, "").strip()
         if not isinstance(subject, str) or not allowed or subject != allowed:
             raise AuthRefused(403, "subject is not the broker")
+        # The pod the token is bound to: the broker Deployment's, by name.
+        prefix = os.environ.get(ALLOWED_POD_PREFIX_ENV, "").strip()
+        kube = claims.get("kubernetes.io")
+        pod = kube.get("pod") if isinstance(kube, dict) else None
+        pod_name = pod.get("name") if isinstance(pod, dict) else None
+        if (
+            not prefix
+            or not isinstance(pod_name, str)
+            or not pod_name.startswith(prefix)
+            or not DEPLOYMENT_POD_SUFFIX_RE.match(pod_name[len(prefix):])
+        ):
+            raise AuthRefused(403, "the token is not bound to a broker pod")
         return subject
 
 
@@ -344,10 +390,6 @@ class Refused(Exception):
         super().__init__(reason)
         self.status = status
         self.reason = reason
-
-
-def reports_root() -> Path:
-    return Path(os.environ.get(REPORTS_DIR_ENV) or DEFAULT_REPORTS_DIR)
 
 
 def _plain_segment(part: str) -> bool:
@@ -415,7 +457,13 @@ def _validate_stamp(stamp: str) -> str:
 # open fd. A symlink anywhere on the path, the root's own path included, is
 # answered 409 and never followed.
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+# O_NONBLOCK: a FIFO planted under a name this opens would otherwise block the
+# open until a writer came, holding a worker thread for good. The fstat check
+# after it refuses anything that is not a regular file.
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+# A directory with more entries than this is not one this store wrote (a
+# ring holds REPORT_HISTORY); refused rather than listed and sorted whole.
+MAX_DIR_ENTRIES = 4096
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 _SYMLINK_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
 
@@ -458,10 +506,9 @@ def _open_child_dir(parent_fd: int, name: str, create: bool) -> int:
 class _DirChain:
     """The directories root/<parts...>, opened fd by fd; `fd` is the last."""
 
-    def __init__(self, parts: list[str], create: bool) -> None:
+    def __init__(self, root: str, parts: list[str], create: bool) -> None:
         self._fds: list[int] = []
-        root = os.path.abspath(reports_root())
-        components = [part for part in root.split(os.sep) if part] + parts
+        components = [part for part in os.path.abspath(root).split(os.sep) if part] + parts
         try:
             self._fds.append(os.open(os.sep, _DIR_FLAGS & ~os.O_NOFOLLOW))
             for name in components:
@@ -499,7 +546,10 @@ def _read_at(dir_fd: int, name: str) -> bytes:
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise _symlink_refusal(name)
-        return handle.read()
+        data = handle.read(REPORT_MAX_BYTES + 1)
+    if len(data) > REPORT_MAX_BYTES:
+        raise Refused(409, f"a stored entry is over {REPORT_MAX_BYTES} bytes")
+    return data
 
 
 def _write_at(dir_fd: int, name: str, data: bytes) -> None:
@@ -520,10 +570,25 @@ def _write_at(dir_fd: int, name: str, data: bytes) -> None:
         raise
 
 
-def _ring_names(runs_fd: int) -> list[str]:
-    """The ring's entries, oldest first: regular files named by a valid stamp."""
+def _listdir(dir_fd: int) -> list[str]:
     names = []
-    for name in os.listdir(runs_fd):
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            names.append(entry.name)
+            if len(names) > MAX_DIR_ENTRIES:
+                raise Refused(409, "a store directory holds more entries than the store writes")
+    return names
+
+
+def _ring_names(runs_fd: int) -> list[str]:
+    """The ring's newest REPORT_HISTORY entries, oldest first: regular files named by a valid stamp."""
+    return _all_ring_names(runs_fd)[-REPORT_HISTORY:]
+
+
+def _all_ring_names(runs_fd: int) -> list[str]:
+    """Every ring entry, oldest first, for the prune."""
+    names = []
+    for name in _listdir(runs_fd):
         if not (name.endswith(".json") and STAMP_RE.match(name[: -len(".json")])):
             continue
         try:
@@ -534,9 +599,9 @@ def _ring_names(runs_fd: int) -> list[str]:
     return sorted(names)
 
 
-def _ring_of(parts: list[str]) -> list[str]:
+def _ring_of(root: str, parts: list[str]) -> list[str]:
     try:
-        with _DirChain(parts + [REPORT_RUNS_DIR], create=False) as runs:
+        with _DirChain(root, parts + [REPORT_RUNS_DIR], create=False) as runs:
             return _ring_names(runs.fd)
     except _Missing:
         return []
@@ -557,7 +622,7 @@ def _validated_body(body: bytes) -> bytes:
 def _child_dirs(dir_fd: int) -> list[str]:
     """The real (not symlinked) subdirectories of a directory, sorted."""
     names = []
-    for name in os.listdir(dir_fd):
+    for name in _listdir(dir_fd):
         try:
             if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
                 names.append(name)
@@ -566,23 +631,23 @@ def _child_dirs(dir_fd: int) -> list[str]:
     return sorted(names)
 
 
-def list_streams() -> list[dict]:
+def list_streams(root: str) -> list[dict]:
     streams = []
     try:
-        root = _DirChain([], create=False)
+        top = _DirChain(root, [], create=False)
     except _Missing:
         return []
-    with root:
-        audits = [name for name in _child_dirs(root.fd) if AUDIT_ID_RE.match(name)]
+    with top:
+        audits = [name for name in _child_dirs(top.fd) if AUDIT_ID_RE.match(name)]
     for audit in audits:
         try:
-            with _DirChain([audit], create=False) as chain:
+            with _DirChain(root, [audit], create=False) as chain:
                 owners = _child_dirs(chain.fd)
         except (_Missing, Refused):
             continue
         for owner in owners:
             try:
-                with _DirChain([audit, owner], create=False) as chain:
+                with _DirChain(root, [audit, owner], create=False) as chain:
                     stores = _child_dirs(chain.fd)
             except (_Missing, Refused):
                 continue
@@ -591,12 +656,12 @@ def list_streams() -> list[dict]:
                 try:
                     if store_dirs_for_key(key) != (owner, name):
                         continue
-                    ring = _ring_of([audit, owner, name])
+                    ring = _ring_of(root, [audit, owner, name])
                 except Refused:
                     continue
                 finished = None
                 try:
-                    with _DirChain([audit, owner, name], create=False) as chain:
+                    with _DirChain(root, [audit, owner, name], create=False) as chain:
                         latest = json.loads(_read_at(chain.fd, REPORT_LATEST_NAME))
                     if isinstance(latest, dict) and isinstance(latest.get("finished_at"), str):
                         finished = latest["finished_at"]
@@ -613,7 +678,19 @@ def list_streams() -> list[dict]:
     return streams
 
 
-def handle(method: str, segments: list[str], body: bytes) -> tuple[int, bytes | list | None]:
+@contextlib.contextmanager
+def _locked(dir_fd: int):
+    """An exclusive flock on a store directory, so two writers to one store
+    cannot interleave a check with a write (PUT latest) or a write with a prune
+    (PUT run)."""
+    fcntl.flock(dir_fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(dir_fd, fcntl.LOCK_UN)
+
+
+def handle(root: str, method: str, segments: list[str], body: bytes) -> tuple[int, bytes | list | None]:
     """One authenticated request, after the raw path was split.
 
     `segments` is the raw path below AUDIT_REPORTS_PREFIX. Returns the status
@@ -622,7 +699,7 @@ def handle(method: str, segments: list[str], body: bytes) -> tuple[int, bytes | 
     if not segments:
         if method != "GET":
             raise Refused(405, "method not allowed")
-        return 200, list_streams()
+        return 200, list_streams(root)
     if len(segments) < 3:
         raise Refused(404, "no such route")
     audit_id, key, *rest = segments
@@ -631,31 +708,39 @@ def handle(method: str, segments: list[str], body: bytes) -> tuple[int, bytes | 
     owner, name = store_dirs_for_key(key)
     store = [_validate_audit_id(audit_id), owner, name]
     try:
-        return _handle_store(method, audit_id, store, rest, body)
+        return _handle_store(root, method, audit_id, store, rest, body)
     except _Missing:
         raise Refused(404, "not found") from None
 
 
-def _handle_store(method: str, audit_id: str, store: list[str], rest: list[str], body: bytes) -> tuple[int, bytes | list | None]:
+def _handle_store(
+    root: str, method: str, audit_id: str, store: list[str], rest: list[str], body: bytes
+) -> tuple[int, bytes | list | None]:
     if rest == ["latest"]:
         if method == "GET":
-            with _DirChain(store, create=False) as chain:
+            with _DirChain(root, store, create=False) as chain:
                 return 200, _read_at(chain.fd, REPORT_LATEST_NAME)
         if method == "PUT":
             data = _validated_body(body)
             try:
-                runs = _DirChain(store + [REPORT_RUNS_DIR], create=False)
+                chain = _DirChain(root, store, create=False)
             except _Missing:
                 raise Refused(409, "latest must be a copy of a run in the ring") from None
-            with runs:
-                if not any(_read_at(runs.fd, entry) == data for entry in _ring_names(runs.fd)):
-                    raise Refused(409, "latest must be a copy of a run in the ring")
-            with _DirChain(store, create=False) as chain:
+            with chain, _locked(chain.fd):
+                try:
+                    runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=False)
+                except _Missing:
+                    raise Refused(409, "latest must be a copy of a run in the ring") from None
+                try:
+                    if not any(_read_at(runs_fd, entry) == data for entry in _ring_names(runs_fd)):
+                        raise Refused(409, "latest must be a copy of a run in the ring")
+                finally:
+                    os.close(runs_fd)
                 _write_at(chain.fd, REPORT_LATEST_NAME, data)
             return 204, None
         if method == "DELETE":
             try:
-                with _DirChain(store, create=False) as chain:
+                with _DirChain(root, store, create=False) as chain:
                     os.unlink(REPORT_LATEST_NAME, dir_fd=chain.fd)
             except (_Missing, FileNotFoundError):
                 pass
@@ -664,20 +749,24 @@ def _handle_store(method: str, audit_id: str, store: list[str], rest: list[str],
     if rest == ["runs"]:
         if method != "GET":
             raise Refused(405, "method not allowed")
-        return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(store))]
+        return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(root, store))]
     stamp = _validate_stamp(rest[1])
     if method == "GET":
-        with _DirChain(store + [REPORT_RUNS_DIR], create=False) as runs:
+        with _DirChain(root, store + [REPORT_RUNS_DIR], create=False) as runs:
             return 200, _read_at(runs.fd, f"{stamp}.json")
     if method == "PUT":
         data = _validated_body(body)
-        with _DirChain(store + [REPORT_RUNS_DIR], create=True) as runs:
-            _write_at(runs.fd, f"{stamp}.json", data)
+        with _DirChain(root, store, create=True) as chain, _locked(chain.fd):
+            runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=True)
             try:
-                for stale in _ring_names(runs.fd)[:-REPORT_HISTORY]:
-                    os.unlink(stale, dir_fd=runs.fd)
-            except Exception as exc:  # noqa: BLE001 - the entry is written; a long ring costs disk only
-                LOGGER.warning("report store prune failed for %s: %s", audit_id, exc)
+                _write_at(runs_fd, f"{stamp}.json", data)
+                try:
+                    for stale in _all_ring_names(runs_fd)[:-REPORT_HISTORY]:
+                        os.unlink(stale, dir_fd=runs_fd)
+                except Exception as exc:  # noqa: BLE001 - the entry is written; a long ring costs disk only
+                    LOGGER.warning("report store prune failed for %s: %s", audit_id, exc)
+            finally:
+                os.close(runs_fd)
         return 204, None
     raise Refused(405, "method not allowed")
 
@@ -721,15 +810,18 @@ async def _read_body(request: Request) -> bytes:
     return b"".join(chunks)
 
 
-def create_app(verifier: TokenVerifier | None = None) -> FastAPI:
+def create_app(verifier: TokenVerifier | None = None, root: str = DEFAULT_REPORTS_DIR) -> FastAPI:
     """The listener.
 
     No routes: one middleware answers every request, so nothing else is
     served and nothing (a path the router's patterns cannot match, a newline
-    in it) reaches a default handler ahead of the auth check.
+    in it) reaches a default handler ahead of the auth check. `root` and the
+    verifier's fetch are parameters for the tests; production takes the
+    defaults, which no environment variable moves.
     """
     application = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     application.state.verifier = verifier or TokenVerifier()
+    application.state.root = root
 
     @application.middleware("http")
     async def store(request: Request, _call_next) -> Response:
@@ -746,7 +838,7 @@ def create_app(verifier: TokenVerifier | None = None) -> FastAPI:
             if request.method not in ("GET", "PUT", "DELETE"):
                 raise Refused(405, "method not allowed")
             body = await _read_body(request) if request.method == "PUT" else b""
-            status, payload = await run_in_threadpool(handle, request.method, segments, body)
+            status, payload = await run_in_threadpool(handle, request.app.state.root, request.method, segments, body)
         except AuthRefused as exc:
             LOGGER.info("%s %s -> %d (%s) subject=%s", request.method, route, exc.status, exc.reason, subject)
             return JSONResponse({"error": exc.reason}, status_code=exc.status)
@@ -767,3 +859,41 @@ def create_app(verifier: TokenVerifier | None = None) -> FastAPI:
 
 
 app = create_app()
+
+
+def bind_listener(port: int = LISTEN_PORT) -> socket.socket:
+    """The listening socket, or a loud ERROR and SystemExit when the port is taken.
+
+    The platform-agent container shares this pod's network namespace, so a
+    process there could bind the port first. uvicorn's own message for that is
+    one errno line among its startup logs; this one names the port and says
+    what it means, because a squatter on it would be answering the broker.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError as exc:
+        sock.close()
+        if exc.errno == errno.EADDRINUSE:
+            LOGGER.error(
+                "ALERT the audit-report store cannot bind port %d: another process in this pod already holds it, "
+                "so whatever answers the broker there is not this listener",
+                port,
+            )
+            raise SystemExit(1) from None
+        raise
+    sock.listen(128)
+    return sock
+
+
+def main() -> None:
+    import uvicorn
+
+    sock = bind_listener()
+    server = uvicorn.Server(uvicorn.Config(app, access_log=False, log_level="info"))
+    server.run(sockets=[sock])
+
+
+if __name__ == "__main__":
+    main()

@@ -30,6 +30,8 @@ AUDIT_REPORT_PATH = (
 
 ISSUER = "https://container.googleapis.com/v1/projects/p/locations/l/clusters/c"
 BROKER = "system:serviceaccount:agents:platform-agent"
+POD_PREFIX = "platform-agent-credential-proxy-"
+BROKER_POD = POD_PREFIX + "7d9f8c6b5-x2k4q"
 STREAM = "/v1/audit-reports/compliance-audit/acme%2Fgitops"
 STAMP_1 = "20261101T010203.000001Z"
 STAMP_2 = "20261102T010203.000001Z"
@@ -89,6 +91,11 @@ def mint(key, alg: str = "RS256", kid: str | None = None, **overrides) -> str:
         "iat": now,
         "nbf": now,
         "exp": now + 600,
+        "kubernetes.io": {
+            "namespace": "agents",
+            "pod": {"name": BROKER_POD, "uid": "pod-uid"},
+            "serviceaccount": {"name": "platform-agent", "uid": "sa-uid"},
+        },
     }
     claims.update(overrides)
     claims = {k: v for k, v in claims.items() if v is not None}
@@ -151,19 +158,21 @@ class StoreTestCase(unittest.TestCase):
         self.api = FakeAPIServer()
         self.key = RSAKey("k1")
         self.api.keys = [self.key.jwk()]
-        env = {
-            store.REPORTS_DIR_ENV: str(self.root),
-            store.ALLOWED_SUBJECT_ENV: BROKER,
-            store.API_SERVER_ENV: self.api.url,
-            store.SA_DIR_ENV: str(self.sa_dir),
-        }
+        env = {store.ALLOWED_SUBJECT_ENV: BROKER, store.ALLOWED_POD_PREFIX_ENV: POD_PREFIX}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.api.stop)
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.client = TestClient(store.create_app(store.TokenVerifier()))
+        self.client = self.make_client()
         self.token = mint(self.key)
+
+    def fetch(self):
+        return store.fetch_cluster_keys(self.api.url, str(self.sa_dir))
+
+    def make_client(self, root: Path | None = None, **verifier_args) -> TestClient:
+        verifier = store.TokenVerifier(fetch=self.fetch, **verifier_args)
+        return TestClient(store.create_app(verifier, root=str(root or self.root)))
 
     def call(self, method: str, path: str, body: bytes | None = None, token: str | None = "default"):
         headers = {}
@@ -403,8 +412,8 @@ class ValidationTests(StoreTestCase):
         real.mkdir()
         link = self.tmp / "link"
         os.symlink(real, link)
-        with mock.patch.dict(os.environ, {store.REPORTS_DIR_ENV: str(link / "reports")}):
-            self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 409)
+        self.client = self.make_client(root=link / "reports")
+        self.assertRefused("PUT", f"{STREAM}/runs/{STAMP_1}", 409)
         self.assertEqual([], list(real.iterdir()))
 
     def test_bodies(self) -> None:
@@ -508,8 +517,7 @@ class AuthTests(StoreTestCase):
 
     def test_jwks_down_after_the_ttl_is_503_not_the_stale_keys(self) -> None:
         clock = [1000.0]
-        verifier = store.TokenVerifier(monotonic=lambda: clock[0])
-        client = TestClient(store.create_app(verifier))
+        client = self.make_client(monotonic=lambda: clock[0])
         headers = {"Authorization": f"Bearer {self.token}"}
         self.assertEqual(200, client.get(f"{STREAM}/runs", headers=headers).status_code)
         self.api.stop()
@@ -526,6 +534,161 @@ class AuthTests(StoreTestCase):
         self.assertNotIn(self.token.split(".")[1], text)
         self.assertIn(f"subject={BROKER}", text)
         self.assertIn("-> 200", text)
+
+
+class HardeningTests(StoreTestCase):
+    """Review follow-ups: no environment trust anchors, FIFOs, bounds, locks, the port."""
+
+    def test_the_module_reads_no_root_api_server_or_sa_dir_from_the_environment(self) -> None:
+        import ast
+
+        tree = ast.parse(Path(store.__file__).read_text())
+        read = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in ("get", "getenv"):
+                target = ast.unparse(node.func.value) if hasattr(node.func, "value") else ""
+                if target in ("os.environ", "os") and node.args:
+                    read.add(ast.unparse(node.args[0]))
+            if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                read.add(ast.unparse(node.slice))
+        self.assertEqual({"ALLOWED_SUBJECT_ENV", "ALLOWED_POD_PREFIX_ENV"}, read)
+
+    def test_setting_the_old_overrides_changes_nothing(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        hostile = {
+            "FLEET_AUDIT_REPORTS_DIR": str(elsewhere),
+            "AUDIT_REPORT_STORE_API_SERVER": "http://127.0.0.1:1",
+            "AUDIT_REPORT_STORE_SA_DIR": str(elsewhere),
+        }
+        with mock.patch.dict(os.environ, hostile):
+            client = TestClient(store.create_app(store.TokenVerifier(fetch=self.fetch)))
+            self.assertEqual(store.DEFAULT_REPORTS_DIR, client.app.state.root)
+            self.assertEqual(204, self.put_run(STAMP_1).status_code)
+        self.assertFalse(elsewhere.exists())
+        self.assertTrue((self.root / "compliance-audit" / "acme" / "gitops" / "runs" / f"{STAMP_1}.json").is_file())
+
+    def test_fifos_are_refused_without_blocking(self) -> None:
+        directory = self.root / "compliance-audit" / "acme" / "gitops"
+        runs = directory / "runs"
+        runs.mkdir(parents=True)
+        os.mkfifo(directory / "latest.json")
+        os.mkfifo(runs / f"{STAMP_1}.json")
+        self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
+        self.assertEqual(409, self.call("GET", f"{STREAM}/runs/{STAMP_1}").status_code)
+        # The ring scan in PUT latest neither blocks on it nor counts it.
+        self.assertEqual(409, self.call("PUT", f"{STREAM}/latest", b"{}").status_code)
+        self.assertEqual([], self.call("GET", f"{STREAM}/runs").json())
+        # And a direct read of a FIFO name returns at once.
+        fd = os.open(runs, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(store.Refused):
+                store._read_at(fd, f"{STAMP_1}.json")
+        finally:
+            os.close(fd)
+
+    def test_an_oversized_stored_entry_is_refused(self) -> None:
+        directory = self.root / "compliance-audit" / "acme" / "gitops"
+        directory.mkdir(parents=True)
+        (directory / "latest.json").write_bytes(b" " * (store.REPORT_MAX_BYTES + 1))
+        self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
+
+    def test_latest_compares_only_the_newest_ring_entries(self) -> None:
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        stamps = [f"202611{day:02d}T000000.000000Z" for day in range(1, store.REPORT_HISTORY + 3)]
+        for i, stamp in enumerate(stamps):
+            (runs / f"{stamp}.json").write_text(json.dumps({"run": i}))
+        self.assertEqual(409, self.call("PUT", f"{STREAM}/latest", json.dumps({"run": 0}).encode()).status_code)
+        newest = json.dumps({"run": len(stamps) - 1}).encode()
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", newest).status_code)
+        self.assertEqual(store.REPORT_HISTORY, len(self.call("GET", f"{STREAM}/runs").json()))
+
+    def test_a_directory_with_too_many_entries_is_refused(self) -> None:
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        for i in range(store.MAX_DIR_ENTRIES + 1):
+            (runs / f"junk{i}").touch()
+        self.assertEqual(409, self.call("GET", f"{STREAM}/runs").status_code)
+
+    def test_writes_hold_the_store_directory_lock(self) -> None:
+        calls = []
+        real = store.fcntl.flock
+
+        def recording(fd, op):
+            calls.append(op)
+            return real(fd, op)
+
+        with mock.patch.object(store.fcntl, "flock", side_effect=recording):
+            self.put_run(STAMP_1, {"run": 1})
+            self.call("PUT", f"{STREAM}/latest", json.dumps({"run": 1}).encode())
+        self.assertEqual([store.fcntl.LOCK_EX, store.fcntl.LOCK_UN] * 2, calls)
+
+    def test_a_taken_port_is_a_loud_error(self) -> None:
+        import socket
+
+        holder = socket.socket()
+        holder.bind(("0.0.0.0", 0))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        port = holder.getsockname()[1]
+        with self.assertLogs("audit_report_store", level="ERROR") as logs, self.assertRaises(SystemExit):
+            store.bind_listener(port)
+        self.assertIn(f"port {port}", "\n".join(logs.output))
+        self.assertIn("another process", "\n".join(logs.output))
+
+
+class JWKSFailureHoldTests(unittest.TestCase):
+    def test_a_failed_fetch_is_held_then_retried(self) -> None:
+        clock = [100.0]
+        attempts = []
+
+        def failing():
+            attempts.append(clock[0])
+            raise store.JWKSUnavailable("down")
+
+        verifier = store.TokenVerifier(fetch=failing, monotonic=lambda: clock[0])
+        token = mint(RSAKey("k1"))
+        for _ in range(3):
+            with self.assertRaises(store.AuthRefused) as caught:
+                verifier.verify(f"Bearer {token}")
+            self.assertEqual(503, caught.exception.status)
+        self.assertEqual(1, len(attempts))
+        clock[0] += store.JWKS_FAILURE_HOLD_SECONDS + 1
+        with self.assertRaises(store.AuthRefused):
+            verifier.verify(f"Bearer {token}")
+        self.assertEqual(2, len(attempts))
+
+    def test_the_lock_is_not_held_across_the_fetch(self) -> None:
+        verifier = store.TokenVerifier(fetch=lambda: (verifier._lock.locked() and self.fail("fetch under the lock")) or (ISSUER, []))
+        with self.assertRaises(store.AuthRefused):
+            verifier.verify(f"Bearer {mint(RSAKey('k1'))}")
+
+
+class TokenCheckAloneTests(StoreTestCase):
+    """With no NetworkPolicy (spec.networkPolicy.enabled false), the token check
+    alone has to refuse every caller but the broker's own pod."""
+
+    def test_only_the_brokers_pod_token_passes(self) -> None:
+        gateway_sa = "system:serviceaccount:agents:platform-agent-gateway-agent"
+        cases = {
+            "the pod's own API token": (401, mint(self.key, aud=["https://kubernetes.default.svc"], sub=gateway_sa)),
+            "the broker's token for another audience": (401, mint(self.key, aud=["kubeagents-credential-proxy"])),
+            "the right audience, another ServiceAccount": (403, mint(self.key, sub=gateway_sa)),
+            "the right audience and subject, an exec-tier pod": (403, mint(self.key, **{"kubernetes.io": {
+                "pod": {"name": POD_PREFIX + "exec-7d9f8c6b5-x2k4q"}}})),
+            "the right audience and subject, another pod": (403, mint(self.key, **{"kubernetes.io": {
+                "pod": {"name": "platform-agent-kube-proxy-7d9f8c6b5-x2k4q"}}})),
+            "the right audience and subject, no pod claim": (403, mint(self.key, **{"kubernetes.io": None})),
+            "no token": (401, None),
+        }
+        for name, (status, token) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(status, self.call("GET", f"{STREAM}/runs", token=token).status_code)
+        self.assertEqual(200, self.call("GET", f"{STREAM}/runs").status_code)
+
+    def test_no_pod_prefix_configured_refuses_everyone(self) -> None:
+        with mock.patch.dict(os.environ, {store.ALLOWED_POD_PREFIX_ENV: ""}):
+            self.assertEqual(403, self.call("GET", f"{STREAM}/runs").status_code)
 
 
 if __name__ == "__main__":

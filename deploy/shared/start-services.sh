@@ -1262,7 +1262,6 @@ start_drift_detector() {
 # so it is silent. Supervised and restarted in place like the watcher, and like
 # it not on the credential path, so its exit never ends the container. It logs
 # to the container's stderr with the other supervised processes.
-readonly AUDIT_REPORT_STORE_PORT=8700
 readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5
 readonly AUDIT_REPORT_STORE_RETRY_MAX_SECONDS=300
 readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
@@ -1270,8 +1269,8 @@ readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
 start_audit_report_store() {
   [[ "${AUDIT_REPORT_STORE_ENABLED:-}" == "1" ]] || return 0
 
-  if [ -z "${AUDIT_REPORT_STORE_ALLOWED_SUBJECT:-}" ]; then
-    echo "start-services: ALERT AUDIT_REPORT_STORE_ALLOWED_SUBJECT is empty, so the audit-report store refuses every request with 403 — profile workers cannot read or write fleet-audit reports. The operator sets it with AUDIT_REPORT_STORE_ENABLED." >&2
+  if [ -z "${AUDIT_REPORT_STORE_ALLOWED_SUBJECT:-}" ] || [ -z "${AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX:-}" ]; then
+    echo "start-services: ALERT AUDIT_REPORT_STORE_ALLOWED_SUBJECT or AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX is empty, so the audit-report store refuses every request with 403 — profile workers cannot read or write fleet-audit reports. The operator sets both with AUDIT_REPORT_STORE_ENABLED." >&2
   fi
 
   (
@@ -1280,11 +1279,10 @@ start_audit_report_store() {
     delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
     while true; do
       started=$SECONDS
-      "${PROXY_PYTHON}" -m uvicorn audit_report_store:app \
-        --app-dir /opt/defaults/scripts \
-        --host 0.0.0.0 \
-        --port "${AUDIT_REPORT_STORE_PORT}" \
-        --no-access-log || true
+      # Run as a script, which binds port 8700 itself (audit_report_store.LISTEN_PORT,
+      # auditReportStorePort in the operator) so that a port another
+      # process in the pod already holds is a loud ALERT naming it.
+      "${PROXY_PYTHON}" /opt/defaults/scripts/audit_report_store.py || true
       ran=$((SECONDS - started))
       if [[ "${ran}" -ge "${AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS}" ]]; then
         delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
