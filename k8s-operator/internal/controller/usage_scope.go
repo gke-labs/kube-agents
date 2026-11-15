@@ -63,15 +63,15 @@ const (
 // scopeUndeclaredNamePattern is the shape a cluster name, project ID or location
 // takes (the CRD's ScopeClusterRef patterns); a label value outside it prints as
 // scopeUndeclaredInvalidName.
-var scopeUndeclaredNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+var scopeUndeclaredNamePattern = regexp.MustCompile(`^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]{0,62}$`)
 
 // scopeProjectIDPattern is the shape of a spec.scope.projects entry (the CRD's
-// item pattern: 6 to 30 characters, a lowercase letter first, no trailing
-// hyphen), which is the form the remedy tells the reader to write. A management
+// item pattern: 6 to 30 characters, optionally preceded by a sovereign partition
+// prefix such as part0:). A management
 // project outside it, a project number or a legacy domain-scoped ID, cannot be
 // declared there, so the operator names nothing rather than a value the API
 // server refuses.
-var scopeProjectIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+var scopeProjectIDPattern = regexp.MustCompile(`^(?:[a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
 
 // scopeDeclared reports whether spec.scope names a project, folder, organisation
 // or selector. Exclusions are not a declaration: a block whose membership lists

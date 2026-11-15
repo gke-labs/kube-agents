@@ -6,10 +6,15 @@ resource "google_service_account" "minter" {
   description = var.owner_description
 }
 
+locals {
+  project_id_parts = split(":", var.project_id)
+  gsa_email_domain = length(local.project_id_parts) == 2 ? "${local.project_id_parts[1]}.${local.project_id_parts[0]}" : var.project_id
+}
+
 resource "google_service_account_iam_member" "workload_identity" {
   service_account_id = google_service_account.minter.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.namespace}/${var.ksa_name}]"
+  member             = "serviceAccount:${local.gsa_email_domain}.svc.id.goog[${var.namespace}/${var.ksa_name}]"
 }
 
 resource "google_kms_key_ring" "minter" {

@@ -20,6 +20,9 @@ readonly NOT_REGISTERED=1
 # A GKE context is gke_<project>_<location>_<cluster>; kubectl's default kubeconfig is under HOME.
 readonly CONTEXT_PREFIX="gke_"
 readonly CONTEXT_SEPARATOR="_"
+readonly PARTITION_MAX_LENGTH=16
+readonly PER_TARGET_PREFIX="kubeconfig_"
+readonly YAML_SUFFIX=".yaml"
 readonly DEFAULT_KUBECONFIG="/.kube/config"
 # What the client hashes for the environment: the record version and the three values, joined by
 # a newline (REGISTERED_MARKER_VERSION and REGISTERED_MARKER_ENV_SEPARATOR in
@@ -69,7 +72,27 @@ set -- ${parts}
 IFS="${old_ifs}"
 set +f
 [ "$#" -eq 3 ] || exit "${NOT_REGISTERED}"
-for part in "$@"; do
+project_part="$1"
+case "${project_part}" in
+*:*)
+  partition_prefix="${project_part%%:*}"
+  project_slug="${project_part#*:}"
+  case "${partition_prefix}" in
+  [a-z]*)
+    case "${partition_prefix}" in
+    *[!a-z0-9-]*) exit "${NOT_REGISTERED}" ;;
+    esac
+    [ "${#partition_prefix}" -le "${PARTITION_MAX_LENGTH}" ] || exit "${NOT_REGISTERED}"
+    ;;
+  *) exit "${NOT_REGISTERED}" ;;
+  esac
+  case "${project_slug}" in
+  "" | -* | *:* | *[!a-z0-9-]*) exit "${NOT_REGISTERED}" ;;
+  esac
+  ;;
+"" | -* | *[!a-z0-9-]*) exit "${NOT_REGISTERED}" ;;
+esac
+for part in "$2" "$3"; do
   case "${part}" in
   "" | -* | *[!a-z0-9-]*) exit "${NOT_REGISTERED}" ;;
   esac
@@ -78,7 +101,30 @@ done
 # The file kubectl reads: KUBECONFIG when it names one file, else ~/.kube/config.
 kubeconfig="${KUBECONFIG:-}"
 case "${kubeconfig}" in
-*:*) exit "${NOT_REGISTERED}" ;;
+*:*:*) exit "${NOT_REGISTERED}" ;;
+*:*)
+  kc_base="${kubeconfig##*/}"
+  case "${kc_base}" in
+  "${PER_TARGET_PREFIX}"[a-z]*:*_*_*"${YAML_SUFFIX}")
+    kc_part="${kc_base#"${PER_TARGET_PREFIX}"}"
+    kc_part="${kc_part%%:*}"
+    kc_rest="${kc_base#*:}"
+    case "${kc_part}" in
+    *[!a-z0-9-]*) exit "${NOT_REGISTERED}" ;;
+    esac
+    [ "${#kc_part}" -le "${PARTITION_MAX_LENGTH}" ] || exit "${NOT_REGISTERED}"
+    case "${kc_rest}" in
+    "" | -* | *[!a-z0-9._-]*) exit "${NOT_REGISTERED}" ;;
+    esac
+    if [ "${kc_base}" = "${kubeconfig}" ]; then
+      kubeconfig="${PER_TARGET_PREFIX}${kc_part}_${kc_rest}"
+    else
+      kubeconfig="${kubeconfig%/*}/${PER_TARGET_PREFIX}${kc_part}_${kc_rest}"
+    fi
+    ;;
+  *) exit "${NOT_REGISTERED}" ;;
+  esac
+  ;;
 "") kubeconfig="${HOME:-}${DEFAULT_KUBECONFIG}" ;;
 esac
 [ -f "${kubeconfig}" ] && [ ! -L "${kubeconfig}" ] || exit "${NOT_REGISTERED}"

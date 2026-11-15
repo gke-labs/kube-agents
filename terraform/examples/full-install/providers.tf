@@ -30,7 +30,8 @@ terraform {
 }
 
 provider "google" {
-  project = var.project_id
+  project         = var.project_id
+  universe_domain = local.custom_universe ? local.effective_universe_domain : null
 }
 
 # Several modules' service-identity resources require the google-beta
@@ -41,7 +42,8 @@ provider "google" {
 # to exist before the sink's publish grant can name it) all use one, so gating
 # any single module does not make this block removable.
 provider "google-beta" {
-  project = var.project_id
+  project         = var.project_id
+  universe_domain = local.custom_universe ? local.effective_universe_domain : null
 }
 
 # The helm provider authenticates against the cluster this configuration

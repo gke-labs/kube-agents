@@ -8,6 +8,8 @@ Reusable Terraform module for provisioning the GKE cluster that hosts Kube-Agent
 
 The full-install composition passes `kube-agents-host=true` through `resource_labels` so the admin portal can discover the deployed host; standalone callers can use the same input when they install kube-agents on the cluster.
 
+When creating a cluster in a project without a `default` VPC network (for example, in Google Cloud Dedicated / Sovereign Cloud environments), pass `network` (and `subnetwork` for custom-mode VPCs) so GKE provisions onto the existing network. Partition-prefixed project IDs (`<partition>:<slug>`) automatically map the cluster's Workload Identity pool to `<slug>.<partition>.svc.id.goog`.
+
 By default (`enable_database_encryption = true`, together with `create_cluster = true`), the module provisions a Cloud KMS Keyring and CryptoKey, binds `roles/cloudkms.cryptoKeyEncrypterDecrypter` to the GKE Service Agent, and enables etcd database encryption (CMEK). FQDN NetworkPolicy is also on by default (`enable_fqdn_network_policy`) — the operator's opt-in `FQDNNetworkPolicy` companion objects only enforce on clusters that have it.
 
 Two things Terraform cannot express, both of which stay `gcloud` steps for callers that need them:

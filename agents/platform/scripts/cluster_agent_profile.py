@@ -75,6 +75,8 @@ PROFILES_BASE = profiles_base(HERMES_HOME)
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
+_FIELD_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_PROJECT_FIELD_RE = re.compile(r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?:)?[a-zA-Z0-9._-]+$")
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
 # managed as Cluster Agents: the front-door router (`default`), the Platform
@@ -179,7 +181,8 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _validate(value: str, field: str) -> None:
-    if not value or not re.match(r"^[a-zA-Z0-9._-]+$", value):
+    pattern = _PROJECT_FIELD_RE if field == "project" else _FIELD_RE
+    if not value or not pattern.match(value):
         raise SystemExit(f"ERROR: invalid {field}: {value!r}")
 
 

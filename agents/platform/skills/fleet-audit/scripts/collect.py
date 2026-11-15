@@ -294,7 +294,7 @@ REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
 # lowercase letters, digits and hyphens, starting with a letter and not ending
 # in a hyphen. Used only to say which project a refusal was about.
 REFUSED_PROJECT_ID_RE = re.compile(
-    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
+    r"\b(?i:projects?)[ /]['\"\[]?((?:[a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9])"
     r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
 )
 REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})

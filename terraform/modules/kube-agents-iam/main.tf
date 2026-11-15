@@ -1,4 +1,15 @@
+moved {
+  from = google_service_account.agent
+  to   = google_service_account.agent[0]
+}
+
+moved {
+  from = google_service_account_iam_member.workload_identity
+  to   = google_service_account_iam_member.workload_identity[0]
+}
+
 resource "google_service_account" "agent" {
+  count        = var.manage_iam ? 1 : 0
   project      = var.project_id
   account_id   = var.service_account_id
   display_name = var.display_name
@@ -75,12 +86,53 @@ resource "google_service_account" "agent" {
 }
 
 resource "google_service_account_iam_member" "workload_identity" {
-  service_account_id = google_service_account.agent.name
+  count              = var.manage_iam ? 1 : 0
+  service_account_id = google_service_account.agent[0].name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.namespace}/${var.ksa_name}]"
+  member             = "serviceAccount:${local.gsa_email_domain}.svc.id.goog[${var.namespace}/${var.ksa_name}]"
+}
+
+# Under var.manage_iam = false, google_service_account.agent has count = 0; this
+# zero-count guard only materializes when an invariant is violated, failing the
+# plan at the module boundary while adding nothing to valid plans or state.
+resource "terraform_data" "unmanaged_iam_guard" {
+  count = !var.manage_iam && (
+    var.scoped_pool_enabled ||
+    (local.scope_declares_anything && !local.scope_can_manage) ||
+    (length(local.scope_shared_vpc_hosts) > 0 && !contains(local.scope_roles, local.scope_shared_vpc_lookup_role)) ||
+    !local.scope_selectors_resolved ||
+    ((length(local.scope_selector_names) > 0 || var.scope.max_projects != local.scope_default_cap) && length(local.scope_listed_projects) > local.scope_resolved_set_cap)
+  ) ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = !local.scope_declares_anything || local.scope_can_manage
+      error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts or scope.metrics_scopes names something but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty the scope lists."
+    }
+    precondition {
+      condition     = length(local.scope_shared_vpc_hosts) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
+      error_message = "scope.shared_vpc_hosts names a host but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries no roles/compute.viewer, the role whose compute.projects.get the reconcile needs in the host project to list its service projects; a custom IAM role is not carried into scoped projects. Add it (it is bound in the host project as well) or empty scope.shared_vpc_hosts."
+    }
+    precondition {
+      condition     = !var.scoped_pool_enabled
+      error_message = "manage_iam = false cannot be combined with scoped_pool_enabled = true: the scoped service account pool creates per-project service accounts and iam.serviceAccounts.setIamPolicy grants."
+    }
+    precondition {
+      condition     = local.scope_selectors_resolved
+      error_message = "scope.shared_vpc_hosts or scope.metrics_scopes names a selector that scope_selector_members has no entry for. Resolve the selectors with the kube-agents-scope-resolver module (terraform/modules/kube-agents-scope-resolver) and pass its members output as scope_selector_members, as terraform/examples/full-install does."
+    }
+    precondition {
+      condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
+      error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the resolved-set cap of ${local.scope_resolved_set_cap} (scope.max_projects, spec.scope.maxProjects on the CR): raise scope.max_projects, declare fewer projects, or narrow the selector."
+    }
+  }
 }
 
 locals {
+  project_id_parts      = split(":", var.project_id)
+  gsa_email_domain      = length(local.project_id_parts) == 2 ? "${local.project_id_parts[1]}.${local.project_id_parts[0]}" : var.project_id
+  workload_pool         = "${local.gsa_email_domain}.svc.id.goog"
+  service_account_email = var.manage_iam ? google_service_account.agent[0].email : "${var.service_account_id}@${local.gsa_email_domain}.iam.gserviceaccount.com"
   # The list that actually reaches google_project_iam_member.agent_roles.
   #
   # There is deliberately only one, and it is `var.project_roles`. An earlier
@@ -121,7 +173,7 @@ locals {
   # strongest reason to want it back. Restore it in the same change that lands
   # per-cluster RBAC, gated on the pool granting something, with a test that a
   # read still succeeds afterwards.
-  agent_project_roles = var.project_roles
+  agent_project_roles = var.manage_iam ? var.project_roles : []
 }
 
 resource "google_project_iam_member" "agent_roles" {
@@ -134,5 +186,5 @@ resource "google_project_iam_member" "agent_roles" {
 
   project = var.project_id
   role    = each.value
-  member  = "serviceAccount:${google_service_account.agent.email}"
+  member  = "serviceAccount:${local.service_account_email}"
 }

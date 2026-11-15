@@ -78,6 +78,26 @@ else
 fi
 unset _gke_dns_endpoint_helper
 
+_universe_env_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/universe_env.sh"
+if [ -r "$_universe_env_helper" ]; then
+  # shellcheck source=scripts/installer/universe_env.sh
+  . "$_universe_env_helper"
+else
+  [ -n "${COMMERCIAL_UNIVERSE_DOMAIN:-}" ] || readonly COMMERCIAL_UNIVERSE_DOMAIN="googleapis.com"
+  [ -n "${UNIVERSE_DOMAIN_MAX_LENGTH:-}" ] || readonly UNIVERSE_DOMAIN_MAX_LENGTH=253
+  [ -n "${UNIVERSE_DOMAIN_PATTERN:-}" ] || readonly UNIVERSE_DOMAIN_PATTERN='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+  is_valid_universe_domain() {
+    local domain="${1:-}"
+    [ -n "$domain" ] && [ "${#domain}" -le "$UNIVERSE_DOMAIN_MAX_LENGTH" ] && [[ "$domain" =~ $UNIVERSE_DOMAIN_PATTERN ]]
+  }
+  is_custom_universe_domain() {
+    [ -n "${1:-}" ] && [ "${1}" != "${DEFAULT_UNIVERSE_DOMAIN:-$COMMERCIAL_UNIVERSE_DOMAIN}" ]
+  }
+  adc_matches_universe_domain() { [ "${1:-$COMMERCIAL_UNIVERSE_DOMAIN}" = "$COMMERCIAL_UNIVERSE_DOMAIN" ]; }
+  configure_installer_universe_env() { export UNIVERSE_DOMAIN="${1:-$COMMERCIAL_UNIVERSE_DOMAIN}"; }
+fi
+unset _universe_env_helper
+
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 # The GitHub token minter's Deployment, and the Secret its App ID is read from
@@ -519,6 +539,10 @@ readonly HINDSIGHT_API_DEPLOYMENT="hindsight-api"
 # not define the list. tests/test_uninstall_script.py compares the two lists.
 readonly ALERT_DAILY_LIMIT_PREFIX="ALERT_DAILY_LIMIT_"
 readonly ALERT_DAILY_LIMIT_KEYS="ALERT_DAILY_LIMIT_CRITICAL ALERT_DAILY_LIMIT_WARNING ALERT_DAILY_LIMIT_INFO ALERT_DAILY_LIMIT_DRIFT"
+
+# ─── Google Cloud Dedicated / Sovereign Cloud (universe_domain) ───────────────
+readonly GKE_REGION_LOCATION_PATTERN='^(u-)?[a-z]+-[a-z]+[0-9]+$'
+readonly RESOURCE_MANAGER_API_URL_FORMAT="https://cloudresourcemanager.%s/v3"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -1618,7 +1642,79 @@ warn_on_overreaching_custom_roles() {
 # pattern: install.sh both demotes the default and validates an explicit
 # --gke-cluster-mode against it, and the two must agree.
 location_is_region() {
-  [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
+  [[ "${1:-}" =~ $GKE_REGION_LOCATION_PATTERN ]]
+}
+
+# Service-account email project domain and Workload Identity pool prefix for a
+# GCP project ID. A partitioned project (<partition>:<slug>) flips its two
+# components (<slug>.<partition>); a commercial project stays <project>.
+gcp_gsa_email_domain() {
+  local project_id="${1:-}"
+  if [[ "$project_id" == *:* ]]; then
+    printf '%s.%s' "${project_id#*:}" "${project_id%%:*}"
+  else
+    printf '%s' "$project_id"
+  fi
+}
+
+gcp_workload_identity_pool() {
+  printf '%s.svc.id.goog' "$(gcp_gsa_email_domain "${1:-}")"
+}
+
+# Google-managed service-agent domain for a GCP project ID. Sovereign
+# partitioned projects (<partition>:<slug>, where <partition> has no dot) place
+# Google-managed robots under <partition>-system.iam.gserviceaccount.com;
+# commercial and legacy domain-scoped projects (example.com:name) stay on
+# iam.gserviceaccount.com.
+gcp_service_agent_domain() {
+  local project_id="${1:-}"
+  if [[ "$project_id" == *:* && "${project_id%%:*}" != *.* ]]; then
+    printf '%s-system.iam.gserviceaccount.com' "${project_id%%:*}"
+  else
+    printf 'iam.gserviceaccount.com'
+  fi
+}
+
+# True when MODEL_PROVIDER calls an inference endpoint outside the active
+# sovereign universe boundary (any provider other than openai_compatible and
+# vertex_ai).
+is_external_saas_model_provider() {
+  local provider="${1:-}"
+  [ -n "$provider" ] || return 1
+  case "$provider" in
+    openai_compatible | vertex_ai) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Resource Manager v3 endpoint in the active universe domain.
+resource_manager_api_url() {
+  local domain="${UNIVERSE_DOMAIN:-${DEFAULT_UNIVERSE_DOMAIN:-$COMMERCIAL_UNIVERSE_DOMAIN}}"
+  if [ "$domain" = "$COMMERCIAL_UNIVERSE_DOMAIN" ]; then
+    printf '%s' "$RESOURCE_MANAGER_API_URL"
+  else
+    # shellcheck disable=SC2059
+    printf "$RESOURCE_MANAGER_API_URL_FORMAT" "$domain"
+  fi
+}
+
+# Validates sovereign external model-egress consent for non-default universes.
+validate_sovereign_model_egress() {
+  local domain="${1:-${UNIVERSE_DOMAIN:-${DEFAULT_UNIVERSE_DOMAIN:-$COMMERCIAL_UNIVERSE_DOMAIN}}}"
+  local provider="${2:-${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}}"
+  local consent="${3:-${ALLOW_EXTERNAL_MODEL_EGRESS:-${DEFAULT_ALLOW_EXTERNAL_MODEL_EGRESS:-false}}}"
+  is_custom_universe_domain "$domain" || return 0
+  if [ -n "$consent" ] && ! is_bool_spelling "$consent"; then
+    print_error "ALLOW_EXTERNAL_MODEL_EGRESS='${consent}' is neither true nor false. Fix it in install.env or pass --allow-external-model-egress=true|false."
+    return 1
+  fi
+  is_external_saas_model_provider "$provider" || return 0
+  if is_truthy "$consent"; then
+    return 0
+  fi
+  print_error "Model provider '${provider}' sends prompts to an external commercial API outside sovereign universe '${domain}'."
+  print_info "Choose an in-universe endpoint (--model-provider=openai_compatible or --model-provider=vertex_ai), or pass --allow-external-model-egress (ALLOW_EXTERNAL_MODEL_EGRESS=true in install.env) to authorize external model egress."
+  return 1
 }
 
 is_valid_cluster_mode() {
@@ -1764,6 +1860,7 @@ load_install_env() {
   # --gitops-host are the per-run way in.
   unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY \
     GITOPS_SWITCH_FROM_FORGE GITOPS_SWITCH_FROM_SECRET
+  unset UNIVERSE_DOMAIN VPC_NETWORK VPC_SUBNETWORK ALLOW_EXTERNAL_MODEL_EGRESS MANAGE_IAM
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -2129,7 +2226,18 @@ check_github_org_is_organization() {
 tf_state_bucket() {
   local project="${1:-${PROJECT_ID:-}}"
   local bucket="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ] && bucket="${project}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+  if [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ]; then
+    local slug="${project//:/-}"
+    bucket="${slug}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+    if [ "${#bucket}" -gt 63 ]; then
+      local digest prefix_len
+      digest="$({ sha256sum 2>/dev/null || shasum -a 256; } <<<"$project" | awk '{print substr($1,1,8)}')"
+      prefix_len=$((63 - ${#DEFAULT_TF_STATE_BUCKET_SUFFIX} - 9))
+      slug="${slug:0:$prefix_len}"
+      while [[ "$slug" == *- ]]; do slug="${slug%-}"; done
+      bucket="${slug}-${digest}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+    fi
+  fi
   echo "$bucket"
 }
 
@@ -3020,10 +3128,11 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false manage_iam=true
   identity="$(_scope_terraform_identity_label)"
   ! scope_pool_lists_containers || pool_lists=true
-  if [[ "$organizations" == *[![:space:],]* ]]; then
+  is_truthy "${MANAGE_IAM:-$DEFAULT_MANAGE_IAM}" || manage_iam=false
+  if $manage_iam && [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
   fi
   # Every probe below is called in a `||` list: the front doors run under
@@ -3041,57 +3150,67 @@ check_scope_container_access() {
       undecided+=("whether ${SCOPE_ASSET_API} can be enabled in project '${project}' (the organisation policy could not be read)")
     fi
   fi
-  if ! command -v curl >/dev/null 2>&1; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
-  elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
-  else
-    local IFS=$', \t\n'
-    case "$-" in *f*) had_noglob=true ;; esac
-    set -f
-    for entry in $folders; do
-      [ -n "$entry" ] || continue
-      rc=0
-      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
-      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
-      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
-        # Undecided, and any status the probe does not define: nothing but a
-        # granted answer passes silently.
-        undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
-      fi
-      $pool_lists || continue
-      rc=0
-      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
-      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
-      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
-        undecided+=("whether ${identity} can list the members of folders/${entry}${reason:+ ($reason)}")
-      fi
-    done
-    for entry in $organizations; do
-      [ -n "$entry" ] || continue
-      rc=0
-      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
-      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
-      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
-        # Undecided, and any status the probe does not define: nothing but a
-        # granted answer passes silently.
-        undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
-      fi
-      $pool_lists || continue
-      rc=0
-      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
-      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
-      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
-        undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
-      fi
-    done
-    $had_noglob || set +f
+  # Under MANAGE_IAM=false with the scoped pool disarmed, Terraform neither sets
+  # container IAM policies nor searches container members at plan time.
+  if $manage_iam || $pool_lists; then
+    local probe_goal="set IAM policy on the declared containers"
+    $manage_iam || probe_goal="list the members of the declared containers"
+    if ! command -v curl >/dev/null 2>&1; then
+      undecided+=("whether ${identity} can ${probe_goal} (curl is not installed)")
+    elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
+      undecided+=("whether ${identity} can ${probe_goal} (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
+    elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
+      undecided+=("whether ${identity} can ${probe_goal} ($(_scope_terraform_token_remedy))")
+    else
+      local IFS=$', \t\n'
+      case "$-" in *f*) had_noglob=true ;; esac
+      set -f
+      for entry in $folders; do
+        [ -n "$entry" ] || continue
+        if $manage_iam; then
+          rc=0
+          reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+          if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+            failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
+          elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+            # Undecided, and any status the probe does not define: nothing but a
+            # granted answer passes silently.
+            undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
+          fi
+        fi
+        $pool_lists || continue
+        rc=0
+        reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+        if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+          failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
+        elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+          undecided+=("whether ${identity} can list the members of folders/${entry}${reason:+ ($reason)}")
+        fi
+      done
+      for entry in $organizations; do
+        [ -n "$entry" ] || continue
+        if $manage_iam; then
+          rc=0
+          reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+          if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+            failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
+          elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+            # Undecided, and any status the probe does not define: nothing but a
+            # granted answer passes silently.
+            undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
+          fi
+        fi
+        $pool_lists || continue
+        rc=0
+        reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+        if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+          failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
+        elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+          undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
+        fi
+      done
+      $had_noglob || set +f
+    fi
   fi
   for entry in ${undecided[@]+"${undecided[@]}"}; do
     print_warning "The scope container preflight could not decide ${entry}; the apply will report it if it fails."
@@ -3647,7 +3766,7 @@ _scope_container_can_set_iam() {
   if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sSg --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
     -H @- -H "Content-Type: application/json" \
     -d "{\"permissions\":[\"${permission}\"]}" \
-    -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
+    -w $'\n%{http_code}' "$(resource_manager_api_url)/${resource}:testIamPermissions" 2>/dev/null)"; then
     printf '%s' "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON"
     return "$SCOPE_PROBE_UNDECIDED"
   fi
@@ -4075,26 +4194,45 @@ minter_name_defaults() {
 # and says so. Caller defines print_error / print_info / print_warning.
 check_service_account_ownership() {
   local in_state line label key account_id email state_rc=0 agent_id marker members
-  local -a candidates=() foreign=()
+  local -a candidates=() foreign=() preprovisioned_checks=()
   agent_id="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
-  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}")
+  if is_truthy "${MANAGE_IAM:-$DEFAULT_MANAGE_IAM}"; then
+    candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}")
+  else
+    preprovisioned_checks+=("${agent_id}	${NAMESPACE:-$DEFAULT_NAMESPACE}/kubeagents-platform-agent")
+  fi
   if [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ]; then
     candidates+=("the GitHub token minter	GITHUB_MINTER_GSA_NAME	${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")
   fi
   if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "vertex_ai" ]; then
-    candidates+=("the LiteLLM gateway	LITELLM_GSA_NAME	${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")
+    if is_truthy "${MANAGE_IAM:-$DEFAULT_MANAGE_IAM}"; then
+      candidates+=("the LiteLLM gateway	LITELLM_GSA_NAME	${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")
+    else
+      preprovisioned_checks+=("${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}	${NAMESPACE:-$DEFAULT_NAMESPACE}/kubeagents-litellm")
+    fi
   fi
+  for line in ${preprovisioned_checks[@]+"${preprovisioned_checks[@]}"}; do
+    local preprovisioned_id="" preprovisioned_ksa="" preprovisioned_email="" describe_err="" describe_rc=0
+    IFS=$'\t' read -r preprovisioned_id preprovisioned_ksa <<<"$line"
+    preprovisioned_email="${preprovisioned_id}@$(gcp_gsa_email_domain "${PROJECT_ID}").iam.gserviceaccount.com"
+    describe_err="$(trap - ERR; gcloud iam service-accounts describe "$preprovisioned_email" --project "${PROJECT_ID}" 2>&1 >/dev/null)" || describe_rc=$?
+    if [ "$describe_rc" -ne 0 ] && grep -Eiq 'NOT_FOUND|does not exist' <<<"$describe_err"; then
+      print_error "MANAGE_IAM=false requires pre-provisioned service account '${preprovisioned_email}' in project '${PROJECT_ID}', and gcloud reported NOT_FOUND."
+      print_info "Create '${preprovisioned_email}', grant its project roles and roles/iam.workloadIdentityUser for $(gcp_workload_identity_pool "${PROJECT_ID}")[${preprovisioned_ksa}], or set MANAGE_IAM=true (--manage-iam=true)."
+      return 1
+    fi
+  done
   in_state="$(tf_state_service_account_ids)" || state_rc=$?
   if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
     print_warning "Skipping the service-account ownership check: this install's Terraform state could not be read (see above), so nothing can be said about which accounts it owns. If the apply stops on a 409 creating a service account, re-run once the state is readable."
     return 0
   fi
-  for line in "${candidates[@]}"; do
+  for line in ${candidates[@]+"${candidates[@]}"}; do
     IFS=$'\t' read -r label key account_id <<<"$line"
     if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
-    email="${account_id}@${PROJECT_ID}.iam.gserviceaccount.com"
+    email="${account_id}@$(gcp_gsa_email_domain "${PROJECT_ID}").iam.gserviceaccount.com"
     # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
     # miss is the ordinary fresh-install answer, not an abort.
     if (trap - ERR; gcloud iam service-accounts describe "$email" --project "${PROJECT_ID}" >/dev/null 2>&1); then
@@ -4108,21 +4246,23 @@ check_service_account_ownership() {
   # lost-state case as a leftover agent account and 409s the moment the pool is
   # armed, so it is listed in the same refusal. A list that fails (no
   # permission, API off) counts as no members, as the describe's miss does.
-  # shellcheck disable=SC2059 # the format is the named constant
-  marker="$(printf "$SCOPED_SA_POOL_MEMBER_MARKER_FORMAT" "$agent_id")"
-  members="$(trap - ERR; gcloud iam service-accounts list --project "${PROJECT_ID}" \
-    --filter="email:${SCOPED_SA_POOL_ACCOUNT_ID_PREFIX}* AND description:\"${marker}\"" \
-    --format="value(email)" 2>/dev/null)" || members=""
-  while IFS= read -r email; do
-    [ -n "$email" ] || continue
-    account_id="${email%%@*}"
-    if grep -Fxq "$account_id" <<<"$in_state"; then
-      continue
-    fi
-    # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
-    # agent's, so renaming the agent is what un-collides them.
-    foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}")
-  done <<<"$members"
+  if is_truthy "${MANAGE_IAM:-$DEFAULT_MANAGE_IAM}"; then
+    # shellcheck disable=SC2059 # the format is the named constant
+    marker="$(printf "$SCOPED_SA_POOL_MEMBER_MARKER_FORMAT" "$agent_id")"
+    members="$(trap - ERR; gcloud iam service-accounts list --project "${PROJECT_ID}" \
+      --filter="email:${SCOPED_SA_POOL_ACCOUNT_ID_PREFIX}* AND description:\"${marker}\"" \
+      --format="value(email)" 2>/dev/null)" || members=""
+    while IFS= read -r email; do
+      [ -n "$email" ] || continue
+      account_id="${email%%@*}"
+      if grep -Fxq "$account_id" <<<"$in_state"; then
+        continue
+      fi
+      # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
+      # agent's, so renaming the agent is what un-collides them.
+      foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}")
+    done <<<"$members"
+  fi
   [ "${#foreign[@]}" -eq 0 ] && return 0
 
   for line in ${foreign[@]+"${foreign[@]}"}; do
@@ -5205,6 +5345,11 @@ write_tfvars_from_state() {
     print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
     return 1
   fi
+  local manage_iam="${MANAGE_IAM:-$DEFAULT_MANAGE_IAM}"
+  if [ -n "$manage_iam" ] && ! is_bool_spelling "$manage_iam"; then
+    print_error "MANAGE_IAM='${manage_iam}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The same again: read as off, a misspelt value leaves the release's
   # upgrade_install off, and the apply it was set to rescue fails with the
   # "cannot re-use a name" it was set to prevent, naming nothing (#4108).
@@ -5251,6 +5396,16 @@ write_tfvars_from_state() {
     fi
   fi
 
+  local universe_domain="${UNIVERSE_DOMAIN:-${DEFAULT_UNIVERSE_DOMAIN:-$COMMERCIAL_UNIVERSE_DOMAIN}}"
+  if ! is_valid_universe_domain "$universe_domain"; then
+    print_error "UNIVERSE_DOMAIN='${universe_domain}' is not a valid universe API domain. Set a bare lowercase domain (such as googleapis.com) in install.env."
+    return 1
+  fi
+  if [ "${KUBE_AGENTS_UNINSTALL_DESTROY:-false}" != "true" ]; then
+    validate_sovereign_model_egress "$universe_domain" "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" \
+      "${ALLOW_EXTERNAL_MODEL_EGRESS:-${DEFAULT_ALLOW_EXTERNAL_MODEL_EGRESS:-false}}" || return 1
+  fi
+
   local old_umask
   old_umask="$(umask)"
   umask 077
@@ -5265,10 +5420,25 @@ write_tfvars_from_state() {
     echo "cluster_name = $(hcl_str "${CLUSTER_NAME}")"
     echo "location     = $(hcl_str "${REGION}")"
     echo "namespace    = $(hcl_str "${NAMESPACE:-$DEFAULT_NAMESPACE}")"
+    if is_custom_universe_domain "$universe_domain"; then
+      echo "universe_domain = $(hcl_str "$universe_domain")"
+      if is_truthy "${ALLOW_EXTERNAL_MODEL_EGRESS:-}" || is_truthy "${KUBE_AGENTS_UNINSTALL_DESTROY:-}"; then
+        echo "allow_external_model_egress = true"
+      fi
+    fi
+    if [ -n "${VPC_NETWORK:-}" ]; then
+      echo "vpc_network    = $(hcl_str "${VPC_NETWORK}")"
+    fi
+    if [ -n "${VPC_SUBNETWORK:-}" ]; then
+      echo "vpc_subnetwork = $(hcl_str "${VPC_SUBNETWORK}")"
+    fi
     echo ""
     echo "# One fixed name per project each, while this state is per cluster: a"
     echo "# second install in the project names its own in install.env."
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
+    if [ -n "$manage_iam" ] && ! is_truthy "$manage_iam"; then
+      echo "manage_iam                       = false"
+    fi
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
     echo "# The minter's KSA, the other half of its Workload Identity binding."
@@ -5454,6 +5624,14 @@ write_tfvars_from_state() {
       fi
       if [ -n "${GITOPS_IDENTITY:-}" ]; then
         echo "gitops_identity           = $(hcl_str "${GITOPS_IDENTITY}")"
+      fi
+    elif [ "${GITOPS_FORGE:-}" = "gitea" ]; then
+      echo "gitops_forge              = \"gitea\""
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitops_repo_path          = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitops_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITEA_TOKEN_SECRET:-gitea-forge-token}}")"
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitops_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"

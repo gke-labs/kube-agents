@@ -571,7 +571,7 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     while IFS= read -r existing_ctx; do
       existing_ctx="$(printf '%s' "$existing_ctx" | tr -d "'\"[:space:]")"
       case "$existing_ctx" in
-      *[!A-Za-z0-9._-]* | "") continue ;;
+      *[!A-Za-z0-9.:_-]* | "") continue ;;
       esac
       discovered_ctxs+=("$existing_ctx")
     done < <(awk '/^[[:space:]]*-[[:space:]]*name:[[:space:]]*gke_/{sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/,""); print}' "$DATA/.kubeconfig" 2>/dev/null || true)
@@ -597,7 +597,7 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
       kc_ctx="$default_ctx"
     fi
     case "$kc_ctx" in
-    *[!A-Za-z0-9._-]* | "") continue ;;
+    *[!A-Za-z0-9.:_-]* | "") continue ;;
     esac
     discovered_ctxs+=("$kc_ctx")
     if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then

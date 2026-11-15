@@ -76,7 +76,7 @@ PROJECT_FLAG = "--project"
 
 # The argument patterns. None of them can start with `-`, so an
 # argument is never read as a flag.
-_PROJECT = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
+_PROJECT = re.compile(r"\A(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*\Z")
 _NUMBER = re.compile(r"\A[0-9]{1,20}\Z")
 CONTAINER_KIND_FOLDERS = "folders"
 # The scope.json keys this module reads.

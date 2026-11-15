@@ -158,3 +158,16 @@ func TestAnExcludedClusterRefusalIsCountedUnderItsReason(t *testing.T) {
 		t.Errorf("no rejected-requests sample under reason scope.excluded-cluster:\n%s", exposition)
 	}
 }
+
+func TestPartitionedProjectExclusionsAndSingleCharPrefixes(t *testing.T) {
+	h, upstream, _ := excludeHandler(
+		t,
+		scopeExcluding("part0:sample-project/u-region-north1/excluded-c", "p:single-char/u-region-north1/excluded-s"),
+		"gke_part0:sample-project_u-region-north1_mgmt",
+	)
+	assertExcluded(t, h, upstream, "gke_part0:sample-project_u-region-north1_excluded-c", ReasonExcludedCluster)
+	assertExcluded(t, h, upstream, "gke_p:single-char_u-region-north1_excluded-s", ReasonExcludedCluster)
+	assertForwarded(t, h, upstream, "gke_part0:sample-project_u-region-north1_allowed-c")
+	assertForwarded(t, h, upstream, "gke_p:single-char_u-region-north1_allowed-s")
+	assertForwarded(t, h, upstream, "in-cluster")
+}

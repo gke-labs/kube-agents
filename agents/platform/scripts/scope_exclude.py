@@ -43,6 +43,8 @@ CLUSTERS_KEY = "clusters"
 CLUSTER_REF_KEYS = ("projectId", "location", "clusterName")
 
 NAME_PART = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+PROJECT_PART = re.compile(r"^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]{0,62}$")
+MAX_PART_LENGTH = 63
 PROJECT_NUMBER = re.compile(r"^[0-9]+$")
 
 
@@ -78,7 +80,16 @@ def parse_exclusions(document: object) -> frozenset[tuple[str, str, str]]:
         if not isinstance(entry, dict):
             raise ValueError("an exclude.clusters entry is not an object")
         parts = tuple(entry.get(key) for key in CLUSTER_REF_KEYS)
-        if not all(isinstance(part, str) and NAME_PART.match(part) for part in parts):
+        project_id, location, cluster_name = parts
+        if not (
+            isinstance(project_id, str)
+            and len(project_id) <= MAX_PART_LENGTH
+            and PROJECT_PART.match(project_id)
+            and isinstance(location, str)
+            and NAME_PART.match(location)
+            and isinstance(cluster_name, str)
+            and NAME_PART.match(cluster_name)
+        ):
             raise ValueError("an exclude.clusters entry lacks a valid projectId, location or clusterName")
         triples.add(parts)
     return frozenset(triples)

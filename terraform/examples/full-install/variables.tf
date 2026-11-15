@@ -3,6 +3,44 @@ variable "project_id" {
   type        = string
 }
 
+variable "universe_domain" {
+  description = "Google Cloud API universe domain: \"googleapis.com\" (the default, standard Google Cloud) or a sovereign / partner domain in Google Cloud Dedicated (for example \"universe.example.test\"). Empty means \"googleapis.com\". When not \"googleapis.com\", both Google providers target that universe and commercial-only APIs/roles (cloudtrace, gkehub, gkebackup, developerknowledge) and the Backup for GKE addon default off."
+  type        = string
+  default     = "googleapis.com"
+  nullable    = false
+
+  validation {
+    condition     = trimspace(var.universe_domain) == "" || (can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", lower(trimspace(var.universe_domain)))) && length(trimspace(var.universe_domain)) <= 253)
+    error_message = "universe_domain must be a bare DNS domain name (for example \"googleapis.com\"), with no scheme, path or port."
+  }
+}
+
+variable "vpc_network" {
+  description = "VPC network name or self_link for a cluster this composition creates. Null or empty uses the project's default VPC network; set explicitly in projects where the default VPC was removed (common in Google Cloud Dedicated). Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "vpc_subnetwork" {
+  description = "Subnetwork name or self_link for a cluster this composition creates. Null or empty uses the network's auto-mode subnetwork in location. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "allow_external_model_egress" {
+  description = "Authorize routing prompts and tool context from a custom universe_domain (not \"googleapis.com\") to an external SaaS model provider (gemini, anthropic or openai). Ignored on \"googleapis.com\" and for in-universe providers (openai_compatible, vertex_ai)."
+  type        = bool
+  nullable    = false
+  default     = false
+}
+
+variable "manage_iam" {
+  description = "Whether Terraform creates and manages GCP service accounts and IAM grants. Set false when an IAM administrator pre-provisions the agent (and optional LiteLLM Vertex AI) service account, project/scope roles, and Workload Identity binding outside this state so the deployment identity runs without setIamPolicy; plan-time preconditions then refuse features that bind IAM on Terraform-created resources (scoped_pool_enabled, enable_drift_detector, enable_stockout_investigator, enable_google_chat, enable_github_minter, and create_cluster with enable_database_encryption)."
+  type        = bool
+  nullable    = false
+  default     = true
+}
+
 variable "cluster_name" {
   description = "Name of the GKE cluster to create (or, with create_cluster = false, the existing cluster to install onto)"
   type        = string
@@ -782,17 +820,17 @@ variable "github_repo" {
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server), gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), bitbucket (Bitbucket Cloud, at bitbucket.org) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab or Bitbucket install must leave github_repo and enable_github_minter unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server), gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), gitea (self-managed Gitea at gitops_host, with gitops_repo_path and gitops_token_secret_name), bitbucket (Bitbucket Cloud, at bitbucket.org) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab, gitea or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab, gitea or Bitbucket install must leave github_repo and enable_github_minter unset."
   type        = string
   default     = "github"
   validation {
-    condition     = contains(["github", "gitlab", "bitbucket", "bitbucket-datacenter"], var.gitops_forge)
-    error_message = "gitops_forge must be github, gitlab, bitbucket or bitbucket-datacenter."
+    condition     = contains(["github", "gitlab", "gitea", "bitbucket", "bitbucket-datacenter"], var.gitops_forge)
+    error_message = "gitops_forge must be github, gitlab, gitea, bitbucket or bitbucket-datacenter."
   }
 }
 
 variable "gitops_host" {
-  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com); with gitops_forge = bitbucket-datacenter, the instance's hostname (required; the instance must serve at the root path on port 443). Bitbucket Cloud (bitbucket) takes no host. Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
+  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com); with gitops_forge = gitea, the self-managed Gitea hostname (required); with gitops_forge = bitbucket-datacenter, the instance's hostname (required; the instance must serve at the root path on port 443). Bitbucket Cloud (bitbucket) takes no host. Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
   type        = string
   default     = ""
   validation {
@@ -828,13 +866,13 @@ variable "gitlab_ca_secret_name" {
 }
 
 variable "gitops_repo_path" {
-  description = "The GitOps repository on a Bitbucket forge: workspace/repo-slug on Bitbucket Cloud (bitbucket), PROJECTKEY/repo-slug on Bitbucket Data Center (bitbucket-datacenter). Read only when gitops_forge is bitbucket or bitbucket-datacenter; a GitLab install names its project in gitlab_repo."
+  description = "The GitOps repository on a Bitbucket or Gitea forge: workspace/repo-slug on Bitbucket Cloud (bitbucket), PROJECTKEY/repo-slug on Bitbucket Data Center (bitbucket-datacenter), or owner/repo on Gitea (gitea). Read only when gitops_forge is bitbucket, bitbucket-datacenter or gitea; a GitLab install names its project in gitlab_repo."
   type        = string
   default     = ""
 }
 
 variable "gitops_token_secret_name" {
-  description = "Name of the Kubernetes Secret, in the agent's namespace, holding a Bitbucket forge's token under the key `token`, and an optional read-only token for context repositories under `read-token`. Empty is bitbucket-forge-token. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is bitbucket or bitbucket-datacenter."
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding a Bitbucket or Gitea forge's token under the key `token`, and an optional read-only token for context repositories under `read-token`. Empty defaults to bitbucket-forge-token for Bitbucket and gitea-forge-token for Gitea. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is bitbucket, bitbucket-datacenter or gitea."
   type        = string
   default     = ""
   validation {
@@ -844,7 +882,7 @@ variable "gitops_token_secret_name" {
 }
 
 variable "gitops_ca_secret_name" {
-  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a Bitbucket Data Center instance's TLS certificate, under the key `ca.crt`. The broker trusts it for that host only. Empty: the system CAs only. Read only when gitops_forge is bitbucket-datacenter."
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a Bitbucket Data Center or self-managed Gitea instance's TLS certificate, under the key `ca.crt`. The broker trusts it for that host only. Empty: the system CAs only. Read only when gitops_forge is bitbucket-datacenter or gitea."
   type        = string
   default     = ""
   validation {
@@ -1036,8 +1074,8 @@ variable "drift_pubsub_source_exclude_projects" {
   nullable    = false
 
   validation {
-    condition     = alltrue([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p == "" || can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", p))])
-    error_message = "drift_pubsub_source_exclude_projects is a comma- or space-separated list of GCP project IDs (6 to 30 characters: lowercase letters, digits and hyphens, starting with a letter)."
+    condition     = alltrue([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p == "" || can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", p))])
+    error_message = "drift_pubsub_source_exclude_projects is a comma- or space-separated list of GCP project IDs (6 to 30 characters: lowercase letters, digits and hyphens, starting with a letter, optionally preceded by a sovereign '<partition>:' prefix)."
   }
 }
 

@@ -77,6 +77,10 @@ _VERB_WORD_MAX = 64
 # at the call site says the same thing twice on purpose: whichever a later
 # reader changes, the other still holds.
 _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+_GKE_PROJECT_COMPONENT = re.compile(r"^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*\Z")
+_PARTITIONED_PER_TARGET_BASENAME = re.compile(
+    r"^kubeconfig_([a-z][a-z0-9-]{0,15}):([a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9-]*_[a-z0-9][a-z0-9-]*\.yaml)\Z"
+)
 
 # Enough for any real kubeconfig; the point is that the file is read into
 # memory before anything is known about it.
@@ -773,8 +777,8 @@ def parse_gke_context(context: str) -> ClusterTarget | None:
     if len(parts) != 4 or parts[0] != "gke":
         return None
     project, location, cluster = parts[1], parts[2], parts[3]
-    if not all(
-        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
+    if not _GKE_PROJECT_COMPONENT.fullmatch(project) or not all(
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (location, cluster)
     ):
         return None
     return ClusterTarget(project=project, location=location, cluster=cluster)
@@ -837,7 +841,11 @@ def kubeconfig_context(kubeconfig: str) -> str:
     request whose target cluster is unknown, and running it anyway means running
     it against the broker's own default cluster: the wrong cluster, silently.
     """
-    entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
+    entries = [
+        entry.strip()
+        for entry in normalize_partitioned_kubeconfig_path(kubeconfig).split(os.pathsep)
+        if entry.strip()
+    ]
     if not entries:
         raise KubeconfigUnreadable("KUBECONFIG is set but empty")
     if len(entries) > 1:
@@ -923,14 +931,28 @@ def kubeconfig_dir() -> Path:
     return Path(home) / KUBECONFIG_DIR_NAME
 
 
+def normalize_partitioned_kubeconfig_path(raw: str) -> str:
+    """Map `<dir>/kubeconfig_<part>:<slug>_<cluster>_<loc>.yaml` onto `_` so `:` never splits `KUBECONFIG`."""
+    stripped = raw.strip()
+    if not stripped:
+        return stripped
+    parent, sep, basename = stripped.rpartition("/")
+    match = _PARTITIONED_PER_TARGET_BASENAME.fullmatch(basename)
+    if match is None:
+        return stripped
+    sanitized = f"kubeconfig_{match.group(1)}_{match.group(2)}"
+    return f"{parent}{sep}{sanitized}" if sep else sanitized
+
+
 def per_target_kubeconfig_path(target: ClusterTarget) -> Path:
     """The per-target file AGENTS.md tells the agent to export.
 
     Built from a `ClusterTarget`, so every component has already passed
-    `parse_gke_context` and none can steer the path.
+    `parse_gke_context` and none can steer the path. Partitioned `<part>:<slug>`
+    project IDs map `:` to `_`, matching `platform_mcp_server._thread_kubeconfig_path`.
     """
     return kubeconfig_dir() / PER_TARGET_KUBECONFIG_NAME.format(
-        project=target.project, cluster=target.cluster, location=target.location
+        project=target.project.replace(":", "_"), cluster=target.cluster, location=target.location
     )
 
 
@@ -1464,7 +1486,7 @@ def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
     if target is None:
         return
     merge_context_into_default_kubeconfig(target.context_name)
-    env_kc = os.environ.get("KUBECONFIG", "").strip()
+    env_kc = normalize_partitioned_kubeconfig_path(os.environ.get("KUBECONFIG", ""))
     if env_kc and os.pathsep not in env_kc:
         candidate = Path(env_kc)
         if candidate not in _default_kubeconfig_candidates():
@@ -1656,7 +1678,9 @@ def get_credentials_local_target(argv: list[str]) -> ClusterTarget | None:
     if len(locations) != 1 or len(projects) != 1:
         return None
     target = ClusterTarget(project=projects[0], location=locations[0], cluster=positionals[-1])
-    if not all(_GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (target.project, target.location, target.cluster)):
+    if not _GKE_PROJECT_COMPONENT.fullmatch(target.project) or not all(
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (target.location, target.cluster)
+    ):
         return None
     return target
 
@@ -1748,13 +1772,13 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
         stripped.append(argument)
         index += 1
     if destination is None and not task_mode():
-        env_kc = os.environ.get("KUBECONFIG", "").strip()
+        env_kc = normalize_partitioned_kubeconfig_path(os.environ.get("KUBECONFIG", ""))
         if env_kc and not (
             os.environ.get("KUBE_PROXY_URL", "").strip()
             and _is_default_sandbox_kubeconfig(env_kc)
         ):
             destination = env_kc
-    return stripped, Path(destination) if destination else None
+    return stripped, Path(normalize_partitioned_kubeconfig_path(destination)) if destination else None
 
 
 def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
@@ -2009,7 +2033,11 @@ def execute(
         elif argv and argv[0] in KUBECONFIG_AWARE:
             flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
-            kubeconfig = "" if in_task else os.environ.get("KUBECONFIG", "").strip()
+            kubeconfig = (
+                ""
+                if in_task
+                else normalize_partitioned_kubeconfig_path(os.environ.get("KUBECONFIG", ""))
+            )
             if kubeconfig and not (
                 os.environ.get("KUBE_PROXY_URL", "").strip()
                 and _is_default_sandbox_kubeconfig(kubeconfig)

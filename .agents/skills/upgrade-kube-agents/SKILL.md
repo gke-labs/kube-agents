@@ -138,8 +138,8 @@ breaking change (`type!:` or a `BREAKING CHANGE:` footer), as a rollback to an o
 usually does, and names each one; `--plan` only warns. Show the user the named commits and get
 their consent before re-running with `--allow-breaking-downgrade`.
 
-A GitLab install needs nothing extra. The upgrade reads the forge, host, project and Secret names
-from `install.env`, needs no token and no CA file, and keeps both Secrets.
+A GitLab, Gitea or Bitbucket install needs nothing extra. The upgrade reads the forge, host, repository and Secret names
+from `install.env`, needs no token and no CA file, and keeps both Secrets. On Google Cloud Dedicated / Sovereign Cloud (`UNIVERSE_DOMAIN` in `install.env`, or `--universe-domain` on the command line), `upgrade.sh` configures child `gcloud` and Terraform calls for that universe automatically (partitioned `<partition>:<slug>` project IDs map the state bucket to `<partition>-<slug>-kube-agents-tfstate`).
 
 Every mode requires the `kube-agents` Helm release to exist in the target namespace. An install
 without one predates the Terraform + Helm engine: upgrade it with the release that installed it

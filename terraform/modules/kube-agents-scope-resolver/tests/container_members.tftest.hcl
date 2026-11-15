@@ -343,3 +343,36 @@ run "one_past_the_cap_less_an_exact_exclude_fits" {
     error_message = "the excluded member is dropped and the other hundred listed: ${length(output.container_members["folders/123456789012"])}"
   }
 }
+
+run "custom_universe_domain_targets_sovereign_endpoints_and_partitioned_projects" {
+  command = plan
+
+  variables {
+    quota_project   = "part0:mgmt-project"
+    universe_domain = "universe.example.test"
+  }
+
+  override_data {
+    target = data.http.scope_container["folders/123456789012"]
+    values = {
+      status_code = 200
+      response_body = jsonencode({ results = [
+        { name = "//container.universe.example.test/projects/part0:fleet-proj-a/locations/u-region-north1/clusters/prod", assetType = "container.googleapis.com/Cluster", project = "projects/500000000001", location = "u-region-north1" },
+      ] })
+    }
+  }
+
+  assert {
+    condition = (
+      local.scope_compute_api_url == "https://compute.universe.example.test/compute/v1" &&
+      local.scope_monitoring_api_url == "https://monitoring.universe.example.test/v1" &&
+      local.scope_resource_manager_api_url == "https://cloudresourcemanager.universe.example.test/v3" &&
+      local.scope_asset_api_url == "https://cloudasset.universe.example.test/v1"
+    )
+    error_message = "custom universe_domain must rewrite all four scope_resolver API base URLs"
+  }
+  assert {
+    condition     = jsonencode(output.container_members) == jsonencode({ "folders/123456789012" = ["part0:fleet-proj-a"] })
+    error_message = "container_members in custom universe: ${jsonencode(output.container_members)}"
+  }
+}

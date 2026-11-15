@@ -67,16 +67,23 @@ class VertexManageServingProjectTest(unittest.TestCase):
             with self.subTest(resource=f"{kind}.{name}"):
                 body = _block(self.main_tf, kind, name)
                 self.assertRegex(body, r"project\s*=\s*local\.vertex_project")
-                self.assertRegex(
-                    body, r"count\s*=\s*local\.manage_vertex_serving\s*\?\s*1\s*:\s*0"
-                )
+                if kind == "google_project_iam_member":
+                    self.assertRegex(
+                        body,
+                        r"count\s*=\s*var\.manage_iam\s*&&\s*local\.manage_vertex_serving\s*\?\s*1\s*:\s*0",
+                    )
+                else:
+                    self.assertRegex(
+                        body, r"count\s*=\s*local\.manage_vertex_serving\s*\?\s*1\s*:\s*0"
+                    )
 
     def test_the_gateway_identity_does_not_follow_it(self):
         # The service account and its binding live in project_id and must
-        # exist whichever way the variable is set; that is what lets the
-        # operator grant the role by hand to a stable email.
+        # exist whichever way vertex_manage_serving_project is set; manage_iam
+        # governs IAM/GSA creation separately.
         body = _block(self.main_tf, "module", "litellm_vertex_iam")
         self.assertRegex(body, r"project_id\s*=\s*var\.project_id")
+        self.assertRegex(body, r"manage_iam\s*=\s*var\.manage_iam")
         self.assertRegex(body, r"count\s*=\s*local\.use_vertex\s*\?\s*1\s*:\s*0")
         self.assertNotIn("manage_vertex_serving", body)
 

@@ -113,7 +113,7 @@ type ScopeSpec struct {
 	// reported with the reason (denied, api-disabled, unreachable) and its
 	// existing profiles are kept.
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`
 	// +listType=set
 	// +optional
 	Projects []string `json:"projects,omitempty"`
@@ -156,7 +156,7 @@ type ScopeSpec struct {
 	// the selector's previous members and holds the scope prune, and is reported
 	// in the snapshot's containers array under sharedVpcHosts/<host>.
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`
 	// +listType=set
 	// +optional
 	SharedVpcHosts []string `json:"sharedVpcHosts,omitempty"`
@@ -180,7 +180,7 @@ type ScopeSpec struct {
 	// previous members and holds the scope prune, and is reported in the
 	// snapshot's containers array under metricsScopes/<scope>.
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`
 	// +listType=set
 	// +optional
 	MetricsScopes []string `json:"metricsScopes,omitempty"`
@@ -214,7 +214,7 @@ type ScopeExcludeSpec struct {
 	// each resolved project ID. A match on the management project is ignored and
 	// recorded in the scope snapshot, never applied.
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern=`^[a-z0-9*?\[\]!-]{1,63}$`
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9:*?\[\]!-]{1,63}$`
 	// +listType=set
 	// +optional
 	Projects []string `json:"projects,omitempty"`
@@ -248,7 +248,7 @@ type ScopeExcludeSpec struct {
 // ScopeClusterRef identifies one GKE cluster.
 type ScopeClusterRef struct {
 	// ProjectID is the project the cluster lives in.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:Pattern=`^([a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*$`
 	// +kubebuilder:validation:MaxLength=63
 	ProjectID string `json:"projectId"`
 

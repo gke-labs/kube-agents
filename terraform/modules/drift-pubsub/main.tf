@@ -99,7 +99,8 @@ locals {
   # The sink's postcondition checks this against what Logging actually returns,
   # because a wrong guess here is the silently-inert pipeline the grant's own
   # comment describes.
-  derived_sink_writer_identity = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-logging.iam.gserviceaccount.com"
+  host_service_agent_domain    = can(regex("^[a-z][a-z0-9-]*:", var.project_id)) ? "${split(":", var.project_id)[0]}-system.iam.gserviceaccount.com" : "iam.gserviceaccount.com"
+  derived_sink_writer_identity = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-logging.${local.host_service_agent_domain}"
 
   # A project where Logging reports some other identity would fail that
   # postcondition on every plan from then on, taking the whole composition with
@@ -117,7 +118,7 @@ locals {
   # a sink of another install's: its own, named sink_name, when it is that
   # install's management project, or another install's source sink when two
   # installs list it in their scopes. The host project is what tells them apart.
-  source_sink_name = "${var.sink_name}-${var.project_id}"
+  source_sink_name = "${var.sink_name}-${replace(var.project_id, ":", "-")}"
 
   # The source sinks carry the shared clauses and the lease carve-out, and not
   # cluster_names: those are bare names in the host project, and a cluster of
@@ -136,7 +137,7 @@ locals {
   # override exists per project, for the same dead end.
   source_derived_sink_writer_identity = {
     for project, source in data.google_project.source :
-    project => "serviceAccount:service-${source.number}@gcp-sa-logging.iam.gserviceaccount.com"
+    project => "serviceAccount:service-${source.number}@gcp-sa-logging.${length(split(":", project)) == 2 ? "${split(":", project)[0]}-system.iam.gserviceaccount.com" : "iam.gserviceaccount.com"}"
   }
   source_expected_sink_writer_identity = {
     for project in local.source_projects :

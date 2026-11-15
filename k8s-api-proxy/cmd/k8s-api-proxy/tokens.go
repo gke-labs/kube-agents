@@ -62,7 +62,8 @@ const (
 
 var (
 	scopedComponentRE      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\z`)
-	scopedServiceAccountRE = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com\z`)
+	scopedProjectRE        = regexp.MustCompile(`^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*\z`)
+	scopedServiceAccountRE = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{1,30}(?:\.[a-z][a-z0-9-]{0,15})?\.iam\.gserviceaccount\.com\z`)
 	universeDomainRE       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 )
 
@@ -383,7 +384,7 @@ func parseScopedSAPool(data []byte) (map[string]string, error) {
 			return nil, fmt.Errorf("serviceAccounts[%d] is not an object", i)
 		}
 		projectID, ok := entry["projectId"].(string)
-		if !ok || !scopedComponentRE.MatchString(projectID) || len(projectID) > maxNameComponentLength {
+		if !ok || !scopedProjectRE.MatchString(projectID) || len(projectID) > maxNameComponentLength {
 			return nil, fmt.Errorf("serviceAccounts[%d]: projectId is not a valid GKE project ID", i)
 		}
 		email, ok := entry["serviceAccountEmail"].(string)
@@ -472,7 +473,7 @@ func (s *scopedPoolTransport) RoundTripCluster(ctx context.Context, clusterID st
 	restID, ok := strings.CutPrefix(clusterID, "gke_")
 	parts := strings.Split(restID, "_")
 	if !ok || len(parts) != 3 ||
-		!scopedComponentRE.MatchString(parts[0]) || len(parts[0]) > maxNameComponentLength ||
+		!scopedProjectRE.MatchString(parts[0]) || len(parts[0]) > maxNameComponentLength ||
 		!scopedComponentRE.MatchString(parts[1]) || len(parts[1]) > maxNameComponentLength ||
 		!scopedComponentRE.MatchString(parts[2]) || len(parts[2]) > maxNameComponentLength {
 		return nil, fmt.Errorf("scoped service account pool is armed and cluster %q is not a gke_PROJECT_LOCATION_NAME cluster", clusterID)

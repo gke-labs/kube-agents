@@ -149,6 +149,15 @@ else
   gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=""; }
 fi
 
+UNIVERSE_ENV_HELPER="../../../scripts/installer/universe_env.sh"
+if [[ -r "$UNIVERSE_ENV_HELPER" ]]; then
+  # shellcheck source=../../../scripts/installer/universe_env.sh
+  . "$UNIVERSE_ENV_HELPER"
+else
+  [ -n "${COMMERCIAL_UNIVERSE_DOMAIN:-}" ] || readonly COMMERCIAL_UNIVERSE_DOMAIN="googleapis.com"
+  configure_installer_universe_env() { export UNIVERSE_DOMAIN="${1:-$COMMERCIAL_UNIVERSE_DOMAIN}"; }
+fi
+
 # Remote state, opt-in. The composition ships no backend block — a hand-driven
 # example works fine on local state — but an installer-driven one cannot:
 # install.sh may run from a disposable clone, and uninstall.sh and upgrade.sh
@@ -260,6 +269,10 @@ readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
 # The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
 readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
+readonly AGENT_GSA_INDEXED_ADDRESS="module.kube_agents_iam.google_service_account.agent[0]"
+readonly AGENT_IAM_MODULE_PREFIX="module.kube_agents_iam."
+readonly LITELLM_VERTEX_IAM_PREFIX="module.litellm_vertex_iam"
+readonly LITELLM_VERTEX_USER_PREFIX="google_project_iam_member.litellm_vertex_user"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
 # What `terraform output -raw <name>` prints when the state records other
@@ -313,6 +326,7 @@ readonly DRIFT_ADOPTION_TARGETS=(
 # subscriptions, sinks -- so the array needs no fourth spelling of it.
 readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
 readonly K8S_LABEL_VALUE_MAX_LENGTH=63
+readonly GCS_STORAGE_API_FMT="https://storage.%s/storage/v1/"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -321,6 +335,10 @@ readonly K8S_LABEL_VALUE_MAX_LENGTH=63
 # the wrong question — an empty bucket plans the whole composition as new,
 # which reads as total drift when the truth is that this is not the install's
 # backend at all.
+normalize_tfvar_universe_domain() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
 ensure_backend() {
   local mode="${1:-}"
   [[ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]] || return 0
@@ -333,12 +351,28 @@ ensure_backend() {
     exit 1
   }
 
-  local project bucket prefix region
+  local project bucket prefix region universe storage_endpoint
   project=$(tfvar project_id)
+  universe="$(normalize_tfvar_universe_domain "$(tfvar universe_domain)")"
+  configure_installer_universe_env "${universe:-$DEFAULT_UNIVERSE_DOMAIN}"
   bucket="$KUBE_AGENTS_STATE_BUCKET"
   # The same derivation as installer_common.sh's tf_state_bucket, from the same
   # two defaults, so the front doors and a hand-driven run name one bucket.
-  [[ "$bucket" == "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ]] && bucket="${project}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+  # Partitioned project IDs (part0:sample-project) convert ':' to '-' because
+  # GCS bucket names forbid colons, and IDs exceeding GCS's 63-char limit are
+  # truncated with an 8-hex SHA-256 suffix.
+  if [[ "$bucket" == "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ]]; then
+    local slug="${project//:/-}"
+    bucket="${slug}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+    if [[ "${#bucket}" -gt 63 ]]; then
+      local digest prefix_len
+      digest="$({ sha256sum 2>/dev/null || shasum -a 256; } <<<"$project" | awk '{print substr($1,1,8)}')"
+      prefix_len=$((63 - ${#DEFAULT_TF_STATE_BUCKET_SUFFIX} - 9))
+      slug="${slug:0:$prefix_len}"
+      while [[ "$slug" == *- ]]; do slug="${slug%-}"; done
+      bucket="${slug}-${digest}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+    fi
+  fi
   prefix="$(state_prefix)"
   # The bucket lives where the cluster does; strip a zone suffix to its region.
   region=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
@@ -358,8 +392,15 @@ ensure_backend() {
   fi
 
   local desired
-  desired=$(printf 'terraform {\n  backend "gcs" {\n    bucket = "%s"\n    prefix = "%s"\n  }\n}\n' \
-    "$bucket" "$prefix")
+  if [[ -n "$universe" && "$universe" != "$DEFAULT_UNIVERSE_DOMAIN" ]]; then
+    # shellcheck disable=SC2059
+    printf -v storage_endpoint "$GCS_STORAGE_API_FMT" "$universe"
+    desired=$(printf 'terraform {\n  backend "gcs" {\n    bucket                  = "%s"\n    prefix                  = "%s"\n    storage_custom_endpoint = "%s"\n  }\n}\n' \
+      "$bucket" "$prefix" "$storage_endpoint")
+  else
+    desired=$(printf 'terraform {\n  backend "gcs" {\n    bucket = "%s"\n    prefix = "%s"\n  }\n}\n' \
+      "$bucket" "$prefix")
+  fi
   if [[ ! -f "$BACKEND_OVERRIDE_FILE" ]] || [[ "$(cat "$BACKEND_OVERRIDE_FILE")" != "$desired" ]]; then
     printf '%s' "$desired" >"$BACKEND_OVERRIDE_FILE"
     log "state backend: gs://$bucket/$prefix"
@@ -392,6 +433,11 @@ ensure_init() {
     warn "terraform init failed; run it by hand to see why"
     exit 1
   }
+  if [[ -z "${KUBE_AGENTS_STATE_BUCKET:-}" ]]; then
+    local local_universe
+    local_universe="$(normalize_tfvar_universe_domain "$(tfvar universe_domain)")"
+    configure_installer_universe_env "${local_universe:-$DEFAULT_UNIVERSE_DOMAIN}"
+  fi
 }
 
 # Reads a resolved input variable. terraform console loads terraform.tfvars the
@@ -1165,9 +1211,16 @@ guard_node_pool_shape() {
 # destroys install #2's GSA and then 409s creating the default name, leaving
 # install #2 with no identity.
 guard_gsa_identity() {
+  [[ "$(tfvar manage_iam)" != "false" ]] || return 0
   load_state
-  local addr="$AGENT_GSA_ADDRESS"
-  in_state "$addr" || return 0
+  local addr="" candidate
+  for candidate in "$AGENT_GSA_INDEXED_ADDRESS" "$AGENT_GSA_ADDRESS"; do
+    if in_state "$candidate"; then
+      addr="$candidate"
+      break
+    fi
+  done
+  [[ -n "$addr" ]] || return 0
 
   local recorded
   recorded=$(state_attr "$addr" account_id)
@@ -1375,10 +1428,10 @@ guard_drift_adoption() {
     IFS='|' read -r addr group noun name <<<"$line"
     warn "  gcloud $group delete $name --project $project"
   done
-  local sink_name
+  local sink_name sink_project="${project//:/-}"
   sink_name=$(tfvar drift_pubsub_sink)
-  warn "An install with a declared scope also owns a sink named '${sink_name}-${project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
-  warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${project}"
+  warn "An install with a declared scope also owns a sink named '${sink_name}-${sink_project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
+  warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${sink_project}"
   warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."
   exit 1
 }
@@ -1448,6 +1501,26 @@ forget_unmanaged_cluster_kms() {
   restore_key_versions \
     "projects/$project/locations/$location/keyRings/$(tfvar kms_keyring_name)/cryptoKeys/$(tfvar kms_key_name)" \
     "$location" "$project"
+}
+
+# manage_iam = false hands the agent and LiteLLM Vertex GSAs and their IAM
+# bindings back to external governance: any managed IAM entry still in state
+# from an earlier apply would otherwise go from count = 1 to 0 and plan the
+# live GSA's destruction and IAM revocations.
+forget_unmanaged_iam() {
+  [[ "$(tfvar manage_iam)" == "false" ]] || return 0
+  load_state
+  local address
+  while IFS= read -r address; do
+    case "$address" in
+      "${AGENT_IAM_MODULE_PREFIX}"* | "${LITELLM_VERTEX_IAM_PREFIX}"* | "${LITELLM_VERTEX_USER_PREFIX}"*) ;;
+      *) continue ;;
+    esac
+    log "forgetting $address (manage_iam = false; kept in GCP under external IAM governance)"
+    state_changed
+    terraform state rm "$address" >/dev/null 2>&1 ||
+      warn "could not forget $address; Terraform may attempt to destroy or revoke it"
+  done <<<"$STATE_LIST"
 }
 
 # When enable_github_minter is true, the minter Deployment cannot pass readiness
@@ -2035,6 +2108,7 @@ case "${1:-}" in
     guard_pubsub_subscription
     guard_drift_adoption
     forget_unmanaged_cluster_kms
+    forget_unmanaged_iam
     guard_minter_key
     log "checking pre-existing GCP resources to adopt (KMS, Pub/Sub)..."
     adopt_kms
@@ -2081,6 +2155,7 @@ case "${1:-}" in
     purge_backups
     disable_deletion_protection
     forget_kms
+    forget_unmanaged_iam
     log "terraform destroy"
     # deletion_protection is passed again because destroy re-evaluates the config,
     # and the variable's default would otherwise reinstate the guard. Filtered,

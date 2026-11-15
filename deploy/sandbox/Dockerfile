@@ -118,6 +118,23 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm /tmp/check_kubectl_base_path.py && \
     printf '%s\n' \
       '#!/bin/sh' \
+      'case "${KUBECONFIG:-}" in' \
+      '*:*:*)' \
+      '  ;;' \
+      '*:*)' \
+      '  _kc_b="${KUBECONFIG##*/}"' \
+      '  case "${_kc_b}" in' \
+      '  kubeconfig_[a-z]*:*_*_*.yaml)' \
+      '    _kc_p="${_kc_b#kubeconfig_}"; _kc_p="${_kc_p%%:*}"; _kc_r="${_kc_b#*:}"' \
+      '    case "${_kc_p}" in *[!a-z0-9-]*) ;; *)' \
+      '      case "${_kc_r}" in "" | -* | *[!a-z0-9._-]*) ;; *)' \
+      '        if [ "${#_kc_p}" -le 16 ]; then' \
+      '          if [ "${_kc_b}" = "${KUBECONFIG}" ]; then export KUBECONFIG="kubeconfig_${_kc_p}_${_kc_r}"; else export KUBECONFIG="${KUBECONFIG%/*}/kubeconfig_${_kc_p}_${_kc_r}"; fi' \
+      '        fi ;;' \
+      '      esac ;;' \
+      '    esac ;;' \
+      '  esac ;;' \
+      'esac' \
       'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
       '  case " $* " in' \
       '  *" --context"*)' \

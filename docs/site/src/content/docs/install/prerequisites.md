@@ -71,6 +71,14 @@ The APIs it enables are `container`, `cloudkms`, `iam`, `cloudresourcemanager`, 
 
 The A2A stack adds no service account, no IAM grant and no API. Its bus identities are Kubernetes ServiceAccounts the operator creates, and the one cluster-scoped grant, the auth callout's ClusterRoleBinding to `system:auth-delegator`, is made by the operator under its own permissions, not yours.
 
+### Google Cloud Dedicated and Sovereign Cloud
+
+For projects in Google Cloud Dedicated or Google Cloud Sovereign Cloud (`universe_domain` other than `googleapis.com`), authenticate `gcloud` against your sovereign configuration first. Pass `--universe-domain` to `install.sh`, `upgrade.sh`, and `uninstall.sh`, or run from an active `gcloud` configuration that already sets `core/universe_domain`.
+
+The installer configures child `gcloud` and `kubectl` calls for that universe and hands Terraform an in-memory access token from your active `gcloud` session without overwriting your default ADC file. Commercial-only APIs and IAM roles (`gkebackup` unless `--enable-gke-backup-plan` is passed, `developerknowledge`, `cloudtrace`, `gkehub`, and `roles/mcp.toolUser`) are omitted automatically. Partition-prefixed project IDs (`<partition>:<project>`) map the state bucket to `<partition>-<project>-kube-agents-tfstate` and the Workload Identity pool to `<project>.<partition>.svc.id.goog`.
+
+When creating a cluster in a project without a `default` VPC network, pass `--vpc-network` (and `--vpc-subnetwork` on custom-mode VPCs). Choose `--model-provider=openai_compatible` or `--model-provider=vertex_ai` (with an operator and chart release supporting `spec.harness.universeDomain`) to keep prompts inside the universe; any other model provider requires `--allow-external-model-egress`. When an IAM administrator pre-provisions `kubeagents-platform-gsa` (and `kubeagents-litellm-gsa` for `vertex_ai`), its roles, and its Workload Identity binding, pass `--manage-iam=false` (`MANAGE_IAM=false`). Use an existing cluster (or `TF_VAR_enable_database_encryption=false`), set `ENABLE_DRIFT_DETECTOR=false`, and leave `--enable-stockout-investigator`, `--enable-google-chat`, `--scoped-sa-pool-enabled`, and `--github-app-id` off.
+
 ## Cluster requirements
 
 A cluster the installer creates meets every requirement here by construction, so on a fresh install there is nothing to check. A cluster somebody else made is a different matter. The composition installs onto one when `create_cluster = false`, and `install.sh` selects that on its own whenever the cluster it is pointed at already exists and this install did not create it. Some requirements are then refused at plan time, some `install.sh` meets by changing the cluster, and the rest fail after the GCP resources exist; the third column says which. Read the cluster before you point the installer at it:
@@ -351,12 +359,12 @@ See [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/) for the ins
 
 ## GitOps repo on Gitea
 
-When the GitOps repository is on a self-managed Gitea instance (in-cluster or on-premises), you need none of the GitHub items above either. `install.sh` has no Gitea flag: the forge is declared on the `PlatformAgent` CR, or through the chart, after the install. Prepare these:
+When the GitOps repository is on a self-managed Gitea instance, you need none of the GitHub items above either. For HTTPS instances serving on port 443, `install.sh --gitops-forge=gitea` configures the forge (`--gitops-host`, `--gitops-repo`, `--gitops-token-file`, and optional `--gitops-ca-file`). In-cluster HTTP Services or non-443 ports are declared on the `PlatformAgent` CR or through Helm values instead. Prepare these:
 
 - **Gitea repository:** the GitOps repository, created before the install, and a dedicated automation account that can write to it.
-- **Access token:** a token of that account with the `write:repository`, `write:issue` and `read:user` scopes, stored in a Secret in the agent's namespace under the key `token`.
+- **Access token:** a token of that account with the `write:repository`, `write:issue` and `read:user` scopes, stored in `gitea-forge-token` (or another Secret in the agent's namespace) under the key `token`.
 - **Network access:** the credential broker pod must reach the Gitea host; an in-cluster Service or a route from the cluster.
-- **Certificate:** an HTTPS instance signed by a private CA needs its chain in a Secret under the key `ca.crt`, referenced from the forge entry.
+- **Certificate:** an HTTPS instance signed by a private CA needs its chain in `gitea-forge-ca` (or another Secret under the key `ca.crt`), passed via `--gitops-ca-file` or referenced from the forge entry.
 
 See [Gitea as the GitOps forge](/kube-agents/install/gitea/) for the token Secret, the CA bundle and the forge declaration.
 

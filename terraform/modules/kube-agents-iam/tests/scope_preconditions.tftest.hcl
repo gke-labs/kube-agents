@@ -96,3 +96,26 @@ run "a_declared_selector_with_no_members_entry_is_refused" {
 
   expect_failures = [google_service_account.agent]
 }
+
+run "manage_iam_false_refuses_scoped_pool_enabled_at_module_boundary" {
+  command = plan
+
+  variables {
+    manage_iam          = false
+    scoped_pool_enabled = true
+  }
+
+  expect_failures = [terraform_data.unmanaged_iam_guard]
+}
+
+run "manage_iam_false_refuses_unresolved_selector_at_module_boundary" {
+  command = plan
+
+  variables {
+    manage_iam             = false
+    scope                  = { metrics_scopes = ["scoping-proj1"] }
+    scope_selector_members = {}
+  }
+
+  expect_failures = [terraform_data.unmanaged_iam_guard]
+}

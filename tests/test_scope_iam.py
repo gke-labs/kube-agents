@@ -106,7 +106,7 @@ class ScopeAllowlistTest(unittest.TestCase):
         self.assertIn("for_each = local.scope_bindings", binding)
         self.assertIn("role    = each.value.role", binding)
         self.assertNotIn("var.project_roles", binding)
-        self.assertIn('member  = "serviceAccount:${google_service_account.agent.email}"', binding)
+        self.assertIn('member  = "serviceAccount:${local.service_account_email}"', binding)
 
     def test_the_host_project_is_never_bound_twice(self):
         # The filter, and the wire from it to the bindings: a for_each fed from
@@ -148,7 +148,7 @@ class ScopeContainerBindingsTest(unittest.TestCase):
         self.assertIn("for_each = local.scope_folder_bindings", binding)
         self.assertIn('folder = "folders/${each.value.folder}"', binding)
         self.assertIn("role   = each.value.role", binding)
-        self.assertIn('member = "serviceAccount:${google_service_account.agent.email}"', binding)
+        self.assertIn('member = "serviceAccount:${local.service_account_email}"', binding)
         self.assertNotIn("var.project_roles", binding)
         self.assertIn("setproduct(sort(tolist(local.scope_folders)), local.scope_container_roles)", self.scope_tf)
 
@@ -157,7 +157,7 @@ class ScopeContainerBindingsTest(unittest.TestCase):
         self.assertIn("for_each = local.scope_organization_bindings", binding)
         self.assertIn("org_id = each.value.organization", binding)
         self.assertIn("role   = each.value.role", binding)
-        self.assertIn('member = "serviceAccount:${google_service_account.agent.email}"', binding)
+        self.assertIn('member = "serviceAccount:${local.service_account_email}"', binding)
         self.assertNotIn("var.project_roles", binding)
         self.assertIn("setproduct(sort(tolist(local.scope_organizations)), local.scope_container_roles)", self.scope_tf)
 
@@ -219,9 +219,9 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("for_each = local.scope_listed_containers", container)
         self.assertIn("local.scope_container_url[each.key]", container)
         self.assertIn('scope_asset_api_url', self.resolver_tf)
-        self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.resolver_tf)
-        self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.resolver_tf)
-        self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.resolver_tf)
+        self.assertIn('scope_compute_api_url          = "https://compute.${local.effective_universe_domain}/compute/v1"', self.resolver_tf)
+        self.assertIn('scope_monitoring_api_url       = "https://monitoring.${local.effective_universe_domain}/v1"', self.resolver_tf)
+        self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.${local.effective_universe_domain}/v3"', self.resolver_tf)
 
     def test_every_read_carries_the_providers_own_token(self):
         # google_client_config is the provider's configured identity, impersonation
@@ -495,8 +495,9 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         for crd_key, tf_key in (("projectId", "project_id"), ("location", "location"), ("clusterName", "cluster_name")):
             with self.subTest(part=crd_key):
                 schema = parts[crd_key]
-                self.assertEqual(schema["pattern"], "^[a-z0-9][a-z0-9-]*$")
-                bounded = f"^[a-z0-9][a-z0-9-]{{0,{schema['maxLength'] - 1}}}$"
+                prefix = "([a-z][a-z0-9-]{0,15}:)?" if crd_key == "projectId" else ""
+                self.assertEqual(schema["pattern"], f"^{prefix}[a-z0-9][a-z0-9-]*$")
+                bounded = f"^{prefix}[a-z0-9][a-z0-9-]{{0,{schema['maxLength'] - 1}}}$"
                 self.assertIn(f'regex("{bounded}", cluster.{tf_key})', self.variable)
 
     def test_the_crds_set_and_map_lists_are_checked_for_repeats(self):
@@ -587,13 +588,14 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn("shared_vpc_hosts = var.scope.shared_vpc_hosts", body)
         self.assertIn("metrics_scopes   = var.scope.metrics_scopes", body)
         self.assertIn("exclude_projects = var.scope.exclude.projects", body)
-        self.assertIn("quota_project = var.project_id", body)
         self.assertNotIn("depends_on", body)
         # Every input is a var. reference and nothing else: a managed value, a
         # module output or a local derived from either makes an input unknown
         # on a first install, and the for_each keyed on it fails the plan.
         inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
-        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "folders", "organizations", "list_container_members", "exclude_projects", "quota_project", "member_cap"})
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "folders", "organizations", "list_container_members", "exclude_projects", "quota_project", "universe_domain", "member_cap"})
+        self.assertIn(("quota_project", "var.project_id"), inputs)
+        self.assertIn(("universe_domain", "var.universe_domain"), inputs)
         self.assertIn(("member_cap", "var.scope.max_projects"), inputs)
         # The containers' members are listed for the scoped service account
         # pool alone (design §6): the resolver reads a container only while

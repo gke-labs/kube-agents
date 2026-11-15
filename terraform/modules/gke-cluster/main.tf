@@ -9,6 +9,15 @@ locals {
   # scripts/installer/installer_common.sh.
   kms_location = replace(var.location, "/-[a-z]$/", "")
 
+  # Partitioned project IDs (<partition>:<slug> in Google Cloud Dedicated) map
+  # to Workload Identity pool <slug>.<partition>.svc.id.goog; unpartitioned
+  # project IDs map to <project_id>.svc.id.goog.
+  project_id_parts = split(":", var.project_id)
+  workload_pool    = length(local.project_id_parts) == 2 ? "${local.project_id_parts[1]}.${local.project_id_parts[0]}.svc.id.goog" : "${var.project_id}.svc.id.goog"
+
+  network    = (var.network != null && var.network != "") ? var.network : null
+  subnetwork = (var.subnetwork != null && var.subnetwork != "") ? var.subnetwork : null
+
   # The shape each sizing profile gives the Standard cluster's two node pools
   # when the caller sets no explicit value. "small" is the rendering the
   # module produced before profiles existed, so the default changes nothing;
@@ -126,6 +135,8 @@ resource "google_container_cluster" "autopilot" {
   project  = var.project_id
 
   enable_autopilot    = true
+  network             = local.network
+  subnetwork          = local.subnetwork
   deletion_protection = var.deletion_protection
   resource_labels     = var.resource_labels
 
@@ -134,7 +145,7 @@ resource "google_container_cluster" "autopilot" {
   enable_fqdn_network_policy = var.enable_fqdn_network_policy
 
   workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
+    workload_pool = local.workload_pool
   }
 
   release_channel {
@@ -189,7 +200,7 @@ resource "google_container_cluster" "autopilot" {
 
   lifecycle {
     precondition {
-      condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.location))
+      condition     = can(regex("^(u-)?[a-z]+-[a-z]+[0-9]+$", var.location))
       error_message = "GKE Autopilot clusters are regional: location must be a region (e.g. us-central1), not a zone."
     }
   }
@@ -227,6 +238,8 @@ resource "google_container_cluster" "standard" {
   location = var.location
   project  = var.project_id
 
+  network             = local.network
+  subnetwork          = local.subnetwork
   deletion_protection = var.deletion_protection
   resource_labels     = var.resource_labels
 
@@ -269,7 +282,7 @@ resource "google_container_cluster" "standard" {
   enable_fqdn_network_policy = var.enable_fqdn_network_policy
 
   workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
+    workload_pool = local.workload_pool
   }
 
   release_channel {
@@ -329,8 +342,8 @@ data "google_container_cluster" "existing" {
     # of installing something that reports success and authenticates as the
     # wrong identity.
     postcondition {
-      condition     = try(self.workload_identity_config[0].workload_pool, "") == "${var.project_id}.svc.id.goog"
-      error_message = "Cluster '${var.cluster_name}' has no Workload Identity pool, which kube-agents requires. Enable it first — gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --workload-pool=${var.project_id}.svc.id.goog — and migrate any node pool still on the legacy metadata server to GKE_METADATA, then re-run."
+      condition     = try(self.workload_identity_config[0].workload_pool, "") == local.workload_pool
+      error_message = "Cluster '${var.cluster_name}' has no Workload Identity pool, which kube-agents requires. Enable it first — gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --workload-pool=${local.workload_pool} — and migrate any node pool still on the legacy metadata server to GKE_METADATA, then re-run."
     }
 
     # Same reasoning for NetworkPolicy enforcement: every NetworkPolicy the
@@ -468,9 +481,10 @@ locals {
   # the endpoint that will actually be dialled: whatever the cluster's
   # configuration says, the certificate offered is the one belonging to the host
   # in this value.
-  cluster_endpoint_is_dns = endswith(local.cluster_endpoint, local.gke_dns_endpoint_suffix)
+  cluster_endpoint_is_dns = endswith(local.cluster_endpoint, local.gke_dns_endpoint_suffix) || can(regex("^gke-[0-9a-f]+-[0-9]+\\.", local.cluster_endpoint))
 
-  # The domain GKE's DNS-based control plane endpoints live under, as
-  # gke-<hash>.<region>.gke.goog.
+  # The domain GKE's DNS-based control plane endpoints live under in commercial
+  # GCP, as gke-<hash>-<project-number>.<region>.gke.goog (custom universes use
+  # gke-<hash>-<project-number>.<region>.gke-<suffix>, matched by prefix above).
   gke_dns_endpoint_suffix = ".gke.goog"
 }

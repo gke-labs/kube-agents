@@ -55,14 +55,16 @@ locals {
   )) : toset([])
   scope_reads_apis = local.scope_resolves_selectors || length(local.scope_listed_containers) > 0
 
+  effective_universe_domain = trimspace(var.universe_domain) != "" ? lower(trimspace(var.universe_domain)) : "googleapis.com"
+
   # The three reads, as the reconcile makes them (agents/platform/scripts/
   # cluster_agent_reconcile.py): the Compute API names a host's service
   # projects by ID with a type; the Monitoring API names a scope's monitored
   # projects by project number, under locations/global/metricsScopes/<scope>/
   # projects/<number>; Resource Manager v3 names a project behind a number.
-  scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"
-  scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"
-  scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"
+  scope_compute_api_url          = "https://compute.${local.effective_universe_domain}/compute/v1"
+  scope_monitoring_api_url       = "https://monitoring.${local.effective_universe_domain}/v1"
+  scope_resource_manager_api_url = "https://cloudresourcemanager.${local.effective_universe_domain}/v3"
   # getXpnResources is paged at the API's maximum of 500, and HCL cannot
   # follow a second page, so a host with more service projects than one page
   # holds is refused whatever cap is declared: the bound on a host at plan
@@ -74,10 +76,10 @@ locals {
   # the segment after `projects/` (the `project` field carries the number).
   # Paged at the API's maximum of 500 clusters, a second page refused as a
   # host's is.
-  scope_asset_api_url              = "https://cloudasset.googleapis.com/v1"
+  scope_asset_api_url              = "https://cloudasset.${local.effective_universe_domain}/v1"
   scope_asset_type_cluster         = "container.googleapis.com/Cluster"
   scope_asset_page_size            = 500
-  scope_cluster_asset_name_pattern = "^//container\\.googleapis\\.com/projects/(?P<project>[^/]+)/(?:locations|zones)/[^/]+/clusters/[^/]+$"
+  scope_cluster_asset_name_pattern = "^//container\\.(?:googleapis\\.com|${replace(local.effective_universe_domain, ".", "\\.")})/projects/(?P<project>[^/]+)/(?:locations|zones)/[^/]+/clusters/[^/]+$"
   scope_asset_viewer_role          = "roles/cloudasset.viewer"
   scope_asset_search_permission    = "cloudasset.assets.searchAllResources"
   # The most projects one selector may resolve to. The reconcile lists at
@@ -107,7 +109,7 @@ locals {
   # The CRD's project ID pattern: a monitored project whose ID does not match
   # it (a legacy domain-scoped `example.com:name`) cannot be declared, excluded
   # by ID or given a profile, so it is refused by number rather than bound.
-  scope_project_id_pattern    = "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  scope_project_id_pattern    = "^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$"
   scope_lookup_timeout_ms     = 20000
   scope_lookup_retry_attempts = 2
   # How much of an API's error body an error message carries.

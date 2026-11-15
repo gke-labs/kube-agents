@@ -109,6 +109,7 @@ PARAM_ALLOW_BREAKING_DOWNGRADE="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+PARAM_UNIVERSE_DOMAIN=""
 # Empty means "whatever the loaded configuration says", which is how this ran
 # before the flag existed: the namespace came from install.env alone.
 PARAM_AGENT_NAMESPACE=""
@@ -346,6 +347,8 @@ Options:
   --gcp-project-id ID      GCP Target Project ID
   --gke-cluster-name NAME  GKE Target Cluster Name
   --gcp-region REGION      GKE GCP Region
+  --universe-domain DOMAIN Cloud universe API domain (default: googleapis.com,
+                           or the install's UNIVERSE_DOMAIN / gcloud core/universe_domain)
   --agent-namespace NS     Kubernetes namespace the release lives in
                            (default: the install's own, else kubeagents-system)
   --image-tag TAG          Validated immutable release tag or full commit SHA.
@@ -1493,6 +1496,8 @@ parse_args() {
       --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --universe-domain=*) PARAM_UNIVERSE_DOMAIN="${1#*=}"; shift ;;
+      --universe-domain) PARAM_UNIVERSE_DOMAIN="$2"; shift 2 ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift ;;
@@ -1861,9 +1866,16 @@ main() {
     validate_github_app_id "${GITHUB_APP_ID:-}" "GITHUB_APP_ID in ${install_env_file:-install.env}" || exit 1
   fi
 
+  local fallback_universe="${DEFAULT_UNIVERSE_DOMAIN:-${COMMERCIAL_UNIVERSE_DOMAIN:-googleapis.com}}"
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
   local target_region="${PARAM_REGION:-${REGION:-$DEFAULT_REGION}}"
+  local target_universe_domain="${PARAM_UNIVERSE_DOMAIN:-${UNIVERSE_DOMAIN:-}}"
+  target_universe_domain="${target_universe_domain:-$fallback_universe}"
+  if declare -F is_valid_universe_domain >/dev/null && ! is_valid_universe_domain "$target_universe_domain"; then
+    print_error "Invalid universe API domain '${target_universe_domain}'. Pass --universe-domain with a bare lowercase domain."
+    exit 1
+  fi
 
   if [ -z "$target_project" ]; then
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
@@ -1897,6 +1909,9 @@ main() {
   if [ -n "$PARAM_REGION" ] && [ -n "${REGION:-}" ] && [ "$PARAM_REGION" != "$REGION" ]; then
     coordinate_conflicts="${coordinate_conflicts}    --gcp-region=${PARAM_REGION}, but REGION=${REGION}"$'\n'
   fi
+  if [ -n "$PARAM_UNIVERSE_DOMAIN" ] && [ -n "${UNIVERSE_DOMAIN:-}" ] && [ "$PARAM_UNIVERSE_DOMAIN" != "$UNIVERSE_DOMAIN" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --universe-domain=${PARAM_UNIVERSE_DOMAIN}, but UNIVERSE_DOMAIN=${UNIVERSE_DOMAIN}"$'\n'
+  fi
   if [ -n "$coordinate_conflicts" ]; then
     # Only --dry-run warns and goes on: it exits immediately below without
     # touching the checkout. --plan would go on to write terraform.tfvars and
@@ -1927,6 +1942,10 @@ main() {
   export PROJECT_ID="$target_project"
   export CLUSTER_NAME="$target_cluster"
   export REGION="$target_region"
+  export UNIVERSE_DOMAIN="$target_universe_domain"
+  if declare -F configure_installer_universe_env >/dev/null; then
+    configure_installer_universe_env "$target_universe_domain" || exit 1
+  fi
 
   print_step "2. Connecting kubectl to GKE Cluster"
   # Taken from repo_dir rather than beside this script: upgrade.sh is also run

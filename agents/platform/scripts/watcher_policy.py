@@ -95,8 +95,8 @@ RULE_K8S_POD_METADATA = "kubernetes.watcher.pod-metadata"
 # Google's project id grammar, and GKE's location and cluster name grammars:
 # lower-case, digits and hyphens, so no segment can smuggle a slash or a dot.
 PROJECT_ID = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
-# A domain-scoped project carries `<domain>:` in front of its id.
-PROJECT = rf"(?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?{PROJECT_ID}"
+# A partitioned or domain-scoped project carries `<prefix>:` in front of its id.
+PROJECT = rf"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?{PROJECT_ID}"
 # A Google resource path may name the project by id or by number: Pub/Sub's,
 # GKE's, and so the Kubernetes route's target, which names the same cluster.
 PROJECT_REF = rf"(?:{PROJECT}|[0-9]{{1,20}})"

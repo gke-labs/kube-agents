@@ -1,9 +1,15 @@
 locals {
+  effective_universe_domain = trimspace(var.universe_domain) != "" ? lower(trimspace(var.universe_domain)) : "googleapis.com"
+  custom_universe           = local.effective_universe_domain != "googleapis.com"
+  chart_supports_universe_domain = can(
+    jsondecode(file("${path.module}/../../../charts/kube-agents/values.schema.json")).properties.platformAgent.properties.harness.properties.universeDomain
+  )
+
   # A zonal Standard cluster this composition creates: one node in its default
   # pool (standard_node_count is per zone), too few for a three-server A2A bus.
   # An adopted cluster's node count is not known here, so it keeps the
   # operator's default, which holds a running bus at its count.
-  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
+  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^(u-)?[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
 
   # iam, monitoring, and logging are here because Terraform must enable every
   # API its own resources call, where gcloud enables them implicitly.
@@ -22,12 +28,20 @@ locals {
     # project's RolloutSequences on the GKE Hub role granted below; the API has
     # to be on for the grant to buy anything.
     "gkehub.googleapis.com",
-    # Unconditional: the cluster is created with the Backup for GKE agent
-    # enabled whether or not a BackupPlan follows, and the addon cannot be
-    # enabled without the API.
+    # Unconditional in standard GCP: the cluster is created with the Backup
+    # for GKE agent enabled whether or not a BackupPlan follows, and the addon
+    # cannot be enabled without the API.
     "gkebackup.googleapis.com",
     "developerknowledge.googleapis.com",
   ]
+  custom_universe_withheld_apis = toset(concat(
+    [
+      "cloudtrace.googleapis.com",
+      "gkehub.googleapis.com",
+      "developerknowledge.googleapis.com",
+    ],
+    var.enable_gke_backup_plan ? [] : ["gkebackup.googleapis.com"],
+  ))
   pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [
     "pubsub.googleapis.com",
   ] : []
@@ -131,6 +145,23 @@ locals {
     role       = "gitops"
   }]
 
+  gitops_is_gitea = var.gitops_forge == "gitea"
+  gitea_forges = [merge(
+    {
+      name           = "gitea"
+      provider       = "gitea"
+      host           = var.gitops_host
+      namespace      = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[0] : ""
+      credentialsRef = { name = var.gitops_token_secret_name != "" ? var.gitops_token_secret_name : "gitea-forge-token" }
+    },
+    var.gitops_ca_secret_name != "" ? { caBundleRef = { name = var.gitops_ca_secret_name } } : {}
+  )]
+  gitea_repositories = [{
+    forge      = "gitea"
+    repository = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[1] : var.gitops_repo_path
+    role       = "gitops"
+  }]
+
   gitops_is_ghes = var.gitops_forge == "github" && var.gitops_host != ""
   ghes_forges = [merge(
     { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
@@ -164,10 +195,12 @@ locals {
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
     local.gitops_is_bitbucket ? { forges = local.bitbucket_forges } : {},
     local.gitops_is_bitbucket ? { repositories = local.bitbucket_repositories } : {},
+    local.gitops_is_gitea ? { forges = local.gitea_forges } : {},
+    local.gitops_is_gitea ? { repositories = local.gitea_repositories } : {},
     local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
     local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
     local.gitops_is_ghes ? { github = null } : {},
-    (!local.gitops_is_gitlab && !local.gitops_is_bitbucket && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
+    (!local.gitops_is_gitea && !local.gitops_is_gitlab && !local.gitops_is_bitbucket && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
       github = merge(
         local.github_org != "" ? { org = local.github_org } : {},
         var.github_repo != "" ? { gitRepo = var.github_repo } : {}
@@ -201,10 +234,18 @@ locals {
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
   ]
+  custom_universe_withheld_roles = [
+    "roles/gkehub.viewer",
+    "roles/cloudtrace.user",
+    "roles/mcp.toolUser",
+  ]
+  effective_read_only_roles = local.custom_universe ? [
+    for r in local.read_only_roles : r if !contains(local.custom_universe_withheld_roles, r)
+  ] : local.read_only_roles
 
   # An explicit project_roles list always wins, so an existing configuration
   # that set it keeps its roles regardless of permission_set.
-  agent_project_roles = var.project_roles != null ? var.project_roles : local.read_only_roles
+  agent_project_roles = var.project_roles != null ? var.project_roles : local.effective_read_only_roles
 
   # Only non-empty credential keys end up in the Secret, so an unset optional
   # provider key does not create an empty entry.
@@ -457,7 +498,7 @@ resource "tls_private_key" "sandbox_ssh" {
 }
 
 resource "google_project_service" "required" {
-  for_each = local.required_apis
+  for_each = local.custom_universe ? setsubtract(local.required_apis, local.custom_universe_withheld_apis) : local.required_apis
 
   project            = var.project_id
   service            = each.value
@@ -473,13 +514,15 @@ module "gke_cluster" {
   create_cluster             = var.create_cluster
   accept_no_network_policy   = var.accept_no_network_policy
   location                   = var.location
+  network                    = var.vpc_network
+  subnetwork                 = var.vpc_subnetwork
   deletion_protection        = var.deletion_protection
   release_channel            = var.release_channel
   enable_database_encryption = var.enable_database_encryption
   kms_keyring_name           = var.kms_keyring_name
   kms_key_name               = var.kms_key_name
   allow_external_dns_traffic = var.allow_external_dns_traffic
-  enable_backup_agent        = var.enable_backup_agent
+  enable_backup_agent        = local.custom_universe && !var.enable_gke_backup_plan ? false : var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
   sizing_profile             = var.sizing_profile
@@ -568,13 +611,15 @@ module "scope_resolver" {
   # The consumer project of the reads: the management project, whose APIs
   # this composition enables (and install.sh pre-enables before a first apply,
   # since the reads run in the plan).
-  quota_project = var.project_id
+  quota_project   = var.project_id
+  universe_domain = var.universe_domain
 }
 
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
   project_id    = var.project_id
+  manage_iam    = var.manage_iam
   namespace     = var.namespace
   project_roles = local.agent_project_roles
   scope         = var.scope
@@ -628,6 +673,7 @@ module "litellm_vertex_iam" {
   count  = local.use_vertex ? 1 : 0
 
   project_id         = var.project_id
+  manage_iam         = var.manage_iam
   service_account_id = var.litellm_service_account_id
   display_name       = "Kube-Agents LiteLLM Vertex AI Service Account"
   namespace          = var.namespace
@@ -653,7 +699,7 @@ resource "google_project_iam_member" "litellm_vertex_user" {
   #checkov:skip=CKV_GCP_46:Dedicated custom service account used for LiteLLM workload identity
   #checkov:skip=CKV_GCP_49:LiteLLM gateway uses dedicated service account for Vertex AI inference
   #checkov:skip=CKV_GCP_117:Vertex AI user role required for LiteLLM gateway inference access
-  count = local.manage_vertex_serving ? 1 : 0
+  count = var.manage_iam && local.manage_vertex_serving ? 1 : 0
 
   project = local.vertex_project
   role    = "roles/aiplatform.user"
@@ -1129,6 +1175,9 @@ resource "helm_release" "kube_agents" {
         # cluster's default pool is one node, so the second server would wait
         # Pending and the bus would never form. extra_helm_values can still
         # set busReplicas (the second document deep-merges over this one).
+        local.custom_universe && local.chart_supports_universe_domain ? {
+          universeDomain = local.effective_universe_domain
+        } : {},
         local.bus_single_server ? {
           tuning = { busReplicas = 1 }
         } : {}
@@ -1259,7 +1308,7 @@ resource "helm_release" "kube_agents" {
       enabled = var.web_console_enabled
       agentIdentity = {
         gcpServiceAccount = module.kube_agents_iam.service_account_email
-        roles             = sort(module.kube_agents_iam.agent_project_roles)
+        roles             = sort(var.manage_iam ? module.kube_agents_iam.agent_project_roles : local.agent_project_roles)
       }
     }
     plugins = {
@@ -1327,6 +1376,24 @@ resource "helm_release" "kube_agents" {
     # have been built; a precondition fails the plan instead. The egress rules
     # (a target port for a Service, CIDRs otherwise) are the chart's to judge.
     precondition {
+      condition     = var.manage_iam || !var.scoped_pool_enabled
+      error_message = "manage_iam = false cannot be combined with scoped_pool_enabled = true: the scoped service account pool creates per-project service accounts and iam.serviceAccounts.setIamPolicy grants."
+    }
+    precondition {
+      condition = var.manage_iam || (
+        !var.enable_drift_detector &&
+        !var.enable_stockout_investigator &&
+        !var.enable_google_chat &&
+        !var.enable_github_minter &&
+        !(var.create_cluster && var.enable_database_encryption)
+      )
+      error_message = "manage_iam = false cannot apply IAM grants required by: ${join(", ", compact([var.enable_drift_detector ? "enable_drift_detector (set ENABLE_DRIFT_DETECTOR=false in install.env)" : "", var.enable_stockout_investigator ? "enable_stockout_investigator" : "", var.enable_google_chat ? "enable_google_chat" : "", var.enable_github_minter ? "enable_github_minter (use a PAT-backed forge or omit --github-app-id)" : "", (var.create_cluster && var.enable_database_encryption) ? "create_cluster with enable_database_encryption (install onto an existing cluster or set TF_VAR_enable_database_encryption=false)" : ""]))}. Disable those features or set manage_iam = true."
+    }
+    precondition {
+      condition     = !local.custom_universe || contains(["openai_compatible", "vertex_ai"], var.model_provider) || var.allow_external_model_egress
+      error_message = "model_provider = \"${var.model_provider}\" sends prompts outside universe_domain \"${local.effective_universe_domain}\" to an external SaaS API. Choose model_provider = \"openai_compatible\" or \"vertex_ai\" to stay inside the universe, or set allow_external_model_egress = true to authorize external model egress."
+    }
+    precondition {
       condition     = !local.use_openai_compatible || var.model_default_name != ""
       error_message = "model_provider = \"openai_compatible\" requires model_default_name, the model the server serves; the provider has no default."
     }
@@ -1383,10 +1450,26 @@ resource "helm_release" "kube_agents" {
       condition     = var.gitops_identity == "" || can(regex("^[A-Za-z0-9._@+{}-]{1,255}$", var.gitops_identity))
       error_message = "gitops_identity is 1 to 255 letters, digits and . _ @ + { } -."
     }
-    # The Bitbucket inputs under another forge would be dropped silently.
     precondition {
-      condition     = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
-      error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\" or \"bitbucket-datacenter\"; set it, or leave them unset."
+      condition = !local.gitops_is_gitea || (
+        var.github_repo == ""
+        && !var.enable_github_minter
+        && var.gitops_identity == ""
+        && var.gitops_host != ""
+        && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
+        && can(regex("^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?/[A-Za-z0-9_][A-Za-z0-9_.-]*$", var.gitops_repo_path))
+        && length(split("/", var.gitops_repo_path)[0]) <= 40
+        && lower(split("/", var.gitops_repo_path)[0]) != lower(var.gitops_host)
+        && !contains(["github.com", "www.github.com", "ssh.github.com", "gitlab.com", "www.gitlab.com", "bitbucket.org", "www.bitbucket.org"], lower(split("/", var.gitops_repo_path)[0]))
+        && trimsuffix(split("/", var.gitops_repo_path)[1], ".git") != ""
+        && !endswith(trimsuffix(split("/", var.gitops_repo_path)[1], ".git"), ".git")
+      )
+      error_message = "gitops_forge = \"gitea\" requires gitops_host (a self-managed hostname, not a hosted GitHub/GitLab/Bitbucket domain) and gitops_repo_path as owner/repo (owner <= 40 chars and not a forge host, repo not starting with '-' or ending in stacked '.git', matching Gitea's grammar), with github_repo, enable_github_minter and gitops_identity left unset."
+    }
+    # The Bitbucket/Gitea inputs under another forge would be dropped silently.
+    precondition {
+      condition     = local.gitops_is_bitbucket || local.gitops_is_gitea || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
+      error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\", \"bitbucket-datacenter\" or \"gitea\"; set it, or leave them unset."
     }
 
     # The reverse: GitLab inputs under the default forge would be dropped,

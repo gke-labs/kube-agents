@@ -503,6 +503,39 @@ run "the_per_project_override_moves_the_source_grant_and_its_postcondition_toget
   }
 }
 
+run "partitioned_project_derives_partition_system_logging_service_agent" {
+  command = plan
+
+  variables {
+    project_id      = "part0:sample-project"
+    source_projects = ["part1:peer-project"]
+  }
+
+  override_data {
+    target = data.google_project.this
+    values = {
+      number = "123456789012"
+    }
+  }
+
+  override_data {
+    target = data.google_project.source["part1:peer-project"]
+    values = {
+      number = "210987654321"
+    }
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.sink_writer.member == "serviceAccount:service-123456789012@gcp-sa-logging.part0-system.iam.gserviceaccount.com"
+    error_message = "partitioned host writer identity mismatch: ${google_pubsub_topic_iam_member.sink_writer.member}"
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.source_sink_writer["part1:peer-project"].member == "serviceAccount:service-210987654321@gcp-sa-logging.part1-system.iam.gserviceaccount.com"
+    error_message = "partitioned source writer identity mismatch: ${google_pubsub_topic_iam_member.source_sink_writer["part1:peer-project"].member}"
+  }
+}
+
 run "a_source_override_without_the_serviceAccount_prefix_is_refused" {
   command = plan
 

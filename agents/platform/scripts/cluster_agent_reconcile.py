@@ -127,7 +127,7 @@ SELECTOR_KINDS = (SELECTOR_KIND_SHARED_VPC, SELECTOR_KIND_METRICS_SCOPE)
 # A selector value is a project ID, the CRD's pattern. The reconcile re-checks it because the
 # Shared VPC host is passed to gcloud as a bare positional, and a value that read as a flag
 # would be refused by the broker, or worse, honoured.
-_PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_PROJECT_ID = re.compile(r"^(?:[a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 # Shared VPC: `compute shared-vpc list-associated-resources <host>` (the Compute API's
 # projects.getXpnResources) names each attached service project with its ID and a type.
 XPN_RESOURCES_FORMAT = "json(id,type)"
