@@ -43,9 +43,7 @@ Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separat
 
 ### Home channel
 
-`spec.integration.googleChat.homeChannel` on the PlatformAgent (surfaced to the pod as `GOOGLE_CHAT_HOME_CHANNEL`) is the space a notification lands in when there is no thread to reply into — which is every alert-driven investigation, since nobody started the conversation.
-
-`/sethome` does not set it. A specialist runs as a kanban worker against its own profile and reads the value from the pod environment. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (or pass `--google-chat-home-channel`), or configure `spec.integration.googleChat.homeChannel` on the `PlatformAgent` resource. If left unset, alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
+`spec.integration.googleChat.homeChannel` on the PlatformAgent is the space an alert-driven report lands in when there is no thread to reply into. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, pass `--google-chat-home-channel`, or set the field on the `PlatformAgent` resource. Left unset, alert-driven reports have nowhere to go until the digest below. The investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
 
 Only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 

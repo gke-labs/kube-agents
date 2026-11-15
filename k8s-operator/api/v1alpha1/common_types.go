@@ -182,10 +182,10 @@ var SensitiveEnvVars = map[string]struct{}{
 	// sends home posts to every armed route when no platform has a home. An
 	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
-	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route. It holds
-	// the gateway's platforms, comma-separated; the cron relay names each in
-	// its refusal when no home channel is set.
+	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
+	// comma-separated. The kanban notifier reports back on it to the gateway
+	// conversation a card was filed in, and the agent sends home posts to
+	// every armed route when no platform has a home channel.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS":     {},
 	"KUBE_AGENTS_ENABLED_PROFILES": {},

@@ -186,7 +186,7 @@ var (
 	slackLegacyAgentNames  = []string{"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS"}
 )
 
-// TestTheLegacySlackConsumerRendersOnlyBesideChat: the broker's Slack relay
+// TestTheLegacySlackConsumerIsNeverRendered: the broker's Slack relay
 // pair, the Hermes slack platform, its relay env on the agent container and
 // its pins in the managed .env never render: the gateway holds Slack
 // whenever it is enabled, whatever spec.mode says, Chat beside it or not,
@@ -772,8 +772,8 @@ func rotateSecretKey(t *testing.T, ctx context.Context, r *PlatformAgentReconcil
 }
 
 // TestRotatingASlackTokenRollsTheArmedGateway: on a Slack-armed next install
-// the pair is read by the A2A gateway, not the broker (legacySlackConsumer is
-// off), so the secret-env digest has to ride the gateway's pod template or a
+// the pair is read by the A2A gateway, not the broker (the broker's Slack relay
+// is never armed), so the secret-env digest has to ride the gateway's pod template or a
 // rotated token reaches no pod at all. A rotated bot token alone is the
 // silent case: the socket stays up on the app token and every post fails.
 func TestRotatingASlackTokenRollsTheArmedGateway(t *testing.T) {

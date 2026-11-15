@@ -144,8 +144,8 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	// CREDENTIAL_PROXY_URL is emitted empty: the agent runs no wrapped CLI, so an
 	// address for the broker in its environment is an invitation and not a
 	// dependency. Emitted rather than omitted so an AgentPlugin cannot be the
-	// only writer of the name — see buildPodTemplateSpec. The two relay URLs are
-	// different; they are polled by the chat clients the agent container does run.
+	// only writer of the name — see buildPodTemplateSpec. TEAMS_RELAY_URL is
+	// different; the Hermes Teams platform, which the agent container runs, polls it.
 	if value, found := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_URL"); !found || value != "" {
 		t.Errorf("the agent container must not be told where the broker is, got %q (present=%v)", value, found)
 	}
