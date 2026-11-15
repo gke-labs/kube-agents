@@ -506,7 +506,14 @@ back to advisory bytes. And the reply subject has to be namespaced the same way:
 `a2a.cap.reply.<caller>.*` rather than `_INBOX`, because under `_INBOX` the verifier's publish
 grant would have to be `_INBOX.>`, which would let it forge JetStream API replies into any
 principal's inbox -- including the gateway's. The verifier also drops any request whose reply
-subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen.
+subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen. Each
+check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
+echoes on every verdict, and the client acts only on a reply echoing its own id (#5647). That's
+defence in depth for the dispatcher's admission, which mints a task's credentials on the answer:
+anything else that lands on the reply subject is dropped, and a check with no answer of its own
+fails closed at its timeout. For one release a reply with no id, an older verifier's, is still acted
+on, so a roll in either order keeps working. A follow-up refuses it once a release with the echo is
+past the rollback window.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose
