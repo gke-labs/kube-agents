@@ -508,12 +508,11 @@ grant would have to be `_INBOX.>`, which would let it forge JetStream API replie
 principal's inbox -- including the gateway's. The verifier also drops any request whose reply
 subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen. Each
 check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
-echoes on every verdict, and the client acts only on a reply echoing its own id (#5647). That's
-defence in depth for the dispatcher's admission, which mints a task's credentials on the answer:
-anything else that lands on the reply subject is dropped, and a check with no answer of its own
-fails closed at its timeout. For one release a reply with no id, an older verifier's, is still acted
-on, so a roll in either order keeps working. A follow-up refuses it once a release with the echo is
-past the rollback window.
+echoes on every verdict, and the client acts only on a reply that echoes its own id. That's defence
+in depth for the dispatcher's admission, which mints a task's credentials on the answer: a reply
+carrying another id is dropped, and a check with no answer of its own fails closed at its timeout,
+as does one whose reply doesn't parse. A reply with no id, from a verifier older than the echo, is
+still acted on while a release without the echo is inside the rollback window.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose
