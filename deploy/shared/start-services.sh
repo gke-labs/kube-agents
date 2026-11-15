@@ -619,7 +619,9 @@ WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
 # from; the two proxy scripts import nothing outside the standard library, so
-# what is in it does not matter, only that it exists. Named once because a wrong
+# what is in it does not matter to them, only that it exists. The audit-report
+# store listener is the exception: it runs under uvicorn and verifies with
+# cryptography, both of which this venv carries. Named once because a wrong
 # path here is a container that exits 127 with one line of output and no
 # indication of which of the two callers below asked for it.
 PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
@@ -628,6 +630,7 @@ runtime_pid=""
 envoy_pid=""
 watcher_pid=""
 drift_pid=""
+store_pid=""
 
 # Shut down every supervised process and the subshell supervising it, given the
 # supervisors' pids. Three things here are load-bearing and none is obvious: what
@@ -732,6 +735,7 @@ terminate() {
   local supervisors=()
   [[ -z "${watcher_pid}" ]] || supervisors+=("${watcher_pid}")
   [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
+  [[ -z "${store_pid}" ]] || supervisors+=("${store_pid}")
   # One shared drain budget, not one each: the two run concurrently and the pod's
   # grace period does not grow with the number of processes in the container.
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
@@ -1246,6 +1250,54 @@ start_drift_detector() {
   drift_pid=$!
 }
 
+# The audit-report store's broker-only listener (#5619,
+# agents/platform/scripts/audit_report_store.py), in the api-proxy role only:
+# the gateway pod's half, where the agent PVC the store lives on is mounted and
+# where the pod's API-audience token (event-watcher-ksa-token) is, which the
+# listener reads the cluster JWKS with. Not the platform-agent container: that
+# one holds only audience-bound tokens (docs/security-requirements.md).
+#
+# On only where the operator says so, which it does under `mode: next` alone,
+# and only with exactly `1`: off is the ordinary state on every today install,
+# so it is silent. Supervised and restarted in place like the watcher, and like
+# it not on the credential path, so its exit never ends the container. It logs
+# to the container's stderr with the other supervised processes.
+readonly AUDIT_REPORT_STORE_PORT=8700
+readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5
+readonly AUDIT_REPORT_STORE_RETRY_MAX_SECONDS=300
+readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
+
+start_audit_report_store() {
+  [[ "${AUDIT_REPORT_STORE_ENABLED:-}" == "1" ]] || return 0
+
+  if [ -z "${AUDIT_REPORT_STORE_ALLOWED_SUBJECT:-}" ]; then
+    echo "start-services: ALERT AUDIT_REPORT_STORE_ALLOWED_SUBJECT is empty, so the audit-report store refuses every request with 403 — profile workers cannot read or write fleet-audit reports. The operator sets it with AUDIT_REPORT_STORE_ENABLED." >&2
+  fi
+
+  (
+    # The watcher supervisor's trap, for the same reason: see drain_supervised.
+    trap 'exit 0' TERM
+    delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
+    while true; do
+      started=$SECONDS
+      "${PROXY_PYTHON}" -m uvicorn audit_report_store:app \
+        --app-dir /opt/defaults/scripts \
+        --host 0.0.0.0 \
+        --port "${AUDIT_REPORT_STORE_PORT}" \
+        --no-access-log || true
+      ran=$((SECONDS - started))
+      if [[ "${ran}" -ge "${AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS}" ]]; then
+        delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
+      fi
+      echo "start-services: audit-report store exited after ${ran}s; retrying in ${delay}s" >&2
+      sleep "${delay}"
+      delay=$((delay * 2))
+      [[ "${delay}" -le "${AUDIT_REPORT_STORE_RETRY_MAX_SECONDS}" ]] || delay="${AUDIT_REPORT_STORE_RETRY_MAX_SECONDS}"
+    done
+  ) &
+  store_pid=$!
+}
+
 write_wif_credentials
 start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
@@ -1257,6 +1309,9 @@ if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "e
   # not run.
   start_event_watcher
   start_drift_detector
+fi
+if [[ "${CREDENTIAL_PROXY_ROLE}" == "api-proxy" ]]; then
+  start_audit_report_store
 fi
 
 # Only the credential-path services are waited on. The watcher and the drift

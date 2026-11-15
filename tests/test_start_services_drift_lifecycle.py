@@ -290,6 +290,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         envoy_pid=""
         watcher_pid=""
         drift_pid=""
+        store_pid=""
         {body}
         """
 
