@@ -245,7 +245,7 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	// Skew: nothing deleted.
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc.DeepCopy(), np.DeepCopy()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("later"), false, true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("later"), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
@@ -253,7 +253,7 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	}
 
 	// Today: both owned objects go.
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true, true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); !apierrors.IsNotFound(err) {
@@ -267,10 +267,104 @@ func TestReconcileAuditReportStoreTearsDownOnTodayOnly(t *testing.T) {
 	foreign := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
 	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
 	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true, true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
 		t.Errorf("today deleted a Service it does not own: %v", err)
+	}
+}
+
+// The store policy's catch-all rule renders only while no other policy
+// isolates the gateway pod for ingress, whoever's policy that is.
+func TestAuditReportStorePolicyReadsTheNamespacesPolicies(t *testing.T) {
+	ctx := context.Background()
+	gatewayPod := map[string]string{"app": "test-agent-gateway"}
+	policy := func(name string, selector map[string]string, types ...networkingv1.PolicyType) *networkingv1.NetworkPolicy {
+		return &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns"},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: selector},
+				PolicyTypes: types,
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name         string
+		existing     []*networkingv1.NetworkPolicy
+		wantCatchAll bool
+	}{
+		{"no other policy", nil, true},
+		{"a foreign ingress policy selecting the pod", []*networkingv1.NetworkPolicy{
+			policy("customer-lockdown", gatewayPod, networkingv1.PolicyTypeIngress)}, false},
+		{"a foreign policy with no policyTypes selecting the pod", []*networkingv1.NetworkPolicy{
+			policy("customer-default", gatewayPod)}, false},
+		{"a foreign policy selecting every pod", []*networkingv1.NetworkPolicy{
+			policy("default-deny", nil, networkingv1.PolicyTypeIngress)}, false},
+		{"a foreign egress-only policy selecting the pod", []*networkingv1.NetworkPolicy{
+			policy("customer-egress", gatewayPod, networkingv1.PolicyTypeEgress)}, true},
+		{"an ingress policy selecting other pods", []*networkingv1.NetworkPolicy{
+			policy("other-app", map[string]string{"app": "litellm"}, networkingv1.PolicyTypeIngress)}, true},
+		{"the store's own policy does not count", []*networkingv1.NetworkPolicy{
+			policy("test-agent-report-store", gatewayPod, networkingv1.PolicyTypeIngress)}, true},
+		{"the operator's gateway policy", []*networkingv1.NetworkPolicy{
+			policy("test-agent-gateway-netpol", gatewayPod, networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := reportStoreAgent("next")
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors())
+			for _, np := range tc.existing {
+				builder = builder.WithObjects(np)
+			}
+			cl := builder.Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			if err := r.reconcileAuditReportStore(ctx, agent, true); err != nil {
+				t.Fatal(err)
+			}
+			var got networkingv1.NetworkPolicy
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent-report-store"}, &got); err != nil {
+				t.Fatal(err)
+			}
+			if catchAll := len(got.Spec.Ingress) == 2; catchAll != tc.wantCatchAll {
+				t.Errorf("rules %d, want the catch-all %v", len(got.Spec.Ingress), tc.wantCatchAll)
+			}
+		})
+	}
+}
+
+// A policy that lands later drops the catch-all on the next pass.
+func TestAuditReportStorePolicyIsRecomputedEachPass(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := reportStoreAgent("next")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	key := types.NamespacedName{Namespace: "test-ns", Name: "test-agent-report-store"}
+	rules := func() int {
+		if err := r.reconcileAuditReportStore(ctx, agent, true); err != nil {
+			t.Fatal(err)
+		}
+		var np networkingv1.NetworkPolicy
+		if err := cl.Get(ctx, key, &np); err != nil {
+			t.Fatal(err)
+		}
+		return len(np.Spec.Ingress)
+	}
+	if n := rules(); n != 2 {
+		t.Fatalf("first pass: %d rules, want 2", n)
+	}
+	lockdown := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "customer-lockdown", Namespace: "test-ns"},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "test-agent-gateway"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}
+	if err := cl.Create(ctx, lockdown); err != nil {
+		t.Fatal(err)
+	}
+	if n := rules(); n != 1 {
+		t.Errorf("after a foreign ingress policy: %d rules, want the broker rule alone", n)
 	}
 }

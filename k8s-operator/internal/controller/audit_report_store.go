@@ -48,10 +48,12 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -200,20 +202,22 @@ func buildAuditReportStoreService(agent *agentv1alpha1.PlatformAgent) *corev1.Se
 // NetworkPolicies selecting one pod are additive: the pod accepts the union
 // of what they allow, and is isolated for ingress as soon as any one of them
 // lists Ingress. There is no deny rule; denying is not allowing. So what this
-// policy must say depends on whether another policy already isolates the pod:
+// policy must say depends on whether another policy already isolates the pod
+// (gatewayPodIngressIsolated, which reads every policy in the namespace: the
+// operator's own and anybody else's):
 //
-//   - gatewayIngressIsolated (spec.networkPolicy on, the default): the gateway
-//     policy <agent>-gateway-netpol already isolates the pod and admits only
-//     its own ports, none of them 8700. Then this policy is rule (a) alone. A
-//     rule from anywhere here would be added to that policy's allowlist and
-//     open every port on the pod to every source.
-//   - not isolated (spec.networkPolicy.enabled false): nothing isolates the pod
-//     for ingress, and the egress-only policy beside it
-//     (buildAgentEgressNetworkPolicy) says why it lists no Ingress: doing so
-//     cuts the agent's API Service and everything else nobody enumerated. Rule
-//     (a) alone would do exactly that. So rule (b) admits every source on every
-//     port but 8700 (TCP 1-8699 and 8701-65535, and all of UDP), which keeps
-//     the pod as open as it was, with 8700 held to the broker.
+//   - isolated (with spec.networkPolicy on, the default, <agent>-gateway-netpol
+//     always is one; a policy a customer applied can be another): then this
+//     policy is rule (a) alone, the one path added to their isolation. A rule
+//     from anywhere here would be added to their allowlists and reopen every
+//     port they closed, to every source.
+//   - not isolated: nothing selects the pod for ingress, and the egress-only
+//     policy beside it (buildAgentEgressNetworkPolicy) says why it lists no
+//     Ingress: doing so cuts the agent's API Service and everything else
+//     nobody enumerated. Rule (a) alone would do exactly that. So rule (b)
+//     admits every source on every port but 8700 (TCP 1-8699 and 8701-65535,
+//     and all of UDP), which keeps the pod as open as it was, with 8700 held
+//     to the broker.
 //
 // Either way the listener also verifies the broker's token (sub, aud, iss), so
 // a cluster whose CNI does not enforce NetworkPolicy still admits nobody else.
@@ -262,7 +266,15 @@ func portRange(protocol corev1.Protocol, from, to int32) networkingv1.NetworkPol
 // reconcileAuditReportStore applies the Service and the NetworkPolicy under
 // next, and deletes them (owned only) under today. On version skew it does
 // neither, as the A2A stack's mode gate does: modeOK is false there.
-func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool, gatewayIngressIsolated bool) error {
+//
+// The policy's shape is recomputed on every pass from the policies in the
+// namespace, so one that starts isolating the gateway pod drops rule (b) on
+// the next reconcile. The NetworkPolicy watch in SetupWithManager enqueues
+// the namespace's agents when any ingress-isolating policy changes, which
+// makes that the pass right after it. The known limit is the window between
+// the foreign policy landing and that pass applying: for those seconds rule
+// (b) is in the union with it.
+func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool) error {
 	if !modeOK {
 		return nil
 	}
@@ -271,6 +283,10 @@ func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context,
 			return err
 		}
 		return r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{})
+	}
+	gatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)
+	if err != nil {
+		return err
 	}
 	for _, obj := range []client.Object{buildAuditReportStoreService(agent), buildAuditReportStoreNetworkPolicy(agent, gatewayIngressIsolated)} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -281,6 +297,64 @@ func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context,
 		}
 	}
 	return nil
+}
+
+// policyIsolatesIngress is whether a NetworkPolicy isolates the pods it
+// selects for ingress. An empty policyTypes is read as the API server defaults
+// it: Ingress always, whatever the policy lists.
+func policyIsolatesIngress(np *networkingv1.NetworkPolicy) bool {
+	if len(np.Spec.PolicyTypes) == 0 {
+		return true
+	}
+	for _, t := range np.Spec.PolicyTypes {
+		if t == networkingv1.PolicyTypeIngress {
+			return true
+		}
+	}
+	return false
+}
+
+// gatewayPodIngressIsolated is whether any NetworkPolicy in the namespace but
+// the store's own selects the gateway pod and isolates it for ingress.
+//
+// The pod's labels are the live gateway Deployment's template labels, or the
+// operator's own if the Deployment is not there yet, plus the leader label,
+// which leader_elect.py stamps on one pod above one replica. Counting a
+// policy that selects only the leader as isolating errs toward rule (a)
+// alone: a non-leader pod could then lose ingress it had, where the other way
+// round every port on the leader would open.
+func (r *PlatformAgentReconciler) gatewayPodIngressIsolated(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	podLabels := commonLabels(agent)
+	podLabels["app"] = agent.Name + "-gateway"
+	var gateway appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, &gateway); err == nil {
+		for k, v := range gateway.Spec.Template.Labels {
+			podLabels[k] = v
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("failed to read the gateway Deployment for the audit-report store policy: %w", err)
+	}
+	podLabels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	var policies networkingv1.NetworkPolicyList
+	if err := r.List(ctx, &policies, client.InNamespace(agent.Namespace)); err != nil {
+		return false, fmt.Errorf("failed to list NetworkPolicies for the audit-report store policy: %w", err)
+	}
+	for i := range policies.Items {
+		np := &policies.Items[i]
+		if np.Name == auditReportStoreName(agent) || !policyIsolatesIngress(np) {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+		if err != nil {
+			// The API server refuses a selector this cannot parse, so this
+			// is a policy that selects nothing.
+			continue
+		}
+		if selector.Matches(labels.Set(podLabels)) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // deleteAuditReportStoreObject deletes the store's object of obj's kind, read first and

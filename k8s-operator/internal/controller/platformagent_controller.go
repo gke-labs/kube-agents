@@ -1374,9 +1374,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	// The audit-report store's Service and NetworkPolicy, under next
-	// (audit_report_store.go). The policy's shape turns on whether the gateway
-	// policy just reconciled isolates the gateway pod for ingress.
-	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil, netpolProf.Generated); err != nil {
+	// (audit_report_store.go). After the gateway policy: the store policy's
+	// shape turns on whether any policy, that one included, isolates the
+	// gateway pod for ingress.
+	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -6776,10 +6777,21 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				if agent, ok := agentOfProfileFence(obj); ok {
 					return []reconcile.Request{{NamespacedName: agent}}
 				}
-				if obj.GetName() != litellmNetworkPolicyName {
-					return nil
+				if obj.GetName() == litellmNetworkPolicyName {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 				}
-				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				// Any other policy that isolates pods for ingress can change
+				// whether the gateway pod is isolated, which decides the
+				// audit-report store policy's shape (gatewayPodIngressIsolated):
+				// re-reconcile the namespace's agents so a policy that lands
+				// drops the store's catch-all rule on the next pass. Not the
+				// store's own policy, whose apply would otherwise enqueue
+				// itself.
+				if np, ok := obj.(*networkingv1.NetworkPolicy); ok && policyIsolatesIngress(np) &&
+					!strings.HasSuffix(np.Name, auditReportStoreSuffix) {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}
+				return nil
 			}),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
 		).
