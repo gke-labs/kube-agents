@@ -1016,7 +1016,14 @@ func (d *A2ADoor) claimTurnIf(ctx context.Context, key, caller, contextID string
 		awake := d.sleep(ctx, wait, deadline)
 		d.mu.Lock()
 		d.claimWaiting--
+		// A last look at the deadline: what stillWanted waits on may have
+		// landed with it, and a refusal then would be for a turn that
+		// wasn't needed.
+		notNeeded := !awake && stillWanted != nil && !stillWanted()
 		d.mu.Unlock()
+		if notNeeded {
+			return a2aPrior{}, turnNotNeeded
+		}
 		if !awake {
 			return a2aPrior{}, turnRefused
 		}

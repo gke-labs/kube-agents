@@ -202,48 +202,64 @@ func TestA2ACancelQueuedBehindATaskThatEndsIsRefusedWithoutAClaim(t *testing.T) 
 // TestA2ACancelRetryAnswersOnceTheCancelIsOnTheBus: a retry queued while
 // the first cancel's turn still holds the slot answers as soon as that
 // cancel reaches the bus, without waiting for the turn to end, so a turn
-// that runs long can't push the retry past its claim window. With the
-// executor's canceled terminal in too, it is still answered with the task:
-// the cancel took.
+// that runs long can't push the retry past its claim window.
 func TestA2ACancelRetryAnswersOnceTheCancelIsOnTheBus(t *testing.T) {
-	for _, terminalToo := range []bool{false, true} {
-		t.Run(fmt.Sprintf("terminal=%v", terminalToo), func(t *testing.T) {
-			r, task, exec, key := cancelQueueRig(t)
-			got := make(chan rpcResponse, 1)
-			errs := make(chan error, 1)
-			go func() {
-				resp, err := r.rpcAsync(9201, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
-				errs <- err
-				got <- resp
-			}()
-			waitQueued(t, r, 1)
-			// The held turn is the first cancel's: its cancel reaches the bus
-			// while it still holds the slot.
-			r.door.CancelPublished(key, task.ID)
-			if terminalToo {
-				if err := exec.PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
-					t.Fatal(err)
-				}
-				r.getUntil(t, a2aTestCaller, task.ID, "the terminal to reach the door", func(task a2aTaskObject) bool {
-					return task.Status.State == lib.StateCanceled
-				})
-			}
-			select {
-			case err := <-errs:
-				if err != nil {
-					t.Fatal(err)
-				}
-				resp := <-got
-				if resp.Error != nil {
-					t.Fatalf("the retry was refused: %d %s", resp.Error.Code, resp.Error.Message)
-				}
-				if taskOf(t, resp).ID != task.ID {
-					t.Errorf("the retry answered with another task")
-				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("the retry waited on the held slot after the cancel was on the bus")
-			}
-			r.door.TurnFinished(key)
-		})
+	r, task, _, key := cancelQueueRig(t)
+	resp := queuedRetry(t, r, task, func() { r.door.CancelPublished(key, task.ID) })
+	if resp.Error != nil {
+		t.Fatalf("the retry was refused: %d %s", resp.Error.Code, resp.Error.Message)
 	}
+	if taskOf(t, resp).ID != task.ID {
+		t.Errorf("the retry answered with another task")
+	}
+	r.door.TurnFinished(key)
+}
+
+// TestA2ACancelRetryForATaskOnTheBusAndEndedGetsTheTask: when the retry
+// next looks, the cancel is on the bus and the executor's canceled terminal
+// is in. Being on the bus wins: the cancel took, so the retry gets the task
+// as it ended, not a not-cancelable refusal. Both are set in one critical
+// section so the retry can't look between them.
+func TestA2ACancelRetryForATaskOnTheBusAndEndedGetsTheTask(t *testing.T) {
+	r, task, _, key := cancelQueueRig(t)
+	resp := queuedRetry(t, r, task, func() {
+		r.door.mu.Lock()
+		defer r.door.mu.Unlock()
+		held := r.door.tasks[task.ID]
+		held.cancelPublished, held.terminal, held.state = true, true, lib.StateCanceled
+		r.door.wakeLocked()
+	})
+	if resp.Error != nil {
+		t.Fatalf("the retry was refused: %d %s", resp.Error.Code, resp.Error.Message)
+	}
+	if got := taskOf(t, resp); got.ID != task.ID || got.Status.State != lib.StateCanceled {
+		t.Errorf("the retry answered with task %q in %q; want %q canceled", got.ID, got.Status.State, task.ID)
+	}
+	r.door.TurnFinished(key)
+}
+
+// queuedRetry sends a tasks/cancel for task, waits until it is queued for
+// the held slot, runs change, and returns its answer, failing if none comes
+// while the slot is still held.
+func queuedRetry(t *testing.T, r *a2aRig, task a2aTaskObject, change func()) rpcResponse {
+	t.Helper()
+	got := make(chan rpcResponse, 1)
+	errs := make(chan error, 1)
+	go func() {
+		resp, err := r.rpcAsync(9201, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
+		errs <- err
+		got <- resp
+	}()
+	waitQueued(t, r, 1)
+	change()
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatal(err)
+		}
+		return <-got
+	case <-time.After(10 * time.Second):
+		t.Fatal("the retry waited on the held slot after the change")
+	}
+	return rpcResponse{}
 }
