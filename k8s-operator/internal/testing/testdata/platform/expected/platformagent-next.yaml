@@ -2773,6 +2773,14 @@ spec:
         - port: 9119
           protocol: TCP
     - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+      ports:
+        - port: 8700
+          protocol: TCP
+    - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
@@ -2841,39 +2849,6 @@ spec:
   type: ClusterIP
 status:
   loadBalancer: {}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: kube-agents
-  name: platformagent-report-store
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app: platformagent-credential-proxy
-              kubeagents.x-k8s.io/component: credential-proxy
-      ports:
-        - port: 8700
-          protocol: TCP
-  podSelector:
-    matchLabels:
-      app: platformagent-gateway
-  policyTypes:
-    - Ingress
 ---
 apiVersion: v1
 data:

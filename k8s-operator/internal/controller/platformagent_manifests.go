@@ -7220,6 +7220,15 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
+	// Under next, the audit-report store listener on agent-api-auth: the
+	// broker's pods alone, to its port (auditReportStoreIngressRule). Here
+	// rather than in a policy of its own, so a rollback to an operator that
+	// renders this policy without it drops it, and spec.networkPolicy.enabled
+	// false takes it with the policy. Today renders this policy unchanged.
+	if auditReportStoreRendered(agent) {
+		ingressRules = append(ingressRules, auditReportStoreIngressRule(agent))
+	}
+
 	// The managed-Prometheus collector, scraping the event watcher's metrics
 	// port on the agent-api-auth sidecar. A rule of its own rather than a port
 	// on the first: that rule admits every pod in the agent's namespace, and the

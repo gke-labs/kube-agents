@@ -37,24 +37,26 @@ package controller
 //   - on the broker, a projected token bound to auditReportStoreAudience,
 //     which it presents to the listener, and the listener's address. The
 //     broker reads neither yet; its routes are the next change;
-//   - the Service <agent>-report-store, and the NetworkPolicy of the same
-//     name that admits only the broker's pods on the port.
+//   - the Service <agent>-report-store;
+//   - in <agent>-gateway-netpol, one more ingress rule: the broker's pods to
+//     the port (auditReportStoreIngressRule). A rule in the gateway policy
+//     rather than a policy of its own, so an operator rollback, whose render
+//     of that policy lacks the rule, drops it with no orphan left isolating
+//     the pod, and spec.networkPolicy.enabled false takes it with the policy.
 //
-// Today mode renders none of it, and a flip back to today deletes the two
-// objects (owned, so an older operator's garbage collection takes them with
-// the CR too). The data stays on the PVC either way.
+// Today mode renders none of it, and a flip back to today deletes the
+// Service. The data stays on the PVC either way. A rollback to an operator
+// before this change leaves the Service behind: it is inert, since nothing
+// listens on 8700 without this change.
 
 import (
 	"context"
 	"fmt"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -211,208 +213,47 @@ func buildAuditReportStoreService(agent *agentv1alpha1.PlatformAgent) *corev1.Se
 	return svc
 }
 
-// buildAuditReportStoreNetworkPolicy admits the broker's pods, and only them,
-// to the listener's port on the gateway pod, and changes nothing else about
-// what reaches that pod.
-//
-// NetworkPolicies selecting one pod are additive: the pod accepts the union
-// of what they allow, and is isolated for ingress as soon as any one of them
-// lists Ingress. There is no deny rule; denying is not allowing. So what this
-// policy must say depends on whether another policy already isolates the pod
-// (gatewayPodIngressIsolated, which reads every policy in the namespace: the
-// operator's own and anybody else's):
-//
-//   - isolated (with spec.networkPolicy on, the default, <agent>-gateway-netpol
-//     always is one; a policy a customer applied can be another): then this
-//     policy is rule (a) alone, the one path added to their isolation. A rule
-//     from anywhere here would be added to their allowlists and reopen every
-//     port they closed, to every source.
-//   - not isolated: nothing selects the pod for ingress, and the egress-only
-//     policy beside it (buildAgentEgressNetworkPolicy) says why it lists no
-//     Ingress: doing so cuts the agent's API Service and everything else
-//     nobody enumerated. Rule (a) alone would do exactly that. So rule (b)
-//     admits every source on every port but 8700 (TCP 1-8699 and 8701-65535,
-//     and all of UDP), which keeps the pod as open as it was, with 8700 held
-//     to the broker.
-//
-// Either way the listener also verifies the broker's token (sub, aud, iss), so
-// a cluster whose CNI does not enforce NetworkPolicy still admits nobody else.
-// Egress is not listed, so the gateway's egress policies are untouched.
-func buildAuditReportStoreNetworkPolicy(agent *agentv1alpha1.PlatformAgent, gatewayIngressIsolated bool) *networkingv1.NetworkPolicy {
-	rules := []networkingv1.NetworkPolicyIngressRule{
-		// (a) The broker's pods, by the selector its Deployment's pods carry
-		// (credentialProxySelector), on the listener's port. The exec tier's
-		// pods carry another app label and are not admitted.
-		{
-			From: []networkingv1.NetworkPolicyPeer{{
-				PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-			}},
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(auditReportStorePort)},
-		},
+// auditReportStoreIngressRule is the rule <agent>-gateway-netpol carries under
+// next: the broker's pods, by the selector its Deployment's pods carry
+// (credentialProxySelector), to the listener's port, and nothing else to it.
+// The exec tier's pods carry another app label and are not admitted. The
+// listener verifies the broker's token as well (audience, issuer, subject and
+// the pod's name), which is the whole control where policies are off or not
+// enforced.
+func auditReportStoreIngressRule(agent *agentv1alpha1.PlatformAgent) networkingv1.NetworkPolicyIngressRule {
+	return networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(auditReportStorePort)},
 	}
-	if !gatewayIngressIsolated {
-		// (b) Everything the pod accepted before this policy existed, with
-		// 8700 cut out of the TCP range. No From: every source.
-		rules = append(rules, networkingv1.NetworkPolicyIngressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				portRange(corev1.ProtocolTCP, 1, auditReportStorePort-1),
-				portRange(corev1.ProtocolTCP, auditReportStorePort+1, 65535),
-				portRange(corev1.ProtocolUDP, 1, 65535),
-			},
-		})
-	}
-	np := &networkingv1.NetworkPolicy{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
-		ObjectMeta: metav1.ObjectMeta{Name: auditReportStoreName(agent), Namespace: agent.Namespace},
-		Spec: networkingv1.NetworkPolicySpec{
-			// The gateway pod, the selector the gateway policies use.
-			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress:     rules,
-		},
-	}
-	withCommonLabels(np, agent)
-	return np
 }
 
-func portRange(protocol corev1.Protocol, from, to int32) networkingv1.NetworkPolicyPort {
-	return networkingv1.NetworkPolicyPort{Protocol: ptr.To(protocol), Port: ptr.To(intstr.FromInt32(from)), EndPort: ptr.To(to)}
-}
-
-// reconcileAuditReportStore applies the Service and the NetworkPolicy under
-// next, and deletes them (owned only) under today. On version skew it does
-// neither, as the A2A stack's mode gate does: modeOK is false there.
+// reconcileAuditReportStore applies the Service under next and deletes it
+// (owned only) under today. On version skew it does neither, as the A2A
+// stack's mode gate does: modeOK is false there.
 //
-// The policy's shape is recomputed on every pass from the policies in the
-// namespace, so one that starts isolating the gateway pod drops rule (b) on
-// the next reconcile. The NetworkPolicy watch in SetupWithManager enqueues
-// the namespace's agents when any ingress-isolating policy changes, which
-// makes that the pass right after it. The known limit is the window between
-// the foreign policy landing and that pass applying: for those seconds rule
-// (b) is in the union with it.
-//
-// With spec.networkPolicy.enabled false (policiesManaged false) the policy is
-// not rendered and an owned one is deleted, as the operator's other managed
-// policies are: that switch hands ingress to the install's own policies. The
-// Service, the listener and the broker's token still render, and the
-// listener's token check (audience, issuer, subject, broker pod name) is then
-// the whole control.
-func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool, policiesManaged bool) error {
+// In every mode it also deletes an owned NetworkPolicy <agent>-report-store:
+// an earlier build of this change rendered the store's rule as a policy of
+// its own, which an install that ran it still has.
+func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool) error {
 	if !modeOK {
 		return nil
 	}
-	if !auditReportStoreRendered(agent) {
-		if err := r.deleteAuditReportStoreObject(ctx, agent, &corev1.Service{}); err != nil {
-			return err
-		}
-		return r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{})
-	}
-	objs := []client.Object{buildAuditReportStoreService(agent)}
-	if policiesManaged {
-		gatewayIngressIsolated, err := r.gatewayPodIngressIsolated(ctx, agent)
-		if err != nil {
-			return err
-		}
-		objs = append(objs, buildAuditReportStoreNetworkPolicy(agent, gatewayIngressIsolated))
-	} else if err := r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{}); err != nil {
+	if err := r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{}); err != nil {
 		return err
 	}
-	for _, obj := range objs {
-		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return fmt.Errorf("failed to set controller reference on audit-report store %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
-		}
-		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply audit-report store %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
-		}
+	if !auditReportStoreRendered(agent) {
+		return r.deleteAuditReportStoreObject(ctx, agent, &corev1.Service{})
+	}
+	svc := buildAuditReportStoreService(agent)
+	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on audit-report store Service %s/%s: %w", svc.Namespace, svc.Name, err)
+	}
+	if err := r.applyManaged(ctx, agent, svc); err != nil {
+		return fmt.Errorf("failed to apply audit-report store Service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 	return nil
-}
-
-// policyIsolatesIngress is whether a NetworkPolicy isolates the pods it
-// selects for ingress. An empty policyTypes is read as the API server defaults
-// it: Ingress always, whatever the policy lists.
-func policyIsolatesIngress(np *networkingv1.NetworkPolicy) bool {
-	if len(np.Spec.PolicyTypes) == 0 {
-		return true
-	}
-	for _, t := range np.Spec.PolicyTypes {
-		if t == networkingv1.PolicyTypeIngress {
-			return true
-		}
-	}
-	return false
-}
-
-// gatewayPodIngressIsolated is whether any NetworkPolicy in the namespace but
-// the store's own selects the gateway pod and isolates it for ingress.
-//
-// The gateway pod's labels are read three ways and a policy counts if it
-// selects any of them: the live gateway Deployment's template (or the
-// operator's own labels before it exists), with the leader label that
-// leader_elect.py stamps on one pod above one replica, and each live gateway
-// pod's labels as they are now. Every doubt counts as isolating, so the doubt
-// costs the catch-all rule rather than reopening a port someone closed: a
-// selector this cannot evaluate, and one that requires a label none of those
-// label sets carries, which another controller may stamp on the pod later.
-// The cost of the doubt is the other direction: a namespace with such a
-// policy for unrelated pods gets the broker rule alone, which isolates the
-// gateway pod where nothing else did.
-func (r *PlatformAgentReconciler) gatewayPodIngressIsolated(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
-	template := commonLabels(agent)
-	template["app"] = agent.Name + "-gateway"
-	var gateway appsv1.Deployment
-	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, &gateway); err == nil {
-		for k, v := range gateway.Spec.Template.Labels {
-			template[k] = v
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("failed to read the gateway Deployment for the audit-report store policy: %w", err)
-	}
-	template[gatewayLeaderLabel] = gatewayLeaderLabelValue
-	labelSets := []labels.Set{labels.Set(template)}
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
-		return false, fmt.Errorf("failed to list the gateway pods for the audit-report store policy: %w", err)
-	}
-	for i := range pods.Items {
-		labelSets = append(labelSets, labels.Set(pods.Items[i].Labels))
-	}
-	known := map[string]bool{}
-	for _, set := range labelSets {
-		for k := range set {
-			known[k] = true
-		}
-	}
-	var policies networkingv1.NetworkPolicyList
-	if err := r.List(ctx, &policies, client.InNamespace(agent.Namespace)); err != nil {
-		return false, fmt.Errorf("failed to list NetworkPolicies for the audit-report store policy: %w", err)
-	}
-	for i := range policies.Items {
-		np := &policies.Items[i]
-		if np.Name == auditReportStoreName(agent) || !policyIsolatesIngress(np) {
-			continue
-		}
-		selector, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
-		if err != nil {
-			return true, nil
-		}
-		for _, set := range labelSets {
-			if selector.Matches(set) {
-				return true, nil
-			}
-		}
-		requirements, _ := selector.Requirements()
-		for _, req := range requirements {
-			if known[req.Key()] {
-				continue
-			}
-			switch req.Operator() {
-			case selection.Equals, selection.DoubleEquals, selection.In, selection.Exists:
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 // deleteAuditReportStoreObject deletes the store's object of obj's kind, read first and
