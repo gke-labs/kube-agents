@@ -457,10 +457,10 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertNotIn("--update", argv)
         text = argv[argv.index("--") + 1]
         self.assertTrue(text.startswith(self.REPORT.rstrip("\n")))
-        # No platform has a home, so every armed route takes the home posts and
-        # the gateway keeps them for its digest: the summaries are not lost.
-        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
-        self.assertNotIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        # No platform has a home: the gateway keeps the home posts for its digest
+        # and posts none, so the note says the install has no home channel.
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
         # Kept as onboarding's destination after delivery.
@@ -495,6 +495,18 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertIn("not posted to the chat: `compliance-audit`.", note)
         self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
 
+    def test_a_gateway_with_no_home_channel_says_so_through_main(self):
+        # Chat is armed but no platform has a home channel: home posts are kept for the
+        # digest, not posted, so the note says the install has none.
+        conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": "google_chat", "A2A_NOTIFY_PLATFORM": ""}), \
+                mock.patch.object(chat_notify, "HOME_FILE_DIR", str(self.d / "no-home-file")):
+            self.assertEqual(self._run(), 0)
+        text = self.calls[-1][self.calls[-1].index("--") + 1]
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+
     def test_the_card_posts_with_its_update_key_then_the_note(self):
         with self._card():
             self._run()
@@ -506,7 +518,7 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual(report[report.index("--") + 1], text)
         self.assertNotIn("--chat-file", note)
         self.assertNotIn("--update", note)
-        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note[note.index("--") + 1])
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
         self.assertNotIn("went as text", stage_log(self.d))
 
     def test_the_card_is_built_from_the_stored_files_not_the_report(self):

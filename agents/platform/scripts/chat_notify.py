@@ -160,28 +160,30 @@ def platform_list(raw: str) -> list[str]:
     return names
 
 
+def home_platforms() -> list[str]:
+    """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
+
+    The operator lists every armed route whose home channel the CR sets
+    (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds it
+    and the projected file names a channel, the CR's or one it learned.
+    """
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    slack_home = SLACK_PLATFORM in gateway_platforms() and bool(home_file_value())
+    if slack_home and SLACK_PLATFORM not in listed:
+        return [*listed, SLACK_PLATFORM]
+    return listed
+
+
 def routed_platforms() -> list[str]:
     """The platforms that get home posts through the gateway, or [] when none does.
 
-    The operator lists every armed route whose home channel the CR sets, Chat
-    first (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds
-    it and the projected file names a channel, the CR's or one it learned.
-    With no such list, home posts go to Slack alone when the file names a
-    channel, and otherwise to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
+    Those are the platforms with a home channel (:func:`home_platforms`). With
+    none, home posts go to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
     whose posts the gateway keeps for the digest it posts once a channel is set.
-    The rule reads only those two variables and the file, so every process
-    computes the same list and a learned channel restarts no pod.
+    The rule reads only those two variables and the projected Slack file, so
+    every process computes the same list and a learned channel restarts no pod.
     """
-    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
-    armed = gateway_platforms()
-    slack_home = SLACK_PLATFORM in armed and bool(home_file_value())
-    if listed:
-        if slack_home and SLACK_PLATFORM not in listed:
-            return [*listed, SLACK_PLATFORM]
-        return listed
-    if slack_home:
-        return [SLACK_PLATFORM]
-    return armed
+    return home_platforms() or gateway_platforms()
 
 
 def gateway_platforms() -> list[str]:

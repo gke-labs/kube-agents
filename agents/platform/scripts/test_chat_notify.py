@@ -172,6 +172,29 @@ class HomePostPlatformsTest(unittest.TestCase):
         self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
 
 
+    def test_home_platforms_names_only_a_platform_with_a_home_channel(self):
+        # (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, projected file or None, expected)
+        rows = (
+            (None, "google_chat,slack", None, []),
+            ("google_chat", "google_chat,slack", None, ["google_chat"]),
+            (None, "google_chat,slack", "C0BUCG2F43E", ["slack"]),
+            ("google_chat", "google_chat,slack", "C0BUCG2F43E", ["google_chat", "slack"]),
+            (None, "google_chat", "C0BUCG2F43E", []),
+        )
+        path = os.path.join(self.dir, chat_notify.HOME_FILE_KEY)
+        for platform, conversations, file_value, expected in rows:
+            with self.subTest(platform=platform, conversations=conversations, file=file_value):
+                os.environ.pop(chat_notify.NOTIFY_PLATFORM_ENV, None)
+                if platform is not None:
+                    os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = platform
+                os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = conversations
+                if file_value is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    self._write(file_value)
+                self.assertEqual(chat_notify.home_platforms(), expected)
+
 class PlatformListTest(unittest.TestCase):
     """Both env vars carry a comma-separated list of platforms; one value is a list of one."""
 
