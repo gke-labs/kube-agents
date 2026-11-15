@@ -52,13 +52,26 @@ type a2aTierEntry struct {
 
 // buildA2ATiersConfigMap renders tiers, sorted by name, into the ConfigMap.
 // A tier being deleted is left out.
-func buildA2ATiersConfigMap(agent *agentv1alpha1.PlatformAgent, tiers []agentv1alpha1.Tier) (*corev1.ConfigMap, error) {
+//
+// kept are tiers a profile still references in the applied dispatch config
+// (keptDrainingTiers): a Tier deleted while a profile drains it stays in the
+// file, at the mode it had, until the drain ends, so the verifier and the
+// auth callout keep judging the tasks still running at it (#3659, 2b-ii).
+func buildA2ATiersConfigMap(agent *agentv1alpha1.PlatformAgent, tiers []agentv1alpha1.Tier, kept ...a2aTierEntry) (*corev1.ConfigMap, error) {
 	f := a2aTiersFile{Tiers: []a2aTierEntry{}}
+	seen := map[string]bool{}
 	for _, t := range tiers {
 		if t.DeletionTimestamp != nil {
 			continue
 		}
+		seen[t.Name] = true
 		f.Tiers = append(f.Tiers, a2aTierEntry{Name: t.Name, Mode: string(t.Spec.Mode)})
+	}
+	for _, k := range kept {
+		if !seen[k.Name] {
+			seen[k.Name] = true
+			f.Tiers = append(f.Tiers, k)
+		}
 	}
 	sort.Slice(f.Tiers, func(i, j int) bool { return f.Tiers[i].Name < f.Tiers[j].Name })
 	raw, err := json.MarshalIndent(f, "", "  ")
@@ -79,7 +92,12 @@ func buildA2ATiersConfigMap(agent *agentv1alpha1.PlatformAgent, tiers []agentv1a
 // applyA2ATiers renders the Tier resources in the agent's namespace into the
 // tiers ConfigMap. With the Tier CRD not installed, or unreadable, it renders
 // an empty list, which serves the compiled-in tiers.
-func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// profiles are the bound profiles reconcileA2AStack already resolved and
+// narrowed (nil when AgentProfiles are unreadable): their draining tiers are
+// the ones a deleted Tier keeps in the file. Passed in rather than listed
+// again, so the map and the file read one drain decision, and so a role that
+// can't list AgentProfiles is never made to (#1009's case).
+func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) error {
 	var list agentv1alpha1.TierList
 	// A role that can't read Tiers lists nothing: a cached List would start
 	// an informer that never syncs and hold the reconcile (#1009's case).
@@ -88,7 +106,11 @@ func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agen
 			return fmt.Errorf("failed to list Tiers: %w", err)
 		}
 	}
-	cm, err := buildA2ATiersConfigMap(agent, list.Items)
+	var kept []a2aTierEntry
+	if !r.tiersUnreadable {
+		kept = keptDrainingTiers(profiles)
+	}
+	cm, err := buildA2ATiersConfigMap(agent, list.Items, kept...)
 	if err != nil {
 		return err
 	}
@@ -131,4 +153,32 @@ func withA2ATiersFile(agent *agentv1alpha1.PlatformAgent, spec *corev1.PodSpec, 
 		spec.Volumes = append(spec.Volumes, vol)
 		return
 	}
+}
+
+// keptDrainingTiers are the custom tiers the profiles drain, with the mode
+// each drains at: the ones a deleted Tier must not take out of the tiers file
+// yet. They come from the drain decisions (decideDrains, on profiles narrowed
+// by boundAgentProfiles), which take a tier's mode from the catalog or the
+// profile's own ServiceAccount, never from the applied config. The built-ins
+// are compiled in and never listed.
+func keptDrainingTiers(profiles []agentv1alpha1.AgentProfile) []a2aTierEntry {
+	builtin := builtinTierCatalog()
+	modes := map[string]string{}
+	for i := range profiles {
+		p := &profiles[i]
+		for tier := range drainingTiersOf(p) {
+			if _, ok := builtin[tier]; ok {
+				continue
+			}
+			if _, ok := modes[tier]; !ok {
+				modes[tier] = tierModeOf(p, tier)
+			}
+		}
+	}
+	out := make([]a2aTierEntry, 0, len(modes))
+	for name, mode := range modes {
+		out = append(out, a2aTierEntry{Name: name, Mode: mode})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }

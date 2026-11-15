@@ -224,8 +224,11 @@ func TestBridgeConcurrencyMaxMatchesTheBridgeQueue(t *testing.T) {
 // The provision script's refusal is the reserve's other reader: it quotes the
 // number, computes the maxSessions that still fits from it, and names what
 // the reserve is for. All three move with the constant, or the operator is
-// told a remedy computed from a stale number.
+// told a remedy computed from a stale number. The constant is the table at
+// the bridge's default, so the rendered bridge is pinned there through the
+// operator's setting (unpinned it runs 10 workers and the row is 80).
 func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 	sessions := 100
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
@@ -247,10 +250,13 @@ func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
 
 // a2aBridgeConcurrency reads BRIDGE_CONCURRENCY off spec.deployment.sidecars
 // the way the bridge reads it off its environment, and the comment above the
-// reserve states the rule; this holds the function to each clause of it. The
-// per-worker arithmetic the rule feeds -- 44 at 4, 56 at 6 -- is pinned
-// beside the cases, so a change to a2aTasksReplayAsk or the tail factor that
-// silently moved the reserve a declared install carries fails here.
+// reserve states the rule; this holds the function to each clause of it. A
+// CR that declares no bridge sidecar gets the one the operator renders, at
+// its default of 10 workers (an 80-consumer reserve), and that is what the
+// rows that declare none read. The per-worker arithmetic the rule feeds --
+// 44 at 4, 56 at 6 -- is pinned beside the cases, so a change to
+// a2aTasksReplayAsk or the tail factor that silently moved the reserve a
+// declared install carries fails here.
 func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 	lit := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", Value: v} }
 	fromRef := corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
@@ -265,10 +271,10 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 		want        int
 		wantReserve int
 	}{
-		{"no deployment block is the default", nil, 2, 32},
-		{"no sidecars is the default", &agentv1alpha1.DeploymentSpec{}, 2, 32},
-		{"a sidecar that does not set it is not a bridge", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("fluent-bit", corev1.EnvVar{Name: "FLB_LOG_LEVEL", Value: "info"})}}, 2, 32},
+		{"no deployment block is the rendered bridge's default", nil, 10, 80},
+		{"no sidecars is the rendered bridge's default", &agentv1alpha1.DeploymentSpec{}, 10, 80},
+		{"a sidecar that does not set it is not a bridge, so the rendered one counts", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
+			sidecar("fluent-bit", corev1.EnvVar{Name: "FLB_LOG_LEVEL", Value: "info"})}}, 10, 80},
 		{"a literal is the count", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("hermes-bridge", lit("6"))}}, 6, 56},
 		{"the presubmit's four", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
@@ -368,15 +374,20 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			}
 		})
 	}
-	if a2aBridgeConcurrency(nil) != a2aBridgeDefaultConcurrency {
-		t.Errorf("a2aBridgeConcurrency(nil) = %d, want the default", a2aBridgeConcurrency(nil))
+	if a2aBridgeConcurrency(nil) != a2aRenderedBridgeDefaultConcurrency {
+		t.Errorf("a2aBridgeConcurrency(nil) = %d, want the rendered bridge's default %d", a2aBridgeConcurrency(nil), a2aRenderedBridgeDefaultConcurrency)
 	}
 }
 
-// The floor's edge, stated in the comment and pinned here: the first
-// maxSessions whose budget clears a2aTasksMaxConsumersFloor, and the default
-// install still under it.
+// The floor's edge, stated in the comment above a2aTasksReservedConsumers and
+// pinned here at the bridge's default of 2 workers (the rendered bridge
+// pinned there through the operator's setting): the first maxSessions whose
+// budget clears a2aTasksMaxConsumersFloor, and the default maxSessions still
+// under it. Unpinned, the rendered bridge runs 10 workers and a default
+// install's 110 is above the floor from maxSessions=1, which the last block
+// holds.
 func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
 	first := 0
 	for m := 1; m <= a2aTasksMaxConsumersFloor; m++ {
 		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -396,6 +407,19 @@ func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	if got := a2aTasksMaxConsumers(def); got != a2aTasksMaxConsumersFloor {
 		t.Errorf("default install renders max_consumers=%d, want the floor %d", got, a2aTasksMaxConsumersFloor)
 	}
+
+	t.Run("the rendered bridge's default is above the floor from one session", func(t *testing.T) {
+		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "")
+		one := 1
+		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &one}}
+		if got := a2aTasksMaxConsumers(agent); got != 83 {
+			t.Errorf("maxSessions=1 renders max_consumers=%d, want 83: 3 plus the 80 the rendered bridge's 10 workers reserve", got)
+		}
+		if got := a2aTasksConsumerBudget(def); got != 110 {
+			t.Errorf("default budget = %d, want 110", got)
+		}
+	})
 }
 
 // a2aBridgeSourceDirs are the bridge's own packages in the a2a module: the
@@ -516,12 +540,12 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 // function they stand for, holds the arithmetic they feed to what it
 // promises (at the presubmit's 4 workers and at 6, a budget within the
 // floor, so TASKS is created at it; at 8 the floor cannot hold the
-// reserve, and the lane relies on its Degraded gate), and decodes the values
-// document the script hands the chart into the CR type, so the field path it
-// names is one the API has: under platformAgent the document carries the
-// CR's own spec paths, which the chart renders one for one
-// (tests/test_ci_deploy_mode_next.py renders it to check that half). Read from the source, for the reason the SessionConsumerRoles
-// test gives, and every step fails rather than defaults.
+// reserve, and the lane relies on its Degraded gate), and decodes the Helm
+// value path the script hands the chart into the CR type, so the field path
+// it names is one the API has: under platformAgent the path is the CR's own
+// spec path, which the chart renders one for one. Read from the source, for
+// the reason the SessionConsumerRoles test gives, and every step fails rather
+// than defaults.
 func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 	script, err := os.ReadFile(ciDeploySource)
 	if err != nil {

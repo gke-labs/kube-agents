@@ -1090,16 +1090,14 @@ start_replay_shadow_collector() {
   return 0
 }
 
-# ─── The replay lane: the cache, in every proxy pod, before any case ─────────
+# ─── The replay lane: the cache, fetched before any case ─────────────────────
 # A no-op unless EVAL_REPLAY_LANE=true. Downloads what recent
 # trusted nightlies selected from the shared cache (fetch_cache.py, into
 # REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS) and seeds
-# every live proxy pod with it (collect_shadow.py --seed-once; a pod draining
-# after a rollout is skipped); the collector then seeds any pod that replaces
-# one. Returns 1, with the reason, when there is nothing to replay, no live pod,
-# or a live pod did not take it: the lane would measure nothing,
-# so the caller stops before its cases. Call once AGENT_CLUSTER_CONTEXT is set,
-# before start_replay_shadow_collector.
+# no pod: seed_replay_lane_cache does that, after the lane's live arm.
+# Returns 1, with the reason, when there is nothing to replay: the lane would
+# measure nothing, so the caller stops before its cases. Call once
+# AGENT_CLUSTER_CONTEXT is set.
 prepare_replay_lane_cache() {
   # Every other run is the collector's to resolve, which only warns.
   [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
@@ -1123,6 +1121,22 @@ prepare_replay_lane_cache() {
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
   fi
+  echo "Replay lane: the cache is fetched; no proxy pod holds it until seed_replay_lane_cache."
+  return 0
+}
+
+# Seeds every live proxy pod with what prepare_replay_lane_cache fetched
+# (collect_shadow.py --seed-once; a pod draining after a rollout is skipped);
+# the collector then seeds any pod that replaces one. Until this runs, a
+# replay proxy's cache is empty, so every request misses and goes to the model:
+# the lane's live arm runs before it. A no-op when nothing was fetched (off the
+# lane, or a lane proxy not in replay mode). Returns 1, with the reason, when no
+# live pod ran or one did not take the cache. Call before
+# start_replay_shadow_collector.
+seed_replay_lane_cache() {
+  [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
+  [ -n "${REPLAY_LANE_SEED_DIR:-}" ] || return 0
+  local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   local args=(
     --namespace "${namespace}" --selector "${REPLAY_SHADOW_POD_SELECTOR}" --container "${REPLAY_SHADOW_CONTAINER}"
     --bucket "${REPLAY_SHADOW_BUCKET}" --kind "${REPLAY_SHADOW_KIND}" --build "${REPLAY_SHADOW_BUILD}"

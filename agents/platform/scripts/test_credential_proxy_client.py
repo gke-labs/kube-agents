@@ -81,7 +81,9 @@ class SubmittedPayloadTestCase(unittest.TestCase):
             captured["payload"] = json.loads(request.data.decode("utf-8"))
             return RecordingResponse(json.dumps(body).encode("utf-8"))
 
-        with patch.dict("os.environ", environ, clear=False):
+        # An empty KUBECONFIG unless the test names one: the ambient value is
+        # not the test's input, and the shim refuses a file with no context.
+        with patch.dict("os.environ", {"KUBECONFIG": "", **environ}, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                     captured["exit_code"] = credential_proxy_client.execute(endpoint, argv)
@@ -989,7 +991,8 @@ class StdinGateTest(unittest.TestCase):
             captured["body"] = json.loads(request.data)
             return RecordingResponse(json.dumps({"exitCode": 0}).encode())
 
-        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+        with patch.dict("os.environ", {"KUBECONFIG": ""}, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open):
             credential_proxy_client.execute(
                 "http://127.0.0.1:8765", ["kubectl", "apply", "-f", "-"], stdin="kind: X\n"
             )
@@ -1082,7 +1085,7 @@ class TestCallerCredential(SubmittedPayloadTestCase):
             return RecordingResponse(b"{}")
 
         stderr = io.StringIO()
-        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token"}
+        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token", "KUBECONFIG": ""}
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stderr", new=stderr):
@@ -1154,7 +1157,9 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual("a.b.next", sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_no_header_outside_a_task_or_after_it(self):
-        sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        sent = self.run_shim(
+            ["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": ""}
+        )
         self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
         # The adapter removed the file at the task's end: no task, no header,
         # and the broker answers local-only commands only.

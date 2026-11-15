@@ -28,7 +28,9 @@ The binary has a second caller: the agent-side notification callers
 through the gateway, and so does the Hermes kanban notifier for card events
 (`deploy/docker/patches/kanban_chat_notify.py`). Both run it only under `next`: proactive posts
 when the operator renders `A2A_NOTIFY_PLATFORM`, and the report of a card filed in a gateway
-conversation, back to that conversation, when it renders `A2A_NOTIFY_CONVERSATIONS`. Onboarding's
+conversation, back to that conversation, when it renders `A2A_NOTIFY_CONVERSATIONS`. Each variable
+holds a comma-separated list of platform names; a single name is a list of one, and the operator
+renders one name today. Onboarding's
 first report goes the same way, into the conversation the user first wrote in
 (`agents/chat/scripts/bootstrap_delivery.py`).
 

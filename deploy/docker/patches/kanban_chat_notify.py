@@ -17,9 +17,9 @@ card's report never reaches the thread.
 
 The fix
 -------
-The operator names the platform the gateway holds in ``A2A_NOTIFY_PLATFORM``
-(the same switch ``agents/platform/scripts/chat_notify.py`` reads). For that
-platform, and only inside the notifier:
+The operator names the platforms the gateway holds in ``A2A_NOTIFY_PLATFORM``,
+a comma-separated list (the same switch ``agents/platform/scripts/chat_notify.py``
+reads). For each of those platforms, and only inside the notifier:
 
 1. :func:`active_platforms` counts it as served, so its subscriptions are
    collected.
@@ -112,14 +112,18 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 logger = logging.getLogger(__name__)
 
 # The operator's switch (written by platformagent_manifests.go, defined as
-# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go).
+# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): the platforms
+# whose home posts go through the gateway, separated by PLATFORM_LIST_SEPARATOR.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
-# The platform whose gateway conversations a card can report back to
-# (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
-# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, rendered with a
-# home channel or when the backend is the install's only chat platform (the
-# gateway then keeps a refused post for its digest).
+# The platforms whose gateway conversations a card can report back to
+# (a2aNotifyConversationsEnvVar), in the same list form. Rendered whenever the
+# gateway arms the route, home channel or not; A2A_NOTIFY_PLATFORM above is home
+# posts, rendered with a home channel or when the backend is the install's only
+# chat platform (the gateway then keeps a refused post for its digest).
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# What separates the platform names in either variable
+# (chat_notify.PLATFORM_LIST_SEPARATOR).
+PLATFORM_LIST_SEPARATOR = ","
 # The operator's projection of the home channel, mounted in the agent pod
 # (agents/platform/scripts/chat_notify.py keeps the same three names).
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
@@ -188,8 +192,9 @@ CONSOLE_PLATFORM_LABEL = "kube-agents console (chat.notify only)"
 # task of the turn that filed it (kanban_event_routing.CONSOLE_THREAD_TASK_SEP),
 # which the report names with --reply-to.
 CONSOLE_THREAD_TASK_SEP = "#"
-# The attribute the stand-in is cached under on the runner, which outlives the
-# per-tick collector and the per-delivery notification.
+# The attribute the home stand-in is cached under on the runner, which outlives
+# the per-tick collector and the per-delivery notification; resolve suffixes
+# the platform name, one slot per platform.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
 # The Slack platform value, whose home threads go out channel-qualified
 # (ChatNotifyAdapter.notify_target).
@@ -258,35 +263,48 @@ def _chat_ux_platforms() -> tuple:
         return (SLACK_PLATFORM,)
 
 
-def routed_platform() -> str:
-    """The platform name the gateway holds, or "" when none.
+def platform_list(raw: str) -> list:
+    """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order.
 
-    The rendered env names it when the CR sets the home channel; a channel the
+    A copy of chat_notify.platform_list, which this patch cannot import.
+    """
+    names: list = []
+    for part in raw.split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def routed_platforms() -> list:
+    """The platforms whose home posts the gateway holds, or [] when none.
+
+    The rendered env names them when the CR sets the home channel; a channel the
     gateway learned is projected into a file instead (the operator's
     ``slack_home`` mount), so with the env empty the answer is derived from the
-    platform the gateway holds and a non-empty file.
+    platforms the gateway holds and a non-empty file. A non-empty env wins.
     """
-    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     if routed:
         return routed
-    if conversation_platform() != HOME_FILE_PLATFORM:
-        return ""
+    if HOME_FILE_PLATFORM not in conversation_platforms():
+        return []
     try:
         with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
-            return HOME_FILE_PLATFORM if handle.read().strip() else ""
+            return [HOME_FILE_PLATFORM] if handle.read().strip() else []
     except (OSError, ValueError):
-        return ""
+        return []
 
 
 def routes(platform: Any) -> bool:
-    """Whether ``platform`` (an enum or a string) is the one the gateway holds."""
+    """Whether ``platform`` (an enum or a string) is one whose home posts the gateway holds."""
     name = str(getattr(platform, "value", platform) or "").lower()
-    return bool(name) and name == routed_platform()
+    return bool(name) and name in routed_platforms()
 
 
-def conversation_platform() -> str:
-    """The platform whose gateway conversations cards report back to, or "" when none."""
-    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+def conversation_platforms() -> list:
+    """The platforms whose gateway conversations cards report back to, or [] when none."""
+    return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
 
 def is_conversation(sub: Optional[dict]) -> bool:
@@ -301,7 +319,7 @@ def chat_route(adapter: Any) -> bool:
 
 def served_platforms() -> set:
     """The platforms whose deliveries go through the gateway's chat.notify route."""
-    return {p for p in (routed_platform(), conversation_platform(), CONSOLE_PLATFORM) if p}
+    return {*routed_platforms(), *conversation_platforms(), CONSOLE_PLATFORM}
 
 
 def active_platforms(names: set) -> set:
@@ -344,7 +362,7 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     conversation = is_conversation(sub)
     name = str(getattr(platform, "value", platform) or "").lower()
     if conversation:
-        if not name or name not in (conversation_platform(), CONSOLE_PLATFORM):
+        if not name or name not in (*conversation_platforms(), CONSOLE_PLATFORM):
             return None
     elif not routes(platform):
         return adapter
@@ -354,12 +372,11 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
         return None
     attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
                  else (RUNNER_ATTR, ChatNotifyAdapter))
-    # The conversation stand-ins are kept one per platform: a chat
-    # platform's and the console's are served side by side, and one shared
-    # slot would rebuild the stand-in, and re-probe the route, on every
-    # switch between them.
-    if conversation:
-        attr = f"{attr}_{name}"
+    # The stand-ins are kept one per platform: two routed platforms' home
+    # stand-ins, or a chat platform's conversation stand-in and the console's,
+    # are served side by side, and one shared slot would rebuild the stand-in,
+    # and re-probe the route, on every switch between them.
+    attr = f"{attr}_{name}"
     stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
         stand_in = cls(platform, runner)

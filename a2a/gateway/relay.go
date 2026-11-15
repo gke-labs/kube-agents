@@ -99,6 +99,7 @@ var reasonSentences = map[string]string{
 	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
+	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
 	// The dispatcher's re-check of a profile task's child (#5686). The
 	// gateway refuses the same at mint, so these reach the room only from a
 	// child an older gateway sent, or one that broke a rule anyway.

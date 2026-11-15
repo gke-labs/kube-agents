@@ -148,16 +148,14 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 
 | Profile | Pods | CPU requests | Memory requests | CPU limits | Memory limits | Ephemeral storage requests / limits | Claims | `requests.storage` | Session quota `pods` |
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
-| `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| `next`, GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| `next` with one NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
+| GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
+| Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
-Under `spec.mode: next`, per pod:
+The A2A stack, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |

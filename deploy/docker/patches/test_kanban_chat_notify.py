@@ -109,29 +109,29 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
             handle.write(text)
 
     def test_the_file_routes_slack(self):
-        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), [])
         self._write("")
-        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), [])
         self._write("C0FILE\n")
-        self.assertEqual(kanban_chat_notify.routed_platform(), "slack")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
         self.assertTrue(kanban_chat_notify.routes("slack"))
         self.assertIn("slack", kanban_chat_notify.served_platforms())
 
     def test_a_file_that_is_not_text_routes_nothing(self):
         with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "wb") as handle:
             handle.write(b"\xff\xfe\x00C0")
-        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), [])
 
     def test_the_env_wins_and_another_platform_ignores_the_file(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
-            self.assertEqual(kanban_chat_notify.routed_platform(), "google_chat")
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
         with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
-            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+            self.assertEqual(kanban_chat_notify.routed_platforms(), [])
 
     def test_an_absent_directory_routes_nothing(self):
         with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
-            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+            self.assertEqual(kanban_chat_notify.routed_platforms(), [])
 
 
 class _Runner:
@@ -280,6 +280,28 @@ class ResolveTest(unittest.TestCase):
             # Another platform's conversation is still gated by the variable.
             self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None,
                                                          {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}))
+
+    def test_a_list_routes_every_named_platform(self):
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack"}, clear=False):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+            self.assertTrue(kanban_chat_notify.routes("slack"))
+            self.assertEqual(kanban_chat_notify.served_platforms(), {"google_chat", "slack", kanban_chat_notify.CONSOLE_PLATFORM})
+
+    def test_home_stand_ins_are_kept_one_per_platform(self):
+        # Both routed, the two platforms' home stand-ins are cached apart: a
+        # Slack resolve between two Google Chat ones does not rebuild Google
+        # Chat's (and re-probe its route).
+        runner = _Runner()
+        both = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}
+        with mock.patch.dict(os.environ, both):
+            chat = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            slack = kanban_chat_notify.resolve(runner, Platform.SLACK, None)
+            self.assertIsInstance(chat, kanban_chat_notify.ChatNotifyAdapter)
+            self.assertIsInstance(slack, kanban_chat_notify.ChatNotifyAdapter)
+            self.assertIsNot(chat, slack)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), chat)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.SLACK, None), slack)
 
     def test_a_chat_and_a_console_conversation_each_keep_their_stand_in(self):
         # Served side by side, the two platforms' stand-ins are cached apart:
@@ -701,6 +723,15 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.NOTIFY_CONNECT_SECONDS, chat_notify.NOTIFY_CONNECT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_MARGIN_SECONDS, chat_notify.NOTIFY_MARGIN_SECONDS)
         self.assertEqual(kanban_chat_notify.SEND_TIMEOUT_SECONDS, chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
+        self.assertEqual(kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV)
+        self.assertEqual(kanban_chat_notify.PLATFORM_LIST_SEPARATOR, chat_notify.PLATFORM_LIST_SEPARATOR)
+        self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), ["a", "b"])
+        self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), chat_notify.platform_list("a, b,,a"))
+        import kanban_event_routing
+        listed = "google_chat, slack,,slack"
+        with mock.patch.dict(os.environ, {kanban_event_routing.NOTIFY_CONVERSATIONS_ENV: listed}):
+            self.assertEqual(kanban_event_routing._served_conversation_platforms(), ["google_chat", "slack"])
+        self.assertEqual(chat_notify.platform_list(listed), ["google_chat", "slack"])
 
     def test_the_conversation_route_is_spelled_alike_where_it_is_written_and_read(self):
         # session_kv_server writes it, kanban_event_routing addresses the card
@@ -713,6 +744,8 @@ class ContractTest(unittest.TestCase):
                   for t in node.targets if isinstance(t, ast.Name)}
         self.assertEqual(ast.literal_eval(consts["CONVERSATION_ROUTE_KEY"]), kanban_chat_notify.CONVERSATION_ROUTE_KEY)
         self.assertEqual(kanban_event_routing.CONVERSATION_ROUTE_KEY, kanban_chat_notify.CONVERSATION_ROUTE_KEY)
+        self.assertEqual(kanban_event_routing.PLATFORM_LIST_SEPARATOR, kanban_chat_notify.PLATFORM_LIST_SEPARATOR)
+        self.assertEqual(kanban_notifier.GATEWAY_PLATFORM_SEPARATOR, kanban_chat_notify.PLATFORM_LIST_SEPARATOR)
         self.assertEqual(sorted(ast.literal_eval(consts["CONVERSATION_KEY_PREFIXES"]).values()),
                          sorted(kanban_chat_notify.CONVERSATION_KEY_PREFIXES))
         self.assertEqual(ast.literal_eval(consts["SESSION_KV_DB_PATH"].args[1]) if isinstance(consts["SESSION_KV_DB_PATH"], ast.Call)

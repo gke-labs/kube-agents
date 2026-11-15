@@ -905,6 +905,66 @@
         }
       }
     },
+    "a2aBus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nats": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "natsBox": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "configReloader": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "prometheusExporter": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "agentSandbox": {
       "type": "object",
       "additionalProperties": false,
@@ -934,6 +994,7 @@
           "type": "string"
         },
         "mode": {
+          "description": "Deprecated and ignored: every install runs the A2A stack, and the operator ignores a value set here (the chart still renders it; the webhook rewrites today to next). Accepted so a values file that still sets it renders.",
           "enum": [null, "", "today", "next"]
         },
         "telemetry": {

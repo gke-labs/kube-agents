@@ -459,7 +459,8 @@ leave open:
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
-  `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
+  `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
+  `no-worker` (an unattended task with no runner, under Job mode below),
   `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
