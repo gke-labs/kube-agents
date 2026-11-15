@@ -284,14 +284,15 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
     ),
-    # The spec.mode: next fixture: the only golden that renders the roles the
-    # operator mints for the A2A stack (the A2A gateway's and the auth
-    # callout's, and the dispatcher's once it renders by default). Not in
-    # _GOLDEN_KEYS: the today-mode invariants that walk those don't hold for
-    # next by design, so a test that wants it reads it by name.
-    "golden_next": Source(
+    # The settled fixture: the default CR reconciled until nothing changes,
+    # so it carries what later passes add (the A2A gateway Deployment and the
+    # bridge's activity hook) beside the roles every golden renders for the
+    # A2A stack. Not in _GOLDEN_KEYS: the first-pass invariants that walk
+    # those (one `-gateway` Deployment, say) don't hold for it, so a test that
+    # wants it reads it by name.
+    "golden_settled": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
-        "platformagent-next.yaml",
+        "platformagent-settled.yaml",
         ("name: platformagent-a2a-gateway", "name: platformagent-a2a-callout"),
     ),
     "golden_scoped_sa": Source(
@@ -340,8 +341,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next with both doors armed (the next-mode golden is
-    # the example CR, which arms neither). The anchors are the collector's namespace and
+    # golden arms both doors (the door flags are operator env, unset when the
+    # goldens render). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(

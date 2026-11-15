@@ -83,7 +83,7 @@ func TestBusCredentialsReadyTracksTheCallout(t *testing.T) {
 	}
 	cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition)
 	if cond == nil {
-		t.Fatal("no BusCredentialsReady condition under next")
+		t.Fatal("no BusCredentialsReady condition")
 	}
 	if cond.Status != metav1.ConditionFalse {
 		t.Errorf("condition = %s with no ready callout replica, want False", cond.Status)
@@ -231,49 +231,6 @@ func TestTheBusConditionMessageNamesOnlyWhatItCanKnow(t *testing.T) {
 	}
 }
 
-// The darkness property reaches status. A today install must not carry a
-// condition describing a component it does not have — a reviewer reading
-// `kubectl describe` on a normal install would see the feature named.
-func TestBusCredentialsReadyIsAbsentUnderToday(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, sandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
-	ctx := context.Background()
-
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d: %v", i+1, err)
-		}
-	}
-
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	fresh.Spec.Mode = nil
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("flip to today: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
-
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	if cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition); cond != nil {
-		t.Errorf("BusCredentialsReady survives a flip to today: %+v", cond)
-	}
-}
-
 // Both tests below are the same defect from its two ends: the condition was
 // written at the very bottom of Reconcile, under every early return, so a
 // reconcile that parked Degraded above it neither wrote it nor cleared it.
@@ -322,63 +279,6 @@ func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testi
 	if meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition) == nil {
 		t.Error("no BusCredentialsReady condition on a next install parked Degraded by an " +
 			"unrelated step; nothing downstream can tell whether the bus can authenticate")
-	}
-}
-
-// The other end: a condition already written must not survive the component it
-// describes. A flip back to today tears the callout down, and if the same
-// reconcile parks Degraded above the clear, the CR goes on reporting that a
-// callout which no longer exists is serving a map -- which reads as healthy.
-func TestBusCredentialsReadyIsClearedOnAFlipToTodayThatAlsoParksDegraded(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	keys := sandboxKeysSecret(agent)
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, keys).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
-	ctx := context.Background()
-
-	// Twice: the first pass creates the callout objects, the second observes
-	// them, which is when the condition is written.
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
-		}
-	}
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	if meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition) == nil {
-		t.Fatal("precondition: no BusCredentialsReady under next")
-	}
-
-	// Flip to today and remove the keypair in the same step, so the reconcile
-	// that tears the callout down is also one that parks Degraded.
-	fresh.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("flip mode: %v", err)
-	}
-	if err := cl.Delete(ctx, keys); err != nil {
-		t.Fatalf("delete keypair: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
-
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	if cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition); cond != nil {
-		t.Errorf("BusCredentialsReady survived the flip to today as %s/%s (%q); "+
-			"the CR describes a callout it no longer has",
-			cond.Status, cond.Reason, cond.Message)
 	}
 }
 
@@ -462,7 +362,7 @@ func TestBusCredentialsReadyIsNotLeftStaleByARefusalAboveTheBusStep(t *testing.T
 
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+			t.Fatalf("Reconcile %d: %v", i+1, err)
 		}
 	}
 	dep := &appsv1.Deployment{}

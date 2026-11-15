@@ -224,11 +224,10 @@ func homeChannelProjectionMount(dir string) corev1.VolumeMount {
 
 // homeChannelRecordFor reads the record from the cache, once per reconcile
 // (the caller carries it to the render and to both condition writers), or an
-// empty record where nothing reads it: a stack that is not rendered, or a
-// gateway that does not hold Slack. NotFound is an empty record: the pass
+// empty record where nothing reads it: a gateway that does not hold Slack. NotFound is an empty record: the pass
 // that creates the object has not run yet.
 func (r *PlatformAgentReconciler) homeChannelRecordFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (homeChannelRecord, error) {
-	if !a2aStackRendering(agent) || !a2aSlackArmed(agent) {
+	if !a2aSlackArmed(agent) {
 		return homeChannelRecord{}, nil
 	}
 	var cm corev1.ConfigMap

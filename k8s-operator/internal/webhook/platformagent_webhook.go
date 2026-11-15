@@ -129,6 +129,15 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgen
 			platformAgent.Spec.Harness.Memory.UserProfileEnabled = ptr.To(false)
 		}
 	}
+	// The retired mode. An apply that still says "today" (an install.env or a
+	// manifest from before the removal) is moved, not refused: the object it
+	// writes is the one the operator runs anyway.
+	if platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+		if platformAgent.Spec.Mode != nil {
+			platformagentlog.Info("rewriting the retired spec.mode", "name", platformAgent.Name, "from", *platformAgent.Spec.Mode, "to", agentv1alpha1.PlatformAgentModeNext)
+		}
+		platformAgent.Spec.Mode = ptr.To(agentv1alpha1.PlatformAgentModeNext)
+	}
 
 	return nil
 }
@@ -358,7 +367,6 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
 	// 7. Leaving next while a bus migration holds the bus: the run's
 	// staging claim can hold the only copy of the bus's data.
-	allErrs = append(allErrs, validateModeDuringBusMigration(oldObj, platformAgent)...)
 
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -378,13 +386,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // count on an existing bus is otherwise how a migration starts (#4225).
 // Best effort: the run is read from the stored object's status.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	// Under today, or coming from it, there is no bus migration to turn
-	// around: the switch to today tears a run down with the bus, and the
-	// webhook refuses that switch while one is under way.
-	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
-		return nil
-	}
-	if oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
+	if oldObj == nil {
 		return nil
 	}
 	run := oldObj.Status.BusMigration
@@ -397,32 +399,6 @@ func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) fie
 	}
 	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
 		fmt.Sprintf("the A2A bus's %s migration is under way (phase %s); busReplicas can change again once it has ended (status.busMigration)", run.Leg, run.Phase))}
-}
-
-// validateModeDuringBusMigration refuses an update that takes spec.mode off
-// next while the bus's migration is under way, or Failed and not given up:
-// the switch tears the bus down around the run, and a run past its Clearing
-// phase holds the bus's data only in its staging claim. A run that ended, or
-// one given up, is no reason to refuse; the operator removes its record and
-// what it left on the switch. Best effort: the run is read from the stored
-// object's status.
-func validateModeDuringBusMigration(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	if oldObj == nil || oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
-		return nil
-	}
-	if platformAgent.Spec.Mode != nil && *platformAgent.Spec.Mode == "next" {
-		return nil
-	}
-	run := oldObj.Status.BusMigration
-	if run == nil || run.Phase == "Done" || run.Phase == "Abandoned" || (run.Phase == "Failed" && run.GivenUp) {
-		return nil
-	}
-	if run.Phase == "Failed" {
-		return field.ErrorList{field.Forbidden(field.NewPath("spec", "mode"),
-			fmt.Sprintf("the A2A bus's %s migration %s is Failed and holds the bus's snapshot; retry it, or give it up with the annotation kubeagents.x-k8s.io/bus-migration-abandon=%s, before leaving next (status.busMigration)", run.Leg, run.RunID, run.RunID))}
-	}
-	return field.ErrorList{field.Forbidden(field.NewPath("spec", "mode"),
-		fmt.Sprintf("the A2A bus's %s migration %s is under way (phase %s); spec.mode can leave next once it has ended (status.busMigration)", run.Leg, run.RunID, run.Phase))}
 }
 
 func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {

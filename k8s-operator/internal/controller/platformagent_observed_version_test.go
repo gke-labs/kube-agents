@@ -120,7 +120,7 @@ func TestReadyStatusRecordsAndUpdatesObservedVersion(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1)).
+		WithObjects(append(a2aStackUp(agent), agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(counter.interceptors()).
 		Build()
@@ -204,7 +204,7 @@ func TestAPrunedObservedVersionDoesNotWriteEveryPass(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1)).
+		WithObjects(append(a2aStackUp(agent), agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(funcs).
 		Build()
@@ -297,7 +297,7 @@ func TestAPrunedObservedVersionIsLoggedOncePerRecordAndClearedOnForget(t *testin
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1)).
+		WithObjects(append(a2aStackUp(agent), agent, gateway, shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(funcs).
 		Build()

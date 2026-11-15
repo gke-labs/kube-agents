@@ -2008,13 +2008,10 @@ class InstallerCommonTest(unittest.TestCase):
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
                                   "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
-            # Installed next through the installer; the key now asks for today,
-            # which renders nothing and so removes the recorded field.
-            ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
-                                 "retires the A2A stack", "set PLATFORM_AGENT_MODE=next in install.env")),
-            # A render that drops a recorded today removes the field from a CR
-            # patched to next since.
-            ("today next today", ("WARN: This apply switches the install from spec.mode next to today",)),
+            # The key asks for today: the CRD defaults spec.mode to next and the
+            # webhook rewrites today, so this is a note, not a switch.
+            ("next next today", ("install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next",)),
+            ("today next today", ("install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next",)),
         ):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
@@ -2025,7 +2022,7 @@ class InstallerCommonTest(unittest.TestCase):
     def test_an_ungated_switch_does_not_offer_run_again(self):
         # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
         # no confirmation after the notice: "run again" is not a way out there.
-        for args in ("next next today", "unset unset next"):
+        for args in ("unset unset next",):
             with self.subTest(args=args):
                 gated = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 self.assertIn("in install.env and run again.", gated.stdout)
@@ -2046,33 +2043,33 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("This run applies it without asking first", proc.stdout, proc.stderr)
 
     def test_a_re_apply_and_an_unread_install_are_silent(self):
-        for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):
+        for args in ("next next next", "unset next next", '"" unset next', 'unset "" next'):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 self.assertEqual(proc.stdout, "")
 
-    def test_a_mode_set_by_hand_is_named_rather_than_announced_as_a_switch(self):
-        # The release renders the key already, so Helm sends no change and a
-        # mode set on the CR by hand stays: a CR patched to next under a
-        # record with no mode, and one patched back to today under a record
-        # of next (a rollback round trip's state).
-        for args, running, key in (("unset next today", "next", "today"), ("next today next", "today", "next"), ("next unset next", "today", "next")):
+    def test_the_apply_leaves_next_whatever_the_record_or_the_cr_says(self):
+        # The CRD defaults spec.mode to next: a CR that reads today moves (a
+        # switch, announced), and a CR that reads next stays with a note when
+        # the key asks for today.
+        for args, expect in (
+            ("unset next today", "install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next"),
+            ("next today next", "WARN: This apply switches the install from spec.mode today to next"),
+            ("next unset next", "WARN: This apply switches the install from spec.mode today to next"),
+        ):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertNotIn("This apply switches", proc.stdout)
-                self.assertIn(
-                    f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
-                    proc.stdout,
-                )
+                self.assertIn(expect, proc.stdout)
+                self.assertNotIn("switches the install from spec.mode next to today", proc.stdout)
 
-    def test_the_mode_after_the_apply_is_kept_for_the_chat_checklists(self):
-        # The chat checklists follow the mode the CR is left on: the key,
-        # unless the CR carries a mode set by hand that the apply leaves there.
-        # Every early return, a first install's included, leaves the key.
+    def test_the_mode_after_the_apply_is_next_for_the_chat_checklists(self):
+        # The chat checklists follow the mode the CR is left on, which the
+        # CRD default makes next whatever the key, the record or the CR says;
+        # a first install's included.
         echo = '; echo "AFTER=$PLATFORM_AGENT_MODE_AFTER_APPLY"'
         for listing, latest, key, after in (
             (self._cr_list("next"), "{}", "today", "next"),
-            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "today"),
+            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "next"),
             (self._cr_list(), "{}", "next", "next"),
             (self._cr_list("next"), '{"platformAgent":{"mode":"next"}}', "next", "next"),
             (self._cr_list(), "norelease", "next", "next"),
@@ -2083,19 +2080,35 @@ class InstallerCommonTest(unittest.TestCase):
                 self.assertIn(f"AFTER={after}\n", proc.stdout, proc.stderr)
         first = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE_AFTER_APPLY=stale; TFVARS_CLUSTER_EXISTS=false "
                           f"announce_platform_agent_mode_for_apply kubeagents-system today{echo}", kubectl_script=None)
-        self.assertIn("AFTER=today\n", first.stdout, first.stderr)
+        self.assertIn("AFTER=next\n", first.stdout, first.stderr)
 
-    def test_a_retag_says_what_a_full_upgrade_would_do(self):
-        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
-        self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
-        self.assertIn("leaves it at spec.mode today", proc.stdout)
-        self.assertIn("A full upgrade applies the switch to next", proc.stdout)
-        # Quiet where a full upgrade would not move the CR either: the same
-        # mode, a hand-set mode the key cannot reach, or nothing read.
-        for args in ("next next next harness", "unset unset today operator", "unset next today harness", "next today next harness", '"" unset next operator', 'unset "" next operator'):
+    def test_a_retag_says_the_operators_crd_leaves_next(self):
+        # A CR that still reads today (its CRD predates the default) moves to
+        # next with the operator this run installs, whatever the key says.
+        for args in ("unset unset next harness", "unset unset today operator", "next today next harness"):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
+                self.assertIn("installs an operator whose CRD defaults spec.mode to next", proc.stdout)
+                self.assertNotIn("switch to today", proc.stdout)
+        # Quiet where the CR already reads next, or nothing was read.
+        for args in ("next next next harness", "unset next today harness", '"" unset next operator', 'unset "" next operator'):
             with self.subTest(args=args):
                 quiet = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
                 self.assertEqual(quiet.stdout, "")
+
+    def test_a_today_recorded_install_is_refused_for_an_email_in_slack_allowed_users(self):
+        # The guard reads the mode the apply leaves (next), not the key, so an
+        # install that still records today meets the gateway's rule now.
+        proc = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE=today SLACK_ENABLED=true GOOGLE_CHAT_ENABLED=false "
+                         'SLACK_ALLOWED_USERS=alice@example.com SLACK_BOT_TOKEN=xoxb-1; refuse_next_slack_gateway_settings_from_env; echo "rc=$?"')
+        self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails", proc.stdout + proc.stderr)
+        self.assertIn("rc=1", proc.stdout)
+
+    def test_a_today_chat_install_with_no_home_channel_key_is_warned(self):
+        proc = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE=today GOOGLE_CHAT_ENABLED=true SLACK_ENABLED=false GOOGLE_CHAT_HOME_CHANNEL=; "
+                         'warn_next_home_channel_unset_from_env; echo "KEY=$NEXT_HOME_CHANNEL_UNSET_KEY"')
+        self.assertIn("WARN:", proc.stdout)
+        self.assertIn("KEY=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout)
 
     def test_the_retag_note_reads_the_record_from_the_retag_values(self):
         # The values the retag re-applies are the record a later full upgrade
@@ -2109,7 +2122,7 @@ class InstallerCommonTest(unittest.TestCase):
             (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "next", None),
             # The record decides here: a recorded next that the key drops is a
             # switch a full upgrade makes; with no recorded mode it would make none.
-            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", "A full upgrade applies the switch to today"),
+            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", None),
             (self._cr_kubectl(self._cr_list("next")), "{}", "today", None),
             (self._cr_kubectl(self._cr_list(present=False)), "{}", "next", None),
             (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE), "{}", "next",

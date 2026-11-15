@@ -107,11 +107,11 @@ func (r *PlatformAgentReconciler) observeA2AGatewayElection(ctx context.Context,
 // gatewayElectedImage is the image the GatewayElected condition should
 // name, or "" for none. observed is what observeA2AGatewayElection read this
 // pass (nil when it couldn't tell, or didn't run). The condition describes
-// the gateway that's running: it's cleared under today, with the election
-// off, and when the gateway rolls to an image outside the operator's release
+// the gateway that's running: it's cleared with the election off, and when
+// the gateway rolls to an image outside the operator's release
 // that no elected pod has run yet.
 func gatewayElectedImage(agent *agentv1alpha1.PlatformAgent, observed *string) string {
-	if !a2aStackRendering(agent) || !a2aGatewayElectionEnabled() {
+	if !a2aGatewayElectionEnabled() {
 		return ""
 	}
 	elected := ""
@@ -227,7 +227,7 @@ func a2aGatewayTopologySpread(agent *agentv1alpha1.PlatformAgent) []corev1.Topol
 // election. No golden renders the scale-out (no pod holds the Lease there), so
 // it's counted apart, as the MCP server is.
 func a2aGatewayStandbyPods(agent *agentv1alpha1.PlatformAgent) int64 {
-	if !a2aStackRendering(agent) || !a2aGatewayElectionEnabled() {
+	if !a2aGatewayElectionEnabled() {
 		return 0
 	}
 	replicas := int64(a2aGatewayReplicas(agent))

@@ -26,7 +26,6 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
@@ -638,7 +637,7 @@ const a2aBusMigratingConditionType = "A2ABusMigrating"
 // false when it is to be absent.
 func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Condition, ok bool) {
 	run := agent.Status.BusMigration
-	if run == nil || !a2aStackRendering(agent) {
+	if run == nil {
 		return metav1.Condition{}, false
 	}
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
@@ -1355,49 +1354,6 @@ func busMigrationStageIsTheOnlyCopy(run *agentv1alpha1.BusMigrationStatus) bool 
 		return false
 	}
 	return true
-}
-
-// busMigrationTornDown is a switch to today's word on the bus migration
-// record: a run that ended, or a Failed run given up, goes, with every
-// object it left (its ServiceAccounts, pods, Jobs, run Secret and staging
-// claim, but for a stage that holds the only copy, which cleanupBusMigration
-// keeps), so a later switch back to next starts with no record and its
-// bridge waits for its own provisioning. A run still under way, or Failed
-// and not given up, is left as it is: the webhook refuses that switch, since
-// the run's staging claim can hold the only copy of the bus, and an install
-// without the webhook keeps the record and the claim for a person. Nothing
-// requeues it off next.
-func (r *PlatformAgentReconciler) busMigrationTornDown(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	run := agent.Status.BusMigration
-	if run == nil {
-		return nil
-	}
-	phase := busMigrationPhase(run.Phase)
-	if !busMigrationTerminal(phase) || (phase == busMigrationFailed && !run.GivenUp) {
-		logf.FromContext(ctx).Info("the A2A stack is off while a bus migration is under way or Failed; its record and staging claim are kept for a person",
-			"run", run.RunID, "phase", run.Phase)
-		return nil
-	}
-	if err := r.cleanupBusMigration(ctx, agent, run); err != nil {
-		return err
-	}
-	// Every migration Job this PlatformAgent controls, any run's and any
-	// attempt's: the pin and unpin Jobs otherwise stay for their TTL.
-	var jobs batchv1.JobList
-	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{a2aComponentLabel: busMigrationComponent}); err != nil {
-		return err
-	}
-	for i := range jobs.Items {
-		job := &jobs.Items[i]
-		if !metav1.IsControlledBy(job, agent) || job.DeletionTimestamp != nil {
-			continue
-		}
-		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
-			return err
-		}
-	}
-	agent.Status.BusMigration = nil
-	return nil
 }
 
 // busMigrationFreezeActive reports the one to three leg's write freeze in
