@@ -1461,7 +1461,8 @@ type DeploymentSpec struct {
 
 	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
 	// native container that authenticates the agent's API-server calls and also
-	// runs the event watcher and the drift detector.
+	// runs the event watcher and the drift detector, and, under mode: next, the
+	// audit-report store listener on 8700.
 	// +optional
 	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
 

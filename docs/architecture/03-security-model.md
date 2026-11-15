@@ -182,7 +182,8 @@ RBAC at runtime. Consequences:
     `spec.security.disallowSecretsRead: true` is set; model-executing containers mount no default-audience
     API server token and reach the API server through `<agent>-kube-proxy`, which enforces
     `KUBE_PROXY_REDACT_SECRETS=true`, while the credential broker's command policy refuses `Secret` reads
-    and the gateway's `agent-api-auth` sidecar uses its in-cluster token only for event and CR watching.
+    and the gateway's `agent-api-auth` sidecar uses its in-cluster token only for event and CR watching
+    and, under `spec.mode: next`, to read the cluster JWKS the audit-report store listener verifies against.
     Assuming it minted none is
     what let the second policy be written so that it denied the controller's own binding.)
   - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —

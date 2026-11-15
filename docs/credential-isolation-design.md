@@ -26,7 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key, and, where enabled, the drift detector. Neither calls Google
    on the pod's own identity: both make their Google calls through the
    broker's watcher routes with a token for the `watcher` audience, which is
-   mounted here and in no other container.
+   mounted here and in no other container. And, under `mode: next`, the
+   audit-report store listener on 8700.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a

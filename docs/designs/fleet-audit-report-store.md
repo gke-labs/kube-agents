@@ -197,25 +197,31 @@ in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make
 probes the agent pods for both containers and reads the sandbox first.
 
 Under `mode: next` a profile worker runs in a pod with no PVC, so the store is also served over the
-network, to the credential broker and to nothing else (#5619). `audit_report_store.py` listens on
+network, to the credential broker and to nothing else (#5619; the broker's routes follow). `audit_report_store.py` listens on
 port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
 volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
 store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
 bound to the audience `kubeagents-audit-report-store`. The listener verifies that token offline
 against the cluster's JWKS, which it reads with the pod's own API-audience token: the default
 `system:service-account-issuer-discovery` binding allows that, so the listener needs no new RBAC.
-It checks the issuer, the audience, the expiry and that the subject is the broker's ServiceAccount.
-A failed check is 401, a wrong subject 403, and a JWKS it cannot read 503, never an accept. The
+It checks the issuer, the audience, the expiry, that the subject is the broker's ServiceAccount and
+that the token is bound to a pod of the broker's Deployment (the ServiceAccount is shared with the
+exec tier). A failed check is 401, a wrong subject or pod 403, and a JWKS it cannot read 503, never
+an accept. The API server, the token it reads the JWKS with and the store's root are fixed in the
+listener, not read from the environment, which `spec.deployment.env` reaches. The
 NetworkPolicy `<agent>-report-store` admits only the broker's pods to the port. Where any other
 policy in the namespace already isolates the gateway pod for ingress (the operator's gateway policy,
 or one a customer applied), that one rule is the whole policy. Where none does, the policy also
 admits every source on every other port, so the pod is no more closed than it was. The operator
 reads the namespace's policies again on every reconcile, and a policy change enqueues one, so a
-lockdown applied later drops that rule on the next pass. The routes take the store key as one path
+lockdown applied later drops that rule on the next pass. With `spec.networkPolicy.enabled: false`
+the policy is not rendered, as the operator's other policies are not, and the token check is the
+whole control. The routes take the store key as one path
 segment, the repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to
 an empty, `.` or `..` part, a control character or a path outside the root. Every file and
 directory step is relative to an open directory and refuses a symlink (409), because the
-`platform-agent` container writes the same volume as the same user. A ring write prunes to 14, and
+`platform-agent` container writes the same volume as the same user; a read opens non-blocking and
+takes regular files of at most 1 MiB alone, and a write holds a lock on its store directory. A ring write prunes to 14, and
 `latest` must be a byte-identical copy of a ring entry. Today mode renders none of this.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
