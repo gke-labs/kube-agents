@@ -1953,7 +1953,8 @@ the whole `text`, not chunked; a `chat` message's text is its fallback, and the 
 text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
 request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
 --reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
-its turn. A `reply_to` that is not a task id's shape is dropped and the report still posted.
+its turn, and echo it as the `replyTo` of a reply under the report ("Transport" above). A
+`reply_to` that is not a task id's shape is dropped and the report still posted.
 The task reaches the card this way. The hermes-bridge records it on a console conversation's
 route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
 card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
@@ -2857,7 +2858,10 @@ the one every other writer here has.
 
 **Transport.** Core NATS, no stream. The browser publishes a frame -
 `{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
-`parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles") - to
+`parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles"), and an optional
+`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by a
+console client such as the MCP server; the page sends none; the gateway puts it on the submission
+as a `replyTo` part, `spec-a2a-payloads.md`) - to
 `chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus

@@ -759,7 +759,7 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
-child's submission once their names pass the target profile's declared ones. Both are `data` parts, and only the gateway
+child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
 `taskParameters` parts.
 
@@ -834,6 +834,17 @@ listed, and a turn with none reads as `platform` only.
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
+
+**Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
+gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
+root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is
+not reached; `hermes-bridge.md`) and the client echoed with its reply (the console frame's `replyTo`; the MCP server's `send_message`
+`reply_to`). The hermes-bridge reads the report the kanban notifier stored for that turn
+(`a2a/docs/hermes-bridge.md`, the reply under a pushed report) and puts it ahead of the words. A
+chat backend's turn never carries one: a Slack or Google Chat reply is in the report's thread. The
+task id is a subject token; the gateway drops one that is not and sends the turn without it, and
+a reader that finds a part breaking that, or two parts, ignores them (`lib.ReplyToOf`) and looks the
+report up by the conversation alone.
 
 ### Card work after the task ends
 

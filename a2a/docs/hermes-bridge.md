@@ -434,15 +434,21 @@ no link to that report, and under `next`
 nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
 the `api` executor. So the bridge asks session-kv for the row the poster stored
 (`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
-recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
-names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
-`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
-the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
-gateway conversation (a console
-conversation's row carries the filing turn's task in its key, which a later reply does not know,
-so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
-since every later message there shares it and would carry the first stored report for the row's
-life). A row found is spliced ahead of
+recent-reports index or its Google Chat first-reply recovery): first, when the submission carries
+a `replyTo` part (`docs/designs/spec-a2a-payloads.md`), by the Hermes session and
+`<conversation key>#<task>`, which is how the notifier keys a card's report it posted into a
+console conversation (the report's frame names the filing turn's task as `replyTo`, and a console
+client, the MCP server's `send_message` with `reply_to`, echoes it with the reply; a card filed in
+a delegated child's turn is keyed by the child's task, which the frame reports as the chain's root,
+so that row is not reached; a reply while the turn is still running is steered into it and carries
+no `replyTo`, since the report is attached on an opening turn only); then by the
+thread the conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
+`gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
+conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
+Chat gateway conversation. A console reply that names no task takes only the last,
+`(session, key)`, and finds no row, since the console row's key carries the task; a key naming a whole DM or space rather than a thread
+is not looked up at all, since every later message there shares it and would carry the first
+stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
 the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
