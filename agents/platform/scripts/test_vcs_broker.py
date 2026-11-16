@@ -2528,6 +2528,8 @@ class CollaborationTest(unittest.TestCase):
         adding = (
             {"labels": ["kube-agents:auto-merge"]}, {"labelsAdd": [" KUBE-AGENTS:Auto-Merge "]},
             {"labels": "kube-agents:auto-merge"},
+            # The GitLab adapter joins the list with commas, so one element can carry two labels.
+            {"labelsAdd": ["bug,kube-agents:auto-merge"]}, {"labels": "bug, Kube-Agents:auto-merge"},
         )
         for level in ("explain", "propose"):
             vcs_broker.set_dial_level(level)

@@ -2609,15 +2609,18 @@ def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, s
     """Refuse a write that adds the auto-merge label while the dial is below Auto-merge.
 
     Compared folded and stripped: a forge matches label names that way, so a
-    spelling that differs only in case is the same label to the pipeline.
-    Removing it is always allowed, and a read (a list filter) never comes here.
+    spelling that differs only in case is the same label to the pipeline. Each
+    value is also split on commas, because the GitLab adapter joins the list
+    with commas and GitLab reads that as several labels. Removing it is always
+    allowed, and a read (a list filter) never comes here.
     """
     if dial_allows_automerge(environ):
         return
     for field in DIAL_ADDING_LABEL_FIELDS:
         values = payload.get(field)
         values = [values] if isinstance(values, str) else values if isinstance(values, (list, tuple)) else []
-        if any(isinstance(v, str) and v.strip().casefold() in DIAL_GATED_LABELS for v in values):
+        names = [part for v in values if isinstance(v, str) for part in v.split(",")]
+        if any(name.strip().casefold() in DIAL_GATED_LABELS for name in names):
             raise WorkspaceError(
                 "the autonomy dial is not at Auto-merge proven fixes, so no pull request or issue may carry "
                 "the auto-merge label. Leave the label off; an install admin raises the dial on the Slack "
