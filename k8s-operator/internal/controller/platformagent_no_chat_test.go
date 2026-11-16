@@ -15,20 +15,20 @@ import (
 )
 
 // TestNoChatPlatformMessageFollowsTheChatPlatforms: the condition is written
-// only on a next install with neither chat platform; a platform, enabled
-// with or without a home channel, hands the question to HomeChannelUnset,
-// and today installs carry nothing.
+// only on an install with neither chat platform, whatever spec.mode says; a
+// platform, enabled with or without a home channel, hands the question to
+// HomeChannelUnset.
 func TestNoChatPlatformMessageFollowsTheChatPlatforms(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
 		want  bool
 	}{
-		{"next, no chat", a2aTestAgent(), true},
-		{"next, slack without a home channel", slackTestAgent("next", true), false},
-		{"next, chat with a home channel", withHome(gchatTestAgent("next", true), "spaces/AAAA"), false},
-		{"next, slack disabled explicitly", slackTestAgent("next", false), true},
-		{"today, no chat", func() *agentv1alpha1.PlatformAgent { a := a2aTestAgent(); a.Spec.Mode = nil; return a }(), false},
+		{"no chat", a2aTestAgent(), true},
+		{"slack without a home channel", slackTestAgent("next", true), false},
+		{"chat with a home channel", withHome(gchatTestAgent("next", true), "spaces/AAAA"), false},
+		{"slack disabled explicitly", slackTestAgent("next", false), true},
+		{"no mode, no chat", func() *agentv1alpha1.PlatformAgent { a := a2aTestAgent(); a.Spec.Mode = nil; return a }(), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := noChatPlatformMsg(tc.agent)
