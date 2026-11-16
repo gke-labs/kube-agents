@@ -86,19 +86,24 @@ BROKER_TIMEOUT_SECONDS = 5
 OFF = "The autonomy dial is off on this install."
 NOT_ADMIN = "Only an install admin can change this."
 NOT_SAVED = "Not saved: the stored setting could not be read or written."
-NOT_REPORTED = "Saved. The broker has not confirmed it yet, so writes follow it once the broker hears it."
+NOT_REPORTED = "Saved. The broker has not confirmed it yet; session-kv reports it again every minute."
 NEEDS_AUTOMERGE = "Pick Auto-merge proven fixes first; auto-merge is requested only there."
 NOT_AT_EXPLAIN = "At Explain the agent opens no pull request; pick Propose fixes to change the rules file."
 NOT_MANAGED = "That repository is not one this install manages."
 UNKNOWN_KIND = "That kind of fix is not on the dial."
 BUSY = "A change to this switch is already running."
 SWITCH_FAILED = "The switch did not run: {reason}"
+OPENING = "Opening the rules pull request for {repo}; the row shows it once it is open."
+CLOSING = "Changing the rules file for {repo}; the row shows the result."
 
 _write_lock = threading.Lock()
 _busy: set[tuple[str, str]] = set()
 _busy_lock = threading.Lock()
 _last_checked: dict[str, float] = {}
 _check_lock = threading.Lock()
+_checking = False
+_reporter_started = False
+REPORT_EVERY_SECONDS = 60
 
 
 class UnreadableRecord(Exception):
@@ -256,6 +261,9 @@ def snapshot_section(session_db: Any, now: datetime | None = None, repos: list[s
             }
             if pending is not None:
                 row["pending_pr"] = pending
+            note = recorded.get(key, {}).get("note")
+            if isinstance(note, str) and note:
+                row["note"] = note
             rows.append(row)
         kinds.append({"kind": kind, "title": title, "environment": environment, "repos": rows})
     refresh_pending_async(state)
@@ -275,6 +283,13 @@ def snapshot_section(session_db: Any, now: datetime | None = None, repos: list[s
 
 
 def broker_url() -> str:
+    """The credential broker, from session-kv's own environment.
+
+    That is the container's, as the operator rendered it: the entrypoint
+    starts session-kv without reading the agent-writable PVC .env, which
+    Hermes alone applies, so a line the agent wrote cannot point the gateway
+    container's broker token somewhere else.
+    """
     return os.environ.get("CREDENTIAL_PROXY_URL", "").strip().rstrip("/")
 
 
@@ -307,7 +322,10 @@ def run_switch(argv: list[str], timeout: float) -> Any:
 
 
 def _switch_results(done: Any) -> list[dict]:
-    results = json.loads(done.stdout or "")
+    try:
+        results = json.loads(done.stdout or "")
+    except ValueError:
+        results = None
     if done.returncode != 0 or not isinstance(results, list):
         reason = results[0].get("reason") if isinstance(results, list) and results and isinstance(results[0], dict) else ""
         raise ValueError(str(reason or (done.stderr or "").strip()[:300] or "no answer"))
@@ -327,8 +345,57 @@ def refresh_pending_async(state: dict) -> None:
         due = [p for p in pending if now - _last_checked.get(p[1] + p[0], -CHECK_EVERY_SECONDS) >= CHECK_EVERY_SECONDS]
         for kind, key, _entry in due:
             _last_checked[key + kind] = now
-    if due:
-        threading.Thread(target=refresh_pending, args=(due,), name="dial-pending-check", daemon=True).start()
+    global _checking
+    with _check_lock:
+        if not due or _checking:
+            return
+        _checking = True
+    _spawn(_refresh_then_clear, due)
+
+
+def _refresh_then_clear(due: list[tuple[str, str, dict]]) -> None:
+    global _checking
+    try:
+        refresh_pending(due)
+    finally:
+        with _check_lock:
+            _checking = False
+
+
+def _spawn(target: Callable[..., None], *args: Any) -> None:
+    """Run ``target`` off the request's thread (the tests run it in place)."""
+    threading.Thread(target=target, args=args, name="dial-work", daemon=True).start()
+
+
+def report_recorded() -> bool:
+    """Report the recorded level (the default when there is none). An unreadable record is not reported."""
+    try:
+        raw = _read_raw()
+    except UnreadableRecord as exc:
+        logger.warning("dial: not reporting the level; %s cannot be read: %s", state_path(), exc)
+        return False
+    return report_level(raw.get("level") if raw.get("level") in LEVELS else DEFAULT_LEVEL)
+
+
+def start_reporter() -> None:
+    """Report the level now and every minute while the switch is on, once per process.
+
+    The broker treats an install that has not reported as Explain, and loses
+    what it heard when its pod restarts; this keeps it on the dial's level.
+    """
+    global _reporter_started
+    with _check_lock:
+        if _reporter_started or not enabled():
+            return
+        _reporter_started = True
+
+    def loop() -> None:
+        while True:
+            if enabled():
+                report_recorded()
+            time.sleep(REPORT_EVERY_SECONDS)
+
+    threading.Thread(target=loop, name="dial-report", daemon=True).start()
 
 
 def refresh_pending(due: list[tuple[str, str, dict]]) -> None:
@@ -357,7 +424,8 @@ def refresh_pending(due: list[tuple[str, str, dict]]) -> None:
                 repos[key] = {**current, "state": STATE_ON if wanted_on else STATE_OFF}
             else:
                 before = current.get("before") if isinstance(current.get("before"), dict) else {"on": not wanted_on}
-                repos[key] = {**before, "state": STATE_ON if before.get("on") is True else STATE_OFF}
+                was_on = before.get("on") is True and before.get("state", STATE_ON) == STATE_ON
+                repos[key] = {"on": was_on, "state": STATE_ON if was_on else STATE_OFF, "url": current.get("url")}
 
         try:
             _write(settle)
@@ -424,22 +492,45 @@ def _switch(action: str, user: str, payload: dict) -> dict:
             return _answer(action, False, BUSY)
         _busy.add((kind, key))
     try:
-        previous = state["kinds"].get(kind, {}).get(key, {})
+        _spawn(_run_switch, action, user, kind, environment, key, url)
+    except BaseException:
+        with _busy_lock:
+            _busy.discard((kind, key))
+        raise
+    return _answer(action, True, (OPENING if turning_on else CLOSING).format(repo=_display(url)))
+
+
+def _run_switch(action: str, user: str, kind: str, environment: str, key: str, url: str) -> None:
+    """The switch for one repository, off the request's thread (the bridge waits 28 s; a run can take longer)."""
+    turning_on = action == ACTION_REQUEST
+    try:
+        with _check_lock:
+            _last_checked[key + kind] = time.monotonic()
+        previous = read_state()["kinds"].get(kind, {}).get(key, {})
+        # Settle the last tap's pull request first: one that merged or closed
+        # while pending decides what "before" is, and the switch only closes an
+        # open one.
+        if previous.get("state") == SWITCH_PROPOSED and type(previous.get("number")) is int and previous.get("url"):
+            refresh_pending([(kind, key, previous)])
+            previous = read_state()["kinds"].get(kind, {}).get(key, {})
         number = previous.get("number")
-        target = f"{url}#{number}" if previous.get("state") == SWITCH_PROPOSED and type(number) is int and number > 0 else url
+        pending = previous.get("state") == SWITCH_PROPOSED and type(number) is int and number > 0
+        target = f"{url}#{number}" if pending else url
         argv = ["python3", SWITCH_SCRIPT, "--kind", kind, "--environment", environment,
                 "--state", "on" if turning_on else "off", "--repo", target]
         try:
             results = _switch_results(run_switch(argv, SWITCH_TIMEOUT_SECONDS))
-        except Exception as exc:  # noqa: BLE001 — said on the tab, nothing recorded
+        except Exception as exc:  # noqa: BLE001 — shown on the row, nothing else recorded
             logger.warning("dial: the %s switch for %s failed: %s", kind, key, exc)
-            return _answer(action, False, SWITCH_FAILED.format(reason=str(exc) or type(exc).__name__))
+            _note(kind, key, previous, SWITCH_FAILED.format(reason=str(exc) or type(exc).__name__))
+            return
         result = next((r for r in results if clean_merges.repo_key(r.get("repo")) == key), results[0] if results else {})
         outcome = result.get("state")
         if outcome == SWITCH_BLOCKED:
-            return _answer(action, False, f"Not changed: {result.get('reason') or 'the switch refused'}.")
-        before = previous.get("before") if previous.get("state") == SWITCH_PROPOSED and isinstance(previous.get("before"), dict) else {
-            "on": previous.get("on") is True}
+            _note(kind, key, previous, f"Not changed: {result.get('reason') or 'the switch refused'}.")
+            return
+        before = previous.get("before") if pending and isinstance(previous.get("before"), dict) else {
+            "on": previous.get("on") is True, "state": previous.get("state") or STATE_OFF}
         entry = {
             "on": turning_on,
             "state": outcome,
@@ -453,13 +544,16 @@ def _switch(action: str, user: str, payload: dict) -> dict:
             write_repo(kind, key, entry)
         except (UnreadableRecord, OSError) as exc:
             logger.warning("dial: not recording the %s switch for %s: %s", kind, key, exc)
-            return _answer(action, False, NOT_SAVED)
-        with _check_lock:
-            _last_checked[key + kind] = time.monotonic()
+            return
         logger.info("dial: %s %s in %s by %s: %s", action, kind, key, user, outcome)
-        if outcome == SWITCH_PROPOSED:
-            return _answer(action, True, f"Rules pull request {result.get('pr') or ''} opened; it takes effect when it merges.".replace("  ", " "))
-        return _answer(action, True, "The rules file already says so; nothing to open.")
     finally:
         with _busy_lock:
             _busy.discard((kind, key))
+
+
+def _note(kind: str, key: str, previous: dict, note: str) -> None:
+    """Keep the repository's entry as it was, with why the last tap changed nothing."""
+    try:
+        write_repo(kind, key, {**previous, "note": note})
+    except (UnreadableRecord, OSError) as exc:
+        logger.warning("dial: not recording a note for %s in %s: %s", kind, key, exc)

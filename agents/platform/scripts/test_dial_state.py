@@ -19,6 +19,7 @@ REPO = "https://github.com/org/infra"
 KEY = "github.com/org/infra"
 ADMIN = "U0ADMIN01"
 REAL_REFRESH_ASYNC = dial_state.refresh_pending_async
+REAL_REPORT = dial_state.report_level
 
 
 def done(results, code=0):
@@ -36,11 +37,15 @@ class DialCase(unittest.TestCase):
             (mock.patch.object(dial_state, "managed_repos", lambda: [REPO]), None),
             (mock.patch.object(dial_state, "report_level", lambda level: self.reported.append(level) or True), None),
             (mock.patch.object(dial_state, "refresh_pending_async", lambda state: None), None),
+            # The switch and the check run in place, so a test reads their outcome.
+            (mock.patch.object(dial_state, "_spawn", lambda target, *args: target(*args)), None),
         ):
             target.start()
             self.addCleanup(target.stop)
         self.reported, self.runs = [], []
         self.answer = [{"repo": REPO, "state": "proposed", "pr": f"{REPO}/pull/35", "number": 35}]
+        self.check_answer = "open"
+        dial_state._checking = False
         runner = mock.patch.object(dial_state, "run_switch", self.fake_run)
         runner.start()
         self.addCleanup(runner.stop)
@@ -50,7 +55,13 @@ class DialCase(unittest.TestCase):
 
     def fake_run(self, argv, timeout):
         self.runs.append(argv)
+        if "--check" in argv:
+            number = int(argv[-1].rsplit("#", 1)[1])
+            return done([{"repo": REPO, "number": number, "state": self.check_answer}])
         return done(self.answer)
+
+    def row(self):
+        return self.section()["kinds"][0]["repos"][0]
 
     def act(self, action, user=ADMIN, **payload):
         return dial_state.handle(action, {"action": action, "user": user, **payload})
@@ -160,20 +171,21 @@ class SwitchTest(DialCase):
 
     def test_request_opens_the_rules_pull_request_and_shows_it_pending(self):
         answer = self.request()
-        self.assertTrue(answer["ok"], answer)
+        self.assertEqual(answer, {"action": "dial.request", "ok": True, "message": dial_state.OPENING.format(repo="org/infra")})
         self.assertEqual(
             self.runs[-1],
             ["python3", dial_state.SWITCH_SCRIPT, "--kind", "no-pdb", "--environment", "dev", "--state", "on", "--repo", REPO],
         )
-        row = self.section()["kinds"][0]["repos"][0]
+        row = self.row()
         self.assertEqual((row["state"], row["pending_pr"]), ("pending", {"number": 35, "url": f"{REPO}/pull/35"}))
 
-    def test_a_second_tap_passes_the_pending_number(self):
+    def test_a_second_tap_settles_then_passes_the_pending_number(self):
         self.request()
         self.answer = [{"repo": REPO, "state": "off", "closed": f"{REPO}/pull/35"}]
         self.request(dial_state.ACTION_STOP)
+        self.assertEqual(self.runs[-2][-3:], ["--check", "--repo", f"{REPO}#35"])
         self.assertEqual(self.runs[-1][-1], f"{REPO}#35")
-        self.assertEqual(self.section()["kinds"][0]["repos"][0]["state"], "off")
+        self.assertEqual(self.row()["state"], "off")
 
     def test_refusals_run_nothing(self):
         for payload, message in (
@@ -198,21 +210,31 @@ class SwitchTest(DialCase):
         self.assertTrue(self.request(dial_state.ACTION_STOP)["ok"])
         self.assertEqual(self.runs[-1][7], "off")
 
-    def test_a_busy_switch_or_a_failed_run_records_nothing(self):
+    def test_a_busy_switch_answers_busy(self):
         dial_state._busy.add(("no-pdb", KEY))
         self.assertEqual(self.request()["message"], dial_state.BUSY)
-        dial_state._busy.clear()
-        with mock.patch.object(dial_state, "run_switch", lambda argv, timeout: done([{"state": "blocked", "reason": "KUBEAGENTS_DIAL is off"}], 1)):
-            answer = self.request()
-        self.assertEqual(answer["message"], "The switch did not run: KUBEAGENTS_DIAL is off")
+        self.assertEqual(self.runs, [])
+
+    def test_a_failed_or_refused_run_leaves_a_note_and_changes_nothing(self):
+        failing = done([], 1)
+        failing.stdout, failing.stderr = "", "ssh: connect to host sandbox: Connection refused"
+        with mock.patch.object(dial_state, "run_switch", lambda argv, timeout: failing):
+            self.request()
+        row = self.row()
+        self.assertEqual(row["state"], "off")
+        self.assertEqual(row["note"], "The switch did not run: ssh: connect to host sandbox: Connection refused")
         self.answer = [{"repo": REPO, "state": "blocked", "reason": "a person's deny rule"}]
-        self.assertIn("a person's deny rule", self.request()["message"])
-        self.assertEqual(self.section()["kinds"][0]["repos"][0]["state"], "off")
+        self.request()
+        self.assertIn("a person's deny rule", self.row()["note"])
+        self.answer = [{"repo": REPO, "state": "proposed", "pr": f"{REPO}/pull/35", "number": 35}]
+        self.request()
+        self.assertNotIn("note", self.row())
+        self.assertNotIn(("no-pdb", KEY), dial_state._busy)
 
     def test_a_file_that_already_agrees_is_on_without_a_pull_request(self):
         self.answer = [{"repo": REPO, "state": "on", "reason": "already allows it"}]
         self.assertTrue(self.request()["ok"])
-        row = self.section()["kinds"][0]["repos"][0]
+        row = self.row()
         self.assertEqual(row["state"], "on")
         self.assertNotIn("pending_pr", row)
 
@@ -227,39 +249,95 @@ class RefreshTest(DialCase):
         return [(k, key, e) for k, repos in dial_state.read_state()["kinds"].items() for key, e in repos.items()]
 
     def test_a_merged_rules_pull_request_turns_the_kind_on(self):
-        self.answer = [{"repo": REPO, "number": 35, "state": "merged"}]
+        self.check_answer = "merged"
         dial_state.refresh_pending(self.pending())
         self.assertEqual(self.runs[-1][-3:], ["--check", "--repo", f"{REPO}#35"])
-        self.assertEqual(self.section()["kinds"][0]["repos"][0]["state"], "on")
+        self.assertEqual(self.row()["state"], "on")
 
     def test_a_closed_one_puts_the_switch_back(self):
-        self.answer = [{"repo": REPO, "number": 35, "state": "closed"}]
+        self.check_answer = "closed"
         dial_state.refresh_pending(self.pending())
-        self.assertEqual(self.section()["kinds"][0]["repos"][0]["state"], "off")
+        self.assertEqual(self.row()["state"], "off")
 
     def test_an_open_one_or_a_failed_check_stays_pending(self):
-        self.answer = [{"repo": REPO, "number": 35, "state": "open"}]
         dial_state.refresh_pending(self.pending())
         with mock.patch.object(dial_state, "run_switch", mock.Mock(side_effect=TimeoutError("sandbox"))):
             dial_state.refresh_pending(self.pending())
-        self.assertEqual(self.section()["kinds"][0]["repos"][0]["state"], "pending")
+        self.assertEqual(self.row()["state"], "pending")
 
-    def test_a_tap_since_the_check_wins(self):
+    def test_a_stop_over_a_merged_request_that_is_then_closed_leaves_it_on(self):
+        # #35 merged while the row still said pending; the stop's own pull
+        # request #40 is then closed unmerged, so the file still allows it.
+        self.check_answer = "merged"
+        self.answer = [{"repo": REPO, "state": "proposed", "pr": f"{REPO}/pull/40", "number": 40}]
+        self.request(dial_state.ACTION_STOP)
+        self.assertEqual(self.row()["pending_pr"]["number"], 40)
+        self.check_answer = "closed"
+        dial_state.refresh_pending(self.pending())
+        self.assertEqual(self.row()["state"], "on")
+
+    def test_a_stale_check_does_not_settle_a_newer_pull_request(self):
         stale = self.pending()
         self.answer = [{"repo": REPO, "state": "proposed", "pr": f"{REPO}/pull/40", "number": 40}]
         self.request(dial_state.ACTION_STOP)
-        self.answer = [{"repo": REPO, "number": 35, "state": "merged"}]
-        dial_state.refresh_pending(stale)
-        row = self.section()["kinds"][0]["repos"][0]
-        self.assertEqual(row["pending_pr"]["number"], 40)
+        self.check_answer = "merged"
+        dial_state.refresh_pending([(k, key, {**e, "number": 35}) for k, key, e in stale])
+        self.assertEqual(self.row()["pending_pr"]["number"], 40)
 
-    def test_the_check_runs_off_the_request_and_at_most_once_a_minute(self):
+    def test_one_check_in_flight_at_a_time_and_at_most_once_a_minute(self):
         started = []
-        with mock.patch.object(dial_state.threading, "Thread", lambda **kw: mock.Mock(start=lambda: started.append(kw["args"]))):
+        with mock.patch.object(dial_state, "_spawn", lambda target, *args: started.append(args)):
             dial_state._last_checked.clear()
             REAL_REFRESH_ASYNC(dial_state.read_state())
+            dial_state._last_checked.clear()
             REAL_REFRESH_ASYNC(dial_state.read_state())
         self.assertEqual(len(started), 1)
+
+
+class ReporterTest(DialCase):
+    def test_the_recorded_level_or_the_default_is_reported(self):
+        self.assertTrue(dial_state.report_recorded())
+        self.act("dial.level", level="explain")
+        self.reported.clear()
+        dial_state.report_recorded()
+        self.assertEqual(self.reported, ["explain"])
+        path = Path(self.home) / dial_state.STATE_NAME
+        path.write_text("{broken")
+        self.reported.clear()
+        self.assertFalse(dial_state.report_recorded())
+        self.assertEqual(self.reported, [])
+
+    def test_report_level_posts_with_the_token_and_reads_the_answer(self):
+        import http.server
+        import threading
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append((self.path, self.headers.get("Authorization"), body))
+                payload = json.dumps({"level": body["level"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        token = Path(self.home) / "token"
+        token.write_text("chat-token\n")
+        env = {"CREDENTIAL_PROXY_URL": f"http://127.0.0.1:{server.server_port}", "CREDENTIAL_PROXY_TOKEN_FILE": str(token)}
+        real = REAL_REPORT
+        with mock.patch.dict(os.environ, env):
+            self.assertTrue(real("automerge"))
+        self.assertEqual(seen, [("/v1/dial", "Bearer chat-token", {"level": "automerge"})])
+        with mock.patch.dict(os.environ, {**env, "CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}):
+            self.assertFalse(real("explain"))
 
 
 if __name__ == "__main__":

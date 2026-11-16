@@ -898,7 +898,7 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
 
-	// The autonomy dial's admin list (ADMINS_KEY in
+	// The autonomy dial's admin list (ADMINS_NAME in
 	// agents/platform/scripts/dial_state.py, which session-kv reads before it
 	// changes the dial), pinned and unconditional for the reason the switches
 	// are: unpinned, one line in the PVC .env written by the agent would name

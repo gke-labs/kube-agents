@@ -165,6 +165,9 @@ async def _lifespan(_app: FastAPI):
     # The data volume check runs on its own thread for the life of the server;
     # see check_data_volume.
     threading.Thread(target=_data_volume_monitor, name="data-volume-monitor", daemon=True).start()
+    # The autonomy dial's level, reported to the broker every minute while
+    # KUBEAGENTS_DIAL is on (dial_state.start_reporter).
+    dial_state.start_reporter()
     yield
 
 
