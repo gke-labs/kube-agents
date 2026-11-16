@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -148,6 +149,31 @@ func TestSlackHomeDialRepoPickSurvivesAnExpiredViewer(t *testing.T) {
 	a.dialClick(dialClickPayload("U1", "4.2"), slackDialActionRepo, "", "no-pdb|dev|github.com/org/apps")
 	if got := dialText(t, dialBlocks(t, api)); !strings.Contains(got, "org/apps · 5 of 5 clean merges · Pending") {
 		t.Errorf("a pick made after the tab's viewer entry expired was dropped:\n%s", got)
+	}
+}
+
+func TestSlackHomeDialRepoPickSurvivesAViewerMapFullOfExpiredEntries(t *testing.T) {
+	a, api, _ := homeAdapter(t, dialBoard("U1"), nil)
+	a.home.mu.Lock()
+	a.home.viewers = map[string]time.Time{}
+	for i := range slackHomeViewersCap {
+		a.home.viewers[fmt.Sprintf("OLD%d", i)] = time.Now().Add(-2 * slackHomeViewerTTL)
+	}
+	a.home.mu.Unlock()
+	a.dialClick(dialClickPayload("U1", "4.3"), slackDialActionRepo, "", "no-pdb|dev|github.com/org/apps")
+	if got := dialText(t, dialBlocks(t, api)); !strings.Contains(got, "org/apps · 5 of 5 clean merges · Pending") {
+		t.Errorf("a pick made while the viewer map held only expired entries was dropped:\n%s", got)
+	}
+}
+
+func TestSlackHomeDialRepoPickFromAMemberNotAdmittedRecordsNothing(t *testing.T) {
+	a, _, _ := homeAdapter(t, dialBoard("U1"), nil)
+	a.dialClick(dialClickPayload("U2", "4.4"), slackDialActionRepo, "", "no-pdb|dev|github.com/org/apps")
+	a.home.mu.Lock()
+	_, viewing := a.home.viewers["U2"]
+	a.home.mu.Unlock()
+	if viewing || a.dialPick("U2", "no-pdb", "dev") != "" {
+		t.Errorf("a member the Home tab denies became a viewer or kept a pick (viewing=%v)", viewing)
 	}
 }
 

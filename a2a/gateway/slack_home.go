@@ -353,11 +353,17 @@ func (s *SlackAdapter) noteViewer(member string) {
 	if s.home.viewers == nil {
 		s.home.viewers = map[string]time.Time{}
 	}
+	// The prune drops dial picks of members it does not count as viewers;
+	// keep this member's, made just before an admitted redraw.
+	picks := s.home.dialPicks[member]
 	s.pruneViewersLocked(time.Now())
 	if _, ok := s.home.viewers[member]; !ok && len(s.home.viewers) >= slackHomeViewersCap {
 		return
 	}
 	s.home.viewers[member] = time.Now()
+	if picks != nil {
+		s.home.dialPicks[member] = picks
+	}
 }
 
 func (s *SlackAdapter) pruneViewersLocked(now time.Time) {

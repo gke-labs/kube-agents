@@ -284,15 +284,8 @@ func (s *SlackAdapter) dialPick(member, kind, environment string) string {
 func (s *SlackAdapter) setDialPick(member, kind, environment, repoKey string) {
 	s.home.mu.Lock()
 	defer s.home.mu.Unlock()
-	// A pick is a sign the member is looking: count them as a viewer, so the
-	// prune in the redraw keeps the pick even when the tab was opened more
-	// than slackHomeViewerTTL ago or before a gateway restart.
-	if s.home.viewers == nil {
-		s.home.viewers = map[string]time.Time{}
-	}
-	if _, ok := s.home.viewers[member]; ok || len(s.home.viewers) < slackHomeViewersCap {
-		s.home.viewers[member] = time.Now()
-	}
+	// Viewer state is left to noteViewer, which the redraw calls for an
+	// admitted member and which keeps this member's pick through its prune.
 	if s.home.dialPicks == nil {
 		s.home.dialPicks = map[string]map[string]string{}
 	}
@@ -345,8 +338,17 @@ func (s *SlackAdapter) dialClick(p slackClickPayload, actionID, value, selected 
 			s.log.Info("slack: dropping a dial repo pick with no row", "member", member)
 			return
 		}
-		s.setDialPick(member, kind, environment, repoKey)
-		s.goSession(func() { s.publishHome(member, false) })
+		s.goSession(func() {
+			if admitted, decided := s.homeAdmitted(member); !admitted || !decided {
+				s.log.Info("slack: ignoring a dial repo pick from a member the gateway would not answer", "member", member, "decided", decided)
+				if decided {
+					s.publishHome(member, false)
+				}
+				return
+			}
+			s.setDialPick(member, kind, environment, repoKey)
+			s.publishHome(member, false)
+		})
 		return
 	case slackDialActionLevel:
 		if !slices.ContainsFunc(slackDialLevels, func(l struct{ level, title, description string }) bool { return l.level == selected }) {
