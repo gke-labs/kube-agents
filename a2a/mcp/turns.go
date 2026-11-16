@@ -112,9 +112,12 @@ const (
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
+// The address is absent on a turn for the conversation's route, so that
+// frame is the bytes it was before a turn could name a profile.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
+	TurnAddress
 }
 
 // ConsoleOutFrame is a frame the gateway posts to a console conversation
@@ -1406,7 +1409,9 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 // following the turn's delegations until it is closed. A turn still running
 // on the conversation, in another call or left by an earlier one, is waited
 // on for up to wait first; past it the send fails with ErrConversationBusy.
-func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error) {
+// A turn addressed to an AgentProfile (to) carries the profile and its
+// parameters in its frame.
+func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string, to TurnAddress, wait time.Duration) (TurnResult, *turnWatch, error) {
 	res := TurnResult{Token: token}
 	if strings.TrimSpace(text) == "" {
 		return res, nil, errors.New("empty message")
@@ -1414,7 +1419,16 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	if len(text) > consoleTextCap {
 		return res, nil, fmt.Errorf("message is %d bytes; the console door takes at most %d", len(text), consoleTextCap)
 	}
+	if err := to.check(); err != nil {
+		return res, nil, err
+	}
 	settled, texts := turnFate(text)
+	if settled && to.Addressee != "" {
+		// A stop or a /session command is the conversation's, never a
+		// task for a profile: the gateway would act on it and drop the
+		// address without a word.
+		return res, nil, fmt.Errorf("%q is a command for the conversation, not a task; send it without addressee", strings.TrimSpace(text))
+	}
 	if settled {
 		res, err := b.sendSettled(ctx, convs, token, text)
 		return res, nil, err
@@ -1454,7 +1468,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	// From here the watch holds the lock, and closing it releases it.
 	var once sync.Once
 	w.release = func() { once.Do(unlock) }
-	if err := b.publishFrame(token, text); err != nil {
+	if err := b.publishFrame(token, text, to); err != nil {
 		w.close()
 		return res, nil, err
 	}
@@ -1618,7 +1632,7 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 		return res, err
 	}
 	defer w.close()
-	if err := b.publishFrame(token, text); err != nil {
+	if err := b.publishFrame(token, text, TurnAddress{}); err != nil {
 		return res, err
 	}
 	timeout := time.After(noticeGrace)
@@ -1637,12 +1651,12 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 	}
 }
 
-func (b *NATSBus) publishFrame(token, text string) error {
+func (b *NATSBus) publishFrame(token, text string, to TurnAddress) error {
 	id := make([]byte, messageIDBytes)
 	if _, err := rand.Read(id); err != nil {
 		return err
 	}
-	frame, _ := json.Marshal(ConsoleInFrame{MessageID: conversationTokenPrefix + "-" + hex.EncodeToString(id), Text: text})
+	frame, _ := json.Marshal(ConsoleInFrame{MessageID: conversationTokenPrefix + "-" + hex.EncodeToString(id), Text: text, TurnAddress: to})
 	return b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
 }
 
