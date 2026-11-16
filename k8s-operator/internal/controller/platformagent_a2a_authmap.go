@@ -96,8 +96,8 @@ const (
 	a2aAuthMapShardsAnnotation = "kubeagents.x-k8s.io/a2a-authmap-shards"
 
 	// a2aAuthMapComponent is the a2aLabels component every identity-map
-	// object carries, shard or legacy, which is how the prune and the
-	// teardown find them whatever their names (deleteA2AAuthMapObjects).
+	// object carries, shard or legacy, which is how the prune finds them
+	// whatever their names (deleteA2AAuthMapObjects).
 	a2aAuthMapComponent = "authmap"
 
 	// a2aAuthMapVersionLength is how much of the content digest becomes the

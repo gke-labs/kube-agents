@@ -826,16 +826,16 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;update;patch;delete,namespace=kubeagents-system
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
-// writes; no Role it renders grants the kind, and the built-in admin and edit
-// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// writes; no Role it renders grants a write on the kind (the dispatcher's Jobs
+// Role grants get, to read the template its config names), and the built-in
+// admin and edit roles don't aggregate it. `podtemplates` create only: the server-side dry
 // run that defaults a Job template (defaultedJobTemplate), which stores
 // nothing. The writes are namespaced like every other rendered kind's. The
 // reads stay cluster-wide, like every other kind's, for the teardown walk:
 // deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
-// deletion and every flip to today, before any check that the namespace or
-// a RoleBinding in it exists, and a Helm install in mode today binds the
-// Role in the install namespace only, so a namespaced read would be a 403
-// there (the API server authorises a namespaced list before it looks for
+// deletion, without checking that the namespace or a RoleBinding in it
+// exists, so a namespaced read would be a 403 wherever that RoleBinding is
+// absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
 // namespaced Role there in the same apply (the chart under mode next,
 // config/profiles under make deploy), which is what lets the namespaced
@@ -1099,7 +1099,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// It was at the bottom, under everything, which meant a reconcile that
 	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
 	// just after the bus step fixed two of those parks and left four: the
-	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// refusals at 9b, 9c, 10 and 11e all return above the bus
 	// step, and the bus step cannot move above them because it renders on top
 	// of what they withhold. There is no position in the sequence that works,
 	// so this is not a position in the sequence.

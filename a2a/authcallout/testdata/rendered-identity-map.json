@@ -1,5 +1,5 @@
 {
-  "version": "ebc80d1ecae36b93",
+  "version": "3ada5df58e0a974d",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -130,7 +130,8 @@
           "a2a.cap.reply.dispatcher.>",
           "_INBOX.dispatcher.>"
         ]
-      }
+      },
+      "narrowing": "dispatcher"
     }
   ]
 }

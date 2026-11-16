@@ -171,9 +171,13 @@ const (
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
 	// on every running next install, rolling the NATS pod and minting a new
-	// provision Job for the same image.
+	// provision Job for the same image. Pinned by exact version and the
+	// digest of its multi-arch OCI index, like the reloader and the exporter:
+	// a floating tag would let two installs a day apart run different servers.
+	// A bump changes this string, images.json and the docs table together,
+	// and rolls every running bus once.
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
-	defaultA2ANATSImage     = "nats:2.10-alpine"
+	defaultA2ANATSImage     = "nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
@@ -326,6 +330,18 @@ const (
 	// It is read the same way a2aStrictEventsWriter is: anything but an
 	// explicit "true" is off, so a typo leaves the door shut.
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
+
+	// a2aNATSDebugEnvVar turns on nats-server's debug logging on the bus, for
+	// CI only (#5708): hack/ci-deploy.sh sets it through operator.extraEnv, so
+	// a failing run's server logs carry the meta group's raft votes, terms and
+	// peer updates. It is never a CR field or a chart value, so an install
+	// can't turn it on by accident (only operator.extraEnv reaches it). Debug, never trace: trace logs protocol
+	// frames, payloads and CONNECT included, and CI logs are public. Debug
+	// names connections and the public keys they authenticated with, nothing
+	// secret. Anything but an explicit "true" is off. It reaches the operator
+	// only through the chart's operator.extraEnv, which takes any variable, so
+	// turning it on is a deliberate act.
+	a2aNATSDebugEnvVar = "A2A_NATS_DEBUG"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
 	// cluster view: session pods route kubectl through <agent>-kube-proxy
@@ -1455,6 +1471,18 @@ func a2aCardStop() string {
 	return "false"
 }
 
+// renderA2ANATSDebug is the bus's debug line, present only while the
+// operator's environment asks for it (a2aNATSDebugEnvVar).
+func renderA2ANATSDebug() string {
+	if os.Getenv(a2aNATSDebugEnvVar) != "true" {
+		return ""
+	}
+	return `# CI only (A2A_NATS_DEBUG on the operator): raft votes, terms and peer
+# updates in the log, for #5708. Debug, never trace.
+debug: true
+`
+}
+
 // a2aInjectBackendEnabled reports whether the operator was deployed with the
 // eval flag. Anything but an explicit "true" is off, for the reason
 // a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
@@ -2460,7 +2488,7 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # For the reloader in the same pod, which signals this PID when the mounted
 # config changes.
 pid_file: "` + a2aNATSPIDFile + `"
-` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
+` + renderA2ANATSDebug() + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -6790,8 +6818,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}
 		// Proactive posts land here (the chat.notify route). Unset leaves
 		// the route serving a kanban card's report back to its conversation
-		// only: proactive posts have nowhere to go, as on today with no home
-		// channel.
+		// only: proactive posts have nowhere to go.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
@@ -8824,13 +8851,6 @@ type a2aTeardownEntry struct {
 // shard at or past this pass's count.
 func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
 	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
-}
-
-// deleteA2AAuthMapShards removes every identity-map object, the unsharded
-// legacy one and every shard. Only tests call it since the flip-to-today
-// teardown went; CR deletion leaves the objects to their owner reference.
-func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
 }
 
 // deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns

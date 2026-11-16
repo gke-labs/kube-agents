@@ -649,6 +649,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
+			// A profile task's supervisor subject in its profile form
+			// (lib.ProfileSupervisorSubject, #5301): read only. The
+			// gateway's publish grant stays five-token, so it can never
+			// write one.
+			"a2a.tasks.p.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
@@ -1097,8 +1102,8 @@ func bridgeIdentity() a2aIdentity {
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit
 // records it as the artifact nobody owns — referenced by no chart, no kustomize
-// path, no Makefile target and no operator code, and it survives a flip to
-// today until someone deletes it by hand.
+// path, no Makefile target and no operator code, and it stays until someone
+// deletes it by hand.
 //
 // It keeps its password because it is APPLIED rather than rendered. It exists on
 // the demo install right now, so dropping its user from nats.conf would refuse

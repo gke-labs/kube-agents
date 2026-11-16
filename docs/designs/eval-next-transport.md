@@ -680,7 +680,9 @@ the TASKS budget counts its workers from the first `next` render, so the mode ch
 change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
 Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step waits for the
+step gates both rolls. On an operator that renders the A2A stack whatever the mode, both rolls
+come before the deploy's first web console check, which waits for the second (#5962), and these
+gates then pass at once. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
 console under `next` (the same read routes and chat turn the deploy gated under `today`, through
