@@ -89,6 +89,19 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
 
+# Google Cloud universe domain (`googleapis.com` in commercial GCP, or a
+# partner/sovereign domain such as Google Cloud Dedicated). Kept in this module
+# because `gke_cluster_reads.py` and the sandbox collectors import it from the
+# root-owned `/opt/vcs/libexec/platform` closure.
+DEFAULT_UNIVERSE_DOMAIN = "googleapis.com"
+GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+CLOUDSDK_UNIVERSE_DOMAIN_ENV = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+MAX_UNIVERSE_DOMAIN_LENGTH = 253
+_GOOGLE_API_SUFFIX = "." + DEFAULT_UNIVERSE_DOMAIN
+_UNIVERSE_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z"
+)
+
 # The exec tier's shared names, here for the same reason as the relay prefix:
 # the broker and the shim both spell them, and this is the module both import.
 # docs/designs/credential-broker-exec-tier.md §12 is the contract, and
@@ -270,11 +283,28 @@ GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 # Beside each kubeconfig the merge below checks, one line per context it found current or wrote:
-# `<context> <sha256 of the file> <sha256 of proxy URL, CA file and token file>`. The sandbox's
-# kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an exact line,
-# so any later edit to the file, or a new proxy URL, CA file or token file, runs the merge once more.
+# `<context> <sha256 of the file> <sha256 of record version, proxy URL, CA file and token file>`. The
+# sandbox's kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an
+# exact line, so any later edit to the file, or a new proxy URL, CA file or token file, runs the
+# merge once more.
 REGISTERED_MARKER_NAME = ".{name}.contexts-registered"
 REGISTERED_MARKER_ENV_SEPARATOR = "\n"
+# The record sits on a volume that outlives the image. Increase this, here and as RECORD_VERSION in
+# the wrapper's helper, when the merge changes what it accepts as a context's current entries: a
+# record from an older client then matches nothing, and the merge runs once more for that context.
+REGISTERED_MARKER_VERSION = "1"
+# The merge's lock beside a kubeconfig `<dir>/<name>`. sandbox-entrypoint removes the default
+# kubeconfig's at pod start (KUBECONFIG_LOCK_NAME in deploy/sandbox/entrypoint.sh).
+KUBECONFIG_LOCK_NAME = ".{name}.lock"
+KUBECONFIG_LOCK_MODE = 0o600
+# What the kubeconfig's owner is told when the lock cannot be opened. The merge needs the lock, so
+# the file is not read: a context that is missing from it stays missing, and kubectl then says the
+# context does not exist. The owner note is left out when the lock is not there to ask.
+KUBECONFIG_LOCK_UNOPENABLE_NOTICE = (
+    "credential proxy: cannot open the kubeconfig lock {lock}{owner}: {reason}; "
+    "context {context} was not checked or registered in {kubeconfig}"
+)
+KUBECONFIG_LOCK_OWNER_NOTE = " (owned by uid {uid})"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -335,6 +365,55 @@ _SHELL_CONTEXT_FILE = re.compile(r"^([0-9]+)-([0-9]+)\.context\Z")
 END_OF_FLAGS = "--"
 CONTEXT_FLAG = "--context"
 KUBECONFIG_FLAG = "--kubeconfig"
+
+
+def normalize_universe_domain(raw: str | None) -> str:
+    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return DEFAULT_UNIVERSE_DOMAIN
+    cleaned = trimmed.removesuffix(".").lower()
+    if (
+        not cleaned
+        or len(cleaned) > MAX_UNIVERSE_DOMAIN_LENGTH
+        or not _UNIVERSE_DOMAIN_RE.fullmatch(cleaned)
+    ):
+        raise ValueError(
+            f"universe domain {raw!r} must be a lowercase DNS domain with at least two labels"
+        )
+    return cleaned
+
+
+def google_universe_domain(environ=os.environ) -> str:
+    """Return the active Google Cloud universe domain from the process environment."""
+    for name in (GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+        raw = environ.get(name, "").strip()
+        if raw:
+            return normalize_universe_domain(raw)
+    return DEFAULT_UNIVERSE_DOMAIN
+
+
+def google_api_host(service: str, universe_domain: str | None = None) -> str:
+    """Return `<service>.<universe_domain>` for the active or explicit universe domain."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    return f"{service}.{domain}"
+
+
+def rewrite_google_api_host(host: str, universe_domain: str | None = None) -> str:
+    """Rewrite `<service>.googleapis.com` to `<service>.<universe_domain>` when custom."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    lowered = host.lower()
+    if domain != DEFAULT_UNIVERSE_DOMAIN and lowered.endswith(_GOOGLE_API_SUFFIX):
+        return lowered[: -len(_GOOGLE_API_SUFFIX)] + "." + domain
+    return host
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -1172,13 +1251,31 @@ def _record_registered_context(
     marker = path.with_name(REGISTERED_MARKER_NAME.format(name=path.name))
     file_digest = hashlib.sha256(content).hexdigest()
     env_digest = hashlib.sha256(
-        REGISTERED_MARKER_ENV_SEPARATOR.join((proxy_url, ca_file, token_file)).encode("utf-8")
+        REGISTERED_MARKER_ENV_SEPARATOR.join(
+            (REGISTERED_MARKER_VERSION, proxy_url, ca_file, token_file)
+        ).encode("utf-8")
     ).hexdigest()
     kept = []
     if marker.is_file() and not marker.is_symlink():
         kept = [line for line in marker.read_text(encoding="utf-8", errors="replace").splitlines()
                 if line.split(" ", 1)[0] != context]
     _replace_file(marker, "\n".join([*kept, f"{context} {file_digest} {env_digest}"]) + "\n")
+
+
+def _report_unopenable_lock(lock_path: Path, kubeconfig: Path, context: str, reason: OSError) -> None:
+    """Say that the kubeconfig's owner could not open its lock. Before the owner check came first
+    in the merge, a root `kubectl --context` left a lock the agent user could not open, and the
+    merge returned without a word."""
+    try:
+        owner = KUBECONFIG_LOCK_OWNER_NOTE.format(uid=lock_path.lstat().st_uid)
+    except OSError:
+        owner = ""
+    print(
+        KUBECONFIG_LOCK_UNOPENABLE_NOTICE.format(
+            lock=lock_path, owner=owner, reason=reason.strerror or reason, context=context, kubeconfig=kubeconfig
+        ),
+        file=sys.stderr,
+    )
 
 
 def _merge_context_into_kubeconfig_file(
@@ -1208,10 +1305,19 @@ def _merge_context_into_kubeconfig_file(
                 ),
             )
             return
-        lock_path = path.with_name(f".{path.name}.lock")
-        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        lock_fd = os.open(lock_path, lock_flags, 0o600)
+        # Only the kubeconfig's owner can change it (the check under the lock, below, says so
+        # again), so only the owner makes the lock: one that root made is one the owner cannot open.
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            return
     except OSError:
+        return
+    lock_path = path.with_name(KUBECONFIG_LOCK_NAME.format(name=path.name))
+    lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, lock_flags, KUBECONFIG_LOCK_MODE)
+    except OSError as exc:
+        _report_unopenable_lock(lock_path, path, context, exc)
         return
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -1659,7 +1765,9 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     with an HTML body. The body is read once and kept on the error, because
     the retry decision and the message printed after it both need it; a body
     that is not a JSON object counts as none. `exc.shim_dropped` says the
-    connection closed while the body was read.
+    connection closed while the body was read. The error is closed here, on
+    every way out: nothing reads the response again, and the status and the
+    headers stay on it.
     """
     exc.shim_dropped = False
     exc.shim_payload = None
@@ -1671,6 +1779,8 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         # The connection closed while the refusal's body was read.
         exc.shim_dropped = True
         return None
+    finally:
+        exc.close()
     exc.shim_payload = payload if isinstance(payload, dict) else None
     return exc.shim_payload
 
@@ -2000,7 +2110,6 @@ def execute(
                     report_throttled(exc.code, text, attempts_made)
                     return 1
                 report_retry(exc.code, text, attempts_made, delay)
-                exc.close()
                 sleep_fn(delay)
                 continue
             return _exec_refused(exc, payload)
@@ -2174,6 +2283,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
             # has no arm for and every consumer is built on it having one.
             raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
+        finally:
+            # The body is read, or lost: nothing reads the response again. The
+            # status stays on the error.
+            exc.close()
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
@@ -2244,7 +2357,8 @@ class ApiSession:
     def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        host = rewrite_google_api_host(parsed.netloc)
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{host}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed

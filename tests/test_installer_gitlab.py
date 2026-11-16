@@ -1042,6 +1042,19 @@ class GitLabThroughMainTest(unittest.TestCase):
         self.assertIn("starts with a host", out)
         self.assertNotIn("1. Checking Prerequisites", out)
 
+    def test_a_path_with_no_segment_is_refused_as_a_path(self):
+        # `/` and `.git` leave no segment once the trailing slash and the
+        # suffix are off. bash 3.2 reads the expansion of that empty array as an
+        # unbound variable under `set -u`; the refusal is the one any other
+        # malformed path gets.
+        for repo in ("/", ".git"):
+            with self.subTest(repo=repo):
+                proc = self._main("-y", "--image-tag=0.1.0", "--gitops-forge=gitlab", f"--gitops-repo={repo}")
+                out = proc.stdout + proc.stderr
+                self.assertNotIn("unbound variable", out)
+                self.assertIn("--gitops-repo must be the GitLab project's full path", out)
+                self.assertNotIn("1. Checking Prerequisites", out)
+
 
 class GitLabInstallEnvTest(unittest.TestCase):
     """The forge keys reach an install.env that already exists, and only from the file."""

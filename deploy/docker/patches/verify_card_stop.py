@@ -34,7 +34,9 @@ dispatcher's board does:
    subscribed to our thread directly is stopped; nor are the cards filed in a
    branch or by a delegate of the compressed session, nor another
    conversation's card; a done card is untouched and reported settled;
-5. a second call stops nothing;
+5. a second call at once answers with the first stop's result, marked
+   ``joined`` (the conversation's stop is single-flight, #5528), and one past
+   the join window stops nothing;
 6. a worker pid written onto a card after it was archived (the claim->spawn
    window in ``_set_worker_pid``) is killed and cleared by the late-pid sweep.
    If upstream has added a status guard there, the pid is never written and
@@ -384,8 +386,12 @@ try:
           json.dumps({k: body[k] for k in ("failed", "pending", "unresolved", "errors")}))
 
     print("card stop: the second stop")
+    joined = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": CONVERSATION})
+    check("a second call at once answers with the first stop's result",
+          joined.get("joined") is True and joined["stopped"] == body["stopped"], json.dumps(joined))
+    skv._card_stop_flights.clear()  # past the join window
     again = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": CONVERSATION})
-    check("a second call stops nothing", again["stopped"] == [] and again["rounds"] == 0, json.dumps(again))
+    check("a second call past the join window stops nothing", again["stopped"] == [] and again["rounds"] == 0, json.dumps(again))
 
     print("card stop: a worker spawned onto an archived card")
     late, late_child = fake_worker(fanned)

@@ -977,7 +977,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// server/stream.go answers any update that moves
 			// MaxConsumers with "stream configuration update can
 			// not change MaxConsumers", in 2.10 and 2.11 alike,
-			// and the operator pins the bus to nats:2.10-alpine.
+			// and the operator pins the bus to nats:2.10.29-alpine (by digest).
 			// An operator who followed it got an error and a
 			// stream no wider than before.
 			//

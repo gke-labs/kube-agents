@@ -88,8 +88,8 @@ def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = Non
     # The A2A component logs the collector ends with; their own suite is
     # tests/test_ci_a2a_component_logs.py.
     a2a_constants = re.findall(r"^readonly A2A_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
-    if len(a2a_constants) != 15:  # pragma: no cover
-        raise AssertionError(f"expected fifteen A2A_DIAG_ constants in {ENV_SCRIPT}, found {a2a_constants}")
+    if len(a2a_constants) != 16:  # pragma: no cover
+        raise AssertionError(f"expected sixteen A2A_DIAG_ constants in {ENV_SCRIPT}, found {a2a_constants}")
     constants += a2a_constants
     if restart_seconds is not None:
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]

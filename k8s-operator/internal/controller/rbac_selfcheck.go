@@ -247,9 +247,9 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	// dispatchjobtemplates: the dispatcher Job admission policy's params in
 	// the profile namespace, which the operator alone writes. The reads stay
-	// cluster-wide (no watch; the teardown lists the kind in a profile
-	// namespace that a mode-today install never binds the Role in), the
-	// writes are namespaced. podtemplates: create only, the dry run that
+	// cluster-wide (no watch; the teardown lists the kind in the profile
+	// namespace without checking that the Role is bound there), the writes
+	// are namespaced. podtemplates: create only, the dry run that
 	// defaults them.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
