@@ -22,8 +22,6 @@ spec:
   profileRef:
     name: fleet-audit # must allow the unattended tier
   prompt: Run the daily compliance audit.
-  parameters:
-    stream: compliance-audit
   delivery:
     mode: chat # or local
     silentWhenClean: true
@@ -32,6 +30,8 @@ spec:
 - `schedule` is a standard 5-field cron expression, read in UTC, as a Kubernetes `CronJob` reads it. It takes no time zone prefix.
 - `profileRef` names an `AgentProfile` in the same namespace whose `allowedTiers` includes `unattended`. A schedule whose profile is missing or doesn't allow it reads `Accepted=False` and never fires.
 - `concurrencyPolicy` is `Forbid`, the only value: a slot that comes due while the last run is still going is skipped and counted in `status.skipCounts.alreadyRunning`.
+- `parameters` (at most 16) go to each run as task parameters. A built-in schedule's report stream is its own name, carried on its trigger, never a parameter.
+- `delivery.jobKey` groups a schedule's posts into one thread per UTC day. It's a DNS-1123 label, defaulting to the schedule's name with dots turned into hyphens.
 - `startingDeadlineSeconds` (default 900) is how late a slot may still start. After an outage, one late slot runs if it is still inside the deadline, and the rest are counted once in `status.skipCounts.missedWindow`.
 - `activeDeadlineSeconds` bounds a run, defaulting to the profile's `lifecycle.activeDeadlineSeconds`, the ceiling its Job runs under. A run that reports no end within it plus five minutes is recorded `Lost`, and the schedule moves on.
 - `suspend: true` skips every slot. A slot that passes while suspended is counted, not run later. A `run-now` still runs: it is an explicit request.

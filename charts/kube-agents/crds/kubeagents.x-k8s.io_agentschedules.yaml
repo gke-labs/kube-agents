@@ -87,9 +87,11 @@ spec:
                   properties:
                     jobKey:
                       description: |-
-                        JobKey groups a schedule's posts into one thread per UTC day. It
-                        defaults to the schedule's name.
+                        JobKey groups a schedule's posts into one thread per UTC day. It keys
+                        stored reports, so it is a DNS-1123 label. It defaults to the
+                        schedule's name folded into one (dots become hyphens, cut to 63).
                       maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     mode:
                       default: chat
@@ -116,9 +118,10 @@ spec:
                   additionalProperties:
                     type: string
                   description: |-
-                    Parameters are passed to each run as task parameters. `stream` names
-                    the run's audit report stream.
-                  maxProperties: 32
+                    Parameters are passed to each run as task parameters, at most 16, the
+                    bound every task submission has. A built-in schedule's report stream
+                    is its own name, carried on its trigger, not a parameter.
+                  maxProperties: 16
                   type: object
                 profileRef:
                   description: |-

@@ -79,9 +79,11 @@ type AgentScheduleDelivery struct {
 	// +optional
 	SilentWhenClean bool `json:"silentWhenClean,omitempty"`
 
-	// JobKey groups a schedule's posts into one thread per UTC day. It
-	// defaults to the schedule's name.
+	// JobKey groups a schedule's posts into one thread per UTC day. It keys
+	// stored reports, so it is a DNS-1123 label. It defaults to the
+	// schedule's name folded into one (dots become hyphens, cut to 63).
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	JobKey string `json:"jobKey,omitempty"`
 }
@@ -112,9 +114,10 @@ type AgentScheduleSpec struct {
 	// +required
 	Prompt string `json:"prompt"`
 
-	// Parameters are passed to each run as task parameters. `stream` names
-	// the run's audit report stream.
-	// +kubebuilder:validation:MaxProperties=32
+	// Parameters are passed to each run as task parameters, at most 16, the
+	// bound every task submission has. A built-in schedule's report stream
+	// is its own name, carried on its trigger, not a parameter.
+	// +kubebuilder:validation:MaxProperties=16
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
