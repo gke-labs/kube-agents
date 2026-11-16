@@ -2445,6 +2445,46 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   exit 1
 fi
 
+# The gateway's second roll on a fresh install (#5962). The operator adds the
+# bridge sidecar to the agent pod only once it has recorded the bus
+# provisioned (a2aBridgeInPod), a reconcile or two after the provisioning
+# Job, so the rollout above can pass on the first ReplicaSet and the gateway
+# then restarts under whatever check runs next (the web console's, below).
+# Wait for the template to carry the bridge, then for that rollout, as step
+# 6b does for the mode upgrade. Not a gate: an operator that renders no
+# bridge (one before the A2A stack always rendered) never adds it, and that
+# is not this deploy's failure, so the wait is skipped (no callout
+# Deployment) or ends, and the deploy carries on.
+# Once the operator renders the bridge from the first pass, the template
+# already carries it and this costs one read.
+BRIDGE_ROLL_START=$SECONDS
+bridge_in_template=false
+bridge_polls="${MODE_NEXT_GENERATION_ATTEMPTS}"
+# No callout Deployment means this operator rendered no A2A stack, and so no
+# bridge: skip the wait rather than spend its whole budget.
+kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -n "${NAMESPACE}" >/dev/null 2>&1 || bridge_polls=0
+for ((poll = 0; poll < bridge_polls; poll++)); do
+  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
+    *" ${BRIDGE_SIDECAR_NAME} "*)
+      bridge_in_template=true
+      break
+      ;;
+  esac
+  sleep "${MODE_NEXT_POLL_SECONDS}"
+done
+if [ "${bridge_in_template}" = true ]; then
+  if ! kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout=600s; then
+    echo "ERROR: ${AGENT_DEPLOYMENT_NAME} rollout with the ${BRIDGE_SIDECAR_NAME} sidecar failed"
+    kubectl describe "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" || true
+    kubectl get pods -n "${NAMESPACE}" || true
+    kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
+    exit 1
+  fi
+  echo "✓ ${AGENT_DEPLOYMENT_NAME} rolled out with the ${BRIDGE_SIDECAR_NAME} sidecar ($((SECONDS - BRIDGE_ROLL_START))s after the first rollout)"
+else
+  echo "${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} sidecar after $((SECONDS - BRIDGE_ROLL_START))s; this operator renders none, so there is no second roll to wait for"
+fi
+
 # The shell sandbox is the other half of the agent: everything the model runs
 # executes there over ssh, so a gateway that is Ready against a StatefulSet
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
