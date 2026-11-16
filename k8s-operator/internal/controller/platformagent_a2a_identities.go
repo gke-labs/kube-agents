@@ -553,6 +553,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// One hashed key per chat person (a2a/gateway/people.go), the
 		// bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
 		"$KV.people.>",
+		// A schedule trigger's finished runs (a2a/gateway/scheduled_reports.go),
+		// the bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.SCHEDULED_REPORTS.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
@@ -613,7 +616,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
 			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
 			"KV_session-state, its own registry, on KV_feedback, the kept\n" +
-			"answer ratings, and on KV_people, one hashed key per chat person.\n" +
+			"answer ratings, and on KV_people, one hashed key per chat person;\n" +
+			"INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs.\n" +
 			"So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
@@ -721,8 +725,8 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// a2aJetStreamSurfaceRationale above: $JS.API.> would let this
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
-		// stream on the bus. It provisions - it creates the five streams
-		// and six buckets, idempotently, with an info-then-add - so it
+		// stream on the bus. It provisions - it creates the six streams
+		// and seven buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -761,6 +765,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
 			"$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+			"$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -773,6 +778,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
+			"$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
 			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
 			// consumer add asks for them: INFO, then CREATE with the filter
 			// token for one filter and without it for two. CREATE is

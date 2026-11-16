@@ -2963,7 +2963,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "6968d99c141e670f",
+      "version": "8b554d7cb19a5f30",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2992,6 +2992,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3004,6 +3005,7 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3104,7 +3106,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 6968d99c141e670f
+    kubeagents.x-k8s.io/a2a-authmap-version: 8b554d7cb19a5f30
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3697,7 +3699,8 @@ stringData:
           # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
+          # answer ratings, and on KV_people, one hashed key per chat person;
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3717,6 +3720,7 @@ stringData:
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
+                  "$KV.SCHEDULED_REPORTS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
@@ -3738,6 +3742,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -3834,6 +3840,8 @@ stringData:
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
                   "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -5571,7 +5579,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-26fb2759
+  name: platformagent-a2a-provision-132a7280
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5805,57 +5813,68 @@ spec:
               so a restarted one can still read\n# every lease it has to re-adopt or fail.\n$NATS
               kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1
               --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=67108864\n\n#
-              PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>),
-              published by the gateway and\n# held by the dispatcher on the operator's
-              durables (contract on #3655). It is\n# its own stream so that the operator
-              is the only principal with a consumer\n# verb on it: on TASKS, anything
-              that can create consumers could pull a\n# profile's queue or rewrite its
-              durable. Follow-ups and events stay on TASKS.\n# max-consumers is the durables'
-              allowance, two per allowed tier for 16\n# profiles; nothing else makes a
-              consumer here.\n$NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS
-              stream add PROFILE_SUBMITS --allow-direct \\\n  --subjects='a2a.submit.>'
-              --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=1073741824
-              --discard=old --replicas=\"${STREAM_REPLICAS}\" \\\n  --max-msgs-per-subject=1
-              --dupe-window=2m \\\n  --max-consumers=64 --defaults\n\n# DISPATCH_STOPS:
-              the gateway's stop records for AgentProfile tasks, one per\n# task (a2a.stop.<profile>.<task>),
-              read by the dispatcher by subject (contract\n# addendum 9). It is outside
-              a2a.dispatch. on purpose: the dispatcher publishes\n# there, and a stop
-              must have one writer, the gateway (granted with #4127). A\n# record outlives
-              any task (24h against the 6h deadline cap). Nothing makes a\n# consumer
-              here; --max-consumers=1 is the tightest cap JetStream has, since 0\n# means
-              unlimited.\n$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream
-              add DISPATCH_STOPS --allow-direct \\\n  --subjects='a2a.stop.>' --storage=file
-              --retention=limits \\\n  --max-age=24h --max-bytes=67108864 --discard=old
-              --replicas=\"${STREAM_REPLICAS}\" \\\n  --max-msgs-per-subject=1 --max-consumers=1
-              --defaults\n\n# TASKS older than this render: the limits the create above
-              could not apply.\n#\n# Provisioning is create-only convergence - the info-then-add
-              guards never\n# edit an existing stream, which buildA2AProvisionJob says
-              in terms - so an\n# install whose TASKS predates a limit keeps the stream
-              it was created with\n# and gains nothing from a re-run. Both limits this
-              render puts on TASKS are\n# in exactly that position on every install that
-              already has the stream, and\n# the two gaps are not the same kind:\n#\n#
-              \  max_consumers short is a capacity shortfall with a load-time failure\n#
-              \  attached. A legitimate session's consumer create is refused, surfaced
-              as\n#   a task failure, with nothing in it pointing at the stream. Worth\n#
-              \  refusing over here, where the number that caused it is in hand.\n#\n#
-              \  max_msgs_per_subject absent is a missing bound, not a broken one: the\n#
-              \  install behaves exactly as it did before this render carried the flag.\n#
-              \  Applying it would be a TIGHTENING, and a tightening evicts: a\n#   stream
-              edit that lowers max_msgs_per_subject drops every message over\n#   the
-              new limit on every subject the moment it lands. Truncating a running\n#
-              \  install's task history as an automatic side effect of an operator\n#
-              \  upgrade is not a decision this script takes on an operator's behalf.
-              It\n#   reports, names the edit and what the edit costs, and moves on.\n#\n#
-              This runs LAST, after every other stream and bucket, so the refusal below\n#
-              leaves a fully provisioned bus short one limit rather than a bus missing\n#
-              DIRECTORY, the topic streams and the KV buckets. The refusal is reached
-              on\n# an operator upgrade alone, with no CR edit involved - an install already\n#
-              running maxSessions above what its stream holds has been under-provisioned\n#
-              the whole time, and this is the first thing that says so.\n#\n# Parsed with
-              grep rather than jq: nats-box is the image, and grep is in\n# busybox for
-              certain. An unparseable answer FAILS - a check that silently\n# skips when
-              its extractor stops matching is not a check.\ntasks_json=\"$($NATS stream
-              info TASKS --json | tr -d ' \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf
+              SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
+              report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
+              gateway, before any post, so a run is on record whether it posts or not.\n#
+              History 1: each record moves through its statuses in place, and only the\n#
+              last is read. It is the durable record later readers enumerate, so the max\n#
+              age is long, 90 days, rather than none: KV is discard=new, and a bucket
+              with\n# no age would fill and refuse every later run's record, which posts
+              nothing.\n# 256MiB holds about ten thousand reports at 25KB.\n$NATS kv info
+              SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1
+              --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=268435456
+              --ttl=2160h\n\n# PROFILE_SUBMITS: new tasks for AgentProfiles, one subject
+              per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the
+              gateway and\n# held by the dispatcher on the operator's durables (contract
+              on #3655). It is\n# its own stream so that the operator is the only principal
+              with a consumer\n# verb on it: on TASKS, anything that can create consumers
+              could pull a\n# profile's queue or rewrite its durable. Follow-ups and events
+              stay on TASKS.\n# max-consumers is the durables' allowance, two per allowed
+              tier for 16\n# profiles; nothing else makes a consumer here.\n$NATS stream
+              info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS
+              --allow-direct \\\n  --subjects='a2a.submit.>' --storage=file --retention=limits
+              \\\n  --max-age=72h --max-bytes=1073741824 --discard=old --replicas=\"${STREAM_REPLICAS}\"
+              \\\n  --max-msgs-per-subject=1 --dupe-window=2m \\\n  --max-consumers=64
+              --defaults\n\n# DISPATCH_STOPS: the gateway's stop records for AgentProfile
+              tasks, one per\n# task (a2a.stop.<profile>.<task>), read by the dispatcher
+              by subject (contract\n# addendum 9). It is outside a2a.dispatch. on purpose:
+              the dispatcher publishes\n# there, and a stop must have one writer, the
+              gateway (granted with #4127). A\n# record outlives any task (24h against
+              the 6h deadline cap). Nothing makes a\n# consumer here; --max-consumers=1
+              is the tightest cap JetStream has, since 0\n# means unlimited.\n$NATS stream
+              info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct
+              \\\n  --subjects='a2a.stop.>' --storage=file --retention=limits \\\n  --max-age=24h
+              --max-bytes=67108864 --discard=old --replicas=\"${STREAM_REPLICAS}\" \\\n
+              \ --max-msgs-per-subject=1 --max-consumers=1 --defaults\n\n# TASKS older
+              than this render: the limits the create above could not apply.\n#\n# Provisioning
+              is create-only convergence - the info-then-add guards never\n# edit an existing
+              stream, which buildA2AProvisionJob says in terms - so an\n# install whose
+              TASKS predates a limit keeps the stream it was created with\n# and gains
+              nothing from a re-run. Both limits this render puts on TASKS are\n# in exactly
+              that position on every install that already has the stream, and\n# the two
+              gaps are not the same kind:\n#\n#   max_consumers short is a capacity shortfall
+              with a load-time failure\n#   attached. A legitimate session's consumer
+              create is refused, surfaced as\n#   a task failure, with nothing in it pointing
+              at the stream. Worth\n#   refusing over here, where the number that caused
+              it is in hand.\n#\n#   max_msgs_per_subject absent is a missing bound, not
+              a broken one: the\n#   install behaves exactly as it did before this render
+              carried the flag.\n#   Applying it would be a TIGHTENING, and a tightening
+              evicts: a\n#   stream edit that lowers max_msgs_per_subject drops every
+              message over\n#   the new limit on every subject the moment it lands. Truncating
+              a running\n#   install's task history as an automatic side effect of an
+              operator\n#   upgrade is not a decision this script takes on an operator's
+              behalf. It\n#   reports, names the edit and what the edit costs, and moves
+              on.\n#\n# This runs LAST, after every other stream and bucket, so the refusal
+              below\n# leaves a fully provisioned bus short one limit rather than a bus
+              missing\n# DIRECTORY, the topic streams and the KV buckets. The refusal
+              is reached on\n# an operator upgrade alone, with no CR edit involved - an
+              install already\n# running maxSessions above what its stream holds has been
+              under-provisioned\n# the whole time, and this is the first thing that says
+              so.\n#\n# Parsed with grep rather than jq: nats-box is the image, and grep
+              is in\n# busybox for certain. An unparseable answer FAILS - a check that
+              silently\n# skips when its extractor stops matching is not a check.\ntasks_json=\"$($NATS
+              stream info TASKS --json | tr -d ' \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf
               '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ];
               then\n  echo \"could not read max_msgs_per_subject off the TASKS stream;

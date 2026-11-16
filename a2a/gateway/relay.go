@@ -325,12 +325,17 @@ func (g *Gateway) retryAck(item relayItem) {
 // requeueDelay, for a try that may succeed then; an item that didn't come
 // off the durable is requeued in memory instead.
 func (g *Gateway) giveBackLater(item relayItem) {
+	g.giveBackAfter(item, requeueDelay)
+}
+
+// giveBackAfter is giveBackLater with its own delay.
+func (g *Gateway) giveBackAfter(item relayItem, delay time.Duration) {
 	if item.d == nil {
 		sessionKey := g.sessionForTask(g.runCtx, item.env.TaskID)
 		go func() {
 			select {
 			case <-g.runCtx.Done():
-			case <-time.After(requeueDelay):
+			case <-time.After(delay):
 				if sessionKey != "" {
 					g.events.enqueue(sessionKey, item)
 				}
@@ -342,7 +347,7 @@ func (g *Gateway) giveBackLater(item relayItem) {
 		// Stopping: the subscription's stop gives it back in stream order.
 		return
 	}
-	if err := item.d.Nak(requeueDelay); err != nil {
+	if err := item.d.Nak(delay); err != nil {
 		g.log.Warn("relay: give-back failed", "taskId", item.env.TaskID, "err", err)
 	}
 }
@@ -556,6 +561,11 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		}
 		fresh = append(fresh, item)
 	}
+	// Terminals handed back for another try (relayTerminal's redeliver):
+	// not marked relayed, and given back rather than acked once the record
+	// is written.
+	var retry []relayItem
+	rendered := fresh[:0:0]
 	for i, item := range fresh {
 		if g.relayInFlight.abandoned() {
 			// The stop's wait ran out on this batch: its deliveries have been
@@ -566,8 +576,12 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
 			return
 		}
-		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
+		if g.applyEvent(ctx, rec, item, i == len(fresh)-1) {
+			retry = append(retry, item)
+			continue
+		}
 		rec.markRelayed(item.env.TaskID, item.sequence())
+		rendered = append(rendered, item)
 	}
 	if g.relayInFlight.abandoned() {
 		g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", len(fresh), "events", len(fresh))
@@ -593,30 +607,40 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	}
 	// Rendered, so acked whatever the write did: the posts are out, and a
 	// redelivery would make them again.
-	for _, item := range fresh {
+	for _, item := range rendered {
 		g.settle(item)
 	}
 	for _, item := range dupes {
+		if slices.ContainsFunc(retry, func(r relayItem) bool { return r.sequence() == item.sequence() }) {
+			// Its original goes back for another try: acked, this copy
+			// would take the message's pending entry with it.
+			g.giveBackAfter(item, g.scheduledRetry)
+			continue
+		}
 		g.settle(item)
+	}
+	for _, item := range retry {
+		g.giveBackAfter(item, g.scheduledRetry)
 	}
 }
 
 // applyEvent folds one event into the render state. render gates only the
-// rolling-line edit; posts always happen.
-func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
+// rolling-line edit; posts always happen. It reports true for a terminal the
+// relay should hand back for another try (relayTerminal).
+func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) (redeliver bool) {
 	env := item.env
 	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
-		return
+		return false
 	}
 	rs := g.relayFor(env.TaskID)
 	// The card-stop control is not a turn and renders as none (cardstop.go).
 	if rec.CardStop != nil && rec.CardStop.TaskID == env.TaskID {
 		g.applyCardStopEvent(ctx, rec, rs, item)
-		return
+		return false
 	}
 	if slices.Contains(rec.RetiredCardStops, env.TaskID) {
 		g.retireTaskRoute(ctx, env.TaskID)
-		return
+		return false
 	}
 
 	switch env.Kind {
@@ -624,24 +648,29 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 		var s lib.StatusUpdate
 		if err := json.Unmarshal(env.Payload, &s); err != nil {
 			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
-			return
+			return false
 		}
-		g.applyStatus(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject), render)
+		try := terminalTry{redeliverable: true}
+		if item.d != nil {
+			try.delivery = item.d.NumDelivered()
+		}
+		return g.applyStatus(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject), render, try)
 	case lib.KindArtifactUpdate:
 		var a lib.ArtifactUpdate
 		if err := json.Unmarshal(env.Payload, &a); err != nil {
 			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
-			return
+			return false
 		}
 		g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, render)
 	}
+	return false
 }
 
-func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource, render bool) {
+func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource, render bool, try terminalTry) (redeliver bool) {
 	rs.state = s.Status.State
 	switch {
 	case s.Final:
-		g.relayTerminal(ctx, rec, rs, taskID, s, source)
+		return g.relayTerminal(ctx, rec, rs, taskID, s, source, try)
 	case s.Status.State == lib.StateInputRequired:
 		ask := ""
 		var question chatmsg.Reading
@@ -670,6 +699,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 			g.updateRollingLine(rec, taskID, rs)
 		}
 	}
+	return false
 }
 
 func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *relayState, subject, taskID string, a lib.ArtifactUpdate, render bool) {
@@ -801,7 +831,14 @@ func reasonInPlainWords(reason string) (string, bool) {
 // session's serialization, and retires the task's index — the stream is
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
-func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
+//
+// On a schedule trigger's conversation, a top-level task's end is recorded
+// in SCHEDULED_REPORTS and delivered per the conversation's Delivery
+// (deliverScheduledReport). It reports true when that delivery wants another
+// try: the terminal then ends right there, its route and the record's active
+// task left as they were, and the relay hands its delivery back (try says
+// whether it can), so the redelivered terminal runs this again.
+func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource, try terminalTry) (redeliver bool) {
 	// A turn answer still assembling posts before the deliverable it led to.
 	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
@@ -884,6 +921,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// reason on its entry (handOffEnd, read by observeDelivered and
 	// observeEnded below and by the read route).
 	g.settleHandOff(rec, taskID, evidence)
+
+	// A schedule trigger's run, recorded before anything else of its end:
+	// nothing else is posted to the trigger's conversation (unpostableTrigger).
+	if isScheduleConversation(rec.Key) && ref.Role != taskRoleChild {
+		if g.deliverScheduledReport(ctx, rec, ref, taskID, s, result, try) {
+			return true
+		}
+	}
 
 	// The terminal's chat message is its mark alone, with no fallback; a
 	// terminal without one takes the default (applyTerminalMark), drawn below
@@ -1108,6 +1153,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}
+	return false
 }
 
 // applySteerNotice reads the executor's word on one follow-up. Queued posts

@@ -123,7 +123,10 @@ const (
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
 	a2aPeopleBucket        = "people"
-	a2aKVStreamPrefix      = "KV_"
+	// a2aScheduledReportsBucket is lib.ScheduledReportsBucket: a schedule
+	// trigger's finished runs, written by the gateway alone.
+	a2aScheduledReportsBucket = "SCHEDULED_REPORTS"
+	a2aKVStreamPrefix         = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
 	// under a2aProfileSubmitPrefix (lib.ProfileSubmitStream and
@@ -1909,7 +1912,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS", "KV_SCHEDULED_REPORTS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2180,6 +2183,13 @@ func a2aAgentJetStreamGrants() []string {
 //     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
 //     Delete are publishes on $KV.people.>.
 //
+//   - KV_SCHEDULED_REPORTS, a schedule trigger's finished runs
+//     (a2a/gateway/scheduled_reports.go): STREAM.INFO to bind it and
+//     DIRECT.GET for the run's record, read back before each write so a
+//     redelivered terminal never posts twice. No consumer verb: the gateway
+//     lists no keys. Create and Update are publishes on
+//     $KV.SCHEDULED_REPORTS.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -2262,6 +2272,7 @@ func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
+	kvScheduledReports := a2aKVStreamPrefix + a2aScheduledReportsBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -2282,6 +2293,8 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
+		"$JS.API.STREAM.INFO." + kvScheduledReports,
+		"$JS.API.DIRECT.GET." + kvScheduledReports + ".>",
 	}
 }
 
@@ -3910,6 +3923,17 @@ $NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 -
 # dispatcher reads expiry from each record, so a restarted one can still read
 # every lease it has to re-adopt or fail.
 $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=67108864
+
+# SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the
+# report and whether and where it was posted (a2a/gateway/scheduled_reports.go;
+# docs/designs/scheduling-on-profiles.md section 4). Written only by the
+# gateway, before any post, so a run is on record whether it posts or not.
+# History 1: each record moves through its statuses in place, and only the
+# last is read. It is the durable record later readers enumerate, so the max
+# age is long, 90 days, rather than none: KV is discard=new, and a bucket with
+# no age would fill and refuse every later run's record, which posts nothing.
+# 256MiB holds about ten thousand reports at 25KB.
+$NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456 --ttl=2160h
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and

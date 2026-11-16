@@ -234,6 +234,15 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// homeReporters post a schedule trigger's report to the install's home
+	// channel (scheduled_reports.go), the chat.notify routes of this term
+	// (SetHomeReporters); guarded by homeReportersMu.
+	homeReportersMu sync.Mutex
+	homeReporters   []homeReporter
+	// scheduledRetry is how long a terminal whose scheduled report failed
+	// to post waits before it is redelivered: scheduledPostRetryDelay, per
+	// gateway so a test can shorten it on its own.
+	scheduledRetry time.Duration
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -608,6 +617,7 @@ func New(o Options) (*Gateway, error) {
 		peopleKeyer:      peopleKeys,
 		peoplePurgeRetry: peopleRetryInterval,
 		feedbackRetry:    feedbackRetryInterval,
+		scheduledRetry:   scheduledPostRetryDelay,
 		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,
@@ -2088,7 +2098,9 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
-	g.relayTerminal(ctx, rec, rs, taskID, status, source)
+	// The heal has no delivery to hand back: a scheduled report's failed post
+	// is its last (terminalTry zero).
+	g.relayTerminal(ctx, rec, rs, taskID, status, source, terminalTry{})
 }
 
 // runFoldedDelegate runs the delegate request a task's fold carries, if any,

@@ -323,8 +323,9 @@ func triggerConversationKey(source string, s lib.ScheduleRef) string {
 
 // unpostableTrigger reports whether conversation is a trigger's own, which
 // no chat backend owns: the relay posts nothing there (a backend handed the
-// key would refuse it, or worse, read it as one of its own). Where an
-// unattended result goes is Track 3's (#5618), from the record's Delivery.
+// key would refuse it, or worse, read it as one of its own). A schedule's
+// result goes to the home channel, or nowhere, by the record's Delivery
+// (deliverScheduledReport, from relayTerminal).
 func (g *Gateway) unpostableTrigger(conversation string) bool {
 	if !strings.HasPrefix(conversation, triggerConversationPrefix) {
 		return false

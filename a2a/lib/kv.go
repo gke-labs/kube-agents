@@ -23,6 +23,16 @@ const FeedbackBucket = "feedback"
 // is the only reader and writer; provision and seed list its keys).
 const PeopleBucket = "people"
 
+// ScheduledReportsBucket is the KV bucket holding one record per finished
+// unattended run on a schedule trigger: the report, whether it was posted,
+// and where (docs/designs/scheduling-on-profiles.md section 4). Provisioned by
+// the deployment with a long max age (90 days): it is the durable record a
+// later reader (the console's #scheduled channel, onboarding) enumerates, and
+// the age keeps a bucket that refuses new writes when full (KV is
+// discard=new) from filling and stalling every later run. The gateway's user
+// is the only writer.
+const ScheduledReportsBucket = "SCHEDULED_REPORTS"
+
 // KV returns a handle to the named KV bucket on the client's current
 // connection. Handles bind to that connection and do not survive a terminal
 // rebuild (NR-2), so callers fetch one per operation rather than caching it;
