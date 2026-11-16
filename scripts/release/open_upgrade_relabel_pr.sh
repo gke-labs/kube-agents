@@ -33,8 +33,9 @@ readonly BASE_BRANCH="main"
 readonly RELABEL_BRANCH="relabel-upgrade-table/pending"
 # The version CI's prettier check pins (.github/workflows/prettier.yml).
 readonly PRETTIER_VERSION="3.9.6"
-readonly GIT_USER_NAME="kube-agents release bot"
-readonly GIT_USER_EMAIL="${GIT_USER_EMAIL:-kube-agents-release-bot@users.noreply.github.com}"
+# Bot user ID 324943056 for kube-agents-release-bot[bot] so GitHub links commits to the App.
+readonly GIT_USER_NAME="${GIT_USER_NAME:-kube-agents-release-bot[bot]}"
+readonly GIT_USER_EMAIL="${GIT_USER_EMAIL:-324943056+kube-agents-release-bot[bot]@users.noreply.github.com}"
 
 cd "${REPO_ROOT}"
 
@@ -62,7 +63,12 @@ commit_message="docs(upgrade): relabel the pending rows ${releases} shipped"
 pr_title="docs(upgrade): relabel the pending rows ${releases} shipped, fixing main's Documentation Checks"
 
 git switch -C "${RELABEL_BRANCH}"
-git -c user.name="${GIT_USER_NAME}" -c user.email="${GIT_USER_EMAIL}" commit --quiet -m "${commit_message}" -- "${UPGRADE_PAGE}"
+# Set GIT_AUTHOR_*/GIT_COMMITTER_* inline so caller env and author.*/committer.* git config cannot override.
+GIT_AUTHOR_NAME="${GIT_USER_NAME}" \
+  GIT_AUTHOR_EMAIL="${GIT_USER_EMAIL}" \
+  GIT_COMMITTER_NAME="${GIT_USER_NAME}" \
+  GIT_COMMITTER_EMAIL="${GIT_USER_EMAIL}" \
+  git commit --quiet -m "${commit_message}" -- "${UPGRADE_PAGE}"
 # The branch is this script's own, named for the release, so a re-run replaces it. The checkout keeps no
 # credentials (persist-credentials: false); the token is handed to this one push as a header.
 push_auth=()
