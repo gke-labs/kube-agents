@@ -113,9 +113,9 @@ _SEPARATOR_RE = re.compile(re.escape(STORE_PATH_SEPARATOR), re.IGNORECASE)
 # (auditReportStoreAudience in k8s-operator).
 AUDIENCE = "kubeagents-audit-report-store"
 # The two caller checks the operator renders (auditReportStoreSidecarEnv),
-# both names reserved there in every mode so spec.deployment.env cannot set
-# them: the broker's ServiceAccount as a subject, and the name prefix of the
-# broker Deployment's pods. The broker's ServiceAccount is shared with other
+# both names reserved there so spec.deployment.env cannot set them: the
+# broker's ServiceAccount as a subject, and the name prefix of the broker
+# Deployment's pods. The broker's ServiceAccount is shared with other
 # pods (the exec tier among them), so the subject alone is not the broker.
 ALLOWED_SUBJECT_ENV = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
 ALLOWED_POD_PREFIX_ENV = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"

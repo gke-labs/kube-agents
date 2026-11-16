@@ -1535,6 +1535,8 @@ spec:
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/kubeagents/audit-report-store/token
+            - name: CREDENTIAL_PROXY_REPORT_PROFILES
+              value: fleet-audit,platform
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy

@@ -2827,13 +2827,13 @@ def report_credential_permits(method: str, path: str) -> bool:
 # principal with no role (NullAuthenticator behind a Unix socket, or a broker
 # with no audience split) is refused here: it is no identity this can name.
 
-# The operator renders it under next, reserved against spec.deployment.env
+# The operator renders it on every install, reserved against spec.deployment.env
 # (audit_report_store.go): the AgentProfiles whose tasks may use the store,
 # comma-separated. Empty or unset: no profile task reads or writes.
 REPORT_PROFILES_ENV = "CREDENTIAL_PROXY_REPORT_PROFILES"
 # Where the store listener is, and the projected token the broker presents to
-# it (audit_report_store.go, auditReportStoreBrokerEnv). Both rendered under
-# next only and reserved in every mode; either unset means no store.
+# it (audit_report_store.go, auditReportStoreBrokerEnv). Both rendered on
+# every install and reserved; either unset means no store.
 AUDIT_REPORT_STORE_URL_ENV = "AUDIT_REPORT_STORE_URL"
 AUDIT_REPORT_STORE_TOKEN_FILE_ENV = "AUDIT_REPORT_STORE_TOKEN_FILE"  # noqa: S105 - an env name
 # One envelope, the listener's cap (audit_report_store.REPORT_MAX_BYTES): a
@@ -3196,7 +3196,7 @@ class ReportStoreRelay:
 
 
 def report_store_from_env(role: str) -> ReportStoreRelay | None:
-    """The store relay the environment configures, or None: today, an exec pod, or unset."""
+    """The store relay the environment configures, or None: an exec pod, or unset."""
     if role == EXEC_ROLE:
         return None
     url = os.environ.get(AUDIT_REPORT_STORE_URL_ENV, "").strip()
@@ -13831,8 +13831,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # caller with no task, so local-only commands only.
     profile_gate: ProfileTaskGate | None = None
     # The audit-report store's relay (#5619), set by serve() from
-    # AUDIT_REPORT_STORE_URL and AUDIT_REPORT_STORE_TOKEN_FILE; None (today, an
-    # exec pod, a test that has not set it) answers the store routes 503.
+    # AUDIT_REPORT_STORE_URL and AUDIT_REPORT_STORE_TOKEN_FILE; None (an exec
+    # pod, an operator that predates the store, a test that has not set it) answers the store routes 503.
     report_store: ReportStoreRelay | None = None
     # REPORT_PROFILES_ENV, set by serve(): the profiles whose tasks use the
     # store. Empty: no profile task reads or writes it.
@@ -17390,7 +17390,8 @@ def serve(args: argparse.Namespace) -> None:
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
     CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
-    # The audit-report store (#5619): unset outside next, and on an exec pod.
+    # The audit-report store (#5619): unset on an exec pod, or under an operator
+    # that predates it.
     CredentialProxyHandler.report_store = report_store_from_env(role)
     CredentialProxyHandler.report_profiles = report_profiles_from_env()
     if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
