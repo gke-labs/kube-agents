@@ -244,3 +244,66 @@ const (
 	TriggerRefusedTierNotAllowed = "tier_not_allowed"
 	TriggerRefusedUnavailable    = "unavailable"
 )
+
+// A trigger's status query (#5617): what state is one task the gateway
+// started for this source in? The operator's reconciler asks on
+// TriggerStatusSubject(source), with a reply subject in the source's reply
+// namespace (TriggerReplySubject), and the gateway answers from its fold of
+// TASKS, for a task it recorded on that source's trigger records and no
+// other. The source never reads TASKS itself.
+
+// TriggerStatusSubjectSuffix ends a2a.trigger.<source>.status.
+const TriggerStatusSubjectSuffix = ".status"
+
+// TriggerStatusSubject is where source asks after a task.
+func TriggerStatusSubject(source string) string {
+	return TriggerSubmitSubjectPrefix + source + TriggerStatusSubjectSuffix
+}
+
+// ParseTriggerStatusSubject returns the source of a2a.trigger.<source>.status.
+func ParseTriggerStatusSubject(subject string) (string, error) {
+	rest, ok := strings.CutPrefix(subject, TriggerSubmitSubjectPrefix)
+	if !ok {
+		return "", fmt.Errorf("subject %q is not %s<source>%s", subject, TriggerSubmitSubjectPrefix, TriggerStatusSubjectSuffix)
+	}
+	source, ok := strings.CutSuffix(rest, TriggerStatusSubjectSuffix)
+	if !ok || !ValidSubjectToken(source) {
+		return "", fmt.Errorf("subject %q is not %s<source>%s", subject, TriggerSubmitSubjectPrefix, TriggerStatusSubjectSuffix)
+	}
+	return source, nil
+}
+
+// TriggerStatus asks after one task of one schedule.
+type TriggerStatus struct {
+	Schedule ScheduleRef `json:"schedule"`
+	TaskID   string      `json:"taskId"`
+}
+
+// ValidateTriggerStatus reports the first way s is malformed for source.
+func ValidateTriggerStatus(source string, s TriggerStatus) error {
+	if source != TriggerSourceSchedule {
+		return fmt.Errorf("trigger source %q is not %q", source, TriggerSourceSchedule)
+	}
+	if !validDNS1123Label(s.Schedule.Namespace) || s.Schedule.Name == "" || len(s.Schedule.Name) > 253 {
+		return fmt.Errorf("schedule %s/%s is not a namespace and a name", s.Schedule.Namespace, s.Schedule.Name)
+	}
+	if !ValidSubjectToken(s.TaskID) {
+		return fmt.Errorf("task id %q is not one subject token", s.TaskID)
+	}
+	return nil
+}
+
+// TriggerStatusReply is the gateway's answer: the task's state, or a
+// refusal (the reasons of TriggerRefusal; unknown for a task the gateway
+// never started for this schedule, or whose record is gone).
+type TriggerStatusReply struct {
+	// Found is false when no record of the task remains: the reconciler
+	// reads that as Lost.
+	Found bool `json:"found"`
+	// State is the task's A2A state, and Terminal whether it has ended.
+	State    TaskState `json:"state,omitempty"`
+	Terminal bool      `json:"terminal,omitempty"`
+	// EndedAt is when it ended, when Terminal.
+	EndedAt string          `json:"endedAt,omitempty"`
+	Refused *TriggerRefusal `json:"refused,omitempty"`
+}

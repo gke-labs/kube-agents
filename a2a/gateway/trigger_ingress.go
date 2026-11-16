@@ -37,6 +37,8 @@ import (
 const (
 	// triggerSubmitWildcard is every source's submission subject.
 	triggerSubmitWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerSubmitSubjectSuffix
+	// triggerStatusWildcard is every source's status query subject.
+	triggerStatusWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStatusSubjectSuffix
 	// triggerConversationPrefix opens a trigger's own conversation key:
 	// trigger:<source>/<namespace>/<name>.
 	triggerConversationPrefix = "trigger:"
@@ -86,9 +88,27 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 				}
 			})
 			if err == nil {
-				<-ctx.Done()
-				sub.Stop()
-				return
+				status, serr := g.client.SubscribeCore(triggerStatusWildcard, func(m *nats.Msg) {
+					source, err := lib.ParseTriggerStatusSubject(m.Subject)
+					if err != nil || !lib.ValidTriggerReplySubject(source, m.Reply) {
+						g.log.Info("trigger status query dropped: no reply subject in the source's namespace", "subject", m.Subject)
+						return
+					}
+					if data, err := json.Marshal(g.handleTriggerStatus(ctx, m.Subject, m.Data)); err == nil {
+						if err := m.Respond(data); err != nil {
+							g.log.Warn("trigger status reply failed", "subject", m.Subject, "err", err)
+						}
+					}
+				})
+				if serr != nil {
+					sub.Stop()
+					err = serr
+				} else {
+					<-ctx.Done()
+					sub.Stop()
+					status.Stop()
+					return
+				}
 			}
 			g.log.Warn("trigger ingress subscription failed; retrying", "err", err, "in", triggerIngressRetry)
 			select {
@@ -313,6 +333,65 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	g.log.Info("trigger task started", "trigger", s.Trigger.Name, "taskId", taskID, "profile", route.Profile,
 		"idempotencyKey", s.IdempotencyKey)
 	return lib.TriggerSubmitReply{TaskID: taskID}
+}
+
+// handleTriggerStatus answers what state one of a schedule's tasks is in,
+// for a task this gateway recorded on that schedule's trigger record and no
+// other, so a source reads only the tasks it started. A recorded run with no
+// events yet is submitted; a task the record no longer holds is not found,
+// which the reconciler reads as Lost.
+func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data []byte) lib.TriggerStatusReply {
+	refuse := func(reason, detail string) lib.TriggerStatusReply {
+		return lib.TriggerStatusReply{Refused: &lib.TriggerRefusal{Reason: reason, Detail: detail}}
+	}
+	source, err := lib.ParseTriggerStatusSubject(subject)
+	if err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	var q lib.TriggerStatus
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, "the query is not well-formed")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return refuse(lib.TriggerRefusedInvalid, "the query has data after its object")
+	}
+	if err := lib.ValidateTriggerStatus(source, q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	if g.cfg.Namespace == "" || q.Schedule.Namespace != g.cfg.Namespace {
+		return refuse(lib.TriggerRefusedInvalid, "schedule "+q.Schedule.Namespace+"/"+q.Schedule.Name+" is not in the install's namespace")
+	}
+	rec, err := g.reg.Get(ctx, triggerConversationKey(source, q.Schedule))
+	if err != nil {
+		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+	}
+	var run *TriggerRun
+	if rec != nil {
+		for i := range rec.TriggerRuns {
+			if rec.TriggerRuns[i].Task == q.TaskID {
+				run = &rec.TriggerRuns[i]
+			}
+		}
+	}
+	if run == nil {
+		return lib.TriggerStatusReply{Found: false}
+	}
+	addressee := ""
+	for _, t := range rec.Tasks {
+		if t.ID == q.TaskID {
+			addressee = t.Addressee
+		}
+	}
+	if addressee == "" || !run.Published {
+		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
+	}
+	task, err := g.replayForTerminal(ctx, addressee, q.TaskID)
+	if err != nil || task == nil || task.State == "" {
+		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
+	}
+	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
 }
 
 // triggerConversationKey is a trigger's own conversation:

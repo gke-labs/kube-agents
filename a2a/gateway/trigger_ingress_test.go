@@ -477,3 +477,68 @@ func TestATriggerKeyAnUnrecordedAttemptMintedTakesTheNextTask(t *testing.T) {
 		t.Fatalf("task = %s, want the second attempt's", reply.TaskID)
 	}
 }
+
+// status asks after taskID for the schedule s names, as the operator will.
+func (tr *triggerRig) status(t *testing.T, s lib.TriggerSubmit, taskID string) lib.TriggerStatusReply {
+	t.Helper()
+	data, err := json.Marshal(lib.TriggerStatus{Schedule: s.Schedule, TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := lib.TriggerReplySubject("schedule", nats.NewInbox()[len("_INBOX."):])
+	sub, err := tr.nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := tr.nc.PublishRequest(lib.TriggerStatusSubject("schedule"), reply, data); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("status reply: %v", err)
+	}
+	var out lib.TriggerStatusReply
+	if err := json.Unmarshal(msg.Data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestATriggersStatusIsAnsweredForItsOwnTasksOnly: the gateway answers what
+// state a schedule's run is in, from its fold of TASKS, through to the
+// terminal; a task it never started for that schedule is not found, so a
+// source reads only its own runs.
+func TestATriggersStatusIsAnsweredForItsOwnTasksOnly(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	if got := tr.status(t, s, reply.TaskID); !got.Found || got.Terminal {
+		t.Fatalf("a running task's status = %+v", got)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, tr.execFor(t, &origin, "fleet-audit"), "No findings.")
+	var got lib.TriggerStatusReply
+	waitFor(t, "the terminal in the status", func() bool {
+		got = tr.status(t, s, reply.TaskID)
+		return got.Terminal
+	})
+	if !got.Found || got.State != lib.StateCompleted {
+		t.Fatalf("the ended task's status = %+v", got)
+	}
+	if got := tr.status(t, s, "task-not-this-schedules"); got.Found || got.Refused != nil {
+		t.Fatalf("an unknown task = %+v, want not found", got)
+	}
+	other := s
+	other.Schedule.Name = "stockout-prevention"
+	if got := tr.status(t, other, reply.TaskID); got.Found {
+		t.Fatalf("another schedule read this run: %+v", got)
+	}
+}
