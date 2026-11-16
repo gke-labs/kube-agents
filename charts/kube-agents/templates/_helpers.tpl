@@ -3756,19 +3756,48 @@ false
 {{- $override := include "kube-agents.resourcesOverrideQuantities" ($tuning.sessionResources | default dict) | fromJson -}}
 {{- $oReq := (index $override "requests") | default dict -}}
 {{- $oLim := (index $override "limits") | default dict -}}
-{{- $cpuReq := $pod.cpuMillisRequest | int64 -}}
-{{- with index $oReq "cpu" -}}{{- $cpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
-{{- $cpuLim := $pod.cpuMillisLimit | int64 -}}
-{{- with index $oLim "cpu" -}}{{- $cpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
-{{- $memReq := $pod.memoryBytesRequest | int64 -}}
-{{- with index $oReq "memory" -}}{{- $memReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
-{{- $memLim := $pod.memoryBytesLimit | int64 -}}
-{{- with index $oLim "memory" -}}{{- $memLim = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
-{{- /* As ResolveSessionResources does after the per-key merge: a request above its limit
-       (limits.memory: 256Mi alone, against the 512Mi default request) is lowered to the
-       limit, per resource, so the override works rather than being refused. */ -}}
-{{- $cpuReq = min $cpuReq $cpuLim | int64 -}}
-{{- $memReq = min $memReq $memLim | int64 -}}
+{{- /* ResolveSessionResources (k8s-operator/api/v1alpha1), key by key: a key counts as
+       set only as a positive quantity, so zero or a negative one (a CR typo the gateway
+       would refuse at start) keeps its default. Negative is read off the sign before
+       parsing, since the quantity parsers take no sign. */ -}}
+{{- $set := dict -}}
+{{- $figures := dict "requests.cpu" ($pod.cpuMillisRequest | int64) "limits.cpu" ($pod.cpuMillisLimit | int64) "requests.memory" ($pod.memoryBytesRequest | int64) "limits.memory" ($pod.memoryBytesLimit | int64) -}}
+{{- range $side, $sideOverride := dict "requests" $oReq "limits" $oLim -}}
+  {{- range $resource := list "cpu" "memory" -}}
+    {{- $raw := index $sideOverride $resource -}}
+    {{- if and $raw (not (hasPrefix "-" (toString $raw))) -}}
+      {{- $v := 0 -}}
+      {{- if eq $resource "cpu" -}}
+        {{- $v = include "kube-agents.parseCpuMillis" $raw | int64 -}}
+      {{- else -}}
+        {{- $v = include "kube-agents.parseBytes" $raw | int64 -}}
+      {{- end -}}
+      {{- if gt $v 0 -}}
+        {{- $_ := set $figures (printf "%s.%s" $side $resource) $v -}}
+        {{- $_ := set $set (printf "%s.%s" $side $resource) true -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- /* Then, per resource, a request above its limit: with the request set and the limit
+       not, the limit rises to the request (requests.memory: 4Gi alone runs 4Gi/4Gi);
+       otherwise the request drops to the limit (limits.memory: 256Mi alone runs
+       256Mi/256Mi). */ -}}
+{{- range $resource := list "cpu" "memory" -}}
+  {{- $req := index $figures (printf "requests.%s" $resource) | int64 -}}
+  {{- $lim := index $figures (printf "limits.%s" $resource) | int64 -}}
+  {{- if gt $req $lim -}}
+    {{- if and (hasKey $set (printf "requests.%s" $resource)) (not (hasKey $set (printf "limits.%s" $resource))) -}}
+      {{- $_ := set $figures (printf "limits.%s" $resource) $req -}}
+    {{- else -}}
+      {{- $_ := set $figures (printf "requests.%s" $resource) $lim -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $cpuReq := index $figures "requests.cpu" | int64 -}}
+{{- $cpuLim := index $figures "limits.cpu" | int64 -}}
+{{- $memReq := index $figures "requests.memory" | int64 -}}
+{{- $memLim := index $figures "limits.memory" | int64 -}}
 {{- $ephReq := $pod.ephemeralStorageBytesRequest | int64 -}}
 {{- $ephLim := $pod.ephemeralStorageBytesLimit | int64 -}}
 {{- /* On GKE Autopilot the pod is admitted at Autopilot's figures, not the gateway's, and

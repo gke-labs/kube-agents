@@ -522,6 +522,34 @@ class PreflightDecisionTest(unittest.TestCase):
         std = self._requirements(["platformAgent.harness.tuning.maxSessions=2"])
         self.assertEqual(std["sessionRequestsCpu"], 2 * self._session_pod()["cpuMillisRequest"])
 
+    def test_a_request_alone_above_the_default_limit_raises_the_limit(self) -> None:
+        """ResolveSessionResources: requests.memory: 4Gi alone runs 4Gi/4Gi, not 2Gi/2Gi."""
+        req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 2,
+            "sessionResources": {"requests": {"memory": "4Gi", "cpu": "3"}},
+        }}}})
+        self.assertEqual(req["sessionRequestsMemory"], 2 * 4 * 1024**3)
+        self.assertEqual(req["sessionLimitsMemory"], 2 * 4 * 1024**3)
+        self.assertEqual(req["sessionRequestsCpu"], 2 * 3000)
+        self.assertEqual(req["sessionLimitsCpu"], 2 * 3000)
+        # Both set, the request above the limit: the request drops to the limit.
+        both = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 2,
+            "sessionResources": {"requests": {"memory": "4Gi"}, "limits": {"memory": "1Gi"}},
+        }}}})
+        self.assertEqual(both["sessionRequestsMemory"], 2 * 1024**3)
+        self.assertEqual(both["sessionLimitsMemory"], 2 * 1024**3)
+
+    def test_a_zero_or_negative_key_keeps_its_default(self) -> None:
+        base = self._requirements(["platformAgent.harness.tuning.maxSessions=2"])
+        req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 2,
+            "sessionResources": {"requests": {"memory": "-1Gi", "cpu": "0"},
+                                 "limits": {"memory": "0Mi", "cpu": "-2"}},
+        }}}})
+        for key in ("sessionRequestsCpu", "sessionLimitsCpu", "sessionRequestsMemory", "sessionLimitsMemory"):
+            self.assertEqual(req[key], base[key], key)
+
     def test_the_session_share_stays_out_of_the_totals_while_the_gate_is_off(self) -> None:
         """kube-agents.quotaCountsSessions is false: the share is reported, not compared."""
         base = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
