@@ -585,3 +585,26 @@ func TestATriggersKeptRunsNeverOutliveTheirTasks(t *testing.T) {
 		t.Fatalf("triggerRunsKept %d > taskHistoryCap %d: a kept run could lose its task and answer submitted forever", triggerRunsKept, taskHistoryCap)
 	}
 }
+
+// A published run's retry is answered with its task even when the profile has
+// left the directory since (a new leader before its first DIRECTORY read, or a
+// deleted profile): it needs nothing from the directory. A new key for the
+// same missing profile is still refused.
+func TestAPublishedRunsRetryNeedsNoDirectory(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	first := tr.submit(t, "schedule", s)
+	if first.Refused != nil || first.TaskID == "" {
+		t.Fatalf("first = %+v", first)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	tr.g.profiles.put(s.Profile, nil)
+	if again := tr.submit(t, "schedule", s); again.TaskID != first.TaskID || again.Refused != nil {
+		t.Fatalf("retry with the profile gone = %+v, want task %s", again, first.TaskID)
+	}
+	next := s
+	next.IdempotencyKey = "schedule/kubeagents-system/compliance-audit/1763100300"
+	if r := tr.submit(t, "schedule", next); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedProfileUnknown {
+		t.Fatalf("a new key with the profile gone = %+v, want profile_unknown", r)
+	}
+}

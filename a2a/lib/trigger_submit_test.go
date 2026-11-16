@@ -138,3 +138,17 @@ func TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit(t *testing.T) {
 		t.Fatalf("the operator's submission fails the gateway's check: %v", err)
 	}
 }
+
+// The prompt bound counts characters, as the CRD's maxLength does: a prompt at
+// the bound in non-ASCII text passes, one character over is refused.
+func TestThePromptBoundCountsCharacters(t *testing.T) {
+	s := goodTriggerSubmit()
+	s.Prompt = strings.Repeat("監", TriggerSubmitPromptMaxLen)
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err != nil {
+		t.Fatalf("a prompt of %d characters (%d bytes) was refused: %v", TriggerSubmitPromptMaxLen, len(s.Prompt), err)
+	}
+	s.Prompt += "監"
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err == nil || !strings.Contains(err.Error(), "characters") {
+		t.Fatalf("a prompt one character over: err = %v", err)
+	}
+}

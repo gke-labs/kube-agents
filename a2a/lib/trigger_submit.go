@@ -3,6 +3,7 @@ package lib
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // A trigger's submission (#4685, Track 2): an unattended source asks the
@@ -179,8 +180,11 @@ func ValidateTriggerSubmit(source string, s TriggerSubmit) error {
 	if !ValidSubjectToken(s.Profile) {
 		return fmt.Errorf("profile %q is not a DNS-1123 label", s.Profile)
 	}
-	if strings.TrimSpace(s.Prompt) == "" || len(s.Prompt) > TriggerSubmitPromptMaxLen {
-		return fmt.Errorf("prompt is empty or longer than %d bytes", TriggerSubmitPromptMaxLen)
+	// Characters, as the CRD's maxLength counts them, not bytes: a prompt
+	// of non-ASCII text the API server admitted would otherwise be refused
+	// at every slot.
+	if strings.TrimSpace(s.Prompt) == "" || utf8.RuneCountInString(s.Prompt) > TriggerSubmitPromptMaxLen {
+		return fmt.Errorf("prompt is empty or longer than %d characters", TriggerSubmitPromptMaxLen)
 	}
 	if len(s.Skills) > TriggerSubmitSkillsMax {
 		return fmt.Errorf("%d skills, at most %d", len(s.Skills), TriggerSubmitSkillsMax)

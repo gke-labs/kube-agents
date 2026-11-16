@@ -207,6 +207,14 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
 	}
+	// A run already on the bus under this key is that run, answered with its
+	// task before any directory check: it needs nothing from the directory,
+	// and a new leader that hasn't read DIRECTORY yet, or a profile deleted
+	// since, would otherwise answer its retry profile_unknown in place of
+	// the task it started.
+	if run := rec.triggerRun(s.IdempotencyKey); run != nil && run.Published {
+		return lib.TriggerSubmitReply{TaskID: run.Task}
+	}
 	card, ok := g.profiles.lookup(s.Profile)
 	if !ok {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedProfileUnknown, "no profile "+s.Profile+" in the directory")
@@ -226,15 +234,12 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the schedule's target routes to profile "+route.Profile+", not "+s.Profile)
 	}
 
-	// A recent run under this key is that run. One already on the bus is
-	// answered with its task; one recorded but not yet published (its
-	// publish failed, or the gateway stopped) is published again with the
-	// same grant and envelope id, so the stream dedupes a publish that had
-	// in fact landed. Neither mints or spends the rate budget.
+	// A run recorded but not yet published (its publish failed, or the
+	// gateway stopped) is published again with the same grant and envelope
+	// id, so the stream dedupes a publish that had in fact landed. It
+	// takes the route checks above, since it does reach the dispatcher.
+	// Neither it nor a published run mints or spends the rate budget.
 	if run := rec.triggerRun(s.IdempotencyKey); run != nil {
-		if run.Published {
-			return lib.TriggerSubmitReply{TaskID: run.Task}
-		}
 		return g.publishTriggerRun(ctx, rec, s, route, *run)
 	}
 
