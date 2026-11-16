@@ -248,3 +248,37 @@ class FallbackTest(unittest.TestCase):
     def test_a_child_whose_parent_has_no_row_falls_back_to_its_own_source(self):
         data = {"sessions": [session("c", source="api_server", parent="pruned")], "cards": [], "runs": []}
         self.assertEqual(at.join(data, CAPS).capability["c"], at.CHAT)
+
+
+class ChunkedReadTest(unittest.TestCase):
+    def test_a_long_read_comes_back_in_chunks_and_the_pod_file_is_removed(self):
+        import base64
+        import zlib
+        from unittest import mock
+        blob = base64.b64encode(zlib.compress(json.dumps({"sessions": [{"id": __import__("os").urandom(8).hex()} for _ in range(20000)]}).encode())).decode()
+        calls = []
+
+        def kubectl(context, *argv, timeout=None):
+            last = len(argv) - 1 - argv[::-1].index("-c")
+            script, args = argv[last + 1], argv[last + 2:]
+            calls.append(script)
+            if script == at.READ_SCRIPT:
+                return f"{len(blob)}\n"
+            if args[1] == at.REMOVE:
+                return ""
+            offset, length = int(args[1]), int(args[2])
+            return blob[offset:offset + length]
+
+        with mock.patch.object(at.operations, "_gateway_pod", return_value="pod/g"), \
+                mock.patch.object(at.kube, "kubectl", side_effect=kubectl):
+            stores = at.read_stores("ctx", "ns")
+        self.assertEqual(len(stores["sessions"]), 20000)
+        self.assertGreater(calls.count(at.CHUNK_SCRIPT), 2)
+
+    def test_an_archive_round_trips(self):
+        import pathlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "s.json.gz"
+            at.archive(stores(), path)
+            self.assertEqual(at.load_archive(path), stores())

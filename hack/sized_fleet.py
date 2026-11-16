@@ -17,6 +17,8 @@ crashed run left.
   install    upgrade the host cluster's install to the newest `main` commit whose
              images are published, at the size's tier (the release's other values
              are kept, so no secret is needed)
+  usage      tokens by capability for any period (--since, --until), from the live install or a
+             kept archive (--stores), checked against Vertex AI's own count
   sweep      delete any sized fleet older than --max-age-hours, whatever its size:
              what an aborted run left
   down       destroy the stack
@@ -41,7 +43,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -51,7 +53,7 @@ sys.path.insert(0, str(REPO / "bench"))
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import attribution, operations, runner, sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import attribution, model_counters, operations, runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -108,6 +110,11 @@ KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
 USAGE_FILE = "capability-usage.json"
 USAGE_REPORT = "capability-usage.md"
+# The install's whole session records, kept before the reset deletes them and after the run.
+STORES_BEFORE = "session-records-before-reset.json.gz"
+STORES_AFTER = "session-records-after-run.json.gz"
+# The model the install's gateway serves; Vertex AI's count for it is the sessions' check.
+INSTALL_MODEL = "gemini-3.5-flash"
 # The label a host cluster carries when its install exists to be measured: a run resets the
 # install's state volumes, and refuses a host without it, as the scale runner does.
 HOST_LABEL = "purpose=harness-scale"
@@ -525,16 +532,37 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     return summary
 
 
-def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]) -> dict[str, dict]:
+def measure_period(stores: dict, project: str, start: float, end: float, litellm: dict | None = None) -> dict:
+    """One period's tokens by capability, checked against Vertex AI's count, with the calls by account."""
+    usage = attribution.attribute(stores, start, end, litellm=litellm)
+    vertex = model_counters.vertex_tokens(project, start, end)
+    usage["vertex"] = model_counters.against_sessions(vertex, usage["capabilities"], INSTALL_MODEL)
+    usage["requests_by_account"] = model_counters.requests_by_account(project, start, end)
+    if litellm is None:
+        # No LiteLLM counters for an arbitrary period: Vertex AI's own count is the sum check.
+        ratio = usage["vertex"]["ratio"]
+        usage["checks"]["sum"] = {"source": "vertex", "ratio": ratio,
+                                  "passed": all(r is not None and abs(r - 1) <= attribution.SUM_TOLERANCE
+                                                for r in ratio.values())}
+    return usage
+
+
+def capability_usage(host_context: str, namespace: str, windows: dict[str, dict], project: str = "",
+                     stores: dict | None = None) -> dict[str, dict]:
     """Each window's tokens by capability (docs/designs/capability-usage-attribution.md), from one read."""
     starts = [datetime.fromisoformat(w["start"]).timestamp() for w in windows.values() if "start" in w]
-    stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
+    if stores is None:
+        stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
     usage = {}
     for name, window in windows.items():
         try:
             start = datetime.fromisoformat(window["start"]).timestamp()
-            usage[name] = attribution.attribute(stores, start, start + window["seconds"], litellm=window.get("tokens"))
-        except (KeyError, ValueError) as exc:
+            end = start + window["seconds"]
+            if project:
+                usage[name] = measure_period(stores, project, start, end, litellm=window.get("tokens"))
+            else:
+                usage[name] = attribution.attribute(stores, start, end, litellm=window.get("tokens"))
+        except (KeyError, ValueError, OSError, kube.CommandError) as exc:
             # A window whose measurements were not read costs only its own record.
             usage[name] = {"error": f"window not attributed: {exc!r}"}
     return usage
@@ -556,16 +584,25 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     def chat_questions() -> None:
         evals.update(run_evals(args, host_context, out))
 
+    def keep_stores_before_reset() -> None:
+        attribution.archive(attribution.read_stores(host_context, args.namespace), out / STORES_BEFORE)
+
     install = collect.Install(args.project, host_context, args.namespace, args.host_cluster, args.host_location)
     record, result = sized_run.run(project=args.project, host_cluster=args.host_cluster, host_context=host_context,
                                    namespace=args.namespace, check_fleet=check_fleet, install=install,
                                    soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE,
-                                   during_soak=chat_questions if args.eval_cases else None)
+                                   during_soak=chat_questions if args.eval_cases else None,
+                                   before_reset=keep_stores_before_reset)
     # Before `down`: the cost record reads the fleet's own instances and clusters.
     cost = sized_records.safe(
         lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
         record.errors, "cost record")
-    usage = sized_records.safe(lambda: capability_usage(host_context, args.namespace, record.windows),
+    stores_after = sized_records.safe(lambda: attribution.read_stores(host_context, args.namespace),
+                                      record.errors, "the session records after the run") or None
+    if stores_after:
+        attribution.archive(stores_after, out / STORES_AFTER)
+    usage = sized_records.safe(lambda: capability_usage(host_context, args.namespace, record.windows, args.project,
+                                                        stores=stores_after),
                                record.errors, "capability usage") or {}
     result["errors"] = list(record.errors)
     records = {
@@ -581,7 +618,8 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
         LOG.info("%s: %s", name, summary(name, body))
     (out / USAGE_REPORT).write_text(attribution.markdown(usage) if usage else "No capability usage was read.\n")
     if args.results_bucket:
-        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in (*records, USAGE_REPORT)],
+        kept = [n for n in (STORES_BEFORE, STORES_AFTER) if (out / n).exists()]
+        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in (*records, USAGE_REPORT, *kept)],
                   results_prefix(args)])
         if (out / EVALS_DIR).is_dir():
             kube.run([kube.GCLOUD, "storage", "cp", "--recursive", str(out / EVALS_DIR), results_prefix(args)])
@@ -728,6 +766,31 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return EXIT_UNSOUND if failed else 0
 
 
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Tokens by capability for any period, from the live install or a kept archive, checked against Vertex AI."""
+    until = datetime.fromisoformat(args.until).timestamp() if args.until else time.time()
+    since = datetime.fromisoformat(args.since).timestamp()
+    if args.stores:
+        stores = attribution.load_archive(Path(args.stores))
+    else:
+        host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
+        kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
+                    project=args.project)
+        stores = attribution.read_stores(host_context, args.namespace, since=since)
+    period = f"{datetime.fromtimestamp(since, timezone.utc):%Y%m%dT%H%M}-{datetime.fromtimestamp(until, timezone.utc):%Y%m%dT%H%M}"
+    usage = {period: measure_period(stores, args.project, since, until)}
+    out = Path(args.out or tempfile.mkdtemp(prefix="sized-usage-"))
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"usage-{period}.json").write_text(json.dumps(usage, indent=2) + "\n")
+    (out / f"usage-{period}.md").write_text(attribution.markdown(usage))
+    if not args.stores:
+        attribution.archive(stores, out / f"session-records-{period}.json.gz")
+    body = usage[period]
+    LOG.info("usage %s: %s tokens, unattributed %.1f%%, sessions against Vertex AI %s; records in %s", period,
+             f"{body['total_tokens']:,}", 100 * body["checks"]["unattributed"]["share"], body["vertex"]["ratio"], out)
+    return 0
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     started = time.time()
     init(args.project, args.size)
@@ -738,7 +801,7 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"plan": cmd_plan, "up": cmd_up, "workloads": cmd_workloads, "verify": cmd_verify, "run": cmd_run,
-            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep}
+            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep, "usage": cmd_usage}
 
 
 def use_ca_bundle() -> None:
@@ -775,6 +838,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
     parser.add_argument("--out", help="run: the folder for the records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
+    parser.add_argument("--since", help="usage: the period's start, ISO 8601 with a zone")
+    parser.add_argument("--until", help="usage: the period's end, ISO 8601 with a zone; default now")
+    parser.add_argument("--stores", help="usage: read a kept session-records archive instead of the live install")
     parser.add_argument("--eval-cases", nargs="?", const=str(EVAL_CASES_FILE), default=None,
                         help="run: run the cases this file lists in the soak window "
                              f"(default file {EVAL_CASES_FILE.relative_to(REPO)})")

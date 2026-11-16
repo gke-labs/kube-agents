@@ -15,8 +15,10 @@ tested on its own; :func:`read_stores` does the reading.
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
+import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +31,12 @@ ROSTERS = (REPO / "agents" / "platform" / "cron" / "jobs.json",
            REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json")
 DATA_ROOT = "/opt/data"
 READ_TIMEOUT_SECONDS = 120
+# kubectl exec into the sandboxed pod cuts stdout at 64 KiB, so a whole history is fetched in
+# pieces well under that, from a file the read script writes in the pod's temp directory.
+CHUNK_CHARS = 48 * 1024
+POD_OUTPUT_DIR = "/tmp"
+POD_OUTPUT_PREFIX = "kage-usage-"
+REMOVE = "remove"
 # The read takes sessions and cards from this long before the run's start, so a parent or
 # creator session that started earlier is still there to join through.
 READ_SLACK_SECONDS = 6 * 3600
@@ -127,7 +135,27 @@ if os.path.exists(board):
             out["runs"].append(dict(r))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (board, exc))
-print(base64.b64encode(zlib.compress(json.dumps(out).encode())).decode())
+blob = base64.b64encode(zlib.compress(json.dumps(out).encode())).decode()
+dest = os.environ.get("KAGE_USAGE_OUT")
+if dest:
+    with open(dest, "w") as f:
+        f.write(blob)
+    print(len(blob))
+else:
+    print(blob)
+"""
+
+# Prints `length` characters of the file at argv[1] from offset argv[2]; with argv[3] == "remove",
+# removes the file instead. Read only, apart from the read script's own output file.
+CHUNK_SCRIPT = r"""
+import os, sys
+path = sys.argv[1]
+if sys.argv[2] == "remove":
+    os.remove(path)
+else:
+    with open(path) as f:
+        f.seek(int(sys.argv[2]))
+        sys.stdout.write(f.read(int(sys.argv[3])))
 """
 
 
@@ -144,10 +172,32 @@ def read_stores(context: str, namespace: str, since: float = 0.0) -> dict[str, A
     pod = operations._gateway_pod(context, namespace)
     if not pod:
         raise kube.CommandError("no gateway pod to read the session records in")
-    out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", operations.AGENT_CONTAINER, "--",
-                       operations.JOB_PYTHON, "-c", READ_SCRIPT, DATA_ROOT, str(max(0.0, since - READ_SLACK_SECONDS)),
-                       SESSION_KV_DB, *INJECT_REASONS, timeout=READ_TIMEOUT_SECONDS)
-    return decode(out)
+    dest = f"{POD_OUTPUT_DIR}/{POD_OUTPUT_PREFIX}{uuid.uuid4().hex}"
+
+    def exec_python(*argv: str) -> str:
+        return kube.kubectl(context, "exec", "-n", namespace, pod, "-c", operations.AGENT_CONTAINER, "--",
+                            "env", f"KAGE_USAGE_OUT={dest}", operations.JOB_PYTHON, "-c", *argv,
+                            timeout=READ_TIMEOUT_SECONDS)
+
+    length = int(exec_python(READ_SCRIPT, DATA_ROOT, str(max(0.0, since - READ_SLACK_SECONDS)), SESSION_KV_DB,
+                             *INJECT_REASONS).strip())
+    try:
+        blob = "".join(exec_python(CHUNK_SCRIPT, dest, str(offset), str(CHUNK_CHARS))
+                       for offset in range(0, length, CHUNK_CHARS))
+    finally:
+        exec_python(CHUNK_SCRIPT, dest, REMOVE)
+    if len(blob) != length:
+        raise kube.CommandError(f"the session records' read came back {len(blob)} of {length} characters")
+    return decode(blob)
+
+
+def archive(stores: dict[str, Any], path: Path) -> None:
+    """Keep the stores as they were, gzipped JSON, so any period in them can be measured again later."""
+    path.write_bytes(gzip.compress(json.dumps(stores).encode()))
+
+
+def load_archive(path: Path) -> dict[str, Any]:
+    return json.loads(gzip.decompress(path.read_bytes()))
 
 
 def decode(out: str) -> dict[str, Any]:
