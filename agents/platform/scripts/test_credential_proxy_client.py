@@ -999,6 +999,13 @@ class StdinGateTest(unittest.TestCase):
         self.assertEqual(captured["body"]["stdin"], "kind: X\n")
 
 
+class BodyThatDrops(io.BytesIO):
+    """A refusal body whose connection closes while it is read."""
+
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"")
+
+
 class VcsCallErrorTest(unittest.TestCase):
     """`vcs_call` hands a refusal through whole, and tells "not built" from "no"."""
 
@@ -1025,6 +1032,34 @@ class VcsCallErrorTest(unittest.TestCase):
         with self._refuse(404, {"error": "not available", "code": "VCS_UNAVAILABLE"}):
             with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
                 credential_proxy_client.vcs_call(self.endpoint, "snapshot", {})
+
+    def _held_refusal(self, status, stream):
+        """An HTTPError the test keeps hold of. Held, it is not collected, so a body
+        that reads as closed was closed by `vcs_call` and not by the interpreter."""
+        error = urllib.error.HTTPError(self.endpoint + "/v1/vcs/publish", status, "refused", {}, stream)
+        self.addCleanup(error.close)
+        return error
+
+    def test_the_refusal_is_closed_once_its_body_is_read_on_every_way_out(self):
+        cases = (
+            ("a refusal", 409, io.BytesIO(b'{"error": "the base branch moved", "code": "BASE_MOVED"}'),
+             credential_proxy_client.WorkspaceRequestError),
+            ("no version control", 404, io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE"}'),
+             credential_proxy_client.WorkspaceUnavailable),
+            ("a body that is not JSON", 502, io.BytesIO(b"<html>bad gateway</html>"),
+             credential_proxy_client.WorkspaceRequestError),
+            ("a body that drops", 500, BodyThatDrops(), credential_proxy_client.BrokerDisconnected),
+        )
+        for name, status, stream, raised in cases:
+            with self.subTest(name):
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                    with self.assertRaises(raised) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+                if raised is credential_proxy_client.WorkspaceRequestError:
+                    # The status is read off the error after the close.
+                    self.assertEqual(caught.exception.status, status)
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -2868,6 +2903,78 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual(1, len(broker.requests))
         self.assertEqual("argv is required", err.strip())
+
+    def held_refusal(self, status, body, headers=None):
+        """An HTTPError the test keeps hold of, and its body. Held, the error is not
+        collected, so a body that reads as closed was closed by the shim and not by the
+        interpreter."""
+        stream = body if isinstance(body, io.BytesIO) else io.BytesIO(
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
+        error = urllib.error.HTTPError("http://broker.invalid/v1/exec", status, "refused", headers or {}, stream)
+        self.addCleanup(error.close)
+        return error, stream
+
+    def run_shim_over(self, replies):
+        """The shim over `replies`, each an HTTPError it raises or a reply body it reads."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=replies), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_printed_refusal_is_closed_and_its_text_was_read_first(self):
+        error, stream = self.held_refusal(400, {"error": "argv is required"})
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertEqual("argv is required", err.strip())
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_with_no_json_body_is_closed(self):
+        error, stream = self.held_refusal(500, b"<html>internal error</html>")
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("credential proxy error (HTTP 500): non-JSON response", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_whose_body_drops_is_closed(self):
+        error, stream = self.held_refusal(503, BodyThatDrops())
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("the connection dropped while the refusal was read", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_each_retried_refusal_is_closed_and_its_retry_after_still_sets_the_wait(self):
+        # Five 429s: four waits, then the throttling line. The status and the
+        # Retry-After header are read off each error after it is closed.
+        held = [self.held_refusal(429, PRESSURE, {"Retry-After": "4"}) for _ in range(5)]
+        code, _, err = self.run_shim_over([error for error, _ in held])
+        self.assertEqual(1, code)
+        self.assertEqual(4, len(self.sleeps))
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+        self.assertIn("gave up after 5 attempts (HTTP 429)", err.strip().splitlines()[-1])
+        self.assertEqual([True] * 5, [stream.closed for _, stream in held], "the shim left a refusal open")
+
+    def test_a_refusal_that_is_retried_into_a_reply_is_closed(self):
+        error, stream = self.held_refusal(503, BUSY_SLOT)
+        code, out, err = self.run_shim_over([error, io.BytesIO(json.dumps(OK).encode())])
+        self.assertEqual(0, code, err)
+        self.assertEqual(OK["stdout"], out)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_the_status_headers_and_payload_stay_on_a_closed_refusal(self):
+        error, stream = self.held_refusal(429, PRESSURE, {"Retry-After": "4"})
+        payload = credential_proxy_client._refusal_payload(error)
+        self.assertTrue(stream.closed)
+        self.assertEqual(PRESSURE, payload)
+        self.assertEqual(PRESSURE, error.shim_payload)
+        self.assertFalse(error.shim_dropped)
+        self.assertEqual(429, error.code)
+        self.assertEqual("4", error.headers.get("Retry-After"))
 
 
 class RetryScheduleTest(unittest.TestCase):

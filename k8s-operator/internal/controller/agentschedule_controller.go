@@ -236,7 +236,7 @@ func runNowKey(sched *agentv1alpha1.AgentSchedule, token string) string {
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentschedules,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentschedules/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentschedules/status,verbs=get;update
 
 func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var sched agentv1alpha1.AgentSchedule
