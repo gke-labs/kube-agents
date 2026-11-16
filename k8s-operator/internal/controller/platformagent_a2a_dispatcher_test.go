@@ -79,8 +79,11 @@ func TestTheDispatcherIsOnByDefaultAndOffAtFalse(t *testing.T) {
 	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
 		t.Errorf("TASKS is created at %d, want %d with no dispatcher", tasksWithout, want)
 	}
-	if got := a2aTasksMaxConsumers(&agentv1alpha1.PlatformAgent{}); got != a2aTasksMaxConsumersFloor {
-		t.Errorf("a default install's TASKS is created at %d, want the floor %d", got, a2aTasksMaxConsumersFloor)
+	// A default install: no dispatcher, and the rendered bridge's 10 workers
+	// put the budget (110) above the floor, so TASKS is created at it.
+	def := &agentv1alpha1.PlatformAgent{}
+	if got, want := a2aTasksMaxConsumers(def), a2aTasksConsumerBudget(def); got != want || got <= a2aTasksMaxConsumersFloor {
+		t.Errorf("a default install's TASKS is created at %d, want its budget %d, above the floor %d", got, want, a2aTasksMaxConsumersFloor)
 	}
 
 	scheme := setupScheme()
@@ -238,6 +241,10 @@ func TestTheDispatchConfigIsResolvedAndListsTheDurables(t *testing.T) {
 // config, which lib decodes and validates.
 func TestRenderedDispatcherFixtures(t *testing.T) {
 	withDispatcher(t)
+	// The flag-off render: the callout's dispatcher contract suite runs a
+	// real server against these grants (the bucketed render has its own
+	// fixture).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	// With the operator, whose durable grants come with the dispatcher.
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()

@@ -2747,6 +2747,17 @@ _REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
 _REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
 _REPORT_STREAM = f"{AUDIT_REPORTS_PREFIX}/{_REPORT_AUDIT_ID}/{_REPORT_STORE_KEY}"
+# How deep a store key is unescaped before it is refused: it is escaped at most
+# twice (a non-GitHub path inside the key), so a fixed point past this is hostile.
+REPORT_STORE_KEY_MAX_UNESCAPES = 4
+# The code points a decoded store key may not hold: C0 controls and DEL.
+REPORT_STORE_KEY_LOWEST_PRINTABLE = 0x20
+REPORT_STORE_KEY_DEL = 0x7F
+# Parts a decoded store key may not have when split on "/".
+REPORT_STORE_KEY_REFUSED_PARTS = frozenset({"", ".", ".."})
+# The store key's index in a split audit-report path:
+# ["", "v1", "audit-reports", <audit id>, <store key>, ...]. The list route has none.
+REPORT_STORE_KEY_SEGMENT = 4
 
 # Every (method, path) a report credential reaches, and nothing else: a default-
 # deny allowlist. A report credential (task_credential.REPORT_TIER) names no
@@ -2778,16 +2789,16 @@ def _report_store_key_is_plain(key: str) -> bool:
     U+0020 or be U+007F.
     """
     decoded = key
-    for _ in range(4):
+    for _ in range(REPORT_STORE_KEY_MAX_UNESCAPES):
         step = urllib.parse.unquote(decoded)
         if step == decoded:
             break
         decoded = step
     else:
         return False
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+    if any(ord(ch) < REPORT_STORE_KEY_LOWEST_PRINTABLE or ord(ch) == REPORT_STORE_KEY_DEL for ch in decoded):
         return False
-    return all(part not in ("", ".", "..") for part in decoded.split("/"))
+    return all(part not in REPORT_STORE_KEY_REFUSED_PARTS for part in decoded.split("/"))
 
 
 def report_credential_permits(method: str, path: str) -> bool:
@@ -2795,8 +2806,7 @@ def report_credential_permits(method: str, path: str) -> bool:
     if not any(method == allowed and pattern.fullmatch(path) for allowed, pattern in REPORT_CREDENTIAL_ROUTES):
         return False
     segments = path.split("/")
-    # ["", "v1", "audit-reports", <audit id>, <store key>, ...]: the list route has no key.
-    return len(segments) < 5 or _report_store_key_is_plain(segments[4])
+    return len(segments) <= REPORT_STORE_KEY_SEGMENT or _report_store_key_is_plain(segments[REPORT_STORE_KEY_SEGMENT])
 
 
 # -- Who may read and write the store (#5619) --------------------------------

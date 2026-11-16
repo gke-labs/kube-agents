@@ -19,11 +19,6 @@ on:
           # They are long-lived and this workflow DESTROYS what it finds, so
           # they are dispatch-only and guarded by confirm_destroy below.
           # `Shared: Reconcile Environment` is the routine way to move them.
-          #
-          # autopush-next is refused `mode: next` here like the other two: a
-          # long-lived environment's mode is its PLATFORM_AGENT_MODE variable,
-          # applied by the reconcile path, not this input. A rebuild installs
-          # today and the next reconcile moves it to the declared mode.
           - "autopush"
           - "autopush-next"
           - "staging"
@@ -36,14 +31,6 @@ on:
         required: false
         default: ""
         type: string
-      mode:
-        description: "The PlatformAgent's spec.mode to install: today, or next (the A2A stack)"
-        required: false
-        default: "today"
-        type: choice
-        options:
-          - "today"
-          - "next"
   workflow_call:
     inputs:
       # The GitHub Actions environment, and nothing else: it renders straight
@@ -63,17 +50,6 @@ on:
       rc_tag:
         description: "Release Candidate Tag or Commit SHA"
         required: true
-        type: string
-      # The PlatformAgent's spec.mode, `today` or `next`. Defaulted, unlike the
-      # two above, because `today` is what every caller installed before the
-      # input existed and the default changes nothing: the provisioning script
-      # sees no PLATFORM_AGENT_MODE at all. `next` reaches install.sh, which
-      # renders it, and the script then waits for the stack it renders
-      # (platform_agent_mode.sh).
-      mode:
-        description: "The PlatformAgent's spec.mode to install: today or next"
-        required: false
-        default: "today"
         type: string
     secrets:
       GEMINI_API_KEY:
@@ -106,12 +82,13 @@ jobs:
     # eleven for its second run), two failed creates that each take about ten
     # minutes to be refused, two ten-minute waits, two teardowns of the
     # half-built environment (ten each, plus eleven for each second run), and
-    # one full install (forty) -- about 150 minutes, so 170 with margin.
-    # `next` adds the mode switch's wait on top: the agent rolls again, and
-    # Ready waits on the bus, the callout and the provisioning Job. A job
-    # stopped here reports `cancelled`, not `failure`, which the promotion
-    # pipeline's teardown condition names.
-    timeout-minutes: ${{ inputs.mode == 'next' && 200 || 170 }}
+    # one full install (forty) -- about 150 minutes, so 170 with margin. On
+    # top of that, the A2A readiness gate the script runs after the install
+    # (a2a_readiness.sh, one 30-minute budget: Ready waits on the bus, the
+    # callout and the provisioning Job), so 200. A job stopped here reports
+    # `cancelled`, not `failure`, which the promotion pipeline's teardown
+    # condition names.
+    timeout-minutes: 200
     permissions:
       contents: read
       id-token: write
@@ -145,50 +122,6 @@ jobs:
           fi
           echo "==> Teardown of '${TARGET}' confirmed."
 
-      # Also before the checkout, and for the same reason. A `workflow_call`
-      # input is a free string, so this is where a caller's typo stops; the
-      # dispatch form offers the two values only.
-      #
-      # Unconditional, and matched in shell. A GitHub expression compares
-      # strings case-insensitively, so an `if:` on the input would skip this
-      # for `TODAY` and let it reach the candidate's exact-match check only
-      # after the checkout, auth and setup. Exactly '', `today` and `next`
-      # pass; '' is today, as it is to the scripts. The steps only `next`
-      # needs read this step's `next` output rather than the input.
-      #
-      # `next` is refused on autopush, autopush-next and staging, matched
-      # case-insensitively like the two guards above. A long-lived
-      # environment's mode is its PLATFORM_AGENT_MODE variable, which the
-      # reconcile path renders into the chart; this input is not consulted
-      # for it, so a rebuild installs today and the next reconcile moves the
-      # environment to its declared mode. provision_environment.sh refuses it
-      # as well.
-      - name: Check the PlatformAgent mode
-        id: mode
-        env:
-          MODE: ${{ inputs.mode }}
-          TARGET: ${{ inputs.github_environment }}
-        run: |
-          case "${MODE}" in
-            "" | today)
-              echo "next=false" >> "${GITHUB_OUTPUT}"
-              exit 0
-              ;;
-            next) ;;
-            *)
-              echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes exactly today or next, lowercase; pass one of those, or leave the input unset for today."
-              exit 1
-              ;;
-          esac
-          case "$(printf '%s' "${TARGET}" | tr '[:upper:]' '[:lower:]')" in
-            autopush | autopush-next | staging)
-              echo "::error title=spec.mode next is for the ephemeral environments::Refusing mode next on '${TARGET}', a long-lived environment: its mode is its PLATFORM_AGENT_MODE variable, applied by the reconcile path, not this input. A rebuild installs today and the next reconcile moves it to the declared mode. Use rc or nightly for next."
-              exit 1
-              ;;
-          esac
-          echo "next=true" >> "${GITHUB_OUTPUT}"
-          echo "==> Installing with spec.mode: ${MODE}."
-
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -213,21 +146,6 @@ jobs:
         with:
           ref: ${{ steps.resolve_target.outputs.commit_sha }}
           persist-credentials: false
-
-      # The scripts below are the candidate's, and a candidate older than
-      # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE: it would install
-      # `today` and the run would report `next` validated. Refused here, before
-      # the teardown, rather than discovered from the tests. Skipped unless
-      # the mode check passed `next`; every candidate installs today.
-      - name: Confirm the candidate can install the mode
-        if: steps.mode.outputs.next == 'true'
-        env:
-          MODE: ${{ inputs.mode }}
-        run: |
-          if [ ! -f scripts/release/platform_agent_mode.sh ]; then
-            echo "::error title=This candidate predates the mode input::The commit being deployed has no scripts/release/platform_agent_mode.sh, so its provisioning script would ignore mode '${MODE}' and install today. Re-run with rc_tag set to a commit at or after the one that added it, or with mode today."
-            exit 1
-          fi
 
       - name: Validate & Log Deployment Configuration Summary
         env:
@@ -288,11 +206,6 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           NAMESPACE: ${{ vars.NAMESPACE }}
-          # No PLATFORM_AGENT_MODE here. This step runs only on the long-lived
-          # environments, where the mode check refuses `next`, so the only values
-          # that could reach it render no key anyway. The reconcile path
-          # (reconcile-environment.yml) is the one that carries the key into a
-          # long-lived environment's install.env, from vars.PLATFORM_AGENT_MODE.
         run: |
           set -euo pipefail
           # The workspace here is the CANDIDATE's tree (see the checkout step
@@ -486,9 +399,6 @@ jobs:
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
-          # The input, under the installer's name for it. The script clears it
-          # for `today`, so uninstall.sh and install.sh inherit nothing new.
-          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}

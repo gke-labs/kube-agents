@@ -26,8 +26,9 @@
 # And one derived file whose source is NOT under config/:
 #   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
 #     renders, which the chart's quota preflight cannot compute for itself. It is summed
-#     from the operator's golden manifests for the default example CR (platformagent.yaml,
-#     and platformagent-next.yaml for what spec.mode: next adds), not from config/ and
+#     from the operator's settled golden manifest for the default example CR
+#     (platformagent-settled.yaml, the render once the bus is provisioned, which carries the
+#     hermes-bridge container, the provisioning Job and the A2A gateway), not from config/ and
 #     not from a live render, so the goldens are what you edit: change the operator, re-bless
 #     the goldens, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
@@ -51,7 +52,7 @@ readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
 readonly FOOTPRINT_GEN=scripts/generate_chart_footprint.py
-readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml
+readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml
 readonly FOOTPRINT_DST=charts/kube-agents/files/footprint.yaml
 
 check=false
@@ -283,7 +284,7 @@ if $check; then
   footprint_rc=0
   python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
   if [[ $footprint_rc -eq 1 ]]; then
-    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC or its next-mode sibling (see the diff above)." >&2
+    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
     echo "       Both are goldens, so re-bless them before syncing:" >&2
     echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
     echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
@@ -292,7 +293,7 @@ if $check; then
   elif [[ $footprint_rc -ne 0 ]]; then
     exit "$footprint_rc"
   fi
-  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC and its next-mode sibling."
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC."
 else
   echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
   echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."

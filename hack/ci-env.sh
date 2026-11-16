@@ -229,6 +229,12 @@ readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
 # wget's own read timeout, inside the exec's bound, so a monitor that accepts
 # and then stalls ends the read before the bound kills the exec.
 readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
+# The first bytes of each bus server's current log file, beside the tail the
+# component logs keep (A2A_DIAG_LOG_MAX_BYTES). The lane runs the bus at debug
+# (#5708), and a server's bring-up, where its meta group forms, is at the start
+# of a log a long run can push out of the tail. A log the kubelet rotated has
+# lost it; the file then says so (collect_a2a_nats_monitor).
+readonly A2A_DIAG_NATS_HEAD_MAX_BYTES=$((2 * 1024 * 1024))
 readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
@@ -1090,16 +1096,14 @@ start_replay_shadow_collector() {
   return 0
 }
 
-# ─── The replay lane: the cache, in every proxy pod, before any case ─────────
+# ─── The replay lane: the cache, fetched before any case ─────────────────────
 # A no-op unless EVAL_REPLAY_LANE=true. Downloads what recent
 # trusted nightlies selected from the shared cache (fetch_cache.py, into
 # REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS) and seeds
-# every live proxy pod with it (collect_shadow.py --seed-once; a pod draining
-# after a rollout is skipped); the collector then seeds any pod that replaces
-# one. Returns 1, with the reason, when there is nothing to replay, no live pod,
-# or a live pod did not take it: the lane would measure nothing,
-# so the caller stops before its cases. Call once AGENT_CLUSTER_CONTEXT is set,
-# before start_replay_shadow_collector.
+# no pod: seed_replay_lane_cache does that, after the lane's live arm.
+# Returns 1, with the reason, when there is nothing to replay: the lane would
+# measure nothing, so the caller stops before its cases. Call once
+# AGENT_CLUSTER_CONTEXT is set.
 prepare_replay_lane_cache() {
   # Every other run is the collector's to resolve, which only warns.
   [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
@@ -1123,6 +1127,22 @@ prepare_replay_lane_cache() {
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
   fi
+  echo "Replay lane: the cache is fetched; no proxy pod holds it until seed_replay_lane_cache."
+  return 0
+}
+
+# Seeds every live proxy pod with what prepare_replay_lane_cache fetched
+# (collect_shadow.py --seed-once; a pod draining after a rollout is skipped);
+# the collector then seeds any pod that replaces one. Until this runs, a
+# replay proxy's cache is empty, so every request misses and goes to the model:
+# the lane's live arm runs before it. A no-op when nothing was fetched (off the
+# lane, or a lane proxy not in replay mode). Returns 1, with the reason, when no
+# live pod ran or one did not take the cache. Call before
+# start_replay_shadow_collector.
+seed_replay_lane_cache() {
+  [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
+  [ -n "${REPLAY_LANE_SEED_DIR:-}" ] || return 0
+  local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   local args=(
     --namespace "${namespace}" --selector "${REPLAY_SHADOW_POD_SELECTOR}" --container "${REPLAY_SHADOW_CONTAINER}"
     --bucket "${REPLAY_SHADOW_BUCKET}" --kind "${REPLAY_SHADOW_KIND}" --build "${REPLAY_SHADOW_BUILD}"
@@ -1386,8 +1406,10 @@ collect_a2a_component_logs() {
 
 # collect_a2a_nats_monitor reads one bus server's monitoring endpoints
 # (A2A_DIAG_NATS_MONITOR_PATHS) from inside its pod, one file each:
-# <base>-<path>.json. Same contract as its caller: every command ends in
-# `|| true`, so a server that doesn't answer leaves the error in its file.
+# <base>-<path>.json, and the head of its server log, <base>-head.log
+# (A2A_DIAG_NATS_HEAD_MAX_BYTES). Same contract as its caller: every command
+# ends in `|| true`, so a server that doesn't answer leaves the error in its
+# file.
 collect_a2a_nats_monitor() {
   local artifact_dir="$1" prefix="$2" ns="$3" pod="$4" base="$5"
   shift 5
@@ -1400,6 +1422,15 @@ collect_a2a_nats_monitor() {
       wget -qO- -T "${A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS}" "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
       | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
   done
+  "${kctl[@]}" logs "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
+    --limit-bytes="${A2A_DIAG_NATS_HEAD_MAX_BYTES}" \
+    >"${artifact_dir}/${prefix}${base}-head.log" 2>&1 || true
+  # kubectl serves the container's current log file only, which the kubelet
+  # rotates at 10Mi: past a rotation the head is the newest file's start, not
+  # the bring-up. Say so in the file rather than let it pass for one.
+  grep -q "Starting nats-server" "${artifact_dir}/${prefix}${base}-head.log" 2>/dev/null \
+    || echo "# no 'Starting nats-server' line: the log rotated, or the read failed; this is not the server's bring-up" \
+      >>"${artifact_dir}/${prefix}${base}-head.log" || true
   return 0
 }
 

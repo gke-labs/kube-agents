@@ -170,6 +170,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	auditReportStoreURLEnv:       true,
 	auditReportStoreTokenFileEnv: true,
 	auditReportProfilesEnv:       true,
+	// The A2A gateway's Chat relay settings: the exec tier runs no relay, and
+	// a subscription change must not roll every exec replica.
+	a2aGoogleChatSubscriptionEnvVar:      true,
+	credentialProxyA2AChatAudienceEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

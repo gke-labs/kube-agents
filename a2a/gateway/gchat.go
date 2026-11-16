@@ -695,6 +695,9 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 	if !gchatIsSpaceName(space) {
 		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
 	}
+	if m.Chat == nil && a.rates(m) {
+		return a.createRatedText(space, thread, m)
+	}
 	if m.Chat == nil {
 		return a.PostNotify(space, thread, m.Text)
 	}
@@ -704,9 +707,10 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 // createLaidOut lays m.Chat out and creates it in space, as a reply on
 // thread when one is given, records the layout it sent (gchat_layout.go),
 // and remembers the question when it carries choices, bound to
-// conversation (empty for a home post). A rated answer in a conversation
-// ends with the rating buttons; when Chat refuses that layout it is created
-// once more without them, and that outcome is returned and recorded.
+// conversation (empty for a home post). A rated message (an answer in a
+// conversation, or a post the agent made on its own in the home space) ends
+// with the rating buttons, after its own; when Chat refuses that layout it is
+// created once more without them, and that outcome is returned and recorded.
 func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
 	layout, err := renderGchatChat(m.Chat)
 	if err != nil {
@@ -716,7 +720,7 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 		layout = gchatHomeButtons(layout)
 	}
 	var rating gchatRating
-	if conversation != "" && a.rates(m) {
+	if a.rates(m) {
 		rating.task = m.Feedback
 	}
 	rated := layout
@@ -839,6 +843,17 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 	if m.Stop != "" {
 		layout = gchatStopButtons(layout, conversation, m.Stop)
 	}
+	// A rated message (a home alert its triage rewrites) keeps its rating
+	// buttons after its own, as last rated; answeredLayout has already put
+	// them back on an answered question.
+	unrated, rating := layout, gchatRating{}
+	if a.rates(m) && !gchatHasRating(layout.Widgets) {
+		rating = a.ratingOf(messageID)
+		if rating.task == "" {
+			rating = gchatRating{task: m.Feedback}
+		}
+		layout.Widgets = gchatWithRating(layout.Widgets, rating)
+	}
 	patch := func(layout gchatChatLayout) error {
 		return a.apiCall([]string{"spaces", "messages"}, "patch", map[string]any{
 			"name":       messageID,
@@ -847,6 +862,16 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 		}, nil)
 	}
 	err := patch(layout)
+	if err != nil && rating.task != "" && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
+		// The rating buttons must not cost the edit its layout: the same
+		// layout once more without them, under the same lock.
+		a.log.Warn("gchat: a rated edit was refused; patching it without the rating buttons", "conversation", conversation, "err", err)
+		layout, rating = unrated, gchatRating{}
+		err = patch(layout)
+	}
+	if err == nil && rating.task != "" {
+		a.rememberRatingIfAbsent(messageID, rating)
+	}
 	if err != nil && m.Stop != "" && m.Chat == nil && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
 		// The text line once more without the button, under the same
 		// lock: a second entry here would wait on it for good.

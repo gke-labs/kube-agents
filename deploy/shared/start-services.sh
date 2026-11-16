@@ -1257,9 +1257,9 @@ start_drift_detector() {
 # listener reads the cluster JWKS with. Not the platform-agent container: that
 # one holds only audience-bound tokens (docs/security-requirements.md).
 #
-# On only where the operator says so, which it does under `mode: next` alone,
-# and only with exactly `1`: off is the ordinary state on every today install,
-# so it is silent. Supervised and restarted in place like the watcher, and like
+# On only where the operator says so, which it does on every install that
+# renders the store (with the A2A stack), and only with exactly `1`: off is the
+# state under an operator that predates the store, so it is silent. Supervised and restarted in place like the watcher, and like
 # it not on the credential path, so its exit never ends the container. It logs
 # to the container's stderr with the other supervised processes.
 readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5

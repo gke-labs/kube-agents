@@ -167,8 +167,9 @@ class BudgetRenderTest(unittest.TestCase):
         # LiteLLM treats a budget_limit of 0 as no limit, so a ceiling that
         # would render as one is refused rather than silently lifted. The
         # schema's floor (0.01) keeps this out of reach up to 100 replicas;
-        # beyond that the render is the backstop.
-        self._fails(_VERTEX_VALUES + "  replicaCount: 1000\n  budget:\n    usd: 0.01\n", "under 0.0001 USD per replica")
+        # beyond that the render is the backstop. The PlatformAgent render is
+        # off here: with it on, 1000 replicas trip the chart-pods cap first.
+        self._fails(_VERTEX_VALUES + "  replicaCount: 1000\n  budget:\n    usd: 0.01\nplatformAgent:\n  enabled: false\n", "under 0.0001 USD per replica")
 
     def test_the_floor_renders_and_below_it_the_schema_refuses_before_the_render(self) -> None:
         # A cent, the least a ceiling can be when it is on; the installer and

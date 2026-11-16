@@ -680,7 +680,9 @@ the TASKS budget counts its workers from the first `next` render, so the mode ch
 change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
 Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step waits for the
+step gates both rolls. On an operator that renders the A2A stack whatever the mode, both rolls
+come before the deploy's first web console check, which waits for the second (#5962), and these
+gates then pass at once. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
 console under `next` (the same read routes and chat turn the deploy gated under `today`, through
@@ -755,8 +757,8 @@ listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking 
 the batch runs Tide started, the main nightly's eight parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
 `ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
-under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
+under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+install gets, the replay lane (`ci-kube-agents-eval-replay-lane`) and the Slack lane's nightly (`ci-kube-agents-eval-nightly-slack`)), and refuses it on any other Prow run, so the flag mis-set on another periodic or
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the

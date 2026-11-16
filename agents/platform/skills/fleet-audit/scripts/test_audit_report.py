@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 import audit_report  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import no_live_google_auth  # noqa: E402
 import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
 import vcs_broker  # noqa: E402
@@ -64,15 +65,28 @@ def setUpModule():
     # the module.
     global _NO_KUBECTL
     _NO_KUBECTL = no_live_kubectl.install()
+    # Nor does one load google.auth. The collectors that this module starts as child processes
+    # open a Cloud Monitoring session with `google.auth.default()`. In a child that has the
+    # library, the guard's variable makes that fail at once; a child without it fails at the import.
+    global _NO_GOOGLE_AUTH
+    _NO_GOOGLE_AUTH = no_live_google_auth.install()
 
 
 def tearDownModule():
-    _NO_KUBECTL.uninstall()
+    try:
+        _NO_GOOGLE_AUTH.uninstall()
+    finally:
+        _NO_KUBECTL.uninstall()
 
 
 class TestNoLiveKubectl(unittest.TestCase):
     def test_no_test_in_this_module_can_reach_a_cluster(self):
         no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
+
+
+class TestNoLiveGoogleAuth(unittest.TestCase):
+    def test_no_test_in_this_module_can_load_google_auth(self):
+        no_live_google_auth.assert_in_force(self, _NO_GOOGLE_AUTH)
 
 
 def skill_text() -> str:
@@ -23397,6 +23411,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with self.subTest(attempt=attempt):
                 self.assertEqual(self.run_finish(make_doc()), 2)
                 self.assertIn("their fix is not written", self.err)
+                self.assertNotIn("Writing a fix opens nothing", self.err, "only the sweep-off refusal says it")
                 self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
                 self.assertFalse(self.harness.forge_calls("issue-create"))
         self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 0, self.err)
@@ -23418,6 +23433,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
                 self.assertEqual(self.run_finish(doc), 2)
                 self.assertIn("need their fix written before a `/remediate`", self.err)
+                # Writing the fix is not an ask to open it (#2953): a worker wrote three
+                # and then ran `remediate` on them.
+                self.assertIn("Writing a fix opens nothing unless a person's `/remediate` already asks for it", self.err)
                 self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
                 self.touch(doc["findings"][0]["remediation"]["path"])
                 self.assertEqual(self.run_finish(doc), 0, self.err)
@@ -29443,6 +29461,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("Read these before asking", body)
         self.assertIn(f"`{derived_id()}`", body)
         self.assertIn("the sweep will not open a pull request", self.err)
+        # Addressed to a person: the worker reads this line too (#2953).
+        self.assertIn("wants one comments `/remediate " + derived_id() + "`; never you.", self.err)
 
     def test_a_triage_marked_critical_is_published_but_not_auto_promoted(self):
         self.promotion_replies()

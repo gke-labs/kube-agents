@@ -22,7 +22,7 @@ two documents of `role.yaml` by what they do:
   verbs on a managed `ClusterRole`.
 - `ensureKubeProxyTLSSecret` needs `create` and `update` to manage the
   `<agent>-kube-proxy-tls` Secret on every install.
-- The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
+- The A2A render needs `create`/`update`/`patch`/`delete`. The
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
   `today`; all of them are owner-referenced to the `PlatformAgent`.
@@ -44,7 +44,7 @@ Every other namespaced kind the operator renders is split the same way
 ClusterRole for the informers and for escalation prevention, the writes are the
 Role document, and the Role document names exactly that set. The Role is bound
 in the install namespace on both delivery paths and in the profile namespace
-(`<install namespace>-profiles`) as well: by the chart under `mode: next`, and
+(`<install namespace>-profiles`) as well: by the chart on every install, and
 by `k8s-operator/config/profiles` on the kustomize path, whose `role.yaml` is a
 copy of the Role document that `make chart-sync` writes and this file holds to
 the source.
@@ -65,10 +65,11 @@ this file replaces: it pins the verb set of each document and the two
 `+kubebuilder:rbac` markers, forbids controller `Secret` list/watch calls, and
 fails if the Trivy exemption widens past those two directories.
 
-`charts/kube-agents/templates/operator-rbac.yaml` is not read here: both of its
-generated blocks are spliced from `role.yaml` by `hack/sync-chart-manifests.sh`,
-and `make chart-check` is what holds the two together. The conformance suite's
-C5 test reads the chart as well.
+`charts/kube-agents/templates/operator-rbac.yaml` is read rendered (`helm
+template`), never as text: its generated blocks are spliced from `role.yaml` by
+`hack/sync-chart-manifests.sh`, `make chart-check` holds the two together, and
+the tests here that render the chart are skipped where `helm` is not installed.
+The conformance suite's C5 test reads the chart rendered as well.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_operator_secrets_grant.py' -v
@@ -117,12 +118,11 @@ SECRETS_MISCONFIG_ID = "KSV-0041"
 INSTALL_NAMESPACE = "kubeagents-system"
 KUSTOMIZE_DEFAULT_DIR = REPO_ROOT / "k8s-operator" / "config" / "default"
 # The profile namespace and the kustomization that renders the Role copy there;
-# the chart renders the same under mode next.
+# the chart renders the same on every install.
 PROFILE_NAMESPACE_SUFFIX = "-profiles"
 PROFILE_NAMESPACE = INSTALL_NAMESPACE + PROFILE_NAMESPACE_SUFFIX
 KUSTOMIZE_PROFILES_DIR = REPO_ROOT / "k8s-operator" / "config" / "profiles"
 PROFILE_ROLE_COPY = KUSTOMIZE_PROFILES_DIR / "role.yaml"
-HELM_MODE_NEXT_SETS = ["--set", "platformAgent.mode=next"]
 # Every namespaced kind the operator renders, as (apiGroup, resource). The Role
 # document names exactly this set and the ClusterRole grants no write verb on
 # any of it; every kind's reads stay in the ClusterRole (the informers,
@@ -162,6 +162,76 @@ NAMESPACED_VERBS_BY_KIND = {
     (CORE_API_GROUP, "events"): frozenset({"create", "patch"}),
     (CORE_API_GROUP, "podtemplates"): frozenset({"create"}),
 }
+# The custom resources' verbs on the ClusterRole, each write verb with the
+# code that calls it. A verb with no caller is a grant the operator never
+# uses, and on a cluster-scoped grant that is authority over every namespace
+# for nothing: `create` and `delete` on `platformagents` were that until this
+# table. The reads are kept whole: `list` and `watch` feed the informers and
+# `get` is the read half of every kind the controller writes or watches, kept
+# where nothing sends a GET today (the status subresources, agentplugins,
+# agentprofiles) and named here so a reader does not go looking for a caller.
+# `tiers` is left to its own owner.
+#
+#   platformagents            get: the uncached reads (r.APIReader.Get in
+#                             platformagent_controller.go, podReader in
+#                             platformagent_a2a_bus_streams.go, a2aReader in
+#                             agentprofile_namespace.go); list/watch: the For()
+#                             informer and the Lists outside it (the webhook's,
+#                             the usage poller's, the bus-stream check's, the
+#                             profile reconciler's); update: the
+#                             finalizer (AddFinalizer/RemoveFinalizer with
+#                             r.Update); patch: the bus-stream annotation
+#                             merge patch (platformagent_a2a_bus_streams.go).
+#   platformagents/status     update/patch: Status().Update and Status().Patch
+#                             across the reconcilers; get/list/watch:
+#                             escalation prevention, because
+#                             buildPlatformLocalRole grants the agent's local
+#                             Role get/list/watch on platformagents and
+#                             platformagents/status, and the API server
+#                             refuses a Role whose grantor does not hold every
+#                             verb in it (a grant on the resource does not
+#                             cover the subresource).
+#   platformagents/finalizers update: SetControllerReference sets
+#                             blockOwnerDeletion on every rendered object, and
+#                             the API server's owner-references admission
+#                             requires it on the owner's finalizers.
+#   agentplugins              list/watch: the Watches() informer and two
+#                             Lists in platformagent_controller.go; get: the
+#                             read half (no Get of a plugin is sent).
+#   agentplugins/status       patch: Status().Patch (the plugin conditions);
+#                             get: the read half.
+#   agentprofiles             list/watch: the For() informer and the identity
+#                             map's List; get: the read half (the reconciler's
+#                             Get is served by the informer; its uncached
+#                             reader reads ServiceAccounts only); patch:
+#                             patchFinalizers' merge patch (an Update would
+#                             drop spec fields a newer CRD added).
+#   agentprofiles/status      update: Status().Update (writeStatus); get: the
+#                             read half.
+#   (no agentprofiles/finalizers: nothing the operator renders carries an
+#                             owner reference to a profile, the profile's
+#                             ServiceAccounts carry labels only and outlive
+#                             it, and the finalizer is a field of the main
+#                             resource written by the merge patch above.)
+CR_API_GROUP = "kubeagents.x-k8s.io"
+CR_VERBS_BY_RESOURCE = {
+    "platformagents": frozenset({"get", "list", "watch", "update", "patch"}),
+    "platformagents/status": frozenset({"get", "list", "watch", "update", "patch"}),
+    "platformagents/finalizers": frozenset({"update"}),
+    "agentplugins": frozenset({"get", "list", "watch"}),
+    "agentplugins/status": frozenset({"get", "patch"}),
+    "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
+    "agentprofiles/status": frozenset({"get", "update"}),
+}
+# Subresources the ClusterRole must not name at all: a row here with any verb
+# is a grant with no caller (see the table's note on agentprofiles/finalizers).
+CR_RESOURCES_WITHOUT_A_GRANT = frozenset({"agentprofiles/finalizers"})
+# The other kubeagents.x-k8s.io resources the ClusterRole names, outside this
+# table: the Tier CRD's (its owner's grant; `tiers/status` `patch` has no
+# caller today) and the dispatcher's params, whose reads stay cluster-wide
+# (see the markers). A new CRD's marker lands here or in the table, so a
+# grant nobody has classified is red rather than unexamined.
+CR_RESOURCES_OUTSIDE_THE_TABLE = frozenset({"tiers", "tiers/status", "dispatchjobtemplates"})
 # The kustomize deploy recipe: config/profiles is applied after config/default
 # and a failed first apply fails the target. The profile namespace's
 # release-namespace annotation is the install namespace, which the operator
@@ -351,21 +421,26 @@ class OperatorSecretsGrantTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_to_the_operator_on_both_delivery_paths(self):
-        # The Role's verbs are pinned above; this pins that something binds it,
-        # in the install namespace alone on a stock render.
-        for path, documents in (("helm", _render_helm()), ("kustomize", _render_kustomize())):
+        # The Role's verbs are pinned above; this pins that something binds it.
+        # A stock chart render creates the profile namespace and binds the Role
+        # there too; the kustomize default directory covers the install
+        # namespace alone (config/profiles adds the other, below).
+        for path, documents, namespaces in (
+            ("helm", _render_helm(), {INSTALL_NAMESPACE, PROFILE_NAMESPACE}),
+            ("kustomize", _render_kustomize(), {INSTALL_NAMESPACE}),
+        ):
             with self.subTest(path=path):
-                self._assert_role_bound_in(path, documents, {INSTALL_NAMESPACE})
+                self._assert_role_bound_in(path, documents, namespaces)
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_in_the_profile_namespace_too(self):
-        # Under mode next the chart creates the profile namespace and renders
+        # The chart creates the profile namespace on every install and renders
         # the Role and its binding there as well; the kustomize path's
         # config/profiles does the same beside config/default. The subject is
         # still the operator's ServiceAccount in the install namespace.
         both = {INSTALL_NAMESPACE, PROFILE_NAMESPACE}
         for path, documents in (
-            ("helm", _render_helm(*HELM_MODE_NEXT_SETS)),
+            ("helm", _render_helm()),
             ("kustomize", _render_kustomize(KUSTOMIZE_DEFAULT_DIR, KUSTOMIZE_PROFILES_DIR)),
         ):
             with self.subTest(path=path):
@@ -412,6 +487,53 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         self.assertEqual("Namespace", namespace.get("kind"))
         self.assertEqual(INSTALL_NAMESPACE, (namespace.get("metadata", {}).get("annotations") or {}).get(RELEASE_NAMESPACE_ANNOTATION))
         self.assertEqual(PROFILE_COMPONENT, (namespace.get("metadata", {}).get("labels") or {}).get(PROFILE_COMPONENT_LABEL))
+
+    def _assert_custom_resource_verbs_have_callers(self, source: str, cluster_roles: list[dict]) -> None:
+        # Per resource, the union over every ClusterRole rule that names it:
+        # equal to the table, so a verb added without a caller (or a caller's
+        # verb dropped) is red here. The Go parity test holds role.yaml to the
+        # self-check list; this holds the grant to the code that uses it.
+        with self.subTest(source=source):
+            self.assertEqual(1, len(cluster_roles), f"{source}: expected one operator ClusterRole")
+            rules = cluster_roles[0].get("rules") or []
+            for resource, want in sorted(CR_VERBS_BY_RESOURCE.items()):
+                with self.subTest(source=source, resource=resource):
+                    verbs = {
+                        verb
+                        for rule in rules
+                        if CR_API_GROUP in (rule.get("apiGroups") or []) and resource in (rule.get("resources") or [])
+                        for verb in (rule.get("verbs") or [])
+                    }
+                    self.assertEqual(want, verbs)
+            for resource in sorted(CR_RESOURCES_WITHOUT_A_GRANT):
+                with self.subTest(source=source, resource=resource):
+                    self.assertFalse(
+                        [rule for rule in rules if CR_API_GROUP in (rule.get("apiGroups") or []) and resource in (rule.get("resources") or [])],
+                        f"{source}: {resource} is granted and nothing calls it",
+                    )
+            named = {
+                resource
+                for rule in rules
+                if CR_API_GROUP in (rule.get("apiGroups") or [])
+                for resource in (rule.get("resources") or [])
+            }
+            self.assertEqual(
+                set(CR_VERBS_BY_RESOURCE) | CR_RESOURCES_OUTSIDE_THE_TABLE,
+                named,
+                f"{source}: a kubeagents.x-k8s.io resource on the ClusterRole is not classified in this test",
+            )
+
+    def test_each_custom_resource_verb_on_the_cluster_role_has_a_caller(self):
+        self._assert_custom_resource_verbs_have_callers("role.yaml", [_cluster_role(self)])
+
+    @unittest.skipUnless(shutil.which("helm"), "helm needed")
+    def test_each_custom_resource_verb_on_the_charts_cluster_role_has_a_caller(self):
+        # The chart's copy is spliced from role.yaml, so this is the same
+        # assertion on the rendered form; make chart-check holds the splice.
+        self._assert_custom_resource_verbs_have_callers(
+            "helm",
+            [d for d in _render_helm() if d.get("kind") == CLUSTER_ROLE_KIND and d["metadata"]["name"].endswith("operator-role")],
+        )
 
     def test_the_cluster_role_grants_no_write_verb_on_a_namespaced_kind(self):
         # The general form of the Secret invariant: every kind the operator
