@@ -264,16 +264,16 @@ operatorRenderedPerReplica:
     pods: 1
   sessionPod:
     requests:
-      cpu: 250m
-      memory: 512Mi
+      cpu: 150m
+      memory: 320Mi
       ephemeral-storage: 1088Mi
     limits:
       cpu: "2"
       memory: 2Gi
       ephemeral-storage: 1088Mi
-    cpuMillisRequest: 250
+    cpuMillisRequest: 150
     cpuMillisLimit: 2000
-    memoryBytesRequest: 536870912
+    memoryBytesRequest: 335544320
     memoryBytesLimit: 2147483648
     ephemeralStorageBytesRequest: 1140850688
     ephemeralStorageBytesLimit: 1140850688

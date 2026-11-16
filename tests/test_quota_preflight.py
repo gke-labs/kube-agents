@@ -459,12 +459,12 @@ class PreflightDecisionTest(unittest.TestCase):
         for key, field in self._SESSION_KEYS.items():
             with self.subTest(key=key):
                 self.assertEqual(req[key], pod["maxSessionsDefault"] * pod[field])
-        # The figures the gateway runs today (spawn.go): 250m and 512Mi requested, 2 CPU
-        # and 2Gi limits, 1088Mi ephemeral, ten at once. A footprint that stopped reading
-        # them would move both sides of the loop above; this pins the numbers.
-        self.assertEqual(req["sessionRequestsCpu"], 10 * 250)
+        # The operator's defaults (DefaultSession* in api/v1alpha1): 150m and 320Mi
+        # requested, 2 CPU and 2Gi limits, 1088Mi ephemeral, ten at once. A footprint that
+        # stopped reading them would move both sides of the loop above; this pins them.
+        self.assertEqual(req["sessionRequestsCpu"], 10 * 150)
         self.assertEqual(req["sessionLimitsCpu"], 10 * 2000)
-        self.assertEqual(req["sessionRequestsMemory"], 10 * 512 * 1024**2)
+        self.assertEqual(req["sessionRequestsMemory"], 10 * 320 * 1024**2)
         self.assertEqual(req["sessionLimitsMemory"], 10 * 2 * 1024**3)
         self.assertEqual(req["sessionRequestsEphemeral"], 10 * 1088 * 1024**2)
 
@@ -481,11 +481,11 @@ class PreflightDecisionTest(unittest.TestCase):
         base = self._requirements(["platformAgent.harness.tuning.maxSessions=4"])
         req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
             "maxSessions": 4,
-            "sessionResources": {"requests": {"cpu": "150m", "memory": "256Mi"},
+            "sessionResources": {"requests": {"cpu": "100m", "memory": "256Mi"},
                                  "limits": {"cpu": "1", "memory": None}},
         }}}})
-        self.assertEqual(req["sessionRequestsCpu"] - base["sessionRequestsCpu"], 4 * (150 - 250))
-        self.assertEqual(req["sessionRequestsMemory"] - base["sessionRequestsMemory"], 4 * (256 - 512) * 1024**2)
+        self.assertEqual(req["sessionRequestsCpu"] - base["sessionRequestsCpu"], 4 * (100 - 150))
+        self.assertEqual(req["sessionRequestsMemory"] - base["sessionRequestsMemory"], 4 * (256 - 320) * 1024**2)
         self.assertEqual(req["sessionLimitsCpu"] - base["sessionLimitsCpu"], 4 * (1000 - 2000))
         # A null leaf is unset, so the default stands; ephemeral storage is not overridable.
         self.assertEqual(req["sessionLimitsMemory"], base["sessionLimitsMemory"])
@@ -501,6 +501,26 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["sessionRequestsMemory"], 2 * 256 * 1024**2)
         self.assertEqual(req["sessionLimitsCpu"], 2 * 100)
         self.assertEqual(req["sessionRequestsCpu"], 2 * 100)
+
+    def test_on_autopilot_the_share_is_at_autopilots_per_pod_minimums(self) -> None:
+        """Autopilot admits the pod at 250m and 512Mi at least, limits equal to requests,
+        and the quota counts what it admits."""
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        req = self._requirements(["platformAgent.harness.tuning.maxSessions=2"], extra_args=autopilot)
+        self.assertEqual(req["sessionRequestsCpu"], 2 * 250)
+        self.assertEqual(req["sessionRequestsMemory"], 2 * 512 * 1024**2)
+        self.assertEqual(req["sessionLimitsCpu"], req["sessionRequestsCpu"])
+        self.assertEqual(req["sessionLimitsMemory"], req["sessionRequestsMemory"])
+        # A request above the minimums rounds up to a multiple of 250m and keeps its memory.
+        big = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 2,
+            "sessionResources": {"requests": {"cpu": "300m", "memory": "1Gi"}},
+        }}}}, extra_args=autopilot)
+        self.assertEqual(big["sessionRequestsCpu"], 2 * 500)
+        self.assertEqual(big["sessionRequestsMemory"], 2 * 1024**3)
+        # Off Autopilot the configured request stands.
+        std = self._requirements(["platformAgent.harness.tuning.maxSessions=2"])
+        self.assertEqual(std["sessionRequestsCpu"], 2 * self._session_pod()["cpuMillisRequest"])
 
     def test_the_session_share_stays_out_of_the_totals_while_the_gate_is_off(self) -> None:
         """kube-agents.quotaCountsSessions is false: the share is reported, not compared."""
@@ -527,6 +547,27 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(total=total):
                 self.assertGreater(on[key], 0)
                 self.assertEqual(on[total] - off[total], on[key])
+
+    def test_the_refusal_names_the_session_share_only_when_the_totals_carry_it(self) -> None:
+        quota = {"probe": {"quotas": [{"metadata": {"name": "tight"}, "spec": {"hard": {"pods": "2"}}}]}}
+        sets = ["platformAgent.harness.tuning.maxSessions=6"]
+        off = self._render(quota, sets)
+        self.assertNotEqual(off.returncode, 0)
+        self.assertNotIn("session pods at the cap", off.stderr)
+        gate = self.chart / "templates" / "_0-session-gate.tpl"
+        gate.write_text('{{- define "kube-agents.quotaCountsSessions" -}}\ntrue\n{{- end }}\n')
+        try:
+            on = self._render(quota, sets)
+            autopilot = self._render(quota, sets, ["--api-versions", _AUTOPILOT_API])
+        finally:
+            gate.unlink()
+        pod = self._session_pod()
+        self.assertIn(
+            f"required includes the session pods at the cap: 6 pods, {6 * pod['cpuMillisRequest']}m CPU"
+            f" and {6 * pod['memoryBytesRequest'] // 1024**2}Mi memory requested", on.stderr)
+        self.assertNotIn("Autopilot", on.stderr)
+        self.assertIn("6 pods, 1500m CPU and 3072Mi memory requested", autopilot.stderr)
+        self.assertIn("GKE Autopilot's per-Pod minimums", autopilot.stderr)
 
     def test_a_footprint_without_the_session_pod_fails_the_render(self) -> None:
         footprint = self.chart / "files" / "footprint.yaml"

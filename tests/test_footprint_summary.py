@@ -191,11 +191,12 @@ class FootprintSummaryTest(unittest.TestCase):
         """#6028: the session line gives the share at maxSessions from the same requirements."""
         notes, req = self._render()
         self.assertIn(
-            "At the cap of 10 they request 2.500 cores and 5.00 GiB over 10 pods,"
+            "At the cap of 10 they request 1.500 cores and 3.12 GiB over 10 pods,"
             " which a namespace ResourceQuota needs room for too.", notes)
+        self.assertNotIn("Autopilot's per-Pod minimums", notes)
         notes, req = self._render(["platformAgent.harness.tuning.maxSessions=4"])
-        self.assertEqual(req["sessionRequestsCpu"], 4 * 250)
-        self.assertIn("At the cap of 4 they request 1.000 cores and 2.00 GiB over 4 pods", notes)
+        self.assertEqual(req["sessionRequestsCpu"], 4 * 150)
+        self.assertIn("At the cap of 4 they request 0.600 cores and 1.25 GiB over 4 pods", notes)
 
     def test_the_summary_names_what_it_leaves_out(self) -> None:
         notes, req = self._render()

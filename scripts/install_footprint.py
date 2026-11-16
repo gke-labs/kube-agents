@@ -379,13 +379,18 @@ def _session_share_sentence() -> str:
     """The session pods at the default cap, from the same render as the totals."""
     default = next(p for p in PROFILES if p.key == "standard")
     r = run_probe(default)["requirements"]
+    a = run_probe(next(p for p in PROFILES if p.autopilot))["requirements"]
     return (
         f"The session pods at the default cap of {r['maxSessions']} add {r['sessionPods']} pods,"
         f" {cpu(r['sessionRequestsCpu'])} CPU and {memory(r['sessionRequestsMemory'])} memory requested,"
         f" {cpu(r['sessionLimitsCpu'])} CPU and {memory(r['sessionLimitsMemory'])} memory in limits, and"
         f" {memory(r['sessionRequestsEphemeral'])} of ephemeral storage: one `a2a-worker` row below per"
         " session. A namespace ResourceQuota needs room for them on top of the totals, and"
-        " `spec.harness.tuning.maxSessions` scales them."
+        " `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting,"
+        " Autopilot admits each pod at its per-Pod minimums where those exceed the request, with"
+        f" limits equal to requests: {cpu(a['sessionRequestsCpu'])} CPU and"
+        f" {memory(a['sessionRequestsMemory'])} memory at the same cap, the figures the quota preflight"
+        " uses on Autopilot."
     )
 
 
