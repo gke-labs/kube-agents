@@ -285,6 +285,9 @@ func TestTheLeverEnqueuesThePlatformAgent(t *testing.T) {
 	if !p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: set}) {
 		t.Error("setting the lever didn't pass the predicate")
 	}
+	if !p.Update(event.UpdateEvent{ObjectOld: set, ObjectNew: old}) {
+		t.Error("removing the lever didn't pass the predicate")
+	}
 	if p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: other}) {
 		t.Error("an unrelated annotation passed the predicate")
 	}
@@ -310,6 +313,18 @@ func TestTheProfilePassComesBackSoonWhileTheLeverIsSet(t *testing.T) {
 	res := h.reconcile(agent.Namespace, "tse")
 	if res.RequeueAfter == 0 || res.RequeueAfter > endTierDrainRecheck {
 		t.Errorf("RequeueAfter %s with the lever set, want at most %s", res.RequeueAfter, endTierDrainRecheck)
+	}
+}
+
+// A profile no PlatformAgent serves never reaches the consume, so the lever
+// on it doesn't poll every endTierDrainRecheck: it waits for the resync.
+func TestAnUnboundProfileWithTheLeverDoesNotPoll(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	is := testAgentProfile("kubeagents-system", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} }, withEndTierDrain("oncall"))
+	h := newProfileHarness(t, &is)
+	res := h.reconcile(is.Namespace, "tse")
+	if res.RequeueAfter > 0 && res.RequeueAfter <= endTierDrainRecheck {
+		t.Errorf("RequeueAfter %s on an unbound profile, want no lever recheck", res.RequeueAfter)
 	}
 }
 

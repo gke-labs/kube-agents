@@ -145,29 +145,40 @@ type AgentProfileReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
+// profilePass is what one pass learns that decides when the next one runs.
+type profilePass struct {
+	// drainEnd is the earliest end of a tier this profile drains; zero for
+	// none.
+	drainEnd time.Time
+	// leverPending is set when the end-tier-drain annotation outlived the
+	// pass's consumeEndTierDrain: the applied dispatch config doesn't carry
+	// the end yet, or the patch lost a conflict.
+	leverPending bool
+}
+
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var drainEnd time.Time
-	res, err := r.reconcile(ctx, req, &drainEnd)
+	var pass profilePass
+	res, err := r.reconcile(ctx, req, &pass)
 	if err != nil {
 		return res, err
 	}
 	// A tier this profile drains is torn down (its ServiceAccounts and
 	// durables) by the first pass after its end, and nothing watched moves
 	// when the end passes: come back just after it (#3659, #5850).
-	if !drainEnd.IsZero() {
-		wait := max(time.Until(drainEnd)+time.Second, time.Second)
+	if !pass.drainEnd.IsZero() {
+		wait := max(time.Until(pass.drainEnd)+time.Second, time.Second)
 		if res.RequeueAfter == 0 || res.RequeueAfter > wait {
 			res.RequeueAfter = wait
 		}
 	}
 	// The end-tier-drain lever is consumed once the applied dispatch config
 	// carries it (consumeEndTierDrain), and nothing this controller watches
-	// moves when that config is written. Come back soon while it is set, so
-	// the entry is consumed within the drain's grace rather than at the next
-	// resync, after the tier has gone (#5850).
-	var p agentv1alpha1.AgentProfile
-	if r.Get(ctx, req.NamespacedName, &p) == nil && p.DeletionTimestamp == nil && p.Annotations[endTierDrainAnnotation] != "" {
+	// moves when that config is written. Come back soon while it is pending,
+	// so the entry is consumed within the drain's grace rather than at the
+	// next resync, after the tier has gone (#5850). A pass that never reached
+	// the consume (an unbound profile, a finalizer pass) doesn't poll.
+	if pass.leverPending {
 		if res.RequeueAfter == 0 || res.RequeueAfter > endTierDrainRecheck {
 			res.RequeueAfter = endTierDrainRecheck
 		}
@@ -175,7 +186,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return res, nil
 }
 
-func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request, drainEnd *time.Time) (ctrl.Result, error) {
+func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request, pass *profilePass) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// The namespace-only request SetupWithManager sends when a PlatformAgent
@@ -230,8 +241,8 @@ func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request
 	}
 	verdict := verdicts[profile.Name]
 	for _, until := range verdict.draining {
-		if drainEnd.IsZero() || until.Before(*drainEnd) {
-			*drainEnd = until
+		if pass.drainEnd.IsZero() || until.Before(pass.drainEnd) {
+			pass.drainEnd = until
 		}
 	}
 	// The end-tier-drain lever, consumed once the applied dispatch config
@@ -239,6 +250,7 @@ func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request
 	if err := r.consumeEndTierDrain(ctx, &profile, verdict); err != nil {
 		return ctrl.Result{}, err
 	}
+	pass.leverPending = profile.Annotations[endTierDrainAnnotation] != ""
 	bound, err := withoutForeignServiceAccounts(ctx, r.Client, renderable)
 	if err != nil {
 		return ctrl.Result{}, err
