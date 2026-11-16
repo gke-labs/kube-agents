@@ -20,10 +20,11 @@ agents/platform/scripts/session_kv_server.py _FixPullRequestLookupPool.__init__ 
 # pool with a bounded queue) is the pattern for this one.
 agents/platform/scripts/session_kv_server.py _fetch_ledger_issue 1
 
-# One executor of CARD_STOP_PARALLEL workers per stop request, left to finish
-# stragglers after the answer; per request, so the count grows with callers.
-# #4331 owns the KV server's per-request threads.
-agents/platform/scripts/session_kv_server.py stop_session_cards 1
+# One executor of CARD_STOP_PARALLEL workers per stop that scans (the route's
+# body, _stop_session_cards_now; a call that joins a running stop starts none),
+# left to finish stragglers after the answer; per scanning request, so the count
+# grows with callers. #4331 owns the KV server's per-request threads.
+agents/platform/scripts/session_kv_server.py _stop_session_cards_now 1
 
 # One daemon Timer per alert, armed for TRIAGE_WATCHDOG_SECONDS before the
 # gateway is contacted, on the triage path every inject route hands to

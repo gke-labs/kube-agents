@@ -58,8 +58,9 @@ func TestTheOperatorsProfilesMapParses(t *testing.T) {
 	want := map[string]string{
 		"provision": "", "session": NarrowingPod, "agent": "", "verifier": "",
 		"operator": "", "profile-auditor-read": NarrowingProfile, "profile-cluster-a-read": NarrowingProfile,
-		// The AgentProfile dispatcher, rendered by default.
-		"dispatcher": "",
+		// The AgentProfile dispatcher, rendered by default, with its
+		// per-profile grants bucketed by default (#5381).
+		"dispatcher": NarrowingDispatcher,
 	}
 	for _, id := range m.Identities {
 		narrowing, ok := want[id.User]
