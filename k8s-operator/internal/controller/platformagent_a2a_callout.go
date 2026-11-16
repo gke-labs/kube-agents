@@ -957,7 +957,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
 	// collector, which deletes it immediately. It is reclaimed by name
-	// instead, from both the mode flip and the deletion path.
+	// instead, from the deletion path.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
 		// The provision Job's identity, applied here so it exists before the
@@ -996,7 +996,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 
 	// Cluster-scoped: no owner reference, because the garbage collector
 	// treats a cluster-scoped object owned by a namespaced one as an orphan
-	// and deletes it immediately. cleanupA2A removes it by name.
+	// and deletes it immediately. handleDeletion removes it by name.
 	for _, obj := range []client.Object{
 		buildA2ACalloutClusterRoleBinding(agent),
 	} {

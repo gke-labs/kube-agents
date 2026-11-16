@@ -355,8 +355,7 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
 
     The first is darkness: with the operator's flag unset, the rendered object
     set contains no inject Service, no inject env on the gateway and no inject
-    NetworkPolicy. The same rule `mode: next` follows, and asserted the same
-    way -- audited rather than commented. The operator's own tests assert the
+    NetworkPolicy -- audited rather than commented. The operator's own tests assert the
     rendered objects; what this adds is that the flag cannot come from a
     `PlatformAgent`, which is a cross-module claim about where the switch
     lives.
@@ -663,7 +662,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
 
 
 class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
-    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    """A3 on the gateway's Slack backend: the allowlist is the
     admission gate, and the principal is either the IdP identity the admin's
     map joins to the member id, or the member id Slack asserted, qualified
     `slack:`.  The map is an override and not a gate, so three things carry
@@ -731,9 +730,10 @@ RBAC_GROUP = "rbac.authorization.k8s.io"
 #
 #   system:auth-delegator  built-in: tokenreviews/create and
 #                          subjectaccessreviews/create, both of which only ask
-#                          the API server questions. Bound to the mode: next
-#                          auth callout's ServiceAccount so it can validate the
-#                          tokens bus clients present.
+#                          the API server questions. Bound to the auth
+#                          callout's ServiceAccount so it can validate the
+#                          tokens bus clients present (C5 pins that binding's
+#                          name and subject).
 #
 # `view` is deliberately NOT here. The operator held bind over it until #387
 # removed the rule, and leaving the name behind would make re-adding that grant
@@ -1795,11 +1795,9 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         The Tier CRD (#3659) is for cluster administrators alone, so:
 
-          - no Role or ClusterRole in the `spec.mode: today` goldens, in the
-            `spec.mode: next` golden or in the chart's own templates names
-            `tiers`, by name or by a wildcard group, resource or subresource,
-            at any verb. Next mode reads tiers through an operator-rendered
-            ConfigMap, so none of its workload roles needs them either;
+          - no Role or ClusterRole in the goldens or in the chart's own
+            templates names `tiers`, by name or by a wildcard group, resource
+            or subresource, at any verb;
           - the operator's RBAC, on both delivery paths (role.yaml plus the
             leader-election Role for kustomize, operator-rbac.yaml for the
             chart), reads tiers and writes their status, and nothing more,
@@ -1812,11 +1810,11 @@ class A4DelegationAttenuates(unittest.TestCase):
         resources and verbs: a templated field would leave the predicate
         reading a placeholder.
 
-        The next golden renders the A2A gateway's and the auth callout's
-        Roles (buildA2AGatewayRole, buildA2ACalloutRole), and the dispatcher's
-        once it renders by default. Not covered yet, because no golden renders
-        them: the scope publisher's Role (buildScopePublisherRole), the A2A
-        MCP server's, and the dispatcher's Jobs Role in the profile namespace.
+        The goldens render the whole stack, so the read covers the A2A
+        gateway's and callout's Roles (buildA2AGatewayRole,
+        buildA2ACalloutRole) beside the tier roles. Not covered: the scope
+        publisher's Role (buildScopePublisherRole), rendered only while its
+        Job may run, and the dispatcher roles; no golden carries either.
         """
         def reaches_tiers(rule: dict) -> set[str]:
             """The tier resources a rule reaches, wildcards included."""
@@ -1860,15 +1858,15 @@ class A4DelegationAttenuates(unittest.TestCase):
                          if isinstance(d, dict))
 
         product_roles = []
-        goldens = dict(h.golden_documents(), golden_next=h.yaml_documents("golden_next"))
+        goldens = dict(h.golden_documents(), golden_settled=h.yaml_documents("golden_settled"))
         for name, documents in goldens.items():
             for kind in ("Role", "ClusterRole"):
                 product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
-        # The next golden is read for the A2A roles in it: losing them would
-        # leave this checking the base roles today's goldens already cover.
-        next_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_next"}
+        # The settled golden is read for the A2A roles in it: losing them would
+        # leave this checking the base roles alone.
+        settled_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_settled"}
         for a2a_role in ("platformagent-a2a-gateway", "platformagent-a2a-callout"):
-            self.assertIn(a2a_role, next_roles, "the next golden no longer renders the A2A roles A4 reads")
+            self.assertIn(a2a_role, settled_roles, "the settled golden no longer renders the A2A roles A4 reads")
         # The chart's own roles (the web console's, the cleanup hook's). A
         # template that declares a role and won't parse fails here rather than
         # being skipped, since a skipped role is an unchecked one.
