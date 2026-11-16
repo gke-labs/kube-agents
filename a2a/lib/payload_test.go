@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -314,6 +315,44 @@ func TestDelegateTargetsRoundTrip(t *testing.T) {
 	}
 	if _, ok, err := DelegateTargetsOf([]Part{text}); ok || err != nil {
 		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+func TestReplyToRoundTrip(t *testing.T) {
+	want := ReplyTo{TaskID: "task-0a1b2c3d"}
+	part, err := ReplyToPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(part.Data) != `{"replyTo":{"taskId":"task-0a1b2c3d"}}` {
+		t.Fatalf("part = %s", part.Data)
+	}
+	text := Part{Kind: "text", Text: "and the other pool?"}
+	got, ok, err := ReplyToOf([]Part{text, part})
+	if err != nil || !ok || got != want {
+		t.Fatalf("ReplyToOf = %+v %v %v, want %+v", got, ok, err, want)
+	}
+	if _, ok, err := ReplyToOf([]Part{text}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+// The task id becomes half of a store key, so anything but a subject token
+// is refused on the way out and an error, not a skip, on the way in; so is a
+// second part, which would leave the report ambiguous.
+func TestReplyToRefusesWhatIsNotATaskID(t *testing.T) {
+	for _, id := range []string{"", "a.b", "task/1", strings.Repeat("x", 64)} {
+		if _, err := ReplyToPart(ReplyTo{TaskID: id}); err == nil {
+			t.Errorf("ReplyToPart(%q) accepted", id)
+		}
+		raw := Part{Kind: "data", Data: json.RawMessage(`{"replyTo":{"taskId":` + strconv.Quote(id) + `}}`)}
+		if _, ok, err := ReplyToOf([]Part{raw}); !ok || err == nil {
+			t.Errorf("ReplyToOf(%q) = ok %v err %v, want found and refused", id, ok, err)
+		}
+	}
+	part, _ := ReplyToPart(ReplyTo{TaskID: "task-1"})
+	if _, ok, err := ReplyToOf([]Part{part, part}); !ok || err == nil {
+		t.Errorf("two parts: ok %v err %v, want found and refused", ok, err)
 	}
 }
 

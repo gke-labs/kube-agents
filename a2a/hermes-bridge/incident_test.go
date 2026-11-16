@@ -129,6 +129,110 @@ func TestAPI_AReportPostedIntoTheConversationIsFoundBySession(t *testing.T) {
 	}
 }
 
+// submitReplyTo is submitFrom with a replyTo part beside the text: the
+// gateway's submission for a console turn that names the task a card's
+// report was on.
+func submitReplyTo(t *testing.T, c *lib.Client, taskID, contextID, conversation, prompt, replyTo string) {
+	t.Helper()
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, taskID, "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": conversation, "kind": "dm"}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, err := lib.ReplyToPart(lib.ReplyTo{TaskID: replyTo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(lib.Message{Role: "user", MessageID: "msg-" + taskID, TaskID: taskID, ContextID: contextID,
+		Parts: []lib.Part{{Kind: "text", Text: prompt}, part}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID, payload,
+		lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), env); err != nil {
+		t.Fatalf("submission publish: %v", err)
+	}
+}
+
+// A console reply that names the task a card's report was on finds the row
+// the notifier keyed by the conversation and that task, in one lookup, and
+// reaches Hermes with the report ahead of it.
+func TestAPI_AConsoleReplyNamingItsReportFindsTheRow(t *testing.T) {
+	_, url := startServer(t)
+	store := newIncidentStore(t, map[[2]string]string{{"a2a-ctx-rt", "console:tab-1#task-filed"}: "card report: np-quartz-7 is at 92%"})
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	submitReplyTo(t, c, "task-rt", "ctx-rt", "console:tab-1", "and the other pool?", "task-filed")
+	if task := waitTerminal(t, c, "task-rt"); task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	want := incidentReplyOpen + "card report: np-quartz-7 is at 92%" + incidentReplyClose + incidentReplyUser + "and the other pool?"
+	if calls := stub.seen(); len(calls) != 1 || calls[0].prompt != want {
+		t.Fatalf("prompt = %+v, want the card's report framed ahead of the reply", calls)
+	}
+	gets := store.seen()
+	if len(gets) != 1 || gets[0] != (incidentGet{chatID: "a2a-ctx-rt", threadID: "console:tab-1#task-filed", auth: "Bearer kv-key"}) {
+		t.Fatalf("lookups = %+v, want one by (session, conversation#task)", gets)
+	}
+}
+
+// A reply naming a task no row was stored for goes on to the conversation's
+// own address, and with no row there the prompt reaches Hermes as typed.
+func TestAPI_AConsoleReplyNamingAnUnknownReportFallsThrough(t *testing.T) {
+	_, url := startServer(t)
+	store := newIncidentStore(t, map[[2]string]string{{"a2a-ctx-ru", "console:tab-1#task-other"}: "another card's report"})
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	submitReplyTo(t, c, "task-ru", "ctx-ru", "console:tab-1", "which pool?", "task-gone")
+	if task := waitTerminal(t, c, "task-ru"); task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if calls := stub.seen(); len(calls) != 1 || calls[0].prompt != "which pool?" {
+		t.Fatalf("prompt = %+v, want the user's words untouched", calls)
+	}
+	gets := store.seen()
+	want := []incidentGet{
+		{chatID: "a2a-ctx-ru", threadID: "console:tab-1#task-gone", auth: "Bearer kv-key"},
+		{chatID: "a2a-ctx-ru", threadID: "console:tab-1", auth: "Bearer kv-key"},
+	}
+	if len(gets) != len(want) || gets[0] != want[0] || gets[1] != want[1] {
+		t.Fatalf("lookups = %+v, want %+v", gets, want)
+	}
+}
+
+// A console reply that names no task does not reach the row keyed by the
+// filing turn's task: it looks up the conversation alone, as before.
+func TestAPI_AConsoleReplyNamingNoTaskLooksUpTheConversationAlone(t *testing.T) {
+	_, url := startServer(t)
+	store := newIncidentStore(t, map[[2]string]string{{"a2a-ctx-rn", "console:tab-1#task-filed"}: "card report: np-quartz-7 is at 92%"})
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	submitFrom(t, c, "task-rn", "ctx-rn", "console:tab-1", "and the other pool?")
+	if task := waitTerminal(t, c, "task-rn"); task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if calls := stub.seen(); len(calls) != 1 || calls[0].prompt != "and the other pool?" {
+		t.Fatalf("prompt = %+v, want the user's words untouched", calls)
+	}
+	if gets := store.seen(); len(gets) != 1 || gets[0].threadID != "console:tab-1" {
+		t.Fatalf("lookups = %+v, want one by the conversation key alone", gets)
+	}
+}
+
 // No stored report, no change: the prompt reaches Hermes as the user typed
 // it, after both addresses were tried.
 func TestAPI_NoStoredReportLeavesThePromptAlone(t *testing.T) {
@@ -195,28 +299,34 @@ func TestAPI_NoRouteStoreMeansNoLookup(t *testing.T) {
 
 func TestIncidentAddresses(t *testing.T) {
 	cases := []struct {
-		key  string
-		want []incidentAddress
+		key     string
+		replyTo string
+		want    []incidentAddress
 	}{
-		{"slack:C0HOME/1712.0001", []incidentAddress{{"C0HOME", "1712.0001"}, {"a2a-x", "slack:C0HOME/1712.0001"}}},
-		{"gchat:spaces/AAA/threads/BBB", []incidentAddress{{"spaces/AAA", "spaces/AAA/threads/BBB"}, {"a2a-x", "gchat:spaces/AAA/threads/BBB"}}},
+		// A reply naming the task its report was on tries that row first and
+		// keeps every address it would have tried without it.
+		{"console:abc", "task-1", []incidentAddress{{"a2a-x", "console:abc#task-1"}, {"a2a-x", "console:abc"}}},
+		{"slack:C0HOME/1712.0001", "task-1", []incidentAddress{{"a2a-x", "slack:C0HOME/1712.0001#task-1"}, {"C0HOME", "1712.0001"}, {"a2a-x", "slack:C0HOME/1712.0001"}}},
+		{"slack:dm/D123", "task-1", nil},
+		{"slack:C0HOME/1712.0001", "", []incidentAddress{{"C0HOME", "1712.0001"}, {"a2a-x", "slack:C0HOME/1712.0001"}}},
+		{"gchat:spaces/AAA/threads/BBB", "", []incidentAddress{{"spaces/AAA", "spaces/AAA/threads/BBB"}, {"a2a-x", "gchat:spaces/AAA/threads/BBB"}}},
 		// A whole conversation is never looked up: every later message there
 		// would carry the first stored report.
-		{"slack:dm/D123", nil},
-		{"gchat:dm/spaces/DDD", nil},
-		{"gchat:space/spaces/AAA", nil},
-		{"gchat:space/spaces/AAA/threads/BBB", nil},
+		{"slack:dm/D123", "", nil},
+		{"gchat:dm/spaces/DDD", "", nil},
+		{"gchat:space/spaces/AAA", "", nil},
+		{"gchat:space/spaces/AAA/threads/BBB", "", nil},
 		// A thread inside a DM is one conversation per thread; in a Google Chat
 		// DM home the relay stores its post by the thread name, as in any space.
-		{"slack:dm/D123/1712.0001", []incidentAddress{{"a2a-x", "slack:dm/D123/1712.0001"}}},
-		{"gchat:dm/spaces/DDD/threads/TTT", []incidentAddress{{"spaces/DDD", "spaces/DDD/threads/TTT"}, {"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
-		{"slack:C0HOME", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
-		{"inject:bench-7", []incidentAddress{{"a2a-x", "inject:bench-7"}}},
-		{"console:abc", []incidentAddress{{"a2a-x", "console:abc"}}},
-		{"", nil},
+		{"slack:dm/D123/1712.0001", "", []incidentAddress{{"a2a-x", "slack:dm/D123/1712.0001"}}},
+		{"gchat:dm/spaces/DDD/threads/TTT", "", []incidentAddress{{"spaces/DDD", "spaces/DDD/threads/TTT"}, {"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
+		{"slack:C0HOME", "", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
+		{"inject:bench-7", "", []incidentAddress{{"a2a-x", "inject:bench-7"}}},
+		{"console:abc", "", []incidentAddress{{"a2a-x", "console:abc"}}},
+		{"", "", nil},
 	}
 	for _, tc := range cases {
-		got := incidentAddresses(tc.key, "a2a-x")
+		got := incidentAddresses(tc.key, "a2a-x", tc.replyTo)
 		if len(got) != len(tc.want) {
 			t.Errorf("%q: %+v, want %+v", tc.key, got, tc.want)
 			continue
@@ -227,8 +337,27 @@ func TestIncidentAddresses(t *testing.T) {
 			}
 		}
 	}
-	if got := incidentAddresses("slack:C0HOME/1712.0001", ""); len(got) != 1 {
+	if got := incidentAddresses("slack:C0HOME/1712.0001", "", ""); len(got) != 1 {
 		t.Errorf("no session: %+v, want the thread address alone", got)
+	}
+	if got := incidentAddresses("console:abc", "", "task-1"); len(got) != 0 {
+		t.Errorf("no session: %+v, want no address, since the task's row is keyed by the session", got)
+	}
+}
+
+// The separator the exact-row address is built with is the notifier's
+// (kanban_event_routing.CONSOLE_THREAD_TASK_SEP), read from that file.
+func TestIncidentReplyTaskSep_MatchesTheNotifier(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "deploy", "docker", "patches", "kanban_event_routing.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^CONSOLE_THREAD_TASK_SEP = "([^"]*)"`).FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatal("CONSOLE_THREAD_TASK_SEP not found in kanban_event_routing.py")
+	}
+	if m[1] != incidentReplyTaskSep {
+		t.Fatalf("incidentReplyTaskSep = %q, the notifier's separator is %q", incidentReplyTaskSep, m[1])
 	}
 }
 

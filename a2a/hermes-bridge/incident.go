@@ -59,6 +59,10 @@ const (
 	incidentGchatDM       = "dm/"
 	incidentGchatSpace    = "gchat:space/"
 	incidentGchatThreads  = "/threads/"
+	// incidentReplyTaskSep joins a console conversation's key and the task
+	// of the turn that filed a card in the row the notifier stores for the
+	// card's report (kanban_event_routing.CONSOLE_THREAD_TASK_SEP).
+	incidentReplyTaskSep = "#"
 )
 
 // incidentTokens are the template tokens a stored report is stripped of
@@ -105,16 +109,16 @@ type incidentAddress struct {
 }
 
 // incidentAddresses are the rows a reply in conversation key, answered by
-// Hermes session sessionID, may be a reply to, in lookup order: the thread
-// the key names, where the relay stores a scheduled report and the kanban
-// notifier the triage card's report under an alert, then (sessionID, key),
-// where the notifier stores a card's report posted into a Slack or Google
-// Chat gateway conversation (kanban_event_routing addresses that
-// subscription to the session holding the route and the key; a console
-// subscription's key also carries the filing turn's task, which a later
-// reply does not know, so that row is not found).
+// Hermes session sessionID, may be a reply to, in lookup order:
+// (sessionID, key#replyTo) when the reply names the task whose report it
+// answers, the notifier's key for a card's report posted into a console
+// conversation; the thread the key names, where the relay stores a
+// scheduled report and the notifier the triage card's report under an
+// alert; then (sessionID, key), the notifier's key for a card's report
+// posted into a Slack or Google Chat conversation. A console reply naming
+// no task does not reach the console row, whose key carries the task.
 //
-// A key that names a whole conversation rather than a thread takes neither:
+// A key that names a whole conversation rather than a thread takes none:
 // a Google Chat space with no thread, a thread-less Slack DM, and the
 // thread-less Google Chat DM key, which is the legacy and openDirect shape
 // (a Google Chat DM ask keys its own thread). Every later message
@@ -122,12 +126,15 @@ type incidentAddress struct {
 // would be spliced ahead of every question for the row's life, and the
 // first card's report would answer a reply to the second's. The hook never
 // had this, since it looks up the message's own thread.
-func incidentAddresses(key, sessionID string) []incidentAddress {
+func incidentAddresses(key, sessionID, replyTo string) []incidentAddress {
 	key = strings.TrimSpace(key)
 	if key == "" || incidentWholeConversation(key) {
 		return nil
 	}
 	var out []incidentAddress
+	if replyTo != "" && sessionID != "" {
+		out = append(out, incidentAddress{chatID: sessionID, threadID: key + incidentReplyTaskSep + replyTo})
+	}
 	if thread, ok := incidentThread(key); ok {
 		out = append(out, thread)
 	}
@@ -191,7 +198,13 @@ func (b *Bridge) attachPushedReport(ctx context.Context, sessionID string, env *
 	if err != nil {
 		return prompt
 	}
-	for _, addr := range incidentAddresses(auth.Audience.Conversation, sessionID) {
+	key := strings.TrimSpace(auth.Audience.Conversation)
+	// The part is read only for a key that is looked up at all.
+	replyTo := ""
+	if key != "" && !incidentWholeConversation(key) {
+		replyTo = b.incidentReplyTo(env)
+	}
+	for _, addr := range incidentAddresses(key, sessionID, replyTo) {
 		report, err := b.getIncident(ctx, addr)
 		if errors.Is(err, errNoIncident) {
 			continue
@@ -206,6 +219,25 @@ func (b *Bridge) attachPushedReport(ctx context.Context, sessionID string, env *
 		return incidentReply(report, prompt)
 	}
 	return prompt
+}
+
+// incidentReplyTo is the task the submission's replyTo part names, or "":
+// no part, or one the gateway would not have written (lib.ReplyToOf), which
+// is logged and read as none, so the turn runs on the other addresses.
+func (b *Bridge) incidentReplyTo(env *lib.Envelope) string {
+	var m lib.Message
+	if err := json.Unmarshal(env.Payload, &m); err != nil {
+		return ""
+	}
+	r, found, err := lib.ReplyToOf(m.Parts)
+	if err != nil {
+		b.cfg.Logger.Warn("replyTo part ignored; the turn looks for its report by conversation alone", "task", env.TaskID, "err", err)
+		return ""
+	}
+	if !found {
+		return ""
+	}
+	return r.TaskID
 }
 
 // getIncident reads the report stored at addr, or errNoIncident.

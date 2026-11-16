@@ -544,6 +544,56 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 	return *found, true, nil
 }
 
+// ReplyTo is the replyTo data part: the task whose stored report this turn
+// answers (spec-a2a-payloads.md, "Task parameters and child results");
+// written by the gateway only.
+type ReplyTo struct {
+	TaskID string `json:"taskId"`
+}
+
+const replyToKey = "replyTo"
+
+// ReplyToPart is r as a data part, refused when its task id is not a
+// subject token.
+func ReplyToPart(r ReplyTo) (Part, error) {
+	if !ValidSubjectToken(r.TaskID) {
+		return Part{}, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+	}
+	data, err := json.Marshal(map[string]ReplyTo{replyToKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ReplyToOf finds the replyTo part among parts. A part whose task id is not
+// a subject token, or a second one, is an error, and the reader goes on as
+// though the turn named no report.
+func ReplyToOf(parts []Part) (ReplyTo, bool, error) {
+	var found *ReplyTo
+	for _, p := range parts {
+		raw, ok := wrappedData(p, replyToKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ReplyTo{}, true, errors.New("reply to: more than one replyTo part")
+		}
+		var r ReplyTo
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %w", err)
+		}
+		if !ValidSubjectToken(r.TaskID) {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+		}
+		found = &r
+	}
+	if found == nil {
+		return ReplyTo{}, false, nil
+	}
+	return *found, true, nil
+}
+
 // ChildResult is the childResult data part: a child task's end, which the
 // gateway delivers on its parent's .in as a message, for a parent that waits
 // by staying open (a profile task under the dispatcher). A chat session's
