@@ -183,6 +183,8 @@ steps:
       - "$_KUBE_PROXY_URI"
       - "-f"
       - "deploy/kube-proxy/Dockerfile"
+      - "--build-arg"
+      - "KUBE_AGENTS_VERSION=$_KUBE_AGENTS_VERSION"
       - "."
 
   # The two AgentPlugin images the presubmit deploys so the Pub/Sub platform

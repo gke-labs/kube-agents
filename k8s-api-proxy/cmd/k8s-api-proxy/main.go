@@ -163,7 +163,8 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 
 // version is what the binary was built for: the release (X.Y.Z) for a release archive,
 // stamped by scripts/release/build_release_binaries.sh, or the commit SHA for the
-// kube-proxy image, stamped by deploy/kube-proxy/Dockerfile. Both use -ldflags "-X main.version=...".
+// kube-proxy image, stamped by deploy/kube-proxy/Dockerfile from KUBE_AGENTS_VERSION, which
+// every image build passes as it does for the platform-agent image. Both use -ldflags "-X main.version=...".
 var version = devVersion
 
 // versionString is what --version prints and the startup log names.

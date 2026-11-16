@@ -67,7 +67,7 @@ docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 docker-build-kube-proxy: ## Build the kube-proxy image.
-	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
+	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) $(VERSION_ARG) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
