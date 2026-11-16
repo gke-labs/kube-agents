@@ -3181,6 +3181,9 @@ class RedactHelmReleaseMetadataTest(unittest.TestCase):
             "mawk": ["mawk"],
             "original-awk": ["original-awk"],
             "busybox": ["busybox", "awk"],
+            # The awk the system ships: on macOS the one true awk, and the
+            # only awk a stock Mac has.
+            "system": ["/usr/bin/awk"],
         }
         tested = 0
         for name, cmd in variants.items():
