@@ -819,6 +819,8 @@ The [admin console](/kube-agents/reference/admin-console/), started from a repos
 
 Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
 
+What the alert path did is still readable. Ask the agent through any of these doors `what alerts fired overnight?` and it answers from its event ledger: the alerts it posted, and the events it held back from chat and why.
+
 The onboarding delivery stage waits a day for a human to connect over chat. Then it files the first-run inventory report as an issue labelled `agent:onboarding`, in the GitOps repository when it is on GitHub or else in the install's one managed GitHub repository. A report it could not file is retired a week after the sweep. For that first day the report sits at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume.
 
 Read it there with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md`, or in the issue afterwards. The file is renamed `INVENTORY.delivered.md` once filed or retired.
