@@ -303,8 +303,6 @@ class WatchHealthTest(unittest.TestCase):
         for name, change in (
             ("restart", lambda c: setattr(c, "pod_list", pods(restarts=(1, 0, 0)))),
             ("not ready", lambda c: setattr(c, "pod_list", pods(ready=False))),
-            ("rollout", lambda c: setattr(c, "workload", deployment(updated=2))),
-            ("generation", lambda c: setattr(c, "workload", deployment(observed=1))),
             ("oom", lambda c: setattr(c, "pod_list", pods(oom_at=(NOW + timedelta(minutes=3)).isoformat()))),
             ("no pods", lambda c: setattr(c, "pod_list", {"items": []})),
         ):
@@ -341,6 +339,67 @@ class WatchHealthTest(unittest.TestCase):
             for seconds, bucket in ((20, "waiting"), (40, "waiting"), (61, "passed")):
                 seen = post_merge_check.watch_health(self.conn, self.cluster, at + timedelta(seconds=seconds))
                 self.assertEqual(seen[bucket], [f"{REPO}/pull/1"], seconds)
+
+    def test_a_rollout_or_scale_under_way_waits_then_fails_only_past_the_settle_limit(self):
+        for name, workload in (("rollout", deployment(updated=2)), ("generation", deployment(observed=1)),
+                               ("scale-up", deployment(replicas=4))):
+            with self.subTest(name):
+                self.setUp()
+                self.cluster.apps = [argo_app()]
+                self.tick(1)
+                self.cluster.workload = workload
+                self.assertEqual(self.tick(6)["waiting"], [f"{REPO}/pull/1"])
+                self.assertTrue(self.row()["health_detail"].startswith("not settled"), self.row()["health_detail"])
+                with self.assertLogs("post_merge_check", level="WARNING"):
+                    self.assertEqual(self.tick(40)["failed"], [f"{REPO}/pull/1"])
+                self.assertIn("no healthy reading by 35 minutes", self.row()["health_detail"])
+
+    def test_a_rollout_that_settles_resets_the_count_then_passes(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.workload = deployment(updated=2)
+        self.tick(2)
+        self.cluster.workload = deployment()
+        self.assertEqual(self.tick(6)["waiting"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.tick(7)["passed"], [f"{REPO}/pull/1"])
+
+    def test_reads_failing_past_the_settle_limit_fail_with_the_last_reading(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.fail = post_merge_check.ClusterReadError("i/o timeout")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(6)["unreadable"], [f"{REPO}/pull/1"])
+            self.assertEqual(self.tick(40)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("i/o timeout", self.row()["health_detail"])
+
+    def test_a_terminating_pod_is_not_judged(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        draining = pods(restarts=(0,), ready=False)["items"][0]
+        draining["metadata"].update(name="checkout-old", uid="old", deletionTimestamp=NOW.isoformat())
+        self.cluster.pod_list = pods()
+        self.cluster.pod_list["items"].append(draining)
+        self.tick(3)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+
+    def test_a_baseline_that_is_not_a_map_of_counts_fails_with_the_reason(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        for value in ("null", "[]", '{"u0/web": "x"}'):
+            with self.subTest(value):
+                self.conn.execute("UPDATE post_merge_records SET health_baseline = ?, health_result = NULL", (value,))
+                with self.assertLogs("post_merge_check", level="WARNING"):
+                    self.assertEqual(self.tick(3)["failed"], [f"{REPO}/pull/1"])
+                self.assertIn("baseline is unreadable", self.row()["health_detail"])
+
+    def test_an_oom_with_no_time_in_the_past_state_does_not_fail_it(self):
+        listed = pods()
+        listed["items"][0]["status"]["containerStatuses"][0]["lastState"] = {"terminated": {"reason": "OOMKilled"}}
+        passed, _ = post_merge_check.judge_health(deployment(), listed, {}, NOW)
+        self.assertTrue(passed)
+        listed["items"][0]["status"]["containerStatuses"][0]["state"] = {"terminated": {"reason": "OOMKilled"}}
+        passed, _ = post_merge_check.judge_health(deployment(), listed, {}, NOW)
+        self.assertFalse(passed)
 
     def test_an_oom_before_the_apply_does_not_fail_it(self):
         self.cluster.apps = [argo_app()]
@@ -466,6 +525,7 @@ class SelectorAndRolloutTest(unittest.TestCase):
         web = {"kind": "Deployment", "metadata": {"name": "web"}}
         self.assertTrue(post_merge_check._owned_by(pod("web-6d4f", "6d4f"), web))
         self.assertFalse(post_merge_check._owned_by(pod("web-canary-7c9b", "7c9b"), web))
+        self.assertFalse(post_merge_check._owned_by({"metadata": {"name": "bare"}}, web), "a pod with no owner")
 
     def test_label_selector_renders_match_expressions(self):
         selector = {"matchLabels": {"app": "web"}, "matchExpressions": [

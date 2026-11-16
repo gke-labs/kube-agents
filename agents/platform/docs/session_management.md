@@ -437,14 +437,7 @@ cluster that deliver the repository into the record's namespace, asking the brok
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
-(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy
-fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings with the last one
-past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under
-`HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod
-of the workload is Ready, no container restarted past its baseline and none was OOMKilled since the
-apply. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the
-reason in `health_detail` and the time in `health_at`. A workload that is gone or cannot be judged fails with the reason; any other read
-failure is kept and retried. The edit, revert and outcome
+(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted) is Ready, no container restarted past its baseline and none was OOMKilled since the apply. A rollout or scale still under way is not settled rather than red: the run waits and the count starts again. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried, until `HEALTH_SETTLE_LIMIT` (30 minutes) past the window with no healthy reading fails it as not settled. The edit, revert and outcome
 columns are left for the later steps. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 

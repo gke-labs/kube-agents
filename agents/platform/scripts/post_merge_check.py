@@ -31,7 +31,7 @@ asking the broker (``revision-contains``) whether a later applied commit
 contains it; with none, or when the broker cannot say, the object the fix adds
 is observed directly. Once applied, the pods' restart counts are the baseline,
 and every run reads the workload again until :data:`HEALTH_SAMPLES` healthy
-readings span the window; any reading that is not healthy fails it.
+readings, the last past the window; any reading that is not healthy fails it.
 """
 
 from __future__ import annotations
@@ -170,8 +170,14 @@ HEALTH_WINDOW = {"no-pdb": timedelta(minutes=5)}
 HEALTHY_AFTER_SYNC = timedelta(seconds=60)
 #: Healthy readings needed before a pass, each on its own run, the last one
 #: after the window: one reading at the end would miss a pod that went red and
-#: recovered inside the window.
+#: recovered inside the window. Nothing else spaces them; how far apart they
+#: fall is the schedule's cadence.
 HEALTH_SAMPLES = 2
+#: How long past the window a record may go without a healthy reading (reads
+#: failing, or a rollout or scale still under way) before it fails as not settled.
+HEALTH_SETTLE_LIMIT = timedelta(minutes=30)
+#: ``health_detail``'s prefix while the workload is still rolling out or scaling.
+NOT_SETTLED = "not settled: "
 #: ``health_detail``'s prefix while the window is being sampled.
 SAMPLED = "healthy samples: "
 HEALTH_PASSED = "passed"
@@ -374,7 +380,7 @@ def _owned_by(pod: dict, workload: dict) -> bool:
         template_hash = ((pod.get("metadata") or {}).get("labels") or {}).get("pod-template-hash")
         if owner.get("kind") == "ReplicaSet" and template_hash and owner.get("name") == f"{name}-{template_hash}":
             return True
-    return not (pod.get("metadata") or {}).get("ownerReferences")
+    return False
 
 
 def _healthy_samples(detail: object) -> int:
@@ -397,7 +403,9 @@ def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: da
     """
     if not _rolled_out(workload):
         return False, "the rollout is not complete"
-    items = [pod for pod in pods.get("items", []) if _owned_by(pod, workload)]
+    # A pod being deleted (a drain, a scale-down) is no longer the workload's to judge.
+    items = [pod for pod in pods.get("items", [])
+             if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")]
     if not items:
         return False, "no pods belong to the workload"
     for pod in items:
@@ -410,10 +418,11 @@ def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: da
             key = f"{meta.get('uid') or name}/{container.get('name')}"
             if int(container.get("restartCount") or 0) > baseline.get(key, 0):
                 return False, f"container {container.get('name')} in pod {name} restarted"
-            for state in (container.get("lastState") or {}, container.get("state") or {}):
+            for current, state in ((False, container.get("lastState") or {}), (True, container.get("state") or {})):
                 ended = state.get("terminated") or {}
                 finished = _parse_time(ended.get("finishedAt"))
-                if ended.get("reason") == OOM_KILLED and (finished is None or finished >= since):
+                # A past termination with no time cannot be placed after the apply; a current one is red now.
+                if ended.get("reason") == OOM_KILLED and (current if finished is None else finished >= since):
                     return False, f"container {container.get('name')} in pod {name} was OOMKilled"
     return True, "rolled out, every pod Ready, no restarts"
 
@@ -506,11 +515,12 @@ def watch_health(
     (:func:`observed_directly`). The reading goes in ``sync_state``. Applied:
     ``applied_at`` and the pods' restart counts (``health_baseline``). Each
     later run: read the workload (:func:`judge_health`); not healthy fails it
-    at once, and :data:`HEALTH_SAMPLES` healthy readings with the last past the
+    at once, a rollout or scale under way waits with the count reset, and :data:`HEALTH_SAMPLES` healthy readings with the last past the
     window (:data:`HEALTH_WINDOW`, at least :data:`HEALTHY_AFTER_SYNC`) pass
     it, into ``health_result`` and ``health_detail``. A workload that is gone or cannot be judged fails
     with the reason; any other read failure is kept in ``health_detail`` (or
-    ``sync_state`` before the apply) and retried. Every read stamps
+    ``sync_state`` before the apply), resets the count and is retried, until
+    :data:`HEALTH_SETTLE_LIMIT` past the window with no healthy reading fails it. Every read stamps
     ``health_checked_at``, which orders the next tick, so no record starves the
     rest. Everything lives on the row, so a restart loses nothing. Returns urls
     under ``applied``, ``waiting``, ``passed``, ``failed`` and ``unreadable``.
@@ -569,14 +579,25 @@ def watch_health(
                 if applied_at is None:
                     raise WorkloadGone("the apply time is unreadable")
                 window = max(HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values())), HEALTHY_AFTER_SYNC)
+                last = record["health_detail"]
+                if last and not _healthy_samples(last) and now - applied_at >= window + HEALTH_SETTLE_LIMIT:
+                    raise WorkloadGone(f"no healthy reading by {int((window + HEALTH_SETTLE_LIMIT).total_seconds() // 60)} "
+                                       f"minutes after the apply; last: {last}")
                 workload, pods = _read_workload(kubectl_json, record)
                 try:
                     baseline = json.loads(record["health_baseline"] or "{}")
                 except ValueError:
-                    raise WorkloadGone("the restart baseline is unreadable") from None
+                    baseline = None
+                if not isinstance(baseline, dict) or not all(isinstance(v, int) for v in baseline.values()):
+                    raise WorkloadGone("the restart baseline is unreadable")
                 healthy, detail = judge_health(workload, pods, baseline, applied_at)
-                samples = _healthy_samples(record["health_detail"]) + 1
-                if not healthy:
+                samples = _healthy_samples(last) + 1
+                if not _rolled_out(workload):
+                    # A rollout or scale under way (an HPA, someone else's change) is not settled yet, not red;
+                    # it resets the count, and HEALTH_SETTLE_LIMIT ends a wait that never settles.
+                    updates["health_detail"] = f"{NOT_SETTLED}{detail}"
+                    seen["waiting"].append(url)
+                elif not healthy:
                     # Any red reading after the apply fails the window, even one that would recover.
                     updates.update(health_result=HEALTH_FAILED, health_detail=detail, health_at=stamp)
                     seen["failed"].append(url)
