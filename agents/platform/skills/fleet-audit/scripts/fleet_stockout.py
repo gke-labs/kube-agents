@@ -559,6 +559,7 @@ Run = collector_run.Run
 listing_fields = collector_run.listing_fields
 listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
+TIMEOUT_RC = collector_run.TIMEOUT_RC
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
@@ -617,12 +618,13 @@ def run_logging_read(
             project, logging_reads.freshness_filter(filter_text, freshness), limit, timeout_s=timeout_s
         )
     except logging_reads.ReadTimedOut as timed_out:
-        return Run(argv, collector_run.TIMEOUT_RC, "", str(timed_out), time.monotonic() - started)
+        return Run(argv, TIMEOUT_RC, "", str(timed_out), time.monotonic() - started)
     if stdout is not None:
         return Run(argv, 0, stdout, "", time.monotonic() - started)
     spent = int(time.monotonic() - started)
     # A relay that is not there answers at once, and `gcloud` then has the whole cap.
-    return run(argv, timeout=timeout_s - spent) if spent else run(argv)
+    # `read_json` raises once the cap is spent, so what is left here is above zero.
+    return run(argv, timeout=max(timeout_s - spent, 1)) if spent else run(argv)
 
 
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:

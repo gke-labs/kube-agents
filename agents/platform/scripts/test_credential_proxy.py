@@ -19869,6 +19869,27 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
                 self.assertEqual([], self.upstream_requests)
                 self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
 
+    def test_a_body_shorter_than_its_content_length_did_not_arrive(self):
+        # The part that arrived is a whole JSON object the policy would allow:
+        # it is still not the request the caller announced.
+        sent = json.dumps({"resourceNames": ["projects/kagents-dev"]}).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                sock.sendall(
+                    b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                    b"Authorization: Bearer shell-token\r\nContent-Length: "
+                    + str(len(sent) + 40).encode() + b"\r\n\r\n" + sent
+                )
+                sock.shutdown(socket.SHUT_WR)
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                payload = json.loads(response.read())
+        self.assertEqual(400, response.status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual("the request body did not arrive", payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
     def test_a_post_with_no_body_at_all_is_400(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             status, payload = self._raw_entries_list(b"")

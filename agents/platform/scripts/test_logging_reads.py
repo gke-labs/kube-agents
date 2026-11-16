@@ -158,6 +158,25 @@ class ReadJsonTest(unittest.TestCase):
         with self.assertRaises(logging_reads.ReadTimedOut):
             self.read(Session(TimeoutError("read timed out")), timeout_s=120, clock=lambda: next(ticks))
 
+    def test_an_unusable_answer_that_arrives_after_the_budget_is_a_timed_out_read(self):
+        # The client's timeout bounds each socket wait, not the whole call, so a
+        # 5xx or a broken page can come back after the deadline. The caller must
+        # not then start gcloud with no time left.
+        late = {
+            "a 502 from the relay": Response(502, {"code": "UPSTREAM_UNAVAILABLE"}),
+            "a page that is not entries": Response(payload={"entries": "x"}),
+            "a token that is not a string": Response(payload={"entries": entries("a"), "nextPageToken": 7}),
+        }
+        for name, response in late.items():
+            with self.subTest(name):
+                ticks = iter([0.0, 1.0, 120.5])
+                with self.assertRaises(logging_reads.ReadTimedOut):
+                    self.read(Session(response), timeout_s=120, clock=lambda: next(ticks))
+
+    def test_an_unusable_answer_with_budget_left_is_none(self):
+        ticks = iter([0.0, 1.0, 30.0])
+        self.assertIsNone(self.read(Session(Response(502, {})), timeout_s=120, clock=lambda: next(ticks)))
+
     def test_a_fault_with_budget_left_is_none(self):
         ticks = iter([0.0, 1.0, 2.0])
         self.assertIsNone(self.read(Session(ConnectionError("refused")), timeout_s=120, clock=lambda: next(ticks)))

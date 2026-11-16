@@ -2764,7 +2764,7 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual([], [a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
         self.assertEqual(fs.DEFAULT_TIMEOUT_S, relay.call_args.kwargs["timeout_s"])
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
-        self.assertIn(f"`gcloud logging read` failed (rc={fs.collector_run.TIMEOUT_RC})", entry["limitations"])
+        self.assertIn(f"`gcloud logging read` failed (rc={fs.TIMEOUT_RC})", entry["limitations"])
         self.assertIn("timed out after 60 seconds", entry["limitations"])
 
     def test_gcloud_gets_what_the_relay_left_of_the_cap(self):

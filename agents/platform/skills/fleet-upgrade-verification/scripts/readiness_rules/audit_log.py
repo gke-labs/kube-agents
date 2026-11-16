@@ -590,12 +590,15 @@ def _read_pages(context: dict, which: str, result: dict) -> None:
         # stderr, like any failed read. The relay is asked first; `cmd` is the same read.
         asked = time.monotonic()
         page_read = _relay_page(project, filter_text, timeout)
-        if page_read is None and timeout:
-            # A relay that is not there answers at once; one that took its time leaves the
-            # command the rest of the per-call cap, so a page is still one cap long.
-            page_read = run(cmd, max(timeout - int(time.monotonic() - asked), 1))
-        elif page_read is None:
-            page_read = run(cmd)
+        if page_read is None:
+            # A relay that is not there answers at once, and the command runs as it always
+            # did. One that took its time leaves the command the rest of the cap it had
+            # (the context's, or the relay's own without one), so a page is one cap long.
+            spent = int(time.monotonic() - asked)
+            if timeout or spent:
+                page_read = run(cmd, max((timeout or RELAY_TIMEOUT_SECONDS) - spent, 1))
+            else:
+                page_read = run(cmd)
         rc, stdout, stderr = page_read
         result["pages"] += 1
         # The proxy cuts a page past its output cap and prints the marker (the shim exits 74

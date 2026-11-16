@@ -100,46 +100,59 @@ def read_json(
     not give the whole answer: no broker here, a request that failed or was
     refused, or an answer that is not a page of entries. Nothing partial is
     returned. Raises `ReadTimedOut` when `timeout_s`, the budget for every
-    page together, is spent first. `session` and `clock` are for tests.
+    page together, is spent: before a page is asked for, or by the time the
+    relay turned out not to answer, so a caller never starts `gcloud` with no
+    time left. `session` and `clock` are for tests.
     """
     if session is None and not os.environ.get(BROKER_URL_ENV):
         return None
     deadline = clock() + timeout_s
-    entries: list = []
-    token = None
+    spent = ReadTimedOut(f"timed out after {timeout_s} seconds")
     try:
-        if session is None:
-            session = _relay_session()
-        while len(entries) < limit:
-            left = deadline - clock()
-            if left <= 0:
-                raise ReadTimedOut(f"timed out after {timeout_s} seconds")
-            body = {
-                RESOURCE_NAMES_KEY: [PROJECT_RESOURCE.format(project=project)],
-                FILTER_KEY: filter_text,
-                ORDER_BY_KEY: ORDER_NEWEST_FIRST,
-                PAGE_SIZE_KEY: min(PAGE_SIZE, limit - len(entries)),
-            }
-            if token:
-                body[PAGE_TOKEN_KEY] = token
-            response = session.post(ENTRIES_LIST_URL, json=body, timeout=left)
-            if response.status_code != HTTP_OK:
-                return None
-            answer = response.json()
-            page = answer.get(ENTRIES_KEY, []) if isinstance(answer, dict) else None
-            if not isinstance(page, list) or not all(isinstance(entry, dict) for entry in page):
-                return None
-            entries.extend(page)
-            token = answer.get(NEXT_PAGE_TOKEN_KEY)
-            if not token:
-                break
-            if not isinstance(token, str):
-                return None
+        text = _read_pages(project, filter_text, limit, session, deadline, clock, spent)
     except ReadTimedOut:
         raise
     except Exception as fault:  # noqa: BLE001 -- any other fault is "the relay did not answer"; gcloud is the fallback
         if deadline - clock() <= 0:
             # A request that ran into the end of the budget: the client's own timeout.
-            raise ReadTimedOut(f"timed out after {timeout_s} seconds") from fault
+            raise spent from fault
         return None
+    if text is None and deadline - clock() <= 0:
+        # An answer that came back unusable only as the budget ended.
+        raise spent
+    return text
+
+
+def _read_pages(project, filter_text, limit, session, deadline, clock, spent) -> str | None:
+    """The pages of one read, or None for an answer that is not a whole one; raises `spent`
+    when the budget is gone before a page is asked for."""
+    entries: list = []
+    token = None
+    if session is None:
+        session = _relay_session()
+    while len(entries) < limit:
+        left = deadline - clock()
+        if left <= 0:
+            raise spent
+        body = {
+            RESOURCE_NAMES_KEY: [PROJECT_RESOURCE.format(project=project)],
+            FILTER_KEY: filter_text,
+            ORDER_BY_KEY: ORDER_NEWEST_FIRST,
+            PAGE_SIZE_KEY: min(PAGE_SIZE, limit - len(entries)),
+        }
+        if token:
+            body[PAGE_TOKEN_KEY] = token
+        response = session.post(ENTRIES_LIST_URL, json=body, timeout=left)
+        if response.status_code != HTTP_OK:
+            return None
+        answer = response.json()
+        page = answer.get(ENTRIES_KEY, []) if isinstance(answer, dict) else None
+        if not isinstance(page, list) or not all(isinstance(entry, dict) for entry in page):
+            return None
+        entries.extend(page)
+        token = answer.get(NEXT_PAGE_TOKEN_KEY)
+        if not token:
+            break
+        if not isinstance(token, str):
+            return None
     return json.dumps(entries[:limit])

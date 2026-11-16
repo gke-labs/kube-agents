@@ -574,6 +574,29 @@ class RelayReadTest(unittest.TestCase):
         self.assertEqual(1, len(helper.asked))
         self.assertIn("failed (rc=-1): timed out after 45 seconds", result["error"])
 
+    def test_with_no_cap_in_the_context_an_absent_relay_leaves_the_command_as_it_was(self):
+        gcloud = FakeRunner()
+        with patch.object(audit_log, "_relay_page", lambda project, filter_text, timeout: None):
+            result = audit_log.read_removed(context_with(gcloud, timeout=None))
+        self.assertEqual([None], gcloud.timeouts, "the runner's own default, as before the relay")
+        self.assertIsNone(result["error"])
+
+    def test_with_no_cap_in_the_context_a_slow_relay_leaves_the_command_the_rest_of_the_relays_cap(self):
+        gcloud = FakeRunner()
+        ticks = iter([100.0, 140.2, 200.0, 200.0])
+        with patch.object(audit_log, "_relay_page", lambda project, filter_text, timeout: None), \
+                patch.object(audit_log.time, "monotonic", lambda: next(ticks)):
+            audit_log.read_removed(context_with(gcloud, timeout=None, clock=lambda: 0.0))
+        self.assertEqual([audit_log.RELAY_TIMEOUT_SECONDS - 40], gcloud.timeouts)
+
+    def test_with_no_cap_in_the_context_the_relays_page_is_used(self):
+        removed, deprecated = split_sample()
+        refused = FakeRunner(rc=1)
+        with patch.object(audit_log, "_relay_page", self.relay_from(FakeRunner(removed, deprecated))):
+            result = audit_log.read_removed(context_with(refused, timeout=None))
+        self.assertEqual([], refused.calls)
+        self.assertTrue(result["callers"])
+
     def test_gcloud_gets_what_the_relay_left_of_the_per_call_cap(self):
         def slow_then_absent(project, filter_text, timeout):
             return None

@@ -162,7 +162,7 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
    `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
    ran; the `subcommand` is the service word of a host the table names (`monitoring`,
-   `cloudtrace`, `container`) and `other` for any other host. The first line is `started`; the
+   `cloudtrace`, `container`, `logging`) and `other` for any other host. The first line is `started`; the
    verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
    `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
    `failed` for the disabled relay, a credential the broker cannot obtain and each upstream

@@ -14909,12 +14909,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     extra=audit(AUDIT_STATUS_REJECTED),
                 )
                 raise
-            try:
-                parsed = json.loads(raw)
-            except (ValueError, RecursionError):
-                # UnicodeDecodeError is a ValueError; a body nested past the
-                # parser's depth is a RecursionError.
-                refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body is not JSON")
+            if len(raw) < length:
+                # The peer closed its side before the length it announced: what
+                # arrived is not the request, even where it parses.
+                refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body did not arrive")
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, RecursionError):
+                    # UnicodeDecodeError is a ValueError; a body nested past the
+                    # parser's depth is a RecursionError.
+                    refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body is not JSON")
         if refusal is not None:
             status, code, reason = refusal
             LOGGER.warning(
