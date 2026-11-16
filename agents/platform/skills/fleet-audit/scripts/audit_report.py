@@ -255,6 +255,7 @@ AUDITS: dict[str, AuditSpec] = {
             "pdb-overlapping",
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
+            "ingress-gateway-healthcheck-mismatch",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -1264,6 +1265,7 @@ CHECK_PHRASES = {
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
+    "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",

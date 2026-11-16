@@ -19,8 +19,9 @@ reader -- `netpol-missing`'s remedy is a default-deny NetworkPolicy, for one --
 so their candidates carry a marker that keeps the automatic sweep from
 opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
-collect in different shapes: obtainability answers every check from one
-workload dump plus the reads its declaration fields need; compliance issues
+collect in different shapes: obtainability answers most checks from one
+workload dump plus supplemental CRD and node-pool reads for §3.24/§3.25 and
+the reads its declaration fields need; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, seven of them
 best-effort (five because their CRDs are not installed everywhere, two because
 an identity may not list webhook configurations or EndpointSlices); ai-security reads
@@ -42,9 +43,10 @@ What this file does for the checks it covers:
      one project and location.
   2. Fetches per-cluster credentials into an isolated kubeconfig — the same
      path convention every SOP already uses (`AGENTS.md`, "Cluster
-     Credentials") — then runs the stream's context builder: one dump for
-     obtainability, several distinct `kubectl`/`gcloud` reads for
-     compliance, two dumps for ai-security, each behind its own fail-closed
+     Credentials") — then runs the stream's context builder: one workload dump
+     plus supplemental CRD and node-pool reads for obtainability, several
+     distinct `kubectl`/`gcloud` reads for compliance, two dumps for
+     ai-security, each behind its own fail-closed
      `jq -e`-equivalent gate so a truncated or empty result cannot read as a
      clean cluster.
   3. Runs every covered check's filter against the collected context, in
@@ -205,6 +207,59 @@ TRIAGE_BY_SLUG = {
     "spread-not-achieved": HARD_SPREAD_TRIAGE,
     SERVICEENTRY_HOST_COLLISION_SLUG: SERVICEENTRY_OWNER_TRIAGE,
 }
+
+# §3.25 (`ingress-gateway-healthcheck-mismatch`): in-cluster cross-check of
+# HTTPRoute / Ingress backendRefs, Service numeric targetPorts, and
+# BackendConfig / HealthCheckPolicy probe ports against backing workloads.
+INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG = "ingress-gateway-healthcheck-mismatch"
+KUBECTL_CHUNK_SIZE_ARG = "--chunk-size=500"
+INGRESS_KIND = "Ingress"
+HTTPROUTE_KIND = "HTTPRoute"
+BACKEND_CONFIG_KIND = "BackendConfig"
+HEALTH_CHECK_POLICY_KIND = "HealthCheckPolicy"
+SERVICE_KIND = "Service"
+CORE_API_GROUP = ""
+HTTPROUTE_CRD_RESOURCE = "httproutes.gateway.networking.k8s.io"
+BACKEND_CONFIG_CRD_RESOURCE = "backendconfigs.cloud.google.com"
+HEALTH_CHECK_POLICY_CRD_RESOURCE = "healthcheckpolicies.networking.gke.io"
+INGRESS_GATEWAY_CRD_RESOURCES: tuple[str, ...] = (
+    HTTPROUTE_CRD_RESOURCE,
+    BACKEND_CONFIG_CRD_RESOURCE,
+    HEALTH_CHECK_POLICY_CRD_RESOURCE,
+)
+INGRESS_GATEWAY_CRD_META: dict[str, tuple[str, str]] = {
+    HTTPROUTE_CRD_RESOURCE: (HTTPROUTE_KIND, "http_routes"),
+    BACKEND_CONFIG_CRD_RESOURCE: (BACKEND_CONFIG_KIND, "backend_configs"),
+    HEALTH_CHECK_POLICY_CRD_RESOURCE: (HEALTH_CHECK_POLICY_KIND, "health_check_policies"),
+}
+BACKEND_CONFIG_ANNOTATIONS: tuple[str, ...] = (
+    "cloud.google.com/backend-config",
+    "beta.cloud.google.com/backend-config",
+)
+HEALTH_CHECK_SUBCONFIG_KEYS: tuple[str, ...] = (
+    "httpHealthCheck",
+    "httpsHealthCheck",
+    "http2HealthCheck",
+    "tcpHealthCheck",
+    "sslHealthCheck",
+    "grpcHealthCheck",
+)
+PORT_SPEC_USE_SERVING = "USE_SERVING_PORT"
+PORT_SPEC_USE_NAMED = "USE_NAMED_PORT"
+REQUEST_MIRROR_FILTER_TYPE = "RequestMirror"
+DEFAULT_PORT_PROTOCOL = "TCP"
+PROBE_FIELDS: tuple[str, ...] = ("readinessProbe", "livenessProbe", "startupProbe")
+READINESS_PROBE_FIELD = "readinessProbe"
+PROBE_PORT_HANDLERS: tuple[str, ...] = ("httpGet", "tcpSocket", "grpc")
+RESTART_POLICY_ALWAYS = "Always"
+WILDCARD_PORT_KEY = "*"
+ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+OPT_OUT_EXEMPT_VALUE = "exempt"
+_IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH = (
+    "Traffic routed through an Ingress or Gateway HTTPRoute, or probed by a "
+    "load-balancer health check, targets a port that the Service or its backing "
+    "pods do not expose, so requests or health checks fail while the pods report Ready."
+)
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -1000,6 +1055,8 @@ DUMP_COMMAND_KINDS = (
     ",persistentvolumeclaims"
     # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
     ",namespaces,nodes"
+    # `ingresses` serves 3.25 (ingress-gateway-healthcheck-mismatch).
+    ",ingresses"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -1419,6 +1476,20 @@ def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
     }
 
 
+def _is_excluded_object(item: dict) -> bool:
+    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions."""
+    meta = item.get("metadata") or {}
+    if _is_system_namespace(meta.get("namespace", "")):  # S1
+        return True
+    labels = meta.get("labels") or {}
+    annotations = meta.get("annotations") or {}
+    if ADDON_MANAGER_MODE_LABEL in labels:  # S2
+        return True
+    if labels.get(OPT_OUT_KEY) == OPT_OUT_EXEMPT_VALUE or annotations.get(OPT_OUT_KEY) == OPT_OUT_EXEMPT_VALUE:  # S4
+        return True
+    return False
+
+
 def cronjobs_with_jobs(dump: dict) -> list[dict]:
     """Every non-system CronJob paired with the Jobs it still retains.
 
@@ -1442,18 +1513,10 @@ def cronjobs_with_jobs(dump: dict) -> list[dict]:
     """
     out = []
     for item in dump.get("items", []) or []:
-        if item.get("kind") != "CronJob":
+        if item.get("kind") != "CronJob" or _is_excluded_object(item):
             continue
         meta = item.get("metadata") or {}
         ns = meta.get("namespace", "")
-        if _is_system_namespace(ns):  # S1
-            continue
-        labels = meta.get("labels") or {}
-        annotations = meta.get("annotations") or {}
-        if "addonmanager.kubernetes.io/mode" in labels:  # S2
-            continue
-        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
-            continue
         name = meta.get("name", "")
         owned = [
             job
@@ -1541,18 +1604,10 @@ def services_with_endpoints(dump: dict) -> list[dict]:
 
     out = []
     for item in dump.get("items", []) or []:
-        if item.get("kind") != "Service":
+        if item.get("kind") != "Service" or _is_excluded_object(item):
             continue
         meta = item.get("metadata") or {}
         ns = meta.get("namespace", "")
-        if _is_system_namespace(ns):  # S1
-            continue
-        labels = meta.get("labels") or {}
-        annotations = meta.get("annotations") or {}
-        if "addonmanager.kubernetes.io/mode" in labels:  # S2
-            continue
-        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
-            continue
         spec = item.get("spec") or {}
         selector = spec.get("selector") or {}
         # No selector at all means the endpoints are managed by hand -- the
@@ -1752,6 +1807,11 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "compute_classes": [i for i in (dump.get("items") or []) if i.get("kind") == "ComputeClass"],
         "namespaces": [i for i in (dump.get("items") or []) if i.get("kind") == "Namespace"],
         "nodes": [i for i in (dump.get("items") or []) if i.get("kind") == "Node"],
+        "ingresses": [i for i in (dump.get("items") or []) if i.get("kind") == INGRESS_KIND],
+        "http_routes": [i for i in (dump.get("items") or []) if i.get("kind") == HTTPROUTE_KIND],
+        "backend_configs": [i for i in (dump.get("items") or []) if i.get("kind") == BACKEND_CONFIG_KIND],
+        "health_check_policies": [i for i in (dump.get("items") or []) if i.get("kind") == HEALTH_CHECK_POLICY_KIND],
+        "raw_workloads": [i for i in (dump.get("items") or []) if i.get("kind") in WORKLOAD_KINDS],
     }
 
 
@@ -4144,6 +4204,451 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
                 "release": release_of(service.get("metadata") or {}),
             }
         )
+    return hits
+
+
+def _is_int_port(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _resolve_probe_port(probe: object, named_ports: dict[str, int]) -> int | None:
+    if not isinstance(probe, dict):
+        return None
+    for handler_key in PROBE_PORT_HANDLERS:
+        handler = probe.get(handler_key)
+        if not isinstance(handler, dict):
+            continue
+        raw = handler.get("port")
+        if _is_int_port(raw):
+            return raw
+        if isinstance(raw, str):
+            if raw.isdigit():
+                return int(raw)
+            return named_ports.get(raw)
+    return None
+
+
+def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) -> dict:
+    """Ports and probes declared across active workloads matching `selector` in `ns`."""
+    backends: list[str] = []
+    declared_ports: set[tuple[str, int]] = set()
+    declared_labels: list[str] = []
+    readiness_ports: set[int] = set()
+    readiness_labels: list[str] = []
+    all_probe_ports: set[int] = set()
+    has_app_port_contract = False
+
+    for item in raw_workloads:
+        meta = item.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        spec = item.get("spec") or {}
+        if spec.get("replicas") == 0:
+            continue
+        template = spec.get("template") or {}
+        pod_labels = (template.get("metadata") or {}).get("labels") or {}
+        if not selector_matches({"matchLabels": selector}, pod_labels):
+            continue
+        backends.append(f"{item['kind']}/{meta.get('name', '')}")
+        pod_spec = template.get("spec") or {}
+        sidecars = [
+            ic
+            for ic in pod_spec.get("initContainers") or []
+            if isinstance(ic, dict) and ic.get("restartPolicy") == RESTART_POLICY_ALWAYS
+        ]
+        for container in list(pod_spec.get("containers") or []) + sidecars:
+            if not isinstance(container, dict):
+                continue
+            is_self_health_sidecar = (container.get("name") or "") in _SELF_HEALTH_SIDECARS
+            named_ports: dict[str, int] = {}
+            for port_entry in container.get("ports") or []:
+                if not isinstance(port_entry, dict):
+                    continue
+                cport = port_entry.get("containerPort")
+                if not _is_int_port(cport):
+                    continue
+                proto = str(port_entry.get("protocol") or DEFAULT_PORT_PROTOCOL).upper()
+                pname = str(port_entry.get("name") or "")
+                if pname:
+                    named_ports[pname] = cport
+                declared_ports.add((proto, cport))
+                if not is_self_health_sidecar:
+                    has_app_port_contract = True
+                    label = f"{pname}:{cport}/{proto}" if pname else f"{cport}/{proto}"
+                    if label not in declared_labels:
+                        declared_labels.append(label)
+            for field in PROBE_FIELDS:
+                pport = _resolve_probe_port(container.get(field), named_ports)
+                if pport is None:
+                    continue
+                all_probe_ports.add(pport)
+                if field == READINESS_PROBE_FIELD:
+                    readiness_ports.add(pport)
+                    if not is_self_health_sidecar:
+                        has_app_port_contract = True
+                        rlabel = f"readiness:{pport}"
+                        if rlabel not in readiness_labels:
+                            readiness_labels.append(rlabel)
+
+    parts = list(declared_labels)
+    for rlabel in readiness_labels:
+        if rlabel not in parts:
+            parts.append(rlabel)
+    backends_str = ", ".join(backends) or "backing workload"
+    ports_str = ", ".join(parts) or "no ports"
+    return {
+        "backends": backends,
+        "declared_ports": declared_ports,
+        "readiness_ports": readiness_ports,
+        "all_probe_ports": all_probe_ports,
+        "has_app_port_contract": has_app_port_contract,
+        "summary": f"{backends_str} declares {ports_str}",
+    }
+
+
+def _service_backend_configs(
+    service: dict,
+    bc_by_key: dict[tuple[str, str], dict],
+    ns: str,
+) -> tuple[list[tuple[str, set[str], int | None, bool]], set[str]]:
+    """BackendConfig bindings on `service`: `(source, port_keys, hc_port, has_hc)` and explicit port keys."""
+    annotations = (service.get("metadata") or {}).get("annotations") or {}
+    raw = ""
+    for ann_key in BACKEND_CONFIG_ANNOTATIONS:
+        val = annotations.get(ann_key)
+        if isinstance(val, str) and val.strip():
+            raw = val.strip()
+            break
+    if not raw:
+        return [], set()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], set()
+    if not isinstance(parsed, dict):
+        return [], set()
+
+    keys_by_bc: dict[str, set[str]] = {}
+    explicit_keys: set[str] = set()
+    default_bc = parsed.get("default")
+    if isinstance(default_bc, str) and default_bc.strip():
+        keys_by_bc.setdefault(default_bc.strip(), set()).add(WILDCARD_PORT_KEY)
+    ports_map = parsed.get("ports")
+    if isinstance(ports_map, dict):
+        for pkey, bc_name in ports_map.items():
+            if isinstance(bc_name, str) and bc_name.strip():
+                key_str = str(pkey).strip()
+                if key_str:
+                    explicit_keys.add(key_str)
+                    keys_by_bc.setdefault(bc_name.strip(), set()).add(key_str)
+
+    bindings: list[tuple[str, set[str], int | None, bool]] = []
+    for bc_name, pkeys in keys_by_bc.items():
+        bc_obj = bc_by_key.get((ns, bc_name))
+        if bc_obj is None:
+            continue
+        hc_raw = (bc_obj.get("spec") or {}).get("healthCheck")
+        has_hc = isinstance(hc_raw, dict) and bool(hc_raw)
+        raw_port = hc_raw.get("port") if isinstance(hc_raw, dict) else None
+        hc_port = raw_port if _is_int_port(raw_port) else None
+        bindings.append((f"{BACKEND_CONFIG_KIND}/{bc_name}", pkeys, hc_port, has_hc))
+    return bindings, explicit_keys
+
+
+def check_ingress_gateway_healthcheck_mismatch(context: dict) -> list[dict]:
+    """Cluster-scoped: route, numeric `targetPort`, or LB health-check port mismatch (§3.25).
+
+    §3.17 catches a named `targetPort` that no container declares because the
+    EndpointSlice controller omits unresolved named ports. A numeric `targetPort`
+    always copies straight into the EndpointSlice whether or not any container
+    listens on it, and an unattached `HTTPRoute` or `Ingress` (or a GKE
+    `BackendConfig` / `HealthCheckPolicy`) can point at a port the Service or
+    its backing pods never expose while every pod stays `Ready`.
+    """
+    routes_by_service: dict[tuple[str, str], list[tuple[str, int | None, str | None]]] = {}
+
+    def _add_route(svc_ns: str, svc_name: str, source: str, port_num: int | None, port_name: str | None) -> None:
+        if not svc_name:
+            return
+        bucket = routes_by_service.setdefault((svc_ns, svc_name), [])
+        item = (source, port_num, port_name)
+        if item not in bucket:
+            bucket.append(item)
+
+    for route in context.get("http_routes") or []:
+        if not isinstance(route, dict) or _is_excluded_object(route):
+            continue
+        meta = route.get("metadata") or {}
+        route_ns = meta.get("namespace", "")
+        route_name = meta.get("name", "")
+        for rule in (route.get("spec") or {}).get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            refs = list(rule.get("backendRefs") or [])
+            for flt in rule.get("filters") or []:
+                if isinstance(flt, dict) and flt.get("type") == REQUEST_MIRROR_FILTER_TYPE:
+                    mirror_ref = (flt.get("requestMirror") or {}).get("backendRef")
+                    if isinstance(mirror_ref, dict):
+                        refs.append(mirror_ref)
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                group = str(ref.get("group") or CORE_API_GROUP)
+                kind = str(ref.get("kind") or SERVICE_KIND)
+                if group != CORE_API_GROUP or kind != SERVICE_KIND:
+                    continue
+                svc_ns = str(ref.get("namespace") or route_ns)
+                svc_name = str(ref.get("name") or "")
+                port_val = ref.get("port") if _is_int_port(ref.get("port")) else None
+                source = (
+                    f"{HTTPROUTE_KIND}/{route_name}"
+                    if svc_ns == route_ns
+                    else f"{HTTPROUTE_KIND}/{route_ns}/{route_name}"
+                )
+                _add_route(svc_ns, svc_name, source, port_val, None)
+
+    for ing in context.get("ingresses") or []:
+        if not isinstance(ing, dict) or _is_excluded_object(ing):
+            continue
+        meta = ing.get("metadata") or {}
+        ing_ns = meta.get("namespace", "")
+        ing_name = meta.get("name", "")
+        spec = ing.get("spec") or {}
+        svc_backends: list[dict] = []
+        default_svc = ((spec.get("defaultBackend") or {}).get("service")) if isinstance(spec.get("defaultBackend"), dict) else None
+        if isinstance(default_svc, dict):
+            svc_backends.append(default_svc)
+        for rule in spec.get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            http_block = rule.get("http")
+            if not isinstance(http_block, dict):
+                continue
+            for path_entry in http_block.get("paths") or []:
+                if not isinstance(path_entry, dict):
+                    continue
+                backend = path_entry.get("backend")
+                svc_ref = backend.get("service") if isinstance(backend, dict) else None
+                if isinstance(svc_ref, dict):
+                    svc_backends.append(svc_ref)
+        for svc_ref in svc_backends:
+            svc_name = str(svc_ref.get("name") or "")
+            port_obj = svc_ref.get("port") if isinstance(svc_ref.get("port"), dict) else {}
+            port_num = port_obj.get("number") if _is_int_port(port_obj.get("number")) else None
+            port_name = str(port_obj.get("name") or "") or None
+            _add_route(ing_ns, svc_name, f"{INGRESS_KIND}/{ing_name}", port_num, port_name)
+
+    bc_by_key: dict[tuple[str, str], dict] = {}
+    for bc in context.get("backend_configs") or []:
+        if not isinstance(bc, dict) or _is_excluded_object(bc):
+            continue
+        meta = bc.get("metadata") or {}
+        bc_by_key[(meta.get("namespace", ""), meta.get("name", ""))] = bc
+
+    hcp_by_service: dict[tuple[str, str], list[tuple[str, int | None, str | None, bool]]] = {}
+    for hcp in context.get("health_check_policies") or []:
+        if not isinstance(hcp, dict) or _is_excluded_object(hcp):
+            continue
+        meta = hcp.get("metadata") or {}
+        hcp_ns = meta.get("namespace", "")
+        hcp_name = meta.get("name", "")
+        spec = hcp.get("spec") or {}
+        target_ref = spec.get("targetRef") if isinstance(spec.get("targetRef"), dict) else {}
+        group = str(target_ref.get("group") or CORE_API_GROUP)
+        kind = str(target_ref.get("kind") or "")
+        svc_name = str(target_ref.get("name") or "")
+        if group != CORE_API_GROUP or kind != SERVICE_KIND or not svc_name:
+            continue
+        cfg = ((spec.get("default") or {}).get("config")) if isinstance(spec.get("default"), dict) else {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        added = False
+        for sub_key in HEALTH_CHECK_SUBCONFIG_KEYS:
+            sub = cfg.get(sub_key)
+            if not isinstance(sub, dict):
+                continue
+            port_spec = str(sub.get("portSpecification") or "")
+            raw_port = sub.get("port")
+            raw_pname = str(sub.get("portName") or "") or None
+            hc_port = (
+                raw_port
+                if _is_int_port(raw_port) and port_spec not in (PORT_SPEC_USE_SERVING, PORT_SPEC_USE_NAMED)
+                else None
+            )
+            hc_pname = (
+                raw_pname
+                if port_spec != PORT_SPEC_USE_SERVING and (port_spec == PORT_SPEC_USE_NAMED or (raw_pname and hc_port is None))
+                else None
+            )
+            uses_serving_port = port_spec == PORT_SPEC_USE_SERVING or (hc_port is None and hc_pname is None)
+            hcp_by_service.setdefault((hcp_ns, svc_name), []).append(
+                (f"{HEALTH_CHECK_POLICY_KIND}/{hcp_name}", hc_port, hc_pname, uses_serving_port)
+            )
+            added = True
+        if not added:
+            hcp_by_service.setdefault((hcp_ns, svc_name), []).append(
+                (f"{HEALTH_CHECK_POLICY_KIND}/{hcp_name}", None, None, False)
+            )
+
+    raw_workloads = context.get("raw_workloads") or []
+    hits: list[dict] = []
+    for entry in context["service_endpoints"]:
+        if not entry["endpoints"]:
+            continue
+        ns = entry["ns"]
+        svc_name = entry["name"]
+        service = entry["service"]
+        route_refs = routes_by_service.get((ns, svc_name), [])
+        bc_refs, explicit_bc_keys = _service_backend_configs(service, bc_by_key, ns)
+        hcp_refs = hcp_by_service.get((ns, svc_name), [])
+        if not route_refs and not bc_refs and not hcp_refs:
+            continue
+
+        svc_ports = [p for p in ((service.get("spec") or {}).get("ports") or []) if isinstance(p, dict)]
+        svc_ports_desc = (
+            ", ".join(
+                f"{p.get('name')}:{p.get('port')}" if p.get("name") else str(p.get("port", ""))
+                for p in svc_ports
+            )
+            or "no ports"
+        )
+
+        reasons: list[str] = []
+        port_sources: dict[int, list[str]] = {}
+
+        def _mark_covered(idx: int, src: str) -> None:
+            srcs = port_sources.setdefault(idx, [])
+            if src not in srcs:
+                srcs.append(src)
+
+        for source, req_port, req_port_name in route_refs:
+            if req_port is not None:
+                matched = [idx for idx, p in enumerate(svc_ports) if p.get("port") == req_port]
+                if not matched:
+                    reasons.append(
+                        f"{source} routes to port {req_port}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, source)
+            elif req_port_name:
+                matched = [idx for idx, p in enumerate(svc_ports) if (p.get("name") or "") == req_port_name]
+                if not matched:
+                    reasons.append(
+                        f"{source} routes to port {req_port_name!r}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, source)
+            else:
+                reasons.append(
+                    f"{source} omits target Service port for Service/{svc_name} "
+                    f"(declares {svc_ports_desc})"
+                )
+
+        routed_port_indices = set(port_sources.keys())
+        hc_checks: list[tuple[str, int]] = []
+        for bc_source, port_keys, hc_port, has_hc in bc_refs:
+            bc_applies = False
+            for key in sorted(port_keys):
+                if key == WILDCARD_PORT_KEY:
+                    unoverridden = [
+                        idx
+                        for idx, p in enumerate(svc_ports)
+                        if str(p.get("name") or "") not in explicit_bc_keys
+                        and str(p.get("port") or "") not in explicit_bc_keys
+                    ]
+                    active = [idx for idx in unoverridden if not routed_port_indices or idx in routed_port_indices]
+                    if active:
+                        bc_applies = True
+                        if has_hc and hc_port is None and not routed_port_indices and len(svc_ports) == 1:
+                            _mark_covered(active[0], bc_source)
+                else:
+                    matched = [
+                        idx
+                        for idx, p in enumerate(svc_ports)
+                        if str(p.get("port") or "") == key or str(p.get("name") or "") == key
+                    ]
+                    if not matched:
+                        reasons.append(
+                            f"{bc_source} is bound to Service port {key!r}, which Service/{svc_name} does not expose "
+                            f"(declares {svc_ports_desc})"
+                        )
+                    else:
+                        active = [idx for idx in matched if not routed_port_indices or idx in routed_port_indices]
+                        if active:
+                            bc_applies = True
+                            if has_hc and hc_port is None:
+                                for idx in active:
+                                    _mark_covered(idx, bc_source)
+            if hc_port is not None and bc_applies:
+                hc_checks.append((bc_source, hc_port))
+
+        for hcp_source, hc_port, hc_pname, uses_serving_port in hcp_refs:
+            if hc_pname:
+                matched = [idx for idx, p in enumerate(svc_ports) if (p.get("name") or "") == hc_pname]
+                if not matched:
+                    reasons.append(
+                        f"{hcp_source} names portName {hc_pname!r}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, hcp_source)
+            elif uses_serving_port and not routed_port_indices and len(svc_ports) == 1:
+                _mark_covered(0, hcp_source)
+            if hc_port is not None:
+                hc_checks.append((hcp_source, hc_port))
+
+        if port_sources or hc_checks:
+            inv = _backing_port_inventory(raw_workloads, ns, entry["selector"])
+            if inv["backends"] and inv["has_app_port_contract"]:
+                for idx in sorted(port_sources):
+                    sp = svc_ports[idx]
+                    raw_target = sp.get("targetPort") if sp.get("targetPort") is not None else sp.get("port")
+                    if not _is_int_port(raw_target):
+                        continue
+                    proto = str(sp.get("protocol") or DEFAULT_PORT_PROTOCOL).upper()
+                    known = {p for pr, p in inv["declared_ports"] if pr == proto}
+                    if proto == DEFAULT_PORT_PROTOCOL:
+                        known |= inv["all_probe_ports"]
+                    if raw_target not in known:
+                        sources_str = ", ".join(port_sources[idx])
+                        sp_name = str(sp.get("name") or "")
+                        sp_label = (
+                            f"port {sp.get('port')} ({sp_name}, targetPort {raw_target}/{proto})"
+                            if sp_name
+                            else f"port {sp.get('port')} (targetPort {raw_target}/{proto})"
+                        )
+                        reasons.append(
+                            f"{sources_str} routes to Service/{svc_name} {sp_label}, which no backing "
+                            f"container declares or probes; {inv['summary']}"
+                        )
+
+                known_pod_ports = (
+                    {p for _, p in inv["declared_ports"]}
+                    | inv["all_probe_ports"]
+                    | {p.get("nodePort") for p in svc_ports if _is_int_port(p.get("nodePort"))}
+                )
+                for hc_source, hc_port in hc_checks:
+                    if hc_port not in known_pod_ports:
+                        reasons.append(
+                            f"{hc_source} probes port {hc_port} on Service/{svc_name}, which no backing "
+                            f"container declares or probes; {inv['summary']}"
+                        )
+
+        if reasons:
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"{SERVICE_KIND}/{svc_name}",
+                    "severity": "major",
+                    "excerpt": "; ".join(reasons),
+                    "reconciler": reconciler_of(service.get("metadata") or {}),
+                    "release": release_of(service.get("metadata") or {}),
+                }
+            )
     return hits
 
 
@@ -7790,6 +8295,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         IMPACT_HPA_AGGRESSIVE_SCALEDOWN,
     ),
+    CheckSpec(
+        INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG,
+        "cluster",
+        check_ingress_gateway_healthcheck_mismatch,
+        "major",
+        None,
+        _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH,
+    ),
 )
 
 def _condition(item: dict, condition_type: str) -> dict | None:
@@ -8487,6 +9000,54 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
 
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
+    if any(spec.slug == INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG for spec in checks):
+        served_crd_runs: list[tuple[str, Run]] = []
+        for crd_resource in INGRESS_GATEWAY_CRD_RESOURCES:
+            expected_kind, context_key = INGRESS_GATEWAY_CRD_META[crd_resource]
+            crd_argv = ["kubectl", "get", crd_resource, "-A", KUBECTL_CHUNK_SIZE_ARG, "-o", "json"]
+            crd_parsed, crd_result = run_and_gate(crd_argv, kubeconfig, run=run)
+            if isinstance(crd_parsed, dict) and isinstance(crd_parsed.get("items"), list):
+                context[context_key] = [
+                    i for i in crd_parsed["items"] if isinstance(i, dict) and i.get("kind") == expected_kind
+                ]
+                served_crd_runs.append(
+                    (f"KUBECONFIG={shlex.quote(str(kubeconfig))} {shlex.join(crd_argv)}", crd_result)
+                )
+            elif (
+                crd_result.rc != TIMEOUT_RC
+                and crd_result.rc != 0
+                and RESOURCE_TYPE_ABSENT_MARKER in crd_result.stderr
+            ):
+                context[context_key] = []
+            else:
+                commands.pop(INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG, None)
+                served_crd_runs = []
+                stderr = crd_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+                what = (
+                    f"did not finish within {DEFAULT_TIMEOUT_S}s and was killed"
+                    if crd_result.rc == TIMEOUT_RC
+                    else f"exited {crd_result.rc} without saying the type is unserved ({stderr})"
+                    if crd_result.rc != 0
+                    else f"returned output that is not a {expected_kind} list (rc=0)"
+                )
+                context.setdefault("unevaluated", {})[INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG] = (
+                    f"{UNDETERMINED_PREFIX} `kubectl get {crd_resource} -A` {what}, so route and "
+                    "health-check port alignment could not be established. "
+                    "This check cleared nothing on this cluster."
+                )
+                break
+        if served_crd_runs and INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG in commands:
+            commands[INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG] = _record(
+                "; ".join([record["command"], *(cmd for cmd, _ in served_crd_runs)]),
+                Run(
+                    [],
+                    0,
+                    dump_run.stdout + "".join(r.stdout for _, r in served_crd_runs),
+                    "",
+                    dump_run.duration_s + sum(r.duration_s for _, r in served_crd_runs),
+                ),
+            )
+
     if cluster.get("autopilot"):
         commands.pop("untargeted-compute-class-workload", None)
         context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (

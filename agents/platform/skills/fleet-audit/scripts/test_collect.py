@@ -428,20 +428,15 @@ def context_of(dump=None, **overrides):
         "workloads": [],
         "workload_keys": set(),
         "pod_namespaces": set(),
+        "ingresses": [],
+        "http_routes": [],
+        "backend_configs": [],
+        "health_check_policies": [],
+        "raw_workloads": [],
         "cluster_name": "test-cluster",
     }
     if dump is not None:
-        base.update(
-            claims=collect.claims_by_key(dump),
-            limitranges=collect.limitranges_by_namespace(dump),
-            pdbs=collect.pdbs_by_namespace(dump),
-            hpas=collect.hpas_by_namespace(dump),
-            services=collect.services_by_namespace(dump),
-            cronjobs=collect.cronjobs_with_jobs(dump),
-            service_endpoints=collect.services_with_endpoints(dump),
-            workloads=collect.normalize_workloads(dump),
-            workload_keys=collect.workload_keys(dump),
-        )
+        base.update(collect.build_context(dump, collect.normalize_workloads(dump)))
     base.update(overrides)
     if "workload_keys" not in overrides and dump is None:
         # A test that hands over `workloads` and no dump is saying "this is
@@ -4258,6 +4253,585 @@ class TestServicePortUnresolved(unittest.TestCase):
                 self.assertEqual(len(orphaned) + len(self.hits(*items)), 1)
 
 
+class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
+    """§3.25 (`ingress-gateway-healthcheck-mismatch`). Cross-checks HTTPRoute /
+    Ingress backendRefs, Service numeric targetPorts, and BackendConfig /
+    HealthCheckPolicy health-check ports against the backing workload's declared
+    containerPorts and readinessProbe in cluster without requiring a Gateway."""
+
+    def hits(self, *items):
+        return collect.check_ingress_gateway_healthcheck_mismatch(context_of(dump_of(*items)))
+
+    def svc(self, name="backend-api-svc", ns="seeded-networking", port=80, target=8080, port_name="http", annotations=None, **kwargs):
+        kwargs.setdefault("selector", {"app": "backend-api"})
+        port_spec = {"port": port, "protocol": "TCP"}
+        if port_name is not None:
+            port_spec["name"] = port_name
+        if target is not None:
+            port_spec["targetPort"] = target
+        kwargs.setdefault("ports", [port_spec])
+        doc = service(name, ns=ns, **kwargs)
+        if annotations:
+            doc["metadata"]["annotations"] = dict(annotations)
+        return doc
+
+    def backend(self, name="backend-api", ns="seeded-networking", ports=None, readiness_probe=None, replicas=1):
+        dep = deployment(name, ns=ns, **{"spec.replicas": replicas})
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "backend-api"}}
+        container = dep["spec"]["template"]["spec"]["containers"][0]
+        if ports is not None:
+            container["ports"] = ports
+        if readiness_probe is not None:
+            container["readinessProbe"] = readiness_probe
+        return dep
+
+    def httproute(self, name="backend-api", ns="seeded-networking", svc_name="backend-api-svc", svc_port=80, labels=None):
+        return {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": name, "namespace": ns, "labels": labels or {}, "annotations": {}},
+            "spec": {
+                "parentRefs": [{"name": "bench-gateway"}],
+                "rules": [{"backendRefs": [{"name": svc_name, "port": svc_port}]}],
+            },
+        }
+
+    def ingress(self, name="backend-ing", ns="seeded-networking", svc_name="backend-api-svc", port_num=80, port_name=None):
+        port_ref = {"name": port_name} if port_name else {"number": port_num}
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": "/",
+                                    "pathType": "Prefix",
+                                    "backend": {"service": {"name": svc_name, "port": port_ref}},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+
+    def backend_config(self, name="api-bc", ns="seeded-networking", hc_port=None):
+        hc = {"port": hc_port} if hc_port is not None else {"requestPath": "/healthz"}
+        return {
+            "apiVersion": "cloud.google.com/v1",
+            "kind": "BackendConfig",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {"healthCheck": hc},
+        }
+
+    def health_check_policy(self, name="api-hcp", ns="seeded-networking", svc_name="backend-api-svc", hc_port=None, port_spec=None, port_name=None):
+        http_hc = {}
+        if hc_port is not None:
+            http_hc["port"] = hc_port
+        if port_spec is not None:
+            http_hc["portSpecification"] = port_spec
+        if port_name is not None:
+            http_hc["portName"] = port_name
+        return {
+            "apiVersion": "networking.gke.io/v1",
+            "kind": "HealthCheckPolicy",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {
+                "targetRef": {"group": "", "kind": "Service", "name": svc_name},
+                "default": {"config": {"type": "HTTP", "httpHealthCheck": http_hc}},
+            },
+        }
+
+    def test_httproute_to_numeric_targetport_missing_from_container_ports_is_flagged(self):
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "https", "containerPort": 8443, "protocol": "TCP"}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["namespace"], "seeded-networking")
+        self.assertEqual(hits[0]["object"], "Service/backend-api-svc")
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("HTTPRoute/backend-api", hits[0]["excerpt"])
+        self.assertIn("8080", hits[0]["excerpt"])
+        self.assertIn("Deployment/backend-api", hits[0]["excerpt"])
+        self.assertIn("https:8443/TCP", hits[0]["excerpt"])
+
+    def test_clean_httproute_matching_declared_container_port_is_silent(self):
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "https", "containerPort": 8443, "protocol": "TCP"}]),
+        )
+        self.assertEqual(hits, [])
+
+    def test_ingress_numeric_targetport_mismatch_and_clean_baseline(self):
+        bad = self.hits(
+            self.ingress(port_num=80),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bad), 1)
+        self.assertIn("Ingress/backend-ing", bad[0]["excerpt"])
+
+        clean = self.hits(
+            self.ingress(port_num=8080),
+            self.svc(port=8080, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[{"containerPort": 8080}],
+                readiness_probe={"httpGet": {"path": "/", "port": 8080}},
+            ),
+        )
+        self.assertEqual(clean, [])
+
+    def test_defaulted_targetport_is_evaluated_when_omitted(self):
+        hits = self.hits(
+            self.httproute(svc_port=80),
+            self.svc(port=80, target=None),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("targetPort 80/TCP", hits[0]["excerpt"])
+
+    def test_route_or_ingress_naming_unexposed_service_port_is_flagged(self):
+        hits = self.hits(
+            self.httproute(svc_port=8080),
+            self.svc(port=80, target=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("does not expose", hits[0]["excerpt"])
+
+        ing_hits = self.hits(
+            self.ingress(port_name="missing"),
+            self.svc(port=80, target=8443, port_name="http"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(ing_hits), 1)
+        self.assertIn("'missing'", ing_hits[0]["excerpt"])
+
+    def test_backendconfig_and_healthcheckpolicy_probe_port_mismatches(self):
+        bc_svc = self.svc(
+            port=80,
+            target=8443,
+            annotations={"cloud.google.com/backend-config": json.dumps({"default": "api-bc"})},
+        )
+        bc_hits = self.hits(
+            bc_svc,
+            self.backend_config(hc_port=9090),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bc_hits), 1)
+        self.assertIn("BackendConfig/api-bc probes port 9090", bc_hits[0]["excerpt"])
+
+        bc_clean = self.hits(
+            bc_svc,
+            self.backend_config(hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(bc_clean, [])
+
+        hcp_hits = self.hits(
+            self.svc(port=80, target=8443),
+            self.health_check_policy(hc_port=9000, port_spec="USE_FIXED_PORT"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hcp_hits), 1)
+        self.assertIn("HealthCheckPolicy/api-hcp probes port 9000", hcp_hits[0]["excerpt"])
+
+        hcp_serving_clean = self.hits(
+            self.svc(port=80, target=8443),
+            self.health_check_policy(hc_port=9000, port_spec="USE_SERVING_PORT"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(hcp_serving_clean, [])
+
+    def test_omitted_container_ports_without_probes_is_not_flagged(self):
+        # Containers that omit `ports` and `readinessProbe` state no port contract;
+        # flagging them would false-positive on valid workloads whose image listens on targetPort.
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=None, readiness_probe=None),
+        )
+        self.assertEqual(hits, [])
+
+    def test_readiness_probe_port_catches_mismatch_and_clears_matching_targetport(self):
+        bad = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 8443}}),
+        )
+        self.assertEqual(len(bad), 1)
+        self.assertIn("readiness:8443", bad[0]["excerpt"])
+
+        clean = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[{"containerPort": 8443}],
+                readiness_probe={"httpGet": {"path": "/readyz", "port": 8080}},
+            ),
+        )
+        self.assertEqual(clean, [])
+
+    def test_native_sidecar_port_satisfies_targetport_while_plain_init_does_not(self):
+        dep = self.backend(ports=[{"containerPort": 8443}])
+        dep["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "envoy", "restartPolicy": "Always", "ports": [{"containerPort": 8080}]},
+        ]
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep,
+            ),
+            [],
+        )
+
+        dep_init = self.backend(ports=[{"containerPort": 8443}])
+        dep_init["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "ports": [{"containerPort": 8080}]},
+        ]
+        self.assertEqual(
+            len(
+                self.hits(
+                    self.httproute(),
+                    self.svc(port=80, target=8080),
+                    endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                    dep_init,
+                )
+            ),
+            1,
+        )
+
+    def test_unrouted_service_and_zero_endpoint_service_and_unresolved_named_port_stay_quiet(self):
+        # Plain ClusterIP Service with no route or policy is not in scope.
+        self.assertEqual(
+            self.hits(
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+        # Scaled-to-zero / empty-endpoint Service (e.g. defects-a scaled_zero_route) stays quiet.
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", addresses=0, ports=[]),
+                self.backend(ports=[{"containerPort": 8443}], replicas=0),
+            ),
+            [],
+        )
+        # Unresolved named targetPort belongs to §3.17 (`service-port-unresolved`), not §3.25.
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target="missing-name"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=[]),
+                self.backend(ports=[{"name": "https", "containerPort": 8443}]),
+            ),
+            [],
+        )
+
+    def test_standard_exclusions_apply_to_service_and_route(self):
+        self.assertEqual(
+            self.hits(
+                self.httproute(ns="kube-system"),
+                self.svc(ns="kube-system", port=80, target=8080),
+                endpointslice("backend-api-svc", ns="kube-system", ports=["http"]),
+                self.backend(ns="kube-system", ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+        exempt_route = self.httproute(labels={collect.OPT_OUT_KEY: "exempt"})
+        self.assertEqual(
+            self.hits(
+                exempt_route,
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+
+    def test_collect_obtainability_handles_autopilot_absent_crds_and_forbidden_reads(self):
+        route = self.httproute()
+        svc = self.svc(port=80, target=8080)
+        es = endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"])
+        dep = self.backend(ports=[{"name": "https", "containerPort": 8443}])
+
+        # 1. Autopilot cluster still evaluates HTTPRoute mismatches before returning early on ComputeClass.
+        def run_autopilot(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if "httproutes.gateway.networking.k8s.io" in argv:
+                return Run(argv, 0, json.dumps(dump_of(route)), "", 0.01)
+            if "backendconfigs.cloud.google.com" in argv or "healthcheckpolicies.networking.gke.io" in argv:
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "backendconfigs"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        ap_cluster = {"name": "ap", "project": "acme", "location": "us-central1", "autopilot": True}
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            res_ap = collect.collect_cluster(ap_cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run_autopilot)
+        self.assertEqual(res_ap["outcome"], "collected")
+        mismatch = [c for c in res_ap["candidates"] if c["check"] == "ingress-gateway-healthcheck-mismatch"]
+        self.assertEqual(len(mismatch), 1)
+        self.assertEqual(mismatch[0]["object"], "Service/backend-api-svc")
+        mm_cmd = next(c["command"] for c in res_ap["commands"] if c["check"] == "ingress-gateway-healthcheck-mismatch")
+        self.assertIn("kubectl get httproutes.gateway.networking.k8s.io -A --chunk-size=500 -o json", mm_cmd)
+        self.assertNotIn("backendconfigs.cloud.google.com", mm_cmd)
+
+        # 2. Forbidden / failed CRD read marks ingress-gateway-healthcheck-mismatch unevaluated.
+        def run_forbidden(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if "httproutes.gateway.networking.k8s.io" in argv:
+                return Run(argv, 1, "", "Error from server (Forbidden): httproutes is forbidden", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            res_fb = collect.collect_cluster(ap_cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run_forbidden)
+        uneval = {e["check"]: e["reason"] for e in res_fb.get("checks_unevaluated") or []}
+        self.assertIn("ingress-gateway-healthcheck-mismatch", uneval)
+        self.assertNotIn("ingress-gateway-healthcheck-mismatch", {c["check"] for c in res_fb["commands"]})
+        self.assertEqual([c for c in res_fb["candidates"] if c["check"] == "ingress-gateway-healthcheck-mismatch"], [])
+
+    def test_multiport_service_unrouted_ports_and_fixed_probe_ports_do_not_false_positive(self):
+        # 1. Service-level HealthCheckPolicy or default BackendConfig on a multi-port Service
+        # must not flag unrouted ports when HTTPRoute only routes port 80.
+        multi_svc = service(
+            "backend-api-svc",
+            ns="seeded-networking",
+            selector={"app": "backend-api"},
+            ports=[
+                {"name": "http", "port": 80, "protocol": "TCP", "targetPort": 8443},
+                {"name": "debug", "port": 9090, "protocol": "TCP", "targetPort": 9090},
+            ],
+        )
+        multi_svc["metadata"]["annotations"] = {"cloud.google.com/backend-config": json.dumps({"default": "api-bc"})}
+        self.assertEqual(
+            self.hits(
+                self.httproute(svc_port=80),
+                multi_svc,
+                self.backend_config(hc_port=None),
+                self.health_check_policy(port_spec="USE_SERVING_PORT"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http", "debug"]),
+                self.backend(ports=[{"name": "https", "containerPort": 8443}]),
+            ),
+            [],
+        )
+
+        # 2. Fixed-port probe (USE_FIXED_PORT or BackendConfig.spec.healthCheck.port) matching a
+        # container's readinessProbe port on a container omitting `ports:` must not flag targetPort.
+        self.assertEqual(
+            self.hits(
+                self.svc(port=80, target=8080),
+                self.health_check_policy(hc_port=9000, port_spec="USE_FIXED_PORT"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 9000}}),
+            ),
+            [],
+        )
+
+    def test_backendconfig_ports_map_and_healthcheckpolicy_named_and_ssl_subconfigs(self):
+        # BackendConfig `ports` map naming a nonexistent Service port is flagged, while explicit
+        # `ports` override suppresses `default` on that port.
+        bad_map_svc = self.svc(
+            port=80,
+            target=8443,
+            annotations={"cloud.google.com/backend-config": json.dumps({"ports": {"missing": "api-bc"}})},
+        )
+        bad_map_hits = self.hits(
+            bad_map_svc,
+            self.backend_config(hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bad_map_hits), 1)
+        self.assertIn("bound to Service port 'missing'", bad_map_hits[0]["excerpt"])
+
+        override_svc = self.svc(
+            port=80,
+            target=8080,
+            port_name="http",
+            annotations={
+                "cloud.google.com/backend-config": json.dumps(
+                    {"default": "broken-default", "ports": {"http": "override-bc"}}
+                )
+            },
+        )
+        override_clean = self.hits(
+            override_svc,
+            self.backend_config(name="broken-default", hc_port=9999),
+            self.backend_config(name="override-bc", hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(override_clean, [])
+
+        # USE_SERVING_PORT ignores a stale portName field alongside it.
+        serving_stale_pname = self.hits(
+            self.svc(port=80, target=8443, port_name="http"),
+            self.health_check_policy(port_spec="USE_SERVING_PORT", port_name="legacy-hc"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(serving_stale_pname, [])
+
+        # HealthCheckPolicy USE_NAMED_PORT missing portName and SSL healthCheck fixed-port mismatch.
+        named_hits = self.hits(
+            self.svc(port=80, target=8443, port_name="http"),
+            self.health_check_policy(port_spec="USE_NAMED_PORT", port_name="admin"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(named_hits), 1)
+        self.assertIn("portName 'admin'", named_hits[0]["excerpt"])
+
+        ssl_hcp = {
+            "apiVersion": "networking.gke.io/v1",
+            "kind": "HealthCheckPolicy",
+            "metadata": {"name": "ssl-hcp", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {
+                "targetRef": {"group": "", "kind": "Service", "name": "backend-api-svc"},
+                "default": {
+                    "config": {
+                        "type": "SSL",
+                        "sslHealthCheck": {"portSpecification": "USE_FIXED_PORT", "port": 9999},
+                    }
+                },
+            },
+        }
+        ssl_hits = self.hits(
+            self.svc(port=443, target=8443),
+            ssl_hcp,
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(ssl_hits), 1)
+        self.assertIn("HealthCheckPolicy/ssl-hcp probes port 9999", ssl_hits[0]["excerpt"])
+
+    def test_httproute_request_mirror_cross_namespace_and_ingress_default_backend(self):
+        cross_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "edge-route", "namespace": "edge", "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "backendRefs": [{"name": "edge-svc", "port": 80}],
+                        "filters": [
+                            {
+                                "type": "RequestMirror",
+                                "requestMirror": {
+                                    "backendRef": {
+                                        "name": "backend-api-svc",
+                                        "namespace": "seeded-networking",
+                                        "port": 80,
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        mirror_hits = self.hits(
+            cross_route,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(mirror_hits), 1)
+        self.assertIn("HTTPRoute/edge/edge-route", mirror_hits[0]["excerpt"])
+
+        default_ing = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "default-ing", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {"defaultBackend": {"service": {"name": "backend-api-svc", "port": {"number": 80}}}},
+        }
+        default_ing_hits = self.hits(
+            default_ing,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(default_ing_hits), 1)
+        self.assertIn("Ingress/default-ing", default_ing_hits[0]["excerpt"])
+
+        # Portless HTTPRoute backendRef reports the missing port rather than blaming unrouted ports.
+        portless_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "portless", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {"rules": [{"backendRefs": [{"name": "backend-api-svc"}]}]},
+        }
+        multi_svc = service(
+            "backend-api-svc",
+            ns="seeded-networking",
+            selector={"app": "backend-api"},
+            ports=[
+                {"name": "http", "port": 80, "protocol": "TCP", "targetPort": 8443},
+                {"name": "debug", "port": 9090, "protocol": "TCP", "targetPort": 9090},
+            ],
+        )
+        portless_hits = self.hits(
+            portless_route,
+            multi_svc,
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http", "debug"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(portless_hits), 1)
+        self.assertIn("omits target Service port", portless_hits[0]["excerpt"])
+        self.assertNotIn("9090/TCP", portless_hits[0]["excerpt"])
+
+    def test_self_health_sidecars_do_not_arm_port_contract_when_app_container_omits_ports(self):
+        dep = self.backend(ports=None, readiness_probe=None)
+        dep["spec"]["template"]["spec"]["containers"].append(
+            {
+                "name": "cloud-sql-proxy",
+                "ports": [{"containerPort": 5432}],
+                "readinessProbe": {"httpGet": {"path": "/readiness", "port": 9090}},
+            }
+        )
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep,
+            ),
+            [],
+        )
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -4490,6 +5064,7 @@ class TestCollectCluster(unittest.TestCase):
                 "cronjob-runs-overlap",
                 "service-selects-nothing",
                 "service-port-unresolved",
+                "ingress-gateway-healthcheck-mismatch",
             },
         )
         self.assertFalse(cluster_slugs & set(na))
@@ -4702,10 +5277,11 @@ class TestCollectCluster(unittest.TestCase):
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
+        extra_read_slugs = {"untargeted-compute-class-workload", "ingress-gateway-healthcheck-mismatch"}
         dump_commands = {
             c["command"]
             for c in result["commands"]
-            if c["check"] != "untargeted-compute-class-workload"
+            if c["check"] not in extra_read_slugs
         }
         self.assertEqual(len(dump_commands), 1)
         self.assertIn("kubectl get", next(iter(dump_commands)))
@@ -4715,6 +5291,12 @@ class TestCollectCluster(unittest.TestCase):
             if c["check"] == "untargeted-compute-class-workload"
         )
         self.assertIn("kubectl get computeclasses", cc_cmd)
+        mm_cmd = next(
+            c["command"]
+            for c in result["commands"]
+            if c["check"] == "ingress-gateway-healthcheck-mismatch"
+        )
+        self.assertIn("kubectl get httproutes.gateway.networking.k8s.io", mm_cmd)
 
     def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
         """The record, not only the reads: each obtainability check's `command` is
@@ -4737,11 +5319,14 @@ class TestCollectCluster(unittest.TestCase):
         self.assertTrue(str(kubeconfig).startswith(tmp), kubeconfig)
         expected = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
         self.assertTrue(expected.startswith("( export KUBECONFIG="), expected)
-        dump_slugs = {c["check"] for c in result["commands"] if c["check"] != "untargeted-compute-class-workload"}
-        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - {"untargeted-compute-class-workload"}, dump_slugs)
+        extra_read_slugs = {"untargeted-compute-class-workload", "ingress-gateway-healthcheck-mismatch"}
+        dump_slugs = {c["check"] for c in result["commands"] if c["check"] not in extra_read_slugs}
+        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - extra_read_slugs, dump_slugs)
         for c in result["commands"]:
-            if c["check"] != "untargeted-compute-class-workload":
+            if c["check"] not in extra_read_slugs:
                 self.assertEqual(expected, c["command"], c["check"])
+            elif c["check"] == "ingress-gateway-healthcheck-mismatch":
+                self.assertTrue(c["command"].startswith(expected + "; KUBECONFIG="), c["command"])
 
 
 class TestCollectFleet(unittest.TestCase):
@@ -13452,6 +14037,18 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
                 self.assertEqual(text, audit_report.trim_command(text))
+        obtainability_dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        crd_suffix = [
+            f"KUBECONFIG={collect.shlex.quote(str(kubeconfig))} kubectl get {crd} -A {collect.KUBECTL_CHUNK_SIZE_ARG} -o json"
+            for crd in collect.INGRESS_GATEWAY_CRD_RESOURCES
+        ]
+        mm_text = "; ".join([obtainability_dump, *crd_suffix])
+        self.assertLessEqual(len(mm_text), audit_report.MAX_COMMAND_CHARS, len(mm_text))
+        self.assertEqual(
+            mm_text,
+            audit_report.validate_check_command(mm_text, "clusters[0]", "ingress-gateway-healthcheck-mismatch"),
+        )
+        self.assertEqual(mm_text, audit_report.trim_command(mm_text))
 
 
 class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
