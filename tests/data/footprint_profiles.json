@@ -1,58 +1,8 @@
 {
   "profiles": {
-    "today-standard": {
-      "label": "`today`, GKE Standard",
+    "standard": {
+      "label": "GKE Standard",
       "sets": [],
-      "autopilot": false,
-      "requirements": {
-        "chartSurgePods": 2,
-        "limitsCpu": 13200,
-        "limitsEphemeral": 15636365312,
-        "limitsMemory": 26709327872,
-        "persistentVolumeClaims": 4,
-        "pods": 9,
-        "requestsCpu": 2756,
-        "requestsEphemeral": 15636365312,
-        "requestsMemory": 12683575296,
-        "requestsStorage": 109521666048,
-        "surgeLimitsCpu": 500,
-        "surgeLimitsEphemeral": 1342177280,
-        "surgeLimitsMemory": 3221225472,
-        "surgeRequestsCpu": 100,
-        "surgeRequestsEphemeral": 1342177280,
-        "surgeRequestsMemory": 2147483648
-      },
-      "sessionQuotaPods": null
-    },
-    "today-autopilot": {
-      "label": "`today`, GKE Autopilot",
-      "sets": [],
-      "autopilot": true,
-      "requirements": {
-        "chartSurgePods": 2,
-        "limitsCpu": 13200,
-        "limitsEphemeral": 15636365312,
-        "limitsMemory": 26709327872,
-        "persistentVolumeClaims": 4,
-        "pods": 9,
-        "requestsCpu": 4256,
-        "requestsEphemeral": 15636365312,
-        "requestsMemory": 13757317120,
-        "requestsStorage": 109521666048,
-        "surgeLimitsCpu": 500,
-        "surgeLimitsEphemeral": 1342177280,
-        "surgeLimitsMemory": 3221225472,
-        "surgeRequestsCpu": 100,
-        "surgeRequestsEphemeral": 1342177280,
-        "surgeRequestsMemory": 2147483648
-      },
-      "sessionQuotaPods": null
-    },
-    "next-standard": {
-      "label": "`next`, GKE Standard",
-      "sets": [
-        "platformAgent.mode=next"
-      ],
       "autopilot": false,
       "requirements": {
         "chartSurgePods": 2,
@@ -74,11 +24,9 @@
       },
       "sessionQuotaPods": 39
     },
-    "next-autopilot": {
-      "label": "`next`, GKE Autopilot",
-      "sets": [
-        "platformAgent.mode=next"
-      ],
+    "autopilot": {
+      "label": "GKE Autopilot",
+      "sets": [],
       "autopilot": true,
       "requirements": {
         "chartSurgePods": 2,
@@ -100,10 +48,9 @@
       },
       "sessionQuotaPods": 39
     },
-    "next-one-server": {
-      "label": "`next` with one NATS server, GKE Standard",
+    "one-server": {
+      "label": "One NATS server, GKE Standard",
       "sets": [
-        "platformAgent.mode=next",
         "platformAgent.harness.tuning.busReplicas=1"
       ],
       "autopilot": false,
@@ -127,10 +74,9 @@
       },
       "sessionQuotaPods": 37
     },
-    "next-hindsight-minter": {
-      "label": "`next` with Hindsight and the GitHub minter, GKE Standard",
+    "hindsight-minter": {
+      "label": "Hindsight and the GitHub minter, GKE Standard",
       "sets": [
-        "platformAgent.mode=next",
         "hindsight.enabled=true",
         "githubMinter.enabled=true"
       ],

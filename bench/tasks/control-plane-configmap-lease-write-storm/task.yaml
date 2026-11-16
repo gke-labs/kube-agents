@@ -25,6 +25,7 @@ id: control-plane-configmap-lease-write-storm
 name: "ConfigMap and Lease write storm (declared gap; planted as a controller with rate limits disabled, writing nothing, when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit

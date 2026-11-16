@@ -148,16 +148,14 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 
 | Profile | Pods | CPU requests | Memory requests | CPU limits | Memory limits | Ephemeral storage requests / limits | Claims | `requests.storage` | Session quota `pods` |
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
-| `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| `next`, GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| `next` with one NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
+| GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
+| Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
-Under `spec.mode: next`, per pod:
+The A2A stack, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
@@ -243,25 +241,26 @@ The Helm chart on its own is the one path that never installs cert-manager: a ch
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true
+  --set crds.enabled=true
 ```
+
+`crds.enabled` is the key in chart 1.15 and later. If you pin a chart below 1.15, set `installCRDs=true` instead: those charts ignore `crds.enabled` and install no CRDs.
 
 ### GKE Autopilot install
 
-Autopilot blocks leader-election Leases in `kube-system`. Disable leader election during install:
+Autopilot blocks leader-election Leases in `kube-system`. Move them to the `cert-manager` namespace during install:
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true \
-  --set controller.leaderElection.enabled=false \
-  --set cainjector.leaderElection.enabled=false
+  --set crds.enabled=true \
+  --set global.leaderElection.namespace=cert-manager
 ```
 
 ### Manifest fallback
@@ -272,7 +271,7 @@ If Helm isn't available:
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml
 ```
 
-On Autopilot you'll additionally need to patch the deployments to append `--leader-elect=false`. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
+The manifest cannot move the leader-election Leases: it writes them to `kube-system` and has no RBAC for another namespace. On Autopilot, patch the controller and cainjector deployments to append `--leader-elect=false` instead. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
 
 ## Chat platform
 
@@ -289,8 +288,7 @@ use. Terraform and Helm both default it off — `enable_google_chat` and the cha
 `googleChat.enabled` are `false`, so neither takes a slot unless you ask. The interactive installer
 goes the other way: its chat menu pre-selects **Google Chat**, so pressing enter at that prompt
 provisions the Chat backend. Pick "None" or Slack there if you want the project's Chat slot left
-alone. Pick Slack alone, too, if you install `next` (a first install's default) and want Slack on the A2A gateway: with both platforms enabled, Google Chat holds the gateway and Slack stays on the
-Hermes Slack platform. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
+alone. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
 is already spoken for can still run kube-agents with Slack in it.
 
 If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available

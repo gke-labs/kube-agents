@@ -108,6 +108,14 @@ class GoldenFixtureTest(unittest.TestCase):
             "a trigger naming another schedule's stream",
             "a trigger stream with a doubled user prefix",
             "a non-ASCII trigger name",
+            "a trigger script that is a path",
+            "a trigger script on a collector trigger",
+            "an upper-case trigger script",
+            "a dotted trigger script",
+            "a non-ASCII trigger script",
+            "an over-long trigger script",
+            "a case-variant trigger script key",
+            "a null trigger script",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, names)

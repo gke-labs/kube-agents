@@ -40,10 +40,28 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
-readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
 # What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
 # a registered case, replayed from the nightlies' recordings, gating nothing.
 readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
+# The lane's safety cases: each runs EVAL_REPETITIONS times live, before the
+# cache is seeded, then as many times replayed, so the lane's report can set
+# the two pass rates side by side (hack/replay-proxy/README.md, "In CI").
+readonly EVAL_REPLAY_LANE_SAFETY_CASES_FILE="eval/replay-lane-safety-cases.txt"
+# A safety case's arms: live, then replayed, EVAL_REPETITIONS each.
+readonly REPLAY_LANE_SAFETY_ARMS=2
+# Where the lane tells lane_report.py which repetitions were live (its
+# ARMS_FILE), beside bench-gate's case-<name>.json.
+readonly REPLAY_LANE_ARMS_FILE="replay-lane-arms.json"
+# The certification suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: certification` (and in part N when
+# it carries `certification_part: N`; absent is part 1). The two line
+# patterns below are the whole grammar; scripts/eval_rosters.py and
+# scripts/validate_bench_cases.py read the same two lines, and the validator
+# refuses any other spelling (a quoted or commented value), so a case the
+# validator registers is a case this grep sees.
+readonly CERTIFICATION_SUITE_LINE_RE='^suite: certification$'
+readonly CERTIFICATION_PART_KEY='certification_part'
+readonly CERTIFICATION_PART_LINE_RE="^${CERTIFICATION_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
 # (#3384, #4238): a stack-bearing case on no list runs in main-a, which
@@ -759,6 +777,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_ROLLBACK_LANE=1 is set: the today lane grades a rolled-back install, which is not main's history"
     return 0
   fi
+  if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+    echo "eval-dashboard publish skipped: EVAL_SLACK_LANE=1 is set: the Slack lane is advisory and grades no matrix"
+    return 0
+  fi
   if [ "${EVAL_TIER:-}" = "certification" ]; then
     echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
     return 0
@@ -1333,13 +1355,15 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
-# On the replay lane, the nightlies' recorded answers go into every proxy pod
-# before any case runs; with nothing to replay the lane stops here, having
-# measured nothing (hack/ci-env.sh). A no-op on every other run.
+# On the replay lane, the nightlies' recorded answers are fetched before any
+# case runs; with nothing to replay the lane stops here, having measured
+# nothing (hack/ci-env.sh). A no-op on every other run. The lane seeds them
+# into the proxy pods and starts its collector at the fan-out, after its live
+# arm (seed_replay_lane_cache).
 prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
-start_replay_shadow_collector
+[ "${EVAL_REPLAY_LANE:-}" = "true" ] || start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -3072,8 +3096,8 @@ export JUDGE_PROVIDER="google"
 # distinct judge model is blocked on one
 # fact this repository cannot prove: that kube-agents-gemini-api-key serves a
 # second model. The tree says it should -- the chart's default for the same
-# GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
-# litellm.yaml, docs/site .../inference-gateway.md) -- so the switch is one
+# GEMINI_API_KEY family is gemini-3.8-flash (charts/kube-agents/templates/
+# _helpers.tpl, docs/site .../inference-gateway.md) -- so the switch is one
 # verified run away: confirm the key against the candidate model, then set
 # JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
 # touching the agent line.
@@ -3133,7 +3157,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: six files under hack/eval/, read here at
+# The matrix is data, not code: five files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), gitlab-cases.txt is what the GitLab lane runs in
 # its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
@@ -3156,12 +3180,13 @@ fi
 # ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
 # nightly entry that is also a presubmit one (it would run twice a night) all
 # stop the job here, before it spends a cluster, rather than running a wrong
-# matrix and reporting green around it. certification-cases.txt is what
-# EVAL_TIER=certification runs on its own (the certification tier, below).
+# matrix and reporting green around it. The certification suite is the one
+# matrix read from the task files themselves: `suite: certification` in a
+# task file is what EVAL_TIER=certification runs (the certification tier,
+# below).
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
-CERTIFICATION_CASES_FILE="${SCRIPT_DIR}/${EVAL_CERTIFICATION_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
@@ -3280,22 +3305,45 @@ done
 # The certification suite: the cases behind the certified-capabilities page,
 # graded on their own lane (the ci-kube-agents-certification periodics in
 # oss-test-infra, EVAL_TIER=certification) and never on a pull request or a
-# nightly. Every entry is a top-level case under bench/tasks/ whose task file
-# carries `suite: certification` (scripts/validate_bench_cases.py holds the
-# roster to that); an entry that is also a presubmit or nightly case stops the
+# nightly. Membership is read from the task files, not from a roster: every
+# top-level case under bench/tasks/ whose task file carries the bare line
+# `suite: certification` is in the suite, in case-id order (LC_ALL=C, the
+# order scripts/eval_rosters.py sorts in), so a case pull request edits no
+# shared file. An entry that is also a presubmit or nightly case stops the
 # job, since a case graded on two lanes would hold two records under one
-# name. The file may be empty between the tier landing and its first case,
+# name. The suite may be empty between the tier landing and its first case,
 # so the empty read is refused only when this tier is the one running.
-# `# part N` lines (N from 1, the line on its own) split the file into
-# sections, one periodic each (EVAL_CERTIFICATION_PART below); an entry
-# above the first marker is part 1. scripts/eval_rosters.py reads the same
-# grammar (PART_MARKER_RE); the two must stay twins.
-CERTIFICATION_ENTRIES="$(roster_entries "${CERTIFICATION_CASES_FILE}")"
+# `certification_part: N` in a task file (N from 1, the bare line) puts the
+# case in section N, one periodic each (EVAL_CERTIFICATION_PART below); a
+# case without the line is part 1. scripts/eval_rosters.py reads the same
+# two lines (CERTIFICATION_SUITE_LINE_RE, CERTIFICATION_PART_LINE_RE); the
+# two must stay twins.
+certification_entries() {
+  # grep -l exits 1 when no task file matches; that is the empty suite, not
+  # an error, and the tier switch below is what refuses it. Exit 2 (a task
+  # file it could not read) is an error: a case dropped in silence would
+  # grade green around a missing record. Sorted on the id field, not the
+  # path: `tasks/foo-bar/` sorts before `tasks/foo/` as text (`-` before
+  # `/`), and scripts/eval_rosters.py sorts by id.
+  (
+    cd "${BENCH_DIR}" || exit 1
+    local files rc=0
+    files="$(LC_ALL=C grep -lE "${CERTIFICATION_SUITE_LINE_RE}" tasks/*/task.yaml)" || rc=$?
+    if [ "${rc}" -gt 1 ]; then
+      echo "ERROR: could not read every task file under bench/tasks/ for the certification suite (grep exit ${rc})." >&2
+      exit 1
+    fi
+    if [ -n "${files}" ]; then
+      LC_ALL=C sort -t/ -k2,2 <<< "${files}" | sed 's|^|./|'
+    fi
+  )
+}
+CERTIFICATION_ENTRIES="$(certification_entries)"
 CERTIFICATION_TASKS=()
 while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
-check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+check_case_entries "bench/tasks (suite: certification)" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
 # A here-string, not `printf | grep -q`: grep exits on its first match, a
 # producer still writing dies of SIGPIPE, and under pipefail the duplicate
 # reads as absent. printf hands the pipe a few KiB per write, so on today's
@@ -3303,22 +3351,25 @@ check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CER
 # it is every run.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
   if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
-    echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
+    echo "ERROR: ${ENTRY} carries 'suite: certification' and is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
     exit 1
   fi
 done
 
-# The entries of one `# part N` section of the certification file, in file
-# order, with the same comment and whitespace rules as roster_entries.
-certification_part_entries() { # <file> <N>
-  awk -v want="$2" '
-    BEGIN { part = 1 }
-    /^#[[:space:]]+part[[:space:]]+[1-9][0-9]*[[:space:]]*$/ { part = $3 + 0; next }
-    {
-      sub(/#.*$/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-      if ($0 != "" && part == want + 0) print
-    }
-  ' "$1"
+# The part a certification case is in: the N of its bare
+# `certification_part: N` line, 1 when it has none.
+certification_part_of() { # <entry>
+  local part
+  part="$(grep -E "${CERTIFICATION_PART_LINE_RE}" "${BENCH_DIR}/$1" | head -n 1 | sed "s/^${CERTIFICATION_PART_KEY}: //" || true)"
+  echo "${part:-1}"
+}
+
+# The entries of section N of the suite, in case-id order.
+certification_part_entries() { # <N>
+  local entry
+  for entry in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
+    if [ "$(certification_part_of "${entry}")" = "$1" ]; then echo "${entry}"; fi
+  done
 }
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -3397,7 +3448,7 @@ case "${EVAL_TIER}" in
       exit 1
     fi
     if [ "${#CERTIFICATION_TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: ${CERTIFICATION_CASES_FILE} names no case; the certification tier would run nothing and report green." >&2
+      echo "ERROR: no task file under bench/tasks/ carries the bare line 'suite: certification'; the certification tier would run nothing and report green." >&2
       exit 1
     fi
     TASKS=("${CERTIFICATION_TASKS[@]}")
@@ -3416,6 +3467,8 @@ esac
 # history (the recorder decision and the dashboard hook below both skip it);
 # its report is the collector's, in the private shadow bucket. It runs on the
 # presubmit tier's defaults and GitHub only.
+# The safety cases' names, comma-separated; set only on the lane, below.
+REPLAY_LANE_SAFETY_NAMES=""
 case "${EVAL_REPLAY_LANE:-false}" in
   false) ;;
   true)
@@ -3439,14 +3492,88 @@ case "${EVAL_REPLAY_LANE:-false}" in
         exit 1
       fi
     done
+    # The safety cases join the matrix at twice the repetitions
+    # (case_repetitions): the first EVAL_REPETITIONS run live, before the
+    # cache is seeded, the rest replayed. Registered, and in neither list twice.
+    REPLAY_LANE_SAFETY_CASES_PATH="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}"
+    REPLAY_LANE_SAFETY_ENTRIES=""
+    if [ -f "${REPLAY_LANE_SAFETY_CASES_PATH}" ]; then
+      REPLAY_LANE_SAFETY_ENTRIES="$(roster_entries "${REPLAY_LANE_SAFETY_CASES_PATH}")"
+    fi
+    while IFS= read -r ENTRY; do
+      [ -n "${ENTRY}" ] || continue
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+      if printf '%s\n' "${REPLAY_LANE_TASKS[@]}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is already in the lane's matrix (${EVAL_REPLAY_LANE_CASES_FILE} or above); a case is listed once." >&2
+        exit 1
+      fi
+      REPLAY_LANE_TASKS+=("${ENTRY}")
+      REPLAY_LANE_SAFETY_NAMES="${REPLAY_LANE_SAFETY_NAMES:+${REPLAY_LANE_SAFETY_NAMES},}$(basename "$(dirname "${ENTRY}")")"
+    done <<< "${REPLAY_LANE_SAFETY_ENTRIES}"
     TASKS=("${REPLAY_LANE_TASKS[@]}")
     echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    echo "EVAL_REPLAY_LANE=true: safety cases, each run live before the cache is seeded and then replayed (${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}): ${REPLAY_LANE_SAFETY_NAMES:-none}"
     ;;
   *)
     echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
     exit 1
     ;;
 esac
+
+# case_repetitions <task-name>: how many repetitions a case runs. A replay-lane
+# safety case runs a live arm and then a replayed one, EVAL_REPETITIONS each;
+# every other case runs EVAL_REPETITIONS. A safety case's repetitions are
+# numbered on: 1..EVAL_REPETITIONS live, the rest replayed (first_queued_rep).
+case_repetitions() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS * REPLAY_LANE_SAFETY_ARMS)) ;;
+    *) echo "${EVAL_REPETITIONS}" ;;
+  esac
+}
+
+# first_queued_rep <task-name>: the first repetition the main fan-out launches:
+# past the live arm for a safety case, whose live repetitions run before the
+# cache is seeded.
+first_queued_rep() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS + 1)) ;;
+    *) echo 1 ;;
+  esac
+}
+
+# write_replay_lane_arms <seeded-at epoch seconds>: tells lane_report.py (its
+# ARMS_FILE) which safety cases ran a live arm, how many repetitions it was,
+# and when replay began, beside bench-gate's case files in the collector's
+# --verdicts-dir.
+write_replay_lane_arms() {
+  [ -n "${REPLAY_LANE_SAFETY_NAMES:-}" ] || return 0
+  python3 -c '
+import json, sys
+path, live_reps, seeded_at, names = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({"live_reps": live_reps, "replayed_from": seeded_at, "cases": names.split(",")}, fh)
+' "${ARTIFACT_DIR}/${REPLAY_LANE_ARMS_FILE}" "${EVAL_REPETITIONS}" "$1" "${REPLAY_LANE_SAFETY_NAMES}"
+}
+
+# run_replay_lane_live_arm: on the replay lane, the live arm runs while every
+# proxy pod's cache is still empty, so each of its requests misses and goes to
+# the model; then the cache goes in and the collector starts, and every unit
+# launched after this is replayed. A no-op off the lane. Uses the fan-out's
+# UNIT_QUEUE_LIVE and LIVE_TOTAL, set before it is called.
+run_replay_lane_live_arm() {
+  [ "${EVAL_REPLAY_LANE:-}" = "true" ] || return 0
+  if [ "${LIVE_TOTAL:-0}" -gt 0 ]; then
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
+    launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+    wait
+  fi
+  seed_replay_lane_cache || exit 1
+  write_replay_lane_arms "$(date -u +%s)"
+  start_replay_shadow_collector
+}
 
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # several periodics on leased projects of their own: the cases that request a pull request
@@ -3484,11 +3611,12 @@ case "${EVAL_NIGHTLY_PART}" in
 esac
 
 # ─── The certification part ──────────────────────────────────────────────────
-# Which `# part N` section of the certification file this run takes, applied
+# Which section of the certification suite this run takes (the cases whose
+# task file carries `certification_part: N`; none means part 1), applied
 # to TASKS here, before the exclusions and TASK_NAMES are built from it, so
 # the suite can run as one periodic per section on one leased project each: a
 # week's worth of runs at three repetitions is longer than any single job
-# here. "all", the default, is the whole file. A part outside the
+# here. "all", the default, is the whole suite. A part outside the
 # certification tier would be a typo that silently ran the wrong matrix, so
 # it stops the job, as does any value that is not "all" or a whole number.
 EVAL_CERTIFICATION_PART="${EVAL_CERTIFICATION_PART:-all}"
@@ -3506,9 +3634,9 @@ case "${EVAL_CERTIFICATION_PART}" in
     TASKS=()
     while IFS= read -r ENTRY; do
       if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
-    done <<< "$(certification_part_entries "${CERTIFICATION_CASES_FILE}" "${EVAL_CERTIFICATION_PART}")"
+    done <<< "$(certification_part_entries "${EVAL_CERTIFICATION_PART}")"
     if [ "${#TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification file; the run would grade nothing and report green." >&2
+      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification suite; the run would grade nothing and report green." >&2
       exit 1
     fi
     echo "Certification part: ${EVAL_CERTIFICATION_PART} (${#TASKS[@]} of ${#CERTIFICATION_TASKS[@]} cases)"
@@ -4547,6 +4675,29 @@ EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 
 # cut-off line counts as "recorded".
 EVAL_RECORDED_MANIFEST="${ARTIFACT_DIR}/baseline-recorded.jsonl"
 
+# ─── The Slack lane (EVAL_SLACK_LANE=1) ──────────────────────────────────────
+# ci-kube-agents-eval-nightly-slack runs hack/slack-lane/run.sh in place of the
+# matrix: each case in hack/slack-lane/cases.txt once, through real Slack
+# (AGENT_TRANSPORT=slack), with the environment exported above. It runs only
+# when the installed PlatformAgent has Slack on, which the deploy sets only when
+# every one of its secrets read (hack/ci-deploy.sh, 2a); the lane reads its own
+# three (the test user's token, the channel, the bot's id) and skips without
+# them. Advisory: the lane's cases never red this job, and nothing here records
+# a baseline or a verdict; a failure in a step above still does. Its results and
+# Slack timings land under ${ARTIFACTS}/slack-lane.
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  profile_begin "slack lane: hack/slack-lane/run.sh"
+  slack_lane_on="$(kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" \
+    get platformagents -o jsonpath='{.items[0].spec.integration.slack.enabled}' 2>/dev/null || true)"
+  if [ "${slack_lane_on}" != "true" ]; then
+    echo "slack lane: skipped: the install has no Slack (the deploy's log says which slack-eval-* secret it could not read)"
+  else
+    SLACK_LANE_ARTIFACTS="${ARTIFACTS:-/tmp/artifacts}/slack-lane" "${SCRIPT_DIR}/slack-lane/run.sh" || true
+  fi
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Slack lane finished; its cases never red this job ==="
+  exit 0
+fi
+
 # ─── Parallel fan-out ─────────────────────────────────────────────────────────
 # The schedulable unit is one (task, repetition): every invocation is an
 # independent agent conversation, and the agent span is ~98% of its wall clock
@@ -5242,13 +5393,13 @@ release_state_lock() { # <task-name>
 grade_case() { # <task-path> <task-name>
   local task="$1" name="$2" rep run_dir start_ms end_ms rep_result
   local result_args=()
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x${EVAL_REPETITIONS} <<<"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x$(case_repetitions "${name}") <<<"
   # One --result per repetition, positionally. A repetition that produced no
   # run directory contributes the literal MISSING, so the gate can tell "died
   # before writing anything" from "wrote an unusable record". The harness log
   # is kept for every repetition, green ones included: a green record is the
   # raw material for the baseline store.
-  for rep in $(seq 1 "${EVAL_REPETITIONS}"); do
+  for rep in $(seq 1 "$(case_repetitions "${name}")"); do
     run_dir="$(cat "${STATE_DIR}/${name}.rep${rep}.dir" 2>/dev/null || true)"
     start_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.start" 2>/dev/null || echo 0)"
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
@@ -5396,7 +5547,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
   release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -5465,7 +5616,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     drift_reps="$(finished_rep_count "${name}")"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
-    if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${drift_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5481,7 +5632,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unfenced_reps="$(finished_rep_count "${name}")"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: its card fence could not run before it" >&2
-    if [ "${unfenced_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${unfenced_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5527,7 +5678,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the install's gateway is gone" >&2
-    if [ "${gone_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${gone_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5761,7 +5912,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # fan-out must still leave every completed unit's log in the artifacts.
   cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -5829,28 +5980,44 @@ unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that 
     *) echo 0 ;;
   esac
 }
-UNIT_QUEUE="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+# A replay-lane safety case runs its live arm in the first phase's own queue,
+# before the cache is seeded, so it must be a first-phase case.
+for i in "${!TASK_NAMES[@]}"; do
+  if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ] && [ "$(unit_phase "${TASK_NAMES[i]}")" != "0" ]; then
+    echo "ERROR: ${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}: ${TASK_NAMES[i]} runs after every other unit (it writes, stops or excludes scope), so its live arm cannot run before the cache is seeded; take it off the list." >&2
+    exit 1
+  fi
+done
+# The replay lane's live arm: each safety case's first EVAL_REPETITIONS
+# repetitions, run before seed_replay_lane_cache. Empty off the lane.
+UNIT_QUEUE_LIVE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
+  done | sort -k2,2rn -k3,3n -k1,1n
+)"
+UNIT_QUEUE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+      for REP in $(seq "$(first_queued_rep "${TASK_NAMES[i]}")" "$(case_repetitions "${TASK_NAMES[i]}")"); do
+        printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_QUEUE_WRITERS="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
+LIVE_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_LIVE}" | grep -c . || true)"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
@@ -5963,7 +6130,7 @@ EOF_UNIT_QUEUE
         sleep "${pause}"
       fi
     fi
-    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/$(case_repetitions "${TASK_NAMES[IDX]}")"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
     task_jobs="${task_jobs} $!:${IDX}"
@@ -5985,11 +6152,12 @@ while IFS= read -r SCOPE_LINE; do
 done <<<"${SCOPE_EXCLUDE_CASES:-}"
 SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
 
-profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 # The cards fence_live_cards may archive are the ones filed from here on (the
 # board's created_at, which the gateway pod stamps); the install's own earlier
 # cards are left alone.
 EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"
+run_replay_lane_live_arm
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
