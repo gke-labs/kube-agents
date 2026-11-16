@@ -33,6 +33,8 @@ class FakeForge:
                 raise RuntimeError("moved")
             return {"deleted": True}
         if verb == "proposal-create":
+            if getattr(self, "refuse_create", False):
+                raise RuntimeError("forge down")
             return {"proposal": {"url": "https://x/pull/12", "number": 12}}
         raise AssertionError(verb)
 
@@ -150,13 +152,13 @@ class TestToggle(unittest.TestCase):
         self.assertEqual(result["state"], sw.BLOCKED)
 
     def test_flipping_back_closes_the_pending_pull_request(self):
-        proposal = {"state": "open", "source": "platform-agent/automerge-switch-on-no-pdb-dev-1", "url": "https://x/pull/11"}
+        proposal = {"state": "open", "source": "platform-agent/automerge-switch-on-no-pdb-dev-20261111000000", "url": "https://x/pull/11"}
         result, forge, _ = run(EMPTY, False, 11, proposal)
         self.assertEqual(forge.calls[1], ("proposal-close", {"number": 11}))
         self.assertEqual((result["state"], result["closed"]), (sw.OFF, "https://x/pull/11"))
 
     def test_closing_takes_the_spent_branch_off_the_forge(self):
-        source = "platform-agent/automerge-switch-on-no-pdb-dev-1"
+        source = "platform-agent/automerge-switch-on-no-pdb-dev-20261111000000"
         proposal = {"state": "open", "source": source, "url": "u", "sourceRevision": "abc"}
         _, forge, _ = run(EMPTY, False, 11, proposal)
         self.assertEqual(forge.calls[2], ("branch-delete", {"branch": source, "revision": "abc"}))
@@ -167,7 +169,7 @@ class TestToggle(unittest.TestCase):
         self.assertEqual(result["state"], sw.OFF)
 
     def test_the_same_direction_reuses_the_pending_pull_request(self):
-        proposal = {"state": "open", "source": "platform-agent/automerge-switch-on-no-pdb-dev-1", "url": "https://x/pull/11"}
+        proposal = {"state": "open", "source": "platform-agent/automerge-switch-on-no-pdb-dev-20261111000000", "url": "https://x/pull/11"}
         result, forge, vcs = run(EMPTY, True, 11, proposal)
         self.assertEqual((result["state"], result["pr"], result["number"]), (sw.PROPOSED, "https://x/pull/11", 11))
         self.assertEqual(forge.verbs(), ["proposal-view"])
@@ -176,12 +178,41 @@ class TestToggle(unittest.TestCase):
     def test_a_pending_number_that_is_not_ours_or_not_open_is_left_alone(self):
         for proposal in (
             {"state": "open", "source": "feature/x", "url": "u"},
-            {"state": "merged", "source": "platform-agent/automerge-switch-on-no-pdb-dev-1", "url": "u"},
-            {"state": "open", "source": "platform-agent/automerge-switch-on-other-dev-1", "url": "u"},
+            {"state": "merged", "source": "platform-agent/automerge-switch-on-no-pdb-dev-20261111000000", "url": "u"},
+            {"state": "open", "source": "platform-agent/automerge-switch-on-other-dev-20261111000000", "url": "u"},
         ):
             with self.subTest(proposal=proposal):
                 _, forge, _ = run(EMPTY, False, 11, proposal)
                 self.assertNotIn("proposal-close", forge.verbs())
+
+
+class TestPortFixes(unittest.TestCase):
+    def test_a_pending_branch_matches_its_environment_exactly(self):
+        # An environment may contain "-": dev's switch must not take dev-eu's branch for its own.
+        for source in (
+            "platform-agent/automerge-switch-on-no-pdb-dev-eu-20261111000000",
+            "platform-agent/automerge-switch-off-no-pdb-dev-eu-20261111000000",
+            "platform-agent/automerge-switch-on-no-pdb-dev-1",
+        ):
+            with self.subTest(source=source):
+                _, forge, _ = run(EMPTY, True, 11, {"state": "open", "source": source, "url": "u"})
+                self.assertNotIn("proposal-close", forge.verbs())
+        self.assertTrue(sw._is_switch_branch("platform-agent/automerge-switch-on-no-pdb-dev-20261111000000", "on", "no-pdb", "dev"))
+
+    def test_a_failure_after_closing_still_reports_the_closed_pull_request(self):
+        proposal = {"state": "open", "source": "platform-agent/automerge-switch-off-no-pdb-dev-20261111000000", "url": "https://x/pull/11"}
+        forge, vcs = FakeForge(proposal), FakeVcs(EMPTY)
+        vcs.clone = mock.Mock(side_effect=RuntimeError("broker down"))
+        result = sw.toggle(REPO, "no-pdb", "dev", True, 11, forge=forge, vcs=vcs, now=lambda: 0)
+        self.assertEqual((result["state"], result["closed"]), (sw.BLOCKED, "https://x/pull/11"))
+        self.assertIn("broker down", result["reason"])
+
+    def test_a_published_branch_whose_pull_request_failed_is_reported(self):
+        forge, vcs = FakeForge(), FakeVcs(EMPTY)
+        forge.refuse_create = True
+        result = sw.toggle(REPO, "no-pdb", "dev", True, None, forge=forge, vcs=vcs, now=lambda: 0)
+        self.assertEqual(result["state"], sw.BLOCKED)
+        self.assertEqual(result["branchKept"], "platform-agent/automerge-switch-on-no-pdb-dev-19700101000000")
 
 
 class TestMain(unittest.TestCase):

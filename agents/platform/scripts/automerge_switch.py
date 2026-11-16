@@ -66,6 +66,15 @@ def _branch(state: str, kind: str, environment: str, now: float) -> str:
     return BRANCH.format(state=state, kind=kind, environment=environment, stamp=time.strftime("%Y%m%d%H%M%S", time.gmtime(now)))
 
 
+def _is_switch_branch(source: str, state: str, kind: str, environment: str) -> bool:
+    """Whether `source` is this switch's branch for exactly `state`, `kind` and `environment`.
+
+    The whole name, stamp included: an environment may contain `-`, so a prefix
+    for `dev` would also match a branch for `dev-eu`.
+    """
+    return re.fullmatch(re.escape(f"{BRANCH_PREFIX}{state}-{kind}-{environment}-") + r"\d{14}", source) is not None
+
+
 def _wording(kind: str, environment: str, on: bool) -> tuple[str, str, str]:
     name = automation_rules.FIX_TYPE_NAMES.get(kind, f"{kind} fixes")
     if on:
@@ -159,9 +168,9 @@ def toggle(
         proposal = forge("proposal-view", {"number": pending}).get("proposal") or {}
         source = str(proposal.get("source") or "")
         if proposal.get("state") == "open" and source.startswith(BRANCH_PREFIX):
-            if source.startswith(f"{BRANCH_PREFIX}{state}-{kind}-{environment}-"):
+            if _is_switch_branch(source, state, kind, environment):
                 return out | {"state": PROPOSED, "pr": str(proposal.get("url") or ""), "number": pending, "reason": "already proposed"}
-            if source.startswith(f"{BRANCH_PREFIX}{OFF if on else ON}-{kind}-{environment}-"):
+            if _is_switch_branch(source, OFF if on else ON, kind, environment):
                 forge("proposal-close", {"number": pending})
                 out["closed"] = str(proposal.get("url") or f"#{pending}")
                 # The branch is spent now; take it off the forge rather than
@@ -173,15 +182,23 @@ def toggle(
                     out["branchKept"] = f"{source}: {exc}"
     branch = _branch(state, kind, environment, now())
     try:
+        return out | _propose(repo, branch, kind, environment, on, forge, vcs)
+    except Exception as exc:  # noqa: BLE001 — reported with what this run already did (a closed PR)
+        return out | {"state": BLOCKED, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _propose(repo: str, branch: str, kind: str, environment: str, on: bool, forge: Forge, vcs: Any) -> dict:
+    """Clone, edit the rules file, publish `branch` and open its pull request; the outcome's fields."""
+    try:
         cloned = vcs.clone(repo, force=True, key=branch)
         base = str(cloned["branch"])
         tree = Path(cloned["path"])
         text, settled, why = _edited(tree, kind, environment, on)
         if text is None:
-            return out | {"state": settled, "reason": why}
+            return {"state": settled, "reason": why}
         switched = vcs.branch(repo, branch, key=branch)
         if switched["exitCode"] != 0:
-            return out | {"state": BLOCKED, "reason": f"could not take {branch}: {switched['stderr']}"}
+            return {"state": BLOCKED, "reason": f"could not take {branch}: {switched['stderr']}"}
         path = tree / automation_rules.RULES_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8", newline="") as handle:
@@ -194,8 +211,11 @@ def toggle(
             vcs.discard(repo, key=branch)
         except Exception as exc:  # noqa: BLE001 — a copy that could not be tidied is no reason to fail
             sys.stderr.write(f"automerge_switch: could not discard the copy of {repo}: {exc}\n")
-    answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base})
-    return out | {"state": PROPOSED, "pr": str(answer["proposal"]["url"]), "number": answer["proposal"].get("number"), "reason": why}
+    try:
+        answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base})
+    except Exception as exc:  # noqa: BLE001 — the branch is published and the broker cannot delete it without a PR
+        return {"state": BLOCKED, "reason": f"published {branch} but could not open its pull request: {exc}", "branchKept": branch}
+    return {"state": PROPOSED, "pr": str(answer["proposal"]["url"]), "number": answer["proposal"].get("number"), "reason": why}
 
 
 def check(repo: str, number: int, *, forge: Forge | None = None) -> dict:

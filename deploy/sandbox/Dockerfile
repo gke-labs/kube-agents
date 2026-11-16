@@ -630,8 +630,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          automation_rules, kubeagents_switches and vcs_client
 #   automerge_switch.py    the autonomy dial's per-kind switch: the rules-file pull
 #                          request that turns auto-merge on or off for a kind of
-#                          fix in one repository; imports automation_rules and
-#                          post_merge_stepdown
+#                          fix in one repository; imports automation_rules,
+#                          post_merge_stepdown, kubeagents_switches and vcs_client
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
