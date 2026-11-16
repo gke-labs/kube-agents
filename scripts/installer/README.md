@@ -673,8 +673,8 @@ leaving the claims larger than the CR says. A value that is not a whole number o
 `Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
 regenerates.
 
-When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
-`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+When Slack is on, the A2A gateway holds it, with Google Chat on or off (the operator's
+`a2aSlackArmed`), and `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
 three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
 
 - a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway

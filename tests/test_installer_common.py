@@ -2007,7 +2007,7 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat and Slack, either or both")),
             # The key asks for today: the CRD defaults spec.mode to next and the
             # webhook rewrites today, so this is a note, not a switch.
             ("next next today", ("install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next",)),
@@ -5816,7 +5816,7 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
 
 class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
-    Slack on and Google Chat off, the A2A gateway takes Slack
+    Slack on, the A2A gateway takes Slack whether Google Chat is on or off
     (a2aSlackArmed in k8s-operator), and three settings that the today path
     accepts break it:
 
@@ -5825,10 +5825,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     - a SLACK_HOME_CHANNEL that is not a channel id leaves the notify route
       unarmed;
     - a comma-separated SLACK_BOT_TOKEN list makes the Slack backend fail
-      at connect.
-
-    With Chat on too, Chat holds the gateway and Slack stays on the today
-    path, so nothing is refused."""
+      at connect."""
 
     _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
     _TOKEN = "xoxb-1-secretpart"
@@ -5966,23 +5963,23 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                     out,
                 )
                 self.assertIn(
-                    "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
-                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    "INFO: The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's "
+                    "bot token (xoxb-...) in install.env and run again, or turn Slack off (SLACK_ENABLED=false).",
                     out,
                 )
                 self.assertNotIn("secretpart", out)
 
-    def test_a_list_of_bot_tokens_through_flags_names_the_mode_flag(self):
-        # A first install is next by default, so the way to keep the list is --mode=today.
+    def test_a_list_of_bot_tokens_through_flags_names_the_token_flag(self):
+        # There is no mode to switch to: the remedy is one token or Slack off.
         proc = self._run(token="xoxb-1-secretpart,xoxb-2-secretpart", flags=True)
         out = proc.stdout + proc.stderr
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn(
-            "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env or "
-            "--slack-bot-token and run again, or keep this install on PLATFORM_AGENT_MODE=today "
-            "(--mode=today on a first install with no install.env).",
+            "INFO: The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's "
+            "bot token (xoxb-...) in install.env or --slack-bot-token and run again, or turn Slack off (SLACK_ENABLED=false).",
             out,
         )
+        self.assertNotIn("PLATFORM_AGENT_MODE=today", out)
 
     def test_one_bot_token_or_none_passes(self):
         for token in (self._TOKEN, f" {self._TOKEN} ", ""):
@@ -6035,12 +6032,20 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
             dict(slack="false"),
             dict(slack=""),
             dict(slack="no"),
-            # Chat holds the gateway; Slack stays on the today path.
-            dict(chat="true"),
-            dict(chat="True"),
         ):
             with self.subTest(**gate):
                 self._passes(**{**bad, **gate})
+
+    def test_google_chat_beside_slack_does_not_lift_the_refusal(self):
+        # Both platforms share the gateway, so Slack's settings still reach it.
+        bad = dict(allowlist="alice@example.com", home="D0DM", token="xoxb-a,xoxb-b")
+        for chat in ("true", "True"):
+            with self.subTest(chat=chat):
+                proc = self._run(**bad, chat=chat)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                for said in ("SLACK_ALLOWED_USERS holds entries that look like emails",
+                             "SLACK_HOME_CHANNEL is 'D0DM'", "SLACK_BOT_TOKEN holds 2 tokens"):
+                    self.assertIn(said, proc.stdout)
 
 
 class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
@@ -6116,8 +6121,8 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     gateway makes the proactive posts and arms them only on a home channel,
     so a chat backend the gateway holds with none refuses and keeps every
     alert for a digest while conversations keep working. The front doors warn, never refuse, and the
-    closing summary says it again. The backend follows the operator's
-    a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
+    closing summary says it again. The backends follow the operator's
+    a2aChatArmed / a2aSlackArmed: with both on, each needs its own home."""
 
     def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
         args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
@@ -6146,10 +6151,61 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
 
-    def test_chat_holds_the_gateway_when_both_are_on(self):
-        # Slack stays on the today path then, so only Chat's home counts.
-        self.assertIn("key=GOOGLE_CHAT_HOME_CHANNEL", self._run(chat="true", slack_home="C0123ABCD").stdout)
-        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA").stdout, "rc=0 key=\n")
+    def test_both_platforms_share_the_gateway(self):
+        # Each backend needs its own home; with both unset both keys are named, Chat first.
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\n", self._run(chat="true", slack_home="C0123ABCD").stdout)
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL\n", self._run(chat="true", chat_home="spaces/AAA").stdout)
+        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA", slack_home="C0123ABCD").stdout, "rc=0 key=\n")
+        proc = self._run(chat="true", flags=True, summary=True)
+        out = proc.stdout
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\nSLACK_HOME_CHANNEL\n", out, proc.stderr)
+        self.assertLess(out.index("WARN: GOOGLE_CHAT_HOME_CHANNEL is empty"), out.index("WARN: SLACK_HOME_CHANNEL is empty"))
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", out)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", out)
+        # The summary repeats both, in the same order, and ends on Slack's remedy.
+        lines = [l for l in out.splitlines() if l]
+        self.assertEqual(sum(l.startswith("WARN: No home channel:") for l in lines), 2, out)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), out)
+
+    def test_with_one_home_the_other_platforms_posts_go_there(self):
+        # Home posts go to every platform with a home channel, so with one set
+        # the other's posts are not kept; the summary says the same.
+        for kw, there in (({"chat": "true", "slack_home": "C0123ABCD"}, "Slack's home channel"),
+                          ({"chat": "true", "chat_home": "spaces/AAA"}, "Google Chat's home channel")):
+            with self.subTest(**kw):
+                out = self._run(summary=True, **kw).stdout
+                self.assertEqual(out.count(f"go to {there} meanwhile"), 2, out)
+                self.assertNotIn("keeps them for one digest", out)
+        both_unset = self._run(chat="true").stdout
+        self.assertEqual(both_unset.count("keeps them for one digest"), 2, both_unset)
+        self.assertNotIn("meanwhile", both_unset)
+
+    def test_a_chat_home_that_is_not_a_space_name_is_no_home(self):
+        # The gateway arms no Chat route for it, so Slack's posts are kept,
+        # as the operator's HomeChannelUnset condition says.
+        for chat_home in ("AAAA", "spaces/AAA/threads/T"):
+            with self.subTest(chat_home=chat_home):
+                out = self._run(chat="true", chat_home=chat_home).stdout
+                self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", out)
+                self.assertIn("keeps them for one digest", out)
+                self.assertNotIn("meanwhile", out)
+
+    def test_a_slack_home_that_is_not_a_channel_id_is_no_home(self):
+        # The operator's slackChannelID arms no Slack route for it, so Google
+        # Chat's posts are kept for the digest, not sent to Slack.
+        for slack_home in ("#general", "D0123ABCD", "c0123abcd"):
+            with self.subTest(slack_home=slack_home):
+                out = self._run(chat="true", slack_home=slack_home, summary=True).stdout
+                self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\n", out)
+                self.assertEqual(out.count("keeps them for one digest"), 2, out)
+                self.assertNotIn("meanwhile", out)
+
+    def test_the_message_names_no_hermes_fallback(self):
+        for kw in ({}, {"slack": "false", "chat": "true"}, {"chat": "true"}):
+            with self.subTest(**kw):
+                out = self._run(**kw).stdout
+                self.assertIn("keeps them for one digest", out)
+                self.assertNotIn("Hermes", out)
 
     def test_flags_name_the_flag(self):
         self.assertIn("install.env or --slack-home-channel", self._run(flags=True).stdout)

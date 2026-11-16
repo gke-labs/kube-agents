@@ -71,7 +71,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    dispatcherCeilingCondition,
 		Written: "While the profile dispatcher is switched on",
-		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 650 profiles at two tiers; the config fills first only for profiles that declare many parameters.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,
@@ -135,8 +135,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    homeChannelUnsetConditionType,
-		Written: "While the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)",
-		Meaning: "`status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or both; on Slack: and no learned channel is admitted)",
+		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
 		Type:    a2aBusConversionRefusedConditionType,
