@@ -152,7 +152,9 @@ type ConsoleInFrame struct {
 // A terminal frame (Kind "result") also names its task (Addressee, TaskID)
 // and the state it ended in. The page reads a completed answer off TASKS and
 // skips that frame; another console client (the MCP server) reads it here,
-// and from TASKS for a frame it missed. Every other field is absent on a notice.
+// and from TASKS for a frame it missed. A top-level profile task's status
+// line names its task too (Addressee, TaskID), since a console client cannot
+// see the profile's submission. Every other field is absent on a notice.
 type ConsoleOutFrame struct {
 	MessageID string        `json:"messageId"`
 	Text      string        `json:"text"`
@@ -601,12 +603,17 @@ func cutConsoleText(text string, max int, note string) string {
 	return strings.ToValidUTF8(text[:max-len(note)], "") + note
 }
 
+// mintID is a new notice frame's id.
+func (a *ConsoleAdapter) mintID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nextID++
+	return fmt.Sprintf("c-%s-%d", a.bootID, a.nextID)
+}
+
 // Post publishes a new notice frame and returns its id.
 func (a *ConsoleAdapter) Post(conversation, text string) (string, error) {
-	a.mu.Lock()
-	a.nextID++
-	id := fmt.Sprintf("c-%s-%d", a.bootID, a.nextID)
-	a.mu.Unlock()
+	id := a.mintID()
 	if err := a.publish(conversation, id, text, false); err != nil {
 		return "", err
 	}
@@ -619,9 +626,18 @@ func (a *ConsoleAdapter) Edit(conversation, messageID, text string) error {
 }
 
 // PostMessage and EditMessage publish text only: a chat message falls back
-// to its text (ErrTextOnly).
+// to its text (ErrTextOnly). A profile task's status line also names its
+// task and profile (addressee, taskId), the one notice that does: a console
+// client sees no profile submission to learn the task from.
 func (a *ConsoleAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	return postTextOnly(a.Post, conversation, m)
+	if m.Chat != nil || m.Stop == "" || m.Profile == "" {
+		return postTextOnly(a.Post, conversation, m)
+	}
+	id := a.mintID()
+	if err := a.publishFrame(conversation, ConsoleOutFrame{MessageID: id, Text: m.Text, Addressee: m.Profile, TaskID: m.Stop}); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (a *ConsoleAdapter) EditMessage(conversation, messageID string, m OutMessage) error {

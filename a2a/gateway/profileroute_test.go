@@ -827,3 +827,36 @@ func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
 		t.Fatalf("%d submission(s) for a refused delegation", len(envs))
 	}
 }
+
+// A profile turn's status line names the profile its task went to, beside
+// the task (Stop): a console client can't see a profile's submission, so the
+// console door puts both on the frame. A plain turn's line names none.
+func TestAProfileTurnsStatusLineNamesItsProfile(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.adapter.inbox <- profileTurn("discord:3/1", "cluster", targetParams("p1", "us-east1", "prod"))
+	var line OutMessage
+	waitFor(t, "the profile task's status line", func() bool {
+		for _, m := range r.adapter.stopPostsCopy() {
+			if strings.HasPrefix(m.Text, "⏳ submitted") {
+				line = m
+				return true
+			}
+		}
+		return false
+	})
+	if line.Profile != "prod-east" {
+		t.Errorf("status line profile = %q, want the resolved profile prod-east", line.Profile)
+	}
+	sub := submissionOn(t, r, "prod-east")
+	if line.Stop != sub.TaskID {
+		t.Errorf("status line task = %q, want the submitted task %q", line.Stop, sub.TaskID)
+	}
+
+	plain := startProfileRig(t)
+	plain.adapter.inbox <- InboundMessage{Conversation: "discord:3/2", Kind: "dm", AuthorID: "1001", MessageID: "m-plain", Text: "hello"}
+	waitFor(t, "the plain task's status line", func() bool { return len(plain.adapter.stopPostsCopy()) > 0 })
+	if p := plain.adapter.stopPostsCopy()[0]; p.Profile != "" {
+		t.Errorf("a plain turn's status line names profile %q", p.Profile)
+	}
+}

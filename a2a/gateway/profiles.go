@@ -151,6 +151,15 @@ func submissionPayload(text, taskID, contextID string, route *profileRoute, extr
 	return messagePayloadParts(append(parts, extra...), taskID, contextID)
 }
 
+// topProfile is the profile a top-level profile task was routed to, for its
+// status line (OutMessage.Profile), and "" for any other task.
+func topProfile(route *profileRoute) string {
+	if route == nil || route.Kind != lib.SubmitKindTop {
+		return ""
+	}
+	return route.Profile
+}
+
 // submissionSubject is where a new task is published: a profile's submission
 // subject, carrying the tier and kind its durables route on, or the
 // addressee's .in subject for platform and sessions.

@@ -310,6 +310,12 @@ type OutMessage struct {
 	// this message, naming that task, and an edit without Stop takes it
 	// off, which is the terminal edit; every other backend ignores it.
 	Stop string
+	// Profile, on a top-level profile task's status line (Stop set), is the
+	// AgentProfile the task was published to. A console client cannot see
+	// a profile's submission (a2a.submit is not on its account), so the
+	// console door names the task and its profile on the frame for it to
+	// follow; every other backend ignores it.
+	Profile string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
