@@ -152,17 +152,9 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentprofiles/status
-    verbs:
-      - get
-      - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
       - agentschedules/status
-      - tiers/status
     verbs:
       - get
-      - patch
       - update
   - apiGroups:
       - kubeagents.x-k8s.io
@@ -187,6 +179,14 @@ rules:
     resources:
       - platformagents/finalizers
     verbs:
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - tiers/status
+    verbs:
+      - get
+      - patch
       - update
   - apiGroups:
       - kustomize.toolkit.fluxcd.io

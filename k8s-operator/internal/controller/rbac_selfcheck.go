@@ -200,7 +200,7 @@ var requiredPermissions = []requiredPermission{
 	// writes its run state (gke-labs/kube-agents#5617). Only the operator and,
 	// later, the broker write schedules: no agent ServiceAccount does.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update"}},
 	// Every rendered kind is two tuples: the reads cluster-wide, for the
 	// informers and for escalation prevention, and the writes namespaced, in
 	// the Role document (the markers carry `namespace=`), which both install
