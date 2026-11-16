@@ -45,6 +45,8 @@ console's Harness limits page reads `harness-limits.json`.
   run, `attribution.py` splits each window's model tokens by capability from the session records
   ([`capability-usage-attribution.md`](../../docs/designs/capability-usage-attribution.md)), into
   `capability-usage.json` and `capability-usage.md` beside the verdict.
+  [`sized-fleet-results.md`](sized-fleet-results.md) holds the S, M and L runs' results and the
+  monthly cost projection.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
