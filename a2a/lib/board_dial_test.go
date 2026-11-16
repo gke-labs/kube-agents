@@ -25,6 +25,7 @@ func TestBoardDialFixtureLandsInEveryField(t *testing.T) {
 		Kinds: []BoardDialKind{{Kind: "no-pdb", Title: "Disruption budgets", Environment: "dev", Repos: []BoardDialRepo{{
 			Repo: "org/infra", RepoKey: "github.com/org/infra", Clean: 3, Needed: 5, Days: 1, DaysNeeded: 2, Ready: false,
 			State: DialStatePending, PendingPR: &BoardDialPR{Number: 35, URL: "https://github.com/org/infra/pull/35"},
+			Note: "Not changed: a person's deny rule",
 		}}}},
 	}
 	if !reflect.DeepEqual(b.Dial, want) {

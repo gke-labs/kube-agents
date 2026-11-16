@@ -25,6 +25,7 @@
             "days_needed": 2,
             "ready": false,
             "state": "pending",
+            "note": "Not changed: a person's deny rule",
             "pending_pr": {
               "number": 35,
               "url": "https://github.com/org/infra/pull/35"

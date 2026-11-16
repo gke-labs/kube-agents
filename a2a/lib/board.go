@@ -131,6 +131,9 @@ type BoardDialRepo struct {
 	// DialStateOn.
 	State     string       `json:"state"`
 	PendingPR *BoardDialPR `json:"pending_pr,omitempty"`
+	// Note is why the last Request or Stop on this row changed nothing, when
+	// it did not ("The switch did not run: ..."); empty otherwise.
+	Note string `json:"note,omitempty"`
 }
 
 // BoardDialPR is the rules-file pull request a Request opened.

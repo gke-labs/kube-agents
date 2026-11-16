@@ -43,9 +43,13 @@ const (
 	// slackDialFieldSeparator joins a row's kind, environment and repository
 	// key in a control's value; none of the three holds it.
 	slackDialFieldSeparator = "|"
-	// slackDialTimeout bounds a tap's round trip; the switch script session-kv
-	// runs for a Request opens a pull request, so it is the board action's.
+	// slackDialTimeout bounds a tap's round trip, the board action's.
 	slackDialTimeout = slackBoardTimeout
+	// slackDialFollowUps are when the tab is read again after a Request or
+	// Stop: session-kv answers at once and runs the switch script on its own,
+	// so the row turns pending, or gets a note, seconds to a minute later.
+	slackDialFollowUpFirst = 20 * time.Second
+	slackDialFollowUpLast  = 75 * time.Second
 	// slackDialKindsMax and slackDialReposMax keep the panel inside the Home
 	// tab's 100-block limit and a select's 100 options.
 	slackDialKindsMax = 6
@@ -204,9 +208,13 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 	if k.Environment != "" {
 		title += " (" + slackEscaper.Replace(k.Environment) + ")"
 	}
-	repos := k.Repos
-	if len(repos) > slackDialReposMax {
-		repos = repos[:slackDialReposMax]
+	// A repository key too long for a Slack value is left out of the whole
+	// row, picker and button alike, rather than blanking the tab.
+	var repos []lib.BoardDialRepo
+	for _, r := range k.Repos {
+		if len(repos) < slackDialReposMax && len(slackDialRowValue(k.Kind, k.Environment, r.RepoKey)) <= slackDialValueMax {
+			repos = append(repos, r)
+		}
 	}
 	if len(repos) == 0 {
 		return []slack.Block{slack.NewSectionBlock(mrk(title+slackHomeDot+slackDialNoRepos), nil, nil)}
@@ -226,27 +234,23 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 		var initial *slack.OptionBlockObject
 		for _, r := range repos {
 			value := slackDialRowValue(k.Kind, k.Environment, r.RepoKey)
-			if len(value) > slackDialValueMax {
-				// A repository key too long for Slack is left out of the
-				// picker rather than blanking the whole tab.
-				continue
-			}
 			o := slack.NewOptionBlockObject(value, plain(firstLine(slackDialRepoName(r), slackDialOptionMax)), nil)
 			options = append(options, o)
 			if r.RepoKey == picked.RepoKey {
 				initial = o
 			}
 		}
-		if len(options) > 1 {
-			sel := slack.NewOptionsSelectBlockElement(slack.OptTypeStatic, plain(slackDialRepoPrompt), slackDialActionRepo, options...)
-			sel.InitialOption = initial
-			accessory = slack.NewAccessory(sel)
-		}
+		sel := slack.NewOptionsSelectBlockElement(slack.OptTypeStatic, plain(slackDialRepoPrompt), slackDialActionRepo, options...)
+		sel.InitialOption = initial
+		accessory = slack.NewAccessory(sel)
 	}
 	blocks := []slack.Block{slack.NewSectionBlock(mrk(title), nil, accessory)}
 	blocks = append(blocks, slack.NewContextBlock("", mrk(strings.Join([]string{
 		slackEscaper.Replace(slackDialRepoName(picked)), slackDialProgressLine(picked), slackDialStateLine(picked),
 	}, slackHomeDot))))
+	if note := strings.TrimSpace(picked.Note); note != "" {
+		blocks = append(blocks, slack.NewContextBlock("", mrk(slackEscaper.Replace(firstLine(note, slackHomeLineMax)))))
+	}
 	if admin {
 		id, label := slackDialActionReq, slackDialRequest
 		if picked.State == lib.DialStateOn || picked.State == lib.DialStatePending {
@@ -280,6 +284,15 @@ func (s *SlackAdapter) dialPick(member, kind, environment string) string {
 func (s *SlackAdapter) setDialPick(member, kind, environment, repoKey string) {
 	s.home.mu.Lock()
 	defer s.home.mu.Unlock()
+	// A pick is a sign the member is looking: count them as a viewer, so the
+	// prune in the redraw keeps the pick even when the tab was opened more
+	// than slackHomeViewerTTL ago or before a gateway restart.
+	if s.home.viewers == nil {
+		s.home.viewers = map[string]time.Time{}
+	}
+	if _, ok := s.home.viewers[member]; ok || len(s.home.viewers) < slackHomeViewersCap {
+		s.home.viewers[member] = time.Now()
+	}
 	if s.home.dialPicks == nil {
 		s.home.dialPicks = map[string]map[string]string{}
 	}
@@ -397,6 +410,11 @@ func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor B
 	s.home.mu.Unlock()
 	s.publishHome(member, false)
 	s.homeChanged(true)
+	if action.Action != lib.DialActionLevel {
+		for _, after := range []time.Duration{slackDialFollowUpFirst, slackDialFollowUpLast} {
+			time.AfterFunc(after, func() { s.homeChanged(true) })
+		}
+	}
 }
 
 // slackDialAnswer is the presser's line: session-kv's message, escaped, or

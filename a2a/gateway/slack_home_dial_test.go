@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack/slackevents"
 
@@ -125,6 +126,31 @@ func TestSlackHomeDialLeavesATooLongRepositoryOutOfThePicker(t *testing.T) {
 	}
 }
 
+func TestSlackHomeDialSkipsATooLongFirstRepositoryEverywhere(t *testing.T) {
+	b := dialBoard("U1")
+	long := "github.com/" + strings.Repeat("o", 39) + "/" + strings.Repeat("r", 100)
+	rest := b.Dial.Kinds[0].Repos[:1]
+	b.Dial.Kinds[0].Repos = append([]lib.BoardDialRepo{{Repo: "long", RepoKey: long, Needed: 5}}, rest...)
+	a, api, _ := homeAdapter(t, b, nil)
+	openHome(a, "U1")
+	got := dialText(t, dialBlocks(t, api))
+	if strings.Contains(got, long) || !strings.Contains(got, "org/infra · 3 of 5 clean merges · off") {
+		t.Errorf("a first repository too long for Slack must be skipped in the row and the button, not only the picker:\n%s", got)
+	}
+}
+
+func TestSlackHomeDialRepoPickSurvivesAnExpiredViewer(t *testing.T) {
+	a, api, _ := homeAdapter(t, dialBoard("U1"), nil)
+	openHome(a, "U1")
+	a.home.mu.Lock()
+	a.home.viewers["U1"] = time.Now().Add(-2 * slackHomeViewerTTL)
+	a.home.mu.Unlock()
+	a.dialClick(dialClickPayload("U1", "4.2"), slackDialActionRepo, "", "no-pdb|dev|github.com/org/apps")
+	if got := dialText(t, dialBlocks(t, api)); !strings.Contains(got, "org/apps · 5 of 5 clean merges · Pending") {
+		t.Errorf("a pick made after the tab's viewer entry expired was dropped:\n%s", got)
+	}
+}
+
 func TestSlackHomeDialIsReadOnlyForAMemberWhoIsNotAnAdmin(t *testing.T) {
 	a, api, _ := homeAdapter(t, dialBoard("U9"), nil)
 	openHome(a, "U1")
@@ -159,6 +185,17 @@ func TestSlackHomeDialLinesForEachState(t *testing.T) {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestSlackHomeDialShowsTheRowsNoteUnderIt(t *testing.T) {
+	b := dialBoard("U9")
+	b.Dial.Kinds[0].Repos[0].Note = "The switch did not run: <!here> the token expired"
+	a, api, _ := homeAdapter(t, b, nil)
+	openHome(a, "U1")
+	got := dialText(t, dialBlocks(t, api))
+	if !strings.Contains(got, "The switch did not run: &lt;!here&gt; the token expired") {
+		t.Errorf("the row's note is not drawn under it, escaped:\n%s", got)
 	}
 }
 
