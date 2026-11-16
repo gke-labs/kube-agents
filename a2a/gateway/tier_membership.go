@@ -26,11 +26,11 @@ const ruleSteerTier = "steer-tier"
 
 // Refusals a tier decision posts in the room.
 const (
-	noticeProfileTierUndefined  = "your tier %s isn't defined on this install, so a profile task can't run for you"
-	noticeProfileTiersDiffer    = "people in this conversation are at different tiers (%s), and a task here runs at one tier"
-	noticeProfileTierCeiling    = "tier %s carries %s, which is beyond what this install allows"
-	noticeProfileAuthorsUnknown = "this conversation has more authors than can be checked for their tiers"
-	noticeSteerTierDiffers      = "the running task is at tier %s and you're at tier %s, so it can't take your message"
+	noticeProfileTierUndefined  = "your tier %s isn't defined on this install, so a profile task can't run for you; ask an administrator to define it or change your tier"
+	noticeProfileTiersDiffer    = "people in this conversation are at different tiers (%s), and a task runs at one tier; start a new thread, or ask an administrator to put everyone at one tier"
+	noticeProfileTierCeiling    = "tier %s allows more than this install's own access, so no profile task can run here; ask an administrator to check the install's settings"
+	noticeProfileAuthorsUnknown = "this conversation has too many people in it to check their tiers; start a new thread to ask"
+	noticeSteerTierDiffers      = "⚠️ not sent: the running task is at tier %s and you're at tier %s; ask someone at that tier to pass it on, or ask in a new thread"
 )
 
 // tierMemberBackends are the backends membership can name: the ones whose
@@ -149,7 +149,10 @@ func (g *Gateway) tierFor(authors []TaskRequester, unknown bool) (capability.Tie
 		for i, v := range out {
 			names[i] = string(v)
 		}
-		return "", refused(noticeProfileTierCeiling, tier, strings.Join(names, ", "))
+		// The verbs are plumbing: the log names them, the room doesn't.
+		g.log.Warn("profile tier refused: it permits verbs the install's authority tier doesn't",
+			"tier", tier, "authorityTier", g.cfg.AuthorityTier, "verbs", strings.Join(names, ","))
+		return "", refused(noticeProfileTierCeiling, tier)
 	}
 	return tier, nil
 }

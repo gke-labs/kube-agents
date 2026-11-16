@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -32,7 +34,7 @@ func tierGateway(t *testing.T) (*Gateway, TaskRequester, TaskRequester, TaskRequ
 	capability.LoadTiers([]capability.TierDefinition{{Name: "oncall", Mode: capability.TierModeInteractive}, {Name: "nightly", Mode: capability.TierModeUnattended}})
 	ps := NewPseudonymizer([]byte("salt"))
 	members := []TierMember{{"gchat", "alice", "oncall"}, {"gchat", "carol", "nightly"}, {"gchat", "dave", "ghost"}}
-	g := &Gateway{cfg: &Config{AuthorityTier: capability.TierDeveloperTeam}, tierMembers: buildTierMembers(members, ps)}
+	g := &Gateway{cfg: &Config{AuthorityTier: capability.TierDeveloperTeam}, tierMembers: buildTierMembers(members, ps), log: slog.New(slog.DiscardHandler)}
 	who := func(backend, id string) TaskRequester {
 		return TaskRequester{Backend: backend, Subject: requesterSubject(ps, backend, id)}
 	}
@@ -84,16 +86,21 @@ func TestTierForMapsAuthorsToOneTier(t *testing.T) {
 }
 
 // The ceiling: a tier carrying a verb the install's AuthorityTier lacks,
-// profile.run aside, is refused naming it.
+// profile.run aside, is refused; the log names the verb, the room doesn't.
 func TestTierForHoldsTheCeiling(t *testing.T) {
 	g, alice, _, _, _, _ := tierGateway(t)
 	if _, err := g.tierFor([]TaskRequester{alice}, false); err != nil {
 		t.Fatalf("oncall under developer-team: %v", err)
 	}
+	var logs strings.Builder
+	g.log = slog.New(slog.NewTextHandler(&logs, nil))
 	g.cfg.AuthorityTier = capability.TierUnattended // holds profile.run alone
 	notice := tierRefusal(t, func() error { _, err := g.tierFor([]TaskRequester{alice}, false); return err }())
-	if !strings.Contains(notice, "task.execute") {
-		t.Errorf("notice %q, want the verb beyond the ceiling named", notice)
+	if want := fmt.Sprintf(noticeProfileTierCeiling, "oncall"); notice != want {
+		t.Errorf("notice %q, want %q", notice, want)
+	}
+	if !strings.Contains(logs.String(), "task.execute") {
+		t.Errorf("the log doesn't name the verb beyond the ceiling: %s", logs.String())
 	}
 }
 
@@ -101,7 +108,7 @@ func TestTierForHoldsTheCeiling(t *testing.T) {
 // passes when there is none (everyone is read then).
 func TestTierForRefusesAnUnknownAuthorListWithMembership(t *testing.T) {
 	g, _, bob, _, _, _ := tierGateway(t)
-	if !strings.Contains(tierRefusal(t, func() error { _, err := g.tierFor([]TaskRequester{bob}, true); return err }()), "more authors") {
+	if !strings.Contains(tierRefusal(t, func() error { _, err := g.tierFor([]TaskRequester{bob}, true); return err }()), "too many people") {
 		t.Error("an overflowed author list with membership wasn't refused")
 	}
 	g.tierMembers = nil
