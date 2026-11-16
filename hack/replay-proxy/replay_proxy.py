@@ -29,8 +29,8 @@ size.
 All of that runs on one background thread fed by a bounded queue
 (ANALYSIS_QUEUE_SIZE); the handler enqueues, and drops the analysis (an
 `analysis_dropped` line) rather than wait when the queue is full. In replay
-mode the handler also, before forwarding, notes each message's first-seen
-time, normalizes and fingerprints the request, and looks it up (lookup); the
+mode the handler also, before forwarding, notes each message's and each
+prefix's first-seen time, normalizes and fingerprints the request, and looks it up (lookup); the
 analysis reuses that normalization and fingerprint. Memory is
 bounded: a request body over MAX_REQUEST_BYTES gets a 413, and the proxy stops
 observing a response after MAX_OBSERVED_BYTES (its bytes still flow).
@@ -645,8 +645,9 @@ class ShadowProxy:
         messages = body.get(request_store.MESSAGES_KEY)
         messages = messages if isinstance(messages, list) else []
         # Noted now, not by the background analysis, so a later request's
-        # slots can normalize this one's messages as of when they arrived.
-        digests, first_seen = self.diagnosis.first_seen_with_digests(messages, received)
+        # slots can normalize this one's prefixes as of when they arrived.
+        digests, _ = self.diagnosis.first_seen_with_digests(messages, received)
+        prefix_seen = self.prefix_first_seen(body, digests, received)
         normalized, fingerprint = keyed or self.keyed(body, received)
         via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
@@ -658,7 +659,7 @@ class ShadowProxy:
             if recorded is None:
                 return None, None
             fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
-            if entry is not None and not self.answers_recorded(body, messages, digests, first_seen, received):
+            if entry is not None and not self.answers_recorded(body, messages, digests, prefix_seen, received):
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
@@ -678,34 +679,56 @@ class ShadowProxy:
             return None, refusal(via, F.GUARD_NAMES_DROPPED_FILE)
         return (answer, entry, fingerprint, via), None
 
+    @staticmethod
+    def settings_chain(body: Dict[str, Any]) -> str:
+        """The root of a request's prefix chain: its settings, raw. Each prefix extends it by a message digest."""
+        settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
+        return normalizer.stable_hash(settings)
+
+    def prefix_first_seen(self, body: Dict[str, Any], digests: List[str], received: float) -> List[float]:
+        """When this proxy first saw each prefix of the request, noting `received` for new ones.
+
+        Element i is for the settings and the first i messages, so it is when
+        this conversation (or one identical up to there) sent the request
+        that message i answered. A message's own first sighting is not: a
+        static one, a skill's text, arrives in every conversation.
+        """
+        chain = self.settings_chain(body)
+        seen = [self.diagnosis.note(chain, received)]
+        for digest in digests:
+            chain = normalizer.stable_hash([chain, digest])
+            seen.append(self.diagnosis.note(chain, received))
+        return seen
+
     def answers_recorded(
-        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], prefix_seen: List[float], received: float,
     ) -> bool:
         """Whether each assistant message is an answer a recording stored for the request it replied to.
 
         Each is checked against that request: the messages before it, with the
-        settings, normalized on their own as of when the last of them arrived,
-        as record mode normalized the request when it noted the answer. That
-        pair depends only on the raw prefix and the answer (and, in this
-        process, on when the prefix arrived), so it is kept by their digests:
-        each turn normalizes only its new answer's prefix, not every earlier one.
+        settings, normalized on their own as of when that prefix first arrived
+        (prefix_first_seen), as record mode normalized the request when it
+        noted the answer. That pair depends only on the raw prefix and the
+        answer (and, in this process, on when the prefix arrived), so it is
+        kept by their digests: each turn normalizes only its new answer's
+        prefix, not every earlier one.
         """
-        for variant in self.history_variants(body, messages, digests, first_seen, received):
+        for variant in self.history_variants(body, messages, digests, prefix_seen, received):
             if not self.cache.has_variant(*variant):
                 return False
         return True
 
     def history_variants(
-        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], prefix_seen: List[float], received: float,
         last_only: bool = False,
     ):
         """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
 
-        Memoized by the digests of the prefix, so each answer is normalized once
-        per process. With `last_only`, only the last assistant message's.
+        `prefix_seen` is prefix_first_seen's. Memoized by the digests of the
+        prefix, so each answer is normalized once per process. With
+        `last_only`, only the last assistant message's.
         """
-        settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
-        chain = normalizer.stable_hash(settings)
+        chain = self.settings_chain(body)
         indices = [i for i, m in enumerate(messages)
                    if isinstance(m, dict) and m.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE]
         wanted = set(indices[-1:] if last_only else indices)
@@ -717,7 +740,7 @@ class ShadowProxy:
                 if variant is None:
                     asked = dict(body)
                     asked[request_store.MESSAGES_KEY] = messages[:index]
-                    now = first_seen[index - 1] if index else received
+                    now = prefix_seen[index] if index else received
                     variant = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
                     with self._variant_lock:
                         self._variants[memo_key] = variant
@@ -1102,8 +1125,9 @@ class ShadowProxy:
         if self.config.mode == F.MODE_RECORD:
             if upstream["message"]:
                 entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
-            digests, first_seen = self.diagnosis.first_seen_with_digests(raw_messages, received)
-            prior = list(self.history_variants(body, raw_messages, digests, first_seen, received, last_only=True))
+            digests, _ = self.diagnosis.first_seen_with_digests(raw_messages, received)
+            prefix_seen = self.prefix_first_seen(body, digests, received)
+            prior = list(self.history_variants(body, raw_messages, digests, prefix_seen, received, last_only=True))
             if prior:
                 entry[F.PRIOR_ANSWER] = list(prior[0])
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)

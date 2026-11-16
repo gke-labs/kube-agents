@@ -186,7 +186,8 @@ class SlotCheckCostTest(SlotCacheCase):
         for length, expected in ((3, 1), (5, 1)):
             calls.clear()
             body = {"model": "m", "messages": turn[:length]}
-            digests, seen = replay.diagnosis.first_seen_with_digests(body["messages"], time.time())
+            digests, _ = replay.diagnosis.first_seen_with_digests(body["messages"], time.time())
+            seen = replay.prefix_first_seen(body, digests, time.time())
             self.assertTrue(replay.answers_recorded(body, body["messages"], digests, seen, time.time()))
             self.assertEqual(len(calls), expected, f"{length} messages")
 
@@ -302,11 +303,13 @@ class VariantContextTest(AnalyzeCase):
         return {"role": "assistant", "content": said, "tool_calls": [
             {"id": call_id, "type": "function", "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}]}
 
-    def fork(self, opening, result, settings=None, later=0):
+    def fork(self, opening, result, settings=None, later=0, seen_before=()):
         """Two recordings answer `opening` in other words; the second goes on to `result` `later` seconds on.
 
         A replay that was served the first recording's answer then asks for the
-        second recording's next step. Returns the replay's lookup.
+        second recording's next step. Returns the replay's lookup. The replay
+        proxy first looks up each (body, time) of `seen_before`, another
+        conversation it served earlier.
         """
         settings = settings or {}
         asked = dict(settings, model="m", messages=opening)
@@ -317,6 +320,8 @@ class VariantContextTest(AnalyzeCase):
         went_on = dict(asked, messages=opening + [second, {"role": "tool", "tool_call_id": "call_2", "content": result}])
         recorder.analyze(went_on, CLOCK + later, self.upstream({"role": "assistant", "content": "All listed."}))
         replay = self.proxy("replay", "r")
+        for body, at in seen_before:
+            replay.lookup(body, at)
         replay.lookup(asked, CLOCK)  # the replay's own earlier request, served the first answer
         replayed = dict(asked, messages=opening + [first, {"role": "tool", "tool_call_id": "call_1", "content": result}])
         return replay.lookup(replayed, CLOCK + later)
@@ -331,6 +336,26 @@ class VariantContextTest(AnalyzeCase):
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - 50 * MINUTE))
         opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
         self.assert_served(self.fork(opening, "a.txt", later=20 * MINUTE))
+
+    def test_a_message_another_conversation_sent_earlier(self):
+        # A skill's text is the same in every conversation. Normalized as of when
+        # another conversation sent it ten minutes before, this card's
+        # timestamps read as future ones and the answer as never recorded.
+        skill = {"role": "user", "content": "skill cluster-agent-lifecycle: create and tear down profiles"}
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}, skill]
+        other = {"model": "m", "messages": [{"role": "user", "content": "card t_cccccccc opened"}, skill]}
+        self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
+
+    def test_the_same_messages_under_other_settings_earlier(self):
+        # Another conversation sent these very messages ten minutes before, with
+        # another model. A prefix is the settings and the messages, so its time
+        # is this conversation's own; keyed by the messages alone, the card's
+        # timestamp would read as a future one and the answer as never recorded.
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
+        other = {"model": "another-model", "messages": opening}
+        self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
 
     def test_a_cidr_only_in_a_later_message(self):
         opening = [{"role": "user", "content": "node 10.1.2.3 is cordoned"}]
