@@ -371,7 +371,10 @@ leave open:
   task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
   worker image. The CRD and the dispatcher's config check both hold paths to it, and
   `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
-  group- or world-writable (#5622). Both name the task, its profile and
+  group- or world-writable (#5622). The broker also accepts a
+  `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
+  credential, which reaches only the audit-report routes and is refused on every other route,
+  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
