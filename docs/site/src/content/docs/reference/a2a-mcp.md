@@ -65,7 +65,9 @@ A message sent through `send_message` reaches the A2A gateway through its consol
 
 ### Sending a turn to an AgentProfile
 
-`send_message` can send a turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can. `addressee` names the profile, for example `cluster`, as one token with no spaces, dots or wildcards. `parameters` is an object of string values holding the profile's task parameters, for `cluster` its `project`, `location` and `cluster`, and is refused without an `addressee`. A stop or a bare `/session` with an `addressee` is refused too. The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards by profile.
+`send_message` can send a turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can. `addressee` names the profile, for example `cluster`, as one token with no spaces, dots or wildcards. `parameters` is an object of string values holding the profile's task parameters, for `cluster` its `project`, `location` and `cluster`, and is refused without an `addressee`. A stop or a bare `/session` with an `addressee` is refused too.
+
+The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards by profile. Otherwise the turn is answered from the profile's task, which the gateway names on its status line. A turn still running when the wait ends returns the task as `<profile>/<task-id>`, and `task_control` reads it under that reference, not a bare id.
 
 The server also serves the workstation bridge's swarm view at `POST /mcp/swarm`, behind the same `Origin` refusal and bearer token. The bridge posts its conversation table and gets back the members and board posts it shows in its host's Swarm UI. The README describes what it reads and its limits.
 
