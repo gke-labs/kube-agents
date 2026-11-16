@@ -3123,6 +3123,10 @@ func isMaxBytes(err error) bool {
 type taskStart struct {
 	// Text is the turn's ask.
 	Text string
+	// ReplyTo is InboundMessage's: the task whose report the turn answers,
+	// put on the submission as a replyTo part. Empty on a turn the gateway
+	// starts on its own.
+	ReplyTo string
 	// MessageID and Principal feed only the ingress log: the backend message
 	// id the audit chain joins on, and the plaintext principal. A turn the
 	// gateway starts on its own (a child, a wake) has no backend message.
@@ -3207,6 +3211,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
 		Text:      agentText(msg),
+		ReplyTo:   msg.ReplyTo,
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
@@ -3295,6 +3300,21 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			g.log.Info("delegate targets not attached: the record's people pass the author cap before the primer's turns are known", "taskId", taskID)
 		} else if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
 			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
+		} else {
+			extra = append(extra, part)
+		}
+	}
+	// A turn answering a report its client named carries the task that
+	// filed it, so the executor can read the report stored for that turn.
+	// One that is not a task id's shape is dropped here, the one check on
+	// the way out, and the turn still starts: the report is a help to the
+	// answer, not a condition of it.
+	if ts.ReplyTo != "" {
+		// The value is sender-chosen, so the line carries it bounded, as the
+		// console door logs its other frame fields; the error quotes it whole.
+		if part, err := lib.ReplyToPart(lib.ReplyTo{TaskID: ts.ReplyTo}); err != nil {
+			g.log.Warn("replyTo dropped: not a task id; the turn runs without the report it answers",
+				"taskId", taskID, "replyTo", truncateRunes(ts.ReplyTo, consoleMessageIDCap), "bytes", len(ts.ReplyTo))
 		} else {
 			extra = append(extra, part)
 		}
@@ -3581,6 +3601,13 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		return
 	}
 	g.noteUnreadQuote(rec.Key, msg)
+	// A steer carries no replyTo: the executor attaches a stored report on
+	// an opening turn only, so a reply that names one while the turn still
+	// runs is steered into it without the report.
+	if msg.ReplyTo != "" {
+		g.log.Warn("replyTo not carried: the turn is still running and the message is steered into it; a report is attached on an opening turn only",
+			"taskId", active.TaskID, "replyTo", truncateRunes(msg.ReplyTo, consoleMessageIDCap), "bytes", len(msg.ReplyTo), "conversation", rec.Key)
+	}
 	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
