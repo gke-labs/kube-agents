@@ -32,7 +32,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
@@ -46,8 +45,8 @@ import (
 // ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector and the
 // operator, on the metrics port, and nobody else": the suite cannot run Go, and no golden
-// renders mode next with both doors armed (the next-mode golden is the example
-// CR, which arms neither), so this file is the contract between the two.
+// renders both doors armed (the settled golden is the example CR, which arms
+// neither), so this file is the contract between the two.
 //
 // Compared as parsed YAML, as the goldens are, because the file is kept in
 // prettier's style for CI's prettier check and the marshaller's is not.
@@ -402,7 +401,7 @@ func assertA2AGatewayFence(t *testing.T, ctx context.Context, cl client.Client, 
 }
 
 // TestTheA2AGatewayFenceComesAndGoesWithTheGateway: the gateway's metrics
-// listener binds every interface on every next install, so the fence that
+// listener binds every interface on every install, so the fence that
 // admits the collector, and the operator where the reconciler knows its
 // namespace, to it renders wherever the gateway Deployment
 // does, door or no door (bnaylor's call on #2473, 2026-10-06), and not where
@@ -501,8 +500,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 	})
 
 	// A gateway whose last backend goes stays at one replica (on the
-	// console door alone) and keeps its fence. Only cleanupA2A takes the
-	// fence away.
+	// console door alone) and keeps its fence.
 	t.Run("a gateway whose backend goes keeps it", func(t *testing.T) {
 		t.Setenv(a2aInjectBackendEnvVar, "true")
 		t.Setenv(a2aAgentDoorEnvVar, "")
@@ -632,53 +630,6 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
-		}
-	})
-
-	// A flip to today takes the fence with the stack, and the early exit
-	// keys on it: a fence left standing alone (the Deployment and the bus
-	// fences deleted by hand) still drives the walk.
-	t.Run("the flip to today removes it, even alone", func(t *testing.T) {
-		t.Setenv(a2aInjectBackendEnvVar, "")
-		t.Setenv(a2aAgentDoorEnvVar, "")
-		agent := a2aTestAgent()
-		r, cl, _ := a2aGateTestReconciler(t, agent)
-		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
-			t.Fatal(err)
-		}
-		gatewayRendered(t, cl, agent)
-		assertA2AGatewayFence(t, ctx, cl, agent)
-		if err := r.cleanupA2A(ctx, agent); err != nil {
-			t.Fatalf("cleanupA2A: %v", err)
-		}
-		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
-			t.Errorf("the gateway's fence %s survived the teardown (err=%v)", a2aGatewayFenceKey(agent).Name, err)
-		}
-
-		alone := &networkingv1.NetworkPolicy{
-			TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace,
-				Labels: a2aLabels(agent, "gateway-netpol"),
-			},
-			Spec: networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}},
-		}
-		stored := &agentv1alpha1.PlatformAgent{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
-			t.Fatal(err)
-		}
-		if err := ctrl.SetControllerReference(stored, alone, r.Scheme); err != nil {
-			t.Fatal(err)
-		}
-		if err := cl.Create(ctx, alone); err != nil {
-			t.Fatalf("seeding the fence alone: %v", err)
-		}
-		if err := r.cleanupA2A(ctx, stored); err != nil {
-			t.Fatalf("cleanupA2A over the fence alone: %v", err)
-		}
-		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
-			t.Errorf("the gateway's fence, standing alone, survived the flip (err=%v): the early exit does not key on it", err)
 		}
 	})
 }

@@ -141,7 +141,8 @@ def project_gke_cluster(body: bytes) -> bytes | None:
 def project_gke_cluster_list(body: bytes) -> bytes | None:
     """The relayed form of a `clusters.list` answer, or None if it is not one.
 
-    `missingZones` is kept so the answer still says when a list is partial. The
+    `missingZones` is kept so the answer still says when a list is partial.
+    stall_watch reads it as its "incomplete listing" signal, so it must stay. The
     reconcile does not need it: it reads a list only as proof that a cluster exists,
     never as proof of absence, so a partial list cannot delete anything.
     """
@@ -220,7 +221,8 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # exactly these two read-only routes): every cluster in a project, and whether one
     # cluster still exists. Both answers are projected to name, location, status and
     # id; node pools, operations and every write stay refused. The get is also the
-    # shim's check before it answers a get-credentials itself (#5447).
+    # shim's check before it answers a get-credentials itself (#5447), and the list
+    # is also stall_watch's cluster listing (#5598).
     ApiRoute(
         "container.googleapis.com",
         API_READ_METHOD,

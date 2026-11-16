@@ -113,6 +113,7 @@ export default defineConfig({
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
             { label: 'GitLab as the GitOps forge', link: '/install/gitlab/' },
+            { label: 'Bitbucket as the GitOps forge', link: '/install/bitbucket/' },
             { label: 'Gitea as the GitOps forge', link: '/install/gitea/' },
             { label: 'Upgrade', link: '/install/upgrade/' },
             { label: 'Uninstall', link: '/install/uninstall/' },

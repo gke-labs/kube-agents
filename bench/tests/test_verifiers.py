@@ -812,6 +812,51 @@ def test_worker_commands_absolute_local_git_is_not_the_bare_name():
     assert v.verify(5.0).status == "pass"
 
 
+def test_tool_called_on_the_workers_grades_zero_calls_on_the_no_worker_calls_entry():
+    """#5371: with the harness's no-worker-calls entry and no tagged entry,
+    a workers-scope check grades zero calls (a required call fails, a
+    forbidden one passes) instead of erroring as unobservable."""
+    from kube_agents_bench import worker_trajectory
+
+    marker = worker_trajectory.no_worker_calls_entry(["t_1"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        required = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert required.status == "fail", required.reason
+    transcript.set("ok", [{"name": "kanban_create"}], final_message="ok", started_at=1.0)
+    try:
+        unobserved = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert unobserved.status == "error"
+    # A capture gap beside the entry still leaves the workers unobservable.
+    gap = worker_trajectory.gap_entry(["session store for cluster-a: locked"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker, gap], final_message="ok", started_at=1.0)
+    try:
+        gapped = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert gapped.status == "error"
+    # A result pattern is not graded beside the entry, on either transport (the scorer sets it aside).
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        with_result = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete"], scope="workers", result="done"
+        ).verify(5.0)
+    finally:
+        transcript.clear()
+    assert with_result.status == "error"
+    # The ``all`` scope reads the router's calls too, which the entry does not speak for.
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        both = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="all").verify(5.0)
+    finally:
+        transcript.clear()
+    assert both.status == "error"
+
+
 def test_worker_commands_missing_required_fails_and_counts():
     _stash_commands(["cat README.md"])
     v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
@@ -3128,6 +3173,13 @@ def test_tool_called_leaves_a_repeated_key_undecided_when_the_clip_cuts_its_name
 
 def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
     transcript.set("done", _terminal_call({"raw": '{"command": "ls", "desc ...[clipped 3000 chars]'}))
+    assert _verdicts() == ("pass", "fail")
+
+
+def test_tool_called_reads_a_clip_marker_inside_a_value_as_text():
+    # The command itself printed a clipped record; the pod's own marker ends the string.
+    head = '{"command": "echo ...[clipped 5 chars] done", "x": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts() == ("pass", "fail")
 
 
@@ -5463,6 +5515,44 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- body_contains: the description carries the evidence (#4966)
+
+_EVIDENCE_PHRASES = ["## Evidence", "**Verify after merge:**"]
+
+
+def test_a_pull_request_whose_description_lacks_the_evidence_is_a_fail(token, github):
+    """The one-line body of #4966 passes every other clause."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        {**_pr_payload(), "body": "Applies a PDB (minAvailable: 1) for the checkout deployment."},
+    )
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "fail"
+    assert "'## Evidence'" in res.reason and "body_contains" in res.reason
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_request_with_no_description_is_a_fail_under_body_contains(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": None})
+    _pr_head_routes(github)
+    assert _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0).status == "fail"
+
+
+def test_a_pull_request_carrying_the_evidence_passes(token, github):
+    _stash_pr_report()
+    body = (
+        "Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n\n"
+        "**Verify after merge:**\n\n```bash\nkubectl get pdb -A\n```\n"
+    )
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": body})
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
 # ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
 
 _SYNCED_MANIFEST = "manifests/apps/eval-autoops-open-pr/deployment.yaml"
@@ -5897,7 +5987,7 @@ def test_a_field_path_is_checked_when_the_case_loads():
 
 
 def test_an_added_file_is_read_from_the_listing_alone(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
+    """The check makes no `/contents` read; a file the pull request
     adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
@@ -7055,6 +7145,69 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
     finally:
         verifiers._forge_unavailable.reset(token)
     assert seen == [(noted, "answered 429")]
+
+
+def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_resolve falls back from /issues to /pulls on a 404; the 404 is a route."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (404, {"message": "Not Found"})
+    github.routes[_pr_api("pulls")] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_an_absent_commits_page_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_head_push reads a 404 commits page as "dates nothing"; the closed-head
+    listing's outage after it still marks the error."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_commits_of()] = (404, {"message": "Not Found"})
+    github.routes[_closed_from()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert _commits_of() in [url for url, _ in github.calls]
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def _three_pr_reply():
+    return "Opened " + ", ".join(_PR_URL.replace("/7", f"/{n}") for n in (5, 6, 7))
+
+
+def test_a_rejected_candidate_drops_only_its_own_reads(minted_token, github):
+    """#5 is unevaluable on a malformed answer (a plain entry), #6 is rejected
+    on a 404, #7 hits a 503. #6's rejection must not take #5's entry with it,
+    so the error stays plain."""
+    _stash_pr_report(final_message=_three_pr_reply())
+    github.routes[_pr_api(number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api("pulls", number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api(number=7)] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    _stash_pr_report(final_message="Opened " + _PR_URL.replace("/7", "/6") + " and " + _PR_URL)
+    github.routes[_pr_api()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_a_handled_404_is_dropped_only_for_its_own_read():
+    """handled() takes the entry of the read just made, and only a plain one."""
+    seen = [(True, "answered 503")]
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+        seen.append((False, "answered 404"))
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+    finally:
+        verifiers._forge_unavailable.reset(token)
 
 
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
@@ -9975,6 +10128,34 @@ def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     assert res.status == "pass" and "not checked" not in res.reason, res
 
 
+def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_printed_one():
+    # The worker's own output quotes a clipped record; the pod's marker opens the kept tail.
+    from kube_agents_bench import worker_trajectory
+
+    output = "earlier: a ...[clipped 12 chars] record\nnode-b NotReady " + "x" * 4000 + "\nverdict: done"
+    out = json.dumps({"output": output, "exit_code": 0})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    res = _grade_claims(_block("kubectl get nodes", "node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+    assert verifiers._clipped_result_marker(clipped).start() == limit
+
+
+def test_verified_claims_backed_a_kept_tail_does_not_make_a_clipped_result_whole():
+    # The tail closes the JSON string and object again, so a whole-object decode
+    # succeeds; an excerpt from the dropped middle is unchecked, not invented.
+    from kube_agents_bench import worker_trajectory
+
+    output = "head " + "x" * 2500 + " middle node-b NotReady " + "y" * 2500 + " tail"
+    out = json.dumps({"output": output, "exit_code": 0, "error": None})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    text, was_clipped = verifiers._terminal_output(clipped)
+    assert was_clipped and "[clipped" not in text and text.startswith("head ")
+    res = _grade_claims(_block("kubectl get nodes", "middle node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" in res.reason and "output clipped" in res.reason, res
+
+
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():
     out = json.dumps({"output": "user:[REDACTED_EMAIL] roles/viewer", "exit_code": 0})
     res = _grade_claims(_block("gcloud projects get-iam-policy p", "user:ana@example.com roles/viewer"),
@@ -11121,6 +11302,44 @@ def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_an
     else:
         github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
         github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+# #5346: a read the check handled, or a candidate it rejected, leaves the
+# forge-unavailable decision, so a later outage on the read that errors is
+# marked. A rejection beside a transient read keeps the error plain.
+
+
+def test_ledger_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(token, github):
+    _stash_report(final_message=f"Ledger: {_LEDGER_URL.replace('/42', '/41')} and {_LEDGER_URL}")
+    github.routes[_api(41)] = (404, {"message": "Not Found"})
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_rejected_candidate_does_not_keep_a_later_outage_on_rung_2(token, gitops_repo, github):
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (404, {"message": "Not Found"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_candidate_rejected_beside_a_transient_read_keeps_the_error_plain(
+    token, gitops_repo, github
+):
+    """#708 is rejected on its state while its comment read answered 503: the
+    code cannot tell that rejection from an outage, so its reads stay, and
+    #709's outage does not mark the error."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason

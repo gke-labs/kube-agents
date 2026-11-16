@@ -21,7 +21,7 @@
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_IMAGE=node
-ARG NODE_VERSION=22-slim
+ARG NODE_VERSION=24-slim
 
 # --- adapter build stage ---
 FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
@@ -74,6 +74,8 @@ ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
+# The wrapper below asks this first, and starts Python only when the context is not registered yet.
+COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq \
     && rm -rf /var/lib/apt/lists/* \
@@ -96,7 +98,7 @@ RUN apt-get update \
          'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
          '  case " $* " in' \
          '  *" --context"*)' \
-         '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
+         '    /usr/local/libexec/kubectl-context-registered "$@" 2>/dev/null || PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
          '    ;;' \
          '  *)' \
          '    if [ ! -f "${HOME}/.kube/config" ]; then' \
@@ -112,7 +114,14 @@ RUN apt-get update \
          'exec /usr/local/libexec/kubectl "$@"' \
          >/usr/local/bin/kubectl \
     && chmod 0755 /usr/local/bin/kubectl
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential-proxy-exec
+# credential-proxy-exec is a launcher that imports the client as a module, so
+# Python loads the client from bytecode compiled here and does not compile its
+# source at every brokered call (deploy/sandbox/Dockerfile says more).
+COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
+COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
+    && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
+       | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 RUN mkdir -p /opt/credential-proxy/bin \
     && for binary in gcloud; do \
          ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \

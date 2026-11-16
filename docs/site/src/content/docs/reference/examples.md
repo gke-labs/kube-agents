@@ -47,7 +47,7 @@ vLLM's OpenAI-compatible server (`vllm serve`) serving Gemma 4 26B-A4B (`RedHatA
 
 [`examples/gitops-repo/`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo)
 
-The reference layout for the GitOps repository the agent writes to: per-cluster desired state under `clusters/<cluster>/`, fleet-level policy under `fleet/`, the knowledge base, admission policies, and `.kube-agents/intent.yaml`, where the declaring audits look for declared-intent notes. It is a template to fork as your own repository, separate from the kube-agents source tree; `submit-suggestion` opens pull requests against whichever repository the install names.
+The reference layout for the GitOps repository the agent writes to: per-cluster desired state under `clusters/<cluster>/`, fleet-level policy under `fleet/`, the knowledge base, admission policies, `.kube-agents/intent.yaml`, where the declaring audits look for declared-intent notes, and `.kube-agents/automation.yaml`, the [automation rules file](/kube-agents/reference/automation-rules/). It is a template to fork as your own repository, separate from the kube-agents source tree; `submit-suggestion` opens pull requests against whichever repository the install names.
 
 **When to use:** setting up the GitOps repository for a new install, or checking where an audit expects a declaration to live.
 

@@ -169,7 +169,12 @@ class SplitAnswerTest(unittest.TestCase):
         md = sentence + " It needs more.\n\nScale it."
         lead, body = sp.split_lead(md)
         self.assertEqual((lead, body), (sentence, ["It needs more.", "Scale it."]))
-        self.assertEqual((sp._clip(sp._plain(lead), sp.HEADLINE_MAX), body), sp.split_answer(md))
+        # split_answer cuts the same sentence at a word, so its clip drops nothing: the headline ends
+        # on the ellipsis the body's first section opens with, and that section carries the rest.
+        headline, sections = sp.split_answer(md)
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertEqual(sections[1:], ["Scale it."])
+        self.assertTrue(sections[0].startswith(sp.ELLIPSIS + "and busy") and sections[0].endswith(" It needs more."), sections)
 
     def test_empty(self):
         self.assertEqual(sp.split_answer(""), ("", []))
@@ -195,6 +200,153 @@ class SplitAnswerTest(unittest.TestCase):
     def test_a_headline_is_not_cut_after_etc(self):
         headline, _body = sp.split_answer("Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.")
         self.assertEqual(headline, "Deployments, StatefulSets, etc. All fail readiness.")
+
+    def test_a_long_first_sentence_with_no_clause_keeps_its_tail(self):
+        # One long parenthetical: no clause break outside the bracket, so clause_cut cannot cut it.
+        # The headline ends on an ellipsis at the last word that fits, and the rest of the sentence
+        # follows in the body, opening on the ellipsis, with no word dropped.
+        sentence = ("platform is currently running the live cluster count and will post the result here when it "
+                    "finishes (its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP "
+                    "projects in scope).")
+        headline, body = sp.split_answer(sentence)
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertLessEqual(len(headline), sp.HEADLINE_MAX)
+        self.assertEqual(len(body), 1)
+        self.assertTrue(body[0].startswith(sp.ELLIPSIS), body)
+        rejoined = headline[: -len(sp.ELLIPSIS)] + " " + body[0][len(sp.ELLIPSIS):]
+        self.assertEqual(rejoined, sentence)
+
+    def test_a_bold_long_first_sentence_with_no_clause_keeps_its_tail_bold(self):
+        sentence = ("**platform counted 209 running GKE clusters across the 42 GCP projects in scope (1 in "
+                    "bhoekstra-gkedemos, 8 in devops-bench-complex-evals, and 5 in each of the 40 kube-agents-evals "
+                    "projects).**")
+        headline, body = sp.split_answer(sentence + "\n\nWant a fresh count?")
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertEqual(body[1], "Want a fresh count?")
+        self.assertTrue(body[0].startswith("**" + sp.ELLIPSIS) and body[0].endswith("**"), body)
+
+    def test_word_cut_leaves_a_code_span_whole(self):
+        # The span with spaces straddles the cap, so the cut falls before it, never inside.
+        sentence = ("(platform is running the live cluster count and will post the result here when it finishes, its last "
+                    "`completed count 14 hours ago found 209 running GKE clusters` across all 42 GCP projects in scope)")
+        cut = sp.word_cut(sentence)
+        self.assertIsNotNone(cut)
+        self.assertTrue(cut[0].endswith("its last…"), cut)
+        for part in cut:
+            self.assertEqual(part.count("`") % 2, 0, part)
+
+    def test_word_cut_declines_one_unbroken_word(self):
+        self.assertIsNone(sp.word_cut("x" * (sp.HEADLINE_MAX + 40)))
+
+    def test_word_cut_prefers_a_cut_outside_a_bracket(self):
+        # The last word that fits is inside the parenthetical; the cut takes the last one before it,
+        # so the parenthetical opens the detail whole.
+        headline, body = sp.split_answer(
+            "platform is currently running the live cluster count and will post the result here when it finishes "
+            "(its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP projects in scope).")
+        self.assertEqual(
+            headline, "platform is currently running the live cluster count and will post the result here when it finishes…")
+        self.assertTrue(body[0].startswith("…(its last completed count"), body)
+        # Nothing fits outside the bracket, so the cut falls inside it.
+        cut = sp.word_cut("(" + "word " * 60 + "end)")
+        self.assertIsNotNone(cut)
+        self.assertTrue(cut[0].startswith("(word") and cut[0].endswith("word…"), cut)
+
+    def test_word_cut_steps_back_from_a_connector_and_a_bare_number(self):
+        # Outside the bracket the last word that fits is "and"; the headline does not hang on it.
+        headline, body = sp.split_answer(
+            "Three pods restarted (checkout, payments, inventory, search, cart, and the ledger worker that feeds them "
+            "all every hour) on seeded-a overnight and none of them has recovered since then at all.")
+        self.assertTrue(headline.endswith("on seeded-a overnight…"), headline)
+        self.assertTrue(body[0].startswith("…and none"), body)
+        # A number keeps its unit: the last word that fits is "209", so the cut falls before "found".
+        cut = sp.word_cut("x" * 132 + " found 209 running GKE clusters across all projects in scope today.")
+        self.assertEqual(cut, ("x" * 132 + " found…", "…209 running GKE clusters across all projects in scope today."))
+
+    def test_word_cut_never_falls_inside_a_link(self):
+        # The last word that fits sits inside the link's label, and the label and url hold no place
+        # to cut outside the bracket either, so the cut falls before the link.
+        sentence = ("(" + "word " * 14 + "then [the Logs Explorer query for the last completed count that found 209 "
+                    "running GKE clusters](https://console.cloud.google.com/logs/query;q=x) across all projects in scope)")
+        cut = sp.word_cut(sentence)
+        self.assertEqual(cut[0], "(" + "word " * 14 + "then…")
+        self.assertTrue(cut[1].startswith("…[the Logs"), cut)
+        mrkdwn = "word " * 20 + "then <https://example.com/a/very/long/path|a label with spaces in it that reaches the cap> and on."
+        cut = sp.word_cut(mrkdwn)
+        self.assertEqual(cut[0], "word " * 20 + "then…")
+
+    def test_an_in_word_marker_is_text_to_both_cuts(self):
+        # DB__HOST and 2**20 are text, as the rest of the presenter reads them: neither cut declines
+        # on a head that holds one, and a bold wrap whose code span holds ** is still one bold run.
+        prose = ("DB__HOST on seeded-c points to the retired replica (the one the migration retired last week after "
+                 "the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "DB__HOST on seeded-c points to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        bold = ("**The `2**20` byte limit on the queue was reached before sunrise on seeded-c (the producer kept "
+                "writing while every consumer waited on the retired replica in us-central1).**")
+        cut = sp.word_cut(bold)
+        self.assertEqual(cut[0], "**The `2**20` byte limit on the queue was reached before sunrise on seeded-c…**")
+        self.assertTrue(cut[1].startswith("**…(the producer") and cut[1].endswith("**"), cut)
+        clause = ("DB__HOST on seeded-c still points to the retired replica because the failover test moved every "
+                  "writer to the new pool in us-central1 and nobody moved the variable after.")
+        self.assertEqual(sp.clause_cut(clause)[0], "DB__HOST on seeded-c still points to the retired replica.")
+
+    def test_a_closed_bold_run_before_an_in_word_marker_stays_closed(self):
+        # Three raw markers, two of them the edges of a closed run: the head is not an open run.
+        prose = ("The __bold__ setting and DB__HOST on seeded-c point to the retired replica (the one the migration "
+                 "retired last week after the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "The bold setting and DB__HOST on seeded-c point to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        stars = ("The **bold** setting and 2**20 byte limit on the queue were reached before sunrise on seeded-c (the "
+                 "producer kept writing while every consumer waited on the retired replica in us-central1).")
+        self.assertTrue(sp.word_cut(stars)[0].endswith("before sunrise on seeded-c…"), sp.word_cut(stars))
+
+    def test_word_cut_reads_the_ellipsis_through_closing_emphasis(self):
+        head, rest = sp.word_cut("x" * 132 + " **found 209…** running GKE clusters across all projects in scope today.")
+        self.assertEqual(head, "x" * 132 + " **found 209…**")
+        self.assertEqual(rest, "…running GKE clusters across all projects in scope today.")
+        head, rest = sp.word_cut("x" * 136 + " found **…209 running** GKE clusters across all projects in scope today.")
+        self.assertEqual((head, rest), ("x" * 136 + " found…", "**…209 running** GKE clusters across all projects in scope today."))
+
+    def test_a_comparison_is_no_mrkdwn_link_and_a_bracketed_connector_is_held(self):
+        # "< 100Mi and memory limit is >" is not a link token: the cut may fall inside it.
+        cut = sp.word_cut("x" * 60 + " request is < 100Mi and memory limit is > 200Mi for all pods running in the production "
+                          "namespace of seeded-c (every one of them since the rollout at noon).")
+        self.assertIsNotNone(cut)
+        self.assertTrue(cut[0].endswith("production…") or cut[0].endswith("namespace…") or cut[0].endswith("seeded-c…"), cut)
+        # "(and" is the connector with its bracket: the cut steps back from it as from a bare "and".
+        cut = sp.word_cut("x" * 130 + " (and the same again for the pods of the other namespace on seeded-c and seeded-b).")
+        self.assertEqual(cut[0], "x" * 130 + "…")
+
+    def test_a_marker_between_two_non_word_characters_is_one_edge(self):
+        # The closing ** sits between a held code span and ")", where it reads as an opener and a
+        # closer at once: it is one edge, so the run is closed and the cut goes ahead.
+        prose = ("The (see **`pod-a`**) container on seeded-c points to the retired replica (the one the migration "
+                 "retired last week after the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "The (see pod-a) container on seeded-c points to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        # An in-word ** inside the bold wrap is no edge either: the sentence is still one bold run.
+        bold = ("**The 2**20 byte limit on the queue was reached before sunrise on seeded-c (the producer kept "
+                "writing while every consumer waited on the retired replica in us-central1).**")
+        cut = sp.word_cut(bold)
+        self.assertEqual(cut[0], "**The 2**20 byte limit on the queue was reached before sunrise on seeded-c…**")
+
+    def test_an_emphasised_connector_or_number_behind_a_bracket_is_held(self):
+        # Inside one long bracket, the last word that fits is "(*and*" and then "(**209**": both held.
+        inner = sp.word_cut("(" + "x" * 140 + " (*and* the same again for the pods of the other namespace on seeded-c and seeded-b).")
+        self.assertEqual(inner[0], "(" + "x" * 140 + "…")
+        inner = sp.word_cut("(" + "x" * 140 + " (**209** running GKE clusters across all projects in scope since the rollout at noon today).")
+        self.assertEqual(inner[0], "(" + "x" * 140 + "…")
+
+    def test_word_cut_adds_no_second_ellipsis(self):
+        # The sentence's own ellipsis stands at the cut: the headline ends on it once, and the rest
+        # opens on one of its own.
+        head, rest = sp.word_cut("x" * 136 + " found 209… running GKE clusters across all projects in scope today.")
+        self.assertEqual(head, "x" * 136 + " found 209…")
+        self.assertEqual(rest, "…running GKE clusters across all projects in scope today.")
 
     def test_a_soft_wrapped_first_sentence_is_the_whole_headline(self):
         md = "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one"

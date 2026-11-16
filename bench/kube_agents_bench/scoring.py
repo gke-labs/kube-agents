@@ -73,6 +73,7 @@ from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, Case
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
+from kube_agents_bench.worker_trajectory import NO_WORKER_CALLS_ENTRY
 
 __all__ = [
     "DEFAULT_AGGREGATE_MARGIN",
@@ -282,7 +283,8 @@ A2A_STATE_WORKING = "working"
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
 #: check that reads the delegated workers or a call's result is set aside
 #: on every inject record that does not carry the workers' tagged entries
-#: in full, marker or not: the trace carries no card ids, no worker's
+#: in full, marker or not (a ``workers``-scope ``tool_called`` grades on zero
+#: calls beside :data:`NO_WORKER_CALLS_ENTRY`, ``_inject_lane_view``): the trace carries no card ids, no worker's
 #: entries and no results (``cases.py``, ``worker_blind_checks``). The names are duplicated rather than imported,
 #: like the status entry, and so are the marker's four loss arguments
 #: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
@@ -979,8 +981,23 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
-#: The public name ``gate`` reads the version key's mode with.
+#: The public name for the inject transport's marker.
 is_inject_record = _inject_record
+
+#: The entry a card-wait stopped ask writes when the A2A door takes its send
+#: (``harness._A2A_DOOR_SEND_ENTRY``, #5407). Duplicated rather than imported,
+#: like the inject names above; ``test_card_wait.py`` asserts they agree.
+A2A_DOOR_SEND_EVENT = "a2a_door.send"
+
+
+def is_next_lane_record(trajectory: list[Any]) -> bool:
+    """Whether the record came off a next install, which ``gate`` files the
+    version key's mode by: the inject transport's task marker, or the A2A
+    door's send entry (only a next install has the door). Not an inject
+    record for grading: the door record keeps the api grading."""
+    return _inject_record(trajectory) or any(
+        isinstance(entry, dict) and entry.get("name") == A2A_DOOR_SEND_EVENT for entry in trajectory
+    )
 
 
 def _entry_failed(entry: dict[str, Any]) -> bool:
@@ -1138,6 +1155,20 @@ def _inject_workers_carried(trajectory: list[Any]) -> bool:
     )
 
 
+def _inject_no_worker_calls(trajectory: list[Any]) -> bool:
+    """Whether an inject record says the workers made no call: it carries the
+    harness's :data:`NO_WORKER_CALLS_ENTRY` (every awaited card closed, a clean
+    capture holding no worker entry), no tagged worker entry and no
+    :data:`WORKER_CAPTURE_GAP_ENTRY`."""
+    entries = [entry for entry in trajectory if isinstance(entry, dict)]
+    names = {entry.get("name") for entry in entries}
+    return (
+        NO_WORKER_CALLS_ENTRY in names
+        and WORKER_CAPTURE_GAP_ENTRY not in names
+        and not any(entry.get("agent") for entry in entries)
+    )
+
+
 def _inject_blind(trajectory: list[Any]) -> bool:
     """Whether the trajectory is the inject transport's and cannot vouch for
     the delegating turn's tool calls.
@@ -1280,6 +1311,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     that does not carry the workers (:func:`_inject_workers_carried`: no
     tagged worker entry, or a capture gap), marker or not, since the trace
     carries no card ids, no worker's entries and no results. On a record
+    carrying :data:`NO_WORKER_CALLS_ENTRY`, no tagged entry and no gap
+    (:func:`_inject_no_worker_calls`), the entries in
+    :attr:`CaseSpec.worker_calls_checks` grade on zero worker calls and the
+    rest stay set aside. On a record
     that carries them it grades, except an entry that also reads the
     router's calls (:attr:`CaseSpec.worker_router_checks`) on a record whose
     door did not vouch for them, and an entry that reads what the trace
@@ -1302,6 +1337,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
         set_aside = set(spec.worker_untraced_checks)
         if trace_blind:
             set_aside |= spec.worker_router_checks
+    elif _inject_no_worker_calls(record.trajectory):
+        # The workers made no call: the checks that read only their calls
+        # grade that as zero calls, and the rest still have nothing to read.
+        set_aside = set(spec.worker_blind_checks) - spec.worker_calls_checks
     else:
         set_aside = set(spec.worker_blind_checks)
     if trace_blind:

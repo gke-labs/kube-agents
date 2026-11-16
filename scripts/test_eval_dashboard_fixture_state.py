@@ -124,6 +124,14 @@ if args[:3] == ["container", "clusters", "describe"]:
 if args[:2] == ["container", "get-server-config"]:
     print(json.dumps(world.get("server_config", {})))
     sys.exit(0)
+if args[:3] == ["compute", "instances", "get-serial-port-output"]:
+    # The startup-fail role's serial assertion: world["serial"][project][name].
+    text = world.get("serial", {}).get(project, {}).get(args[3])
+    if text is None:
+        print(f"ERROR: (gcloud.compute.instances.get-serial-port-output) Required 'compute.instances.getSerialPortOutput' permission for {args[3]}", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(text)
+    sys.exit(0)
 if args[0] == "compute" and args[2] == "list":
     # A project-scoped role's probe (`--format=value(name)`) or state read
     # (`--format json`): the objects of world["compute"][project][collection]
@@ -286,7 +294,7 @@ def healthy_world(*projects):
     fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     compute = {
         "instances": [
-            {"name": "startup-fail-seeded", "status": "RUNNING", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
+            {"name": "startup-fail-seeded", "status": "RUNNING", "zone": "https://x/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
             {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}]},
         ],
         "firewall-rules": [
@@ -297,6 +305,8 @@ def healthy_world(*projects):
     return {
         "clusters": {project: fleet for project in projects},
         "compute": {project: compute for project in projects},
+        # The startup-fail VM's console still holds the boot that ran its script.
+        "serial": {project: {"startup-fail-seeded": 'Script "startup-script" failed with error: exit status 1\n'} for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -366,6 +376,7 @@ def healthy_world(*projects):
             },
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
             "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
+            "validatingwebhookconfiguration/seeded-crd-gate": {"webhooks": [{"name": "crd-gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 2, "clientConfig": {"service": {"name": "nonexistent-crd-gate"}}, "objectSelector": {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}}, "rules": [{"apiGroups": ["autoscaling.x-k8s.io"], "resources": ["capacitybuffers"]}]}]},
             # seeded-d's zonal-skew trio. Each is in the state its role's
             # `state` block asserts: a scheduled pod for the scheduling case,
             # a Bound claim for the volume case, and a Pending pod for the
@@ -585,10 +596,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 48, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 49, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 48, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 49, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -642,7 +653,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 95, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 97, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

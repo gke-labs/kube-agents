@@ -44,6 +44,7 @@ const (
 	noticeProfileNoTarget    = "%s needs a target cluster (project, location and cluster)"
 	noticeProfileTakesNone   = "%s doesn't take a target cluster"
 	noticeProfileTier        = "%s doesn't run at tier %s"
+	noticePinnedTier         = "cluster %s is pinned to %s, which doesn't allow tier %s"
 	noticeProfileAmbiguous   = "more than one agent profile is pinned to cluster %s"
 	noticeProfileNoGeneric   = "no agent profile serves cluster %s"
 	noticeTargetExcluded     = "cluster %s is excluded from this install's scope"
@@ -66,6 +67,19 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// The profile parent's chain and scope refusals (#5686). The chain and
+	// scope named are the parent's own.
+	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"
+	noticeOutsideParentScope   = "%s is outside this task's %s; it delegates only within that cluster"
+	noticeChildWiderThanParent = "a task with no target cluster is wider than this task's %s; name a cluster inside it"
+	noticeParentScopeUnknown   = "this task started before its delegations were checked, so it can't delegate; ask again to start a new task"
+	noticeParentChainMismatch  = "this task's delegation history can't be verified, so it can't delegate; ask again to start a new task"
+	// noticeParentScopeStale: the parent's scope is neither a cluster nor this
+	// install's, as when the install's namespace changed under an open task.
+	noticeParentScopeStale = "this task's scope no longer matches this install, so it can't delegate; ask again to start a new task"
+	noticeUnattendedParent = "a task a trigger started can't delegate; ask in chat instead"
+	// noticeChainSeparator joins a chain's profiles in noticeProfileCycle.
+	noticeChainSeparator = " → "
 	// noticePlatformTakesNoParameters: platform takes its target from the text.
 	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
@@ -283,8 +297,11 @@ func refused(format string, args ...any) error {
 // resolveProfile picks the profile a task addressed to `addressee` with
 // `params` goes to (spec-profiles-dispatch.md, "Addressing", step 1):
 //   - addressed to a pinned profile, the target must be its cluster;
-//   - addressed to a profile that takes a target, a profile pinned to that
-//     target gets it instead, and otherwise the addressed profile does;
+//   - addressed to a profile that takes a target and yields to pinned
+//     profiles (the generic cluster agent), a profile pinned to that target
+//     gets it instead, and otherwise the addressed profile does;
+//   - addressed to any other profile that takes a target (a specialist), the
+//     addressed profile keeps it, pinned cluster or not;
 //   - addressed to a profile that takes none, the task carries no target.
 //
 // Two profiles pinned to one cluster is refused rather than guessed between.
@@ -318,6 +335,9 @@ func resolveProfile(dir *profileDirectory, addressee string, params map[string]s
 	case takesTarget(card):
 		if !hasTarget {
 			return "", nil, refused(noticeProfileNoTarget, addressee)
+		}
+		if !card.YieldToPinned {
+			return addressee, &target, nil
 		}
 		switch pinned := dir.pinnedTo(target); len(pinned) {
 		case 0:
@@ -559,6 +579,9 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	if haveCard && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
 		return nil, refused(noticeProfileTier, profile, tier)
 	}
+	if err := g.checkPinnedTiers(profile, target, tier); err != nil {
+		return nil, err
+	}
 	route := &profileRoute{Profile: profile, Tier: tier, Kind: kind, Params: maps.Clone(params),
 		Scope: capability.NamespaceScope(g.cfg.Namespace)}
 	if target == nil {
@@ -594,6 +617,27 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	}
 	route.Scope = target.scope()
 	return route, nil
+}
+
+// checkPinnedTiers keeps a pin's tiers as the cap on its cluster when a task
+// for that cluster stays with another profile: a specialist that doesn't
+// yield to pinned profiles keeps its persona there, but not a tier the pin
+// refuses (spec-profiles-dispatch.md, "Tiers and identity"). A pin only ever
+// narrows, so every profile pinned to the target is checked, and a card with
+// no tiers (an operator from before them) isn't.
+func (g *Gateway) checkPinnedTiers(profile string, target *clusterTarget, tier capability.Tier) error {
+	if target == nil {
+		return nil
+	}
+	for _, pin := range g.profiles.pinnedTo(*target) {
+		if pin == profile {
+			continue
+		}
+		if card, ok := g.profiles.lookup(pin); ok && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
+			return refused(noticePinnedTier, *target, pin, tier)
+		}
+	}
+	return nil
 }
 
 // checkDeclaredParameters holds a task's parameters to what the resolved

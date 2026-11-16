@@ -135,6 +135,11 @@ type Request struct {
 	// ignored by another.
 	Profile string `json:"profile,omitempty"`
 	Tier    Tier   `json:"tier,omitempty"`
+
+	// Trigger is profile.run's too: the trigger the submission claims,
+	// which must equal the grant's (nil only against a grant with none).
+	// Refused on any other verb, like Profile and Tier.
+	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
 // Response is a verdict and the rule behind it. It deliberately does NOT carry
@@ -200,13 +205,13 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		return Response{Reason: WalkRefused}
 	}
 	if req.Verb == VerbProfileRun {
-		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource); err != nil {
+		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource, req.Trigger); err != nil {
 			return Response{Reason: Reason(err)}
 		}
 		return Response{Allowed: true}
 	}
-	if req.Profile != "" || req.Tier != "" {
-		return Response{Reason: "profile and tier are only read for profile.run"}
+	if req.Profile != "" || req.Tier != "" || req.Trigger != nil {
+		return Response{Reason: "profile, tier and trigger are only read for profile.run"}
 	}
 	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
 		return Response{Reason: Reason(err)}
@@ -416,10 +421,12 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 }
 
 // CheckProfileRun asks profile.run: may the grant at ref run profile at tier
-// for target. target is the task's target scope, or the install's namespace
-// scope for a task with none; it is never empty.
-func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope) error {
-	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier})
+// for target, started by trigger. target is the task's target scope, or the
+// install's namespace scope for a task with none; it is never empty. trigger
+// is the one the submission claims (TriggerFromAuthority), nil when it claims
+// none; the verifier permits only when it equals the grant's.
+func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope, trigger *Trigger) error {
+	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier, Trigger: trigger})
 }
 
 func (c *Client) check(ctx context.Context, req Request) error {

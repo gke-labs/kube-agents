@@ -85,6 +85,7 @@ func newUsageEnvtestHarness(t *testing.T, cfg *rest.Config, scheme *runtime.Sche
 	}
 	h.runningPod(usageGatewayPod("gateway", "", usageTestGatewayIP, time.Time{}))
 	h.runningPod(usageBrokerPod("broker", "", usageTestBrokerIP, time.Time{}))
+	h.runningPod(usageLiteLLMPod("litellm", "", usageTestLiteLLMIP, time.Time{}))
 
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme}
 	h.p = &UsageCounterPoller{
@@ -103,9 +104,15 @@ func (h *usageEnvtestHarness) runningPod(pod *corev1.Pod) {
 	pod.Namespace = usageEnvtestNamespace
 	pod.UID = ""
 	pod.CreationTimestamp = metav1.Time{}
-	pod.Labels["app"] = envtestAgentName + "-gateway"
-	if pod.Labels["kubeagents.x-k8s.io/component"] == "credential-proxy" {
+	// The builders label their pods for the unit tests' agent name; the
+	// envtest agent has its own. LiteLLM's label is the chart's, not the
+	// agent's, and stays.
+	switch {
+	case pod.Labels["kubeagents.x-k8s.io/component"] == "credential-proxy":
 		pod.Labels = credentialProxySelector(&agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: envtestAgentName}})
+	case pod.Labels[podLabelApp] == litellmAppName:
+	default:
+		pod.Labels["app"] = envtestAgentName + "-gateway"
 	}
 	for i := range pod.Spec.InitContainers {
 		pod.Spec.InitContainers[i].Image = usageEnvtestImage
@@ -170,10 +177,14 @@ func TestUsagePollerOnAServedCRDEnvtest(t *testing.T) {
 	h := newUsageEnvtestHarness(t, cfg, scheme)
 	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
 	h.stub.set(brokerAddr(), 50, ptr.To(2.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(3.0))
 
 	h.poll(5)
 	if h.patches != 0 {
 		t.Fatalf("the first poll patched the status %d times", h.patches)
+	}
+	if got := h.stub.pathOf(litellmAddr()); got != usageLiteLLMMetricsPath {
+		t.Fatalf("LiteLLM was read at %q, want %q", got, usageLiteLLMMetricsPath)
 	}
 	cm := h.configMap()
 	if len(cm.OwnerReferences) != 1 || cm.OwnerReferences[0].UID != h.agent.UID || (cm.OwnerReferences[0].Controller != nil && *cm.OwnerReferences[0].Controller) {
@@ -182,6 +193,9 @@ func TestUsagePollerOnAServedCRDEnvtest(t *testing.T) {
 
 	h.stub.set(gatewayAddr(), 104, ptr.To(1.0))
 	h.stub.set(brokerAddr(), 57, ptr.To(2.0))
+	// Sixty thousand tokens in one interval: past the common ceiling, which
+	// the served CRD's three int64 fields take under the token ceiling.
+	h.stub.setLiteLLM(litellmAddr(), 1_060_000, 51_000, 5_300_000, ptr.To(3.0))
 	h.poll(10)
 	if h.patches != 1 {
 		t.Fatalf("a poll in which the source moved patched %d times, want 1", h.patches)
@@ -189,6 +203,9 @@ func TestUsagePollerOnAServedCRDEnvtest(t *testing.T) {
 	status := h.status()
 	if status.EventsIngestedTotal != 4 || status.ToolExecutionsTotal != 7 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(h.at(10)) {
 		t.Fatalf("status after the move: %+v", status)
+	}
+	if status.InputTokensTotal != 60_000 || status.OutputTokensTotal != 1_000 || status.SpendMicrosUSDTotal != 300_000 {
+		t.Fatalf("the served CRD did not carry the three inference totals: %+v", status)
 	}
 	h.poll(15)
 	if h.patches != 1 {
@@ -214,7 +231,7 @@ func TestUsagePollerOnAServedCRDEnvtest(t *testing.T) {
 		t.Fatalf("the repair poll patched %d times in total, want 2", h.patches)
 	}
 	repaired := h.status()
-	if repaired.EventsIngestedTotal != 4 || repaired.ToolExecutionsTotal != 7 {
+	if repaired.EventsIngestedTotal != 4 || repaired.ToolExecutionsTotal != 7 || repaired.InputTokensTotal != 60_000 || repaired.SpendMicrosUSDTotal != 300_000 {
 		t.Fatalf("the repair moved the totals: %+v", repaired)
 	}
 	if repaired.LastActiveTime == nil || !repaired.LastActiveTime.Time.Equal(h.at(10)) {
@@ -237,8 +254,10 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 	h := newUsageEnvtestHarness(t, cfg, scheme)
 	h.stub.set(brokerAddr(), 50, ptr.To(2.0))
 	h.stub.set(gatewayAddr(), 0, ptr.To(1.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000, 100, 10_000, ptr.To(3.0))
 	h.poll(5)
 	h.stub.set(brokerAddr(), 60, ptr.To(2.0))
+	h.stub.setLiteLLM(litellmAddr(), 21_000, 200, 20_000, ptr.To(3.0))
 	h.poll(10)
 	if h.patches != 1 {
 		t.Fatalf("the first movement under the pruning CRD patched %d times, want 1 (the probe)", h.patches)
@@ -264,7 +283,7 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 	if err := decodeUsageDocument(cm, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Totals[usageCounterToolExecutions] != 20 {
+	if doc.Totals[usageCounterToolExecutions] != 20 || doc.Totals[usageCounterInputTokens] != 20_000 || doc.Totals[usageCounterSpendMicros] != 10_000 {
 		t.Fatalf("the ConfigMap fell behind under the pruning CRD: %v", doc.Totals)
 	}
 
@@ -287,6 +306,9 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 		if status := h.status(); status.ToolExecutionsTotal == 20 {
 			if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(h.at(15)) {
 				t.Fatalf("lastActiveTime after the CRD landed = %v, want the last move %v", status.LastActiveTime, h.at(15))
+			}
+			if status.InputTokensTotal != 20_000 || status.OutputTokensTotal != 100 || status.SpendMicrosUSDTotal != 10_000 {
+				t.Fatalf("the inference totals after the CRD landed: %+v, want what the ConfigMap accumulated", status)
 			}
 			break
 		}

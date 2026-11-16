@@ -112,6 +112,10 @@ type holding struct {
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// trigger is the trigger the verifier found equal to the grant's, nil
+	// when the submission names none: its credential-proxy token carries it
+	// (#4685).
+	trigger *taskcred.Trigger
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -682,7 +686,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 
 	now := d.now()
-	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	adm, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
 		d.dropUnstartedJob(ctx, log, hk)
 		d.stopQueued(ctx, log, del, hk)
@@ -744,7 +748,8 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
-	h.cluster = cluster
+	h.cluster = adm.cluster
+	h.trigger = adm.trigger
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
@@ -896,7 +901,7 @@ const capHeld = "already held here"
 // delivery that raced the first past handle's check) is refused as capHeld,
 // never given a second holding.
 func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
-	unattended := d.cfg.unattended(tier)
+	unattended := d.cfg.unattendedFor(prof, tier)
 	shared := snap.Ceiling - snap.ChildReserve - snap.InteractiveReserve
 
 	d.mu.Lock()
@@ -1177,7 +1182,8 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 
 // taskCredentials mints the task credential (audience nats) and, when the
 // task names a cluster, the credential-proxy token for the pod being
-// confirmed (#3889). Both name the task, its profile and tier, the pod and
+// confirmed (#3889). A checked trigger on a task with no cluster is logged
+// as dropped. Both name the task, its profile and tier, the pod and
 // the UID it had at the offer; a pod whose UID has changed since (deleted
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
@@ -1194,25 +1200,34 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		expires = limit
 	}
 	base := taskcred.Claims{Task: h.taskID, Profile: h.profile, Tier: h.tier, Pod: pod, PodUID: uid, Expires: expires}
-	natsToken, err = d.mintOne(log, base, taskcred.AudienceNATS, nil, now)
+	natsToken, err = d.mintOne(log, base, taskcred.AudienceNATS, nil, nil, now)
 	if err != nil {
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, now)
+		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
 		if err != nil {
 			return "", "", err
 		}
+	} else if h.trigger != nil {
+		// Admission checked the trigger, but only the credential-proxy token
+		// carries one, and a task that names no cluster gets none. Said, not
+		// silent, until a cluster-less report credential exists (#5619).
+		log.Warn("trigger dropped: the task names no cluster, so no credential-proxy token carries it", "trigger", h.trigger.Name, "pod", pod)
 	}
 	return natsToken, proxyToken, nil
 }
 
 // mintOne mints one credential for aud, reads it back and logs its jti.
-func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.Audience, target *taskcred.Target, now time.Time) (string, error) {
+func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.Audience, target *taskcred.Target, trigger *taskcred.Trigger, now time.Time) (string, error) {
 	c.Audience = aud
 	if target != nil {
 		t := *target
 		c.Target = &t
+	}
+	if trigger != nil {
+		t := *trigger
+		c.Trigger = &t
 	}
 	token, err := d.mint(c)
 	if err != nil {
@@ -1258,7 +1273,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier), onJob: d.cfg.jobPossible(prof, hk.tier) && d.jobs != nil,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()

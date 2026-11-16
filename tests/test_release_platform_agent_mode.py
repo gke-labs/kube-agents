@@ -465,9 +465,13 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         for job_id in ("step-4-tag-validated", "step-5-teardown-env"):
             with self.subTest(job=job_id):
                 self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", jobs[job_id]["if"]))
-        # The same suites as the today leg, so the two results read side by side.
-        for key in ("blocking_suite", "optional_suites"):
-            self.assertEqual(jobs["step-7-run-e2e-today"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])
+        # The same suites as the today leg, so the two results read side by side, bar
+        # `slack`, which runs on next only: today's Hermes Slack adapter drops the test
+        # user's app-attributed post (tests/e2e/README.md, "Slack E2E test").
+        today, on_next = jobs["step-7-run-e2e-today"]["with"], jobs["step-3-run-e2e-tests"]["with"]
+        self.assertEqual(today["blocking_suite"], on_next["blocking_suite"])
+        next_only = {"slack"}
+        self.assertEqual(set(today["optional_suites"].split(",")), set(on_next["optional_suites"].split(",")) - next_only)
 
     def test_needs_reads_the_scalar_form_as_one_job(self):
         """Step 2 writes `needs:` as a scalar; the pin above must see it as a job name."""

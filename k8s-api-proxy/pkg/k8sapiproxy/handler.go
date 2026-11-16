@@ -57,6 +57,15 @@ type Config struct {
 	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
 	// before policy, cache or upstream; nil excludes nothing.
 	Exclusions *Exclusions
+	// CallerPartition names the upstream credential an authenticated caller's requests use,
+	// for an Upstream that chooses a credential per caller or tenant. Its value is part of
+	// the cache key and the in-flight coalescing key, so requests share a cached response or
+	// an upstream fetch only within one partition, and the Upstream reads it with
+	// PartitionFromContext. Nil puts every caller in one partition: the handler then shares
+	// responses across callers, which is safe only when the Upstream uses one credential.
+	// It runs once per authenticated request, refused ones included, with a non-nil caller,
+	// and must not panic.
+	CallerPartition func(*CallerIdentity) string
 	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
 	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
@@ -74,6 +83,7 @@ type handler struct {
 	metrics        *Metrics
 	tracerProvider trace.TracerProvider
 	cache          *responseCache
+	partition      func(*CallerIdentity) string
 	factory        *request.RequestInfoFactory
 	proxy          *httputil.ReverseProxy
 	// slots holds one token per counted request in flight; nil when there is no cap.
@@ -137,6 +147,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		metrics:        metrics,
 		tracerProvider: tp,
 		cache:          cache,
+		partition:      cfg.CallerPartition,
 		factory:        NewRequestInfoFactory(),
 		slots:          slots,
 		proxy: &httputil.ReverseProxy{
@@ -265,6 +276,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 	ev.Caller = caller
+	// Before anything is recorded as forwarded: a panic in the embedder's func is then
+	// audited as the panic it is.
+	var partition string
+	if h.partition != nil {
+		partition = h.partition(caller)
+	}
 
 	clusterID, apiPath, perr := SplitClusterPath(r.URL)
 	if perr != nil {
@@ -316,6 +333,10 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
 	ev.Outcome = OutcomeForwarded
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
+	if h.partition != nil {
+		// Read by the cache key and by the Upstream; a coalesced fetch inherits it.
+		ctx = context.WithValue(ctx, partitionKey{}, partition)
+	}
 	callerAccept := normalizeAcceptHeader(out.Header)
 	if h.cache != nil {
 		ctx = context.WithValue(ctx, cacheRequestMetaKey{}, cacheRequestMeta{info: info, callerAccept: callerAccept})

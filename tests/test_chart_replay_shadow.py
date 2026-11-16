@@ -25,6 +25,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _ROOT / "charts" / "kube-agents"
 _TEMPLATE = _CHART / "templates" / "litellm.yaml"
 _CI_ENV = _ROOT / "hack" / "ci-env.sh"
+_LITELLM_POLICY_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_litellm_policy.go"
 
 _REQUIRED = (
     "platformAgent.harness.clusterName=ci-cluster",
@@ -103,6 +104,14 @@ class TemplateTextTest(unittest.TestCase):
         collector = _CI_ENV.read_text()
         self.assertIn(f'readonly LITELLM_LOG_CONTAINER="{_LITELLM_CONTAINER}"', collector)
         self.assertNotEqual(_PROXY_CONTAINER, _LITELLM_CONTAINER)
+
+    def test_the_operators_usage_poller_reads_the_container_the_chart_names(self):
+        """The operator gates its LiteLLM scrape on this container's name and reads no pod
+        without it, so a rename on either side would leave the three inference totals
+        standing still with no Warning, since an unread pod opens no failure streak."""
+        match = re.search(r'^\s*litellmContainerName\s*=\s*"([^"]+)"', _LITELLM_POLICY_GO.read_text(), re.M)
+        self.assertIsNotNone(match, f"litellmContainerName not found in {_LITELLM_POLICY_GO}")
+        self.assertEqual(match.group(1), _LITELLM_CONTAINER)
 
 
 class DisabledTest(unittest.TestCase):

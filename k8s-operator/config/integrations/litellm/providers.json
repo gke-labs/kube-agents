@@ -18,7 +18,7 @@
     {
       "id": "gemini",
       "label": "Gemini API",
-      "defaultModel": "gemini-3.5-flash",
+      "defaultModel": "gemini-3.8-flash",
       "overlay": "base",
       "authentication": {
         "type": "api_key",
@@ -29,7 +29,7 @@
     {
       "id": "vertex_ai",
       "label": "Vertex AI",
-      "defaultModel": "gemini-3.5-flash",
+      "defaultModel": "gemini-3.8-flash",
       "overlay": "vertex_ai",
       "authentication": {
         "type": "workload_identity"
