@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1179,44 +1178,6 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	}
 }
 
-// A flip to today clears status.busReplicas: a today CR has no bus.
-func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	keys := sandboxKeysSecret(agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, keys).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
-		}
-	}
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Status.BusReplicas == 0 {
-		t.Fatal("precondition: status.busReplicas not written under next")
-	}
-	fresh.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Status.BusReplicas != 0 {
-		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
-	}
-}
-
 // A NATS pod the hostname spread holds Pending is named with the scheduler's
 // reason by the status pod scan, not blamed on the CR's RuntimeClass, which
 // the pod does not ask for: the remedy that message gives (a gVisor node pool)
@@ -1323,7 +1284,8 @@ func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
 // OrderedReady creates server 1 and its claim only once server 0 is Ready, so
 // a new cluster's StatefulSet deleted before then leaves only claim 0, as a
 // single server does. The recorded count tells them apart; with nothing
-// recorded (a bus back from today) the lone claim reads as one server.
+// recorded (a record lost to a served CRD that prunes it) the lone claim
+// reads as one server.
 func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	for _, tc := range []struct {
 		recorded, want int32
@@ -1840,5 +1802,47 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
+	}
+}
+
+// The bus logs at debug only while the operator's environment carries
+// A2A_NATS_DEBUG=true, as CI's does; never trace, which logs payloads. The
+// default render, and any other value, has neither.
+func TestTheBusLogsAtDebugOnlyWhenTheOperatorAsks(t *testing.T) {
+	render := func() string {
+		return renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "") // a developer shell may carry it
+	debugLine := regexp.MustCompile(`(?m)^\s*debug:`)
+	traceLine := regexp.MustCompile(`(?m)^\s*(trace|trace_verbose):`)
+	if conf := render(); debugLine.MatchString(conf) || traceLine.MatchString(conf) {
+		t.Errorf("the default render logs at debug or trace:\n%s", conf)
+	}
+	for _, v := range []string{"1", "yes", "TRUE", ""} {
+		t.Setenv(a2aNATSDebugEnvVar, v)
+		if debugLine.MatchString(render()) {
+			t.Errorf("%s=%q turned debug on; only \"true\" does", a2aNATSDebugEnvVar, v)
+		}
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "true")
+	conf := render()
+	if !regexp.MustCompile(`(?m)^debug: true$`).MatchString(conf) {
+		t.Errorf("%s=true left debug off:\n%s", a2aNATSDebugEnvVar, conf)
+	}
+	if traceLine.MatchString(conf) {
+		t.Error("debug brought trace with it")
+	}
+	// The rendered config still parses with the line in it.
+	full := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aFullCreds("c", "1"), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	path := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, strings.NewReplacer(`pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, "server_name: $POD_NAME", "server_name: n0").Replace(full))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(path)
+	if err != nil {
+		t.Fatalf("the debug render does not parse: %v", err)
+	}
+	if !opts.Debug || opts.Trace {
+		t.Errorf("parsed debug=%v trace=%v, want debug only", opts.Debug, opts.Trace)
 	}
 }

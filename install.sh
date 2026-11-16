@@ -549,6 +549,12 @@ if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
 else
   export GITHUB_MINTER_GSA_NAME_GIVEN="false"
 fi
+# And its KSA (#5282).
+if [ -n "${GITHUB_MINTER_KSA_NAME:-}" ]; then
+  export GITHUB_MINTER_KSA_NAME_GIVEN="true"
+else
+  export GITHUB_MINTER_KSA_NAME_GIVEN="false"
+fi
 # GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
 # token is read from. There is deliberately no token-value input: a value in
 # argv or the environment is a value in `ps`, shell history and CI logs.
@@ -2377,7 +2383,7 @@ record_github_gitops_keys() {
   # cluster rather than defaulted, so a file that doesn't record them would
   # send the next upgrade.sh back to the project-wide names. And the key it
   # shares on purpose, when it does.
-  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME MINTER_SHARED_KEY; do
+  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME MINTER_SHARED_KEY; do
     [ -n "${!key:-}" ] && keys+=("$key")
   done
   for key in "${keys[@]}"; do
@@ -3186,7 +3192,7 @@ bootstrap_install_env_file() {
   # NAMESPACE is not in that list, and is handled separately below: the
   # ambient variable must not be frozen, but a flag must be.
   local identity_key
-  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
+  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
     if [ -n "${!identity_key:-}" ]; then
       write_env_var "$tmp" "$identity_key" "${!identity_key}"
     fi
@@ -3495,21 +3501,25 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
-# Gives the token minter this install's own key ring, key and GSA names where
-# the operator named none (#3504): the names its state holds on an install
-# that already has a minter, else names derived from the cluster
+# Gives the token minter this install's own key ring, key, GSA and KSA names
+# where the operator named none (#3504, #5282): the names its state holds on an
+# install that already has a minter, else names derived from the cluster
 # (minter_derived_names). Called once project and cluster are settled and
 # before anything reads the names: the PEM decision, the interview's
-# defaults, and the KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME this run
-# records in install.env, which keep a new install's names on later runs.
+# defaults, and the KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and
+# GITHUB_MINTER_KSA_NAME this run records in install.env, which keep a new
+# install's names on later runs.
 apply_minter_name_defaults() {
-  local project=$1 cluster=$2 names ring key gsa
+  local project=$1 cluster=$2 names ring key gsa ksa
   names="$(minter_name_defaults "$project" "$cluster")"
-  IFS='|' read -r ring key gsa <<<"$names"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
   [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
   [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
   if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
     export GITHUB_MINTER_GSA_NAME="$gsa"
+  fi
+  if [ "${GITHUB_MINTER_KSA_NAME_GIVEN:-false}" != "true" ]; then
+    export GITHUB_MINTER_KSA_NAME="$ksa"
   fi
 }
 
@@ -3764,8 +3774,10 @@ wait_for_rollout() {
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
 
   local rc=0
+  # ${ctx_flag[@]+...}: empty without a context, and macOS's bash 3.2 treats
+  # an empty array expansion as unbound under `set -u`.
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -3806,7 +3818,8 @@ wait_for_deployment_object() {
   fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
+  # ${ctx_flag[@]+...}: as in wait_for_rollout, for bash 3.2.
+  while ! kubectl get deployment "$deployment" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -5399,7 +5412,9 @@ gitlab_repo_path() {
   local seg lower n=0 segs=()
   IFS=/ read -r -a segs <<<"$repo"
   [[ "$repo" == */ ]] && return 0
-  for seg in "${segs[@]}"; do
+  # ${segs[@]+...}: `/` and `.git` leave no segment, and bash 3.2 treats an
+  # empty array expansion as unbound under `set -u`.
+  for seg in ${segs[@]+"${segs[@]}"}; do
     # The reserved endings in any case, as the operator compares them.
     lower="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
     if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$lower" == *.git ]] || [[ "$lower" == *.atom ]]; then
@@ -7351,15 +7366,16 @@ run_menu_system() {
         PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
-          # redrawn below would push the checklist off screen. Under next the
-          # A2A gateway answers the platform it holds; the agent, the rest.
+          # redrawn below would push the checklist off screen. The A2A gateway
+          # answers every enabled platform (the mode the helpers read is next
+          # after every apply).
           local menu_listeners="" menu_deployment
           if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
-            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled"; then
             menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
           fi
           if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
-            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled"; }; then
             menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
           fi
           echo ""
@@ -7908,13 +7924,13 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    # Under next with Chat off the A2A gateway takes Slack (the mode was
-    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
-    # it takes one bot token, member IDs and a channel id. Those prompts say
-    # so and ask again on an answer the gateway cannot use, rather than let
-    # the refusal after this step throw the interview away. A run with nobody
+    # The A2A gateway takes Slack, with Google Chat on or off, and it takes
+    # one bot token, member IDs and
+    # a channel id. Those prompts say so and ask again on an answer the
+    # gateway cannot use, rather than let the refusal after this step throw
+    # the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
-    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true; then
       _prompt_slack_settings_for_gateway
       return 0
     fi
@@ -7937,7 +7953,7 @@ main() {
       can_ask=false
     fi
     while :; do
-      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)" \
         slack_bot_token "$slack_bot_token" true "$bot_hint"
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
       if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
@@ -8022,12 +8038,16 @@ main() {
   # channel (#3320). An empty answer is allowed, after a warning and a yes:
   # true to keep the answer, false to ask again. $1 the key, $2 the answer,
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
-  # the warning before the apply and the closing summary say it then.
+  # the warning before the apply and the closing summary say it then. The
+  # warning names the other platform's home channel when it holds a value
+  # already: an answer (Google Chat is asked first), a flag or install.env.
   _confirm_no_home_channel() {
-    local home keep=""
+    local home keep="" set_platform
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
-    print_warning "$(next_home_channel_unset_message "$1")"
+    set_platform="$(next_home_channel_set_platform "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" \
+      "$slack_enabled" "$google_chat_enabled" "$slack_home_channel" "$google_chat_home_channel")"
+    print_warning "$(next_home_channel_unset_message "$1" "$set_platform")"
     prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
@@ -8125,7 +8145,6 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -8928,11 +8947,11 @@ main() {
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
   platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
-  # The bus's three third-party images are the operator's compiled defaults
+  # The bus's four third-party images are the operator's compiled defaults
   # (A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE in
   # images.json), which neither this installer nor the chart points at a
   # mirror, so a next install that mirrors its third-party images still pulls
-  # those three from Docker Hub.
+  # those four from Docker Hub.
   if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
     print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's four images (nats, nats-box, nats-server-config-reloader, prometheus-nats-exporter) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
     print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE name the mirrored copies (images.json lists all four)."

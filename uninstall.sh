@@ -705,7 +705,10 @@ main() {
     fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
-    exec bash "${repo_dir}/uninstall.sh" "${dispatch_args[@]}"
+    # ${dispatch_args[@]+...}: empty on an interactive run that forwards no
+    # coordinates, and bash 3.2 (macOS's /bin/bash) treats an empty array
+    # expansion as unbound under `set -u`.
+    exec bash "${repo_dir}/uninstall.sh" ${dispatch_args[@]+"${dispatch_args[@]}"}
   elif [ -f "${script_dir}/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
     repo_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
@@ -978,6 +981,18 @@ main() {
   # install.env by hand: the composition refuses either one in the wrong shape,
   # and a destroy has no use for them, since both only steer adoption.
   export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
+  # The minter's KSA name, for the same reason: the composition validates its
+  # shape (DNS-1123), an operator may set it in install.env by hand, and a
+  # destroy has no use for it. Blank, the generator writes the default name,
+  # which passes; terraform destroys what is in state either way.
+  export GITHUB_MINTER_KSA_NAME=""
+  # The agent's KSA name, for the same reason: the composition validates its
+  # shape (DNS-1123 label ending in -agent), and an operator sets it in
+  # install.env as TF_VAR_agent_ksa_name. Unset rather than blanked because the
+  # generator writes no agent_ksa_name and an empty TF_VAR_ fails both
+  # validations; unset, the variable's default passes and terraform destroys
+  # what is in state either way.
+  unset TF_VAR_agent_ksa_name
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

@@ -294,6 +294,19 @@ type TaskRef struct {
 	// runs at its tier, and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
+	// Scope is a profile task's scope, recorded at mint: its target's
+	// cluster path, or the install's namespace scope for a task with no
+	// target. Never empty on a profile task this gateway minted, so an
+	// empty one on a profile parent means the scope and chain weren't
+	// recorded, and its delegation is refused (#5686).
+	Scope string `json:"scope,omitempty"`
+	// ProfileChain is the profiles of the waiting profile tasks above a
+	// profile task, nearest last, recorded at mint. A top submission, and
+	// a profile task delegated from a session turn or a wake, heads its
+	// chain and has none: neither a session nor a wake's ended child is a
+	// profile task waiting open. Carried rather than walked, because the
+	// bounded history can evict an ancestor and a walk would then miss it.
+	ProfileChain []string `json:"profileChain,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -346,15 +359,20 @@ type TaskRef struct {
 	// wake turn is started on the child's terminal and names the child. Depth
 	// counts delegations: a child's is its parent's plus one, a wake inherits
 	// its child's, and a turn at the bound may not delegate again. Children
-	// is a slice although one child runs at a time, so fan-out is one
-	// condition later rather than a record migration. Role, ParentTaskID and
+	// holds every child the turn's request minted: one, or each of a batch
+	// (mintBatch). Role, ParentTaskID and
 	// Depth are empty on a human turn, and Children is empty on one that did
 	// not delegate; all four are empty on entries written before they
 	// existed.
 	// StatusMsgID is the rolling-line message of a turn that delegated:
 	// the child takes ActiveTask, and with it the only other copy, so the
-	// parent's line is kept here to close on the parent's terminal.
-	StatusMsgID  string   `json:"statusMsgId,omitempty"`
+	// parent's line is kept here to close on the parent's terminal. A batch
+	// child, which never takes ActiveTask, keeps its own line here too.
+	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
+	// with its line because the child never holds the active task, whose
+	// LineNote the single-child path reads.
+	LineNote     string   `json:"lineNote,omitempty"`
 	Role         string   `json:"role,omitempty"`
 	ParentTaskID string   `json:"parentTaskId,omitempty"`
 	Children     []string `json:"children,omitempty"`

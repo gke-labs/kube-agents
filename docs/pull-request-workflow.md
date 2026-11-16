@@ -130,6 +130,13 @@ place, and the comment above the target says why. In a mirrored `gke-*` skill, m
 place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
 fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
+**A new or changed test.** Run it through `scripts/dev/repeat_under_load.sh -- <test command>`.
+By default it runs the command ten times pinned to four cores (fewer on a smaller machine, and
+unpinned where `taskset` is missing or cannot bind them, which the line then says), with three busy
+loops per core on the same cores; `-n`, `-c` and `-l` change those. It keeps each run's output and
+prints the line the Testing section carries. A failure in any run blocks the push. The rule is in
+`.agents/rules/pre_pr_review.md`, "Repeat a new or changed test".
+
 **Agent blueprints.** If you add a `kubectl get` to a `.py`, `.sh` or `.md` under `agents/`, run
 `make cluster-reads-check`. It fails a read of several kinds, or of one kind in one page, across
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
@@ -236,8 +243,9 @@ ensure compilation succeeds.
 
 **A2A module code.** If you modify `a2a/`, run `make gosec` from the repository root (it scans every
 module; the CI step scans `a2a/` alone, with the same binary built from `k8s-operator/go.mod`'s
-pin), then `go vet ./...` and `go test -race ./...` inside that directory — what the
-`A2A Module Tests` CI job runs for this module. The conformance suite starts an embedded
+pin), then `go vet ./...` and `go test -race -timeout 20m ./...` inside that directory — what the
+`A2A Module Tests` CI job runs for this module (the gateway package alone takes close to go test's
+default 10 minutes under `-race`). The conformance suite starts an embedded
 JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
 envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
 and the run still reports green. To match it, run with
@@ -254,11 +262,13 @@ bases against their Dockerfile `ARG` defaults; the Go builder pin against the `g
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
 worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
-rather than a literal. Two copies it does not reach, where a stale pin passes every check:
+rather than a literal. Copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in
-`charts/kube-agents/values.yaml` are unguarded; and cert-manager's version is set again in
-`terraform/examples/full-install/variables.tf`, which no check reads. So: bump the pin in
+`charts/kube-agents/values.yaml` are unguarded; cert-manager's version is set again in
+`terraform/examples/full-install/variables.tf`, which no check reads; and the example
+fluent-bit tags in `INSTALL.md` and the commented example in
+`k8s-operator/config/manager/manager.yaml` are prose. So: bump the pin in
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
@@ -278,7 +288,9 @@ alert closing: a pull-request run reports changed lines only, and an absent anno
 evidence. To show an alert closing, or to see one before the pull request opens, reproduce it
 locally: install the CLI as a `gh` extension, pin it to the version the alert's `tool.version`
 reports, and build a database once before the change and once after. For Python the database is
-over a scratch tree holding the flagged file at its repository path. For Go it is over the module
+over a scratch tree holding the flagged file at its repository path, or over the whole tree when the
+alert's source is in another file (a `py/polynomial-redos` alert's user-provided value can be): the
+flagged file alone then reports nothing. For Go it is over the module
 that holds the file, because a Go database is built rather than read, and the build is named rather
 than left to the autobuilder, which runs whatever build file its source root holds (from the
 repository root, `make`, whose default target is the platform image's Docker build; it fails
@@ -287,7 +299,8 @@ fast on a runner where the image tag is empty and runs for real where it is not)
 ```bash
 gh extension install github/gh-codeql
 gh codeql set-version 2.27.3 # the alert's tool.version
-# Python: the flagged file alone, at its repository path under /tmp/cq/tree
+# Python: the flagged file alone, at its repository path under /tmp/cq/tree,
+# or --source-root . from the repository root when the source is in another file
 gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
 gh codeql database analyze /tmp/cq/db \
   codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
@@ -867,7 +880,10 @@ only the pull request's own runs: a head commit that is also a commit on `main` 
 carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
 under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
 of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
-re-run. GitHub's own re-run button needs Write access, which most
+re-run. A run still `queued` an hour after it started, which is what a run GitHub lost during an
+Actions incident looks like, is cancelled (force-cancelled if a cancel does not take) and re-run
+whole; when a newer run of its workflow on the pull request carries its checks, it is cancelled
+and not re-run. That clears the checks without the push that would restart the smoke test. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

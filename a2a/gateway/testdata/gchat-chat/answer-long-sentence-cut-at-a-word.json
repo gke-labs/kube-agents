@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*platform is currently running the live cluster count and will post the result here when it finishes…*\n\n…(its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP projects in scope).",
+    "widgets": null
+  }
+]

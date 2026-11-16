@@ -46,7 +46,8 @@ replies short", "Write replies as warm, full sentences that lead with the fact")
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 ("Short by default") and §7. The
 layout is `answer_message` in `agents/platform/scripts/chat_message.py` and its port `answerChat`
 in `a2a/hermes-bridge/chat.go`: the first sentence becomes `headline`, cut at a clause to stay
-within 150 characters and rendered bold, and a rest too long for `detail` goes under `fold`.
+within 150 characters, or at a word with an ellipsis the detail then opens with when no clause
+fits, and rendered bold, and a rest too long for `detail` goes under `fold`.
 
 ## The acknowledgement names its target
 
@@ -58,7 +59,8 @@ Why: the ack is status, and a specific target is what tells the user they were u
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 4 is the rule. The arrival
 reaction is the receipt before any model call: `arrival_reaction` in `slack_presenter.py`, ported
-as `askKind` in `a2a/hermes-bridge/chat.go`.
+as `askkind.Kind` in `a2a/lib/askkind`, which the A2A gateway draws when it accepts the ask and
+the hermes-bridge's heartbeats mark with.
 
 ## One live status line, updated in place
 

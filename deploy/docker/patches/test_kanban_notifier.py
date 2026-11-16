@@ -50,6 +50,7 @@ from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
     COMPLETION_HEAD,
     chat_ux_on,
+    gateway_serves,
     DEFAULT_WAKE_KINDS,
     EXPLAINED_KINDS,
     HELD_ATTR,
@@ -1690,6 +1691,15 @@ class CompletionTextTest(unittest.TestCase):
             and node.targets[0].id in ("NOTIFY_PLATFORM_ENV", "NOTIFY_CONVERSATIONS_ENV")
         }
         self.assertEqual(kanban_notifier_envs(), (names["NOTIFY_PLATFORM_ENV"], names["NOTIFY_CONVERSATIONS_ENV"]))
+
+    def test_the_gateway_serves_every_platform_a_list_names(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertTrue(gateway_serves("google_chat"))
+            self.assertTrue(gateway_serves("slack"))
+            self.assertFalse(gateway_serves("discord"))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": "slack, google_chat"}):
+            self.assertTrue(gateway_serves("google_chat"))
+            self.assertTrue(gateway_serves("slack"))
 
     def test_chat_ux_is_on_for_google_chat_only_where_the_gateway_serves_it(self):
         # Under spec.mode: next the gateway lays chat messages out on Google Chat, so the

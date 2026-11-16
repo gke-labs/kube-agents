@@ -70,8 +70,8 @@
 # audit_streams: a fleet-wide question with a stale or missing report is a full
 # run, and on an install with a GitOps repository a full run files the stream's
 # ledger issue through `start` and `finish`, so the runner holds the stream's lock
-# for the unit and the stage's own run on the same stream (oobe-first-run-audits)
-# cannot land beside it.
+# for the unit, and first waits out a run of the stream the install started for
+# itself (wait_platform_runs), the first-run stage's included.
 #
 # Isolation class: read-only against the fleet (the collector reads with gcloud
 # container and kubectl get and writes only its own store on the shell volume); a

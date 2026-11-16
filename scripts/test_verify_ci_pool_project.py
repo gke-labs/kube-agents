@@ -24,6 +24,29 @@ from unittest import mock
 
 import verify_ci_pool_project as checker
 
+# The repository root, for `tests.testing`: a direct run has only this directory on the path.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tests.testing import no_live_gcloud  # noqa: E402
+
+
+def setUpModule():
+    # No test here runs the real gcloud: a gcloud call that a test leaves
+    # unstubbed goes to a stand-in, and the stand-in fails the module.
+    global _NO_GCLOUD
+    _NO_GCLOUD = no_live_gcloud.install()
+
+
+def tearDownModule():
+    _NO_GCLOUD.uninstall()
+
+
+class TestNoLiveGcloud(unittest.TestCase):
+    def test_no_test_in_this_module_can_run_the_real_gcloud(self):
+        no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
+
 
 def _ok(stdout: str):
     return (0, stdout, "")
@@ -3436,7 +3459,7 @@ class LedgerTokenMintTest(unittest.TestCase):
 
     def test_a_refused_permission_fails_because_the_eval_preflight_would(self):
         # The pinned body makes 422 possible: the installation no longer holds
-        # one of the three reads. hack/ci-eval-pr.sh sends the same body at
+        # one of the four reads. hack/ci-eval-pr.sh sends the same body at
         # preflight and exits on this answer, so it is a pool-wide failure,
         # not an "unknown" to re-run later.
         token, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
@@ -4495,13 +4518,54 @@ FLEET_RESOURCE_ROLES = {
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
     # get-server-config` and `clusters describe` as the reconciler.
     "external": {"roles/container.admin"},
-    "google_client_config": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
 FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
 # Needed by every google_* call regardless of type.
 FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetKubernetesProvidersUseExecAuthTest(unittest.TestCase):
+    """Every `provider "kubernetes"` block in the fleet stack authenticates
+    through gke-gcloud-auth-plugin on each call and carries no `token`.
+
+    hack/fleet_reconcile.py saves the plan and applies it, so a token read at
+    plan time travels inside the plan and is dead an hour later; a project
+    whose node pools roll before its in-cluster fixtures then fails every
+    Kubernetes write with Unauthorized. Read through the HCL tokenizer the
+    next class loads, so a commented-out `exec` or a brace inside a comment
+    is read as HCL reads it.
+    """
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    _PLUGIN = "gke-gcloud-auth-plugin"
+    _PROVIDER_BLOCK, _PROVIDER_LABELS, _KUBERNETES = "provider", 1, "kubernetes"
+    _TOKEN_ATTRIBUTE, _EXEC_BLOCK = "token", "exec"
+    _API_VERSION_ATTRIBUTE, _COMMAND_ATTRIBUTE = "api_version", "command"
+
+    @classmethod
+    def _kubernetes_providers(cls, fleet):
+        """(file name, attributes, [exec block attributes]) per kubernetes provider."""
+        hcl, providers = FleetResourceTypesAreCoveredByReconcilerRolesTest._tokenizer(), []
+        for path in sorted(fleet.glob("*.tf")):
+            for labels, body in hcl._blocks(hcl._tokens(path.read_text()), cls._PROVIDER_BLOCK, cls._PROVIDER_LABELS):
+                if labels[0] == cls._KUBERNETES:
+                    execs = [hcl._attributes(block) for block in hcl._nested_blocks(body, cls._EXEC_BLOCK)]
+                    providers.append((path.name, hcl._attributes(body), execs))
+        return providers
+
+    def test_every_kubernetes_provider_runs_the_plugin_and_bakes_no_token(self):
+        providers = self._kubernetes_providers(self._FLEET)
+        self.assertTrue(providers, 'no provider "kubernetes" block under %s' % self._FLEET)
+        for name, attributes, execs in providers:
+            with self.subTest(file=name):
+                self.assertNotIn(self._TOKEN_ATTRIBUTE, attributes, "%s: a kubernetes provider reads a token at plan time" % name)
+                self.assertEqual(len(execs), 1, "%s: a kubernetes provider without one exec block" % name)
+                self.assertIn(self._API_VERSION_ATTRIBUTE, execs[0], "%s: the exec block sets no api_version" % name)
+                command = execs[0].get(self._COMMAND_ATTRIBUTE)
+                self.assertIsNotNone(command, "%s: the exec block sets no command" % name)
+                self.assertEqual(command[1].strip('"'), self._PLUGIN, "%s: the exec command is not the plugin" % name)
 
 
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
@@ -5065,6 +5129,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         # IAM, Artifact Registry and the warm-cache readers all need the
@@ -5266,6 +5331,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):

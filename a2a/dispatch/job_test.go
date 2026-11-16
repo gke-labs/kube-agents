@@ -575,16 +575,25 @@ func TestAnUnsentJobOfferKeepsTheTaskQueued(t *testing.T) {
 	}
 }
 
-// A Job the admission policy refuses is reported in Health (and logged as an
-// error naming the upstream param-cache bug), the task stays queued, and the
-// report clears once a Job is admitted.
+// A Job the admission policy refuses, or one whose template param isn't the
+// rendering the config names, is reported in Health (and logged as an error),
+// the task stays queued, and the report clears once a Job is admitted.
 func TestAJobRefusedByThePolicyIsReported(t *testing.T) {
+	for name, launchErr := range map[string]error{
+		"policy":      fmt.Errorf("%w: forbidden by kube-agents-a2a-dispatcher-job", ErrJobRefusedByPolicy),
+		"stale param": fmt.Errorf("%w: profile inv's param holds rendering \"b\", the config names \"a\"", ErrJobTemplateNotCurrent),
+	} {
+		t.Run(name, func(t *testing.T) { jobRefusalIsReported(t, launchErr) })
+	}
+}
+
+func jobRefusalIsReported(t *testing.T, launchErr error) {
 	b := newBus(t, "job-task-1")
 	b.ensure("inv", 1, 0, "unattended")
 	b.worker("inv", "unattended", "job-task-1", answerAccept, 300*time.Millisecond)
 	jobs := newFakeJobs(0)
 	jobs.mu.Lock()
-	jobs.launchErr = fmt.Errorf("%w: forbidden by kube-agents-a2a-dispatcher-job", ErrJobRefusedByPolicy)
+	jobs.launchErr = launchErr
 	jobs.mu.Unlock()
 	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, nil), &fakeVerifier{}, jobs)
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")

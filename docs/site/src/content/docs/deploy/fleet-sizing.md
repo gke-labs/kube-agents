@@ -39,8 +39,8 @@ agent reads.
 
 ## What each pod needs
 
-The table is the `today` component stack with the GitHub minter on, the web console off and
-Hindsight off. The default column is declared. The fleet column is what
+The table is the component stack without the A2A stack, with the GitHub minter on, the web
+console off and Hindsight off. The default column is declared. The fleet column is what
 [`values-fleet.yaml`](#the-fleet-values-file) sets, plus the one field it cannot, and is modeled.
 CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
 declared column from the two files and fails when the page falls behind them.
@@ -54,7 +54,7 @@ declared column from the two files and fails when the page falls behind them.
 | Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **222 GiB default, 322 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -83,12 +83,12 @@ runtime unless
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
 
-Two optional stacks add to the total:
+Two more stacks add to the total:
 
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
   at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: the A2A stack's standing pods, a container in the agent pod and a
+- **The A2A stack**, on every install: its standing pods, a container in the agent pod and a
   JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
   once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
   gives the totals and each pod's requests and limits, generated from the chart.
@@ -119,7 +119,7 @@ table above means there:
   proxy's 8 GiB is the largest declared; raising `limits.ephemeral-storage` past 10 GiB leaves
   the pod unschedulable.
 
-Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 202 GiB of `pd-balanced`
+Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 322 GiB of `pd-balanced`
 (modeled, without bursting). At `us-central1` list prices that is about $400 to $500 a month
 including the cluster fee; modeled, so check the pricing calculator against your region.
 
@@ -155,10 +155,10 @@ request (`e2-standard-8` or larger) before the count reaches 25. The `medium` ro
 fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
 the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
 
-| Pool             | Shape (modeled)                                                                            | Carries                                                               |
-| ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack                    |
-| gVisor (sandbox) | 1 × `n2-standard-4`, 150 GB boot disk, autoscale 1 to 2; `n2-standard-8` for `mode: next`  | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
+| Pool             | Shape (modeled)                                                                                                                                         | Carries                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4                                                              | proxy, operator, LiteLLM, minter, the A2A stack                       |
+| gVisor (sandbox) | 1 × `n2-standard-4` from the profile, 150 GB boot disk, autoscale 1 to 2; the A2A gateway pod needs `n2-standard-8`, so set `gvisor_machine_type` to it | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
 
 Create the gVisor pool with `--sandbox type=gvisor`, so it carries the taint only the sandboxed
 pods tolerate. The boot disk sizes are modeled: the measured fleet's evictions were disk
@@ -233,10 +233,11 @@ caveat beside it:
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it. Process tunables such
-as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
-allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
-`kubectl` run, and an agent container that does not. The example leaves them out. The
+containers. The name in the example reaches the container that reads it. A process tunable such
+as `MALLOC_ARENA_MAX` is not on the agent container's allowlist: a values file that sets it
+renders a proxy pod that carries it, where `gcloud` and `kubectl` run, and an agent container
+that does not. The example leaves it out. Setting `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` has no
+effect on `gcloud`: the credential proxy does not pass the pod's value to its commands. The
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#sizing-for-a-fleet-examplesvalues-fleetyaml)
 has the chart-side detail.
 

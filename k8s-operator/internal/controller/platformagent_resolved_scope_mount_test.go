@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 )
 
 func resolvedScopeVolume(vols []corev1.Volume) *corev1.Volume {
@@ -16,12 +15,11 @@ func resolvedScopeVolume(vols []corev1.Volume) *corev1.Volume {
 	return nil
 }
 
-// Under mode next the agent container reads the scope publisher's resolved
-// scope (#5621): the <agent>-resolved-scope ConfigMap, mounted read-only as
+// The agent container reads the scope publisher's resolved scope (#5621): the <agent>-resolved-scope ConfigMap, mounted read-only as
 // a directory (no subPath, so the kubelet updates it in place), optional
 // (the publisher may not have written it yet), and named by an env var the
 // managed .env pins, so the agent can't point its scripts at a file it wrote.
-func TestTheAgentReadsTheResolvedScopeUnderModeNext(t *testing.T) {
+func TestTheAgentReadsTheResolvedScope(t *testing.T) {
 	agent := a2aTestAgent()
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	vol := resolvedScopeVolume(dep.Spec.Template.Spec.Volumes)
@@ -56,30 +54,6 @@ func TestTheAgentReadsTheResolvedScopeUnderModeNext(t *testing.T) {
 	}
 	if got, ok := managedEnvValue(renderManagedEnv(agent), resolvedScopeFileEnvKey); !ok || got != want {
 		t.Errorf("the managed .env pins %s = %q (set %v), want %q", resolvedScopeFileEnvKey, got, ok, want)
-	}
-}
-
-// A today install has no scope publisher, so nothing about the resolved
-// scope renders.
-func TestATodayInstallGetsNoResolvedScope(t *testing.T) {
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if resolvedScopeVolume(dep.Spec.Template.Spec.Volumes) != nil {
-		t.Error("a today install mounts the resolved scope")
-	}
-	gateway := containerNamed(t, dep, "platform-agent")
-	for _, m := range gateway.VolumeMounts {
-		if m.Name == resolvedScopeVolumeName || m.MountPath == resolvedScopeDir {
-			t.Errorf("a today install mounts %+v", m)
-		}
-	}
-	if got, ok := envValue(gateway, resolvedScopeFileEnvKey); !ok || got != "" {
-		t.Errorf("a today install's container env has %s = %q (set %v); want it empty, as the managed .env pins it", resolvedScopeFileEnvKey, got, ok)
-	}
-	// Pinned empty, not left out: an absent key is one the agent may write.
-	if got, ok := managedEnvValue(renderManagedEnv(agent), resolvedScopeFileEnvKey); !ok || got != "" {
-		t.Errorf("a today install pins %s = %q (set %v); want it pinned empty", resolvedScopeFileEnvKey, got, ok)
 	}
 }
 

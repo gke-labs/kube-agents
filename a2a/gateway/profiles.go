@@ -67,6 +67,19 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// The profile parent's chain and scope refusals (#5686). The chain and
+	// scope named are the parent's own.
+	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"
+	noticeOutsideParentScope   = "%s is outside this task's %s; it delegates only within that cluster"
+	noticeChildWiderThanParent = "a task with no target cluster is wider than this task's %s; name a cluster inside it"
+	noticeParentScopeUnknown   = "this task started before its delegations were checked, so it can't delegate; ask again to start a new task"
+	noticeParentChainMismatch  = "this task's delegation history can't be verified, so it can't delegate; ask again to start a new task"
+	// noticeParentScopeStale: the parent's scope is neither a cluster nor this
+	// install's, as when the install's namespace changed under an open task.
+	noticeParentScopeStale = "this task's scope no longer matches this install, so it can't delegate; ask again to start a new task"
+	noticeUnattendedParent = "a task a trigger started can't delegate; ask in chat instead"
+	// noticeChainSeparator joins a chain's profiles in noticeProfileCycle.
+	noticeChainSeparator = " → "
 	// noticePlatformTakesNoParameters: platform takes its target from the text.
 	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
