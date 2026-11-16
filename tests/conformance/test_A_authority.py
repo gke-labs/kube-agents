@@ -587,6 +587,70 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
 
+    def test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist(self) -> None:
+        # The read rule for the audit-report store (#5619), with stand-in
+        # claims: the shell reads every stream, a profile task reads with a
+        # profile on the reports allowlist, and nothing else reads.
+        cp = h.credential_proxy
+        allowlist = frozenset({"fleet-audit", "platform"})
+        read = cp.report_read_permitted
+        self.assertIsNone(read(cp.CALLER_ROLE_SHELL, None, frozenset()))
+        self.assertIsNone(read(cp.CALLER_ROLE_PROFILE, "fleet-audit", allowlist))
+        for name, rule in (
+            ("a profile outside the allowlist", read(cp.CALLER_ROLE_PROFILE, "auditor", allowlist)),
+            ("an empty allowlist", read(cp.CALLER_ROLE_PROFILE, "fleet-audit", frozenset())),
+            ("no task credential", read(cp.CALLER_ROLE_PROFILE, None, allowlist)),
+            # With an allowlisted profile, so only the role check can refuse.
+            ("a caller with no role", read("", "fleet-audit", allowlist)),
+            ("another role", read(cp.CALLER_ROLE_CHAT, "fleet-audit", allowlist)),
+        ):
+            with self.subTest(name):
+                self.assertIsNotNone(rule)
+
+    def test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod(self) -> None:
+        # The store's handler relays a request only when its method and path
+        # are one of REPORT_CREDENTIAL_ROUTES whole, for every caller, the
+        # shell (which reads every stream) included; and an exec pod, which
+        # holds no store token, serves none of them.
+        cp = h.credential_proxy
+        relayed: list = []
+
+        class Store:
+            def relay(self, method, path, body):
+                relayed.append((method, path))
+                return 200, b"{}"
+
+        def handle(method: str, path: str) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_SHELL)
+            handler.report_store = Store()
+            handler.report_profiles = frozenset()
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        stream = "/v1/audit-reports/compliance-audit/acme%2Fgitops"
+        for method, path in (
+            ("GET", "/v1/audit-reports/"),
+            ("GET", stream),
+            ("GET", f"{stream}/latest?all=1"),
+            ("GET", "/v1/audit-reports/compliance-audit/%2e%2e/latest"),
+            ("GET", "/v1/audit-reports/compliance-audit/acme%2F..%2Fother/latest"),
+            ("GET", f"{stream}/runs/../latest"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertEqual([404], handle(method, path))
+        self.assertEqual([], relayed)
+        self.assertEqual([200], handle("GET", f"{stream}/latest"))
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            path = "/v1/audit-reports" if pattern.pattern == "/v1/audit-reports" else f"{stream}/latest"
+            with self.subTest(exec_pod=method):
+                self.assertFalse(cp.exec_pod_serves(method, path))
+                self.assertFalse(cp.exec_pod_serves(method, f"{stream}/runs/20261113T120000.123456Z"))
+
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
         # only the servers whose tools name no cluster: Developer Knowledge's

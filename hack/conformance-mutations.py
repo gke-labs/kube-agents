@@ -174,6 +174,54 @@ MUTATIONS: list[Mutation] = [
         "its schedule never publishes to",
     ),
     Mutation(
+        "A3-report-read-any-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role != CALLER_ROLE_PROFILE:\n        return RULE_REPORT_ROLE\n",
+         "    if False:\n        return RULE_REPORT_ROLE\n"),
+        "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
+        "read the store for any role holding an allowlisted profile name, since "
+        "only the shell and profile reach the route -- until a role table edit "
+        "hands the session pods every audit's findings",
+    ),
+    Mutation(
+        "A3-report-read-any-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if not _report_profile_permitted(profile, allowlist):\n        return RULE_REPORT_PROFILE\n    return None\n",
+         "    if False:\n        return RULE_REPORT_PROFILE\n    return None\n"),
+        "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
+        "let any profile task read the store, since reads change nothing -- every "
+        "profile's model output then reads the fleet's audit findings",
+    ),
+    Mutation(
+        "A3-report-trigger-any-name",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            or getattr(trigger, \"name\", None) != f\"{REPORT_TRIGGER_SCHEDULE_SOURCE}/{stream}\"\n",
+         ""),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "trust the stream alone, since the verifier pins the name -- until a "
+        "verifier change lets a collector trigger carry a stream and write an "
+        "audit's baseline",
+    ),
+    Mutation(
+        "A3-report-route-shape-gate",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not report_credential_permits(method, path):\n            self._log_audit_report(HTTPStatus.NOT_FOUND, \"no-such-route\")\n",
+         "        if False:\n            self._log_audit_report(HTTPStatus.NOT_FOUND, \"no-such-route\")\n"),
+        "test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod",
+        "relay any path under the prefix, since the listener validates its own "
+        "routes -- the broker's rule then reads segments of a path it never "
+        "matched, and an escaped traversal reaches the listener as the shell's",
+    ),
+    Mutation(
+        "A3-exec-pod-serves-the-store",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if is_audit_report_path(path):\n        return False\n",
+         "    if is_audit_report_path(path):\n        return True\n"),
+        "test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod",
+        "serve the store from the exec tier too, to spread the load -- an exec "
+        "pod has no store token, and its pods' tokens are not the broker's",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",
