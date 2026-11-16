@@ -101,7 +101,7 @@
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/persona-tse",
       "tagPolicy": "release",
-      "pulledBy": "The worker pods of the tse AgentProfile under spec.mode: next, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "pulledBy": "The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
       "description": "The GKE Support Agent's persona (agents/tse/persona) as a persona image (a2a/Dockerfile.persona-tse): the manifest, instructions, MCP servers and skill under /files, on busybox for the staging copy."
     },
     {
