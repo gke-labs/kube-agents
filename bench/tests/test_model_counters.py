@@ -17,11 +17,21 @@ class AgainstSessionsTest(unittest.TestCase):
 
 class RequestsTest(unittest.TestCase):
     def test_callers_are_named_by_the_project_accounts(self):
-        series = [{"resource": {"labels": {"credential_id": "serviceaccount:111"}}, "points": [{"value": {"int64Value": "5"}}]},
-                  {"resource": {"labels": {"credential_id": "serviceaccount:999"}}, "points": [{"value": {"int64Value": "2"}}]}]
+        minute = {"interval": {"endTime": "1970-01-01T00:01:00Z"}}
+        series = [{"resource": {"labels": {"credential_id": "serviceaccount:111"}},
+                   "points": [{**minute, "value": {"int64Value": "5"}}]},
+                  {"resource": {"labels": {"credential_id": "serviceaccount:999"}},
+                   "points": [{**minute, "value": {"int64Value": "2"}}]}]
         with mock.patch.object(mc, "_query", return_value=series), \
                 mock.patch.object(mc, "service_accounts", return_value={"111": "gw@p.iam.gserviceaccount.com"}):
             self.assertEqual(mc.requests_by_account("p", 0, 60), {"gw@p.iam.gserviceaccount.com": 5, "999": 2})
+
+
+class WindowTest(unittest.TestCase):
+    def test_only_minutes_that_end_inside_the_period_count(self):
+        series = {"points": [{"interval": {"endTime": t}, "value": {"int64Value": "10"}}
+                             for t in ("1970-01-01T00:00:00Z", "1970-01-01T00:01:00Z", "1970-01-01T00:02:00Z")]}
+        self.assertEqual(mc._total(series, 0, 120), 20)
 
 
 if __name__ == "__main__":

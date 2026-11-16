@@ -23,6 +23,9 @@ REQUEST_METRIC = "serviceruntime.googleapis.com/api/request_count"
 VERTEX_SERVICE = "aiplatform.googleapis.com"
 SERVICE_ACCOUNT_PREFIX = "serviceaccount:"
 TIMEOUT_SECONDS = 120
+# Points a minute apart, each kept when its minute ends inside the period: one point spanning the
+# whole period is aligned by Monitoring to its own boundaries and takes in time outside it.
+ALIGNMENT_SECONDS = 60
 
 
 def _rfc3339(ts: float) -> str:
@@ -33,7 +36,7 @@ def _query(project: str, flt: str, start: float, end: float, group: list[str]) -
     """One sum over [start, end), grouped; application-default credentials, as collect.py reads."""
     token = kube.run([kube.GCLOUD, "auth", "application-default", "print-access-token"]).strip()
     params = {"filter": flt, "interval.startTime": _rfc3339(start), "interval.endTime": _rfc3339(end),
-              "aggregation.alignmentPeriod": f"{max(1, int(end - start))}s",
+              "aggregation.alignmentPeriod": f"{ALIGNMENT_SECONDS}s",
               "aggregation.perSeriesAligner": "ALIGN_SUM", "aggregation.crossSeriesReducer": "REDUCE_SUM",
               "aggregation.groupByFields": group}
     base = collect.MONITORING_URL.format(project=project)
@@ -49,8 +52,14 @@ def _query(project: str, flt: str, start: float, end: float, group: list[str]) -
     return series
 
 
-def _total(series: dict[str, Any]) -> float:
-    return sum(float(p["value"].get("int64Value") or p["value"].get("doubleValue") or 0) for p in series["points"])
+def _total(series: dict[str, Any], start: float = float("-inf"), end: float = float("inf")) -> float:
+    """The series' sum over the points whose minute ends inside (start, end]."""
+    total = 0.0
+    for p in series["points"]:
+        ends = datetime.fromisoformat(p["interval"]["endTime"].replace("Z", "+00:00")).timestamp()
+        if start < ends <= end:
+            total += float(p["value"].get("int64Value") or p["value"].get("doubleValue") or 0)
+    return total
 
 
 def vertex_tokens(project: str, start: float, end: float) -> dict[str, dict[str, int]]:
@@ -59,7 +68,7 @@ def vertex_tokens(project: str, start: float, end: float) -> dict[str, dict[str,
     for s in _query(project, f'metric.type="{TOKEN_METRIC}"', start, end,
                     ["metric.label.type", "resource.label.model_user_id"]):
         model = s["resource"]["labels"].get("model_user_id", "")
-        out.setdefault(model, {"input": 0, "output": 0})[s["metric"]["labels"]["type"]] = int(_total(s))
+        out.setdefault(model, {"input": 0, "output": 0})[s["metric"]["labels"]["type"]] = int(_total(s, start, end))
     return out
 
 
@@ -78,7 +87,7 @@ def requests_by_account(project: str, start: float, end: float) -> dict[str, int
     out: dict[str, int] = {}
     for s in _query(project, flt, start, end, ["resource.label.credential_id"]):
         caller = s["resource"]["labels"].get("credential_id", "").removeprefix(SERVICE_ACCOUNT_PREFIX)
-        out[names.get(caller, caller)] = out.get(names.get(caller, caller), 0) + int(_total(s))
+        out[names.get(caller, caller)] = out.get(names.get(caller, caller), 0) + int(_total(s, start, end))
     return out
 
 
