@@ -396,6 +396,11 @@ type Gateway struct {
 	// case preserved: Slack member ids compare exactly).
 	slackAllowed  map[string]bool
 	slackAllowAll bool
+	// teamsAllowed and teamsAllowAll gate the teams backend's identity the
+	// way gchatAllowed does Chat's: the Entra object id is the principal,
+	// compared lowercased, and the allowlist is the whole verification config.
+	teamsAllowed  map[string]bool
+	teamsAllowAll bool
 	// a2aGoogleAllowed gates the A2A door's Google-verified callers
 	// (Config.A2ADoorAllowedUsers, lowercased at build). Empty admits
 	// nobody; there is no allow-all.
@@ -590,6 +595,15 @@ func New(o Options) (*Gateway, error) {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
 		}
 	}
+	teamsAllowed := map[string]bool{}
+	for _, u := range o.Config.TeamsAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			teamsAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if o.Config.TeamsRelayURL != "" && len(teamsAllowed) == 0 && !o.Config.TeamsAllowAllUsers {
+		log.Warn("teams allowlist is empty and allow-all is off; every inbound Teams message will be dropped at verification")
+	}
 	slackAllowed := map[string]bool{}
 	for _, u := range o.Config.SlackAllowedUsers {
 		if u = strings.TrimSpace(u); u != "" {
@@ -666,6 +680,8 @@ func New(o Options) (*Gateway, error) {
 		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
+		teamsAllowed:     teamsAllowed,
+		teamsAllowAll:    o.Config.TeamsAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		a2aEntraAllowed:  a2aEntraAllowed,
 		droppedNotices:   map[string]bool{},
@@ -2741,6 +2757,11 @@ func conversationIsOwnThread(backend, conversation string) bool {
 	case slackBackend:
 		_, threadTS, ok := slackChannelThread(conversation)
 		return ok && threadTS != ""
+	case teamsBackend:
+		// A channel thread carries its ;messageid= suffix; a personal chat is
+		// one thread by itself. A bare channel id names the whole channel.
+		id, ok := strings.CutPrefix(conversation, teamsKeyPrefix)
+		return ok && (strings.Contains(id, teamsThreadToken) || strings.HasPrefix(id, teamsPersonalConversationPrefix))
 	}
 	return false
 }

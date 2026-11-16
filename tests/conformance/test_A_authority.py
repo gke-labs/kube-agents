@@ -2130,6 +2130,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_TEAMS_PROBE = "chat.notify.teams"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
@@ -2150,6 +2151,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         for probe, want in (
             (self.NOTIFY_PROBE, ["agent"]),
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_TEAMS_PROBE, ["agent"]),
             (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):

@@ -463,10 +463,10 @@ with the reply; a reply while the turn is still running is steered into it and c
 `replyTo`, since the report is attached on an opening turn only); then by the thread the
 conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
 `gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
-conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
-Chat gateway conversation. A console reply that names no task takes only the last,
+conversation key, which is how the notifier keys a card's report it posted into a Slack, Google
+Chat or Teams gateway conversation. A console reply that names no task takes only the last,
 `(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
-whole DM or space rather than a thread is not looked up at all, since every later message there
+whole DM or space rather than a thread (a Teams personal or group chat among them) is not looked up at all, since every later message there
 shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with

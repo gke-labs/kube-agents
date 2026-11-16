@@ -392,6 +392,12 @@ func TestIncidentAddresses(t *testing.T) {
 		{"slack:dm/D123/1712.0001", "", []incidentAddress{{"a2a-x", "slack:dm/D123/1712.0001"}}},
 		{"gchat:dm/spaces/DDD/threads/TTT", "", []incidentAddress{{"spaces/DDD", "spaces/DDD/threads/TTT"}, {"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
 		{"slack:C0HOME", "", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
+		// Teams: a personal chat and a group chat are one conversation each;
+		// a channel thread is keyed by its own id, stored as (id, id).
+		{"teams:a:1UxxASmI", "", nil},
+		{"teams:19:group@thread.v2", "", nil},
+		{"teams:19:chan@thread.tacv2", "", nil},
+		{"teams:19:chan@thread.tacv2;messageid=1794603936403", "", []incidentAddress{{"19:chan@thread.tacv2;messageid=1794603936403", "19:chan@thread.tacv2;messageid=1794603936403"}, {"a2a-x", "teams:19:chan@thread.tacv2;messageid=1794603936403"}}},
 		{"inject:bench-7", "", []incidentAddress{{"a2a-x", "inject:bench-7"}}},
 		{"console:abc", "", []incidentAddress{{"a2a-x", "console:abc"}}},
 		{"", "", nil},

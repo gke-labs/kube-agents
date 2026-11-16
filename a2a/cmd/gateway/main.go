@@ -160,6 +160,15 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 			// allowlist still decides who is served.
 			sl.SetTestUsers(cfg.SlackTestUsers)
 			adapters[backend] = sl
+		case gateway.BackendTeams:
+			tm, err := gateway.NewTeamsAdapter(cfg.TeamsRelayURL, cfg.TeamsTokenPath, cfg.TeamsTenantID, cfg.TeamsAdaptiveCards, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			// The allowlist, so a sender listed by either of their ids is
+			// handed over under the listed one; the gateway still decides.
+			tm.SetAllowedUsers(cfg.TeamsAllowedUsers, cfg.TeamsAllowAllUsers)
+			adapters[backend] = tm
 		case gateway.BackendDiscord:
 			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 			if err != nil {
@@ -470,6 +479,18 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 			return nil
 		}
 		n.SetConversations(conversations(slack))
+		return n
+	}
+	if teams, ok := backend.(*gateway.TeamsAdapter); ok {
+		if cfg.TeamsHomeChannel == "" {
+			log.Warn("chat.notify home posts not armed: no Teams home channel configured; conversation posts are")
+		}
+		n, err := gateway.NewTeamsNotifier(teams, cfg.TeamsHomeChannel, log)
+		if err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+			return nil
+		}
+		n.SetConversations(conversations(teams))
 		return n
 	}
 	gchat, ok := backend.(*gateway.GoogleChatAdapter)

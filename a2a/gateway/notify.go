@@ -317,6 +317,23 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	return n, nil
 }
 
+// NewTeamsNotifier builds the Teams route. home is a Teams conversation id
+// (a channel's "19:…@thread.tacv2" or a chat's) or "", for conversation
+// requests only; a thread under the home is the home with its
+// ";messageid=" suffix, which is how Teams names a channel thread.
+func NewTeamsNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
+	if home != "" && !teamsIsConversationID(home) {
+		return nil, fmt.Errorf("notify: home channel %q is not a Teams conversation id", home)
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	n := &Notifier{subject: lib.NotifySubjectTeams, home: home, poster: poster, log: log,
+		convPrefix: teamsKeyPrefix, backend: lib.NotifyPlatformTeams}
+	n.threadOK = teamsThreadInHome
+	return n, nil
+}
+
 // NewSlackNotifier builds the Slack notifier. home is the configured home
 // channel's id ("C0123" or a private channel's "G0123"), or "" when there is
 // none, which leaves the route serving conversation requests only; anything

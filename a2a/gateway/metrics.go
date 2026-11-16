@@ -154,6 +154,7 @@ const (
 	// chat, and are not counted.
 	platformGoogleChat = "googlechat"
 	platformSlack      = "slack"
+	platformTeams      = "teams"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
 	// The answer label's values: what the rated message answered with, the
@@ -234,7 +235,7 @@ var (
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
-	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformTeams, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	metricsAnswers         = []string{answerReply, answerCard}
 	metricsPostKinds       = []string{postKindAlert, postKindReport}
@@ -246,6 +247,7 @@ var (
 	metricsBackendPlatforms = map[string]string{
 		gchatBackend:   platformGoogleChat,
 		slackBackend:   platformSlack,
+		teamsBackend:   platformTeams,
 		discordBackend: platformDiscord,
 		consoleBackend: platformConsole,
 	}

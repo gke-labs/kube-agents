@@ -63,6 +63,7 @@ const (
 var routePlatforms = map[string]string{
 	"gchat:":           lib.NotifyPlatformGchat,
 	"slack:":           lib.NotifyPlatformSlack,
+	"teams:":           lib.NotifyPlatformTeams,
 	consoleRoutePrefix: lib.NotifyPlatformConsole,
 }
 
