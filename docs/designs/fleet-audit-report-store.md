@@ -241,23 +241,32 @@ why (`report store: broker <url> (FLEET_AUDIT_REPORT_STORE=broker)`), and never 
 `audit_report.py` stays silent with the switch unset, so `finish`'s output is unchanged there.
 Everything in §2 holds through it: the ring entry is written first and `latest` as its byte copy,
 the listener prunes, `finish` drops `latest` before each ledger rewrite and after a failed write,
-and the readers flag a missing `latest` or a newer ring entry. A 404 is a missing file; a 502, 503
-or 504, or no answer, is a store that cannot be used now, which a write logs as a warning without
+and the readers flag a missing `latest` or a newer ring entry. A 404 is a missing file only when its body is the listener's `{"error": "not found"}`, which the
+broker relays whole. Any other 404 (the broker's own `not_found`, as a broker that predates the
+routes answers every one, or the listener's `no such route`), a 3xx, a 502, 503 or 504, or no answer
+is a store that cannot be used now, which a write logs as a warning without
 changing the exit code and a read treats as unreadable, so a run over it has a lost memory rather
 than a first run. The in-flight notes and the precheck digest stay in the pod's scratch directory.
 
 The sandbox's own file store holds every run from before the switch, and the broker store starts
-empty. So the first time a script touches a stream through the broker (a read, or a write) and the
-broker store has no such stream (no `latest` and an empty ring) while the pod's local root holds
-it, the script copies that stream in once: the ring entries oldest first, then `latest.json` only
-when it is a byte copy of the newest entry. It then leaves `.seeded-to-broker` in the local stream
-directory so the copy never repeats, and logs one line for the stream. A stream the broker refuses
-to take (a 403: a repository the install does not register) is skipped and logged with no marker,
-so a later registration can still seed it, and any other failure is retried by the next run. The
-copy is idempotent and never deletes or changes a local envelope, so a rollback to the file store
-finds the history as it was at the seed. A profile worker has no local store, so nothing is seeded
-there. The known limit: the copied envelopes are as trustworthy as today's file store, which the
-agent can write; the seed is not attested.
+empty. So the first time a script touches a stream through the broker (a read, or a write) while the
+pod's local root holds it with no `.seeded-to-broker` marker, the script copies it in. It holds an
+flock on the local stream directory throughout, and looks for the marker again once it has it, so two
+seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. When the
+broker's ring is empty, or holds only stamps the local ring holds (a seed that stopped part way), the
+local entries it lacks and that are newer than its newest go oldest first. Then `latest.json` goes,
+only when it is a byte copy of the newest local entry and, checked again just before the write, the
+broker's newest ring entry is that same run and it has no other `latest`: a run that landed through
+the broker meanwhile (a profile worker takes no local lock) keeps its own, so a seed never rolls
+`latest` back. Then the script leaves the marker so the copy never repeats, and logs one line for the
+stream. When the broker's ring holds a run the local one does not, a run has written the stream since:
+nothing is copied, and the marker is left only when every local entry is already in the broker. A
+stream the broker refuses to take (a 403: a repository the install does not register) is skipped and
+logged with no marker, so a later registration can still seed it, and any other failure leaves no
+marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
+a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
+worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
+trustworthy as today's file store, which the agent can write; the seed is not attested.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
