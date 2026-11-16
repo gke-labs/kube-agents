@@ -88,7 +88,8 @@ jobs:
   installer-tests-on-bash-3-2:
     name: Installer test files under /bin/bash 3.2 (not required)
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The first run took under five minutes.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
