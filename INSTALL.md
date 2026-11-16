@@ -1008,21 +1008,24 @@ The Kubernetes Operator requires `cert-manager` (version `1.13.0+`) to generate 
   ```bash
   helm repo add jetstack https://charts.jetstack.io
   helm repo update
-  helm install cert-manager jetstack/cert-manager \
+  helm install cert-manager jetstack/cert-manager --version v1.21.3 \
     --namespace cert-manager \
     --create-namespace \
-    --set installCRDs=true
+    --set crds.enabled=true
   ```
 
+  `crds.enabled` is the key in chart 1.15 and later. If you pin a chart below 1.15, set `installCRDs=true` instead: those charts ignore `crds.enabled` and install no CRDs.
+
 - **GKE Autopilot Cluster (Leader Election Workaround)**:
-  GKE Autopilot restricts coordination Leases in `kube-system`. Disable leader election during install:
+  GKE Autopilot restricts coordination Leases in `kube-system`. Move the leader-election Leases to the `cert-manager` namespace during install:
   ```bash
-  helm install cert-manager jetstack/cert-manager \
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+  helm install cert-manager jetstack/cert-manager --version v1.21.3 \
     --namespace cert-manager \
     --create-namespace \
-    --set installCRDs=true \
-    --set controller.leaderElection.enabled=false \
-    --set cainjector.leaderElection.enabled=false
+    --set crds.enabled=true \
+    --set global.leaderElection.namespace=cert-manager
   ```
 
 ### Step 2: Create API Key & Access Secrets
@@ -1541,7 +1544,7 @@ make uninstall
 
 ### 3. GKE Autopilot Pod Pending on Lease Resources
 
-- Check if your deployment is stuck waiting for leader election Leases in `kube-system`. Disable leader election arguments `--leader-elect=false` when deploying controllers to GKE Autopilot clusters.
+- Check if your deployment is stuck waiting for leader election Leases in `kube-system`. GKE Autopilot denies Lease writes there. Move the Leases to the controller's own namespace (for cert-manager, `--set global.leaderElection.namespace=cert-manager`, as in [Step 1](#step-1-install-cert-manager)). If a controller cannot move them, disable leader election with `--leader-elect=false`.
 
 ### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
 
