@@ -202,7 +202,7 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         # scheduled one): already had, so not required to be the stage's, and outside the chain.
         adopted = [a for a in FIRST_RUN_AUDITS if a in set(read.get("adopted") or [])]
         # A run that got going and then failed, or was cut off by a restart, still started: how it
-        # ended is the audit cases' to grade. A row with no start time ran nothing.
+        # ended is `oobe_audits_ended`'s to grade. A row with no start time ran nothing.
         running = [
             a for a in FIRST_RUN_AUDITS
             if runs.get(a, {}).get("status") in STARTED_STATUSES or runs.get(a, {}).get("started_at")

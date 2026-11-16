@@ -246,7 +246,7 @@ def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) 
 
 @pytest.mark.parametrize("status", ["failed", "unknown"])
 def test_a_run_that_got_going_and_then_ended_badly_still_started(store: Store, status: str) -> None:
-    # How the run ended is the audit cases' to grade; a GitHub 500 in `finish` is not "did not start".
+    # How the run ended is the ended check's to grade; a GitHub 500 in `finish` is not "did not start".
     store.arm()
     store.chain(ARMED + timedelta(minutes=1))
     store.run(oobe.FIRST_RUN_AUDITS[0], ARMED + timedelta(seconds=30), status, ARMED + timedelta(seconds=50), started=True)
