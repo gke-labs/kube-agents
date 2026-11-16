@@ -119,8 +119,9 @@ const (
 
 // envSlackAnswerFeedback and envGchatAnswerFeedback turn answer feedback
 // off when "false" (feedback.go); the operator renders each only from its
-// backend's answerFeedback=false. The gateway holds one chat backend, so
-// either name turns off the one switch.
+// backend's answerFeedback=false. The gateway keeps one switch for every
+// backend it holds, so either name turns feedback off on Chat and Slack
+// alike.
 const (
 	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
@@ -275,8 +276,8 @@ type Config struct {
 	GatewayLease string
 	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
-	// googleChat.answerFeedback=false: no rating controls are drawn and
-	// nothing is kept, whatever the feedback bucket holds.
+	// googleChat.answerFeedback=false: no rating controls are drawn on any
+	// backend and nothing is kept, whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.

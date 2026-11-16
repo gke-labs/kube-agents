@@ -549,7 +549,7 @@ Helm adopts the object and rewrites its spec to the static copy in the same upgr
 Deployment, the Postgres/pgvector StatefulSet behind it, NetworkPolicies
 isolating the API pod (`hindsight-api`) and standing in for the database's
 deliberate lack of a password (`hindsight-postgresql`),
-and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
+and a `PodMonitoring` (`hindsight.podMonitoring`, `null` by default so it renders when the cluster serves `monitoring.googleapis.com/v1/PodMonitoring`). `hindsight.enabled` is a tri-state: `null` (the default)
 follows `platformAgent.harness.memory.provider`, so selecting a
 Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
 with it and everything else renders nothing; `true`/`false` override. The
@@ -717,7 +717,8 @@ series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.in
 `kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
-pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
+pods, the same `null` tri-state as `platformAgent.podMonitoring`, `litellm.podMonitoring`
+(`litellm-monitoring`), and `hindsight.podMonitoring` (`hindsight-monitoring`). `operator.metrics.enabled: false`
 binds no listener and renders neither the port, the `PodMonitoring` nor the policy.
 `<release>-operator-netpol` bounds the plain listener as the broker's and gateway's
 policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and from
@@ -1276,11 +1277,11 @@ granted by hand.
 Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
-- **Annotations set** (the Workload Identity case): the **operator** creates
+- **Annotations set** (at least one non-null, non-empty string value — the Workload Identity case): the **operator** creates
   and manages the KSA with those annotations.
-- **No annotations**: the operator treats the named KSA as user-managed and
+- **No annotations** (empty map, `null`, or inherited keys cleared to `null` or `""` in a layered values file): the operator treats the named KSA as user-managed and
   does not create it — the **chart** renders it instead, so a default install
-  still starts.
+  still starts. (`litellm.vertex.serviceAccountAnnotations` filters `null` and `""` entries the same way.)
 
 ### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
 

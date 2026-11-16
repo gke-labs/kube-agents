@@ -389,6 +389,41 @@ render, or --validate to ask the cluster the kubeconfig points at.
 {{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.platformAgent.podMonitoring "Capabilities" .Capabilities) -}}
 {{- end }}
 
+{{- define "kube-agents.litellmPodMonitoring" -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.litellm.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end }}
+
+{{- define "kube-agents.hindsightPodMonitoring" -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.hindsight.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end }}
+
+{{/*
+Filters a string map to keys carrying a non-null, non-empty string value, fails
+when an entry is a non-string (such as a nested map created by unescaped dots in
+helm --set), and renders the result as YAML (or empty string when nothing
+survives). Shared by platform-agent-ksa.yaml, platform-agent-cr.yaml, and
+litellm.yaml so layered values files that clear an inherited annotation key with
+null or "" keep ServiceAccount ownership and rendered annotations consistent.
+*/}}
+{{- define "kube-agents.nonEmptyStringMap" -}}
+{{- if and . (kindIs "map" .) -}}
+{{- $out := dict -}}
+{{- range $k, $v := . -}}
+{{- if not (kindIs "invalid" $v) -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "serviceAccountAnnotations[%q] must be a string or null (got %s); escape dots in helm --set keys (for example iam\\.gke\\.io/gcp-service-account)" $k (kindOf $v)) -}}
+{{- end -}}
+{{- if ne ($v | trim) "" -}}
+{{- $_ := set $out $k $v -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $out) 0 -}}
+{{- toYaml $out -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 The tri-state behind every PodMonitoring knob: null follows the cluster, true
 and false decide. Takes a dict with "explicit" (the value) and "Capabilities".
