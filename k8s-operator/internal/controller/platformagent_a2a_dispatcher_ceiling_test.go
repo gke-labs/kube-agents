@@ -60,6 +60,9 @@ func ceilingProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 // dispatcher serves the rest, with every shard under the budget
 // (gke-labs/kube-agents#5381).
 func TestTheDispatcherCeiling(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := authMapTestAgent()
@@ -154,6 +157,9 @@ func TestTheDispatcherProfileSharesAddUp(t *testing.T) {
 // breaking ties, so a pass never reshuffles which; deleting an older profile
 // readmits the oldest refused one.
 func TestTheCeilingRefusesTheNewestProfiles(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := authMapTestAgent()
@@ -242,6 +248,9 @@ func TestTheDispatcherCeilingWarnsOncePerTransition(t *testing.T) {
 // draining profiles' grants can push the entry past the budget, and then the
 // dispatcher step tears it down rather than leave it without a map entry.
 func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withDispatcher(t)
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -317,6 +326,9 @@ func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T)
 // AgentProfile controller has to cut without it too, or the profile at the
 // boundary is rendered by one and refused by the other.
 func TestBothControllersCutAtTheSameProfile(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	withDispatcher(t)
 	agent := a2aTestAgent()
@@ -528,6 +540,9 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 // The cut is cached by what decides it, a profile's spec among it, so a spec
 // change moves the cut even where nothing bumps the generation.
 func TestTheCutFollowsAProfileSpecChange(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := a2aTestAgent()
