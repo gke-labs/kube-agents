@@ -618,7 +618,7 @@ class TestScrubStepText(unittest.TestCase):
             with self.subTest(cmd=cmd[:40]):
                 start = time.monotonic()
                 out = _scrub("tool_call", cmd)
-                # Wall-clock budget: a quadratic scrub of these 100k+ character
+                # Wall-clock budget: a quadratic scrub of the 100k+ character
                 # inputs takes tens of seconds, while a linear one finishes near a
                 # second on a loaded CI runner, so 1.0 s flaked and 5.0 s does not.
                 self.assertLess(time.monotonic() - start, LINEAR_SCRUB_BUDGET_SECONDS)
