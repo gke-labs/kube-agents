@@ -188,3 +188,22 @@ func TestANullAuthorityIsRefusedAsNoCapability(t *testing.T) {
 		t.Errorf("%d verifier calls; want none", n)
 	}
 }
+
+// A script-run trigger (#5622) reaches the verifier and the task credential
+// whole, script included: the copy into the credential drops no field.
+func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
+	d, v, snap, prof, hk := triggerAdmission(t)
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+	adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+	if err != nil || ref != nil {
+		t.Fatalf("admit: refusal %+v, err %v", ref, err)
+	}
+	if got := v.triggerList(); len(got) != 1 || got[0] == nil || got[0].Script != "compliance-audit" {
+		t.Fatalf("verifier asked with triggers %+v; want the script", got)
+	}
+	want := taskcred.Trigger{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}
+	if adm.trigger == nil || *adm.trigger != want {
+		t.Errorf("admission handed on trigger %+v; want %+v", adm.trigger, want)
+	}
+}
