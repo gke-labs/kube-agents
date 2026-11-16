@@ -517,6 +517,9 @@ class Collector:
         self.publish_thread: Optional[threading.Thread] = None
         # Writes the lane's report into a directory and returns its summary.
         self.lane_report = lane_report
+        # Set once the report has been tried: replay mode's last pass writes it
+        # before its uploads, and run_loop's call after the pass is then a no-op.
+        self.lane_report_tried = False
 
     # --- plumbing ---------------------------------------------------------
 
@@ -853,9 +856,10 @@ class Collector:
         self.publish_thread.start()
 
     def write_lane_report(self) -> None:
-        """Replay mode's last step: the lane's report, into the job's prefix under report/."""
-        if self.lane_report is None:
+        """Replay mode's last step: the lane's report, into the job's prefix under report/. Tried once."""
+        if self.lane_report is None or self.lane_report_tried:
             return
+        self.lane_report_tried = True
         root = tempfile.mkdtemp(dir=self.staging)
         try:
             try:
@@ -888,10 +892,34 @@ class Collector:
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def _upload_batch(self, root: str, batch: Sequence[Tuple[str, int]], written: Dict[str, int],
+                      emptiable: List[Tuple[str, int]], stats: Dict[str, int]) -> None:
+        """Upload one fetched batch from its staging root, adding what reached the bucket to `emptiable`; removes the root."""
+        try:
+            uploaded = set(self.upload(root, written))
+            for name in uploaded:
+                self.uploaded.add(name)
+                stats["uploaded"] += 1
+                self.totals.uploaded_files += 1
+            # The size the pod's file had is the size uploaded: a
+            # closed file never changes, and an open one is never emptied.
+            emptiable += [(rel, written[object_name(rel)]) for rel, _ in batch
+                          if object_name(rel) in uploaded]
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def collect_pass(self, final: bool = False) -> Dict[str, int]:
-        """One pass over every proxy pod; `final` also takes the open segments."""
+        """One pass over every proxy pod; `final` also takes the open segments.
+
+        Replay mode's last pass copies every pod into the kept copy first,
+        then writes the lane's report from it, and uploads the lines and store
+        only after: the report is what the lane is for, and earlier passes
+        have uploaded most of the rest.
+        """
         stats = {"pods": 0, "listed": 0, "new": 0, "uploaded": 0}
         budget = PASS_MAX_BYTES
+        report_first = final and self.mode == MODE_REPLAY and self.lane_report is not None
+        deferred: List[Tuple[str, List[Tuple[str, Sequence[Tuple[str, int]], Dict[str, int]]], List[Tuple[str, int]]]] = []
         for pod, draining in self.pods():
             if self.cut_short(final):
                 break
@@ -905,6 +933,7 @@ class Collector:
             # Uploaded already, from this pod or another: a blob both pods
             # wrote, or a file whose emptying failed last time.
             emptiable = [(rel, size) for rel, size in files if object_name(rel) in self.uploaded]
+            staged: List[Tuple[str, Sequence[Tuple[str, int]], Dict[str, int]]] = []
             for batch in batches(new, BATCH_MAX_BYTES):
                 if budget <= 0 or self.cut_short(final):
                     break
@@ -913,20 +942,27 @@ class Collector:
                 try:
                     written = self.fetch(pod, batch, root)
                     self.keep(pod, root, written)
-                    uploaded = set(self.upload(root, written))
-                    for name in uploaded:
-                        self.uploaded.add(name)
-                        stats["uploaded"] += 1
-                        self.totals.uploaded_files += 1
-                    # The size the pod's file had is the size uploaded: a
-                    # closed file never changes, and an open one is never emptied.
-                    emptiable += [(rel, written[object_name(rel)]) for rel, _ in batch
-                                  if object_name(rel) in uploaded]
-                finally:
+                except BaseException:
                     shutil.rmtree(root, ignore_errors=True)
+                    raise
+                if report_first:
+                    staged.append((root, batch, written))
+                else:
+                    self._upload_batch(root, batch, written, emptiable, stats)
+            if report_first:
+                deferred.append((pod, staged, emptiable))
+                continue
             self.empty(pod, emptiable)
             if self.mode == MODE_RECORD and self.keep_dir and budget > 0 and not self.cut_short(final):
                 budget -= self.collect_cache(pod, budget, final)
+        if report_first:
+            self.write_lane_report()
+            # Each upload gets what the deadline leaves (run()); one that
+            # cannot start is counted, and its files stay in the pod.
+            for pod, staged, emptiable in deferred:
+                for root, batch, written in staged:
+                    self._upload_batch(root, batch, written, emptiable, stats)
+                self.empty(pod, emptiable)
         self.totals.passes += 1
         self.maybe_publish(final)
         return stats
@@ -971,10 +1007,15 @@ def run_loop(collector: Collector, interval: float, final_deadline: float, paren
             if not manifest_done:
                 manifest_done = bool(manifest())  # type: ignore[misc]
             collector.report(collector.collect_pass(final=final), final=final)
-            if final:
-                collector.write_lane_report()
         except Exception as exc:  # one bad pass is not the end of collection
             collector.fail("pass_crashed", reason=type(exc).__name__)
+        if final:
+            # A no-op when replay mode's last pass wrote it already; here
+            # too when that pass crashed first.
+            try:
+                collector.write_lane_report()
+            except Exception as exc:
+                collector.fail("pass_crashed", reason=type(exc).__name__)
 
     while not stop() and parent_alive(parent_pid):
         one_pass(final=False)

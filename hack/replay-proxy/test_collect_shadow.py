@@ -376,6 +376,18 @@ class FinalPassTest(CollectorTestCase):
         self.collector.collect_pass(final=True)
         self.assertEqual(self.cluster.objects(), {})
 
+    def test_outside_replay_mode_the_last_pass_uploads_each_pod_before_the_next(self):
+        other = self.cluster.add_pod("proxy-b")
+        self.put("logs/p-1-000001.jsonl", b"a\n")
+        self.put("logs/p-2-000001.jsonl", b"b\n", pod=other)
+        self.collector.lane_report = lambda out_dir: None
+        self.collector.deadline = self.now + 60
+        self.collector.collect_pass(final=True)
+        steps = [("upload" if c[0] == "gcloud" else "list" if C.LIST_SCRIPT in c else "")
+                 for c in self.cluster.calls]
+        self.assertEqual([s for s in steps if s], ["list", "upload", "list", "upload"])
+        self.assertFalse(self.collector.lane_report_tried, "only replay mode writes the report in the pass")
+
     def test_ordinary_pass_never_takes_open_segments(self):
         self.put("logs/p-1-000002.jsonl.open", b"whole\n")
         self.collector.collect_pass()
@@ -865,6 +877,43 @@ class ReplayModeTest(CollectorTestCase):
         C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
         self.assertIn(self.key("report/verdicts.json"), self.cluster.objects())
         self.assertIn("case-a: lane 3/3", self.out.getvalue())
+
+    def slow_bulk_uploads(self):
+        """Every logs/store upload runs out the last pass's deadline; the report's upload is quick."""
+        def runner(cmd, input=None, remaining=None, env=None, stdin_path=None):
+            if cmd[0] == "gcloud" and "-I" in cmd and f"/{C.REPORT_DIR}/" not in cmd[-1]:
+                self.cluster.calls.append(list(cmd))
+                self.now = self.collector.deadline + 1
+                raise subprocess.TimeoutExpired(cmd, 0)
+            return self.cluster(cmd, input=input, remaining=remaining, env=env, stdin_path=stdin_path)
+
+        self.collector.runner = runner
+
+    def test_a_last_pass_whose_bulk_upload_times_out_still_uploads_the_report(self):
+        self.put("logs/p-1-000001.jsonl", b"last\n")
+        seen = []
+
+        def report(out_dir):
+            seen.append(sorted(os.listdir(os.path.join(self.collector.keep_dir, C.KEEP_PODS_DIR, "proxy-a", "logs"))))
+            with open(os.path.join(out_dir, "verdicts.json"), "w") as handle:
+                handle.write("{}")
+            return "case-a: lane 3/3"
+
+        self.collector.lane_report = report
+        self.slow_bulk_uploads()
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(seen, [["p-1-000001.jsonl"]], "the report reads the last pass's lines, copied first")
+        objects = self.cluster.objects()
+        self.assertIn(self.key("report/verdicts.json"), objects)
+        self.assertNotIn(self.key("logs/p-1-000001.jsonl"), objects)
+        self.assertEqual(self.collector.totals.errors, {"upload_timeout": 1})
+        self.assertEqual(self.size("logs/p-1-000001.jsonl"), 5, "a file not uploaded is not emptied")
+
+    def test_the_report_is_written_once(self):
+        calls = []
+        self.collector.lane_report = lambda out_dir: calls.append(out_dir) or ""
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
 
 
 class ProcessTest(unittest.TestCase):
