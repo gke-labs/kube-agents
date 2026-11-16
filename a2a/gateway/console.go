@@ -485,10 +485,11 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		a.log.Warn("console frame dropped", "reason", "empty text", "conversation", conversation, "messageId", f.MessageID)
 		return InboundMessage{}, "", false
 	}
-	// Backend is stamped here rather than left to the gateway's configured
-	// one: the console runs beside whichever chat backend the process was
-	// configured for, so a frame that said nothing would be attributed to
-	// that backend and verified against its mapping table (Gateway.backendFor).
+	// Backend is stamped here so the frame is attributed to the console with
+	// or without a mux. Behind the mux an unstamped frame would get the
+	// console key from the mux; a console without a mux (no real backend)
+	// has no one else to stamp it, and Gateway.backendFor would fall back to
+	// the gateway's configured backend (the door default).
 	// The addressee is sender-chosen and becomes a subject token, so it is
 	// held to a profile name's shape here; the parameters are checked where
 	// the turn is routed (resolveProfile), which says why in the room.

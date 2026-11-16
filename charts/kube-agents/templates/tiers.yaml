@@ -4,8 +4,9 @@ The two tiers an install with the platform agent starts with (#3659; docs/design
 trigger's. The chart owns these two, so an edit to either is reverted on the next
 upgrade; an install's own tiers go under other names.
 
-Nothing reads a Tier yet: the capability verifier and the gateway use their built-in
-read and unattended tiers, and writeMode isn't enforced. Rendered only when the API
+The operator renders every Tier into the tiers file the verifier, gateway and
+callout load, and profiles can list them; people aren't mapped to tiers yet, and
+writeMode isn't enforced. Rendered only when the API
 server serves the Tier kind, so a helm upgrade that hasn't applied crds/ skips them
 rather than failing on an unknown kind (upgrade.sh applies crds/ first).
 */}}

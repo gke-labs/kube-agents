@@ -283,6 +283,20 @@ const (
 	// confirmation surface are distinct from the browser's.
 	a2aConsoleMCPUser = "console-mcp"
 
+	// a2aCuratorUser is the NATS user name for the OKF memory curator pod
+	// (a2a/cmd/curator), rendered under A2A_CURATOR=true.
+	a2aCuratorUser = "curator"
+
+	// The memory query and outcome subjects served by the curator pod under
+	// A2A_CURATOR=true. Replies ride their own namespace (a2a.memory.reply.>)
+	// for the same reason verifierIdentity answers on a2a.cap.reply.> and
+	// bridgeIdentity answers on chat.board.reply.gateway.>: the curator never
+	// holds a publish grant on _INBOX.agent.>.
+	a2aMemoryQuerySubject       = "a2a.memory.query"
+	a2aMemoryReplySubjects      = "a2a.memory.reply.>"
+	a2aMemoryReplyAgentSubjects = "a2a.memory.reply.agent.>"
+	a2aCuratorOutcomesSubject   = "a2a.topics.agent.platform.curator-outcomes"
+
 	// a2aConsoleConfirmSubject is the console confirmation subject: console
 	// alone may publish it and gateway alone may subscribe to it. Its
 	// publisher and subscriber land with #4457.
@@ -640,6 +654,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
+			// A profile task's supervisor subject in its profile form
+			// (lib.ProfileSupervisorSubject, #5301): read only. The
+			// gateway's publish grant stays five-token, so it can never
+			// write one.
+			"a2a.tasks.p.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
@@ -949,6 +968,36 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	}
 }
 
+// curatorIdentity returns the NATS auth-callout entry for the curator pod,
+// rendered when A2A_CURATOR=true. It holds no task-plane grants, no JetStream
+// consumer-create verbs, and no publish grant on _INBOX.agent.>; replies to
+// a2a.memory.query ride a2a.memory.reply.>.
+func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.topics.shared.annotations",
+		"a2a.topics.shared.blueprint",
+	}
+	publish = append(publish, a2aAgentJetStreamGrants()...)
+	publish = append(publish, a2aMemoryReplySubjects)
+	publish = append(publish, "_INBOX."+a2aCuratorUser+".>")
+
+	return a2aIdentity{
+		user:           a2aCuratorUser,
+		account:        a2aAccountApp,
+		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries on a2a.memory.reply.> with no cluster or forge credentials",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.topics.shared.annotations",
+			"a2a.topics.shared.blueprint",
+			a2aCuratorOutcomesSubject,
+			a2aMemoryQuerySubject,
+			"_INBOX." + a2aCuratorUser + ".>",
+		},
+	}
+}
+
 // bridge: the Hermes bridge sidecar, executor for the `platform` addressee.
 //
 // The other half of `worker`. The bridge is a passthrough that makes the
@@ -1088,8 +1137,8 @@ func bridgeIdentity() a2aIdentity {
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit
 // records it as the artifact nobody owns — referenced by no chart, no kustomize
-// path, no Makefile target and no operator code, and it survives a flip to
-// today until someone deletes it by hand.
+// path, no Makefile target and no operator code, and it stays until someone
+// deletes it by hand.
 //
 // It keeps its password because it is APPLIED rather than rendered. It exists on
 // the demo install right now, so dropping its user from nats.conf would refuse

@@ -234,6 +234,25 @@ The rules that keep this safe:
   same small number would refuse about one answer in five after a queued card, and none of the
   64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
   queued event.
+- **The front door's `kanban_create` queue fields are dropped from the key.** When the new card's
+  class has no free worker slot at that moment, the result carries `"queued": true` and
+  `"queue": {"running": N, "limit": M}`, and neither key otherwise; being queued doesn't change
+  the card's status (only a `ready` card can carry the fields), and the thread hears about the wait from the dispatcher's queued event above, not
+  from the model. So in a tool message answering a `kanban_create` call, a result holding
+  `task_id` and `subscribed` keys the same queued or not, also when Hermes has appended a warning
+  after it. Any other tool's result, and any other JSON holding `queued`, keeps it. In 9,780
+  front-door answers after a create in the nightly and presubmit stores kept locally (4,281
+  queued, counted once per distinct answer) none mentioned a queue, so the model does not
+  read the fields. `running` and `limit` count against an answer as a dropped queued event's
+  payload numbers do. And when the dropped `queued` was true, an answer that talks about a queue or
+  a slot at all ("queued", "frees up", "slot", "in use", "board is full", "waiting for a worker")
+  isn't saved, with or without a number: served to a run whose card had a free slot, it would
+  announce a wait that run doesn't have. That is the only direction the drop opens that could
+  mislead: an answer recorded without the fields came from a model never told of a wait, and a
+  queued run's thread hears of its wait from the dispatcher, so nothing more is checked at replay.
+  It would refuse none of the 4,358 answers (counted once per build) that came straight after a queued create in the Nov 6–14
+  nightly and presubmit stores, nor any of the up to twelve answers after each before the next user
+  turn.
 - **A missing file's list of similar names is dropped from the key.** When `read_file` can't find
   a file, Hermes lists up to five names like it from the same directory (`similar_files`), as the
   directory stood at that moment, and leaves the list out when nothing is like it. Whether another
@@ -308,7 +327,7 @@ they are when a network range is in the request.
 
 ## Measurements
 
-All on one dev install, `spec.mode: next`, Gemini 3.1 Pro via LiteLLM. Each row is one recording
+All on one dev install, `spec.mode: next`, the agent model via LiteLLM. Each row is one recording
 followed by replays of that same recording minutes later; "tokens" is the share of prompt tokens
 served from the cache.
 
@@ -381,7 +400,7 @@ requests of one conversation served through the second key described under "Diff
 same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
 it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
 offline against the trial's saved requests, with each recorded answer noted and checked the way the
-proxy now does).
+proxy did before it timed that check by the whole prefix rather than its last message).
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
@@ -624,7 +643,10 @@ that misses on the exact key can still be served from the second one, but only i
 
 - every earlier answer in it is one the model really gave to that same point in a recording, and
   that the proxy itself recorded and could have stored: never one the client wrote into the history,
-  and never an answer from a fallback;
+  and never an answer from a fallback. That point is read as of when the proxy first saw it whole
+  (the settings and every message up to it), as the recording read it. When the proxy first saw its
+  last message would not do: a skill's text is the same in every conversation, so that time can be
+  another conversation's, minutes earlier, and this run's timestamps before it would read as future;
 - the agent did the same things: every tool call matches by name, and by arguments unless the tool
   only reads. A different action that happened to get the same output (`{"ok": true}` from
   completing a card rather than commenting on it) is still a miss, and so is any other tool called
@@ -873,6 +895,9 @@ before stage 3 of the rollout (turning replay on):
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
    served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   Only passing runs' answers are published, so replay could push a flaky case toward passing; the
+   lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
+   cache is seeded and then replayed, and the report sets the two pass rates side by side.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
    behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what

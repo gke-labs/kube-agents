@@ -150,7 +150,8 @@ working directory, off the module path, so a `json.py` the model dropped there i
 not the code that runs. The per-cluster kubeconfigs stay in
 `/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
 prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
-cluster to what `kubectl api-resources` says it serves. The CR's
+cluster to what `kubectl api-resources` says it serves. A cluster with no
+namespace to watch skips that call and the wildcard discovery. The CR's
 `spec.harness.stallWatch` sets three knobs, which the operator pins in the
 managed `.env` on every install (empty when unset, which is the default):
 `STALL_WATCH_EXCLUDE_NAMESPACES` names namespaces never read,

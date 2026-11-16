@@ -84,7 +84,9 @@ the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
 ([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
 domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
-`data.json` ([The weekly health email](#the-weekly-health-email)), and appends
+`data.json` ([The weekly health email](#the-weekly-health-email)), once a week
+cross-checks the Slack lane's overhead against `autopush` and `staging`
+([The Slack cross-check](#the-slack-cross-check)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
@@ -541,7 +543,8 @@ daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
 its record is its logs bucket and nothing else reads a failed build of it. A fifth,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
-and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
+`ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
@@ -567,8 +570,14 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
 hourly and this tick reads its latest finished build every fifteen minutes, so
 every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note waits until two consecutive checks have failed;
-the reconciles' first failed build is the news. Any project's failure fails a
+one is a flap. The sweep's note waits until two consecutive checks have failed.
+A reconcile's first failed build is the news only when it owes a hand step (a
+refused plan, a locked state, an unmapped project or a runner fault, a run that
+failed before reaching a project or whose check of `main` failed, or a report it
+wrote none of or could not read); a failure the next run retries (a stockout, a
+409, an expired plan token)
+is noted once the same project has failed in two consecutive runs, and a silent
+one still advances the counts. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
@@ -577,8 +586,9 @@ read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
 that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
-recovery needs a build that passed: a failed check under the threshold writes
-no note and is not one. One whose latest finished
+recovery needs a build that passed, or for the postsubmit reconcile a later
+daily run that reached its projects (below): a failed check under the
+threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
@@ -589,7 +599,8 @@ message is built from (where the job acts, what stops happening when it fails
 and resumes when it recovers, what it does and how often, what a failure costs),
 a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
-interrupted in, each with its reason and its one next step, then how many it
+interrupted in, each with its reason and its one next step (a project that
+failed in consecutive runs leads, with its count), then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
@@ -616,7 +627,7 @@ digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
+reconcile, when a later daily run at the same fleet tree reached the projects it failed on (a pass that held and planned them, or a run that failed elsewhere and applied them; a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines and a
 "how it died" line (the log line that says so, the node, a Warning pod event)
 under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
@@ -1075,6 +1086,14 @@ with two identities:
 | Infra                                                                      | `infra_owner`                               |
 | Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
 
+A suspected pull request also has to have merged between the issue's last
+green night and its first red one (the same nights that bound the commit
+window, by UTC date, the green one a day early to cover a build that started
+just before midnight). One that merged outside them, or an issue with no green
+night on record, routes by the filer's rule: with no green night the commit
+window is the 80 commits before the first red night, which can reach back
+weeks.
+
 The first login GitHub accepts is assigned, the rule's logins behind it; a
 person without access to the issues repository is not assignable there, and
 the issue falls to the rule. The job then posts one comment on the issue with
@@ -1378,8 +1397,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median; and its cache hit rate when repetitions carry the prompt
-split), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when at least 30 repetitions carry the prompt
+split); the tile says the figure is one repetition of one scenario, all agents, a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1392,8 +1411,8 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. When full counts carry the prompt
-split, the tile and the Chat line add the cache hit rate: their cache reads over their
+weighs the same and its partial counts do not move it. When at least 30 full counts carry the prompt
+split (`TOKENS_CACHE_MIN_RUNS`; fewer say little about caching), the tile and the Chat line add the cache hit rate: their cache reads over their
 whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
 a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
 tokens tile and the Chat line are left out when no repetition the week compared carries a
@@ -1465,6 +1484,40 @@ renders against any downloaded pair (it reads the issues with `gh`), and
 `python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
 prints the message body it would post.
 
+## The Slack cross-check
+
+The Slack lane's overhead is measured on a quiet CI channel, so the nightly
+pages' estimated Slack times are a floor. Once a week the tick checks that
+floor against real traffic: `scripts/eval_dashboard/slack_crosscheck.py`
+reads the A2A gateway's Slack histograms (delivery lag, a post's time, time
+to first ack) on `autopush` and `staging`'s host clusters over the last seven
+days, from each environment's Managed Service for Prometheus, and sets them
+beside the lane's nightly values for the same days in `data.json`. It is
+published as `slack-crosscheck.json` beside `data.json`: `lane` (`nights` and
+the four values), `environments.<name>` (`project`, the four values,
+`deliveries` and each value's `ratio` to the lane's, or `error`), `complete`,
+`window_days` and `generated_at`. The lane's quantiles are the mean of its
+nightly quantiles, not pooled ones. A metric an environment does not serve
+yet reads as `null`. A complete run within the last seven days skips with one
+log line.
+
+It reads as the publisher, which needs `roles/monitoring.viewer` on the two
+environments' projects, `kube-agents-autopush` (autopush) and
+`kube-agents-gkedemos` (staging):
+
+```bash
+for p in kube-agents-autopush kube-agents-gkedemos; do
+  gcloud projects add-iam-policy-binding "$p" --role=roles/monitoring.viewer \
+    --member=serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+done
+```
+
+An environment whose project refuses the read is skipped with one log line
+naming the role, and any other failure is logged and recorded as its `error`.
+A run that reads no environment publishes nothing; one that reads only some
+publishes with `complete: false`, which does not count as the week's run, so
+each tick reads again and a grant takes effect on the next one.
+
 ## The seeded-fleet scan
 
 Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
@@ -1476,7 +1529,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, eight projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, ten projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -1629,7 +1682,7 @@ the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 `verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,gemini_api_key,token_minter_kms --report`
-against every pool project, eight at a time, and publishes
+against every pool project, ten at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
 `forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project with provider `gemini` in their eval-model pair (`docs/ci-pool-projects.md` 5.10); a lane whose pair names `vertex_ai` does not read the key. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
@@ -1751,7 +1804,7 @@ mean "retest" by that word, and this one has nothing to retest for.
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
 past which it starts no check and cuts every command short, so a stall costs the reads it
 hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1620 s: five waves of eight projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+scan's own ceiling (1620 s: five waves of ten projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.

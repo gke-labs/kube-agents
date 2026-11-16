@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -92,7 +93,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	}
 	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID)
 	if err != nil {
-		if errors.Is(err, ErrJobRefusedByPolicy) {
+		if errors.Is(err, ErrJobRefusedByPolicy) || errors.Is(err, ErrJobTemplateNotCurrent) {
 			d.jobRefused(log, err)
 		}
 		return lib.LeaseRecord{}, "", false, fmt.Errorf("launch the task's Job: %w", err)
@@ -183,7 +184,7 @@ func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
 // launched may still be there, and the Job's name follows from the task. A
 // Job never launched, or already gone, is no error.
 func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, hk holdKey) {
-	if d.jobs == nil || !d.cfg.unattended(hk.tier) {
+	if d.jobs == nil || !d.mayHaveJob(hk) {
 		return
 	}
 	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
@@ -196,7 +197,7 @@ func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, hk 
 // record (never confirmed to a worker) has its Job deleted. A lease that
 // can't be read deletes nothing: unknown is not "never started".
 func (d *Dispatcher) dropUnconfirmedJob(ctx context.Context, log *slog.Logger, hk holdKey) {
-	if d.jobs == nil || !d.cfg.unattended(hk.tier) {
+	if d.jobs == nil || !d.mayHaveJob(hk) {
 		return
 	}
 	_, _, found, err := d.findLease(ctx, hk.profile, hk.tier, hk.taskID)
@@ -211,7 +212,7 @@ func (d *Dispatcher) dropUnconfirmedJob(ctx context.Context, log *slog.Logger, h
 
 // jobRefusedHint is what the dispatcher says when the Job admission policy
 // refuses a Job built from the operator's own template.
-const jobRefusedHint = "the Job admission policy refused a Job built from the operator's template: the policy's DispatchJobTemplate params and the dispatch config disagree (an operator pass may be under way, or a param was edited or removed), or a mutating webhook changed the Job (check the operator's events). The task stays queued."
+const jobRefusedHint = "a Job couldn't be made from the operator's template: its DispatchJobTemplate param is missing or isn't the rendering the dispatch config names (an operator pass may be under way, or a param was edited or removed), or the Job admission policy refused the Job (a param changed between the read and the create, or a mutating webhook changed the Job; check the operator's events). The task stays queued."
 
 // jobRefused records a Job the admission policy refused: reported in Health
 // and logged once as an error until a Job is admitted.
@@ -229,4 +230,26 @@ func (d *Dispatcher) jobAdmitted() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.jobAdmissionErr = ""
+}
+
+// mayHaveJob is whether hk's task could have a Job: its tier is unattended
+// for its profile (Config.unattendedFor, which reads the profile's own
+// unattended-mode tier, #3659), or the config no longer lists the profile,
+// so its tier's mode can't be told and a delete, which is no error for a Job
+// that was never made, is the safe answer.
+func (d *Dispatcher) mayHaveJob(hk holdKey) bool {
+	if d.cfg.unattended(hk.tier) {
+		return true
+	}
+	prof, ok := profileOf(d.src.Config(), hk.profile)
+	return !ok || d.cfg.jobPossible(prof, hk.tier)
+}
+
+// jobPossible is whether a task of prof at tier could run on a Job: the tier
+// is unattended for the profile, or the profile no longer lists it. A
+// custom unattended-mode tier dropped from the profile leaves UnattendedTier
+// empty, so its mode can't be told any more, and its Jobs must still be
+// deleted (#3659); a delete of a Job never made is no error.
+func (c Config) jobPossible(prof lib.DispatchProfile, tier string) bool {
+	return c.unattendedFor(prof, tier) || !slices.Contains(prof.Tiers, tier)
 }
