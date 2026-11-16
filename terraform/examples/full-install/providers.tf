@@ -22,8 +22,9 @@ terraform {
     helm = {
       source = "hashicorp/helm"
       # The kubernetes = { ... } attribute syntax below is helm-provider-3.x
-      # only, so the floor must exclude 2.x.
-      version = ">= 3.0, < 4.0"
+      # only, so the floor must exclude 2.x. 3.1 because 3.0.x lacks
+      # helm_release's upgrade_install, which main.tf sets on every install.
+      version = ">= 3.1, < 4.0"
     }
   }
 }

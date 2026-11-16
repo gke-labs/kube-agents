@@ -64,10 +64,35 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 	return []string{path}
 }
 
+// stubMarkerEnv and stubBarrierEnv carry a test's paths to its stub through
+// the environment the child inherits, not through the stub's source, where a
+// Go-quoted path is not always a Python string with the same bytes.
+const (
+	stubMarkerEnv  = "HERMES_STUB_TEST_MARKER"
+	stubBarrierEnv = "HERMES_STUB_TEST_BARRIER"
+)
+
+// waitForFile returns once path exists or d has passed. It runs off the test
+// goroutine, so it reports nothing: the caller's assertions fail instead.
+func waitForFile(path string, d time.Duration) {
+	for give := time.Now().Add(d); time.Now().Before(give); time.Sleep(50 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+	}
+}
+
 // startBridgeCfg is startBridge with the caller's Config; the door is opened
 // on an ephemeral port unless the caller says otherwise. The lifecycle and
 // the consumer wait are startBridgeConfig's.
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
+	t.Helper()
+	return startBridgeCfgHooked(t, url, command, mutate, nil)
+}
+
+// startBridgeCfgHooked is startBridgeCfg plus a hook that sees the bridge
+// between New and Run.
+func startBridgeCfgHooked(t *testing.T, url string, command []string, mutate func(*Config), hook func(*Bridge)) *Bridge {
 	t.Helper()
 	cfg := Config{
 		NATSURL:        url,
@@ -86,7 +111,7 @@ func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Con
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	b, _ := startBridgeConfig(t, cfg, nil)
+	b, _ := startBridgeConfig(t, cfg, hook)
 	return b
 }
 
@@ -194,10 +219,13 @@ print("the answer")
 		}
 	}
 
-	// Order on the wire: the trace precedes the result, and the result the
-	// final; the first activity part opens the artifact, the second appends.
+	// Order on the wire: the trace precedes the turn's usage, the usage the
+	// result, and the result the final; the first activity part opens the
+	// artifact, the second appends. Each plan step goes out when it closes:
+	// kubectl's at the next tool's call, the last one at the drain, still
+	// ahead of the result (activity_steps.go).
 	trail := eventTrail(t, replayEvents(t, url, "task-activity"))
-	want := []string{"submitted", "working", "activity", "activity", "result", "completed/final"}
+	want := []string{"submitted", "working", "activity", "steps", "activity", "usage", "steps", "result", "completed/final"}
 	if strings.Join(trail, " ") != strings.Join(want, " ") {
 		t.Fatalf("event trail = %v, want %v", trail, want)
 	}
@@ -225,14 +253,31 @@ print("done")
 	}
 }
 
+// The deadline kills the stub only once its pre_tool_call is in: the
+// bridge records the open call before it answers the post, and the stub
+// writes its marker after the answer. Without the hold, the 2 s deadline
+// raced the stub's start, and a stub that had not posted yet left nothing
+// open to report.
 func TestActivity_AnOpenCallIsReportedInterruptedAtTheDeadline(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	posted := filepath.Join(t.TempDir(), "posted")
+	t.Setenv(stubMarkerEnv, posted)
+	startBridgeCfgHooked(t, url, hermesStub(t, `
 post("pre_tool_call", "terminal", {"cmd": "sleep 60", "secret": "x"}, {"tool_call_id": "c-open", "task_id": ""})
+open(os.environ["`+stubMarkerEnv+`"], "w").close()
 time.sleep(30)
 `), func(c *Config) {
 		c.TaskDeadline = 2 * time.Second
 		c.KillGrace = 200 * time.Millisecond
+	}, func(b *Bridge) {
+		b.afterDeadline = func(d time.Duration, f func()) *time.Timer {
+			return time.AfterFunc(d, func() {
+				// Half of waitTerminal's budget, so a stub that never posts
+				// fails on the entry assertion below, not on the terminal wait.
+				waitForFile(posted, terminalWait/2)
+				f()
+			})
+		}
 	})
 	c := gatewayClient(t, url)
 
@@ -336,7 +381,9 @@ func TestActivity_ChildGetsItsOwnManagedScope(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("model:\n  default: pinned/model\nhooks:\n  outbound:\n    - name: theirs\n      url: https://audit.example/\n      events: [post_tool_call]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("PINNED_KEY=pinned-value\n"), 0o600); err != nil {
+	// Not a credential-shaped key: the child prints the .env through its
+	// answer, which the bridge scrubs before publishing (scrubAnswer).
+	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("PINNED_SETTING=pinned-value\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	scratch := t.TempDir()
@@ -358,7 +405,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_SETTING=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
@@ -467,7 +514,7 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 	var d hookDelivery
 	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
 	d.Extra.ToolCallID, d.Extra.Status = long, "ok"
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || len(e.Tool) != activityToolNameCap || len(e.CallID) != activityCallIDCap || len(e.At) != activityWordCap {
 		t.Fatalf("entry fields not bounded: ok=%v tool=%d callId=%d at=%d", ok, len(e.Tool), len(e.CallID), len(e.At))
 	}
@@ -501,7 +548,7 @@ func TestActivity_UnreadableSignedDeliveryIsNotCounted(t *testing.T) {
 	if err := json.Unmarshal(good, &d); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
+	if e, ok, _ := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
 		t.Fatalf("post without an open pre was not published whole: %+v %v", e, ok)
 	}
 }
@@ -546,30 +593,45 @@ func TestActivityStatus(t *testing.T) {
 	}
 }
 
+// concurrentBarrierWait is how long each stub in the concurrency test waits
+// at the barrier for the other stub. It is under the task deadline, so a
+// stub that waits in vain exits on its own and its task ends failed.
+const concurrentBarrierWait = 10 * time.Second
+
 // Two tasks at once: each delivery lands on the task whose key signed it,
-// never on the other. The stubs overlap by sleeping after their calls.
+// never on the other. The stubs meet at a barrier between their two calls:
+// each writes its marker after its first call and waits for the other's, so
+// both tasks complete only when both stubs run at the same time. The test
+// used to time the two terminals against twice a stub's sleep, which a
+// loaded runner crossed with the tasks running at once.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	t.Setenv(stubBarrierEnv, t.TempDir())
+	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-time.sleep(1.5)
+barrier = os.environ["`+stubBarrierEnv+`"]
+open(os.path.join(barrier, prompt), "w").close()
+give_up = time.monotonic() + %g
+while not all(os.path.exists(os.path.join(barrier, p)) for p in ("A", "B")):
+    if time.monotonic() > give_up:
+        sys.exit("the other task's stub never started: the two tasks did not run at once")
+    time.sleep(0.05)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`), func(c *Config) { c.Concurrency = 2 })
+`, concurrentBarrierWait.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
-	// The two stubs each sleep 1.5 s between their calls; run together both
-	// terminals land well inside twice that, run one after the other they
-	// cannot. The bound is what makes "at once" a tested claim.
-	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
-		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
+	for _, task := range []*lib.Task{ta, tb} {
+		if task.State != lib.StateCompleted {
+			t.Fatalf("task %s: state = %s (%v), want completed: the two tasks did not run at once",
+				task.ID, task.State, task.FinalMessage)
+		}
 	}
 	// The input carries the prompt as a number, since no string value rides
 	// the trace: "A" is 65, "B" is 66.
@@ -621,13 +683,13 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		return d
 	}
 	a := newActivityState(false)
-	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
+	if e, _, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
-	if e, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
+	if e, _, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
 		t.Fatalf("error/tool_error -> %+v", e)
 	}
-	if e, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
+	if e, _, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
 		t.Fatalf("ok -> %+v", e)
 	}
 }
@@ -661,6 +723,9 @@ func TestActivity_NoArgumentTextReachesTheBus(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}, "project": "p"}, "call_1")
+call("read_file", {"path": "/etc/secret-path.yaml"}, "call_2")
+call("mcp__gke__list_clusters", {"cluster": "secret-cluster-name"}, "call_3")
+call("terminal", {"command": "kubectl get pods --cluster secret-cluster"}, "call_4")
 print("the answer")
 `), nil)
 	c := gatewayClient(t, url)
@@ -670,8 +735,13 @@ print("the answer")
 		t.Fatalf("state = %s, want completed", task.State)
 	}
 	entries := activityEntries(t, task)
-	if len(entries) != 1 {
-		t.Fatalf("activity entries = %d, want 1: %+v", len(entries), entries)
+	if len(entries) != 4 {
+		t.Fatalf("activity entries = %d, want 4: %+v", len(entries), entries)
+	}
+	for i, e := range entries {
+		if e.Title != "" {
+			t.Fatalf("entry %d in cli mode populated Title = %q, want empty", i, e.Title)
+		}
 	}
 	var input map[string]any
 	if err := json.Unmarshal(entries[0].Input, &input); err != nil {
@@ -685,8 +755,10 @@ print("the answer")
 	}
 	for _, art := range task.Artifacts {
 		for _, p := range art.Parts {
-			if strings.Contains(string(p.Data), "get pods") || strings.Contains(string(p.Data), "hunter2") || strings.Contains(p.Text, "hunter2") {
-				t.Fatalf("raw argument text on the bus under %s: %s %s", art.Name, p.Data, p.Text)
+			for _, secret := range []string{"get pods", "hunter2", "/etc/secret-path.yaml", "secret-path.yaml", "secret-cluster-name", "secret-cluster"} {
+				if strings.Contains(string(p.Data), secret) || strings.Contains(p.Text, secret) {
+					t.Fatalf("raw argument text %q on the bus under %s: %s %s", secret, art.Name, p.Data, p.Text)
+				}
 			}
 		}
 	}
@@ -1197,7 +1269,8 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","delivery_id":"`+id+`","extra":{"tool_call_id":"`+id+`","status":"ok"}}`), &d); err != nil {
 			t.Fatal(err)
 		}
-		return a.observe(d)
+		e, ok, _ := a.observe(d)
+		return e, ok
 	}
 	for i := 0; i < activitySeenCap+1; i++ {
 		if _, ok := post(fmt.Sprintf("d-%d", i)); !ok {
@@ -1224,7 +1297,7 @@ func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"timestamp":{"x":1},"delivery_id":12,"extra":{"tool_call_id":7,"duration_ms":"fast","status":"ok","error_type":null}}`), &d); err != nil {
 		t.Fatalf("a field's type dropped the delivery: %v", err)
 	}
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted || e.DurationMs != 0 || e.CallID != "7" || e.At != "" {
 		t.Fatalf("observed %+v %v", e, ok)
 	}

@@ -16,8 +16,9 @@ metadata:
 This reference covers networking configuration for GKE clusters. The golden path
 enforces private, VPC-native clusters with Dataplane V2.
 
-> **MCP Tools:** `get_cluster`, `update_cluster`, `apply_k8s_manifest`,
-> `get_k8s_resource`
+> **MCP Tools:** `get_cluster`, `get_k8s_resource`
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Golden Path Networking Defaults
 
@@ -58,19 +59,11 @@ gcloud container clusters get-credentials {cluster_name} \
 
 ## Bring-Your-Own VPC/Subnet
 
-If the customer has existing network infrastructure:
-
-```bash
-gcloud container clusters create-auto {cluster_name} \
-  --region {region} \
-  --network {vpc_name} \
-  --subnetwork {subnet_name} \
-  --cluster-secondary-range-name {pod_range} \
-  --services-secondary-range-name {svc_range} \
-  --enable-private-nodes \
-  --enable-master-authorized-networks \
-  --quiet
-```
+If the customer has existing network infrastructure, the cluster's `ContainerCluster` names it
+in Config Connector YAML through `gcp-config-connector`: `spec.networkRef`, `spec.subnetworkRef`,
+and the pod and Service ranges in `spec.ipAllocationPolicy.clusterSecondaryRangeName` and
+`spec.ipAllocationPolicy.servicesSecondaryRangeName`, proposed as a pull request through
+`submit-suggestion`.
 
 > **Day-0 Warning**: VPC, subnet, and IP ranges cannot be changed after cluster
 > creation.
@@ -140,8 +133,9 @@ gcloud container clusters describe {cluster_name} --region {region} \
 Do not infer support from the command succeeding. When external traffic is disabled, a caller that
 Google treats as internal gets a warning rather than an error, plus a kubeconfig pointing at the
 DNS endpoint that then returns HTTP 403 on first use — a failure that surfaces one step later than
-its cause. `gcloud container clusters update {cluster_name} --enable-dns-access` turns the
-setting on.
+its cause. The setting is turned on as Config Connector YAML on the cluster's `ContainerCluster`
+(`spec.controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic`) through
+`gcp-config-connector`, proposed as a pull request through `submit-suggestion`.
 
 The Platform Agent's own tooling makes this decision per cluster in
 `/opt/data/scripts/gke_endpoint.py`, so `switch_kube_context` and the Cluster Agent profile

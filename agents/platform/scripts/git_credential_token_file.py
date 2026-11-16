@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import sys
 
+#: The username that asks for the token as a bearer, not a password. Kept in
+#: step with `providers.credentials.BEARER_GIT_USERNAME` by hand: this script
+#: imports nothing of the broker's.
+BEARER_USERNAME = "authtype-bearer"
+
 
 def main(argv: list[str]) -> int:
     if len(argv) != 4 or argv[3] != "get":
@@ -29,9 +34,9 @@ def main(argv: list[str]) -> int:
         # credential; this helper's only store is the Secret.
         return 0
     token_path, username = argv[1], argv[2]
-    # Drain the request git sends; the answer does not depend on it, because
-    # git only asks this helper for the host its config key is scoped to.
-    sys.stdin.read()
+    # The request git sends. Only its capabilities matter: git asks this
+    # helper only for the host its config key is scoped to.
+    request = sys.stdin.read()
     try:
         with open(token_path, encoding="utf-8") as handle:
             token = handle.read().strip()
@@ -41,6 +46,15 @@ def main(argv: list[str]) -> int:
     # The rule `providers.credentials.is_token` applies, kept in step by hand:
     # this script imports nothing of the broker's.
     if not (token and token.isascii() and token.isprintable() and " " not in token):
+        return 0
+    if username == BEARER_USERNAME:
+        # A forge that takes the token only as a bearer (Bitbucket Data
+        # Center's HTTP access tokens refuse Basic with any shared username).
+        # Git 2.46 and later offer the `authtype` capability and then send
+        # `Authorization: Bearer <credential>`; an older git gets nothing,
+        # and its clone fails on its own authentication error.
+        if "capability[]=authtype" in request.splitlines():
+            sys.stdout.write(f"capability[]=authtype\nauthtype=Bearer\ncredential={token}\n")
         return 0
     sys.stdout.write(f"username={username}\npassword={token}\n")
     return 0

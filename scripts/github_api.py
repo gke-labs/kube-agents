@@ -4,9 +4,11 @@ Combines bounded retries on transient errors (5xx, 429, secondary rate limit 403
 with automatic list endpoint pagination (`get_all`), so callers neither drop
 writes on transient blips nor silently truncate multi-page lists. `graphql()`
 goes through the same retries and raises on an `errors` body, so a partial
-answer is never mistaken for a whole one. `workflows()` pages the one list
-endpoint that wraps its page in an object, and `is_refusal()` is the 4xx test
+answer is never mistaken for a whole one. `get_object_pages()` pages the
+Actions list endpoints that wrap their page in an object (`workflows()` is
+one caller), and `is_refusal()` is the 4xx test
 the scheduled sweeps share for "ours to fix" against "wait for the next one".
+`has_marker_comment()` is the sweeps' check for a comment they already posted.
 """
 
 from __future__ import annotations
@@ -150,23 +152,27 @@ class GitHubAPI:
                 return items
             page += 1
 
-    def workflows(self):
-        """Every workflow the repository has, paged to the endpoint's own total.
+    def get_object_pages(self, path: str, key: str, query=None):
+        """Every page of an endpoint that wraps its list as `{"total_count": n, <key>: [...]}`.
 
-        The list endpoint returns `{"total_count": n, "workflows": [...]}`, so
-        `get_all`, which pages a bare list, cannot read it. An empty page ends
-        the loop as well as reaching the total, so a total that overstates the
-        list cannot spin this.
+        The Actions list endpoints (workflows, workflow runs, a commit's check
+        runs) answer that way, so `get_all`, which pages a bare list, cannot
+        read them. An empty page ends the loop as well as reaching the total,
+        so a total that overstates the list cannot spin this.
         """
         found = []
         page = 1
         while True:
-            query = urllib.parse.urlencode({"per_page": PER_PAGE, "page": page})
-            batch = self.get(f"/repos/{self.repo}/actions/workflows?{query}")
-            found.extend(batch["workflows"])
-            if not batch["workflows"] or len(found) >= batch["total_count"]:
+            encoded = urllib.parse.urlencode({**(query or {}), "per_page": PER_PAGE, "page": page})
+            batch = self.get(f"{path}?{encoded}")
+            found.extend(batch[key])
+            if not batch[key] or len(found) >= batch["total_count"]:
                 return found
             page += 1
+
+    def workflows(self):
+        """Every workflow the repository has, paged to the endpoint's own total."""
+        return self.get_object_pages(f"/repos/{self.repo}/actions/workflows", "workflows")
 
     def post(self, path: str, payload=None, tolerate=()):
         return self.request("POST", path, payload, tolerate=tolerate)
@@ -189,3 +195,17 @@ class GitHubAPI:
         if errors:
             raise RuntimeError(f"GraphQL: {errors}")
         return result["data"]
+
+
+def has_marker_comment(api: GitHubAPI, number: int, marker: str, since: str | None = None) -> bool:
+    """Whether a comment on issue or pull request ``number`` starts with ``marker``.
+
+    The sweeps open their own comments with a hidden marker, so a later run
+    can tell it already posted one. ``since`` (an ISO 8601 time) reads only
+    the comments updated from then on. A failed read is raised, not taken for
+    "none": each caller decides what a failed read costs it.
+    """
+    path = f"/repos/{api.repo}/issues/{number}/comments"
+    if since:
+        path = f"{path}?since={since}"
+    return any((comment.get("body") or "").startswith(marker) for comment in api.get_all(path))

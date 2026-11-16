@@ -75,6 +75,19 @@ DEFAULT_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 #: look for a better address; a row naming a real chat platform is left alone.
 NON_CHAT_ORIGINS = frozenset({"api_server", "k8s-watcher"})
 
+#: The console door's platform name on a conversation route
+#: (lib.NotifyPlatformConsole). The gateway serves its chat.notify route
+#: whenever the console runs, so a console route is accepted whatever
+#: NOTIFY_CONVERSATIONS_ENV names. Kanban-era, like the rest of this patch:
+#: it goes when kanban does.
+CONSOLE_PLATFORM = "console"
+#: Joins a console card's conversation key and the gateway task of the turn
+#: that filed it in the subscription's thread_id, snapshotted at creation so
+#: the card's report names the turn it answers (kanban_chat_notify sends it as
+#: --reply-to). '#' cannot occur in a console conversation's token, which is
+#: one DNS-1123 label.
+CONSOLE_THREAD_TASK_SEP = "#"
+
 #: How long to wait for the routing database. The caller is holding a board
 #: transaction open, so this is deliberately short: losing the thread is better
 #: than stalling the create.
@@ -101,12 +114,26 @@ COMPRESSION_WALK_MAX = 32
 #: route, the conversation key); the kanban stand-in reads the context id back
 #: from here, and a wake self-posts into that session.
 CONVERSATION_ROUTE_KEY = "conversation_route"
-#: The platform whose gateway conversations the kanban notifier serves
-#: (kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV, rendered by the operator). A
-#: route for any other platform is not substituted: the card keeps its
-#: api_server address, whose wake still reaches the bridge's session, rather
-#: than a chat address nothing collects.
+#: The platforms whose gateway conversations the kanban notifier serves
+#: (kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV, rendered by the operator), a
+#: list separated by PLATFORM_LIST_SEPARATOR. A route for any other platform
+#: is not substituted: the card keeps its api_server address, whose wake still
+#: reaches the bridge's session, rather than a chat address nothing collects.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+#: What separates the platform names (kanban_chat_notify.PLATFORM_LIST_SEPARATOR).
+PLATFORM_LIST_SEPARATOR = ","
+#: What the log lines print for an empty or absent value.
+UNSET_LABEL = "<unset>"
+
+
+def _served_conversation_platforms() -> list[str]:
+    """The platforms NOTIFY_CONVERSATIONS_ENV names: stripped, empties dropped, first of a duplicate kept, in order."""
+    names: list[str] = []
+    for part in os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def session_kv_db_path() -> str:
@@ -139,6 +166,9 @@ def _conversation_route(session_id: str, metadata: Optional[dict[str, Any]]) -> 
     conversation = str(route.get("conversation") or "")
     if not platform or not conversation or not route.get("context_id"):
         return None
+    task_id = str(route.get("task_id") or "")
+    if platform == CONSOLE_PLATFORM and task_id and CONSOLE_THREAD_TASK_SEP not in task_id:
+        conversation += CONSOLE_THREAD_TASK_SEP + task_id
     return platform, session_id, conversation
 
 
@@ -255,13 +285,13 @@ def resolve_chat_route(
                 break
     conversation = _conversation_route(holder, metadata)
     if conversation:
-        served = os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
-        if conversation[0] == served:
+        served = _served_conversation_platforms()
+        if conversation[0] in (*served, CONSOLE_PLATFORM):
             return conversation
         _log_undeliverable(
             chat_id,
             f"its conversation route is on {conversation[0]}, which no notifier serves here "
-            f"({NOTIFY_CONVERSATIONS_ENV}={served or '<unset>'})",
+            f"({NOTIFY_CONVERSATIONS_ENV}={PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL})",
         )
         return platform, chat_id, thread_id
     if not metadata:
@@ -281,7 +311,7 @@ def resolve_chat_route(
         _log_undeliverable(
             chat_id,
             "the recorded route is not a chat surface either: "
-            f"{route_platform or '<unset>'}/{route_chat_id or '<unset>'}",
+            f"{route_platform or UNSET_LABEL}/{route_chat_id or UNSET_LABEL}",
         )
         return platform, chat_id, thread_id
 

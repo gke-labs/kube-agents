@@ -1034,6 +1034,25 @@ class SourceRefDispatchTest(unittest.TestCase):
         self.assertIsNotNone(log, combined)
         self.assertEqual(log.split(), ["--non-interactive"])
 
+    def test_source_ref_hands_over_with_no_argument_to_forward(self):
+        """An interactive run that names no coordinates forwards nothing at all.
+
+        The list of forwarded arguments is then empty, and bash 3.2 (macOS's
+        /bin/bash) reads the expansion of an empty array as an unbound
+        variable under `set -u`: the run ended there, after the clone and
+        before the hand-over.
+        """
+        proc, log = self._run(
+            ref_carries_uninstall=True,
+            ref_speaks_domain_scoped=True,
+            args=["--source-ref=v0.3.0"],
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("unbound variable", combined)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIsNotNone(log, combined)
+        self.assertEqual(log.split(), [])
+
     def test_source_ref_stays_quiet_about_coordinates_it_was_given(self):
         """Flags are a complete answer, so the second half of that warning is
         only printed when nothing named the install at all."""
@@ -1134,6 +1153,34 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         # The scope keys for the same reason: the generator's triple check and
         # terraform's variable validation both run on the destroy path.
+        # The openai_compatible endpoint too: the generator validates it, and an
+        # openai_compatible provider with its endpoint blanked would be refused,
+        # so the provider is reset as well.
+        endpoint_at = text.find('export OPENAI_COMPATIBLE_API_BASE="" OPENAI_COMPATIBLE_TARGET_PORT="" OPENAI_COMPATIBLE_EGRESS_CIDRS="" OPENAI_COMPATIBLE_CA_SECRET_NAME=""')
+        self.assertNotEqual(endpoint_at, -1, "uninstall.sh must blank the OPENAI_COMPATIBLE_* keys")
+        self.assertLess(endpoint_at, call_at)
+        env_secret_at = text.find('export LITELLM_ENV_SECRET_NAME=""')
+        self.assertNotEqual(env_secret_at, -1, "uninstall.sh must blank LITELLM_ENV_SECRET_NAME")
+        self.assertLess(env_secret_at, call_at)
+        # The minter's adoption keys (#3504): terraform validates their shape,
+        # and an operator types them into install.env by hand.
+        minter_at = text.find('export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""')
+        self.assertNotEqual(minter_at, -1, "uninstall.sh must blank MINTER_SHARED_KEY and MINTER_ADOPT_KEY")
+        self.assertLess(minter_at, call_at)
+        # The minter's KSA name: terraform validates it as a DNS-1123 label.
+        minter_ksa_at = text.find('export GITHUB_MINTER_KSA_NAME=""')
+        self.assertNotEqual(minter_ksa_at, -1, "uninstall.sh must blank GITHUB_MINTER_KSA_NAME")
+        self.assertLess(minter_ksa_at, call_at)
+        # The agent's KSA name: terraform validates it as a DNS-1123 label
+        # ending in -agent, and install.env carries it as TF_VAR_agent_ksa_name
+        # (an empty export fails both validations, so it is unset to let the
+        # variable's default stand).
+        agent_ksa_at = text.find("unset TF_VAR_agent_ksa_name")
+        self.assertNotEqual(agent_ksa_at, -1, "uninstall.sh must unset TF_VAR_agent_ksa_name")
+        self.assertLess(agent_ksa_at, call_at)
+        provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
+        self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
+        self.assertLess(provider_at, call_at)
         scope_at = text.find('export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_MAX_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
         self.assertNotEqual(scope_at, -1, "uninstall.sh must blank the SCOPE_* keys")
         self.assertLess(scope_at, call_at)
@@ -1145,16 +1192,39 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         self.assertNotEqual(redaction_at, -1, "uninstall.sh must blank the LITELLM_REDACTION_* keys")
         self.assertLess(redaction_at, call_at)
+        # The spend ceiling too: the generator refuses an amount or a period it
+        # cannot read, and a teardown must not stop on either.
+        budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
+        self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
+        self.assertLess(budget_at, call_at)
         # And the mode: the generator refuses a value outside the CRD's enum,
         # and a teardown must not stop on a typo in install.env.
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
         self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
         self.assertLess(mode_at, call_at)
+        # And the Slack home channel policy, refused outside the same kind of enum.
+        policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
+        self.assertLess(policy_at, call_at)
+        # The data volume size likewise: the generator refuses a malformed size.
+        storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
+        self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
+        self.assertLess(storage_at, call_at)
         # The scoped service account pool too: the generator refuses a
         # misspelt switch or a malformed cap, and the pool goes with the state.
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # The serving-project switch likewise: the generator refuses a
+        # misspelt value, and the destroy removes what is in state either way.
+        vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
+        self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
+        self.assertLess(vertex_at, call_at)
+        # The release's upgrade_install switch too: the generator refuses a
+        # misspelt HELM_UPGRADE_INSTALL, and a teardown must not stop on it.
+        helm_at = text.find('export HELM_UPGRADE_INSTALL=""')
+        self.assertNotEqual(helm_at, -1, "uninstall.sh must blank HELM_UPGRADE_INSTALL")
+        self.assertLess(helm_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

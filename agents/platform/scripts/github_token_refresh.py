@@ -10,7 +10,6 @@ deployments continue to use the direct path.
 import argparse
 import email.message
 import http.client
-import io
 import json
 import os
 import re
@@ -64,18 +63,27 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
+#: The three Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
-#: context repository, by the broker, for its own git and nothing else.
+#: context repository, by the broker, for its own git and nothing else; the
+#: sweep scope reads contents, pull requests and issues of one managed
+#: repository, for the broker's read of the agent's own proposals.
 MINTY_WRITE_SCOPE = "platform-agent-scope"
 MINTY_READ_SCOPE = "platform-agent-read-scope"
+MINTY_SWEEP_SCOPE = "platform-agent-sweep-scope"
 
 #: The flag that selects the read-only mint. `credential_proxy.CommandExecutor`
 #: spells the same flag when it runs this script; it cannot import this module
 #: for the constant without also importing the CLI side, so the two copies are
 #: kept in step by `test_credential_proxy.py`.
 READ_ONLY_FLAG = "--read-only"
+
+#: The flag that selects the sweep mint: a token in the sweep scope for one
+#: managed repository, printed bare on stdout, nothing installed.
+#: `credential_proxy.FORGE_SWEEP_FLAG` is the same string, kept in step by
+#: `test_credential_proxy.py`.
+SWEEP_FLAG = "--sweep"
 
 #: The flags that select the write mint for a GitHub Enterprise Server host:
 #: the token and the repositories it covers are printed as JSON, and nothing is
@@ -288,7 +296,9 @@ def refresh_credentials_once(
     single poll into a mint per call.
 
     Note: In multi-org deployments, if an un-scoped preflight check (e.g. `auth
-    status`) triggers token refresh, it mints for the first managed repository.
+    status`) triggers token refresh, it mints for the first managed repository,
+    and the token covers that repository alone: each minter policy lists its
+    own repository, so no one token spans the managed list.
     Subsequent 401s for a repository in a different organization within the same
     process will not trigger a second mint due to the process-wide at-most-once
     guard. Full multi-org refresh across different organizations requires lifting
@@ -665,13 +675,12 @@ def mint_read_only_token(target_repo: str | None) -> str:
     """A `contents: read` installation token for one repository, and nothing else.
 
     The credential the broker presents to its own `git clone` of a context
-    repository (`content_workspace.py`, through `MintedReadCredential`). Three
+    repository (the vcs `snapshot` verb, through `MintedReadCredential`). Three
     things distinguish it from `refresh_git_credentials`, each deliberate:
 
     * The scope is `MINTY_READ_SCOPE` and the repository list is this one
-      repository. The write scope's list is widened to every managed repository
-      so one token slot serves them all; a read token is per clone, so there is
-      no slot to serve and no reason to widen.
+      repository, as the write mint's now is; each repository's minter policy
+      lists that repository alone.
     * It goes straight to Minty. There is no sidecar to delegate to, because
       this runs *in* the sidecar, and no sandbox to forward through, because the
       sandbox must never hold it.
@@ -693,6 +702,28 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+def mint_sweep_token(target_repo: str | None) -> str:
+    """A sweep-scope installation token for one managed repository, and nothing else.
+
+    Reads contents, pull requests and issues, and writes nothing: what the
+    broker presents to the forge API when it reads the outcome of the agent's
+    own proposals. Like `mint_read_only_token` it goes straight to Minty for
+    this one repository and installs nothing; the broker admits managed
+    repositories only before it runs this.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    org_name, repo_name = repository.split("/", 1)
+    token = request_minty_token(
+        broker_oidc_token(), org_name, [repo_name], MINTY_SWEEP_SCOPE
+    )
+    log(f"Minted a sweep installation token for repository: {repository}")
+    return token
+
+
 def mint_write_token(target_repo: str | None, host: str) -> dict:
     """A write installation token for one repository on a GitHub Enterprise Server host.
 
@@ -703,10 +734,12 @@ def mint_write_token(target_repo: str | None, host: str) -> dict:
     nothing. There is no CLI login, no credential helper and no file; the
     token goes back to the broker, which keeps it in memory.
 
-    The scope is widened to every managed repository of the same organisation
-    on the same host, as the write refresh widens it, so one token serves the
-    managed repositories a verb run may touch. Repositories on another host are
-    never in it.
+    The token covers the one repository asked for, as the write refresh's
+    does: the minter's policy for a managed repository names that repository
+    alone, so a request listing the organisation's other managed repositories
+    would be refused by the policy the key is read from. The broker caches
+    the token by the repositories it reports covering, so a verb run touching
+    two managed repositories mints twice.
     """
     repository = target_repo.strip().strip("/") if target_repo else ""
     if not repo_ref.is_github_slug(repository):
@@ -717,21 +750,9 @@ def mint_write_token(target_repo: str | None, host: str) -> dict:
     if not host or host in repo_ref.GITHUB_HOSTS:
         raise RuntimeError(f"{PRINT_WRITE_FLAG} mints for a GitHub Enterprise Server host, not {host or 'no host'}")
     org_name, repo_name = repository.split("/", 1)
-    repositories = [repo_name]
-    try:
-        from gitops_workspace import get_managed_repo_keys
-
-        prefix = f"github:{host}/{org_name.lower()}/"
-        for key in get_managed_repo_keys():
-            if key.startswith(prefix):
-                name = key[len(prefix):]
-                if "/" not in name and name not in {r.lower() for r in repositories}:
-                    repositories.append(name)
-    except Exception as e:
-        log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
-    token = request_minty_token(broker_oidc_token(), org_name, repositories, MINTY_WRITE_SCOPE)
+    token = request_minty_token(broker_oidc_token(), org_name, [repo_name], MINTY_WRITE_SCOPE)
     log(f"Minted a write installation token for repository {repository} on {host}")
-    return {"token": token, "repositories": [f"{org_name}/{r}".lower() for r in repositories]}
+    return {"token": token, "repositories": [repository.lower()]}
 
 
 class RefreshToken(str):
@@ -882,23 +903,24 @@ def refresh_git_credentials(
 
     oidc_token = broker_oidc_token()
 
-    # In a multi-repo deployment, scope the installation token to all managed
-    # repositories within this organization to avoid pod-wide token slot churn.
+    # One repository per token. The request used to list every managed
+    # repository of the organisation, so one token served a verb run that
+    # spanned several and the CLI's single login slot was not churned between
+    # them; the operator rendered the same list into every repository's minter
+    # policy to admit it, which made that ConfigMap quadratic in the
+    # repository count and unrenderable past the API server's object limit.
+    # Each policy now names its own repository alone, so a wider request is
+    # refused by the policy. The broker refreshes before every credentialed
+    # verb (`BrokeredCredential.ensure` -> `refresh_forge_credential`) and
+    # coalesces refreshes only while the last one covers the repository named,
+    # so a run that writes to two managed repositories refreshes on each
+    # switch, and two such verbs running at once can each install their own
+    # repository's token in the CLI's one slot while the other verb is still
+    # running. Serialising credentialed verbs per host, or handing each verb
+    # its own credential as the GitHub Enterprise Server path does, is the
+    # change that closes that; it is not made here.
     org_name, repo_name = repository.split("/", 1)
     repositories_to_scope = [repo_name]
-    try:
-        from gitops_workspace import get_managed_github_repos
-
-        for m in get_managed_github_repos():
-            if "/" in m:
-                m_org, m_repo = m.split("/", 1)
-                if (
-                    m_org.lower() == org_name.lower()
-                    and m_repo not in repositories_to_scope
-                ):
-                    repositories_to_scope.append(m_repo)
-    except Exception as e:
-        log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
 
     token = request_minty_token(
         oidc_token,
@@ -954,8 +976,8 @@ def refresh_git_credentials(
                 env=env,
             )
         # The identity note again on the last line: the sidecar keeps the tail
-        # of this output, and a long managed-repository list in the Minty line
-        # above would otherwise push the branch that minted out of its log.
+        # of this output, and the Minty line above would otherwise push the
+        # branch that minted out of its log.
         log(
             f"GitHub authentication successfully configured for repository: {repository}"
             + (f" (identity token {identity_note['minted']})" if identity_note["minted"] else "")
@@ -990,6 +1012,13 @@ def main():
         "stdout, installing nothing; the broker's clone of a context repository",
     )
     parser.add_argument(
+        SWEEP_FLAG,
+        action="store_true",
+        help="print a contents, pull-request and issue read installation token "
+        "for the repository on stdout, installing nothing; the broker's read of "
+        "the agent's own proposals in a managed repository",
+    )
+    parser.add_argument(
         PRINT_WRITE_FLAG,
         action="store_true",
         help="print a write installation token for the repository on a GitHub "
@@ -1000,6 +1029,9 @@ def main():
     try:
         if args.print_write_token:
             print(json.dumps(mint_write_token(args.repository, args.host)), end="")
+            return
+        if args.sweep:
+            print(mint_sweep_token(args.repository), end="")
             return
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")

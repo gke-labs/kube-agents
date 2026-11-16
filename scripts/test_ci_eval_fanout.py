@@ -8,8 +8,9 @@ out of the script, in the same style as test_ci_eval_trap.py:
   - the lock deadline: a holder that died without releasing must convert into
     a loud per-unit failure, never a silent spin `wait` can outlast;
   - lock mutual exclusion: two contenders never hold one lock at once;
-  - queue order: repetition-major, cost-descending within a repetition, so a
-    lane is never parked on the task lock of a unit launched seconds earlier
+  - queue order: case by case, cost-descending, each case's repetitions
+    together, so a deadline-cut night keeps whole cases (#3939); launch_units
+    holds a unit back while its task runs, so no lane parks on the task lock
     (the 2026-08-31 pool run paid two of four lanes for twelve minutes that
     way).
 
@@ -23,6 +24,7 @@ and only that unit -- grades and records the case, and a repetition that gave
 up on its lock leaves the case for the loop after the fan-out.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -59,6 +61,65 @@ def run_bash(body: str) -> subprocess.CompletedProcess:
         text=True,
         check=False,
     )
+
+
+class EvalLogDirTest(unittest.TestCase):
+    """EVAL_LOG_DIR is absolute and exists once the script's top has run: the
+    write runs in a subshell that cds into BENCH_DIR, the reads do not."""
+
+    def setup_lines(self) -> str:
+        src = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r'^EVAL_LOG_DIR="\$\{EVAL_LOG_DIR:-/tmp\}"\n.*?^readonly EVAL_LOG_DIR$', src, re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(match, "the EVAL_LOG_DIR setup block moved or changed shape")
+        return match.group(0)
+
+    def test_a_relative_directory_is_created_and_made_absolute(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            out = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+                cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": "logs", "CDPATH": ""},
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            self.assertEqual(os.path.realpath(os.path.join(cwd, "logs")), os.path.realpath(out))
+            self.assertTrue(os.path.isabs(out))
+            self.assertTrue(os.path.isdir(out))
+
+    def test_cdpath_does_not_redirect_a_relative_directory(self):
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as elsewhere:
+            os.mkdir(os.path.join(elsewhere, "logs"))
+            out = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+                cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": "logs", "CDPATH": elsewhere},
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertEqual(1, len(out.splitlines()), out)
+            self.assertEqual(os.path.realpath(os.path.join(cwd, "logs")), os.path.realpath(out.strip()))
+
+    def test_unset_keeps_tmp(self):
+        env = {k: v for k, v in os.environ.items() if k != "EVAL_LOG_DIR"}
+        out = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+            env=env, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(os.path.realpath("/tmp"), os.path.realpath(out))
+
+    def test_a_path_ending_in_a_newline_resolves_to_the_directory_mkdir_made(self):
+        # A plain substitution strips the newline and names "logs", which was
+        # never created, or names an unrelated "logs" that exists (#3394). cd
+        # drops a trailing "/" or "/.", so those values end pwd's path in a
+        # newline too. Values stay relative, so a regression writes inside cwd.
+        for value in ("logs\n", "logs\n/", "logs\n/."):
+            for existing in ([], ["logs"]):
+                with self.subTest(value=value, existing=existing), tempfile.TemporaryDirectory() as cwd:
+                    for name in existing:
+                        os.mkdir(os.path.join(cwd, name))
+                    out = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\nprintf "%s" "${EVAL_LOG_DIR}"'],
+                        cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": value, "CDPATH": ""},
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    self.assertEqual(os.path.realpath(os.path.join(cwd, "logs\n")), os.path.realpath(out))
+                    self.assertTrue(os.path.isdir(out))
 
 
 class LockTest(unittest.TestCase):
@@ -106,11 +167,11 @@ class LockTest(unittest.TestCase):
 
 
 class QueueOrderTest(unittest.TestCase):
-    def queue(self, reps: int) -> list[tuple[int, int, int]]:
+    def queue(self, reps: int, block: str = "UNIT_QUEUE", requesting: str = "") -> list[tuple[int, int, int]]:
         src = SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
+        match = re.search(rf'^{block}="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
         if match is None:  # pragma: no cover
-            raise AssertionError(f"UNIT_QUEUE block not found in {SCRIPT}")
+            raise AssertionError(f"{block} block not found in {SCRIPT}")
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
@@ -118,13 +179,16 @@ class QueueOrderTest(unittest.TestCase):
                 # (the inject lane's second phase); with the list unset every
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
+                lifted("case_repetitions"),
+                lifted("first_queued_rep"),
                 f"EVAL_REPETITIONS={reps}",
+                f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
                 'TASKS=("t/reliability-pdb-probe/task.yaml" "t/compliance-rbac-overgrant/task.yaml")',
                 'TASK_NAMES=(reliability-pdb-probe compliance-rbac-overgrant)',
                 match.group(0),
-                'printf "%s\\n" "${UNIT_QUEUE}"',
+                f'printf "%s\\n" "${{{block}}}"',
             ]
         )
         result = run_bash(body)
@@ -135,15 +199,21 @@ class QueueOrderTest(unittest.TestCase):
                 rows.append((int(rep), int(cost), int(idx)))
         return rows
 
-    def test_rep_major_then_cost_descending(self):
+    def test_case_major_cost_descending_then_rep_ascending(self):
         rows = self.queue(reps=3)
         self.assertEqual(len(rows), 6)
-        # All rep-1 units precede any rep-2 unit: a task's second repetition
-        # must not launch while its first plausibly still runs.
-        self.assertEqual([r for r, _, _ in rows], [1, 1, 2, 2, 3, 3])
-        # Within a repetition, the expensive unit launches first.
-        for pair in (rows[0:2], rows[2:4], rows[4:6]):
-            self.assertGreaterEqual(pair[0][1], pair[1][1])
+        # Every repetition of a case precedes the next case's first (#3939), so
+        # a deadline kill leaves whole cases graded; the expensive case first.
+        # launch_units, not the queue, keeps a task's next repetition from
+        # launching while its last still runs.
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
+        self.assertGreater(rows[0][1], rows[3][1])
+
+    def test_the_writers_queue_is_case_major_too(self):
+        # The second phase runs one unit at a time, so its queue order alone
+        # decides what a cut-off writers night keeps.
+        rows = self.queue(reps=3, block="UNIT_QUEUE_WRITERS", requesting="reliability-pdb-probe,compliance-rbac-overgrant")
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
 
 
 class DelegationCeilingTest(unittest.TestCase):
@@ -170,6 +240,10 @@ class DelegationCeilingTest(unittest.TestCase):
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
+            "gce-startup-script-failure",
+            "networking-world-open-ingress",
+            "obtainability-pdb-kustomize-overlay",
+            "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
@@ -239,6 +313,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "stream_note_count() { echo 1; }",
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
                 "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,
@@ -254,8 +329,9 @@ class PerCaseGradingTest(unittest.TestCase):
 
     run_one_unit writes its state files while it still holds the task lock
     and counts them there, so exactly one repetition sees the count reach
-    EVAL_REPETITIONS; finish_case then grades under one grading lock, prints
-    the block in one piece, and marks the case `.graded` only when the
+    EVAL_REPETITIONS; finish_case then grades under one grading lock, appends
+    the block to the grading artifact with a pointer line in the job log, and
+    marks the case `.graded` only when the
     grading produced its JSON. The loop after the fan-out grades what has no
     sentinel and the record step passes the manifest that keeps a case from
     being appended twice.
@@ -280,6 +356,8 @@ _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"; BENCH_DIR=/tmp
+# A private log directory, so runs that share the machine do not share rep logs.
+EVAL_LOG_DIR="$(mktemp -d)"
 EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1; EVAL_INFLIGHT_GRACE_SECONDS=300
 release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
@@ -290,8 +368,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The one constant the unit reads from the script's top: the base
             # of its per-unit inject port.
             lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
-            # The name the opening turn's timing is copied in under.
+            # The names the opening turn's timing and the reply's shape
+            # are copied in under.
             lifted_constant("EVAL_TIMING_FILE"),
+            lifted_constant("EVAL_SHAPE_FILE"),
             # The unit resolves the task file it hands the bench through
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
@@ -299,6 +379,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The count of finished repetitions the unit reads under its
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
+            lifted("case_repetitions"),
             lifted("skip_unit"),
             # What the unit does when the install is gone (#3129): the code
             # wait_platform_runs returns for it and the marker that latches it.
@@ -337,6 +418,21 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertIn('rep 1: {"turn1_s": 1.5}', result.stdout, result.stdout + result.stderr)
         self.assertIn("rep 2: none", result.stdout)
         self.assertIn('rep 3: {"turn1_s": 3.5}', result.stdout)
+
+    def test_the_replys_shape_lands_beside_each_repetitions_results(self):
+        """The same contract for KUBE_AGENTS_SHAPE_FILE: rep 2 delivered no
+        reply, so the harness wrote nothing, and its stale file stays out."""
+        runs = 'RUNS="$(mktemp -d)"; : > "${STATE_DIR}/case-x.rep2.shape.json"\n'
+        bench = (
+            'uv() { mkdir -p "${RUNS}/run_${rep}"; '
+            '[ "${rep}" = 2 ] || echo "{\\"bot_messages\\": ${rep}}" > "${KUBE_AGENTS_SHAPE_FILE}"; '
+            'echo "ran 1 task(s); results: ${RUNS}/run_${rep}/results.json"; }\n'
+        )
+        check = 'for r in 1 2 3; do echo "rep ${r}: $(cat "${RUNS}/run_${r}/shape.json" 2>/dev/null || echo none)"; done'
+        result = self.run_reps(runs + bench, check)
+        self.assertIn('rep 1: {"bot_messages": 1}', result.stdout, result.stdout + result.stderr)
+        self.assertIn("rep 2: none", result.stdout)
+        self.assertIn('rep 3: {"bot_messages": 3}', result.stdout)
 
     def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
         # Rep 2 never gets the task lock: no state file, so the count stops at
@@ -489,9 +585,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
     FINISH_STUBS = """
 lock_acquire() { echo "lock $(basename "$1")"; }
 lock_release() { echo "unlock $(basename "$1")"; }
-grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
+grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; echo "WARNING: $2: a bench-gate note" >&2; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
 record_case() { echo "  recorded $1: 3/3 -> store"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
+EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
 """
 
     def run_finish(self, grade_status: int) -> subprocess.CompletedProcess:
@@ -501,29 +598,75 @@ STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
             f"GRADE_STATUS={grade_status}",
             "finish_case ./tasks/x/task.yaml case-x",
             '[ -f "${STATE_DIR}/case-x.graded" ] && echo GRADED || echo NOT_GRADED',
+            'echo "GRADING_LOG=${EVAL_GRADING_LOG}"',
         ])
         return run_bash(body)
 
-    def test_a_graded_case_is_marked_recorded_and_printed_in_one_piece(self):
+    @staticmethod
+    def grading_log(out: str) -> str:
+        """What finish_case appended to the grading artifact, "" when nothing."""
+        path = re.search(r"^GRADING_LOG=(.*)$", out, re.MULTILINE).group(1)
+        return pathlib.Path(path).read_text() if os.path.exists(path) else ""
+
+    def test_a_graded_case_is_marked_recorded_and_its_block_goes_to_the_artifact(self):
         out = self.run_finish(0).stdout
         self.assertIn("GRADED", out)
-        self.assertLess(out.index("lock lock-grade"), out.index("Task case-x Result:"))
-        self.assertLess(out.index("Task case-x Result:"), out.index("  recorded case-x"))
-        self.assertLess(out.index("  recorded case-x"), out.index("unlock lock-grade"))
+        block = self.grading_log(out)
+        self.assertLess(block.index("Task case-x Result:"), block.index("  recorded case-x"))
+        # The job log gets the pointer, between the lock lines, and none of the detail.
+        pointer = "case-x: graded; its block is in eval-grading.log"
+        self.assertLess(out.index("lock lock-grade"), out.index(pointer))
+        self.assertLess(out.index(pointer), out.index("unlock lock-grade"))
+        self.assertNotIn("Task case-x Result:", out, "grading detail never reaches the public job log")
+        self.assertNotIn("recorded case-x", out)
+        # bench-gate's stderr is not grading detail: it stays on the job log.
+        self.assertIn("WARNING: case-x: a bench-gate note", self.run_finish(0).stderr)
+        self.assertNotIn("a bench-gate note", block)
 
     def test_a_grading_that_failed_is_left_for_the_loop_after_the_fan_out(self):
         out = self.run_finish(2).stdout
         self.assertIn("NOT_GRADED", out)
         self.assertIn("grading case-x inside the fan-out failed (status 2)", out)
         self.assertNotIn("recorded case-x", out)
+        self.assertNotIn("Task case-x Result:", out)
+        self.assertIn("Task case-x Result:", self.grading_log(out), "what the grading printed before failing is kept")
         self.assertIn("unlock lock-grade", out, "the throttle is released either way")
 
     def test_the_loop_after_the_fan_out_skips_what_the_fan_out_graded(self):
         src = SCRIPT.read_text(encoding="utf-8")
         loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
         self.assertIn('if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then', loop)
-        self.assertIn('grade_case "${TASK}" "${TASK_NAME}"', loop)
+        self.assertIn('grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" || {', loop)
+        self.assertNotIn('"${EVAL_GRADING_LOG}" 2>&1', loop, "stderr stays on the job log")
         self.assertIn('CASE_RESULTS+=(--case-result "${CASE_JSON}")', loop)
+
+    def test_grading_detail_reaches_the_job_log_nowhere(self):
+        """Every writer of grading detail -- `bench-gate case` through
+        grade_case, `bench-gate suite`'s table -- lands in EVAL_GRADING_LOG,
+        and the ledger lines that quote audit titles and token lifetimes go
+        the same way. The live job log of a public repository is served to
+        anyone by Deck; who reads the artifact is the bucket's IAM."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('cat "${block}" >> "${EVAL_GRADING_LOG}"', lifted("finish_case"))
+        self.assertIn('--json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?', src)
+        self.assertIn('sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"', lifted("reset_audit_ledgers"))
+        self.assertIn('expires ${minted##* }" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
+        self.assertEqual(src.count("uv run bench-gate case"), 1, "grade_case is the one caller; both of its call sites redirect")
+        # The table pointer is printed only when the table exists; a suite
+        # that died before writing it says so instead.
+        self.assertIn('if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then', src)
+        self.assertIn('WARNING: bench-gate suite exited ${SUITE_STATUS} without writing', src)
+        # The two sides of the artifact's name: the script writes it, the
+        # collector reads it; a rename on one side records every build with
+        # no tasks, and nothing else pins the pair.
+        from eval_dashboard import collect
+        name = re.search(r'^readonly EVAL_GRADING_LOG_FILE="([^"]+)"$', src, re.MULTILINE).group(1)
+        self.assertEqual(name, os.path.basename(collect.EVAL_GRADING_FILE))
+        # A grading the loop after the fan-out could not run still stops the
+        # job, and the job log says where its output went.
+        loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
+        self.assertIn('echo "ERROR: grading ${TASK_NAME} failed (status ${rc}); its output is in ${EVAL_GRADING_LOG_FILE}" >&2', loop)
+        self.assertIn('exit "${rc}"', loop)
 
     def test_both_record_calls_share_the_manifest(self):
         src = SCRIPT.read_text(encoding="utf-8")
@@ -617,9 +760,12 @@ class StateLockTest(unittest.TestCase):
     def state_lock(self, case: str) -> str:
         return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
 
-    def test_only_oobe_first_run_audits_is_exempt(self):
-        self.assertTrue(self.exempt("oobe-first-run-audits"))
-        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe"):
+    def test_only_the_listed_cases_are_exempt(self):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
+            with self.subTest(case=case):
+                self.assertTrue(self.exempt(case))
+        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe",
+                     "autoops-warning-event-triage"):
             with self.subTest(case=case):
                 self.assertFalse(self.exempt(case))
 
@@ -653,11 +799,11 @@ class StateLockTest(unittest.TestCase):
         self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
 
     def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
-        for case in ("oobe-first-run-audits",):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
-                own = main.index('KUBECONFIG="$kubeconfig_dir/config"')
+                own = re.search(r'KUBECONFIG="\$\w+/config"', main).start()
                 self.assertLess(own, main.index("get-credentials"))
                 self.assertLess(own, main.index("kubectl"))
 
@@ -691,13 +837,15 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
                 lifted("release_state_lock"),
-                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'ACQ_LOG="$(mktemp)"',
                 'lock_acquire() { echo "$(basename "$1")" >> "${ACQ_LOG}"; mkdir "$1" 2>/dev/null; }',
                 "unit_state_lock() { echo onboarding; }",
                 "state_lock_deadline() { echo 0; }",
@@ -706,7 +854,7 @@ class StateLockTest(unittest.TestCase):
                 f'( sleep {hold_state}; rmdir "${{STATE_DIR}}/lock-state-onboarding" ) &' if hold_state else ":",
                 'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && [ -d "${STATE_DIR}/lock-infra" ] && echo "BOTH"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" true 1 2>&1 | tail -1',
-                "cat /tmp/eval_case-x_rep1.log 2>/dev/null",
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log" 2>/dev/null',
                 'echo "INFRA_TRIES=$(grep -c lock-infra "${ACQ_LOG}")"',
                 'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
             ]
@@ -734,8 +882,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -744,7 +894,7 @@ class StateLockTest(unittest.TestCase):
                 'state_lock_deadline() { echo 1; }',
                 'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "HELD"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
-                'cat /tmp/eval_case-x_rep1.log',
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log"',
                 '[ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "LEFT" || echo "RELEASED"',
             ]
         )
@@ -776,14 +926,16 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
                 lifted("release_state_lock"),
                 lifted("release_streams"),
-                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'ACQ_LOG="$(mktemp)"',
                 'lock_acquire() { mkdir "$1" 2>/dev/null && echo "$(basename "$1")" >> "${ACQ_LOG}"; }',
                 "unit_state_lock() { echo onboarding; }",
                 "state_lock_deadline() { echo 0; }",
@@ -836,8 +988,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -846,7 +1000,7 @@ class StateLockTest(unittest.TestCase):
                 "export KUBECONFIG=/shared/config",
                 'uv() { echo "KUBECONFIG=${KUBECONFIG}"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
-                "cat /tmp/eval_case-x_rep1.log",
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log"',
                 'echo "AFTER=${KUBECONFIG}"',
             ]
         )

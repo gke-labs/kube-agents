@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented at playground posture
+- **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented; `next` is the default for a first `install.sh` install, and `today` is supported as a rollback for one release
 
 ## Purpose
 
@@ -24,10 +24,13 @@ One optional enum on `PlatformAgentSpec`, next to `Harness` and `Integration`:
 Mode *string `json:"mode,omitempty"`
 ```
 
-`mode: next` is a dev toggle, not a supported configuration. Same shape as the other
-opt-in toggles on this CRD: optional pointer field, nil-safe helper. The install surfaces
-can set it, and each one's default writes no field at all ("Choosing it at install",
-below). Naming note: the CRD already has a `mode` field on the
+`mode: next` is what a first install through `install.sh` runs; `today` is supported as a
+rollback for one release before stage 4 removes it. Same shape as the other opt-in toggles
+on this CRD: optional pointer field, nil-safe helper. The field carries no CRD default and
+absent stays `today`: the API server applies a structural-schema default whenever it reads a
+stored object, not only on create, so a default of `next` would move every existing install
+that never wrote the field. The new-install default lives in the install surfaces instead
+("Choosing it at install", below). Naming note: the CRD already has a `mode` field on the
 Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
 Different path, no schema collision - named here so nobody conflates them.
 
@@ -91,10 +94,12 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
 A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
 is torn down, with two objects kept so a later flip forward reuses them. The bus creds
 Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
-credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+credentials. The JetStream PVCs `data-<agent>-a2a-nats-<n>`, one per bus server, stay, because flipping a mode
 is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
 against a live install: it flips `next` to `today` and back, asserts the two keep their
-UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+UIDs and the agent answers on each side. A next-mode eval run on `main` runs it after its
+matrix, and the today lane runs it before its own with `ROLLBACK_END_MODE=today`, which flips
+back to `today` once more and grades `today`'s matrix on the rolled-back install.
 
 ## What the operator renders
 
@@ -116,8 +121,9 @@ UIDs and the agent answers on each side, and the next lane runs it after its mat
 
 One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
 the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
-section describes the design, not what this toggle turns on. Dev posture; don't run
-traffic that matters on it and expect audit to exist.
+section describes the design, not what this toggle turns on. A `next` install keeps bus
+traffic for 72 hours and no longer; that is a known limit of the new-install default until
+the exporter lands.
 
 The operator also writes the mode into the managed settings it already renders, as a
 single key: `KUBEAGENTS_MODE`. (Amended 8/26: the draft said
@@ -147,15 +153,28 @@ delivery mechanism can change later without touching call sites.
 
 ## Choosing it at install
 
-Every install surface can set the mode, and every one defaults to rendering no field, so
-an install that never asks renders the CR it did before the surfaces knew the field:
+Every install surface can set the mode. `install.sh` is the one whose first install
+defaults to `next`; the chart and the composition default to rendering no field, so an
+install made through them that never asks renders the CR it did before they knew the field.
+Neither can tell a first install from an upgrade without reading the cluster, and the chart
+rendered without one (`helm template`, Argo CD) would move an existing install:
 
 - The chart's `platformAgent.mode`, `null` by default, which leaves `mode` out of the CR
   (`""` does the same). `today` and `next` render as themselves; the values schema refuses
   anything else.
 - The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
   the chart nothing; `"next"` passes `platformAgent.mode: next`.
-- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`. When
+  neither the flag nor the file names a mode (`install.env.example` leaves the line commented
+  out), the target cluster decides: a live `PlatformAgent` keeps its mode (absent is `today`),
+  a deleted one whose release is still installed keeps the release's, and only a cluster with
+  neither is a first install, which records `next` (`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`),
+  or `today` when it mirrors its third-party images, since nothing points `next`'s NATS images at the mirror. A
+  cluster that cannot be described or read is never taken for a first install. `upgrade.sh`
+  and the other front doors read a file with no key as `today` (`DEFAULT_PLATFORM_AGENT_MODE`), so
+  `install.sh` records the mode it settled on there; under `-y` it refuses a switch that
+  neither `--mode` nor the file asked for, and a full `upgrade.sh` over a file with no key is
+  refused when the install may run `next`.
 
 A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
 passing `--mode`, which is refused when it disagrees with the file, and the run that
@@ -167,8 +186,8 @@ Flipping it with `kubectl patch` on the CR still works, and is how the dev insta
 predate the chart value run. Helm patches a custom resource from the difference between
 its renders, so while the chart value stays `null` a patched mode survives chart
 upgrades; a value set through the chart and later cleared removes the field again, which
-is `today`. The next lane's eval deploy (`hack/ci-deploy.sh`) sets the mode through the
-chart value, so its smoke exercises that route.
+is `today`. The eval deploy under `EVAL_MODE_NEXT=1` (`hack/ci-deploy.sh`) sets the mode
+through the chart value, so the merge-blocking presubmit exercises that route.
 
 ## Switches inside `next`
 
@@ -186,17 +205,17 @@ and that the flag is not a CRD field.
 
 A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
 `spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
-clusters. The operator names the session ServiceAccount on the credential broker's allowed
-callers, renders a session audience the broker maps to a role that reaches the exec route for
-`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
-and no other caller may present it, opens the broker's ingress and the session pod's egress to each
-other, and tells the gateway, whose spawner projects the audience-bound token and enables the
-worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
-broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
-with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
-data, as
+clusters. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
+session audience (`CREDENTIAL_PROXY_SESSION_AUDIENCE`) on both `<agent>-kube-proxy` and the
+credential broker, where the broker's `session` role reaches `/v1/exec` for `gcloud` only and no
+other caller may present that audience. It opens ingress and session egress to `<agent>-kube-proxy`
+(`:8443`) and the credential broker (`:8765`), and tells the gateway, whose spawner mounts
+`<agent>-kube-proxy-ca-bundle`, projects the audience-bound token, sets `KUBE_PROXY_*` and
+`CREDENTIAL_PROXY_*`, and enables the worker's shell. The session ServiceAccount gains no RBAC in
+either state; `kubectl` routes through `<agent>-kube-proxy` under its `read-only-dry-run` policy
+(`get`, `list`, `watch`, and `?dryRun=All` validation) with `Secret` value redaction, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
-says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
+describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
 widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
 between a person and that read is the gateway's ingress allowlist. That differs from the design of
 record ([architecture 02](../architecture/02-agent-personas.md) §2.4,

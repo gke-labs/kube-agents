@@ -305,7 +305,8 @@ def decide(runner, project="p", cluster="c", location="us-central1"):
     """Run the flag-only decision with a clean cache, no own-cluster identity in
     the environment, and stderr swallowed."""
     gke_endpoint.reset_cache()
-    scrubbed = {k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV}
+    scrubbed = {k: v for k, v in os.environ.items()
+                if k not in OWN_CLUSTER_ENV and k not in gke_endpoint.KUBE_PROXY_ENVS}
     with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), \
             redirect_stderr(io.StringIO()):
         return gke_endpoint.dns_endpoint_args(project, cluster, location, run=runner)
@@ -348,6 +349,47 @@ class PredicateTest(unittest.TestCase):
             }
         }
         self.assertEqual(decide(FakeRunner(shape)), [])
+
+
+class KubeProxySkipTest(unittest.TestCase):
+    """Under the kube-api proxy the endpoint flags never reach the kubeconfig, so
+    nothing is run to choose them."""
+
+    DESCRIBE = {"controlPlaneEndpointsConfig": {"dnsEndpointConfig": {"endpoint": "x.gke.goog", "allowExternalTraffic": True}}}
+
+    def flags_with(self, name, value, env=None):
+        runner = FakeRunner(describe=self.DESCRIBE)
+        gke_endpoint.reset_cache()
+        scrubbed = {k: v for k, v in os.environ.items() if k not in gke_endpoint.KUBE_PROXY_ENVS}
+        if name:
+            scrubbed[name] = value
+        with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), redirect_stderr(io.StringIO()):
+            return gke_endpoint.dns_endpoint_args("p", "c", "us-central1", env=env, run=runner), runner
+
+    def test_either_proxy_env_gives_no_flags_and_runs_nothing(self):
+        for name in gke_endpoint.KUBE_PROXY_ENVS:
+            with self.subTest(name):
+                flags, runner = self.flags_with(name, "https://kube-proxy.ns.svc.cluster.local:8443")
+                self.assertEqual(flags, [])
+                self.assertEqual(runner.calls, [])
+
+    def test_without_it_the_flags_are_chosen_as_before(self):
+        flags, runner = self.flags_with(None, "")
+        self.assertEqual(flags, [gke_endpoint.DNS_ENDPOINT_FLAG])
+        self.assertTrue(runner.describe_calls)
+
+    def test_an_empty_value_or_an_unexpanded_placeholder_is_not_the_proxy(self):
+        # Hermes hands an MCP server the literal `${NAME}` for an unset variable,
+        # which is what platform_control gets under an operator older than the env.
+        for value in ("  ", "${KUBE_PROXY_IN_USE_URL}"):
+            with self.subTest(value):
+                flags, runner = self.flags_with("KUBE_PROXY_IN_USE_URL", value)
+                self.assertEqual(flags, [gke_endpoint.DNS_ENDPOINT_FLAG])
+                self.assertTrue(runner.describe_calls)
+
+    def test_a_passed_env_is_read_rather_than_the_process_env(self):
+        flags, runner = self.flags_with(None, "", env={"KUBE_PROXY_IN_USE_URL": "https://kube-proxy.ns.svc.cluster.local:8443"})
+        self.assertEqual((flags, runner.calls), ([], []))
 
 
 class DegradesQuietlyTest(unittest.TestCase):
@@ -521,17 +563,17 @@ class CacheTest(unittest.TestCase):
     def test_the_answer_is_re_read_once_it_expires(self):
         """The remedy this repository documents has to be able to take effect.
 
-        The `gke-networking` footer tells the agent to run `clusters update
-        --enable-dns-access` when a cluster's endpoint refuses external traffic,
-        and the MCP server and the credential proxy both outlive any number of
-        such changes. An answer kept for the life of the process would make the
-        remedy look like it did nothing.
+        The `gke-networking` footer tells the agent to propose turning on
+        `dnsEndpointConfig.allowExternalTraffic` when a cluster's endpoint
+        refuses external traffic, and the MCP server and the credential proxy
+        both outlive any number of such changes landing. An answer kept for
+        the life of the process would make the remedy look like it did nothing.
         """
         runner = FakeRunner(DNS_INTERNAL_ONLY)
         gke_endpoint.reset_cache()
         with expired_cache(), redirect_stderr(io.StringIO()):
             self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
-            runner.describe = DNS_EXTERNAL  # the operator ran --enable-dns-access
+            runner.describe = DNS_EXTERNAL  # the pull request landed
             self.assertEqual(
                 gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
                 ["--dns-endpoint"],
@@ -539,7 +581,7 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(len(runner.describe_calls), 2)
 
     def test_the_reverse_change_is_picked_up_too(self):
-        # --no-enable-dns-access, the reversal. Keeping the flag past it means a
+        # allowExternalTraffic turned back off. Keeping the flag past it means a
         # kubeconfig whose every request comes back 403.
         runner = FakeRunner(DNS_EXTERNAL)
         gke_endpoint.reset_cache()

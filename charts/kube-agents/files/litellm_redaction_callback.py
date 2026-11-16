@@ -36,7 +36,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
 from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("kube_agents.litellm_redaction")
@@ -100,12 +99,12 @@ _configure_logger()
 
 
 def load_rules(config_path: str) -> List[RedactionRule]:
-    """Read the rendered config and build the rule list; raise on any defect."""
-    with open(config_path, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"{config_path} must hold a mapping, not {type(config).__name__}")
-    return AuditRedactor.rules_from_config(config)
+    """Read the rendered config and build the rule list; raise on any defect.
+
+    The loader is ``AuditRedactor.rules_from_file``, shared with the agent
+    image's on-disk redaction, so both read the same file the same way.
+    """
+    return AuditRedactor.rules_from_file(config_path)
 
 
 def _config_path_from_env() -> str:

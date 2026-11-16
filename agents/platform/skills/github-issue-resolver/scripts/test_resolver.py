@@ -635,10 +635,12 @@ class HandlePollTest(ResolverTest):
     def test_the_forge_is_asked_to_skip_the_ledgers_other_jobs_own(self):
         """The exclusion is a filter the forge applies, not a page this filters.
 
-        `agent:audit` is the fleet-audit ledger and `agent:delivery-watch` is
+        `agent:audit` is the fleet-audit ledger, `agent:delivery-watch` is
         `chat_delivery_watch.py`'s ledger of scheduled reports that stopped
-        reaching chat; both are edited and closed by their owner alone, and a
-        resolver turn on either corrupts a report that is not its own.
+        reaching chat, and `agent:onboarding` is the first-run inventory report
+        `bootstrap_delivery.py` filed when no chat thread took it; each is a
+        record its owner keeps, and a resolver turn on any of them corrupts a
+        report that is not its own.
 
         Asserted twice on purpose: once on the payload, because a page-side
         filter would read a repository with a full page of claimed issues as a
@@ -655,12 +657,14 @@ class HandlePollTest(ResolverTest):
                     issue(5, labels=["status:resolved"]),
                     issue(6, labels=["status:escalation-needed"]),
                     issue(7, labels=["bug"]),
+                    issue(8, labels=["agent:onboarding"]),
                 ]
             }
         )
         payload, _ = self.poll(forge=forge)
         asked = forge.payloads("issue-list")[-1]
         self.assertEqual(asked["excludeLabels"], resolver.SKIP_LABELS)
+        self.assertIn("agent:onboarding", asked["excludeLabels"])
         self.assertEqual(payload["issue_number"], 7)
 
     def test_the_poll_ranks_over_a_window_wider_than_one_page(self):
@@ -866,6 +870,104 @@ class HandlePollTest(ResolverTest):
         # Two different messages: the generic line, with each one beside it.
         self.assertEqual(payload["error"], "every managed repository refused the listing")
         self.assertIn("acme/one", payload["errors"]["acme/one"])
+
+
+class NoIssueTrackerForge(FakeForge):
+    """A repository on a forge with proposals and no issue tracker or labels.
+
+    Every issue and label verb on `untracked` is refused as the broker refuses
+    a verb its forge does not serve, and `capabilities` says what it has.
+    """
+
+    def __init__(self, untracked, capabilities=None, **kwargs):
+        super().__init__(**kwargs)
+        self.untracked = set(untracked)
+        self.answer = capabilities or {"forge": "bitbucket", "verbs": ["proposal-list"], "labels": False, "missing": []}
+
+    def __call__(self, verb, payload):
+        repo = payload.get("repository")
+        if repo in self.untracked and (verb.startswith("issue-") or verb == "label-ensure"):
+            self.calls.append((verb, payload))
+            raise vcs_client.VcsError(f"no {verb} here", code="FORGE_UNSUPPORTED")
+        return super().__call__(verb, payload)
+
+    def _capabilities(self, repo, payload):
+        return dict(self.answer) if repo in self.untracked else {"verbs": ["issue-list", "issue-view", "issue-comment", "issue-update"], "labels": True}
+
+
+class SkipLabelsTest(unittest.TestCase):
+    def test_the_onboarding_report_label_is_skipped(self):
+        """bootstrap_delivery.py files the first-run report under REPORT_ISSUE_LABEL; the poll
+        must not take that issue. Read from the source: the two scripts share no import path."""
+        import ast
+
+        source = Path(resolver.__file__).resolve().parents[4] / "chat" / "scripts" / "bootstrap_delivery.py"
+        self.assertTrue(source.is_file(), f"expected the delivery stage at {source}")
+        label = None
+        for node in ast.parse(source.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "REPORT_ISSUE_LABEL" for t in node.targets
+            ):
+                label = ast.literal_eval(node.value)
+        self.assertIsInstance(label, str, f"no REPORT_ISSUE_LABEL assignment in {source}")
+        self.assertIn(label, resolver.SKIP_LABELS)
+
+
+class UntrackedRepositoryTest(ResolverTest):
+    """A forge with no issue tracker has nothing to poll, and that is not a fault."""
+
+    def setUp(self):
+        resolver._NO_TRACKER.clear()
+        self.addCleanup(resolver._NO_TRACKER.clear)
+
+    def test_the_stale_sweep_prints_no_fault_for_an_untracked_repository(self):
+        forge = NoIssueTrackerForge({"ws/infra"})
+        self.poll(forge=forge, repos=("ws/infra",))
+        self.assertNotIn("sweep skipped", self.stderr)
+        self.assertEqual(1, self.forge.verbs().count("capabilities"))
+
+    def test_a_mixed_fleet_that_refused_says_which_repositories_had_no_tracker(self):
+        forge = NoIssueTrackerForge(
+            {"ws/infra"}, refuse={"a/one": "FORGE_NOT_FOUND", "b/two": "FORGE_FORBIDDEN"}
+        )
+        payload, code = self.poll(forge=forge, repos=("a/one", "b/two", "ws/infra"))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+        self.assertIn("with an issue tracker", payload["error"])
+
+    def test_a_repository_with_no_tracker_is_named_and_not_refused(self):
+        forge = NoIssueTrackerForge(
+            {"ws/infra"}, issues={"acme/toolkit": [issue(12, title="work", body="d")]}
+        )
+        payload, code = self.poll(forge=forge, repos=("ws/infra", "acme/toolkit"))
+        self.assertIsNone(code)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(payload["unreachable_repos"], [])
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+
+    def test_only_untracked_repositories_is_a_quiet_poll(self):
+        forge = NoIssueTrackerForge({"ws/infra"})
+        payload, code = self.poll(forge=forge, repos=("ws/infra",))
+        self.assertIsNone(code)
+        self.assertEqual(payload["status"], "NO_ISSUES")
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+
+    def test_an_unserved_host_stays_a_refusal(self):
+        forge = NoIssueTrackerForge({"gitlab.com/acme/infra"}, capabilities={"forge": "gitlab", "verbs": [], "labels": False, "missing": ["no credential is configured for gitlab.com"]})
+        payload, code = self.poll(forge=forge, repos=("gitlab.com/acme/infra",))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], "FORGE_UNSUPPORTED")
+
+    def test_capabilities_that_cannot_be_read_keep_the_refusal(self):
+        forge = NoIssueTrackerForge({"ws/infra"}, refuse={"capabilities": "FORGE_CALL_FAILED"})
+        payload, code = self.poll(forge=forge, repos=("ws/infra",))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], "FORGE_UNSUPPORTED")
+
+    def test_a_forge_with_a_tracker_answers_exactly_as_before(self):
+        payload, _ = self.poll()
+        self.assertNotIn("untracked_repos", payload)
+        self.assertNotIn("capabilities", self.forge.verbs())
 
 
 class SweepStaleIssuesTest(ResolverTest):
@@ -1428,8 +1530,8 @@ class SanitizerCoverageTest(unittest.TestCase):
         The cases are read out of that file rather than restated here. An
         earlier version of this test asserted a hardcoded list of eight
         framings, which made its name a promise it did not keep: a marker added
-        to the canonical copy tomorrow left it green. `SanitizerMirrorDriftTest`
-        below does the same job for `_is_safe_char`.
+        to the canonical copy tomorrow left it green. `SharedTextFilterTest`
+        below checks that the character filter is the shared module's.
 
         Asserted as "the sanitizer changed it" rather than as a specific
         replacement: `<untrusted_pod_diagnostics>` is covered by the boundary-tag
@@ -1480,49 +1582,21 @@ class SanitizerCoverageTest(unittest.TestCase):
                 )
 
 
-class SanitizerMirrorDriftTest(unittest.TestCase):
-    def test_is_safe_char_matches_the_platform_mcp_server_copy(self):
-        """The two `_is_safe_char` definitions must stay one function.
+class SharedTextFilterTest(unittest.TestCase):
+    def test_the_sanitizer_uses_the_shared_text_filter(self):
+        """One filter for every path to the model: pod diagnostics, issue text, memory text.
 
-        `platform_mcp_server.py` holds the canonical copy; this script mirrors
-        it because importing that module means importing `mcp`,
-        `agent_common_server` and `gke_endpoint` and constructing an MCP
-        server as a side effect. A mirror nobody checks is how the two drift,
-        and a character class stripped on one path but not the other is a hole
-        in whichever side forgot. The Unicode tag block is the standard
-        invisible-ASCII smuggling vector, and an issue body carrying it reaches
-        the same model as a pod log carrying it.
-
-        Compared as parsed syntax rather than as text, so comments and
-        formatting may differ (they do) while the logic may not.
+        The copy this script used to carry drifted from the memory plugin's by three
+        code points; the shared module ends that class of hole.
         """
-        import ast
+        import untrusted_text
 
-        def _definition(path: Path) -> str:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "_is_safe_char":
-                    # Strip the docstring: prose is allowed to differ.
-                    body = node.body
-                    if (
-                        body
-                        and isinstance(body[0], ast.Expr)
-                        and isinstance(body[0].value, ast.Constant)
-                        and isinstance(body[0].value.value, str)
-                    ):
-                        body = body[1:]
-                    return "\n".join(ast.dump(n) for n in body)
-            raise AssertionError(f"_is_safe_char not found in {path}")
-
-        here = Path(resolver.__file__).resolve()
-        canonical = here.parents[3] / "scripts" / "platform_mcp_server.py"
-        self.assertTrue(canonical.is_file(), f"expected canonical copy at {canonical}")
-        self.assertEqual(
-            _definition(here),
-            _definition(canonical),
-            "resolver.py's _is_safe_char has drifted from platform_mcp_server.py's; "
-            "update both or neither",
-        )
+        self.assertIs(resolver.untrusted_text, untrusted_text)
+        self.assertFalse(hasattr(resolver, "_is_safe_char"))
+        for ch in ("\u2028", "\u2029", "\u2800", "\u200b", "\U000e0041", "\x9f"):
+            with self.subTest(ch=repr(ch)):
+                self.assertNotIn(ch, resolver.sanitize_untrusted_text(f"a{ch}b"))
+        self.assertEqual(resolver.sanitize_untrusted_text("a\u2028b"), "ab")
 
 
 class RepoValidationTest(unittest.TestCase):

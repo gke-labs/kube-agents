@@ -25,6 +25,7 @@ import functools
 import json
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
@@ -191,6 +193,14 @@ SOURCES: dict[str, Source] = {
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
          "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
+    "kube_proxy_manifests_go": Source(
+        "k8s-operator/internal/controller/kube_proxy_manifests.go",
+        ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+    ),
+    "k8s_api_proxy_main_go": Source(
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
+    ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("DefaultPlatformAgentVersion",),
@@ -203,8 +213,15 @@ SOURCES: dict[str, Source] = {
         # (system:auth-delegator), and A4 is once again a statement about how
         # that bind is bounded rather than about its absence. Deleting the
         # scoping is the mutation this anchor exists to make loud.
+        #
+        # "kind: Role" is the second document: the operator's write verbs on
+        # every namespaced kind it renders, rendered as a namespaced Role by
+        # the markers that carry `namespace=`. C5 asserts the ClusterRole
+        # grants no write verb on any of them,
+        # and that assertion is vacuous the day the Role document disappears
+        # with the grant moved back.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings", "resourceNames"),
+        ("clusterrolebindings", "resourceNames", "kind: Role"),
     ),
     # The other Role a kustomize install ships. role.yaml is the operator's
     # ClusterRole and was for a long time the only RBAC A4 read; this one is
@@ -221,7 +238,9 @@ SOURCES: dict[str, Source] = {
         # is anchored too because it is the chart's RBAC object OUTSIDE that
         # block -- the one `make chart-sync` does not manage and a
         # block-scoped parse never reached.
-        ("END GENERATED RULES", "operator-leader-election-role"),
+        # The namespaced block is the chart's copy of role.yaml's Role
+        # document (the write verbs on every rendered kind); C5 reads it.
+        ("END GENERATED RULES", "operator-leader-election-role", "END GENERATED NAMESPACED RULES"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -230,6 +249,27 @@ SOURCES: dict[str, Source] = {
     "chart_admission_policy": Source(
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
+    ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
+    ),
+    # C1 reads the guard on the hindsight-postgresql NetworkPolicy, the only
+    # thing between a passwordless Postgres and the namespace. The template
+    # carries multi-line Helm comments, which helm_documents() cannot read, so
+    # the test slices the policy's block by these anchors instead.
+    "chart_hindsight": Source(
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "$postgresqlNetworkPolicy :=",
+            "{{- if $postgresqlNetworkPolicy }}",
+            "name: hindsight-postgresql",
+            "POSTGRES_HOST_AUTH_METHOD",
+        ),
     ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
@@ -243,6 +283,17 @@ SOURCES: dict[str, Source] = {
     "golden_default": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
+    ),
+    # The settled fixture: the default CR reconciled until nothing changes,
+    # so it carries what later passes add (the A2A gateway Deployment and the
+    # bridge's activity hook) beside the roles every golden renders for the
+    # A2A stack. Not in _GOLDEN_KEYS: the first-pass invariants that walk
+    # those (one `-gateway` Deployment, say) don't hold for it, so a test that
+    # wants it reads it by name.
+    "golden_settled": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-settled.yaml",
+        ("name: platformagent-a2a-gateway", "name: platformagent-a2a-callout"),
     ),
     "golden_scoped_sa": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
@@ -259,15 +310,24 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
-    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
-    # because that rule is the only reason the fixture is registered here:
-    # every other golden is single-replica and renders it away, so without
-    # this key group C bounds the leader Role only in the shape where it holds
-    # no write verb on pods at all.
+    # The CR that asks for availability.replicas: 3. The operator caps the
+    # gateway at one replica, so this renders the single-replica shape: the
+    # gateway Deployment on Recreate and a leader Role holding leases only.
+    # No golden renders the leader Role's pods rule any more, because no
+    # install does. It stays registered so group C's bounds keep reading the
+    # one CR that would render that rule if the cap were lifted. The last
+    # anchor is the cap: it is the gateway Deployment's own selector label
+    # followed by its strategy, because a bare `type: Recreate` also matches
+    # the credential-proxy Deployment, which is always on Recreate. Losing it
+    # means the multi-replica shape is back and this key's comment is wrong.
     "golden_ha": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-ha.yaml",
-        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+        (
+            "kind: Deployment",
+            "kubeagents:leader:",
+            "app: platformagent-gateway\n  strategy:\n    type: Recreate",
+        ),
     ),
     # C1's cross-module pair. The session fence is rendered by the operator
     # (Go module k8s-operator) and its selector has to match the labels the
@@ -281,7 +341,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next. The anchors are the collector's namespace and
+    # golden arms both doors (the door flags are operator env, unset when the
+    # goldens render). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(
@@ -371,18 +432,26 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
     ),
-    # The broker's shim, which the worker image carries as kubectl/gcloud and
-    # the spawner configures through three env names it spells itself.
+    # The broker's shim, which the worker image carries as gcloud (alongside
+    # stock kubectl wired to kube-proxy) and the spawner configures through env
+    # names it spells itself.
     "credential_proxy_client": Source(
         "agents/platform/scripts/credential_proxy_client.py",
-        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME", "KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT"),
     ),
     # The gateway's env contract with the operator (module a2a reading what
     # module k8s-operator renders). C1 pins the cluster-view names across the
-    # boundary; the anchors are the two names and a long-standing neighbour.
+    # boundary; the anchors are the cluster-view names and a long-standing neighbour.
     "a2a_gateway_config": Source(
         "a2a/gateway/config.go",
-        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+        (
+            "A2A_DEFAULT_ADDRESSEE",
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target
     # check a session's delegation is held to. The names cross the module
@@ -440,6 +509,14 @@ SOURCES: dict[str, Source] = {
     # file also holds one half of a contract neither module can import: the
     # operator renders an env var naming the agent's principal, and the `a2a`
     # CLI reads it back to pin its inbox prefix.
+    # The AgentProfile dispatcher's identity is built in its own file. It
+    # authenticates through the callout, so it is in no served config, and
+    # its publish list is appended to a per-profile slice that the identity
+    # reader above can't parse; the writer tests read its body directly.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
+    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -468,13 +545,14 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+        ("func sessionGrants", "func executorGrants", "func executorTaskGrants", "lib.TaskEventsSubject(addressee,"),
     ),
-    # The other narrowing that starts from executorGrants: an AgentProfile's
-    # pods (the A2A profile resource, not a Hermes profile directory).
+    # The other narrowing that starts from executorTaskGrants: an
+    # AgentProfile's pods (the A2A profile resource, not a Hermes profile
+    # directory), on the task connection a task credential opens (#3889).
     "a2a_profile_grants": Source(
         "a2a/authcallout/profile_narrowing.go",
-        ("func profileGrants", "executorGrants(profile, pod)"),
+        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, stem)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what
@@ -579,7 +657,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", 'required := []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the
@@ -630,6 +708,32 @@ SOURCES: dict[str, Source] = {
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
+    "tse_config": Source(
+        "agents/tse/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    # --- the tool-call audit ---------------------------------------------
+    # D1 reads that every profile config enables tool_call_audit. The Planning
+    # Agent's config is the one the image ships as the default profile. A
+    # Cluster Agent profile copies the shared plugins tree when it is
+    # scaffolded, and the image fills that tree from agents/chat/defaults/, so
+    # these anchors pin that the plugin a Cluster Agent enables is there to load.
+    "chat_config": Source("agents/chat/config.yaml", ("plugins:",)),
+    "tool_call_audit_manifest": Source(
+        "agents/chat/defaults/plugins/tool_call_audit/plugin.yaml",
+        ("name: tool_call_audit",),
+    ),
+    "cluster_agent_profile": Source(
+        "agents/platform/scripts/cluster_agent_profile.py",
+        (
+            'SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))',
+            "overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR",
+        ),
+    ),
+    "dockerfile_shared_plugins": Source(
+        "deploy/docker/Dockerfile",
+        ("COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/",),
+    ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(
         "deploy/docker/Dockerfile",
@@ -637,6 +741,7 @@ SOURCES: dict[str, Source] = {
             "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
             "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
             "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+            "COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/",
         ),
     ),
     # --- supply chain -----------------------------------------------------
@@ -744,6 +849,20 @@ def site_pages() -> list[Path]:
 
 _HELM_DIRECTIVE = re.compile(r"^\s*\{\{-?.*-?\}\}\s*$")
 
+# A rendered chart, for the assertions a text read of a template cannot make:
+# `helm_documents` drops every template line, so a `range` collapses to one
+# object and rules that arrive through an `include` vanish. The release name
+# and namespace are the install defaults; the three harness values are the
+# ones the chart's schema requires before it renders at all.
+HELM_CHART_DIR = "charts/kube-agents"
+HELM_RELEASE_NAME = "kube-agents"
+HELM_RENDER_NAMESPACE = "kubeagents-system"
+HELM_REQUIRED_SETS = (
+    "platformAgent.harness.clusterName=ci-cluster",
+    "platformAgent.harness.location=us-central1",
+    "platformAgent.harness.projectId=ci-project",
+)
+
 
 @functools.lru_cache(maxsize=None)
 def yaml_documents(name: str) -> tuple[dict, ...]:
@@ -799,6 +918,27 @@ def helm_documents(name: str) -> tuple[dict, ...]:
     )
     body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
+@functools.lru_cache(maxsize=None)
+def helm_rendered(*sets: str) -> tuple[dict, ...]:
+    """Every object `helm template` renders for the chart, with `sets` as extra `--set` values.
+
+    The rendered form, where the text reader above cannot see: a Role rendered
+    once per namespace from a `range`, or rules that come through an `include`.
+    Raises rather than returning () when helm is missing or refuses the values,
+    so a test asserting on the render never passes on nothing.
+    """
+    command = ["helm", "template", HELM_RELEASE_NAME, str(REPO_ROOT / HELM_CHART_DIR), "-n", HELM_RENDER_NAMESPACE]
+    for value in (*HELM_REQUIRED_SETS, *sets):
+        command += ["--set", value]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(f"helm template failed ({proc.returncode}): {proc.stderr.strip()}")
+    documents = tuple(d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict))
+    if not documents:
+        raise AssertionError("helm template rendered no object; the chart is empty or the values gate everything off")
+    return documents
 
 
 def golden_documents() -> dict[str, tuple[dict, ...]]:

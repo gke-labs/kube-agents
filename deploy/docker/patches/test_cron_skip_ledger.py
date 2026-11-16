@@ -391,7 +391,7 @@ class ReasonTest(unittest.TestCase):
         for code in (SKIP_CREATE_EXECUTION_FAILED, SKIP_FIRE_CLAIM_LOST):
             self.assertIn(code, SKIP_REASONS)
             self.assertEqual(normalize_reason(code), code)
-        self.assertEqual(len(SKIP_REASONS), 7)
+        self.assertEqual(len(SKIP_REASONS), 8)
 
     def test_an_empty_reason_becomes_unspecified_rather_than_null(self):
         for value in (None, "", "   "):
@@ -473,6 +473,7 @@ from apply_cron_skip_ledger import (  # noqa: E402
     HEALTH_IMPORT,
     HEALTH_STATUSES,
     JOBS_CATCH_UP,
+    JOBS_GRACE,
     PATCHES,
     SCHED_CREATE_EXECUTION_ERR,
     SCHED_DISPATCH_CLAIM,
@@ -535,7 +536,8 @@ FAKE_SCHEDULER = (
 # whose ``return False`` is the fire-once-now fall-through.
 FAKE_JOBS = (
     "import logging\n\nlogger = logging.getLogger(__name__)\n\n\n"
-    "def _fast_forward_missed_recurring(d, grace):\n"
+    + JOBS_GRACE
+    + "\n\ndef _fast_forward_missed_recurring(d, grace):\n"
     "    if True:\n        return False\n"
     + JOBS_CATCH_UP
 )

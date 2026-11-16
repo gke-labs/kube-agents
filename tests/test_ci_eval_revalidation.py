@@ -14,7 +14,7 @@ override plugin's, one pull of a batch without a verdict, the escape hatch
 -- must fall through to a full run.
 
 The script is copied into a fixture checkout (with the mint module beside
-it) and sourced, then executed with `gsutil` stubbed, GitHub faked by a
+it) and sourced, then executed with `gcloud` stubbed, GitHub faked by a
 `sitecustomize` that replaces urlopen for every python the script runs, and
 the fixture git repository standing in for the decorated checkout, so these
 assertions are against the code that ships.
@@ -48,7 +48,7 @@ _JOB = "pull-kube-agents-smoke-test"
 _PROW_BOT = "google-oss-prow[bot]"
 _ADMIN = "alice"
 _OVERRIDE_URL = f"https://github.com/gke-labs/kube-agents/pull/{_PR}#issuecomment-1"
-_SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+_BUILD_URL = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 
 # Printed by the wrapper before it sources the script, whose constants read
 # JOB_NAME as they load, so a test can pin whether the variable was absent
@@ -59,30 +59,31 @@ _JOB_NAME_PROBE = 'if [ -n "${JOB_NAME+x}" ]; then echo "JOB_NAME: set"; else ec
 _JOB_NAME_SET = "JOB_NAME: set"
 _JOB_NAME_ABSENT = "JOB_NAME: absent"
 
-_GSUTIL_STUB = """#!/usr/bin/env bash
-# gsutil stub: `ls` prints the fixture listing for the PR named in the glob
-# (GSUTIL_LS_DIR/<pr>.txt, else it fails like a no-match glob), `cat` serves
-# "<build>.<file>" out of GSUTIL_OBJECT_DIR.
-# Every call is appended to GSUTIL_CALL_LOG so a test can pin WHICH history
+_GCLOUD_STUB = """#!/usr/bin/env bash
+# gcloud stub, its `storage` group only: `ls` prints the fixture listing for
+# the PR named in the glob (GCLOUD_LS_DIR/<pr>.txt, else it fails like a
+# no-match glob), `cat` serves "<build>.<file>" out of GCLOUD_OBJECT_DIR.
+# Every call is appended to GCLOUD_CALL_LOG so a test can pin WHICH history
 # the script read -- reading another PR's (or another job's) records would
 # reuse a foreign verdict while every content assertion still passed.
-cmd="$1"; shift
-if [ -n "${GSUTIL_CALL_LOG:-}" ]; then
-  echo "${cmd} $*" >> "${GSUTIL_CALL_LOG}"
+[ "$1" = "storage" ] || exit 1
+cmd="$2"; shift 2
+if [ -n "${GCLOUD_CALL_LOG:-}" ]; then
+  echo "${cmd} $*" >> "${GCLOUD_CALL_LOG}"
 fi
 case "${cmd}" in
   ls)
     pr="$(printf '%s' "$1" | sed -n 's|.*/gke-labs_kube-agents/\\([0-9]*\\)/.*|\\1|p')"
-    if [ -n "${GSUTIL_LS_DIR:-}" ] && [ -f "${GSUTIL_LS_DIR}/${pr}.txt" ]; then
-      cat "${GSUTIL_LS_DIR}/${pr}.txt"
+    if [ -n "${GCLOUD_LS_DIR:-}" ] && [ -f "${GCLOUD_LS_DIR}/${pr}.txt" ]; then
+      cat "${GCLOUD_LS_DIR}/${pr}.txt"
     else
-      echo "CommandException: One or more URLs matched no objects." >&2
+      echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2
       exit 1
     fi
     ;;
   cat)
     build="$(basename "$(dirname "$1")")"
-    object="${GSUTIL_OBJECT_DIR}/${build}.$(basename "$1")"
+    object="${GCLOUD_OBJECT_DIR}/${build}.$(basename "$1")"
     [ -f "${object}" ] || exit 1
     cat "${object}"
     ;;
@@ -197,11 +198,11 @@ class RevalidationTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
 
-        # The stub gsutil, first on PATH; the fake GitHub, first on PYTHONPATH.
+        # The stub gcloud, first on PATH; the fake GitHub, first on PYTHONPATH.
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        stub = self.bin / "gsutil"
-        stub.write_text(_GSUTIL_STUB)
+        stub = self.bin / "gcloud"
+        stub.write_text(_GCLOUD_STUB)
         stub.chmod(0o755)
         self.pysite = self.tmp / "pysite"
         self.pysite.mkdir()
@@ -282,7 +283,7 @@ class RevalidationTest(unittest.TestCase):
         status_events = {}
         for build_id, passed, base_sha, head_sha in builds:
             listing.append(
-                f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}/finished.json"
+                f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}/finished.json"
             )
             if passed is not None:
                 revision = f', "revision": "{head_sha}"' if head_sha else ""
@@ -305,7 +306,7 @@ class RevalidationTest(unittest.TestCase):
                     {
                         "context": _JOB,
                         "state": "success",
-                        "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}",
+                        "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}",
                     }
                 )
         for head_sha, events in status_events.items():
@@ -338,7 +339,7 @@ class RevalidationTest(unittest.TestCase):
         overrode, and crier's report of the override ProwJob with the BaseSHA
         suffix and the comment URL."""
         return [
-            self._override_event(when=when, pr=pr, url=f"{_SPYGLASS}/{pr}/{_JOB}/900"),
+            self._override_event(when=when, pr=pr, url=f"{_BUILD_URL}/{pr}/{_JOB}/900"),
             self._override_event(when=when, pr=pr, description=f"Overridden by {_ADMIN}                  BaseSHA:{self.c5}"),
         ]
 
@@ -350,7 +351,7 @@ class RevalidationTest(unittest.TestCase):
             "state": state,
             "creator": {"login": creator},
             "description": f"{description}                    BaseSHA:{self.c5}",
-            "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build}",
+            "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build}",
             "created_at": when,
         }
 
@@ -365,6 +366,7 @@ class RevalidationTest(unittest.TestCase):
         "JOB_TYPE",
         "PULL_REFS",
         "EVAL_SKIP_REVALIDATION",
+        "EVAL_REVALIDATION_NOT_BEFORE",
         "EVAL_LEDGER_APP_KEY_FILE",
         "EVAL_LEDGER_APP_ID",
         "EVAL_LEDGER_INSTALLATION_ID",
@@ -397,7 +399,7 @@ class RevalidationTest(unittest.TestCase):
         return key
 
     def _base_env(self, cur_head, cur_base):
-        self.call_log = self.tmp / "gsutil.calls"
+        self.call_log = self.tmp / "gcloud.calls"
         env = {
             "PULL_NUMBER": _PR,
             "PULL_PULL_SHA": cur_head,
@@ -406,9 +408,9 @@ class RevalidationTest(unittest.TestCase):
             # Unset in the pod that is not this job; a developer's shell may
             # carry one, and the default is what these fixtures name.
             "JOB_NAME": "",
-            "GSUTIL_OBJECT_DIR": str(self.objects),
-            "GSUTIL_LS_DIR": str(self.listings),
-            "GSUTIL_CALL_LOG": str(self.call_log),
+            "GCLOUD_OBJECT_DIR": str(self.objects),
+            "GCLOUD_LS_DIR": str(self.listings),
+            "GCLOUD_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
             "GITHUB_REQUEST_LOG": str(self.requests_log),
             "PYTHONPATH": str(self.pysite),
@@ -474,7 +476,7 @@ class RevalidationTest(unittest.TestCase):
         """Humans grep build logs for this line (and future collector support
         needs a stable line to key on); the word REVALIDATED and the reused
         build id must appear together, a serial run names its one build with
-        no pull suffix, and the Spyglass URL must follow."""
+        no pull suffix, and the build's Console URL must follow."""
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn(
@@ -483,7 +485,7 @@ class RevalidationTest(unittest.TestCase):
         )
         self.assertEqual(proc.stdout.count("Step 0: REVALIDATED"), 1)
         self.assertIn(
-            "Reused verdict: https://oss.gprow.dev/view/gs/kube-agents-prow/"
+            "Reused verdict: https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/"
             f"pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/200",
             proc.stdout,
         )
@@ -491,11 +493,11 @@ class RevalidationTest(unittest.TestCase):
     def test_the_history_read_is_scoped_to_this_prs_own_job(self):
         """A wrong PR number, job name or bucket in the history path would
         reuse a FOREIGN verdict while every content assertion still passed;
-        the URLs the script hands gsutil are the load-bearing part."""
+        the URLs the script hands gcloud storage are the load-bearing part."""
         self._plant_history([("200", True, self.c1, self.c3)])
         self._run(cur_head=self.c4, cur_base=self.c2)
         calls = self.call_log.read_text().splitlines()
-        prefix = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}"
+        prefix = f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}"
         self.assertIn(f"ls {prefix}/*/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/started.json", calls)
@@ -513,7 +515,7 @@ class RevalidationTest(unittest.TestCase):
             cur_head=self.c4, cur_base=self.c2, env_overrides={"JOB_NAME": other_job}
         )
         calls = self.call_log.read_text().splitlines()
-        own = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
+        own = f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
         self.assertIn(f"ls {own}/*/finished.json", calls)
         self.assertFalse(
             [c for c in calls if f"/{_PR}/{_JOB}/" in c],
@@ -552,7 +554,7 @@ class RevalidationTest(unittest.TestCase):
     # ── the same head passes whatever main did ──────────────────────────────
 
     def test_a_green_at_this_head_is_reused_whatever_main_did_since(self):
-        """The retest Tide starts because main moved, serial or batch: the
+        """The retest Tide started because main moved, serial or batch: the
         base delta c1..c5 touches code.py, which the inert rule would refuse,
         and the same-head rule does not look at it."""
         self._plant_history([("200", True, self.c1, self.c3)])
@@ -580,6 +582,59 @@ class RevalidationTest(unittest.TestCase):
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
         self.assertIn("this head already passed", proc.stdout)
 
+    # ── the same tree at a new head passes like the same head ───────────────
+
+    def _same_tree_commit(self, sha):
+        """A new commit on `sha` with `sha`'s tree: what an empty commit pushes."""
+        out = subprocess.run(
+            ["git", "-C", str(self.repo), "commit-tree", f"{sha}^{{tree}}", "-p", sha, "-m", "empty"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return out.stdout.strip()
+
+    def test_a_green_at_an_earlier_head_with_the_same_tree_is_reused(self):
+        """An empty commit on c5: a new head, the same tree. The base delta
+        c1..c5 touches code.py, which the inert rule would refuse; the
+        same-tree rule does not look at the base, as for the same head."""
+        empty = self._same_tree_commit(self.c5)
+        self._plant_history([("200", True, self.c1, self.c5)])
+        proc = self._run(cur_head=empty, cur_base=self.c5)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"Step 0: REVALIDATED against green build 200\b")
+        self.assertIn("this tree already passed", proc.stdout)
+        self.assertIn(f"at head {self.c5} then, {empty} now", proc.stdout)
+        self.assertNotIn("code.py", proc.stdout)
+
+    def test_a_different_tree_still_goes_through_the_inert_rule(self):
+        """c3 to c5 changes code.py: not the same tree, so the inert rule
+        decides, and it refuses."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c5, cur_base=self.c2)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("files outside REVALIDATION_INERT_PATHS", proc.stdout)
+        self.assertNotIn("this tree already passed", proc.stdout)
+
+    def test_the_same_tree_rule_still_honours_the_cutoff(self):
+        """A green first reported before EVAL_REVALIDATION_NOT_BEFORE is not
+        reused at the same tree either: the cutoff is checked first."""
+        empty = self._same_tree_commit(self.c3)
+        self._plant_dated_green("2026-10-15T10:00:00Z")
+        proc = self._run(cur_head=empty, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("before EVAL_REVALIDATION_NOT_BEFORE (2026-10-20T20:00:00Z)", proc.stdout)
+        self.assertNotIn("this tree already passed", proc.stdout)
+
+    def test_the_same_tree_rule_still_demands_the_attestation(self):
+        empty = self._same_tree_commit(self.c3)
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, [])
+        proc = self._run(cur_head=empty, cur_base=self.c5)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
     def test_the_same_head_rule_still_demands_the_attestation(self):
         """Same head or not, a GCS record with no Prow-posted success status
         on that head is the forged record, and runs full."""
@@ -588,6 +643,37 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
+    def _plant_dated_green(self, *whens):
+        """Green build 200 at c3, attested by Prow events created at `whens`."""
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, [self._prow_event("success", "Job succeeded.", when, build="200") for when in whens])
+
+    def test_a_green_first_reported_before_the_cutoff_is_not_reused(self):
+        """The swap: a pre-swap green at this head graded the other mode. A
+        later copy naming the same build (the sticky re-pin's, or its expiry)
+        does not stand in for the original event."""
+        self._plant_dated_green("2026-10-15T10:00:00Z", "2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("before EVAL_REVALIDATION_NOT_BEFORE (2026-10-20T20:00:00Z)", proc.stdout)
+
+    def test_a_green_reported_after_the_cutoff_is_reused(self):
+        self._plant_dated_green("2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+
+    def test_an_unparsable_cutoff_is_a_full_run(self):
+        self._plant_dated_green("2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "next week"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("not a UTC time", proc.stdout)
+
+    def test_an_attesting_event_with_no_time_is_a_full_run_under_a_cutoff(self):
+        self._plant_history([("200", True, self.c1, self.c3)])  # attested with no created_at
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("unreadable time", proc.stdout)
 
     def test_a_red_at_this_head_newer_than_its_green_is_overridden(self):
         """The newest GREEN wins, as for inert pushes. For the same head that is
@@ -604,7 +690,7 @@ class RevalidationTest(unittest.TestCase):
     # ── an admin /override at this head is a verdict too ────────────────────
 
     def test_an_admin_override_at_this_head_is_reused_whatever_main_did(self):
-        """The retest Tide starts after main moves, for a pull request an
+        """The retest Tide started after main moved, for a pull request an
         admin overrode: the only green on the head is the override plugin's
         status, and the reuse needs no passed build in GCS -- the history is
         read first and yields nothing, then the override holds."""
@@ -676,7 +762,7 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("no green build among the newest", proc.stdout)
         calls = self.call_log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("stat")], [], "no second object is consulted")
-        self.assertNotIn(f"cat gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/started.json", calls)
+        self.assertNotIn(f"cat gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/started.json", calls)
 
     def test_an_artifacts_directory_that_does_not_exist_yet_is_created(self):
         """At the hoisted step 0 nothing in the job has written to ARTIFACTS
@@ -749,8 +835,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_an_override_survives_the_retest_tide_started_and_aborted(self):
-        """#2464's history: override, then Tide's retest posts pending, then
-        the trigger plugin aborts it with a failure status. The override is
+        """#2464's history: override, then Tide's retest posted pending, then
+        the trigger plugin aborted it with a failure status. The override is
         older than both and still the verdict -- nothing withdrew it."""
         self._plant_statuses(
             self.c3,
@@ -822,7 +908,7 @@ class RevalidationTest(unittest.TestCase):
         the commit's newest status: crier's report points at PR 78's
         comment, and the plugin's re-posted status keeps PR 77's Spyglass
         URL. Neither is a verdict for PR 77."""
-        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
+        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_BUILD_URL}/{_PR}/{_JOB}/900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
@@ -845,7 +931,7 @@ class RevalidationTest(unittest.TestCase):
         """The re-posted status keeps whatever URL the commit's status had,
         even one under this pull request's own history path; without the
         comment-URL event it is not a verdict."""
-        self._plant_statuses(self.c3, [self._override_event(url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
+        self._plant_statuses(self.c3, [self._override_event(url=f"{_BUILD_URL}/{_PR}/{_JOB}/900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
@@ -909,8 +995,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
 
     def test_an_override_behind_days_of_re_pins_is_still_found(self):
-        """The sticky re-pin posts a copy on this head after every merge to
-        main, newest first, so the one Prow-bot event is soon past the first
+        """The retired sticky re-pin posted a copy on this head after every
+        merge to main, newest first, so the one Prow-bot event is soon past the first
         hundred; the read follows GitHub's next-page link until it finds it."""
         pins = [
             self._override_event(creator="github-actions[bot]", when=f"2026-10-{7 + i // 24:02d}T{i % 24:02d}:00:00Z")
@@ -942,6 +1028,18 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "3"})
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+
+    def test_a_partial_read_is_no_earliest_under_a_cutoff(self):
+        """Under EVAL_REVALIDATION_NOT_BEFORE the original report may lie
+        past the pages read, so a green attested by later copies alone is a
+        full run; without the cutoff the same read reuses it (above)."""
+        copies = [self._prow_event("success", "Job succeeded.", "2026-10-21T10:00:00Z", build="200") for _ in range(150)]
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, copies)
+        env = {"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "2", "EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"}
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides=env)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("capped read may not reach", proc.stdout)
 
     def test_an_unparsed_link_header_ends_the_walk_and_says_so(self):
         """RFC 8288 permits an unquoted rel; GitHub quotes it. A Link value
@@ -1042,7 +1140,7 @@ class RevalidationTest(unittest.TestCase):
         calls = self.call_log.read_text().splitlines()
         for pr in (_PR, _OTHER_PR):
             self.assertIn(
-                f"ls gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/*/finished.json",
+                f"ls gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/*/finished.json",
                 calls,
             )
 
@@ -1099,7 +1197,7 @@ class RevalidationTest(unittest.TestCase):
 
     def test_a_malformed_pull_refs_is_a_full_run(self):
         """A PULL_REFS whose entries are not <number>:<40-hex> is a full run
-        before any SHA reaches gsutil or git -- a short SHA, a base alone, a
+        before any SHA reaches gcloud storage or git -- a short SHA, a base alone, a
         non-numeric number."""
         self._plant_history([("200", True, self.c1, self.c3)])
         for refs in (
@@ -1127,9 +1225,9 @@ class RevalidationTest(unittest.TestCase):
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
                 self.assertIn("PULL_REFS is not <base_ref>:<PULL_BASE_SHA>", proc.stdout)
                 self.assertNotIn("holds a reusable verdict", proc.stdout)
-                # Refused before any SHA reached gsutil (the stub logs every
+                # Refused before any SHA reached gcloud storage (the stub logs every
                 # call) or git (the fixture repo's only reader is the script).
-                self.assertFalse(self.call_log.exists(), "gsutil was called on a refused PULL_REFS")
+                self.assertFalse(self.call_log.exists(), "gcloud storage was called on a refused PULL_REFS")
 
     def test_a_malformed_base_or_head_sha_is_a_full_run(self):
         """PULL_BASE_SHA and PULL_PULL_SHA are held to 40-hex before they can
@@ -1153,7 +1251,7 @@ class RevalidationTest(unittest.TestCase):
                 proc = self._run(cur_head=self.c4, cur_base=self.c2, env_overrides=overrides)
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
                 self.assertIn(reason, proc.stdout)
-                self.assertFalse(self.call_log.exists(), "gsutil was called on a malformed SHA")
+                self.assertFalse(self.call_log.exists(), "gcloud storage was called on a malformed SHA")
 
     def test_a_started_json_entry_with_a_ref_suffix_is_read_the_same_way(self):
         """started.json's repos value is the same Refs.String() shape as
@@ -1306,7 +1404,7 @@ class RevalidationTest(unittest.TestCase):
                 {
                     "context": _JOB,
                     "state": "success",
-                    "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/111",
+                    "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/111",
                 },
                 {"context": _JOB, "state": "pending", "target_url": None},
             ],

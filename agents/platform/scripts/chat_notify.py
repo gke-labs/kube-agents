@@ -4,8 +4,8 @@ Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
 that ``hermes send`` posts through, because the A2A gateway consumes the chat
 backend instead. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
-nowhere. The operator names the platform the gateway now holds in
-``A2A_NOTIFY_PLATFORM``, and for that platform these callers run
+nowhere. The operator names the platforms the gateway now holds, and for the
+ones :func:`routed_platforms` picks these callers run
 ``a2a notify`` instead, which asks the gateway to post to the home channel over
 its ``chat.notify`` route.
 
@@ -21,18 +21,63 @@ conversation only for a request naming one, which the kanban notifier sends
 for a card's report). A target's chat id is therefore not forwarded: a thread names its own space, and a post
 with no thread goes to the home channel, which is where a bare platform target
 went under ``hermes send`` too.
+
+:func:`conversation_command` is the other route: a post into one gateway
+conversation, home channel or not, for a caller that knows the conversation and
+its context id (:func:`conversation_route` reads them from what the hermes-bridge
+recorded). Onboarding's report goes this way to the conversation that started it.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
+from contextlib import closing
 
-# The variable the operator renders into the agent container exactly when the
-# next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
+# The variable the operator renders into the agent container when the next
+# stack holds the chat backend (platformagent_manifests.go,
+# a2aNotifyPlatformEnvVar): every armed platform whose home channel the CR
+# sets, and absent when none is. Its value is a list of platform names as
+# Hermes spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list
+# of one. routed_platforms() adds the learned Slack channel and the fallback.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
+# The variable the operator renders whenever the gateway arms its chat.notify
+# route, home channel or not (platformagent_a2a_manifests.go,
+# a2aNotifyConversationsEnvVar): the platforms whose backends the gateway holds,
+# in the same list form.
+NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# What separates the platform names in either variable.
+PLATFORM_LIST_SEPARATOR = ","
+# The operator projects the home channel it admitted (the CR field, else the
+# channel the gateway learned) into a ConfigMap mounted as a directory in the
+# agent pod, so a learned channel reaches the pod without a restart. One file,
+# the Slack channel id or empty; the directory is absent on an operator older
+# than the projection and in today mode. No env override: the agent's own
+# .env is loaded into its environment, so a seam there would let a line on
+# the writable volume point the readers at a file of its own.
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
+# What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
+# bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
+BUS_URL_ENV = "NATS_URL"
+BUS_USER_ENVS = ("A2A_BUS_USER", "NATS_USER")
+# The CA the CLI trusts the bus by (a2a/lib/tls.go, EnvNATSCAFile). Not read
+# here: the Go CLI reads it, so a child that runs `a2a notify` has to be
+# handed it, and the MCP env contract test asserts that from this name.
+BUS_CA_ENV = "NATS_CA_FILE"
+# Where the hermes-bridge records which gateway conversation an `a2a-*` session
+# answers (a2a/hermes-bridge/route.go; session_kv_server.py, CONVERSATION_ROUTE_KEY).
+SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
+SESSION_KV_DEFAULT_DB = "/var/lib/kube-agents/session/session_kv.db"
+CONVERSATION_ROUTE_KEY = "conversation_route"
+SESSION_KV_TIMEOUT_SECONDS = 2.0
+# The route's fields (route.go, conversationRoute).
+ROUTE_PLATFORM = "platform"
+ROUTE_CONVERSATION = "conversation"
+ROUTE_CONTEXT = "context_id"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
 A2A_CLI = "a2a"
 # The Hermes CLI the today path posts through.
@@ -41,9 +86,14 @@ HERMES_CLI = "hermes"
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
 # The exit status `a2a notify` uses when the route is not there right now: no
-# gateway subscribed (a roll, or its bind retry) or the bus unreachable. Nothing
-# was posted, and waiting may help where retrying a refusal would not.
+# gateway subscribed (a roll, or its bind retry), the bus unreachable, or a
+# refusal the gateway marks retry (stopping, a record it couldn't read in time).
+# Nothing was posted, and waiting may help where retrying a refusal would not.
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# `a2a notify`'s exit when the gateway refused a home post for want of a home
+# channel and kept it for the digest it posts once one is set: nothing posted
+# now, nothing lost, so a sender that re-sends on failure treats it as handled.
+NOTIFY_KEPT = 5
 # The waits before each retry of a send that found the route unavailable, for
 # a caller with one shot at the post. They sum past the gateway's longest wait
 # between attempts to bind the route (a2a/gateway/notify.go,
@@ -74,15 +124,130 @@ def alert_update_key(session_id: str) -> str:
     return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
-def routed_platform() -> str:
-    """The platform whose posts go through the gateway, or "" when none does."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+def home_file() -> tuple[str, bool]:
+    """The projected Slack home channel, trimmed, and whether the file is mounted.
+
+    Read on every call: the kubelet refreshes the file in place when the
+    operator's projection changes, within about a minute, and no process
+    restarts for it. Mounted means the directory is there: the Optional
+    volume gives an empty directory until the operator writes the ConfigMap,
+    and in that gap the home is still the operator's to say. No directory at
+    all is today mode, or an operator older than the projection: ("", False).
+    """
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            try:
+                return handle.read().strip(), True
+            except ValueError:
+                # Not text: mounted, but no channel to read, as the gateway reads it.
+                return "", True
+    except OSError:
+        return "", os.path.isdir(HOME_FILE_DIR)
+
+
+def home_file_value() -> str:
+    """The Slack home channel the operator projected into the pod, or "" when none."""
+    return home_file()[0]
+
+
+def platform_list(raw: str) -> list[str]:
+    """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order."""
+    names: list[str] = []
+    for part in raw.split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def home_platforms() -> list[str]:
+    """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
+
+    The operator lists every armed route whose home channel the CR sets
+    (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds it
+    and the projected file names a channel, the CR's or one it learned.
+    """
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    slack_home = SLACK_PLATFORM in gateway_platforms() and bool(home_file_value())
+    if slack_home and SLACK_PLATFORM not in listed:
+        return [*listed, SLACK_PLATFORM]
+    return listed
+
+
+def routed_platforms() -> list[str]:
+    """The platforms that get home posts through the gateway, or [] when none does.
+
+    Those are the platforms with a home channel (:func:`home_platforms`). With
+    none, home posts go to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
+    whose posts the gateway keeps for the digest it posts once a channel is set.
+    The rule reads only those two variables and the projected Slack file, so
+    every process computes the same list and a learned channel restarts no pod.
+    """
+    return home_platforms() or gateway_platforms()
+
+
+def gateway_platforms() -> list[str]:
+    """The platforms whose backends the gateway holds, or [] when it holds none.
+
+    It names every armed route, home channel or not: the platforms whose
+    conversations :func:`conversation_command` can post into, and the home-post
+    fallback of :func:`routed_platforms`.
+    """
+    return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
 
 def routes(platform: str) -> bool:
     """Whether a post to ``platform`` goes through the gateway's chat.notify route."""
-    routed = routed_platform()
-    return bool(routed) and platform == routed
+    return platform in routed_platforms()
+
+
+def bus_unreachable_reason() -> str:
+    """Why `a2a notify` cannot reach the bus from this process's env, or "" when it can."""
+    if not os.environ.get(BUS_URL_ENV, "").strip():
+        return f"{BUS_URL_ENV} is not set"
+    if not any(os.environ.get(name, "").strip() for name in BUS_USER_ENVS):
+        return f"no bus identity ({' or '.join(BUS_USER_ENVS)})"
+    return ""
+
+
+def conversation_route(session_id: str) -> dict:
+    """The gateway conversation ``session_id`` answers, as the hermes-bridge recorded it, or {}.
+
+    Only a route naming a platform, a conversation and its context id is
+    returned. The read is read-only and bounded; any failure is {}.
+    """
+    path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DEFAULT_DB
+    if not session_id or not os.path.exists(path):
+        return {}
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SESSION_KV_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+        route = (json.loads(row[0]) if row and row[0] else {}).get(CONVERSATION_ROUTE_KEY)
+    except Exception:  # noqa: BLE001 - an unreadable route is no route
+        return {}
+    if not isinstance(route, dict):
+        return {}
+    fields = {key: str(route.get(key) or "").strip() for key in (ROUTE_PLATFORM, ROUTE_CONVERSATION, ROUTE_CONTEXT)}
+    return fields if all(fields.values()) else {}
+
+
+def conversation_command(platform: str, conversation: str, context_id: str, text: str, chat_path: str = "",
+                         update: str = "", timeout_s: float = 0) -> list[str]:
+    """The argv that posts into a gateway conversation, home channel or not.
+
+    The gateway posts it only while the conversation's session record carries
+    ``context_id``. ``chat_path`` names a ``kube-agents.chat/v1`` message file,
+    with ``text`` as its fallback; ``update`` edits the message an earlier post
+    with the same key left in the conversation.
+    """
+    argv = [A2A_CLI, "notify", "--platform", platform, "--conversation", conversation, "--context", context_id]
+    if chat_path:
+        argv += ["--chat-file", chat_path]
+    if update:
+        argv += ["--update", update]
+    if timeout_s > 0:
+        argv += ["--timeout", f"{max(1, int(timeout_s))}s"]
+    return argv + ["--", text]
 
 
 def subprocess_timeout(target: str, default: float | None) -> float | None:
@@ -107,8 +272,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
     caller with a deadline shorter than the CLI's default. ``update`` names the
     message on the gateway path (``a2a notify --update``), so a later notify
-    with the same key in the same conversation edits it; the Hermes path has
-    no such key and ignores it.
+    with the same key in the same conversation or home thread edits it; the
+    Hermes path has no such key and ignores it.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
@@ -164,6 +329,11 @@ def outcome_unknown(returncode: int) -> bool:
 def route_unavailable(returncode: int) -> bool:
     """Whether a failed send found no route (nothing posted; waiting may help)."""
     return returncode == NOTIFY_ROUTE_UNAVAILABLE
+
+
+def kept(returncode: int) -> bool:
+    """Whether a failed send was kept by the gateway for its digest (nothing posted now; do not re-send)."""
+    return returncode == NOTIFY_KEPT
 
 
 def thread_from_response(platform: str, response: dict) -> str:

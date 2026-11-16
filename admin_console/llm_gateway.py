@@ -16,6 +16,7 @@ from admin_console.agent_runtime import (
     GATEWAY_PYTHON,
     AgentRuntimeProvider,
     KubectlRunner,
+    invalidate as invalidate_runtime_discovery,
 )
 from admin_console.kube_access import GKEKubeAccess, KubeCommandResult
 from admin_console.project_config import (
@@ -36,6 +37,8 @@ CATALOG_PATH = (
 LITELLM_ROOT = CATALOG_PATH.parent
 OPERATOR_ROOT = REPO_ROOT / "k8s-operator"
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,254}$")
+# The in-pod verification call waits up to 60 s on LiteLLM itself.
+VERIFY_TIMEOUT_SECONDS = 75
 
 
 @dataclass(frozen=True)
@@ -330,7 +333,6 @@ class LlmGatewayService:
             runner=KubectlRunner(self.target, access=self.kube),
         )
         agent = runtime.canonical_agent()
-        pod, container = runtime.gateway_endpoint(agent)
         script = """import json,urllib.request,urllib.error
 payload={'model':MODEL_ALIAS,'messages':[{'role':'user','content':'OK?'}],'max_tokens':8}
 body=json.dumps(payload).encode()
@@ -354,9 +356,12 @@ except urllib.error.HTTPError as error:
                 f"{gateway['inferencePath']}"
             ),
         )
-        evidence = self._run(
-            f"POST {gateway['inferencePath']} from Platform Agent {agent}",
-            [
+
+        def arguments_for(endpoint: tuple[str, str]) -> list[str]:
+            pod, container = endpoint
+            return [
+                "--context",
+                self.kube.context,
                 "exec",
                 pod,
                 "-n",
@@ -367,8 +372,20 @@ except urllib.error.HTTPError as error:
                 GATEWAY_PYTHON,
                 "-c",
                 script,
-            ],
-            timeout=75,
+            ]
+
+        # The held pod may have been replaced since discovery; the runtime
+        # discovers again and repeats the call once if the pod moved.
+        endpoint, result = runtime.exec_on_gateway(
+            agent,
+            lambda endpoint: self.kube.run(
+                arguments_for(endpoint), timeout=VERIFY_TIMEOUT_SECONDS
+            ),
+        )
+        evidence = RawEvidence.from_result(
+            f"POST {gateway['inferencePath']} from Platform Agent {agent}",
+            "kubectl " + " ".join(arguments_for(endpoint)),
+            result,
         )
         return {
             "target": asdict(self.target),
@@ -824,6 +841,10 @@ except urllib.error.HTTPError as error:
                 timeout=60,
             )
         )
+        # The apply and the rollout below change pods in the agent's
+        # namespace; the next runtime read discovers again rather than trust
+        # answers held from before.
+        invalidate_runtime_discovery(self.target)
         if evidence[-1].returncode != 0:
             return {
                 "configurationApplied": False,

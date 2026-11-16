@@ -77,9 +77,8 @@ _resolve_spot_only_shapes() {
         # Only consider shapes the region actually offers on demand: a shape absent from
         # the region has no Spot either, but then "add an on-demand tier" fixes nothing
         # and the scenario would be teaching the wrong lesson.
-        gcloud compute machine-types list --project="$PROJECT_ID" \
-            --filter="name=${mt} AND zone ~ ^${CLUSTER_LOCATION}-" --format='value(name)' 2>/dev/null |
-            grep -q . || continue
+        grep -q . <<<"$(gcloud compute machine-types list --project="$PROJECT_ID" \
+            --filter="name=${mt} AND zone ~ ^${CLUSTER_LOCATION}-" --format='value(name)' 2>/dev/null)" || continue
         _spot_unsupported "$mt" && found+=("$mt")
     done
 

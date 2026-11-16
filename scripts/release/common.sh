@@ -65,16 +65,20 @@ export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
   "platform-agent"
   "credential-proxy"
+  "kube-proxy"
   "agent-sandbox"
   "replay-proxy"
   "pubsub-platform"
   "gke-stockout-investigator"
   "a2a-gateway"
   "a2a-worker"
+  "persona-cluster"
   "a2a-authcallout"
   "a2a-verifier"
+  "a2a-dispatcher"
   "a2a-console"
   "hermes-bridge"
+  "web-console"
 )
 
 # Declarative registry of release bundle directories, root files, and Helm charts
@@ -2338,7 +2342,7 @@ promote_release_images() {
 
       local raw_target=""
       if [ "${target_digest}" = "${source_digest}" ] || \
-         ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && printf '%s' "${raw_target}" | grep -q "${source_digest}" ); then
+         ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && grep -q "${source_digest}" <<<"${raw_target}" ); then
         echo "    ℹ️ Target image '${target_image}' already exists in registry and matches source image (${resolved_commit:0:7}). Skipping duplicate promotion."
         continue
       else

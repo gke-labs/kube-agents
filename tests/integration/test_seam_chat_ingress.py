@@ -111,6 +111,11 @@ class ChatIngressSeamTest(unittest.TestCase):
             def create_adapter(self, name, *args, **kwargs):
                 return adapter_class() if name == "google_chat" else None
 
+            # install() wraps this too, swapping the entry's standalone sender:
+            # the path `hermes send` takes, with no adapter built.
+            def register(self, entry, *, scope=None):
+                return None
+
         registry_module.PlatformRegistry = PlatformRegistry
         gateway_pkg = types.ModuleType("gateway")
         gateway_pkg.platform_registry = registry_module
@@ -225,6 +230,39 @@ class ChatIngressSeamTest(unittest.TestCase):
         self.assertEqual(["spaces", "messages"], resource)
         self.assertEqual("create", method)
         self.assertEqual("spaces/AAA", arguments["parent"])
+
+    def test_a_hermes_send_reply_is_posted_through_the_proxy_in_its_thread(self):
+        async def stock_sender(*_args, **_kwargs):
+            raise AssertionError("the token-minting sender must not run")
+
+        entry = types.SimpleNamespace(
+            name="google_chat", standalone_sender_fn=stock_sender
+        )
+        sys.modules["gateway.platform_registry"].PlatformRegistry().register(
+            entry, scope="profile-home"
+        )
+
+        result = asyncio.run(
+            entry.standalone_sender_fn(
+                None, "spaces/AAA", "apply", thread_id="spaces/AAA/threads/t1"
+            )
+        )
+
+        self.assertEqual({"success": True, "message_id": "spaces/AAA/messages/m1"}, result)
+        self.assertEqual(
+            [
+                (
+                    ["spaces", "messages"],
+                    "create",
+                    {
+                        "parent": "spaces/AAA",
+                        "body": {"text": "apply", "thread": {"name": "spaces/AAA/threads/t1"}},
+                        "messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
+                    },
+                )
+            ],
+            self.relay.api_calls,
+        )
 
     @unittest.expectedFailure
     def test_a_malformed_event_is_settled_rather_than_redelivered_forever(self):

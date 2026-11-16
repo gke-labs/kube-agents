@@ -67,6 +67,7 @@ NOT_STARTED_NOTICES = (
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
+    "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
 )
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000
@@ -1323,8 +1324,10 @@ class UnitTest(unittest.TestCase):
         # The queued acknowledgement (#2634) is a steer too, not the bot's answer.
         self.assertEqual(harness.classify("✏️ got it, I'll take that next"), harness.KIND_STEER)
         for failure in ("🚫 *rejected*", "❌ *failed* — the pod died", "🛑 *canceled*", "❌ could not reach the bus; try again",
-                        "❌ failed: the executor is down", "❌ the task failed", "🛑 canceled",
-                        "🚫 the executor rejected the task", "🚫 the executor rejected the task: no capability"):
+                        "❌ failed: the executor is down", "❌ failed — the agent could not be started; ask again",
+                        "❌ the task failed", "🛑 canceled", "🚫 the executor rejected the task",
+                        "🚫 the executor rejected the task: no capability",
+                        "🚫 the executor rejected the task — the request carried no text"):
             self.assertEqual(harness.classify(failure), harness.KIND_FAILURE, failure)
         # Not the gateway's grammar: the agent's own text, whatever it opens with.
         for answer in ("PONG", "✅ PONG", "✅ *done*", "⚙️ PONG", "❌ PONG", "🚫 rejected", "✏️ PONG", "🔎 task `t` is *completed*",
@@ -1336,7 +1339,9 @@ class UnitTest(unittest.TestCase):
         relay = (REPO / "a2a" / "gateway" / "relay.go").read_text()
         # Since #2493 the placeholder carries a delegated child's line note;
         # a typed turn has none, so the live check sees the bare placeholder.
-        self.assertIn(f'g.adapter.Post(rec.Key, withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote))', gateway)
+        # The placeholder is a message value since the Google Chat Stop button:
+        # posted with Stop naming the task while it runs.
+        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: taskID}})', gateway)
         self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
         # Main moved the notice into a constant; pin the constant and its use.
         self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
@@ -1352,9 +1357,19 @@ class UnitTest(unittest.TestCase):
         for state, icon in harness.STATUS_ICONS.items():
             const = "lib.State" + "".join(part.capitalize() for part in state.split("-"))
             self.assertRegex(relay, rf'{const}:\s+"{icon}",', state)
-        for post in ('"❌ failed: "+reason', '"❌ the task failed"', '"🛑 canceled"', '"🚫 the executor rejected the task: "+reason',
-                     '"🚫 the executor rejected the task"'):
-            self.assertIn(f"g.post(rec.Key, {post})", relay)
+        # The terminal notices are worded in one place, terminalNotice, which
+        # the relay posts through (and a console conversation's terminal
+        # frame carries): pin the constants it joins, the two separators
+        # (a dash after an executor's `reason:` detail, a colon after plain
+        # text), and the posts that use it.
+        for const, text in (("noticeFailed", "❌ failed"), ("noticeFailedBare", "❌ the task failed"),
+                            ("noticeCanceled", "🛑 canceled"), ("noticeRejected", "🚫 the executor rejected the task"),
+                            ("noticeDetailSeparator", " — "), ("noticePlainSeparator", ": ")):
+            self.assertRegex(relay, rf'{const}\s*=\s*"{re.escape(text)}"', const)
+        self.assertIn("return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)", relay)
+        self.assertIn("return noticeWithReason(noticeRejected, noticeRejected, text, shaped)", relay)
+        self.assertIn("return noticeCanceled", relay)
+        self.assertEqual(relay.count("g.post(rec.Key, terminalNotice(s.Status.State, reason))"), 2)
 
     def test_not_started_grammar_matches_the_gateway_source(self):
         # Every "not started:" the gateway can post, read off the source, is one the
@@ -1366,10 +1381,22 @@ class UnitTest(unittest.TestCase):
         rendered = set()
         for fmt in formats:
             self.assertTrue(harness.NOT_STARTED_PATTERN.match(fmt), fmt)
+            if fmt.endswith(": "):
+                # A bare prefix constant renders nothing by itself (the
+                # gateway appends a notice, pinned below), and as a pattern
+                # it would match every rendering here.
+                continue
             literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
             matching = [n for n in NOT_STARTED_NOTICES if re.fullmatch(literal, n, re.DOTALL)]
             self.assertTrue(matching, f"no test rendering of {fmt!r}")
             rendered.update(matching)
+        # The profile route's notices are posted under that prefix: each
+        # rendering here is the prefix plus a notice the source spells out.
+        prefix = 'noticeTurnNotStarted       = "⚠️ not started: "'
+        self.assertIn(prefix, sources["profiles.go"])
+        profile_notice = "a task is still running here; stop it or wait for it before asking an agent profile"
+        self.assertIn(f'noticeProfileWhileRunning = "{profile_notice}"', sources["profiles.go"])
+        rendered.add("⚠️ not started: " + profile_notice)
         self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
         # The session cap's count phrase, both forms.
         self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])
@@ -1387,8 +1414,10 @@ class UnitTest(unittest.TestCase):
             self.assertNotIn("tail", redactor.redact(f"x {printed} y"), printed)
 
     def test_refusal_marker_matches_the_gateway_source(self):
-        gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
-        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '"+backend+'), gateway)
+        # unverifiedNotice, which the gateway posts and the Slack adapter
+        # sends a shortcut's clicker privately.
+        gchat = (REPO / "a2a" / "gateway" / "gchat.go").read_text()
+        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '" + backend + '), gchat)
 
     def test_turn_subtypes_match_the_gateway_source(self):
         slack = (REPO / "a2a" / "gateway" / "slack.go").read_text()
@@ -1505,7 +1534,7 @@ class NoStatusLineTest(unittest.TestCase):
         answer = {"text": "*payments-api is CrashLooping.*", "ts": "2"}
         self.assertIsNone(harness.read_turn([answer], harness.WAIT_ANSWER))
         self.assertEqual(harness.read_turn([answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
-        failed = {"text": "❌ failed: reason: spawn-failed", "ts": "3"}
+        failed = {"text": "❌ failed — exec: no such file", "ts": "3"}
         self.assertEqual(harness.read_turn([answer, failed], harness.WAIT_ANSWER, lineless=True), (failed, harness.KIND_FAILURE))
 
     def test_a_standalone_queue_notice_is_no_status_line(self):

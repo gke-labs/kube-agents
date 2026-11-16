@@ -24,6 +24,21 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// The detached-leftover stub in TestAReusedPodAsInitKillsWhatLeftTheGroup
+// answers only once its perl has left the harness's process group, since
+// the group kill that follows the answer would otherwise reach a perl that
+// has not called setsid yet. detachPollInterval is how often the stub looks
+// for the marker perl writes after setsid returns; detachWaitBound caps that
+// wait, so a perl that never detaches fails the test instead of hanging it.
+// detachedLeftoverLifetime is how long the leftover sleeps once detached;
+// it has to outlast waitDeadline, or the leftover dies on its own and the
+// pid1=false case reads that as the group kill reaching it.
+const (
+	detachPollInterval       = 50 * time.Millisecond
+	detachWaitBound          = 10 * time.Second
+	detachedLeftoverLifetime = 300 * time.Second
+)
+
 // recordingStub is a harness that writes, per run, its argv and the opening
 // stdin line into dir (argv.<n>, prompt.<n>), reports session id
 // sess-<n> at init unless the file noinit.<n> exists, and answers
@@ -195,6 +210,9 @@ if [ "$n" = 2 ]; then echo "$$" > "$dir/pid.2"; exec sleep 60; fi`)
 	publishIn(t, c, session, "task-s-1", "")
 	submit(t, c, session, "task-s-2", "second")
 	waitState(t, c, session, "task-s-2", lib.StateWorking)
+	// Run 2 has counted itself once its argv record exists; a cancel
+	// landing earlier would leave task-s-3 to run as the stub's second.
+	waitRun(t, dir, "argv", 2)
 
 	// A stop aimed at the ended task leaves this one running.
 	publishIn(t, c, session, "task-s-1", "")
@@ -576,11 +594,16 @@ func TestAReusedPodAsInitKillsWhatLeftTheGroup(t *testing.T) {
 			c := testClient(t, url)
 			const session = "chat-ferret-s3d4"
 			dir := t.TempDir()
-			// setsid first, as the Bash tool's detached spawn does, then
-			// let the stub record the pid once the setsid has landed.
-			harness := recordingStub(t, dir, `/usr/bin/env perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' >/dev/null 2>&1 &
+			// setsid first, as the Bash tool's detached spawn does. perl
+			// writes sid.<n> once setsid has returned, and the stub answers
+			// only after that marker holds something: a fixed pause here
+			// let a slow runner's group kill reach a perl still in the
+			// group, which made the leftover die for the wrong reason.
+			harness := recordingStub(t, dir, fmt.Sprintf(`SID_MARK="$dir/sid.$n" /usr/bin/env perl -MPOSIX -e 'POSIX::setsid(); open(my $f, ">", $ENV{SID_MARK}) or die; print $f $$; close($f); exec "sleep", "%d"' >/dev/null 2>&1 &
 echo $! > "$dir/bg.$n"
-sleep 0.5`)
+i=0
+while [ ! -s "$dir/sid.$n" ] && [ "$i" -lt %d ]; do sleep %g; i=$((i+1)); done`,
+				int(detachedLeftoverLifetime.Seconds()), int(detachWaitBound/detachPollInterval), detachPollInterval.Seconds()))
 			var killed, reapedAll atomic.Int32
 			pidOf := func() int {
 				var pid int
@@ -605,6 +628,13 @@ sleep 0.5`)
 			defer cancel()
 			done := runAdapter(ctx, reuseConfig(url, "task-s-1", session, harness))
 			waitState(t, c, session, "task-s-1", lib.StateCompleted)
+			// The stub answers after the marker holds something or its
+			// bound runs out, so by now the marker is final: an empty one
+			// is the stub failing to detach its leftover, not the group
+			// kill reaching a detached one.
+			if readRunIfAny(dir, "sid", 1) == "" {
+				t.Fatal("the stub answered without its leftover detaching; sid.1 is empty")
+			}
 			pid := pidOf()
 			if pid <= 0 {
 				t.Fatal("no background pid recorded")
@@ -635,6 +665,36 @@ sleep 0.5`)
 			cancel()
 			waitOutcome(t, done, 30*time.Second)
 		})
+	}
+}
+
+// The pod's two connections are one principal, and both reconnect at every
+// grant expiry of a reused session pod. nats.go runs each reconnect's whole
+// handshake under the connection's dial timeout, and under the auth callout
+// that handshake holds the server's TokenReview round trip, so the raw
+// connection the session's consumers ride takes the library's dial timeout
+// rather than nats.go's default: with the default, a slow bus left the lib
+// client re-authenticated and the task watcher's connection not, and the
+// next turn was never taken.
+func TestDialBusGivesTheRawConnectionTheLibraryDialTimeout(t *testing.T) {
+	url := startServerNoVerifier(t)
+	cfg := adapterConfig(url, "task-dial", "sess-dial", nil)
+	cfg.applyDefaults()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b, closeBus, err := dialBus(ctx, cfg)
+	if err != nil {
+		t.Fatalf("dialBus: %v", err)
+	}
+	defer closeBus()
+	if got := b.nc.Opts.Timeout; got != lib.DialTimeout {
+		t.Fatalf("raw connection dial timeout = %s, want the library's %s", got, lib.DialTimeout)
+	}
+	if got := b.c.Conn().Opts.Timeout; got != b.nc.Opts.Timeout {
+		t.Fatalf("lib client dial timeout = %s, raw connection %s: the pod's two connections re-authenticate under one budget", got, b.nc.Opts.Timeout)
+	}
+	if lib.DialTimeout <= nats.DefaultTimeout {
+		t.Fatalf("lib.DialTimeout = %s is not longer than nats.go's default %s", lib.DialTimeout, nats.DefaultTimeout)
 	}
 }
 
@@ -683,14 +743,7 @@ if [ "$n" = 2 ]; then while [ ! -e "$dir/go" ]; do sleep 0.1; done; fi`)
 	}
 
 	submit(t, c, session, "task-s-2", "second")
-	deadline := time.Now().Add(waitDeadline)
-	for readRunIfAny(dir, "sock", 2) == "" {
-		if time.Now().After(deadline) {
-			t.Fatal("the second turn's harness never started")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	second := strings.TrimSpace(readRun(t, dir, "sock", 2))
+	second := waitRun(t, dir, "sock", 2)
 	if second == first || second == sock {
 		t.Fatalf("second turn's socket = %q, the same as an earlier or the configured path", second)
 	}
@@ -715,6 +768,24 @@ if [ "$n" = 2 ]; then while [ ! -e "$dir/go" ]; do sleep 0.1; done; fi`)
 func readRunIfAny(dir, what string, n int) string {
 	b, _ := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%s.%d", what, n)))
 	return strings.TrimSpace(string(b))
+}
+
+// waitRun is readRun for a record the stub may not have written yet: it
+// polls until what.<n> holds something, bounded by waitDeadline, and fails
+// naming the record that never came. A record's presence also means the
+// stub has counted the run, since it writes n before any record.
+func waitRun(t *testing.T, dir, what string, n int) string {
+	t.Helper()
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		if v := readRunIfAny(dir, what, n); v != "" {
+			return v
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("harness run %d never wrote %s", n, what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // withDelegateSocket rewrites the delegate server's socket inside the
@@ -851,6 +922,12 @@ func TestAReusedPodKeepsItsSessionWhenAResumedTurnIsStoppedBeforeInit(t *testing
 	waitState(t, c, session, "task-k-1", lib.StateCompleted)
 	submit(t, c, session, "task-k-2", "second")
 	waitState(t, c, session, "task-k-2", lib.StateWorking)
+	// working is published before the harness is launched, so the cancel
+	// waits for run 2's record: a SIGTERM that lands before the stub has
+	// counted itself leaves no run 2, and task-k-3 would then become it.
+	// The turn is still stopped before any init line, since noinit.2 is
+	// planted.
+	waitRun(t, dir, "argv", 2)
 	publishIn(t, c, session, "task-k-2", "")
 	waitState(t, c, session, "task-k-2", lib.StateCanceled)
 

@@ -58,6 +58,13 @@ class ParseTest(unittest.TestCase):
         ref = repo_ref.parse("github.com/acme/toolkit")
         self.assertEqual((ref.host, ref.path), ("github.com", "acme/toolkit"))
 
+    def test_bitbucket_org_in_a_schemeless_value_is_lifted(self):
+        """One entry per forge the harness serves: Bitbucket Cloud's host too,
+        so `bitbucket.org/ws/repo` is a Bitbucket repository, not a GitHub
+        owner called `bitbucket.org`."""
+        ref = repo_ref.parse("bitbucket.org/acme/infra")
+        self.assertEqual((ref.host, ref.path, ref.host_inferred), ("bitbucket.org", "acme/infra", True))
+
     def test_a_doubled_separator_after_a_lifted_host_is_trimmed(self):
         # As it is after a URL's host; repo_ref.go reads it the same way.
         for value in ("github.com//acme/toolkit", "github.com//acme/toolkit/"):

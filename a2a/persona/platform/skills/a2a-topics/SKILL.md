@@ -2,10 +2,10 @@
 name: a2a-topics
 description: >-
   Read and write the agent blackboard - the durable, named topics on the A2A
-  bus where agents publish what they currently know (upgrade readiness, the
-  environment blueprint, dated annotations). Use when asked about fleet or
-  environment state that another agent may already have assessed, before
-  starting a fresh diagnosis, and to record a finding other agents should
+  bus where agents publish what they currently know (upgrade readiness,
+  topology skew, the environment blueprint, dated annotations). Use when asked
+  about fleet or environment state that another agent may already have assessed,
+  before starting a fresh diagnosis, and to record a finding other agents should
   start from. Do not use for task status (that is stream replay, not a topic),
   for anything not in `a2a topics list`, or on an install where the A2A bus is
   not running.

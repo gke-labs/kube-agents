@@ -1,9 +1,10 @@
 """The gateway keeps a Gemini model's replayed thinking out of the request, and only Gemini's.
 
-LiteLLM's Gemini transformation sends a replayed thinking block as an ordinary
-text part, so Gemini reads its earlier thought summaries as answer text and
-repeats them. The chart and the kustomize base mount a pre-call hook that drops
-those blocks from assistant messages bound for a Gemini model. These tests
+LiteLLM's Gemini transformation before v1.106.0 sent a replayed thinking block
+as an ordinary text part, so Gemini read its earlier thought summaries as
+answer text and repeated them. The chart and the kustomize base still mount a
+pre-call hook that drops those blocks from assistant messages bound for a
+Gemini model; the hook's header says why it stays. These tests
 hold the hook's behaviour, that both deployment paths ship the same file and
 register it, and that every chart render carries it. The render cases need
 `helm` and skip without it.
@@ -147,15 +148,16 @@ class TestHook(unittest.TestCase):
         self.assertEqual(len(logs.records), 1)
         self.assertIn("hook inactive", logs.output[0])
 
-    def test_an_alias_the_router_cannot_resolve_is_a_blind_hook_too(self):
-        # A router that answers an empty list, or deployments with no model
-        # string, is the silent shape an upgrade could hand the hook.
+    def test_an_alias_the_router_does_not_serve_is_left_alone_without_a_warning(self):
+        # An empty list is what the router answers for an alias it does not
+        # serve, which the proxy refuses next; the one-shot "blind" warning
+        # must stay available for a router the hook really cannot read.
         for router in (_Router({}), _Shapeless()):
             with self.subTest(router=type(router).__name__):
                 self.hook._blind_warned = False
-                with self.assertLogs("kube_agents.litellm_thinking_replay", level="WARNING") as logs:
-                    self.assertFalse(self.hook.routes_to_gemini("model-default", router))
-                self.assertIn("no deployment model", logs.output[0])
+                with self.assertNoLogs("kube_agents.litellm_thinking_replay", level="WARNING"):
+                    self.assertFalse(self.hook.routes_to_gemini("unknown", router))
+                self.assertFalse(self.hook._blind_warned)
 
     def test_replayed_thinking_goes_and_everything_else_stays(self):
         messages = _session()

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
-# plant a fixed INVENTORY.raw.md (inventory-raw.txt beside this file) on the
+# The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery and
+# bench/tasks/bootstrap-inventory-posture-scope:
+# plant a fixed INVENTORY.raw.md (`raw_report`, a file beside this one) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
 # the onboarding gate's hand-off files once it has written that file, wait until
 # the card's worker has ended its run itself, or `run_wait` has passed, and
@@ -93,7 +94,10 @@ locals {
     "INVENTORY.shown.delivered.json",
   ] : "${local.home}/${name}"])
   # Base64, so the report crosses two shells and kubectl untouched.
-  raw_b64 = base64encode(file("${path.module}/inventory-raw.txt"))
+  raw_b64 = base64encode(file("${path.module}/${var.raw_report}"))
+  # Every report a case of this stack plants: a run that finishes a teardown an
+  # earlier run left resolves whichever case's findings that run registered.
+  planted_b64 = [for name in sort(fileset(path.module, "inventory-raw*.txt")) : base64encode(file("${path.module}/${name}"))]
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and
   # the card agents/chat/scripts/bootstrap_handoff.py files: this plant stands
   # in for the hand-off. The body is the install's own `_prioritize_body()`,
@@ -161,11 +165,11 @@ locals {
     open("${local.home}/.user_aligned", "x").close()
     print("armed")
   EOP
-  # Resolves every finding in the raw report's block that the worker or the
-  # delivery job registered, so the findings nudge does not bring the planted
+  # Resolves every finding, in the block of each planted report it is given,
+  # that the worker or the delivery job registered, so the findings nudge does not bring the planted
   # ones to chat after the case and the next run registers them as new. A
-  # finding the queue does not hold (404) was never registered, as when the
-  # run ended before delivery. The delivery's marks count the report's items
+  # finding the queue does not hold (404) was never registered: the run ended
+  # before delivery, or it belongs to the other case on this stack. The delivery's marks count the report's items
   # against that UTC day's critical allowance, which this does not give back.
   # Runs in the agent pod, which serves the queue.
   resolve_py = <<-EOP
@@ -182,7 +186,8 @@ locals {
         headers["Authorization"] = "Bearer " + token
     body = json.dumps({"outcome": "resolved", "observed": "bench teardown of a planted finding"}).encode()
     resolved, failed = 0, []
-    for item in inventory_findings.parse_block(base64.b64decode(sys.argv[1]).decode()):
+    items = [i for raw in sys.argv[1:] for i in inventory_findings.parse_block(base64.b64decode(raw).decode())]
+    for item in items:
         fid = findings_queue.derive_finding_id(
             item["check"], item["project"], item["cluster"], item.get("namespace", ""), item["object"]
         )
@@ -279,7 +284,7 @@ resource "null_resource" "ranking" {
     inventory         = local.inventory
     disarm_b64        = base64encode(local.disarm_py)
     resolve_b64       = base64encode(local.resolve_py)
-    raw_b64           = local.raw_b64
+    planted_b64       = join(" ", local.planted_b64)
   }
 
   provisioner "local-exec" {
@@ -380,8 +385,11 @@ resource "null_resource" "ranking" {
       disarm() {
         printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
       }
+      # Every case's planted report: the next run on this stack may be the other case, so a
+      # resolve that failed here is finished by whichever case runs next. A finding already
+      # resolved stays resolved.
       resolve() {
-        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py "${local.raw_b64}"
+        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py ${join(" ", local.planted_b64)}
       }
       # Writes base64 $1 to the sandbox path $2 aside and renames it, owned as
       # the data volume is: the user the card's terminal and file tools run as.
@@ -401,7 +409,7 @@ resource "null_resource" "ranking" {
       jobs = {j.get("id"): j for j in load_jobs()}
       if os.path.exists("${local.state_file}"):
           print("armed")
-      elif os.path.exists(home + "/.user_aligned"):
+      elif os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation") or os.path.exists(home + "/onboarding_conversation.json"):
           print("aligned")
       elif os.path.exists("${local.greeted}"):
           print("greeted")
@@ -438,7 +446,7 @@ resource "null_resource" "ranking" {
       case "$state" in
         clear) ;;
         aligned)
-          echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
+          echo "ERROR: ${local.home}/.user_aligned exists (or .user_aligned_conversation) on ${var.host_cluster_name}: a person has connected, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         greeted)
           echo "ERROR: ${local.greeted} exists on ${var.host_cluster_name}: a person has been greeted, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
@@ -640,7 +648,7 @@ resource "null_resource" "ranking" {
         ${self.triggers.python} - || failed="$failed, disarm the delivery job"
       printf '%s' '${self.triggers.resolve_b64}' | base64 -d | \
         kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        ${self.triggers.python} - "${self.triggers.raw_b64}" || failed="$failed, resolve the planted findings"
+        ${self.triggers.python} - ${self.triggers.planted_b64} || failed="$failed, resolve the planted findings"
       if [ -n "$failed" ]; then
         echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery, and its teardown resolves the findings." >&2
         exit 1

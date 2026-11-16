@@ -33,8 +33,12 @@
 provider "kubernetes" {
   alias                  = "seeded_b"
   host                   = "https://${google_container_cluster.seeded_b.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_b.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 # Defect (upgrade readiness): a pool that upgrades in place. `max_surge = 0`
@@ -381,6 +385,69 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
   }
 }
 
+# Defect (upgrade readiness, certification): a fail-closed webhook whose dead
+# backend would refuse the writes GKE's control plane makes in the
+# autoscaling.x-k8s.io group after a 1.35+ upgrade, where it installs and
+# reconciles capacitybuffers.autoscaling.x-k8s.io and Cluster Autoscaler
+# initialization hangs on a refusal (#2567, item 1). The one rule names
+# CapacityBuffer creates and updates in that group, which is the reach the
+# check reads; the clientConfig names a Service that does not exist, which is
+# what makes it fail closed for real; the 2-second timeout bounds the wait of
+# any request that ever reached it.
+#
+# The rule stays off apiextensions.k8s.io on purpose: a rule on CRD writes
+# names the group GKE's addon manager writes on this cluster, and a dropped
+# selector there would refuse every CRD write on every pool project. On the
+# x-k8s.io group the same drop refuses CapacityBuffer creates and updates
+# alone, which nothing on a lab cluster issues (Cluster Autoscaler writes the
+# status subresource, which `capacitybuffers` does not match). The
+# objectSelector is what keeps the gate inert: the API server calls it only
+# for a CapacityBuffer that carries the fleet label on its new or its old
+# object, and the fleet creates none. No namespaceSelector, so the gate carries
+# no namespace exemption a check could read as the system exemption #2567
+# names. The readiness grader reads rules and not selectors
+# (upgrade_readiness.py, the note on objectSelector above its scope
+# constants), which is why the selector does not hide the gate from the
+# check this fixture waits for.
+#
+# Addressed by the readiness-crd-webhook role.
+resource "kubernetes_validating_webhook_configuration_v1" "crd_gate" {
+  provider = kubernetes.seeded_b
+
+  metadata {
+    name   = "seeded-crd-gate"
+    labels = local.fleet_labels
+  }
+
+  webhook {
+    name                      = "crd-gate.seeded.invalid"
+    side_effects              = "None"
+    admission_review_versions = ["v1"]
+    failure_policy            = "Fail"
+    timeout_seconds           = 2
+
+    client_config {
+      service {
+        name      = "nonexistent-crd-gate"
+        namespace = kubernetes_namespace_v1.seeded_upgrade.metadata[0].name
+        path      = "/validate"
+      }
+    }
+
+    object_selector {
+      match_labels = local.fleet_labels
+    }
+
+    rule {
+      api_groups   = ["autoscaling.x-k8s.io"]
+      api_versions = ["*"]
+      operations   = ["CREATE", "UPDATE"]
+      resources    = ["capacitybuffers"]
+      scope        = "Namespaced"
+    }
+  }
+}
+
 # Defect (upgrade readiness): the budget that makes the drain impossible, not
 # merely slow. `maxUnavailable: 0` means no pod this budget matches may ever be
 # evicted voluntarily, so `disruptionsAllowed` is 0 forever -- not because the
@@ -427,5 +494,82 @@ resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
     selector {
       match_labels = { app = "pinned-batch-runner" }
     }
+  }
+}
+
+# Defect (upgrade readiness): a load balancer whose connection drain outlasts
+# the node's deregistration wait (catalogue entry 21). When a node pool upgrade
+# removes a node that is a backend of a load balancer, GKE deregisters the node
+# from the backend service and waits for the service's connection draining, up
+# to 600 seconds per node. A backend service whose
+# `connectionDraining.drainingTimeoutSec` is above that wait outlasts it: GKE
+# stops waiting at 600 seconds, but the instance group's delete of the old VM
+# waits out the full drain, so each node's removal takes the whole drain and,
+# past about 30 minutes, GKE fails the node step (the price below). In one
+# production fleet's support history this is one of the five causes behind
+# fourteen failed or blocked upgrade operations.
+#
+# Planted as a global external TCP backend service on the default pool's
+# instance group, draining for 720 seconds (a fifth over the wait), behind a
+# TCP health check and with no forwarding rule or proxy in front of it, so it
+# routes nothing and costs nothing. The default pool rather than
+# no-surge-pool, so the finding reads against the pool the version lag
+# already names and the no-surge-pool's budget stays the one drain blocker.
+#
+# The price: every default-pool node recreate on seeded-b waits out the whole
+# drain before the old VM goes, which is the mechanism the entry describes and
+# is what the readiness report must flag. Compute Engine holds the delete for
+# the full drainingTimeoutSec, not GKE's 600 seconds. The reconcile pays it
+# whenever the pool's version moves, at a minor roll and after GKE's own
+# auto-upgrade moves the master, because the default pool follows
+# local.lagging_version (main.tf); GKE's node auto-upgrade, which a REGULAR
+# cluster cannot turn off, pays it too. So the value has to stay inside what that roll survives, and 3600
+# did not: on 2026-10-27 the instance group manager flagged the old node at
+# 09:25:40 UTC, Compute Engine deleted it at 10:26:42, and GKE had already
+# ended the UPGRADE_NODES `Failed to update node pool` at 09:55:52, about 30
+# minutes after the flag. The pool sat in ERROR for an hour on every project
+# (#4043). At 720 the old node goes 12 minutes after the flag, so a node's
+# step finishes in about 18 minutes: clear of GKE's 30-minute give-up and of
+# the provider's 30-minute node-pool update timeout. The default pool runs two
+# nodes and surges both at once (main.tf), so the roll stays one such step.
+# Above 600 is all the readiness rule needs; the 30-minute give-up is the
+# ceiling.
+#
+# `managed_instance_group_urls` is the pool's `instanceGroups` URL, the form a
+# backend's `group` takes; `instance_group_urls` is the manager's. The
+# readiness rule matches either by zone and name.
+#
+# The reconciler creates and deletes these two kinds with
+# roles/compute.loadBalancerAdmin (the grant loop in
+# scripts/provision_ci_pool_project.sh, FLEET_RECONCILER_ROLES, the repair block
+# in docs/ci-pool-projects.md section 3), granted on every registered project
+# before this merges; the role landed with the fixture.
+#
+# Addressed by the readiness-lb-drain-timeout role.
+resource "google_compute_health_check" "drain_timeout" {
+  name = "drain-timeout-${var.cluster_prefix}-b"
+
+  tcp_health_check {
+    # The kube-proxy health port every GKE node serves; nothing is routed, so
+    # the check only has to be a valid one.
+    port = 10256
+  }
+}
+
+resource "google_compute_backend_service" "drain_timeout" {
+  name                  = "drain-timeout-${var.cluster_prefix}-b"
+  protocol              = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+  timeout_sec           = 10
+  # The defect: above the 600 seconds GKE waits per node during a pool
+  # upgrade, and under the 30 minutes after which GKE fails the node step (the
+  # comment above). Lower it to 600 and the fixture is healed while every probe
+  # still passes, which is why the role's fixture text names the value.
+  connection_draining_timeout_sec = 720
+  health_checks                   = [google_compute_health_check.drain_timeout.id]
+
+  backend {
+    group          = google_container_node_pool.seeded_b_default.managed_instance_group_urls[0]
+    balancing_mode = "UTILIZATION"
   }
 }

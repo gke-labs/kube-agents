@@ -1,0 +1,51 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Question*\n\n<@U123> said so. Which?",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "<!here>"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "<!here>"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "<!channel>"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "<!channel>"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

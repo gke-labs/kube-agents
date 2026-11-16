@@ -26,11 +26,15 @@ output "cluster_location" {
 output "cluster_ca_certificate" {
   description = "Base64-encoded public CA certificate of the cluster"
   # A conditional, not a one(concat(...)) fold, for the reason given at
-  # local.cluster_endpoint in main.tf.
+  # local.cluster_endpoint in main.tf. The certificate is read off master_auth
+  # with a splat rather than [0]: GKE always returns the block on a real
+  # cluster, so the value is the same there, while a mocked provider under
+  # `terraform test` leaves the block empty, where [0] would fail the plan
+  # and one([]) is null.
   value = (
-    !var.create_cluster ? data.google_container_cluster.existing[0].master_auth[0].cluster_ca_certificate :
-    var.cluster_mode == "autopilot" ? google_container_cluster.autopilot[0].master_auth[0].cluster_ca_certificate :
-    google_container_cluster.standard[0].master_auth[0].cluster_ca_certificate
+    !var.create_cluster ? one(data.google_container_cluster.existing[0].master_auth[*].cluster_ca_certificate) :
+    var.cluster_mode == "autopilot" ? one(google_container_cluster.autopilot[0].master_auth[*].cluster_ca_certificate) :
+    one(google_container_cluster.standard[0].master_auth[*].cluster_ca_certificate)
   )
   sensitive = true
 }
@@ -47,4 +51,39 @@ output "workload_identity_pool" {
 output "network_policy_enforced" {
   description = "Whether the cluster enforces NetworkPolicy (Dataplane V2 or the legacy Calico addon). Always true for a cluster this module creates; false only for an adopted cluster admitted by accept_no_network_policy, where every NetworkPolicy kube-agents installs is inert."
   value       = local.network_policy_enforced
+}
+
+output "sizing_profile" {
+  description = "The sizing profile the Standard cluster's node pools were resolved under (small, medium or fleet); small when sizing_profile was given as \"\"."
+  value       = local.sizing_profile_name
+}
+
+output "standard_machine_type" {
+  description = "Resolved machine type of the Standard cluster's default node pool: the explicit standard_machine_type, or the sizing_profile's. Informational on an Autopilot or adopted cluster, which has no such pool."
+  value       = local.standard_machine_type
+}
+
+output "standard_disk_size_gb" {
+  description = "Resolved boot disk size in GB of the Standard cluster's default node pool: the explicit standard_disk_size_gb, or the sizing_profile's."
+  value       = local.standard_disk_size_gb
+}
+
+output "standard_disk_type" {
+  description = "Resolved boot disk type of the Standard cluster's default node pool: the explicit standard_disk_type, or pd-balanced."
+  value       = local.standard_disk_type
+}
+
+output "gvisor_machine_type" {
+  description = "Resolved machine type of the gVisor node pool: the explicit gvisor_machine_type, or the sizing_profile's. Informational when enable_gvisor_node_pool is false."
+  value       = local.gvisor_machine_type
+}
+
+output "gvisor_disk_size_gb" {
+  description = "Resolved boot disk size in GB of the gVisor node pool: the explicit gvisor_disk_size_gb, or the sizing_profile's."
+  value       = local.gvisor_disk_size_gb
+}
+
+output "gvisor_disk_type" {
+  description = "Resolved boot disk type of the gVisor node pool: the explicit gvisor_disk_type, or pd-balanced."
+  value       = local.gvisor_disk_type
 }

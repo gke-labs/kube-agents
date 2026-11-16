@@ -16,7 +16,8 @@ The exact interfaces a builder implements against: the **`Agent` CRD** (per pers
 harness, reconciled by the kube-agents controller), the **identity contract** (read-only per tier;
 pre-created KSA/RBAC/WI the controller references by name), the **user-authorization** contract
 (_deferred hardening_ — down-scope to the requester), the **GitOps repo layout** + actuation/IaC
-conventions, the **OKF** knowledge schema, **session** state keys (semantic-recall/mem0 deferred
+conventions, the **OKF** knowledge schema, **session and long-term memory** state (`kube_agents_memory`,
+plus proposed `kube-agents-decisions` Hindsight indexing; multi-tier `mem0/Qdrant` coordination deferred
 post-v1), the **review-gate** contract, and the **MCP tool** changes that make agents read-only.
 Namespace convention `kubeagents-system`; agent labels use the `kube-agents/…` prefix.
 
@@ -232,7 +233,7 @@ above; the gateway normalizes them to a single dispatch path.
 in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
 command that opts a conversation onto the session route is a slash command that names a route rather
 than a handle. It is built: the A2A gateway resolves `/session`, `/session <text>` and `/session off`
-ahead of its status, stop and steer matchers, and it is the only slash command that gateway resolves
+ahead of its status, stop and steer matchers, and, with a bare `/feedback` (answered with the two reporting links; `docs/designs/chat-feedback-command.md`), one of the two slash commands that gateway resolves
 today (every other `/word` is plain text to it); the grammar is in
 [`spec-chatops-gateway.md`](../designs/spec-chatops-gateway.md), "Sessions by default".
 
@@ -317,36 +318,37 @@ optional for later). It lives outside the paths the pipeline deploys (`clusters/
 `fleet/`), so it is never applied to a cluster. Required frontmatter field: `type`. Convention for
 kube-agents knowledge types:
 
-| `type`              | Purpose                               | Key frontmatter                    |
-| ------------------- | ------------------------------------- | ---------------------------------- |
-| `cluster-blueprint` | Standard cluster config baseline      | `title, tags, resource, timestamp` |
-| `tenancy-model`     | Namespace isolation standard          | `title, tags`                      |
-| `runbook`           | Operational procedure (SRE CUJ)       | `title, tags, timestamp`           |
-| `metric-definition` | Named metric/KPI definition           | `title, tags, resource`            |
-| `escalation`        | A cross-tier request not yet a change | `title, tags, timestamp, resource` |
-| `observation`       | A durable finding worth sharing       | `title, tags, timestamp`           |
+| `type`              | Purpose                                            | Key frontmatter                             |
+| ------------------- | -------------------------------------------------- | ------------------------------------------- |
+| `cluster-blueprint` | Standard cluster config baseline                   | `title, tags, resource, timestamp`          |
+| `tenancy-model`     | Namespace isolation standard                       | `title, tags`                               |
+| `runbook`           | Operational procedure (SRE CUJ)                    | `title, tags, timestamp`                    |
+| `metric-definition` | Named metric/KPI definition                        | `title, tags, resource`                     |
+| `escalation`        | A cross-tier request not yet a change              | `title, tags, timestamp, resource`          |
+| `observation`       | A durable finding worth sharing                    | `title, tags, timestamp`                    |
+| `decision`          | Forward-looking architectural choice _(proposed)_  | `id, title, status, scope, guard`           |
+| `lesson`            | Verified incident / PR outcome lesson _(proposed)_ | `id, title, status, scope, guard, evidence` |
 
-The six types are the canonical starting set; `type` is an **open convention, not a hard enum** — new
-types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown
+The six baseline types (`cluster-blueprint`, `tenancy-model`, `runbook`, `metric-definition`,
+`escalation`, `observation`) ship today, and [`docs/designs/memory.md`](../designs/memory.md) proposes adding `decision` and `lesson`; `type` is an **open convention, not a hard enum** — new
+types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}` (singular `<type>/` canonical, with plural aliases such as `decisions/` and `lessons/` also accepted when ingesting existing repos); markdown
 links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
-**not** session state. An entry of any type may carry `declares:`, a list of
-`{check, namespace, object}` items (plus `cluster` for a one-cluster choice) that an audit reads as a
-declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from.
+**not** session state. Baseline posture entries may carry `declares:`, a list of
+`{check, namespace, object}` items (plus `cluster` for a one-cluster choice and `expires`, a `YYYY-MM-DD`
+UTC date, for one that lapses unless renewed) that an audit reads as a declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from. In the proposed Layer 2 design ([`docs/designs/memory.md`](../designs/memory.md)), entries of type `decision` and `lesson` carry separate `scope` and `guard.expect` frontmatter so the VCS publish broker (`/v1/vcs/publish` in `credential-proxy`) can run deterministic manifest checks against the protected base branch before pushing a branch.
 
-## 6. Session-state contract (mem0 deferred post-v1)
+## 6. Session-state and long-term memory contract
 
-**Semantic recall (mem0/Qdrant) is deferred post-v1** ([02](02-agent-personas.md) §2.3); v1 ships no
-vector store. If introduced later, scope every insert/query by a composite key `{tier}:{scope-id}`
+**Multi-tier RBAC scope isolation (mem0/Qdrant cross-tier coordination deferred post-v1):** Cross-tier `mem0/Qdrant` coordination remains deferred post-v1 ([02](02-agent-personas.md) §2.3). Any multi-tier vector store introduced later must scope every insert/query by a composite key `{tier}:{scope-id}`
 (e.g. `cluster-admin:cluster-a`, `developer-team:cluster-a/team-x`) with **server-side** isolation —
-each scope mapped to its own Qdrant collection / access-controlled key, never a client-supplied filter
+each scope mapped to its own collection or access-controlled key, never a sandbox-supplied filter
 (a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries
 (default ~30–90 days) that graduate durable observations to OKF via a human-reviewed PR.
 
-**Session state (existing, `kube_agents_memory`):** `session_db.sqlite` keyed by
-platform/space/thread; per-user memory in one Hindsight bank, isolated by a `user:<id>` scope tag
-derived from the runtime `user_id`. This stays as-is; do **not** move it
-into OKF or mem0. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
+**Session state & Hindsight banks (`kube_agents_memory`, plus proposed `kube-agents-decisions`):** `session_db.sqlite` is keyed by
+platform/space/thread; when `--memory=hindsight` is enabled, per-user conversational memory lives in `kube-agents-memory` on self-hosted Hindsight, isolated by a `user:<id>` scope tag
+deterministically derived by `kube_agents_memory` (`session.py`) from the gateway-verified caller identity (never supplied by the LLM or tool sandbox). [`docs/designs/memory.md`](../designs/memory.md) proposes narrowing intra-namespace `hindsight-api` port `8888` `NetworkPolicy` ingress to the gateway pods (`app: <agent>-gateway`, `kubeagents.x-k8s.io/a2a-component: gateway`) and the credential-free `curator` pod (`kubeagents.x-k8s.io/component: curator`) while preserving `gke-gmp-system` Prometheus scraping, and indexing OKF records verbatim into a second Hindsight bank (`kube-agents-decisions`). Under that proposed Layer 2 contract, when `--memory=file` (default) or `--memory=off` is selected, OKF `decision` and `lesson` guards evaluate deterministically from Git with no database dependency. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
 affinity** — a thread stays bound to the agent it was first routed to (§2b) until re-addressed.
 
 ## 7. Review-gate contract ([04](04-workflow-model.md) §3)
@@ -382,7 +384,7 @@ The concrete code delta that enforces [03](03-security-model.md):
 | `create_cluster` (remote `gke` MCP → `container.googleapis.com`)        | Direct GCP mutation via the remote `gke` MCP proxy (`config.yaml`) — **not** a `platform_mcp_server.py` tool                                                                                                                                                                                                      | No cluster-creating tool reaches agents; provisioning becomes "author KCC YAML or Terraform HCL + open PR"                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `gke` MCP wiring — **operator-rendered config**                         | The operator's `renderConfigYAML()` (`k8s-operator/internal/controller/platformagent_manifests.go`) emits a ConfigMap key the entrypoint **merges into** `/opt/data/config.yaml` at pod startup; it hard-codes the `gke` remote proxy + `mcp-gke` toolset. The baked configs are the merge **base**, not shadowed | Edit **`renderConfigYAML()`**: front the remote `gke` server with a **read-only tool-allowlist proxy** or drop it from `platform_toolsets` (a remote MCP's toolset can't be subset client-side). The baked configs (`agents/chat/config.yaml`, `agents/platform/config.yaml`, `deploy/shared/defaults/config.yaml`) must be edited **too**, not for consistency but for effect: `platform_toolsets` lists are unioned by the merge, so removing an entry from one side alone leaves the deployed agent write-capable |
 | `apply_manifest` / `delete_cluster_manifest` (`platform_mcp_server.py`) | Undecorated helpers running `kubectl apply` / `kubectl delete` — present but **not** exposed as MCP tools                                                                                                                                                                                                         | **Remove** the dead helpers so no `kubectl` write path can be re-exposed                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `gke-cluster-creator` skill (`agents/platform/skills/`)                 | `SKILL.md` invokes the `create_cluster` tool                                                                                                                                                                                                                                                                      | **Retire/adjust** — it must author KCC YAML or Terraform + open a PR, not call `create_cluster`                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `gke-cluster-creation` skill (`agents/platform/skills/`)                | Step 6 proposes a pull request in the repository's format (Config Connector YAML through `gcp-config-connector`, Terraform HCL through `gcp-terraform`); no create command remains in its templates                                                                                                               | **Done** for Config Connector and Terraform                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Agent K8s RBAC                                                          | **already read-only** — runtime-minted `view` binding + `get/list` "explorer" ClusterRole (no write on `containerclusters`/`kubeagents.x-k8s.io`)                                                                                                                                                                 | **read-only, pre-created** — stop runtime-minting; render per-tier manifests (§2)                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `submit-suggestion`                                                     | exists                                                                                                                                                                                                                                                                                                            | becomes the sole mutation path for all tiers                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 

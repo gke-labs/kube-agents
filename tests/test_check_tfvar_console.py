@@ -76,39 +76,50 @@ esac
 
     def test_the_shapes_tfvar_normalises_pass_as_empty(self):
         """`tostring(null)` is the shape #1309 missed and #1350 taught tfvar() to
-        read as unset; the check sees the helper's answer, so both pass empty.
-        Against the helper as #1309 left it, this case fails with the message
-        the test below asserts."""
-        for shape in ("tostring(null)", "null"):
+        read as unset; `tonumber(null)` and `tobool(null)` are what an unset
+        nullable number or bool prints, folded the same way since the node-pool
+        shape guard reads the two nullable disk sizes. The check sees the
+        helper's answer, so all four pass empty. Against the helper as #1309
+        left it, this case fails with the message the test below asserts."""
+        for shape in ("tostring(null)", "tonumber(null)", "tobool(null)", "null"):
             with self.subTest(shape=shape):
                 result = self._run(answers={"agent_service_account_id": shape})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertRegex(result.stdout, r"agent_service_account_id\s+-> <empty>")
 
     def test_the_shapes_tfvar_does_not_normalise_fail_and_name_the_variable(self):
-        """A typed null of another type, a typed null list, and an unresolved
-        required variable: what the next nullable variable a caller reads could
-        come back as."""
-        for shape in ("tobool(null)", "tolist(null) /* of string */", "(known after apply)"):
+        """A typed null list, map or object (what a nullable collection prints,
+        and the shapes the helper does not fold) and an unresolved required
+        variable: what the next nullable variable a caller reads could come
+        back as."""
+        for shape in (
+            "tolist(null) /* of string */",
+            "tomap(null) /* of string */",
+            "null /* object */",
+            "(known after apply)",
+        ):
             with self.subTest(shape=shape):
                 result = self._run(answers={"namespace": shape})
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn(f"tfvar namespace returned raw console output '{shape}'", result.stderr)
 
-    def test_the_sweep_includes_every_nullable_string_in_variables_tf(self):
-        """The second route into the sweep. Its only member today is also a
-        literal caller, so the sweep's output cannot show whether the route
-        works; the list mode can. The expected set is parsed here with a
+    def test_the_sweep_includes_every_nullable_scalar_in_variables_tf(self):
+        """The second route into the sweep: every string, number or bool
+        variables.tf declares with `default = null`, the three types whose
+        typed null the helper folds. The sizing inputs the node-pool shape
+        guard reads through a shell variable reach the sweep by this route
+        only; the list mode shows it. The expected set is parsed here with a
         different tool than the script's awk, so a formatting change in
         variables.tf that one of them misses fails rather than agrees."""
         variables_tf = (_REPO_ROOT / "terraform" / "examples" / "full-install" / "variables.tf").read_text()
         blocks = re.findall(r'^variable "([^"]+)" \{(.*?)^\}', variables_tf, re.M | re.S)
         expected = {
             name for name, body in blocks
-            if re.search(r"^\s*type\s*=\s*string\s*$", body, re.M)
+            if re.search(r"^\s*type\s*=\s*(string|number|bool)\s*$", body, re.M)
             and re.search(r"^\s*default\s*=\s*null\s*$", body, re.M)
         }
         self.assertIn("agent_service_account_id", expected)
+        self.assertIn("gvisor_disk_size_gb", expected)
         result = subprocess.run(
             ["bash", str(_SCRIPT), "--list"],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
@@ -116,7 +127,7 @@ esac
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         listed = set(result.stdout.split())
-        self.assertTrue(expected <= listed, f"nullable strings missing from the sweep: {expected - listed}")
+        self.assertTrue(expected <= listed, f"nullable scalars missing from the sweep: {expected - listed}")
         self.assertIn("project_id", listed)
 
     def test_every_swept_name_is_a_declared_variable(self):

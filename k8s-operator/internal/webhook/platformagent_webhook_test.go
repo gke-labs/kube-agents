@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"reflect"
 	"slices"
 	"strings"
@@ -600,6 +601,22 @@ func TestPlatformAgentValidation(t *testing.T) {
 		assertFieldError(t, err, "spec.security.serviceAccountName")
 	})
 
+	t.Run("fails if the broker's service account is one the operator mints for another workload", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		for _, name := range []string{"test-agent-gateway-agent", "test-agent-a2a-session", "test-agent-shell", "test-agent-a2a-mcp"} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec: agentv1alpha1.AgentSpec{
+						Security: &agentv1alpha1.SecuritySpec{ServiceAccountName: name},
+					},
+				},
+			}
+			_, err := val.ValidateCreate(ctx, agent)
+			assertFieldError(t, err, "spec.security.serviceAccountName")
+		}
+	})
+
 	t.Run("fails if system:admin service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 
@@ -888,6 +905,28 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 			t.Errorf("expected ImagePullPolicy IfNotPresent, got %v", agent.Spec.Deployment.ImagePullPolicy)
 		}
 	})
+
+	// spec.mode is deprecated: "today" named a stack no release renders any
+	// more, so the defaulter moves it, and an absent field, to "next" rather
+	// than refusing the apply; a "next" stays as it is.
+	t.Run("rewrites the retired spec.mode to next", func(t *testing.T) {
+		for name, mode := range map[string]*string{
+			"absent": nil,
+			"today":  ptr.To("today"),
+			"next":   ptr.To("next"),
+		} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Mode: mode},
+			}
+			if err := defaulter.Default(ctx, agent); err != nil {
+				t.Fatalf("%s: unexpected defaulting error: %v", name, err)
+			}
+			if agent.Spec.Mode == nil || *agent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+				t.Errorf("%s: spec.mode = %v after defaulting, want %q", name, agent.Spec.Mode, agentv1alpha1.PlatformAgentModeNext)
+			}
+		}
+	})
 }
 
 func TestPlatformAgentValidateDelete(t *testing.T) {
@@ -1061,7 +1100,7 @@ func TestGitIntegrationAdmission(t *testing.T) {
 			// check has to hold too: a CR applied before the enum narrowed, or one
 			// reaching the webhook by another path, must not reconcile.
 			name: "a provider with no registered rules",
-			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gg", Provider: "gogs"}}},
 			path: "spec.integration.forges[0].provider",
 		},
 		{
@@ -1126,5 +1165,195 @@ func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.forges[0].credentialsRef") {
 		t.Errorf("warnings = %v, expected one naming spec.integration.forges[0].credentialsRef", warnings)
+	}
+}
+
+func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
+	ctx := context.Background()
+	val := &PlatformAgentCustomValidator{}
+	giteaIntegration := &agentv1alpha1.PlatformAgentIntegrationSpec{
+		IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{
+				Name:           "gitea",
+				Provider:       agentv1alpha1.GitProviderGitea,
+				Host:           "gitea.example.com",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitea-ca"},
+			}},
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		dep  *agentv1alpha1.DeploymentSpec
+		path string
+	}{
+		{
+			name: "VCS_FORGES_CONFIG env override",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "VCS_FORGES_CONFIG", Value: "/etc/forges.json"}},
+			},
+			path: "spec.deployment.env[0].name",
+		},
+		{
+			name: "vcs-forge-credentials volume mount in extraVolumeMounts",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumeMounts: []corev1.VolumeMount{{Name: "vcs-forge-credentials-0", MountPath: "/tmp/token"}},
+			},
+			path: "spec.deployment.extraVolumeMounts[0].name",
+		},
+		{
+			name: "vcs-forge-ca reserved volume name in extraVolumes",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{
+					Name:         "vcs-forge-ca-0",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+			path: "spec.deployment.extraVolumes[0].name",
+		},
+		{
+			name: "vcs-forge-credentials reserved volume name in sidecarVolumes",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{
+					Name:         "vcs-forge-credentials-0",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+			path: "spec.deployment.sidecarVolumes[0].name",
+		},
+		{
+			name: "extraVolumes mounting forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{
+					Name:         "steal-gitea",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "gitea-token"}},
+				}},
+			},
+			path: "spec.deployment.extraVolumes[0].secret.secretName",
+		},
+		{
+			name: "deployment env secretKeyRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{
+					Name: "GITEA_TOKEN",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+							Key:                  "token",
+						},
+					},
+				}},
+			},
+			path: "spec.deployment.env[0].valueFrom.secretKeyRef.name",
+		},
+		{
+			name: "sidecarVolumes mounting projected forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{
+					Name: "steal-gitea-projected",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{{Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+						}}},
+					}},
+				}},
+			},
+			path: "spec.deployment.sidecarVolumes[0].projected.sources[0].secret.name",
+		},
+		{
+			name: "sidecar env secretKeyRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Sidecars: []corev1.Container{{
+					Name:  "helper",
+					Image: "busybox:1.36",
+					Env: []corev1.EnvVar{{
+						Name: "GITEA_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+								Key:                  "token",
+							},
+						},
+					}},
+				}},
+			},
+			path: "spec.deployment.sidecars[0].env[0].valueFrom.secretKeyRef.name",
+		},
+		{
+			name: "initContainer envFrom secretRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				InitContainers: []corev1.Container{{
+					Name:  "init-helper",
+					Image: "busybox:1.36",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+						},
+					}},
+				}},
+			},
+			path: "spec.deployment.initContainers[0].envFrom[0].secretRef.name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec:   agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					Integration: giteaIntegration,
+				},
+			}
+			_, err := val.ValidateCreate(ctx, agent)
+			assertFieldError(t, err, tc.path)
+		})
+	}
+}
+
+// An edit asking an existing bus for another server count is refused at
+// apply time with the operator's message, in both directions; an edit that
+// leaves the field as it was, a bus with no recorded count, and a create
+// pass, because the operator is the enforcement and this only refuses early.
+// spec.mode plays no part: every install runs the bus.
+func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
+	agent := func(spec *int, running int32) *agentv1alpha1.PlatformAgent {
+		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		if spec != nil {
+			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
+		}
+		pa.Status.BusReplicas = running
+		return pa
+	}
+	for _, tc := range []struct {
+		name     string
+		old, new *agentv1alpha1.PlatformAgent
+		refused  bool
+	}{
+		{"one to three", agent(nil, 1), agent(ptr.To(3), 1), true},
+		{"three to one", agent(nil, 3), agent(ptr.To(1), 3), true},
+		{"three to one, changing a set field", agent(ptr.To(3), 3), agent(ptr.To(1), 3), true},
+		{"the count it runs", agent(nil, 3), agent(ptr.To(3), 3), false},
+		{"removing the field", agent(ptr.To(3), 1), agent(nil, 1), false},
+		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
+		{"no recorded count (pruned by an older CRD)", agent(nil, 0), agent(ptr.To(1), 0), false},
+		{"a create", nil, agent(ptr.To(1), 0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateBusReplicas(tc.old, tc.new)
+			if tc.refused != (len(errs) == 1) {
+				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
+			}
+			if tc.refused {
+				want := controller.BusConversionRefusedMessage(int32(*tc.new.Spec.Harness.Tuning.BusReplicas), tc.old.Status.BusReplicas)
+				if !strings.Contains(errs[0].Detail, want) || errs[0].Field != "spec.harness.tuning.busReplicas" {
+					t.Errorf("refusal %s: %q, want the operator's message %q", errs[0].Field, errs[0].Detail, want)
+				}
+			}
+		})
+	}
+	// Wired into the update path.
+	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 3), agent(ptr.To(1), 3))
+	if err == nil || !strings.Contains(err.Error(), "#4225") {
+		t.Errorf("ValidateUpdate of a 3 to 1 edit: %v, want the refusal", err)
 	}
 }

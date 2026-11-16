@@ -1,0 +1,8 @@
+2026-10-21T04:13:02.0044640Z WARNING  googleapiclient.http:http.py:140 Encountered 403 Forbidden with reason "PERMISSION_DENIED"
+2026-10-21T04:13:02.0044942Z =========================== short test summary info ============================
+2026-10-21T04:13:02.0045400Z FAILED tests/e2e/gchat_agent_test.py::test_gchat_agent_math_response - AssertionError: Timed out after 300s waiting for agent response in spaces/***
+2026-10-21T04:13:02.0228974Z assert False
+2026-10-21T04:13:02.0229165Z ======================== 1 failed in 303.16s (0:05:03) =========================
+2026-10-21T04:13:02.0763797Z ✓ Using established kubectl cluster connection for 'platform-agent-host' (gke_kube-agents-rc_us-central1_platform-agent-host).
+2026-10-21T04:13:02.0841129Z ##[error]Process completed with exit code 1.
+2026-10-21T04:13:02.0916050Z Post job cleanup.

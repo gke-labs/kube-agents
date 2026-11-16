@@ -650,9 +650,15 @@ func TestAHealthyPassAsksToBeWokenForTheSecretReRead(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 1: %v", err)
 	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2: %v", err)
+	}
+	// The A2A stack's own pending requeue would mask the interval under test
+	// until the stack has settled.
+	settleA2AStack(t, ctx, cl, r, req, agent)
 	result, err := r.Reconcile(ctx, req)
 	if err != nil {
-		t.Fatalf("Reconcile 2: %v", err)
+		t.Fatalf("settled Reconcile: %v", err)
 	}
 	if result.RequeueAfter != secretEnvReprobeInterval {
 		t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, secretEnvReprobeInterval)
@@ -663,25 +669,26 @@ func TestAHealthyPassAsksToBeWokenForTheSecretReRead(t *testing.T) {
 // Teams credentials are on the credential proxy, not the gateway, and they are
 // the credentials an install rotates most often.
 //
-// Slack has to be enabled for this to test anything. The proxy names a Secret
-// only when an integration is configured (buildCredentialProxyEnv), so on a
-// default fixture it is stamped with nothing and reverting the call in
-// reconcileCredentialProxy leaves the suite green — which is exactly what
-// review found.
-func TestRotatingASlackTokenChangesTheRenderedCredentialProxy(t *testing.T) {
+// Teams has to be enabled for this to test anything. The proxy names a Secret
+// only when an integration it relays is configured (buildCredentialProxyEnv),
+// so on a default fixture it is stamped with nothing and reverting the call
+// in reconcileCredentialProxy leaves the suite green — which is exactly what
+// review found. Teams is the one chat platform whose credentials the broker
+// still carries: the A2A gateway holds Chat's and Slack's.
+func TestRotatingATeamsPasswordChangesTheRenderedCredentialProxy(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+				Teams: &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true)},
 			},
 		},
 	}
 	secret := secretHashTestSecret("platform-agent-secrets", map[string][]byte{
-		"SLACK_BOT_TOKEN": []byte("xoxb-before-rotation"),
-		"SLACK_APP_TOKEN": []byte("xapp-unchanged"),
-		"API_SERVER_KEY":  []byte("gateway-key"),
+		"TEAMS_APP_ID":       []byte("app-id-unchanged"),
+		"TEAMS_APP_PASSWORD": []byte("password-before-rotation"),
+		"API_SERVER_KEY":     []byte("gateway-key"),
 	})
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -706,21 +713,21 @@ func TestRotatingASlackTokenChangesTheRenderedCredentialProxy(t *testing.T) {
 	if err := cl.Get(ctx, proxyKey, proxy); err != nil {
 		t.Fatalf("read the credential-proxy Deployment: %v", err)
 	}
-	if !podReadsSecretKey(&proxy.Spec.Template.Spec, "SLACK_BOT_TOKEN") {
-		t.Fatal("the fixture no longer gives the proxy a Slack secretKeyRef, so this proves nothing")
+	if !podReadsSecretKey(&proxy.Spec.Template.Spec, "TEAMS_APP_PASSWORD") {
+		t.Fatal("the fixture no longer gives the proxy a Teams secretKeyRef, so this proves nothing")
 	}
 	before := proxy.Spec.Template.Annotations[secretEnvHashAnnotation]
 	if before == "" {
-		t.Fatalf("the rendered credential proxy carries no %s; a rotated Slack token would reach nothing", secretEnvHashAnnotation)
+		t.Fatalf("the rendered credential proxy carries no %s; a rotated Teams password would reach nothing", secretEnvHashAnnotation)
 	}
 
 	rotated := &corev1.Secret{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "platform-agent-secrets", Namespace: "test-ns"}, rotated); err != nil {
 		t.Fatalf("read the Secret back: %v", err)
 	}
-	rotated.Data["SLACK_BOT_TOKEN"] = []byte("xoxb-after-rotation")
+	rotated.Data["TEAMS_APP_PASSWORD"] = []byte("password-after-rotation")
 	if err := cl.Update(ctx, rotated); err != nil {
-		t.Fatalf("rotate the token: %v", err)
+		t.Fatalf("rotate the password: %v", err)
 	}
 
 	if _, err := r.Reconcile(ctx, req); err != nil {
@@ -730,7 +737,7 @@ func TestRotatingASlackTokenChangesTheRenderedCredentialProxy(t *testing.T) {
 		t.Fatalf("re-read the credential-proxy Deployment: %v", err)
 	}
 	if after := proxy.Spec.Template.Annotations[secretEnvHashAnnotation]; after == before {
-		t.Errorf("the rendered credential proxy is unchanged after the rotation (%s), so the running pod keeps the old Slack token", before)
+		t.Errorf("the rendered credential proxy is unchanged after the rotation (%s), so the running pod keeps the old Teams password", before)
 	}
 }
 
@@ -760,10 +767,11 @@ func TestTheSecretAndRBACReprobeIntervalsStayDistinguishable(t *testing.T) {
 	}
 }
 
-// reconcileWorkload renders a StatefulSet instead of a Deployment above one
-// replica with RWO storage, and stamps it from a second call site. Without this
-// the Deployment test alone passes with that call reverted, and a multi-replica
-// install keeps the old key.
+// reconcileWorkload rendered a StatefulSet instead of a Deployment above one
+// replica with RWO storage. The replica cap (supportedGatewayReplicas) keeps
+// that spec on the single-replica Deployment, so the upgrade from a release
+// that rendered the StatefulSet has to delete the live one and stamp the
+// Deployment that replaces it.
 func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -780,16 +788,17 @@ func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 			},
 		},
 	}
-	if !useStatefulSet(agent) {
-		t.Fatal("this fixture no longer renders a StatefulSet, so it does not reach the second call site")
+	if useStatefulSet(agent) {
+		t.Fatal("this fixture still renders a StatefulSet past the replica cap")
 	}
+	legacy := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"}}
 	secret := secretHashTestSecret("platform-agent-secrets", map[string][]byte{
 		"API_SERVER_KEY":     []byte("before-rotation"),
 		"SESSION_KV_API_KEY": []byte("session-key"),
 	})
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, secret).
+		WithObjects(agent, secret, legacy).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -806,12 +815,15 @@ func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 	}
 
 	gatewayKey := types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}
-	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, gatewayKey, sts); err != nil {
-		t.Fatalf("read the gateway StatefulSet: %v", err)
+	if err := cl.Get(ctx, gatewayKey, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the legacy gateway StatefulSet is still there after the capped render (err=%v)", err)
 	}
-	if sts.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
-		t.Fatalf("the rendered StatefulSet carries no %s; nothing would roll it", secretEnvHashAnnotation)
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, gatewayKey, dep); err != nil {
+		t.Fatalf("read the gateway Deployment: %v", err)
+	}
+	if dep.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
+		t.Fatalf("the rendered Deployment carries no %s; nothing would roll it", secretEnvHashAnnotation)
 	}
 }
 

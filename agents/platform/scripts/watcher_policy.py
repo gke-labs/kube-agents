@@ -9,16 +9,35 @@ those calls through the broker, on the broker's credential, under the
 `watcher` role, and this module is the whole of what decides which calls the
 broker makes for them.
 
-Two tables, one per route family:
+Two tables, one per route family, and a third family that reuses the Pub/Sub
+half of the first:
 
 - `/v1/watcher/gcp/<host>/<path>`: the GKE `clusters.get` the watchers use to
   learn a cluster's Autopilot bit, and the four Pub/Sub calls the drift detector
   makes, each pinned to the one subscription the operator configured.
+- `/v1/pubsub/gcp/<host>/<path>`: the same four Pub/Sub calls for the gateway's
+  Pub/Sub platform adapter (agentplugins/pubsub-platform), under the `chat`
+  role, pinned to the set of subscriptions the operator rendered from the
+  AgentPlugin configs. The gateway pod holds no Google credential of its own,
+  so this is the adapter's only way to a subscription. `evaluate_pubsub`.
 - `/v1/k8s/<project>/<location>/<cluster>/<path>`: GET only. List and watch of
-  core/v1 events across the cluster (the event watcher), and a GET of one named
-  object of any kind but `secrets` (the drift detector's join reads the object
-  an audit record names). No other list, no watch of anything else (the
-  deprecated `watch/<resource>` paths included), no subresource.
+  core/v1 events across the cluster (the event watcher), a GET of one named
+  object of a kind in `WATCHER_NAMED_READS` (the drift detector's join reads the
+  object an audit record names), and a count list: one of the five
+  cluster-scoped lists in `COUNT_LIST_PATHS`, with `limit=1` as its whole query
+  and an `Accept` every range of which asks for a `PartialObjectMetadataList`
+  (the event watcher's fleet-shape probe reads one item's metadata plus the
+  server's `remainingItemCount`; the item is one object's whole `ObjectMeta`,
+  so its annotations come too, a `last-applied-configuration` holding the
+  applied manifest among them, but no spec or status of its own). The four
+  controller kinds are already readable whole by name under
+  `WATCHER_NAMED_READS`; pods are not, so the first-sorted pod's metadata is
+  reach this rule adds. One more GET reads one named Pod's metadata, under a
+  JSON `PartialObjectMetadata` Accept on every range, for the event watcher's
+  owner lookup; the broker relays only its projection (`project_pod_metadata`;
+  the `POD_METADATA_KIND` comment names each field it keeps, and why). No
+  other list, no watch of anything else (the deprecated `watch/<resource>`
+  paths included), no subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -34,6 +53,10 @@ from command_policy import Decision
 
 WATCHER_GCP_PREFIX = "/v1/watcher/gcp/"
 WATCHER_K8S_PREFIX = "/v1/k8s/"
+# The platform adapter's family. Its own prefix rather than a second caller on
+# the watcher's: the two roles are confined to different subscriptions, and the
+# prefix is what ROUTE_ROLES keys the role on.
+PLATFORM_PUBSUB_PREFIX = "/v1/pubsub/gcp/"
 
 METHOD_GET = "GET"
 METHOD_POST = "POST"
@@ -47,12 +70,23 @@ RULE_GCP_ROUTE = "gcp.watcher.route"
 RULE_GCP_SUBSCRIPTION = "gcp.watcher.subscription"
 RULE_GCP_BODY = "gcp.watcher.body"
 RULE_GCP_CLUSTER_GET = "gcp.watcher.cluster-get"
+RULE_PUBSUB_METHOD = "gcp.pubsub.method"
+RULE_PUBSUB_ROUTE = "gcp.pubsub.route"
+RULE_PUBSUB_SUBSCRIPTION = "gcp.pubsub.subscription"
+RULE_PUBSUB_BODY = "gcp.pubsub.body"
 RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
 RULE_K8S_SECRETS = "kubernetes.watcher.secrets"
+RULE_K8S_KIND = "kubernetes.watcher.kind"
 RULE_K8S_LEGACY = "kubernetes.watcher.legacy-path"
 RULE_K8S_QUERY = "kubernetes.watcher.query"
+RULE_K8S_ACCEPT = "kubernetes.watcher.accept"
+# The rule ids an allowed Kubernetes call is answered with.
+RULE_K8S_EVENTS = "kubernetes.watcher.events"
+RULE_K8S_NAMED_GET = "kubernetes.watcher.named-get"
+RULE_K8S_COUNT_LIST = "kubernetes.watcher.count-list"
+RULE_K8S_POD_METADATA = "kubernetes.watcher.pod-metadata"
 
 # Google's project id grammar, and GKE's location and cluster name grammars:
 # lower-case, digits and hyphens, so no segment can smuggle a slash or a dot.
@@ -96,6 +130,64 @@ _NAMED_GROUP = re.compile(
 # `namespaces/<ns>` alone matches the cluster-scoped named form with resource
 # "namespaces"; that is a named GET of a Namespace object and is allowed.
 REFUSED_RESOURCES = frozenset({"secrets"})
+
+# The GitOps reconcilers' sync objects: the six kinds gke-labs/kube-agents#2987
+# adds to the agent's `minimal` ClusterRole (get/list/watch, in
+# k8s-operator/internal/controller/platformagent_manifests.go). Drift on a
+# GitOps-managed object is what the drift detector exists for, and the join
+# reading only kinds the agent itself can read keeps the two grants in step. A
+# change to either list has to change both: conformance
+# test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read
+# compares this table with the rendered role on every golden fixture.
+RECONCILER_NAMED_READS = frozenset(
+    {
+        ("argoproj.io", "applications"),
+        ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+        ("source.toolkit.fluxcd.io", "gitrepositories"),
+        ("source.toolkit.fluxcd.io", "ocirepositories"),
+        ("configsync.gke.io", "rootsyncs"),
+        ("configsync.gke.io", "reposyncs"),
+    }
+)
+# The kinds the drift detector's join may read by name, as (API group, resource
+# plural): what an audit record's resourceName carries, any version. The audit
+# sink and the detector's classifier filter no kinds (terraform/modules/
+# drift-pubsub, cmd/drift-detector/classify.go), so this table is the only kind
+# boundary on the join. These are the declarative kinds a person edits out of
+# band. Controller-written kinds (pods, replicasets, nodes, leases, events) are
+# left out, and so is every other custom resource. A record of an unlisted kind
+# is still reported: the join fails open and forwards it unenriched, with this
+# refusal as its lookup error. Widen by PR, as with api_policy.API_READ_ROUTES.
+WATCHER_NAMED_READS = frozenset(
+    {
+        ("", "configmaps"),
+        ("", "limitranges"),
+        ("", "namespaces"),
+        ("", "persistentvolumeclaims"),
+        ("", "resourcequotas"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicies"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicybindings"),
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations"),
+        ("apiextensions.k8s.io", "customresourcedefinitions"),
+        ("apps", "daemonsets"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("autoscaling", "horizontalpodautoscalers"),
+        ("batch", "cronjobs"),
+        ("batch", "jobs"),
+        ("networking.k8s.io", "ingresses"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "clusterrolebindings"),
+        ("rbac.authorization.k8s.io", "clusterroles"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    }
+    | RECONCILER_NAMED_READS
+)
 # Segments the API server serves in the resource position that are not a
 # resource: the deprecated `watch/<resource>` prefix (a watch, of any kind,
 # Secrets included) and `proxy/`. Read as a named GET they would be a watch the
@@ -123,16 +215,131 @@ EVENTS_QUERY_KEYS = frozenset(
 )
 # A named GET may only ask for a resource version.
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
+# The count lists: the five cluster-scoped lists the event watcher's fleet-shape
+# probe counts (k8s-operator/cmd/k8s-event-watcher/fleetshape.go), each as the
+# exact path. Cluster-scoped only, so a namespaced form of the same plural is a
+# path the route does not know; no `secrets`, no `nodes`, no `configmaps`: a
+# count is of workloads, and the rule is widened by PR, as the tables above are.
+COUNT_LIST_PATHS = frozenset(
+    {
+        "api/v1/pods",
+        "apis/apps/v1/deployments",
+        "apis/apps/v1/statefulsets",
+        "apis/apps/v1/daemonsets",
+        "apis/batch/v1/cronjobs",
+    }
+)
+# The whole of a count list's query: one item. Anything else -- a larger limit,
+# a selector, a continue token, a watch -- is a list, not a count.
+COUNT_LIST_QUERY = {"limit": ["1"]}
+# The parameters that make the API server answer with each item's ObjectMeta
+# and nothing of its spec or status, and the whole of what a count list's
+# Accept may carry on each media range: with one plain range beside it the
+# server may pick the plain one and the one item comes back whole. Compared as
+# the server reads them (goautoneg's ParseAccept: names and values trimmed, the
+# last duplicate winning), so a range is parsed into a name-value table, a
+# repeated name is refused outright rather than resolved, and the table has to
+# equal this one: an `as=Table` after the metadata `as` would otherwise win on
+# the server and return the printer columns, which are spec and status. A
+# spelling the server might also take (quoted, cased) is refused, not guessed at.
+COUNT_LIST_ACCEPT_PARAMS = {"as": "PartialObjectMetadataList", "g": "meta.k8s.io", "v": "v1"}
+# A named Pod GET is admitted only under this Accept, parsed the same way, and
+# only as JSON, so the broker can project the answer: the server answers with
+# the one Pod's whole ObjectMeta, every annotation (a client-side apply's
+# last-applied-configuration, which holds the manifest and its env values,
+# among them) and managedFields included, and the broker relays only the few
+# fields POD_METADATA_KIND's comment names (project_pod_metadata). The event watcher reads a
+# Pod's controller from that (cmd/k8s-event-watcher/owner.go), so its incident
+# folds with the other Pods of the same workload. Pods stay out of
+# WATCHER_NAMED_READS: a full Pod read is still refused.
+POD_METADATA_ACCEPT_PARAMS = {"as": "PartialObjectMetadata", "g": "meta.k8s.io", "v": "v1"}
+POD_METADATA_MEDIA_TYPE = "application/json"
+POD_RESOURCE = "pods"
+# What a projected Pod answer keeps, and nothing else, each because the event
+# watcher's owner lookup (cmd/k8s-event-watcher/owner.go) reads it:
+# - the controller ownerReference's kind and name, only when it is one of
+#   POD_METADATA_OWNER_KINDS: the workload the Pod's incident folds on;
+# - its controller flag, true: the lookup reads only a controller entry;
+# - the pod-template-hash label, only when that controller is a ReplicaSet: the
+#   Deployment is the ReplicaSet's name less "-<hash>". A ReplicaSet without
+#   the label, or whose name does not end in it, is not a Deployment's, and
+#   the lookup reads it as none, so it is not relayed either.
+# The Pod's name, namespace and UID are not relayed: the watcher has them from
+# the event it is looking up. Any other controller (a static Pod's Node, a
+# custom controller), every other owner, label and annotation, and
+# managedFields, are dropped.
+POD_METADATA_KIND = "PartialObjectMetadata"
+POD_METADATA_HASH_LABEL = "pod-template-hash"
+POD_METADATA_HASH_OWNER_KIND = "ReplicaSet"
+# The controller kinds the lookup folds on (foldableControllerKinds in owner.go;
+# tests/test_watcher_pod_metadata_parity.py holds the two equal).
+POD_METADATA_OWNER_KINDS = frozenset({POD_METADATA_HASH_OWNER_KIND, "StatefulSet", "DaemonSet", "Job"})
+
+
+def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
+    """Refuse a malformed table at import, so a bad edit fails every test."""
+    for group, resource in table:
+        if group and not re.fullmatch(SEGMENT, group):
+            raise ValueError(f"WATCHER_NAMED_READS: group {group!r} is not an API group")
+        if not re.fullmatch(r"[a-z][a-z0-9]*", resource):
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is not a lower-case resource plural")
+        if resource in REFUSED_RESOURCES or resource in REFUSED_PATH_SEGMENTS:
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is refused under every group")
+
+
+_validate_named_reads(WATCHER_NAMED_READS)
 
 
 # What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
-# (clusterprofiles.ClientConfigForIdentity and Discover) and nothing else. The
+# (clusterprofiles.ClientConfigForIdentity and Discover, and the event watcher's
+# fleet-shape probe, which reads `currentNodeCount`) and nothing else. The
 # rest of `clusters.get` is not theirs, and `masterAuth` is the sharp part: on a
 # cluster with client certificate issuance on, it carries `clientCertificate`
 # and `clientKey`, a credential for that cluster's API server far wider than the
 # GET-only route the watcher role is held to. Only its CA, which is public, is kept.
-CLUSTER_FIELDS = frozenset({"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot"})
+CLUSTER_FIELDS = frozenset(
+    {"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot", "currentNodeCount"}
+)
 CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})
+
+
+def project_pod_metadata(body: bytes) -> bytes | None:
+    """The relayed form of a named Pod's PartialObjectMetadata, or None if it is not one.
+
+    `{"metadata": {"ownerReferences": [{"kind", "name", "controller": true}],
+    "labels": {"pod-template-hash"}}}` with the first controller entry only,
+    and the label only when that controller is a ReplicaSet. `{"metadata": {}}`
+    for a Pod with no controller, a controller of another kind, or a ReplicaSet
+    without the label or whose name does not end in it. See POD_METADATA_KIND's comment for why each field is
+    there.
+    """
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("kind") != POD_METADATA_KIND:
+        return None
+    meta = obj.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    projected: dict[str, object] = {}
+    owners = meta.get("ownerReferences")
+    for ref in owners if isinstance(owners, list) else []:
+        if not isinstance(ref, dict) or ref.get("controller") is not True:
+            continue
+        kind, name = ref.get("kind"), ref.get("name")
+        if not (isinstance(kind, str) and kind and isinstance(name, str) and name):
+            continue
+        labels = meta.get("labels")
+        hash_value = labels.get(POD_METADATA_HASH_LABEL) if isinstance(labels, dict) else None
+        # The lookup reads a ReplicaSet only when its name ends in the hash.
+        has_hash = isinstance(hash_value, str) and bool(hash_value) and name.endswith("-" + hash_value)
+        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):
+            projected["ownerReferences"] = [{"kind": kind, "name": name, "controller": True}]
+            if kind == POD_METADATA_HASH_OWNER_KIND:
+                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}
+        break
+    return json.dumps({"metadata": projected}, separators=(",", ":")).encode()
 
 
 def project_cluster(body: bytes) -> bytes | None:
@@ -154,6 +361,65 @@ def _refuse(rule_id: str, message: str) -> Decision:
     return Decision(allowed=False, rule_id=rule_id, message=message)
 
 
+class _SubscriptionRules:
+    """The rule ids and refusal texts one relay family answers Pub/Sub calls with.
+
+    The watcher's and the platform adapter's families decide the same four calls
+    the same way; only who they say they are, and which subscriptions they
+    reach, differ. One decision procedure, two vocabularies, so the two cannot
+    drift apart on what a body may carry.
+    """
+
+    def __init__(self, *, method: str, route: str, subscription: str, body: str, allowed_prefix: str,
+                 route_message: str, subscription_message: str) -> None:
+        self.method = method
+        self.route = route
+        self.subscription = subscription
+        self.body = body
+        self.allowed_prefix = allowed_prefix
+        self.route_message = route_message
+        self.subscription_message = subscription_message
+
+
+_WATCHER_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_GCP_METHOD,
+    route=RULE_GCP_ROUTE,
+    subscription=RULE_GCP_SUBSCRIPTION,
+    body=RULE_GCP_BODY,
+    allowed_prefix="gcp.watcher.subscription",
+    route_message="The watcher relay makes four Pub/Sub calls on one subscription.",
+    subscription_message="The watcher relay reaches only the drift detector's configured subscription.",
+)
+_PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_PUBSUB_METHOD,
+    route=RULE_PUBSUB_ROUTE,
+    subscription=RULE_PUBSUB_SUBSCRIPTION,
+    body=RULE_PUBSUB_BODY,
+    allowed_prefix="gcp.pubsub.subscription",
+    route_message="The platform Pub/Sub relay makes four Pub/Sub calls on its configured subscriptions.",
+    subscription_message="The platform Pub/Sub relay reaches only the subscriptions the AgentPlugins configure.",
+)
+
+
+def _evaluate_subscription_call(
+    method: str, path: str, body: bytes, subscriptions: frozenset[str], rules: _SubscriptionRules
+) -> Decision:
+    """The four Pub/Sub calls on one of `subscriptions`; an empty set refuses them all."""
+    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
+    if match is None:
+        return _refuse(rules.route, rules.route_message)
+    if match.group("sub") not in subscriptions:
+        return _refuse(rules.subscription, rules.subscription_message)
+    verb = match.group("verb")
+    if verb is None:
+        if method != METHOD_GET:
+            return _refuse(rules.method, "A subscription is read with GET.")
+        return Decision(allowed=True, rule_id=rules.allowed_prefix + "-get", message="")
+    if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
+        return _refuse(rules.body, "That Pub/Sub call carries a body this relay does not forward.")
+    return Decision(allowed=True, rule_id=rules.allowed_prefix + verb.replace(":", "-"), message="")
+
+
 def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: str) -> Decision:
     """Allow or refuse one `/v1/watcher/gcp/` call.
 
@@ -167,23 +433,24 @@ def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: s
             return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
     if host == PUBSUB_HOST:
-        match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
-        if match is None:
-            return _refuse(RULE_GCP_ROUTE, "The watcher relay makes four Pub/Sub calls on one subscription.")
-        if not subscription or match.group("sub") != subscription:
-            return _refuse(
-                RULE_GCP_SUBSCRIPTION,
-                "The watcher relay reaches only the drift detector's configured subscription.",
-            )
-        verb = match.group("verb")
-        if verb is None:
-            if method != METHOD_GET:
-                return _refuse(RULE_GCP_METHOD, "A subscription is read with GET.")
-            return Decision(allowed=True, rule_id="gcp.watcher.subscription-get", message="")
-        if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
-            return _refuse(RULE_GCP_BODY, "That Pub/Sub call carries a body this relay does not forward.")
-        return Decision(allowed=True, rule_id="gcp.watcher.subscription" + verb.replace(":", "-"), message="")
+        allowed = frozenset({subscription}) if subscription else frozenset()
+        return _evaluate_subscription_call(method, path, body, allowed, _WATCHER_SUBSCRIPTION_RULES)
     return _refuse(RULE_GCP_ROUTE, "The watcher relay reaches the GKE and Pub/Sub APIs only.")
+
+
+def evaluate_pubsub(method: str, host: str, path: str, body: bytes, subscriptions: frozenset[str]) -> Decision:
+    """Allow or refuse one `/v1/pubsub/gcp/` call for the gateway's platform adapter.
+
+    `subscriptions` is the set of `projects/<p>/subscriptions/<s>` the operator
+    rendered from the AgentPlugin configs; empty means no plugin route the
+    operator could qualify, and every call is refused. Pub/Sub is the only host: the
+    adapter has no business with the GKE API.
+    """
+    if method not in (METHOD_GET, METHOD_POST):
+        return _refuse(RULE_PUBSUB_METHOD, "The platform Pub/Sub relay forwards GET and POST only.")
+    if host != PUBSUB_HOST:
+        return _refuse(RULE_PUBSUB_ROUTE, "The platform Pub/Sub relay reaches the Pub/Sub API only.")
+    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)
 
 
 def _body_fits(body: bytes, keys: dict[str, type]) -> bool:
@@ -215,8 +482,43 @@ def split_k8s_target(rest: str) -> tuple[dict[str, str], str] | None:
     return match.groupdict(), parts[3]
 
 
-def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decision:
-    """Allow or refuse one `/v1/k8s/` call. `rest` is the path after the prefix."""
+def accepts_metadata_only(
+    accept: str, expected: dict[str, str] = COUNT_LIST_ACCEPT_PARAMS, media_type: str = ""
+) -> bool:
+    """True when every media range in `accept` asks for metadata only.
+
+    Each range's parameters are parsed into a name-value table the way the
+    API server parses them, and the table has to equal `expected`
+    (`COUNT_LIST_ACCEPT_PARAMS` for a count list, `POD_METADATA_ACCEPT_PARAMS`
+    for a named Pod): no parameter missing, none extra, none repeated. When
+    `media_type` is set, every range's type has to be it too. An empty or
+    blank `Accept` offers no range and is False.
+    """
+    ranges = [media_range.strip() for media_range in accept.split(",")]
+    if not all(ranges):
+        return False
+    for media_range in ranges:
+        if media_type and media_range.split(";", 1)[0].strip().lower() != media_type:
+            return False
+        params: dict[str, str] = {}
+        for param in media_range.split(";")[1:]:
+            name, separator, value = param.partition("=")
+            name, value = name.strip(), value.strip()
+            if not separator or name in params:
+                return False
+            params[name] = value
+        if params != expected:
+            return False
+    return True
+
+
+def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]], accept: str = "") -> Decision:
+    """Allow or refuse one `/v1/k8s/` call.
+
+    `rest` is the path after the prefix; `accept` is the `Accept` header the
+    broker will forward, or empty when it forwards none. Only the count-list
+    and named Pod rules read it.
+    """
     if method != METHOD_GET:
         return _refuse(RULE_K8S_METHOD, "The watcher's Kubernetes route is read-only: GET only.")
     split = split_k8s_target(rest)
@@ -226,13 +528,19 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
     if _EVENTS_LIST.fullmatch(path):
         if not set(query) <= EVENTS_QUERY_KEYS:
             return _refuse(RULE_K8S_QUERY, "An events list or watch carries a query key this route does not forward.")
-        return Decision(allowed=True, rule_id="kubernetes.watcher.events", message="")
+        return Decision(allowed=True, rule_id=RULE_K8S_EVENTS, message="")
+    if path in COUNT_LIST_PATHS:
+        if query != COUNT_LIST_QUERY:
+            return _refuse(RULE_K8S_QUERY, "A count list carries limit=1 and no other query key.")
+        if not accepts_metadata_only(accept):
+            return _refuse(RULE_K8S_ACCEPT, "A count list asks for a PartialObjectMetadataList on every Accept range.")
+        return Decision(allowed=True, rule_id=RULE_K8S_COUNT_LIST, message="")
     match = _NAMED_CORE.fullmatch(path) or _NAMED_GROUP.fullmatch(path)
     if match is None:
         return _refuse(
             RULE_K8S_PATH,
-            "The watcher's Kubernetes route lists and watches events, and reads one named object; "
-            "this path is neither.",
+            "The watcher's Kubernetes route lists and watches events, counts five workload kinds, "
+            "and reads one named object; this path is none of those.",
         )
     if match.group("resource") in REFUSED_PATH_SEGMENTS or match.group("name") in DOT_SEGMENTS:
         return _refuse(
@@ -241,9 +549,26 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
         )
     if match.group("resource") in REFUSED_RESOURCES:
         return _refuse(RULE_K8S_SECRETS, "The watcher's Kubernetes route never reads a Secret.")
+    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:
+        # No query key at all: the watcher's lookup sends none, and a
+        # resourceVersion would only let a caller read a cached version.
+        if query:
+            return _refuse(RULE_K8S_QUERY, "A named Pod read carries no query key.")
+        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):
+            return _refuse(
+                RULE_K8S_ACCEPT, "A named Pod read asks for a JSON PartialObjectMetadata on every Accept range."
+            )
+        return Decision(allowed=True, rule_id=RULE_K8S_POD_METADATA, message="")
+    group = match.groupdict().get("group") or ""
+    if (group, match.group("resource")) not in WATCHER_NAMED_READS:
+        return _refuse(
+            RULE_K8S_KIND,
+            "The watcher's Kubernetes route reads only the kinds in its table; "
+            "the drift record is reported without ownership.",
+        )
     if not set(query) <= NAMED_QUERY_KEYS:
         return _refuse(RULE_K8S_QUERY, "A named read carries a query key this route does not forward.")
-    return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")
+    return Decision(allowed=True, rule_id=RULE_K8S_NAMED_GET, message="")
 
 
 # The values the API server reads `watch` as false. It decodes ListOptions with

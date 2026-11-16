@@ -106,10 +106,10 @@ class EnvRewriteTest(unittest.TestCase):
         )
 
     def test_a_terminal_setting_the_managed_block_does_not_own_stays(self):
-        # `hermes config set terminal.timeout 600` mirrors into .env like this.
-        self.write("TERMINAL_TIMEOUT=600\nTERMINAL_ENV=local\n")
+        # `hermes config set terminal.persistent_shell true` mirrors into .env like this.
+        self.write("TERMINAL_PERSISTENT_SHELL=true\nTERMINAL_ENV=local\n")
         self.rewrite()
-        self.assertIn("TERMINAL_TIMEOUT=600\n", self.env.read_text())
+        self.assertIn("TERMINAL_PERSISTENT_SHELL=true\n", self.env.read_text())
         self.assertNotIn("TERMINAL_ENV=local", self.env.read_text())
 
     def test_commented_out_managed_lines_are_left_alone(self):
@@ -344,6 +344,11 @@ class BuildCheckTerminalTest(unittest.TestCase):
                     self.assertEqual(tep.BUILD_CHECK_TERMINAL[key].split(".", 2)[2], value.split(".", 2)[2])
                 else:
                     self.assertEqual(tep.BUILD_CHECK_TERMINAL[key], value)
+
+    def test_the_operator_pins_the_timeout_the_preflight_budgets_against(self):
+        """cluster_preflight.sh budgets under TERMINAL_TOOL_TIMEOUT_SECONDS; the build check holds
+        that to Hermes' code default, and this holds the operator's terminal.timeout to it."""
+        self.assertEqual(tep.preflight_terminal_mirror_seconds(), self.rendered_terminal()["timeout"])
 
 
 class ManagedBlockTest(unittest.TestCase):
@@ -619,15 +624,30 @@ class HermesTest(unittest.TestCase):
     def test_a_profile_config_key_that_outranks_the_copy_is_deleted_and_the_rest_kept(self):
         self.operator_pod()
         config = self.home / "config.yaml"
-        config.write_text("# mine\nmodel: x\nterminal:\n  backend: local  # old\n  timeout: 60\n")
+        config.write_text(
+            "# mine\nmodel: x\nterminal:\n  backend: local  # old\n  timeout: 60\n  persistent_shell: true\n"
+        )
         config.chmod(0o640)
         self.assertTrue(tep.pin(self.home))
-        self.assertEqual("ssh", tep.resolved_scope(self.home)["TERMINAL_ENV"])
+        scope = tep.resolved_scope(self.home)
+        self.assertEqual("ssh", scope["TERMINAL_ENV"])
+        self.assertEqual("180", scope["TERMINAL_TIMEOUT"])
         text = config.read_text()
         self.assertNotIn("backend", text)
-        for kept in ("# mine", "model: x", "timeout: 60"):
+        self.assertNotIn("timeout", text)
+        for kept in ("# mine", "model: x", "persistent_shell: true"):
             self.assertIn(kept, text)
         self.assertEqual(0o640, stat.S_IMODE(config.stat().st_mode))
+
+    def test_the_copy_replaces_the_timeout_hermes_seeds_into_env(self):
+        # stage2-hook.sh seeds .env from Hermes' .env.example, whose TERMINAL_TIMEOUT=60 beats
+        # the terminal tool's 180s code default.
+        self.operator_pod()
+        (self.home / ".env").write_text("# Default command timeout in seconds\nTERMINAL_TIMEOUT=60\n")
+        self.assertEqual("60", tep.resolved_scope(self.home).get("TERMINAL_TIMEOUT"))
+        tep.pin(self.home)
+        self.assertEqual("180", tep.resolved_scope(self.home)["TERMINAL_TIMEOUT"])
+        self.assertIn("TERMINAL_TIMEOUT=180\n", (self.home / ".env").read_text())
 
     def test_a_profile_config_key_that_cannot_be_deleted_is_fatal_and_named(self):
         self.operator_pod()

@@ -34,6 +34,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -41,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestToTriageEvent(t *testing.T) {
@@ -459,17 +461,25 @@ func TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
 	client := fake.NewClientset()
 	allowPreflight(client)
 	var lists atomic.Int64
-	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+	relisted := []corev1.Event{
+		listedEvent("pod-2", "FailedScheduling", "api.1"),
+		listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
+	}
+	client.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		// A field-selected list is the mark pass ahead of a paged list; a
+		// real server answers it with the matching Events of the same
+		// snapshot. The first reflector list is empty, every later one holds
+		// the two Events.
+		if isMarkPass(action) {
+			if lists.Load() < 1 {
+				return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
+			}
+			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "20"}, Items: selectReason(relisted, action)}, nil
+		}
 		if lists.Add(1) == 1 {
 			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
 		}
-		return true, &corev1.EventList{
-			ListMeta: metav1.ListMeta{ResourceVersion: "20"},
-			Items: []corev1.Event{
-				listedEvent("pod-2", "FailedScheduling", "api.1"),
-				listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
-			},
-		}, nil
+		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "20"}, Items: relisted}, nil
 	})
 	var openWatch atomic.Pointer[watch.FakeWatcher]
 	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
@@ -835,6 +845,55 @@ func TestHandleWatchError_ForbiddenAfterSyncIsHeld(t *testing.T) {
 	w.watchEstablished()
 	if got, want := rec.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
 		t.Errorf("transitions after the watch succeeded again = %v; want %v", got, want)
+	}
+}
+
+// A list or watch that fails for any other reason is client-go's to retry,
+// and nothing is held; but the caller is told the cluster is not delivering,
+// as it is for a hold, until a watch succeeds again.
+func TestHandleWatchError_OtherErrorAfterSyncReportsDownUntilTheWatchReturns(t *testing.T) {
+	logs := captureLog(t)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "flaky"})
+	w.forbiddenHold = time.Hour
+	rec := &transitionRecorder{}
+	w.onWatching = func(watching bool) { rec.record(watching) }
+	w.markSynced()
+	// A real reflector, because the non-403 path hands the error to client-go's
+	// default handler, which reads it.
+	r := cache.NewReflector(w.newListWatch(), &corev1.Event{}, cache.NewStore(cache.MetaNamespaceKeyFunc), 0)
+
+	start := time.Now()
+	w.handleWatchError(context.Background(), r, apierrors.NewInternalError(errors.New("etcd unavailable")))
+	if time.Since(start) >= time.Second {
+		t.Errorf("a non-403 error held the handler; it must return to client-go's backoff at once")
+	}
+	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Fatalf("transitions after the error = %v; want %v", got, want)
+	}
+	if strings.Contains(logs.String(), "forbidden, holding") {
+		t.Errorf("a non-403 error must not be logged as a hold:\n%s", logs.String())
+	}
+	w.handleWatchError(context.Background(), r, apierrors.NewInternalError(errors.New("still")))
+	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Errorf("a second error reported again = %v; want %v", got, want)
+	}
+	w.watchEstablished()
+	if got, want := rec.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
+		t.Errorf("transitions after the watch returned = %v; want %v", got, want)
+	}
+	// A failure before the sync is reported at the sync, as a hold is.
+	w2 := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "early"})
+	rec2 := &transitionRecorder{}
+	w2.onWatching = func(watching bool) { rec2.record(watching) }
+	w2.handleWatchError(context.Background(), cache.NewReflector(w2.newListWatch(), &corev1.Event{}, cache.NewStore(cache.MetaNamespaceKeyFunc), 0), apierrors.NewInternalError(errors.New("early")))
+	w2.markSynced()
+	if got, want := rec2.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Errorf("transitions for an error before the sync = %v; want %v", got, want)
+	}
+	w2.listCompleted()
+	w2.watchEstablished()
+	if got, want := rec2.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
+		t.Errorf("transitions after the list and watch succeeded = %v; want %v", got, want)
 	}
 }
 
@@ -1547,4 +1606,33 @@ func TestObserveWatch_ForwardsInOrderAndReleasesOnStop(t *testing.T) {
 	if !fw.IsStopped() {
 		t.Error("Stop did not stop the upstream watch")
 	}
+}
+
+// isMarkPass reports whether a list action is one of the field-selected
+// lists the watcher makes ahead of a paged list to put the autoscaler marks
+// on record (see listInPages), as opposed to the reflector's own list.
+func isMarkPass(action k8stesting.Action) bool {
+	la, ok := action.(k8stesting.ListAction)
+	if !ok {
+		return false
+	}
+	fields := la.GetListRestrictions().Fields
+	return fields != nil && !fields.Empty()
+}
+
+// selectReason answers a mark pass as the API server would: the Events whose
+// reason the action's field selector names.
+func selectReason(events []corev1.Event, action k8stesting.Action) []corev1.Event {
+	fields := action.(k8stesting.ListAction).GetListRestrictions().Fields
+	var out []corev1.Event
+	for _, ev := range events {
+		if fields.Matches(fieldsSetOf(ev)) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func fieldsSetOf(ev corev1.Event) fields.Set {
+	return fields.Set{"reason": ev.Reason}
 }

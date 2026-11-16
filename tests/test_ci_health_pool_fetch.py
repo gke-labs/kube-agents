@@ -7,7 +7,7 @@ published nothing means the periodic is running and failing, and the bot has
 to say so; anything else is the artifact. The third is the dead-man's switch
 -- an artifact never written never gets old, so ageing `window_end` cannot
 catch it -- and it is one `if !` branch that no other test reaches. The step's
-own bash is lifted and run here rather than copied, against a stub gsutil.
+own bash is lifted and run here rather than copied, against a stub gcloud.
 """
 
 import json
@@ -32,9 +32,10 @@ OLDEST = "2099957253191766014"
 READING = {"verdict": "OK", "window_end": "2026-09-15T20:23:27Z"}
 EARLIER_READING = {"verdict": "OK", "window_end": "2026-09-15T19:22:11Z"}
 OLDEST_READING = {"verdict": "OK", "window_end": "2026-09-15T18:21:04Z"}
-# gsutil's own wording for the two failures the step has to tell apart.
-NOT_FOUND = "CommandException: No URLs matched: " + LOGS + "/latest-build.txt"
-DENIED = "AccessDeniedException: 403 does not have storage.objects.get access"
+# gcloud storage's own wording for the two failures the step has to tell
+# apart. An absent object is named on the line after the message.
+NOT_FOUND = "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n" + LOGS + "/latest-build.txt"
+DENIED = "ERROR: (gcloud.storage.cat) HTTPError 403: does not have storage.objects.get access to the Google Cloud Storage object."
 
 
 def workflow_env(name: str) -> str:
@@ -54,8 +55,8 @@ def step_script() -> str:
 
 class PoolFetchStepTest(unittest.TestCase):
     def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True, builds=(EARLIER, BUILD), aborted=(), pointer_error=NOT_FOUND):
-        """The step against a stub gsutil. `pointer` None means latest-build.txt
-        is unreadable and `pointer_error` is what gsutil says about it,
+        """The step against a stub gcloud. `pointer` None means latest-build.txt
+        is unreadable and `pointer_error` is what gcloud storage says about it,
         `artifact` None means the copy fails, `raw` is bytes copied verbatim --
         what a crashed periodic leaves behind, `finished` False is a build
         still running, `builds` is what the log prefix holds, which is how far
@@ -73,32 +74,36 @@ class PoolFetchStepTest(unittest.TestCase):
             payload = tmp / "payload.json"
             payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
-        # `gsutil ls` on the prefix, the way the fallback reads it: the build
+        # `gcloud storage ls` on the prefix, the way the fallback reads it: the build
         # directories plus the pointer object, which the step has to skip.
         listing = "".join(f"{LOGS}/{b}/\\n" for b in builds)
-        # One stat and one cp per prior build, so the walk past an aborted one
-        # is answered rather than falling through to exit 2.
+        # One existence check (`objects describe`) and one cp per prior build,
+        # so the walk past an aborted one is answered rather than falling
+        # through to exit 2.
         priors = ""
         for build, reading in ((EARLIER, EARLIER_READING), (OLDEST, OLDEST_READING)):
             published = tmp / f"{build}.json"
             published.write_text(json.dumps(reading))
-            priors += f'  "stat {LOGS}/{build}/finished.json") exit {1 if build in aborted else 0} ;;\n'
+            priors += f'  "exists {LOGS}/{build}/finished.json") exit {1 if build in aborted else 0} ;;\n'
             priors += f'  "cp {LOGS}/{build}/artifacts/pool-pressure.json") cat "{published}" > "${{@: -1}}" ;;\n'
         # Matched on the verb and the object it names, so the step asking for
         # the wrong path falls through to exit 2 rather than being answered.
-        (bin_dir / "gsutil").write_text(
+        # `objects describe --format=none <url>` is the existence check; it is
+        # folded to `exists <url>` so it matches the same way.
+        (bin_dir / "gcloud").write_text(
             "#!/bin/bash\n"
-            "shift  # -q\n"
+            "shift  # storage\n"
+            'if [ "$1 $2" = "objects describe" ]; then set -- exists "${@: -1}"; fi\n'
             'case "$1 $2" in\n'
             f'  "cat {LOGS}/latest-build.txt") {cat} ;;\n'
             f'  "ls {LOGS}/") printf "{LOGS}/latest-build.txt\\n{listing}" ;;\n'
-            f'  "stat {LOGS}/{BUILD}/finished.json") exit {0 if finished else 1} ;;\n'
+            f'  "exists {LOGS}/{BUILD}/finished.json") exit {0 if finished else 1} ;;\n'
             f'  "cp {LOGS}/{BUILD}/artifacts/pool-pressure.json") {copy} ;;\n'
             f"{priors}"
-            '  *) echo "unexpected gsutil call: $*" >&2; exit 2 ;;\n'
+            '  *) echo "unexpected gcloud storage call: $*" >&2; exit 2 ;;\n'
             "esac\n"
         )
-        (bin_dir / "gsutil").chmod(0o755)
+        (bin_dir / "gcloud").chmod(0o755)
         result = subprocess.run(
             ["bash", "-c", step_script()],
             cwd=tmp,
@@ -173,7 +178,7 @@ class PoolFetchStepTest(unittest.TestCase):
 
     def test_an_artifact_that_copies_but_does_not_parse_gets_the_same_treatment(self):
         """The periodic redirects into the file before it runs, so a crash
-        publishes a 0-byte object and `gsutil cp` copies it happily. Left
+        publishes a 0-byte object and `gcloud storage cp` copies it happily. Left
         alone, health.py reads a bare `{}` as no artifact at all -- the one
         reading that means "not wired up"."""
         for name, content in (("empty", ""), ("truncated", '{"verdict": "OK", "trend": {'), ("html", "<html>nope")):

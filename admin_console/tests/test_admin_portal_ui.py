@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from admin_console.connections import (
@@ -689,6 +690,10 @@ class FakeLargeTelemetryProvider(FakeTelemetryProvider):
 
 class AdminPortalFunctionalTest(unittest.TestCase):
     def setUp(self) -> None:
+        # The chat page keeps one in-process portal client per target, and
+        # that client keeps one runtime provider; each test patches its own
+        # provider, so the resource cache starts empty.
+        st.cache_resource.clear()
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.environment = patch.dict(
             os.environ,

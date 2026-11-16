@@ -1071,6 +1071,10 @@ class ExtraRulesTest(unittest.TestCase):
             # A blank id passes "is a string" and would key `rules` and print as nothing.
             "blank_id": (dict(RULE_ID="", ENTRY=2, CAN_BLOCK=True), None, "RULE_ID is blank; not evaluated"),
             "spaced_id": (dict(RULE_ID="  ", ENTRY=2, CAN_BLOCK=True), None, "RULE_ID is blank; not evaluated"),
+            # HOLDS, when declared, names the moves the contract knows, in a non-empty tuple.
+            "holds_str": (dict(RULE_ID="holdsy", ENTRY=5, CAN_BLOCK=True, HOLDS="cluster"), None, "HOLDS is str, not a non-empty tuple of cluster or node-pool; not evaluated"),
+            "holds_value": (dict(RULE_ID="holdsv", ENTRY=5, CAN_BLOCK=True, HOLDS=("pods",)), None, "HOLDS is tuple, not a non-empty tuple of cluster or node-pool; not evaluated"),
+            "holds_empty": (dict(RULE_ID="holdse", ENTRY=5, CAN_BLOCK=True, HOLDS=()), None, "HOLDS is tuple, not a non-empty tuple of cluster or node-pool; not evaluated"),
         }
         for name, (attributes, evaluate, reason) in cases.items():
             broken = bare_module(name, evaluate=evaluate, **attributes)
@@ -1080,6 +1084,26 @@ class ExtraRulesTest(unittest.TestCase):
             self.assertEqual(folded["rules"]["fine"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0}, name)
             self.assertEqual((folded["blocking"], [f["rule"] for f in folded["risks"]], folded["notes"]), ([], ["fine"], []), name)
             json.dumps(folded)  # what the writer does with it
+        # A declared HOLDS is stamped on each blocker as `holds`; a module that declares none stamps nothing.
+        holder = bare_module("holder", evaluate=returning(blocking=[{"what": "b"}]), RULE_ID="holder", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        silent = bare_module("silent", evaluate=returning(blocking=[{"what": "s"}]), RULE_ID="silent", ENTRY=5, CAN_BLOCK=True)
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[holder, silent])
+        self.assertEqual([(f["rule"], f.get("holds")) for f in folded["blocking"]], [("holder", ["node-pool"]), ("silent", None)])
+        self.assertEqual(folded["unknown"], [])
+        # An `unknown` entry carries the module's HOLDS too, so a reader knows which move the rule could not grade.
+        unread = bare_module("unread", evaluate=returning(unknown=["the instances were not read"]), RULE_ID="unread", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[unread, silent])
+        self.assertEqual([(u["rule"], u["can_block"], u.get("holds")) for u in folded["unknown"]], [("unread", True, ["node-pool"])])
+        # A rule that raises, or returns a shape the contract forbids, carries its HOLDS on the unknown the fold files for it:
+        # the attributes were read before it ran, and the audit would otherwise read the row as holding both moves.
+        def raising(cluster, member, read, target, context):
+            raise ValueError("one odd record")
+
+        raiser = bare_module("raiser", evaluate=raising, RULE_ID="raiser", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        malformed = bare_module("malformed", evaluate=lambda cluster, member, read, target, context: {"blocking": "not a list"}, RULE_ID="malformed", ENTRY=21, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[raiser, malformed, silent])
+        self.assertEqual([(u["rule"], u["can_block"], u.get("holds")) for u in folded["unknown"]], [("raiser", True, ["node-pool"]), ("malformed", True, ["node-pool"])])
+        self.assertTrue(folded["unknown"][0]["reason"].startswith("rule raised ValueError('one odd record')"), folded["unknown"][0]["reason"])
         # An attribute whose read itself raises is the same defect under the fold's guard: a
         # module that resolves its names through a module-level `__getattr__` (the lazy-import
         # idiom) and raises there is one unknown under its `__name__`; an ENTRY whose encoding

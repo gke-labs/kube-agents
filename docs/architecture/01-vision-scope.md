@@ -166,8 +166,8 @@ write-capable remote `gke` MCP that serves `create_cluster` and its `platform_to
 render does **not** shadow the baked configs (`agents/chat/config.yaml`,
 `agents/platform/config.yaml`, `deploy/shared/defaults/config.yaml`): they are merged, and
 `platform_toolsets` lists are **unioned**, so an entry removed from only one side still reaches the
-agent. Also update: the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
-call); and `agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
+agent. Also update: the `agents/platform/skills/gke-cluster-creation` skill (its `create_cluster`
+call is retired: it now proposes a pull request); and `agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
 `delete_cluster_manifest` `kubectl` helpers). _Note:_ `create_cluster` is a tool of the **remote `gke`
 MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py` function.
 
@@ -190,6 +190,9 @@ _Two v1 SLIs, measured continuously from the audit log ([05](05-system-architect
 cluster/cloud write whose actor is an agent identity — and **zero cross-scope isolation escapes** — alert
 on any agent read or `SubjectAccessReview`-allow outside its tier scope. The rest are qualitative
 per-phase acceptance ([07](07-implementation-roadmap.md) §2)._
+
+The user-facing criteria measured per release, with their gap audit, are in
+[`docs/kube-agents-success-criteria.md`](../kube-agents-success-criteria.md).
 
 ## 8. Verification
 

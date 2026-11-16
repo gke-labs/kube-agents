@@ -1,6 +1,6 @@
 """Runtime patches for the platform agent image.
 
-Every patch here exists to reach inside the running gateway -- the two relay
+Every patch here exists to reach inside the running gateway -- the relay
 patches monkeypatch ``gateway.platform_registry``, ``sandbox_artifact_patch``
 wraps ``gateway.kanban_watchers`` -- so all of them are dead weight in any
 process that never runs a gateway. That used to be a purely theoretical
@@ -8,8 +8,9 @@ distinction. The operator sets ``PYTHONPATH=/opt/defaults/scripts``
 on the agent container (``platformagent_manifests.go``), which means this module
 runs in *every* Python the pod starts, and calling ``install()`` eagerly pulled
 in ``gateway`` -> ``slack_bolt`` -> ``aiohttp``/``requests`` before the process
-reached its own work: 747 modules, 2.2-6.1s under gVisor, to set up a hook only
-the long-lived gateway can ever fire. Kanban spawns a fresh subprocess per card
+reached its own work: 747 modules, 2.2-6.1s under gVisor, to set up a hook that
+fires only in a process that imports the registry: the long-lived gateway, and
+the ``hermes send`` and cron children whose standalone sends the relays reroute. Kanban spawns a fresh subprocess per card
 and Hermes' environment probe spawns four more interpreters per session, so that
 import was paid several times over on every card. Deferring it took the probe
 from 9.6-10.3s to 0.39-0.44s.
@@ -26,7 +27,7 @@ regardless of which process imports it or what it is called.
 import os
 import sys
 
-# The import every patch here waits on. The two relay patches replace something
+# The import every patch here waits on. The relay patches replace something
 # in it; ``sandbox_artifact_patch`` does not, and uses it only as the signal that
 # this process is a gateway rather than one of the pod's short-lived
 # interpreters. Nothing else the gateway imports is as reliable a marker, and
@@ -37,6 +38,7 @@ TRIGGER_MODULE = "gateway.platform_registry"
 RELAY_PATCHES = (
     ("GOOGLE_CHAT_RELAY_URL", "google_chat_relay_patch"),
     ("SLACK_RELAY_URL", "slack_relay_patch"),
+    ("TEAMS_RELAY_URL", "teams_relay_patch"),
 )
 
 # Patches deferred the same way but applied whatever the chat wiring is, because

@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import unittest
 
+import yaml
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -46,6 +48,49 @@ class CiDeployLitellmVertexTest(unittest.TestCase):
             "the gateway's own GSA, or the pod has no Workload Identity and "
             "every Vertex call 403s after helm --wait has already passed.",
         )
+
+    def test_the_eval_install_retries_at_the_gateway_twenty_seconds_apart(self) -> None:
+        """A Vertex 429 on a per-minute quota names no Retry-After; LiteLLM's
+        stock pause (0.5s doubling, clamped to 8s) retries inside the same
+        closed minute. The eval install sets two retries 20s apart; the chart
+        default stays none."""
+        text = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"', text)
+        self.assertIn(
+            'readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"', text
+        )
+        self.assertIn('--set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}"', text)
+        self.assertIn('--set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}"', text)
+
+    def test_the_eval_pair_sits_under_the_charts_stale_bound_and_the_bound_is_the_overlays(self) -> None:
+        """The gateway's retries are a silent hold on the agent's stream. The
+        Platform and Cluster Agents drop a stream with no first chunk for
+        stale_timeout_seconds and retry blind, never seeing the 429. The chart
+        refuses a pair whose hold plus a first-chunk allowance crosses that
+        bound (tests/test_litellm_reasoning_fallback.py pins the refusal); here:
+        the chart's copy of the bound is the overlays' value, and the eval
+        install's defaults sit under it."""
+        template = (_CHART / "templates" / "_helpers.tpl").read_text()
+
+        def chart_const(name: str) -> int:
+            match = re.search(rf"\$\{{?{name}\}}? := (\d+)", template) or re.search(rf"\${name} := (\d+)", template)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        stale = chart_const("workerStaleSeconds")
+        allowance = chart_const("firstChunkAllowanceSeconds")
+        for overlay in ("agents/platform/config.yaml", "agents/cluster/config.yaml"):
+            config = yaml.safe_load((_REPO_ROOT / overlay).read_text())
+            self.assertEqual(config["providers"]["custom"]["stale_timeout_seconds"], stale, overlay)
+        script = _CI_DEPLOY.read_text()
+
+        def default(name: str) -> int:
+            match = re.search(rf'^readonly {name}="\$\{{{name}:-(\d+)\}}"', script, re.MULTILINE)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        hold = (default("EVAL_LITELLM_NUM_RETRIES") + 1) * default("EVAL_LITELLM_RETRY_AFTER_SECONDS")
+        self.assertLessEqual(hold + allowance, stale)
 
     def test_the_litellm_gsa_is_not_the_platform_gsa(self) -> None:
         """The gateway proxies attacker-influenceable content and must hold

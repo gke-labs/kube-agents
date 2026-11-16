@@ -1,0 +1,4 @@
+name: chat_feedback_reactions
+description: Counts a thumbs-down a reactor other than the bot puts on one of the Platform Agent's Slack messages into the chat_metrics registry, once per reactor and message, for status.usage.negativeFeedbackTotal.
+events:
+  - reaction:added

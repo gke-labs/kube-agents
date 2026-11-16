@@ -18,6 +18,7 @@ from pathlib import Path
 
 import git_credential_token_file
 import providers
+from providers import credentials
 from providers.credentials import StaticFileCredential
 from workspace_paths import WorkspaceError
 
@@ -50,6 +51,16 @@ class CredentialTest(unittest.TestCase):
         self.assertEqual({"PRIVATE-TOKEN": "glpat-first"}, credential.headers("acme/infra"))
         self.token.write_text("glpat-rotated\n")
         self.assertEqual({"PRIVATE-TOKEN": "glpat-rotated"}, credential.headers("acme/infra"))
+
+    def test_holds_token_answers_by_the_rule_the_header_applies(self):
+        credential = self.credential()
+        self.assertTrue(credential.holds_token())
+        for bad in ("", "  \n", "glpat first\n", "\ufeffglpat-first\n", "glpat-first\nmore\n"):
+            with self.subTest(bad=bad):
+                self.token.write_text(bad, encoding="utf-8")
+                self.assertFalse(credential.holds_token())
+        self.token.unlink()
+        self.assertFalse(credential.holds_token(), "a missing file holds no token")
 
     def test_the_forge_chooses_the_header_and_its_format(self):
         credential = self.credential(header="Authorization", header_format="Bearer {token}")
@@ -200,3 +211,23 @@ class HelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_the_bearer_username_answers_only_a_git_that_offers_authtype(self):
+        # Bitbucket Data Center refuses an HTTP access token as a Basic
+        # password; git 2.46 and later take it as a bearer from a helper that
+        # answers `authtype` (seen live on ka-bb-pr2). An older git, which
+        # does not offer the capability, gets nothing rather than a password.
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write("BBDC-token\n")
+        self.addCleanup(os.unlink, handle.name)
+
+        def ask(request):
+            return subprocess.run(
+                [HELPER, handle.name, git_credential_token_file.BEARER_USERNAME, "get"],
+                input=request, capture_output=True, text=True, timeout=30,
+            ).stdout
+
+        offered = ask("capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=x\n\n")
+        self.assertEqual("capability[]=authtype\nauthtype=Bearer\ncredential=BBDC-token\n", offered)
+        self.assertEqual("", ask("protocol=https\nhost=x\n\n"))
+        self.assertEqual(credentials.BEARER_GIT_USERNAME, git_credential_token_file.BEARER_USERNAME)

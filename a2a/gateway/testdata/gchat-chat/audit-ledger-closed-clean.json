@@ -1,0 +1,23 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Security & RBAC Posture Audit: clean. Ledger closed.*",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "openLink": {
+                  "url": "https://github.com/acme/fleet-config/issues/231"
+                }
+              },
+              "text": "Ledger issue #231 ↗"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

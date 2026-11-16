@@ -74,8 +74,11 @@ sandbox (invisible to the file guard's ``realpath``, which runs on the
 gateway) never reaches this module. The sandbox closes those itself: its copy
 of the trees is root-owned and mounted read-only (see "The delivered trees
 are read-only mounts" in ``docs/designs/agent-shell-sandboxing.md``). The
-bench case's safeguard counts only a successful ``skill_manage`` write;
-``platform-worker-shell-edit-of-shipped-skill`` grades the sandbox's copy.
+bench case ``platform-worker-refuses-shipped-skill-edit`` grades the routes
+as state: a ``skill_manage`` write that went through, and the sandbox's staged
+trees (where the file tools and the shell write) against the image;
+``platform-worker-shell-edit-of-shipped-skill`` grades the sandbox's copy on
+its own run.
 """
 
 from __future__ import annotations
@@ -96,6 +99,7 @@ SKILL_FILE = "SKILL.md"
 #: and the default (Planning Agent) profile at the home itself.
 PLATFORM_PROFILE = "platform"
 CLUSTER_PROFILE_PREFIX = "cluster-"
+TSE_PROFILE = "tse"
 DEFAULT_PROFILE = "default"
 #: The flag ``python3 -m tools.skill_manage_image_owned`` takes in the
 #: ``platform`` build stage; ``deploy/docker/Dockerfile`` spells it too.
@@ -108,6 +112,7 @@ CHECK_ROOTS_FLAG = "--check-roots"
 #: under these roots" are one question.
 PLATFORM_ROOTS: tuple[str, ...] = ("/opt/platform-template/skills", "/opt/a2a-template/skills")
 CLUSTER_ROOTS: tuple[str, ...] = ("/opt/cluster-template/skills",)
+TSE_ROOTS: tuple[str, ...] = ("/opt/tse-template/skills",)
 
 #: Every action upstream's ``_ACTION_HANDLERS`` knows. An action outside this
 #: set is left to upstream's own "Unknown action" error.
@@ -141,6 +146,8 @@ def image_skill_roots(profile: str) -> tuple[str, ...]:
         return PLATFORM_ROOTS
     if profile.startswith(CLUSTER_PROFILE_PREFIX):
         return CLUSTER_ROOTS
+    if profile == TSE_PROFILE:
+        return TSE_ROOTS
     return ()
 
 
@@ -377,7 +384,11 @@ def check_roots(argv: Optional[list[str]] = None) -> int:
         print(f"usage: python3 -m tools.skill_manage_image_owned {CHECK_ROOTS_FLAG}")
         return 2
     problems: list[str] = []
-    for profile, roots in ((PLATFORM_PROFILE, PLATFORM_ROOTS), (CLUSTER_PROFILE_PREFIX + "x", CLUSTER_ROOTS)):
+    for profile, roots in (
+        (PLATFORM_PROFILE, PLATFORM_ROOTS),
+        (CLUSTER_PROFILE_PREFIX + "x", CLUSTER_ROOTS),
+        (TSE_PROFILE, TSE_ROOTS),
+    ):
         for root in roots:
             skills = sorted(md.parent.name for md in Path(root).glob(f"*/{SKILL_FILE}"))
             if not skills:

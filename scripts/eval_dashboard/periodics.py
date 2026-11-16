@@ -3,9 +3,10 @@
 
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
-from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
-then `finished.json`, then the report the job wrote and any extra report the
-entry names, on every finished build) and turns a failed or overdue run into
+from the bucket it logs to, gs://kube-agents-periodic-logs for the pool jobs and
+the nightlies' bucket for the certification slice and the replay lane, each entry's `logs_root`
+(`latest-build.txt`, then `finished.json`, then the report the job wrote and any
+extra report the entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
 link and the report's detail: for the reconcile the projects it refused or
 could not finish, for the sweep the projects whose sweep failed and what the run
@@ -41,10 +42,83 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics
 # The bucket these jobs log to, not the Prow archive: they run under their
 # own identities, which cannot write gs://kube-agents-prow.
 LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
-JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs"
+# Where the eval lanes that share the nightlies' decoration log: the
+# certification slice and the replay lane write there, beside the nightlies,
+# not to the periodic-logs bucket the other watched jobs use.
+EVAL_NIGHTLY_LOGS_ROOT = collect.NIGHTLY_LOGS_ROOT
+# Deck's job-history page for a logs root: the gs:// prefix becomes a path
+# under this host, so a job logged in another bucket links to its own page.
+JOB_HISTORY_HOST = "https://oss.gprow.dev/job-history/gs/"
+GS_SCHEME = "gs://"
+JOB_HISTORY_ROOT = f"{JOB_HISTORY_HOST}{LOGS_ROOT[len(GS_SCHEME):]}"
 POINTER = "latest-build.txt"
 FINISHED = "finished.json"
 ARTIFACTS_DIR = "artifacts"
+# What Prow writes beside a build's finished.json: the pod it ran in (its node
+# and events) and its log. Read for a failed build only, for the note's cause.
+PODINFO = "podinfo.json"
+BUILD_LOG = "build-log.txt"
+# How much of a failed build's log is read, from the end: the last few lines
+# of any job here fit, and the whole log of a long reconcile does not.
+BUILD_LOG_TAIL_BYTES = 4096
+# The last log line is quoted in a Chat message; longer is cut with an ellipsis.
+LAST_LINE_MAX_CHARS = 200
+LAST_LINE_ELLIPSIS = "…"
+# podinfo.json as Prow's sidecar writes it: the pod and its events. Only an
+# event Kubernetes itself classed as a Warning (NodeNotReady, Evicted,
+# OOMKilling) says how a build died; Normal ones are the pod's life. Prow's
+# list is not time-ordered, so the last Warning is taken wherever it sits.
+PODINFO_KEY_POD = "pod"
+PODINFO_KEY_SPEC = "spec"
+PODINFO_KEY_NODE_NAME = "nodeName"
+PODINFO_KEY_EVENTS = "events"
+EVENT_KEY_REASON = "reason"
+EVENT_KEY_TYPE = "type"
+EVENT_TYPE_WARNING = "Warning"
+# The log tail is read as bytes and decoded leniently: a range cut inside a
+# multibyte character must cost one character, not the line (as
+# scripts/pool_pressure.py reads its head).
+BUILD_LOG_ENCODING = "utf-8"
+BUILD_LOG_DECODE_ERRORS = "replace"
+# What makes a log line the cause rather than the script's own stdout summary
+# (which the report already carries): a line that starts like an error
+# (`ERROR:`, `fatal:`, `KeyError:`, `urllib.error.HTTPError:`) or ends like
+# one (`: not found`, `denied`, `Killed`, `timed out`). Anchored, not a
+# substring: a sweep line naming a branch such as `agent/fix-imagepull-error`
+# is not an error. A traceback's header is not a shape: the exception line
+# under it is the cause, and a tail cut above it falls to the last-line rule.
+# The last such line is quoted; with none, the last line only when the build
+# wrote no report, which is a script that died before its summary.
+ERROR_LINE_RE = re.compile(
+    r"^(?:ERROR|FATAL|[\w.]*(?:Error|Exception))\b|(?::\s*not found|Killed|denied|timed out|No such file or directory)\s*$",
+    re.IGNORECASE,
+)
+ENTRYPOINT_ERROR_MARKER = '"level":"error"'
+# The quoted line reaches Chat, the tracking issues (through the evidence) and
+# the public health.json, from a bucket only the job can read: credential
+# shapes are scrubbed first, and control characters and Chat markup dropped.
+SCRUB_PATTERNS = (
+    (re.compile(r"://[^\s/:@]+:[^\s/@]+@"), "://[redacted]@"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}"), "[redacted]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]+"), "[redacted]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]+"), "[redacted]"),
+    (re.compile(r"\bya29\.[\w-]+"), "[redacted]"),
+    (re.compile(r"\bAIza[\w-]{35}"), "[redacted]"),
+    (re.compile(r"\b(Bearer|Basic|Authorization:\s*token)\s+\S+", re.IGNORECASE), r"\1 [redacted]"),
+    (re.compile(r"(private[_-]token|access[_-]token|api[_-]?key|password|(?:client[_-])?secret|token)(\"?\s*[=:]\s*)\S+", re.IGNORECASE), r"\1\2[redacted]"),
+    (re.compile(r"-----BEGIN[^-]*-----.*"), "[redacted key]"),
+)
+CONTROL_CHARS_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+CHAT_MARKUP = {"<": "‹", ">": "›"}
+# Prow's entrypoint logs JSON lines into build-log.txt around the process
+# (its timeout, its grace period); they carry `"level":"error"` but are not
+# the script's words. The script's own error line wins; with none, the
+# entrypoint's first error `message` (the timeout) is the cause.
+ENTRYPOINT_LINE_PREFIX = '{"component":"entrypoint"'
+ENTRYPOINT_KEY_MESSAGE = "message"
+# A backtick inside the quoted line would end the Chat code span early.
+LINE_QUOTE_CHAR = "`"
+LINE_QUOTE_SUBSTITUTE = "'"
 # The pointer moves at job start, so the newest build is often still running;
 # the one before it has finished. Three covers a run of aborted builds.
 FALLBACK_BUILDS = 3
@@ -82,14 +156,16 @@ REPORT_EXIT_FAILED = "failed"
 RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
 # The scope line every message carries: none of this reaches a user cluster.
 SCOPE_LINE = "CI eval infrastructure only."
-# When a failing job is news. The sweep runs every ten minutes and the bot
-# reads its latest finished build every fifteen, so the unit is the check, not
-# the build (one sweep build in three is never read), and one failed check
-# followed by a clean one is a flap: the sweep is said once it has failed this
-# many consecutive checks. The reconciles run daily and on every merge: their
-# first failed build is the news. Any project's failure fails a run, so a per-project
-# threshold could never fire before the run's; the per-project counts name the
-# projects that have failed in every one of those checks.
+# When a failing job is news. The sweep runs hourly and the bot reads its
+# latest finished build every fifteen minutes, so every build is read and
+# counted once, and one failed build followed by a clean one is a flap: the
+# sweep is said once it has failed this many consecutive checks. The
+# reconciles run daily and on every merge: their first failed build is the
+# news when it owes a hand step, and otherwise once the same project has
+# failed in PERSISTENT_AFTER consecutive runs (`actionable_or_persistent`,
+# kube-agents#5685). Any project's failure fails a run, so a per-project
+# threshold could never fire before the run's; the per-project counts name
+# the projects that have failed in every one of those checks.
 SWEEP_RUN_ALERT_AFTER = 2
 FIRST_FAILURE = 1
 # A project named as persisting in the message: failed in this many consecutive
@@ -125,8 +201,20 @@ RECONCILE_UNMAPPED_MARKER = "not a mapped pool project"
 RECONCILE_NEXT_STEP_UNMAPPED = "add its gitops_repo_for_project row in hack/ci-deploy.sh, or remove the Boskos registration"
 RECONCILE_RUNNER_MARKER = "could not run tofu ("
 RECONCILE_NEXT_STEP_RUNNER = "a runner fault (tofu missing or unrunnable), not the project's: fix the job image or the machine"
+# The next steps that owe nothing by hand: a `failed` or `interrupted` the
+# next run retries (a stockout, a 409 from a hand-made pool, an expired plan
+# token). A failed build whose every named project has one of these is not
+# news on its own; every other shape (a refused plan, a locked state, an
+# unmapped project, a runner fault, a run that failed before reaching a
+# project or on its main check, a report that cannot be read) is.
+RECONCILE_RETRY_STEPS = (RECONCILE_NEXT_STEP["failed"], RECONCILE_NEXT_STEP["interrupted"])
+REPORT_KEY_MAIN_CHECK_ERROR = "main_check_error"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 RECONCILE_OUTCOME_BUSY = "busy"
+# A project the run listed but never held: it neither failed nor succeeded,
+# so a streak count it carries stands, and a pass that lists it so did not
+# reach it.
+RECONCILE_UNREACHED_OUTCOMES = (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY)
 # The report's outcome names as the message says them.
 RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
@@ -143,8 +231,17 @@ REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
 # kube-agents-postsubmits.yaml); a rename there is a rename here.
 RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
+# The certification lane's first slice (oss-test-infra: kube-agents-periodics.yaml).
+CERTIFICATION_SLICE_JOB = "ci-kube-agents-certification-1"
+# A week between runs, plus a day: a Saturday run that never started (no
+# cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
+CERTIFICATION_STALE_AFTER = timedelta(days=8)
+# The inference-replay lane (oss-test-infra: kube-agents-periodics.yaml),
+# daily at 06:00 UTC; a day and a half, as for the daily reconcile.
+REPLAY_LANE_JOB = "ci-kube-agents-eval-replay-lane"
+REPLAY_LANE_STALE_AFTER = timedelta(hours=36)
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
-# A watched job whose failed build is retired by another job's later pass:
+# A watched job whose failed build is retired by another job's later run:
 # the postsubmit has no window, and the daily that followed it did its work.
 SUPERSEDED_BY = {RECONCILE_POSTSUBMIT_JOB: RECONCILE_DAILY_JOB}
 SUPERSEDED_RECOVERY = "recovery"
@@ -154,14 +251,18 @@ SUPERSEDED_KEY_RECOVERY = "recovery"
 # The superseding run a recovery was decided on: what the clear cites, read
 # or not on the tick that sends it.
 SUPERSEDED_KEY_BY = "by"
-# gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
-# settled on for the Prow archive; the same wording here. Never a bare 404,
-# because gsutil echoes the failing URL and a 19-digit build id can contain
-# those digits.
-NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexception: 404")
+# gcloud storage's absent-object wording, the set
+# scripts/release/poll_rc_eval_verdict.py settled on for the Prow archive;
+# the same wording here. An absent object is "matched no objects" on every
+# verb; an absent bucket is "<gs://bucket> not found: 404". Never a bare
+# 404, because gcloud echoes the failing URL and a 19-digit build id can
+# contain those digits; "not found: 404" is anchored on the words before it.
+NOT_FOUND_PATTERNS = ("matched no objects", "not found: 404")
 # A NotFound that names the bucket rather than an object: every job reads as
-# "never ran" for as long as it lasts, so it is warned, unlike an absent pointer.
-BUCKET_MISSING_MARKER = "bucket does not exist"
+# "never ran" for as long as it lasts, so it is warned, unlike an absent
+# pointer. `cat` never says this of an absent object (that is "matched no
+# objects"), so on a read it is the bucket.
+BUCKET_MISSING_MARKER = "not found: 404"
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
@@ -194,6 +295,12 @@ KEY_DOES = "does"
 KEY_EFFECT = "effect"
 KEY_RUNBOOK = "runbook"
 KEY_SUMMARY = "summary"
+# A failed build's cause, from podinfo.json and the log's tail: the node the
+# pod ran on, a Warning event's reason, and the log line that says how it died.
+KEY_NODE = "node"
+KEY_LAST_EVENT = "last_event"
+KEY_LAST_LINE = "last_line"
+CAUSE_KEYS = (KEY_NODE, KEY_LAST_EVENT, KEY_LAST_LINE)
 # periodics_runs only, for a job with extra reports: True when the GitLab
 # report was read and names no token to rotate, False when it names one, None
 # when it was not read (absent, unreadable, or a failed read). What clears a
@@ -218,8 +325,8 @@ class Periodic:
     job: str
     label: str
     # A finished build older than this is a job that stopped running. It is a
-    # window, not the cadence: the sweep runs every ten minutes and the daily
-    # reconcile once a day. None for a job with no cadence (the postsubmit
+    # window, not the cadence: the sweep runs hourly and the daily reconcile
+    # once a day. None for a job with no cadence (the postsubmit
     # runs on merges), which no age makes stale.
     stale_after: timedelta | None
     artifact: str | None
@@ -232,9 +339,17 @@ class Periodic:
     # A failed build is a note once the job has failed this many consecutive
     # checks; FIRST_FAILURE for a job whose every run is news.
     run_alert_after: int = FIRST_FAILURE
+    # A reconcile whose failed build is news on its first check only when it
+    # owes a hand step (actionable_failure), and otherwise once a project has
+    # failed in PERSISTENT_AFTER consecutive runs; a silenced build still
+    # advances the streaks.
+    actionable_or_persistent: bool = False
     # Reports the job writes beside `artifact`, read into the reading when
     # present and absent otherwise; their lines ride in the note's detail.
     extra_artifacts: tuple = ()
+    # The bucket prefix the job's builds are read from; a job decorated like
+    # the nightlies logs beside them (EVAL_NIGHTLY_LOGS_ROOT).
+    logs_root: str = LOGS_ROOT
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
@@ -247,10 +362,10 @@ SWEEP_EFFECT = "pull requests a run left behind stay open until the project's ne
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
     Periodic(
-        "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), SWEEP_ARTIFACT,
+        "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=2), SWEEP_ARTIFACT,
         "Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up",
         "leftover pull requests from eval runs are being cleaned up again",
-        f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
+        f"runs hourly and {SWEEP_DOES}", SWEEP_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it",
         SWEEP_RUN_ALERT_AFTER,
         extra_artifacts=(GITLAB_SWEEP_ARTIFACT,),
@@ -260,12 +375,37 @@ WATCHED = (
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs daily at 08:30 UTC and re-applies the seeded-fleet stack in every pool project, waiting for the leased ones", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+        actionable_or_persistent=True,
     ),
     Periodic(
         RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (postsubmit)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+        actionable_or_persistent=True,
+    ),
+    # The certification lane's first slice: weekly and on Rerun, graded on
+    # the newest GA release, recorded for the certified-capabilities page from its logs
+    # bucket and nowhere else, so a failed build (a forbidden write, an
+    # unrun check, a deploy refusal) reaches a person only through this note.
+    Periodic(
+        CERTIFICATION_SLICE_JOB, "certification lane (slice 1)", CERTIFICATION_STALE_AFTER, None,
+        "Certification lane", "the certification suite's weekly run is not recording", "the certification suite's weekly run is recording again",
+        "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of the certification suite (the task files carrying suite: certification) at 60 repetitions against the newest GA release on a leased pool project",
+        "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
+        logs_root=EVAL_NIGHTLY_LOGS_ROOT,
+    ),
+    # The inference-replay lane: it gates nothing and publishes no dashboard
+    # data, so a red run (nothing to replay, a refused key, a proxy pod that
+    # did not take the cache) reaches a person only through this note.
+    Periodic(
+        REPLAY_LANE_JOB, "inference replay lane", REPLAY_LANE_STALE_AFTER, None,
+        "Inference replay lane", "the replay lane is not measuring replay", "the replay lane is measuring replay again",
+        "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on the commit the newest night ran, reporting the served share, verdict agreement and the safety cases' live-vs-replayed pass rates under replay-shadow/replay-lane/",
+        "the served share and verdict agreement go unmeasured until the lane runs green again.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#511-the-replay-lane",
+        logs_root=EVAL_NIGHTLY_LOGS_ROOT,
     ),
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
@@ -273,8 +413,8 @@ WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "postsubmit run"}
 
 
-def history_url(job: str) -> str:
-    return f"{JOB_HISTORY_ROOT}/{job}"
+def history_url(job: str, logs_root: str = LOGS_ROOT) -> str:
+    return f"{JOB_HISTORY_HOST}{logs_root[len(GS_SCHEME):]}/{job}"
 
 
 def iso(value: datetime | None) -> str | None:
@@ -301,10 +441,10 @@ class Unreadable(Exception):
     on this job rather than walking back to an older build and reporting it."""
 
 
-def _finished(job: str, build: str, runner) -> dict | None:
+def _finished(job: str, build: str, runner, logs_root: str = LOGS_ROOT) -> dict | None:
     """The build's finished.json, None when it has none (still running or
     aborted); Unreadable when the read itself failed."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{logs_root}/{job}/{build}/{FINISHED}"], runner=runner)
     if out is None:
         if _not_found(err):
             return None
@@ -320,8 +460,90 @@ def _finished(job: str, build: str, runner) -> dict | None:
     return doc
 
 
-def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
-    out, err = collect._gsutil_call(["-q", "ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
+def _cause_read(path: str, runner, ranged: bool = False) -> str | None:
+    """One best-effort read for the cause: the object's text, or None on any
+    failure. Not collect._gcloud_storage_call: its text mode decodes strictly,
+    and a tail cut inside a multibyte character would raise out of the fetch
+    and blind every job after this one; here the bytes are decoded leniently.
+    A ranged read is `--range=-N`, the object's last N bytes."""
+    args = ["cat", f"--range=-{BUILD_LOG_TAIL_BYTES}", path] if ranged else ["cat", path]
+    try:
+        proc = runner([collect.DEFAULT_GCLOUD, collect.STORAGE_GROUP, *args], capture_output=True, timeout=collect.GCLOUD_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout
+    text = out.decode(BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS) if isinstance(out, bytes) else (out or "")
+    if ranged and len(out or "") >= BUILD_LOG_TAIL_BYTES:
+        # A suffix range starts wherever the object's length puts it: the
+        # first line of a full tail is a fragment, not a line.
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    return text
+
+
+def quotable(line: str) -> str:
+    """A log line fit to quote outside the bucket: credential shapes
+    scrubbed, Chat markup and the code-span backtick replaced."""
+    for pattern, replacement in SCRUB_PATTERNS:
+        line = pattern.sub(replacement, line)
+    for char, substitute in CHAT_MARKUP.items():
+        line = line.replace(char, substitute)
+    return line.replace(LINE_QUOTE_CHAR, LINE_QUOTE_SUBSTITUTE)
+
+
+def _entrypoint_message(line: str) -> str:
+    """The `message` of one of Prow's entrypoint JSON lines; the line itself
+    when it does not parse."""
+    try:
+        doc = json.loads(line)
+    except ValueError:
+        return line
+    return str(doc.get(ENTRYPOINT_KEY_MESSAGE) or line) if isinstance(doc, dict) else line
+
+
+def _failed_build_cause(job: str, build: str, runner, has_report: bool, logs_root: str = LOGS_ROOT) -> dict:
+    """The node a failed build's pod ran on and a Warning pod event
+    (podinfo.json), and the line of its log that says how it died (a ranged
+    read of the tail: the last error-shaped line, or the last line of all when
+    the build wrote no report), for the note to say how the run died rather
+    than only that it did. Best-effort: an absent or unreadable object leaves
+    its keys out."""
+    cause: dict = {}
+    out = _cause_read(f"{logs_root}/{job}/{build}/{PODINFO}", runner)
+    if out is not None:
+        try:
+            podinfo = json.loads(out)
+        except ValueError:
+            podinfo = None
+        if isinstance(podinfo, dict):
+            pod = podinfo.get(PODINFO_KEY_POD)
+            spec = pod.get(PODINFO_KEY_SPEC) if isinstance(pod, dict) else None
+            node = spec.get(PODINFO_KEY_NODE_NAME) if isinstance(spec, dict) else None
+            if node:
+                cause[KEY_NODE] = str(node)
+            events = podinfo.get(PODINFO_KEY_EVENTS)
+            warnings = [
+                str(event[EVENT_KEY_REASON])
+                for event in (events if isinstance(events, list) else [])
+                if isinstance(event, dict) and event.get(EVENT_KEY_REASON) and event.get(EVENT_KEY_TYPE) == EVENT_TYPE_WARNING
+            ]
+            if warnings:
+                cause[KEY_LAST_EVENT] = warnings[-1]
+    out = _cause_read(f"{logs_root}/{job}/{build}/{BUILD_LOG}", runner, ranged=True)
+    if out is not None:
+        lines = [" ".join(line.split()) for line in CONTROL_CHARS_RE.sub("", out).splitlines() if line.strip()]
+        own = [line for line in lines if not line.startswith(ENTRYPOINT_LINE_PREFIX) and ERROR_LINE_RE.search(line)]
+        prow = [_entrypoint_message(line) for line in lines if line.startswith(ENTRYPOINT_LINE_PREFIX) and ENTRYPOINT_ERROR_MARKER in line]
+        chosen = own[-1] if own else (prow[0] if prow else (lines[-1] if lines and not has_report else None))
+        if chosen:
+            chosen = quotable(chosen)
+            cause[KEY_LAST_LINE] = chosen if len(chosen) <= LAST_LINE_MAX_CHARS else chosen[: LAST_LINE_MAX_CHARS - len(LAST_LINE_ELLIPSIS)] + LAST_LINE_ELLIPSIS
+    return cause
+
+
+def _earlier_builds(job: str, newest: str, runner, log=print, logs_root: str = LOGS_ROOT) -> list[str]:
+    out, err = collect._gcloud_storage_call(["ls", f"{logs_root}/{job}/"], runner=runner)
     if out is None:
         log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
@@ -334,12 +556,12 @@ def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
     return [name for _, name in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
 
-def _candidates(job: str, newest: str, runner, log=print):
+def _candidates(job: str, newest: str, runner, log=print, logs_root: str = LOGS_ROOT):
     """The newest build, then -- only if it is needed -- the finished builds
     before it: the listing is one call over a prefix that only grows, and the
     newest build has finished most of the time."""
     yield newest
-    yield from _earlier_builds(job, newest, runner, log)
+    yield from _earlier_builds(job, newest, runner, log, logs_root)
 
 
 def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | None:
@@ -348,7 +570,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     None is also what a pointer that cannot be read for a reason other than
     NotFound returns, after a warning: the bot has gone blind on this job, and
     an absent reading holds any open note rather than ending it."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{POINTER}"], runner=runner)
     if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
@@ -360,9 +582,9 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     if not newest.isdecimal():
         log(f"{WARNING_PREFIX}{periodic.job}'s build pointer is not a build id: {newest!r}", file=sys.stderr)
         return None
-    for build in _candidates(periodic.job, newest, runner, log):
+    for build in _candidates(periodic.job, newest, runner, log, periodic.logs_root):
         try:
-            finished = _finished(periodic.job, build, runner)
+            finished = _finished(periodic.job, build, runner, periodic.logs_root)
         except Unreadable as exc:
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s {exc}", file=sys.stderr)
             return None
@@ -391,7 +613,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # than never. Any other failure is unreadable and the tick is blind
             # on this job, as for finished.json: a note is posted once, and one
             # written without its projects would stay so.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -414,7 +636,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # not an object is said in its own lines; a read that fails for
             # another reason follows the main report's rule above: a failed
             # build's note is posted once, so it goes out whole or not yet.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -427,6 +649,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                     return None
         if extras:
             reading[KEY_EXTRA_ARTIFACTS] = extras
+        if not reading[KEY_PASSED]:
+            reading.update(_failed_build_cause(periodic.job, build, runner, has_report=reading[KEY_ARTIFACT] is not None, logs_root=periodic.logs_root))
         return reading
     return None
 
@@ -477,17 +701,7 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
         if outcome not in RECONCILE_NAMED_OUTCOMES:
             continue
         detail = str(entry.get(REPORT_KEY_DETAIL) or "no detail")
-        step = RECONCILE_NEXT_STEP[outcome]
-        if outcome == "failed":
-            if any(marker in detail for marker in RECONCILE_LOCK_MARKERS):
-                step = RECONCILE_NEXT_STEP_LOCKED
-            elif RECONCILE_CEILING_MARKER in detail:
-                step = RECONCILE_NEXT_STEP["interrupted"]
-            elif RECONCILE_UNMAPPED_MARKER in detail:
-                step = RECONCILE_NEXT_STEP_UNMAPPED
-            elif RECONCILE_RUNNER_MARKER in detail:
-                step = RECONCILE_NEXT_STEP_RUNNER
-        lines.append(f"{project}: {outcome} ({detail}); next: {step}")
+        lines.append(f"{project}: {outcome} ({detail}); next: {_reconcile_step(outcome, detail)}")
     # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
@@ -508,6 +722,34 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     if artifact.get(REPORT_KEY_ERROR):
         lines.append(f"run: {artifact[REPORT_KEY_ERROR]}")
     return lines
+
+
+def _reconcile_step(outcome: str, detail: str) -> str:
+    """The one next step for a named outcome, read from its detail."""
+    if outcome != "failed":
+        return RECONCILE_NEXT_STEP[outcome]
+    if any(marker in detail for marker in RECONCILE_LOCK_MARKERS):
+        return RECONCILE_NEXT_STEP_LOCKED
+    if RECONCILE_CEILING_MARKER in detail:
+        return RECONCILE_NEXT_STEP["interrupted"]
+    if RECONCILE_UNMAPPED_MARKER in detail:
+        return RECONCILE_NEXT_STEP_UNMAPPED
+    if RECONCILE_RUNNER_MARKER in detail:
+        return RECONCILE_NEXT_STEP_RUNNER
+    return RECONCILE_NEXT_STEP["failed"]
+
+
+def actionable_failure(artifact) -> bool:
+    """Whether a failed reconcile build owes a hand step now: a report that
+    is absent or unreadable, a main check that failed, a run that failed
+    before naming a project, or a named project whose next step is not the
+    next run's retry (RECONCILE_RETRY_STEPS)."""
+    if not isinstance(artifact, dict) or artifact.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE or artifact.get(REPORT_KEY_MAIN_CHECK_ERROR):
+        return True
+    named = [e for e in (_outcomes(artifact) or {}).values() if isinstance(e, dict) and e.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES]
+    if not named:
+        return True
+    return any(_reconcile_step(e[REPORT_KEY_OUTCOME], str(e.get(REPORT_KEY_DETAIL) or "")) not in RECONCILE_RETRY_STEPS for e in named)
 
 
 def _allowlist_verdict(entry: dict) -> set[str] | None:
@@ -712,6 +954,12 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
     return out
 
 
+def _project_unreached(periodic: Periodic, entry) -> bool:
+    """A reconcile report lists every mapped project, the ones it never held
+    as busy or not reached; the sweep's leaves them out."""
+    return periodic.artifact == RECONCILE_ARTIFACT and isinstance(entry, dict) and entry.get(REPORT_KEY_OUTCOME) in RECONCILE_UNREACHED_OUTCOMES
+
+
 def _project_failed(periodic: Periodic, entry) -> bool:
     if not isinstance(entry, dict):
         return False
@@ -745,6 +993,8 @@ def streaks(readings: dict[str, dict], prev_streaks: dict | None, watched=WATCHE
             else:
                 if isinstance(outcomes, dict):
                     for project, entry in outcomes.items():
+                        if _project_unreached(periodic, entry):
+                            continue
                         if _project_failed(periodic, entry):
                             projects[project] = projects.get(project, 0) + 1
                         else:
@@ -770,6 +1020,14 @@ def _failure_text(periodic: Periodic, entry: dict) -> str:
     return f"{entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})"
 
 
+def _next_step(periodic: Periodic, entry: dict) -> str:
+    """The reconcile's `; next: <step>` clause for a failed project; the
+    sweep's lines carry none."""
+    if periodic.artifact == SWEEP_ARTIFACT:
+        return ""
+    return f"; next: {_reconcile_step(entry.get(REPORT_KEY_OUTCOME), str(entry.get(REPORT_KEY_DETAIL) or 'no detail'))}"
+
+
 def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | None, extras: dict | None = None) -> list[str]:
     """The persisting projects first with their count, then this build's other
     failed projects, capped together; then the run's own lines."""
@@ -777,10 +1035,10 @@ def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | N
     outcomes = outcomes if isinstance(outcomes, dict) else {}
     lines = []
     for project in sorted(persistent, key=lambda p: (-persistent[p], p)):
-        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({_failure_text(periodic, outcomes[project])})")
+        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({_failure_text(periodic, outcomes[project])}){_next_step(periodic, outcomes[project])}")
     for project in sorted(outcomes):
         if project not in persistent and _project_failed(periodic, outcomes[project]):
-            lines.append(f"{project}: {_failure_text(periodic, outcomes[project])}")
+            lines.append(f"{project}: {_failure_text(periodic, outcomes[project])}{_next_step(periodic, outcomes[project])}")
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
     project_prefixes = tuple(f"{p}:" for p in outcomes)
@@ -824,6 +1082,8 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             if (streak.get(KEY_STREAK_RUNS) or 0) < periodic.run_alert_after:
                 continue
             persistent = _persistent(periodic, streak, artifact)
+            if periodic.actionable_or_persistent and not persistent and not actionable_failure(artifact):
+                continue
         notes[periodic.job] = {
             KEY_JOB: periodic.job,
             KEY_LABEL: periodic.label,
@@ -835,10 +1095,11 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR) if periodic.stale_after is not None else None,
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
             # A job whose first failure is news keeps the report's own lines; a
-            # thresholded job leads with the projects that keep failing.
-            KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
+            # thresholded job, or a build said for a project that keeps
+            # failing, leads with those projects.
+            KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE or persistent else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
             KEY_SUMMARY: f"the run passed; {len(token_lines)} token(s) to rotate" if verdict == VERDICT_TOKEN else (run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), extras) if verdict == VERDICT_FAILED else None),
-            KEY_HISTORY_URL: history_url(periodic.job),
+            KEY_HISTORY_URL: history_url(periodic.job, periodic.logs_root),
             KEY_PLACE: periodic.place,
             # A TOKEN note is about the credential, not the sweep: its words say so.
             KEY_ABSENCE: TOKEN_ABSENCE if verdict == VERDICT_TOKEN else periodic.absence,
@@ -846,7 +1107,22 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_EFFECT: TOKEN_EFFECT if verdict == VERDICT_TOKEN else periodic.effect,
             KEY_RUNBOOK: TOKEN_RUNBOOK if verdict == VERDICT_TOKEN else periodic.runbook,
         }
+        if verdict == VERDICT_FAILED:
+            notes[periodic.job].update({key: reading[key] for key in CAUSE_KEYS if reading.get(key)})
     return notes
+
+
+def cause_text(note: dict) -> str | None:
+    """How a failed build died, for the evidence and the message: the log line
+    that says so, the node, a Warning pod event; None when none was read."""
+    parts = []
+    if note.get(KEY_LAST_LINE):
+        parts.append(f"log `{note[KEY_LAST_LINE]}`")
+    if note.get(KEY_NODE):
+        parts.append(f"node `{note[KEY_NODE]}`")
+    if note.get(KEY_LAST_EVENT):
+        parts.append(f"pod event {note[KEY_LAST_EVENT]}")
+    return ", ".join(parts) if parts else None
 
 
 def _named_failures(artifact) -> list[str]:
@@ -870,11 +1146,13 @@ def _whole_pass(artifact: dict) -> bool:
     return artifact.get(REPORT_KEY_MODE) == REPORT_MODE_ALL and isinstance(visited, int) and isinstance(mapped, int) and visited == mapped
 
 
-def _reached(artifact, projects: list[str]) -> bool:
+def _reached(artifact, projects: list[str], applied: bool = False) -> bool:
     """True when the report holds every named project with an outcome that
-    means it was held and planned (not busy, not not_reached). A project a
-    whole pass does not list at all has left the pool (a stray registration
-    removed, a mapping row retired), and counts as dealt with."""
+    means it was held and planned (not busy, not not_reached); with
+    `applied`, one that is not a failure either, which is what a run that
+    failed elsewhere has to show. A project a whole pass does not list at
+    all has left the pool (a stray registration removed, a mapping row
+    retired), and counts as dealt with."""
     outcomes = _outcomes(artifact)
     if outcomes is None:
         return False
@@ -885,20 +1163,26 @@ def _reached(artifact, projects: list[str]) -> bool:
             if not whole:
                 return False
             continue
-        if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY):
+        if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in RECONCILE_UNREACHED_OUTCOMES:
+            return False
+        if applied and entry.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES:
             return False
     return True
 
 
 def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     """How the superseding job's latest build relates to this job's failed
-    one: SUPERSEDED_RECOVERY when it passed later having reached every
-    project the failed build named (a build naming none needs a whole pass),
-    at the same fleet tree (a failed build's pre-input-hash git id is not compared), SUPERSEDED_SILENCE
-    when it failed later (its own note is the current story; nothing
-    recovered), None otherwise. A later pass that never reached them (busy,
-    not reached), applied another tree of the same kind, or carries the
-    git id against a hashed failure, is None."""
+    one: SUPERSEDED_RECOVERY when a later run reached every project the
+    failed build named at the same fleet tree (a failed build's
+    pre-input-hash git id is not compared): a pass that held and planned
+    them, or a run that failed elsewhere and applied them (a build naming
+    none needs a whole pass that passed); SUPERSEDED_SILENCE when it failed
+    later on a build that owes a hand step and did not do that (its own note
+    is the current story); None otherwise. A later run that never reached
+    them (busy, not reached), applied another tree of the same kind, or
+    carries the git id against a hashed failure, is no recovery; a later
+    failure the next run retries writes no note of its own (unless a project
+    persists, and then both stories stand) and silences nothing."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
@@ -908,16 +1192,18 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     when, later = parse_iso(mine.get(KEY_FINISHED_AT)), parse_iso(theirs.get(KEY_FINISHED_AT))
     if when is None or later is None or later <= when:
         return None
-    if not theirs.get(KEY_PASSED):
-        return SUPERSEDED_SILENCE
+    passed = bool(theirs.get(KEY_PASSED))
+    # What a later failed run is when it did not recover this one: its own
+    # note when it owes a hand step, nothing otherwise.
+    otherwise = None if passed else (SUPERSEDED_SILENCE if actionable_failure(theirs.get(KEY_ARTIFACT)) else None)
     if _outcomes(mine.get(KEY_ARTIFACT)) is None:
         # A failed build whose report is absent or cut short names no project
         # because nothing can be read, not because nothing failed: a later
         # pass cannot be shown to have reached what it does not name.
-        return None
+        return otherwise
     tree, later_tree = _fleet_tree(mine.get(KEY_ARTIFACT)), _fleet_tree(theirs.get(KEY_ARTIFACT))
     if not tree or not later_tree:
-        return None
+        return otherwise
     legacy = bool(_LEGACY_FLEET_TREE.fullmatch(tree) and _INPUT_HASH_FLEET_TREE.fullmatch(later_tree))
     if not legacy and tree != later_tree:
         # A daily that reached the project at another tree (one it started
@@ -929,14 +1215,14 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # out main after that build's merge, so the reach check decides
         # alone. The other way round (an old-kind daily, a new-kind failure)
         # is a daily from before the merge, and proves nothing.
-        return None
+        return otherwise
     named = _named_failures(mine.get(KEY_ARTIFACT))
     if not named:
         # Failed above the projects (busy for its whole budget, a Boskos or
         # mapping fault): nothing was reached, so only a whole pass at this
         # tree has done what it did not.
-        return SUPERSEDED_RECOVERY if _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else None
-    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named) else None
+        return SUPERSEDED_RECOVERY if passed and _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else otherwise
+    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named, applied=not passed) else otherwise
 
 
 def _fleet_tree(artifact) -> str | None:
@@ -948,14 +1234,16 @@ def _fleet_tree(artifact) -> str | None:
 def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> dict[str, dict]:
     """`{job: {build, recovery[, by]}}` for the watched jobs whose latest
     failed build a later build of their superseding job has dealt with; `by`
-    is the run a recovery was decided on (build, finished_at, summary), what
-    the clear cites. Carried in health.json and handed back as `carried`
+    is the run a recovery was decided on (build, finished_at, summary,
+    passed), what the clear cites. Carried in health.json and handed back as `carried`
     next tick, so the decision sticks for as long as the failed build is the
     job's latest: a tick blind to either job, or a later failing daily, does
     not re-open a retired failure as news. A silence becomes a recovery once
-    a later pass reaches the projects, and ends when a later pass does not
-    reach them (the failure is back in the notes, not as news); a new failed
-    build is decided afresh."""
+    a later run reaches the projects (a pass, or a run that failed elsewhere
+    and applied them), and ends when a later pass does not reach them, or a
+    later failing daily neither reaches them nor owes a hand step, and so
+    writes no note to stand in (the failure is back in the notes, not as
+    news); a new failed build is decided afresh."""
     carried = carried if isinstance(carried, dict) else {}
     latest = runs(readings)
     out = {}
@@ -978,15 +1266,16 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
             continue
         other = SUPERSEDED_BY[job]
         theirs = readings.get(other)
-        if ground is None and before is not None and not before.get(SUPERSEDED_KEY_RECOVERY) and isinstance(theirs, dict) and theirs.get(KEY_PASSED):
+        if ground is None and before is not None and not before.get(SUPERSEDED_KEY_RECOVERY) and isinstance(theirs, dict) and (theirs.get(KEY_PASSED) or not actionable_failure(theirs.get(KEY_ARTIFACT))):
             # The daily that silenced this failure has passed without
-            # reaching its projects: its own note clears, and the failure
-            # it hid is still open.
+            # reaching its projects, or failed again on a build the next run
+            # retries: its own note clears or is not written, and the
+            # failure it hid is still open.
             continue
         entry = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY}
         if ground == SUPERSEDED_RECOVERY:
             run = latest.get(other) or {}
-            entry[SUPERSEDED_KEY_BY] = {key: run.get(key) for key in (KEY_BUILD, KEY_FINISHED_AT, KEY_SUMMARY)}
+            entry[SUPERSEDED_KEY_BY] = {key: run.get(key) for key in (KEY_BUILD, KEY_FINISHED_AT, KEY_SUMMARY, KEY_PASSED)}
         elif isinstance((before or {}).get(SUPERSEDED_KEY_BY), dict):
             entry[SUPERSEDED_KEY_BY] = before[SUPERSEDED_KEY_BY]
         out[job] = entry
@@ -1002,7 +1291,8 @@ def evidence(note: dict) -> str:
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
     if note[KEY_VERDICT] == VERDICT_TOKEN:
         return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} passed at {note[KEY_FINISHED_AT]}{detail}"
-    return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
+    cause = cause_text(note)
+    return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}" + (f" ({cause})" if cause else "")
 
 
 def parse_args(argv):

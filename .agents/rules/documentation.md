@@ -10,8 +10,8 @@ description: "Documentation rules: site audience boundaries, forbidden maintaine
 # Documentation rules
 
 [`AGENTS.md`](../../AGENTS.md) states each documentation rule in a line and owns the canonical-home
-table. This file holds the form the audience rule takes — who the site is for, the identifiers it
-never carries, and what enforces both — and the long form of the two prose rules.
+table. This file holds the form the audience rule takes — who the site is for and the identifiers it
+never carries — the long form of the citation and prose rules, and what enforces them.
 
 ## Who the site is for
 
@@ -43,6 +43,7 @@ The site is public and is mirrored, quoted, and indexed. None of the following a
 - The maintainers' GCP project IDs, the service-account emails inside them, and their Workload
   Identity pool or provider names.
 - Internal repository paths.
+- Maintainer release-pipeline tags and release workflow filenames.
 - The maintainers' own projects, clusters, and deployment environments as things the reader would
   configure or reach — the Prow project and build cluster, the evaluation pool, the `autopush`
   and `staging` installs. The `staging` release stage a consumer pins, and either word in its
@@ -71,18 +72,32 @@ on is touched, and a review pass raises it on that line, not on the backlog arou
 
 - `make docs-check-audience` (`scripts/check_docs_audience.py`) fails when a file under
   `docs/site/src/content/docs/` matches a shape in `scripts/docs_audience_denylist.txt` — one
-  regular expression per line, so the next identifier is a one-line addition — or names a
-  service-account email whose project is not a placeholder, or names a project ID that
-  `hack/ci-env.sh` exports. The project IDs are read from that script at run time rather than
-  copied, so the denylist never repeats them. The check also fails when it finds no site page or
-  derives no project ID, so a moved site root or a reworded export cannot turn it green. Neither
-  the denylist nor this file spells out the values: refer to them by shape or by the file that
-  holds them.
+  regular expression per line, including maintainer release-pipeline tags and workflow filenames, so
+  the next identifier is a one-line addition — names a service-account email whose project is not a
+  placeholder, names a project ID that `hack/ci-env.sh` exports, or cites a pull request or issue
+  in prose (a bare `#NNN` of three or more digits, or a repository `pull/` or `issues/` URL or
+  Markdown link, outside fenced code, inline code, and comments; `contributing.md` is exempt). The
+  project IDs are read from `hack/ci-env.sh` at run time rather than copied, so the denylist never
+  repeats them. Pages that carried findings when a backlog shape arrived are pinned per page and
+  shape in `scripts/docs_audience_allowlist.txt`, which only shrinks and refuses shapes that held at
+  zero: a rise fails, and a drop fails until the allowlist entry is lowered or removed. The check
+  also fails when it finds no site page or derives no project ID, so a moved site root or a
+  reworded export cannot turn it green. Neither the denylist nor this file spells out the values:
+  refer to them by shape or by the file that holds them.
+- `make docs-check-prose` (`scripts/check_docs_prose.py`) enforces `## Write it straight` on
+  `docs/site/src/content/docs/` against the two-sided per-page, per-kind ceilings in
+  `scripts/docs_prose_ratchet.json` across five kinds: banned filler words and phrases,
+  antithesis epigrams, and paragraphs, table cells, and sentences exceeding the script's word
+  limits (frontmatter, code fences, comments, generated regions, MDX component tags, inline code
+  spans, and link URLs are excluded). A page with no entry is held at zero, a count above its
+  ceiling fails, and a count below its ceiling fails until lowered or removed
+  (`python3 scripts/check_docs_prose.py --write-ratchet` lowers or drops entries and never raises
+  or adds one).
 - The `review-docs-drift` skill asks the reader question of every hunk under `docs/site/`, and the
   `review-adversarial` skill treats a site hunk that arrives with a CI change as a prompt to ask
-  whether the page is a runbook. The identifier check does not read prose for you, and nothing
-  mechanical reads a page's audience: a page can describe the maintainers' Prow setup without
-  naming one identifier, and only the reader question catches it.
+  whether the page is a runbook. The identifier check does not judge topic ownership for you, and
+  nothing mechanical reads a page's audience: a page can describe the maintainers' Prow setup
+  without naming one identifier, and only the reader question catches it.
 
 ## Write it straight
 

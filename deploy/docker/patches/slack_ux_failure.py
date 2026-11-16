@@ -22,13 +22,17 @@ only when it ends on a yes/no question.
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
 reading :data:`OFFER_LABEL` ("Try again"), whatever the question's words; the
-question stays in the reply above it. An open question ("Which namespace
+question stays in the reply above it, and a declared step's line never posts. An open question ("Which namespace
 should it use?"), a request ("Could you share the namespace?") or an either/or
-stays text, since it needs a word, not a click. A click is the clicker answering in the thread with the button's text
+stays text, since it needs a word, not a click. A reply that declares its next step on a
+last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
+step as the button instead, whatever its question says, and the line is left out of the
+blocks. The line itself is plumbing and is never posted as text, on any chat platform
+(:func:`visible`, in the final's send); outside a thread nothing takes its place. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
-``text`` Slack keeps for notifications and for a later read of the thread is
-unchanged, question included.
+``text`` Slack keeps for notifications and for a later read of the thread keeps
+the question, and, like every chat final, has no step line.
 
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
@@ -59,8 +63,8 @@ Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
 kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
 blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
 the same mark: the reply's first sentence as the headline, the rest as the
-detail, and Try again as a choice when :func:`present` finds the offer
-(``agents/platform/scripts/chat_message.py``).
+detail, and the declared step, else Try again when :func:`present` finds the
+offer, as a choice (:func:`layout`, ``agents/platform/scripts/chat_message.py``).
 
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
@@ -86,6 +90,10 @@ try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
     _chat = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
 
 SLACK_PLATFORM = "slack"
 
@@ -138,11 +146,17 @@ LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
 
-#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time, card id)``.
-_marks: "OrderedDict[tuple[str, str], tuple[float, datetime, str]]" = OrderedDict()
-#: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
-#: (mark time, when carried)``: taken under any event that arrived before the carry.
-_carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
+#: Marked threads, ``(platform, chat_id, thread_id) -> (monotonic time, wall time, card id)``.
+_marks: "OrderedDict[tuple[str, str, str], tuple[float, datetime, str]]" = OrderedDict()
+#: Marks a queued wake carried to its follow-up's reply, ``(platform, chat_id, thread_id)
+#: -> (mark time, when carried)``: taken under any event that arrived before the carry.
+_carried: "OrderedDict[tuple[str, str, str], tuple[float, datetime]]" = OrderedDict()
+
+#: The step the final being sent declared, held while its line is kept off the posted text.
+_held: contextvars.ContextVar[str] = contextvars.ContextVar("kage_declared_step", default="")
+#: Platforms whose finals are no chat post: the API server's reader is a program (the eval
+#: among them), which gets the agent's text as written, and the local CLI.
+NOT_CHAT_PLATFORMS = frozenset({"api_server", "local"})
 
 #: The marked thread's id ("" outside a thread) for the length of one marked final's send.
 _marked: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("kage_failure_reply", default=None)
@@ -153,8 +167,10 @@ def enabled() -> bool:
     return _presenter is not None and _presenter.enabled()
 
 
-def _key(chat_id: Any, thread_id: Any) -> tuple[str, str]:
-    return str(chat_id or ""), str(thread_id or "")
+def _key(platform: Any, chat_id: Any, thread_id: Any) -> tuple[str, str, str]:
+    """A thread's mark key: its platform too, since a Slack channel and a Chat space
+    could share an id, and a mark on one must not draw the other's reply."""
+    return str(platform or "").strip().lower(), str(chat_id or ""), str(thread_id or "")
 
 
 def _wake_note() -> str:
@@ -167,13 +183,15 @@ def _wake_note() -> str:
 
 
 def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
-    """Mark ``sub``'s thread when this wake announces a failure on Slack."""
+    """Mark ``sub``'s thread when this wake announces a failure on a platform whose
+    replies are laid out: Slack, or Google Chat under ``spec.mode: next``
+    (``kanban_notifier.chat_ux_on``)."""
     try:
-        if str(sub.get("platform") or "").strip().lower() != SLACK_PLATFORM:
+        if not _chat_ux_on(sub.get("platform")):
             return
-        if not FAILURE_KINDS & set(wake_kinds or ()) or not enabled():
+        if not FAILURE_KINDS & set(wake_kinds or ()):
             return
-        key = _key(sub.get("chat_id"), sub.get("thread_id"))
+        key = _key(sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"))
         card = str(sub.get("task_id") or "")
         if _wake_note() in (text or ""):
             # Only this card's own mark: a sibling's failure wake may still be queued.
@@ -209,7 +227,7 @@ def begin(event: Any) -> Optional[contextvars.Token]:
             return None
         if time.monotonic() - carried[0] > MARK_TTL_SECONDS:
             return None
-        return _marked.set(key[1])
+        return _marked.set(key[2])
     except Exception:
         logger.warning("slack_ux_failure: reading the final's thread failed", exc_info=True)
         return None
@@ -264,11 +282,49 @@ def drop(source: Any, pending_event: Any) -> None:
         logger.warning("slack_ux_failure: dropping the turn's claim failed", exc_info=True)
 
 
-def _slack_key(source: Any) -> Optional[tuple[str, str]]:
+def _slack_key(source: Any) -> Optional[tuple[str, str, str]]:
     platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
-    if str(platform or "").lower() != SLACK_PLATFORM:
+    if str(platform or "").lower() not in _chat_ux_platforms():
         return None
-    return _key(source.chat_id, getattr(source, "thread_id", None))
+    return _key(platform, source.chat_id, getattr(source, "thread_id", None))
+
+
+def _chat_ux_on(platform: Any) -> bool:
+    """Whether ``platform``'s failure replies are laid out: Slack with the flag on, or Google
+    Chat with the flag on where the gateway serves it (``spec.mode: next``, where the A2A
+    gateway lays the reply out; under ``today`` Google Chat takes text). Anything wrong
+    reads as off."""
+    name = str(platform or "").strip().lower()
+    if not enabled():
+        return False
+    if name == SLACK_PLATFORM:
+        return True
+    notifier = _notifier()
+    if notifier is None or name not in notifier.CHAT_UX_PLATFORMS:
+        return False
+    try:
+        return bool(notifier.gateway_serves(name))
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        logger.debug("slack_ux_failure: reading the gateway's served platforms failed", exc_info=True)
+        return False
+
+
+def _notifier() -> Any:
+    """``gateway.kanban_notifier``, read when a send runs; None on an image without it."""
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return kanban_notifier
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return None
+
+
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose failure replies are laid out (kanban_notifier.CHAT_UX_PLATFORMS); Slack alone without the module."""
+    notifier = _notifier()
+    return tuple(notifier.CHAT_UX_PLATFORMS) if notifier is not None else (SLACK_PLATFORM,)
 
 
 def _queued_reply(event: Any) -> bool:
@@ -297,9 +353,30 @@ def _noted_by(event: Any, moment: datetime) -> bool:
 
 
 def end(token: Optional[contextvars.Token]) -> None:
-    """Undo :func:`begin`."""
+    """Undo :func:`begin`, and drop any step :func:`visible` held."""
+    _held.set("")
     if token is not None:
         _marked.reset(token)
+
+
+def visible(event: Any, text: Any) -> Any:
+    """The final ``text`` as a chat platform posts it: without a declared step's line.
+
+    The ``[next: ...]`` line is plumbing, so no chat surface shows it, on any
+    platform and with the flag on or off. The step it declares is held for
+    :func:`maybe_blocks`, which draws it as the reply's button in a thread. A
+    program's platform (:data:`NOT_CHAT_PLATFORMS`) gets the text as written.
+    """
+    try:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        if not isinstance(text, str) or _moments is None or str(platform or "").lower() in NOT_CHAT_PLATFORMS:
+            return text
+        _held.set(_moments.next_step(text)[1])
+        return _moments.visible_text(text) or text
+    except Exception:
+        logger.warning("slack_ux_failure: taking the step line off the final failed", exc_info=True)
+        return text
 
 
 def present(content: str) -> tuple[str, str]:
@@ -425,6 +502,26 @@ def _continues(line: str) -> bool:
     )
 
 
+def _next_step(content: str) -> tuple[str, str]:
+    """``slack_moments.next_step``: the reply without its declared step's line, and the step's label."""
+    return _moments.next_step(content) if _moments is not None else (content, "")
+
+
+def layout(content: str, in_thread: bool) -> Optional[dict]:
+    """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
+    declared next step in its place, as its button, only ``in_thread``. The step's line is
+    never part of the layout, in a thread or out of one."""
+    # The send's visible() has usually taken the line off already and held the step.
+    content, step = _next_step(content)
+    step = (step or _held.get()) if in_thread else ""
+    content = _moments.visible_text(content) or content if _moments is not None else content
+    _bolded, offer = present(content)
+    if step and _chat.command_word(step):
+        # A step the gateway would act on as a command is no choice; the question's Try again stands.
+        step = ""
+    return _chat.failure_message(content, bool((step or offer) and in_thread), step)
+
+
 def chat_for(content: str) -> Optional[dict]:
     """The ``kube-agents.chat/v1`` layout of a marked failure reply, or None for any other.
 
@@ -435,27 +532,33 @@ def chat_for(content: str) -> Optional[dict]:
     if thread is None or _chat is None:
         return None
     try:
-        _bolded, offer = present(content)
-        return _chat.failure_message(content, bool(offer and thread))
+        return layout(content, bool(thread))
     except Exception:
         logger.warning("slack_ux_failure: laying out the failure reply failed", exc_info=True)
         return None
 
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
-    """``render(content)``, or for a marked reply its :func:`present` form plus the Try again offer."""
+    """``render(content)``, or for a marked reply its :func:`present` form plus its offer: the
+    declared next step, else Try again."""
     thread = _marked.get()
     if thread is None:
         return render(content)
     try:
-        bolded, offer = present(content)
+        # visible() has usually taken the step's line off already and held the step.
+        shown, step = _next_step(content)
+        step = step or _held.get()
+        shown = _moments.visible_text(shown) or shown if _moments is not None else shown
+        bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:
-            return render(content)
-        if offer and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
-            blocks = list(blocks) + _presenter.blocks_answer(
-                "", choices=[OFFER_LABEL], action_id_prefix=ACTION_ID_PREFIX,
+            return render(shown)
+        label = step or (OFFER_LABEL if offer else "")
+        if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
+            return list(blocks) + _presenter.blocks_answer(
+                "", choices=[label], action_id_prefix=ACTION_ID_PREFIX,
             )
+        # No button can carry the step (outside a thread, or no room): nothing takes its place.
         return blocks
     except Exception:
         logger.warning("slack_ux_failure: drawing the failure reply failed", exc_info=True)

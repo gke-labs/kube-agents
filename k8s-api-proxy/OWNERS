@@ -1,0 +1,9 @@
+# The k8s-api-proxy module. These approvers and reviewers add to the root
+# OWNERS: no_parent_owners is not set, so a root approver can still approve a
+# change here.
+approvers:
+- dshnayder
+- GinnyJI
+reviewers:
+- dshnayder
+- GinnyJI

@@ -1,0 +1,152 @@
+{
+  "payload": {
+    "title": "Raise the replica floor on the ingest deployment",
+    "body": "The floor of one meant a single eviction took ingest offline.\n",
+    "source": "platform-agent/replicas-1793644386",
+    "target": "main",
+    "draft": true
+  },
+  "responses": [
+    {
+      "id": 10,
+      "version": 0,
+      "title": "Raise the replica floor on the ingest deployment",
+      "description": "The floor of one meant a single eviction took ingest offline.",
+      "state": "OPEN",
+      "open": true,
+      "closed": false,
+      "draft": true,
+      "createdDate": 1793644407817,
+      "updatedDate": 1793644407817,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas-1793644386",
+        "displayId": "platform-agent/replicas-1793644386",
+        "latestCommit": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 1,
+          "name": "infra",
+          "hierarchyId": "5840b4a83cefa1b0580e",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "statusMessage": "Available",
+          "forkable": true,
+          "project": {
+            "key": "ACME",
+            "id": 1,
+            "name": "acme",
+            "public": false,
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/projects/ACME"
+                }
+              ]
+            }
+          },
+          "public": false,
+          "archived": false,
+          "links": {
+            "clone": [
+              {
+                "href": "https://bitbucket.acme.example/scm/acme/infra.git",
+                "name": "http"
+              },
+              {
+                "href": "ssh://git@bitbucket.acme.example:7999/acme/infra.git",
+                "name": "ssh"
+              }
+            ],
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/browse"
+              }
+            ]
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "adae32302776860009d732ce2599f15be92954d9",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 1,
+          "name": "infra",
+          "hierarchyId": "5840b4a83cefa1b0580e",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "statusMessage": "Available",
+          "forkable": true,
+          "project": {
+            "key": "ACME",
+            "id": 1,
+            "name": "acme",
+            "public": false,
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/projects/ACME"
+                }
+              ]
+            }
+          },
+          "public": false,
+          "archived": false,
+          "links": {
+            "clone": [
+              {
+                "href": "https://bitbucket.acme.example/scm/acme/infra.git",
+                "name": "http"
+              },
+              {
+                "href": "ssh://git@bitbucket.acme.example:7999/acme/infra.git",
+                "name": "ssh"
+              }
+            ],
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/browse"
+              }
+            ]
+          }
+        }
+      },
+      "locked": false,
+      "author": {
+        "user": {
+          "name": "access-token-user/1/1",
+          "active": true,
+          "displayName": "Access Token User - acme",
+          "emailAddress": null,
+          "id": 4,
+          "slug": "access-token-user_1_1",
+          "type": "SERVICE",
+          "links": {
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+              }
+            ]
+          }
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/10"
+          }
+        ]
+      }
+    }
+  ]
+}

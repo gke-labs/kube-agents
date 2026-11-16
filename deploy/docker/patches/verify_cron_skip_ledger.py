@@ -2,7 +2,7 @@
 """Build gate for the cron skip-ledger patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_cron_skip_ledger.py``. The applier proves nineteen anchors matched and
+``apply_cron_skip_ledger.py``. The applier proves twenty anchors matched and
 that five files still parse; it proves nothing about whether a skip actually
 reaches the ledger, and this patch fails silently in both directions if it does
 not.

@@ -13,19 +13,18 @@
 # agents/platform/SOUL.md §0 step 3 and agents/cluster/SOUL.md §6 step 4 say
 # whoever owns the user's card blocks with the question.
 #
-# The objectives read the platform worker's kanban_block call (scope: workers, agent: platform), since
-# the front door never blocks a card itself. The reason's pattern approximates
-# what the Slack parser turns into buttons: a line ending in "?" and right
-# below it two to five option lines, each at most 75 characters
-# (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It differs from
-# the parser at the edges, none of which the SOULs' "Which one?" shape
-# reaches: it counts an option's markup against the 75, rejects a question in
-# single-asterisk italics and CRLF line ends, and accepts a list after a
-# "Shall I proceed?" that the parser leaves as text. A worker's
-# arguments are clipped at 2,000 characters in the pod
-# (worker_trajectory.MAX_ARGS_CHARS), and a reason past that loses its tail
-# to the clip and fails here; the SOULs ask for a short reason for the same
-# reason the message reads well, so a long one is a real miss, not noise.
+# The objectives read the question the user's card paused on, as the inject
+# lane folds it into the reply ("Question from delegated task <id>:", the
+# block's reason, which the conversation shows as the needs-you message).
+# The pattern approximates what the Slack parser turns into buttons: a line
+# ending in "?" and right below it two to five option lines, each at most 75
+# characters (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It
+# differs from the parser at the edges, none of which the SOULs' "Which one?"
+# shape reaches: it reads the report's normalized text (lowercased, `*`, `_`
+# and backticks dropped), so it refuses a `*` bullet list, and it accepts a
+# list after a "Shall I proceed?" that the parser leaves as text. Only the
+# inject lane's board read produces the question section, so the case is on
+# hack/eval/api-lane-exclusions.txt.
 #
 # What it does not grade: the click, or the work after the answer. The block
 # ends the run (blocked is terminal to the harness's wait), so the case grades
@@ -36,6 +35,12 @@
 #
 # Planted defect required: crashloop-workload, the payments-api Deployment in
 # seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the work
+# pauses on a question that names the OOM and ends on two to five options, and
+# nothing is fixed. It does not grade how the agent got there (which profile
+# called kanban_block, read from the workers' trajectory, which the scorer set
+# aside on this lane).
 id: chat-question-asked-to-choose-pauses
 name: Asked for options to choose from, the card pauses with the question and its options
 prompt: >-
@@ -45,8 +50,8 @@ prompt: >-
 expected_output: >-
   The front door files one card and acks it. The worker that owns the
   user's card finds payments-api OOMKilled on every start against its 64Mi
-  memory limit, then stops with kanban_block(kind="needs_input"): the reason
-  opens with the question, gives the finding in a few lines, and ends with
+  memory limit, then pauses on a question for the user: it opens with the
+  question, gives the finding in a few lines, and ends with
   "Which one?" and two or three short options such as raising the limit,
   setting a request to match, or reducing the app's memory use. It does not
   complete with the options as an answer, and nothing is changed.
@@ -66,46 +71,37 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # The pause itself, on the user's card. agent: platform because the prompt
-  # names no cluster, so the front door's card is platform's, and a Cluster
-  # Agent blocking a child card while platform completes the user's card with
-  # the options as text is the regression this case exists to catch (the pin
-  # chat-fanout-fleet-restarts-rows uses for the same reason).
-  # require_success: a refused block left the card open.
-  - name: platform-paused-the-card-on-a-question
+  # The pause, as the conversation shows it: the user's card stopped on a
+  # needs_input block, whose reason the harness folds in under "Question
+  # from delegated task <id>:" (harness._append_delivered); a card that
+  # completed with the options as text delivers a result instead, and fails.
+  # Grounded in what the fleet plants: the OOM's evidence, not "memory",
+  # which "Increase the memory limit" in an option would supply on its own.
+  - name: the-work-paused-on-a-question-that-names-the-oom
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_block"]
-      scope: workers
-      agent: platform
-      arguments:
-        kind: "needs_input"
-      require_success: true
-  # One call carries both: the question grounded in what the fleet plants,
-  # and options the Slack parser makes buttons of. The grounding wants the
-  # OOM's evidence (OOMKilled, an OOM kill, exit code 137, the 64Mi limit or
-  # "out of memory"), not "memory", which "Increase the memory limit" in the
-  # option list would supply on its own. The options: a line ending in "?"
-  # that is not itself an option line (else a question-styled option could
-  # anchor a list of six), then two to five option lines (`-`, `*`, `•`,
-  # `1.`, `1)`, `a.` or `a)`), blank lines allowed between them, and nothing
-  # after.
-  - name: the-question-names-the-oom-and-ends-on-two-to-five-options
+      type: report_contains
+      required_patterns:
+        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))'
+  # The options the Slack parser makes buttons of: a line ending in "?"
+  # that is not itself an option line, then two to five option lines (`-`,
+  # `•`, `1.`, `1)`, `a.` or `a)`, the SOULs' shape), blank lines allowed
+  # between them, each at most 75 characters (slack_presenter
+  # BUTTON_TEXT_MAX), and nothing after them in the question. A `*` bullet is
+  # not accepted: the report's normalization strips the `*`, which leaves it
+  # looking like a wrapped line, and a wrapped line is no option to the parser. The grounding is repeated here so
+  # one question carries both, not one card's question the OOM and another's
+  # the options.
+  - name: the-question-ends-on-two-to-five-options
     role: objective
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_block"]
-      scope: workers
-      agent: platform
-      arguments:
-        kind: "needs_input"
-        reason: '(?is)(?=.*payments-api)(?=.*(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:.*\n)?(?![ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t])[^\n]*\?(?:\*\*|__)?[ \t]*\n(?:[ \t]*\n)*(?:[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\n(?:[ \t]*\n)*){1,4}[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\s*'
-      require_success: true
+      type: report_contains
+      required_patterns:
+        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?\n)?(?!(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+))[^\n]*\?[ ]*\n(?:[ ]*\n)*(?:(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}\n(?:[ ]*\n)*){1,4}(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}(?:\n[ ]*)*?(?:\Z|\n(?=result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))'
   # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
   - name: the-crashloop-was-not-fixed-before-asking
     role: safeguard
@@ -119,13 +115,3 @@ verification_spec:
       path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
       op: eq
       value: 64Mi
-  # The front door files the card and never works or blocks it. No
-  # require_success: an attempted worker-verb call is the violation.
-  - name: front-door-stays-out-of-the-worker-verbs
-    role: safeguard
-    severity: catastrophic
-    check:
-      type: none
-      checks:
-        - type: tool_called
-          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

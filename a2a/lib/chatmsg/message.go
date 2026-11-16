@@ -2,7 +2,8 @@
 // executor states beside its text so every chat adapter can lay out a
 // report, a question or a plan without reading prose
 // (spec-a2a-payloads.md, "Chat messages"). It holds the types, the
-// validator for every rule in that section, the text fallback each carrier
+// validator for every rule in that section but wording, the lint for
+// wording, the text fallback each carrier
 // pairs with a chat message, and the DataPart encoding. The shared cases in
 // tests/conformance/chat/ are checked against Validate here and against the
 // Python presenters' reader there.
@@ -98,7 +99,19 @@ type Row struct {
 	Text     string `json:"text"`
 	Severity string `json:"severity,omitempty"`
 	Detail   string `json:"detail,omitempty"`
+	// Tasks are the board cards the row stands for, and Actions the buttons
+	// a renderer draws under it (RowActionRetry, RowActionDrop), labelled by
+	// the renderer, never by the sender. A click is no turn: it acts on
+	// Tasks. Both or neither.
+	Tasks   []string `json:"tasks,omitempty"`
+	Actions []string `json:"actions,omitempty"`
 }
+
+// Row action values: the board-health card's buttons on a stuck row.
+const (
+	RowActionRetry = "retry"
+	RowActionDrop  = "drop"
+)
 
 // Fold is the message's one collapsed section.
 type Fold struct {
@@ -119,6 +132,10 @@ type Choice struct {
 	Text    string `json:"text"`
 	Reply   string `json:"reply,omitempty"`
 	Primary bool   `json:"primary,omitempty"`
+	// Next marks a finished answer's optional next step: a click still
+	// arrives as the clicker's text, but nothing waits on it, so a renderer
+	// never reads a typed reply as its answer.
+	Next bool `json:"next,omitempty"`
 }
 
 // Link is a button that opens a url.
@@ -177,12 +194,12 @@ var leaf *shape
 // like any other, not the headline.
 var messageShape = &shape{keys: map[string]*shape{
 	schemaKey: leaf, "headline": leaf, "note": leaf, "detail": leaf, "tone": leaf, "after": leaf,
-	"rows": {list: true, keys: map[string]*shape{"text": leaf, "severity": leaf, "detail": leaf}},
+	"rows": {list: true, keys: map[string]*shape{"text": leaf, "severity": leaf, "detail": leaf, "tasks": leaf, "actions": leaf}},
 	"fold": {keys: map[string]*shape{
 		"title": leaf, "text": leaf,
 		"table": {keys: map[string]*shape{"columns": leaf, "rows": leaf}},
 	}},
-	"choices": {list: true, keys: map[string]*shape{"text": leaf, "reply": leaf, "primary": leaf}},
+	"choices": {list: true, keys: map[string]*shape{"text": leaf, "reply": leaf, "primary": leaf, "next": leaf}},
 	"links":   {list: true, keys: map[string]*shape{"text": leaf, "url": leaf, "primary": leaf}},
 	"plan": {keys: map[string]*shape{
 		"title": leaf,

@@ -1,0 +1,113 @@
+# NIGHTLY — registered in hack/eval/nightly-cases.txt. The fixture repository
+# was planted by #4705.
+#
+# The large-tree variant of upgrades-api-deprecation-clean-repo (#4279). The
+# broker refuses a snapshot of a tree over its ceiling (32 MiB of tar by
+# default), and the scan used to list such a repository as `not scanned`, so a
+# removed apiVersion in it was never found. The scan now reads the parts of the
+# tree that hold manifests. The fixture is a public repository whose tree is
+# over the ceiling because of a vendored directory with no manifests, and which
+# holds one manifest on a removed apiVersion in another directory:
+# `clusters/prod/pdb.yaml`, a PodDisruptionBudget `large-repo-pdb` on
+# `policy/v1beta1`, removed in 1.25 and replaced by `policy/v1`.
+#
+# The prompt names the versions (from 1.24 to 1.27), so the hit is in range
+# whatever versions the eval clusters run; the removal table ends at 1.32, and
+# a floor above it would leave nothing in range to find.
+#
+# Red on main, observed on the devops-bench-complex-evals dev install (today
+# mode, graded over the agent API) at main 5a4cdc5e: the scan's section is
+# `not scanned` (the broker refuses the 41963520-byte tree against its
+# 33554432-byte ceiling). The worker then snapshotted `clusters/` and
+# `README.md` itself and scanned the copy with `--manifests-dir`, so the report
+# names the PDB but fails the-scan-read-the-repository-itself and
+# the-section-names-its-source. Green three times on #4776's build: the scan
+# reads the tree in one snapshot of `clusters/` and every check passes. Not yet
+# run on a next-mode install through the inject door.
+#
+# The red's home is the api lane. The nightly grades through the inject door,
+# which sets aside the-deprecation-scan-ran and
+# the-scan-read-the-repository-itself on every record, and
+# the-request-was-delegated when the door shows no tool-call trace. What stays
+# graded there reads only the report: the PDB, no invented CVE, and
+# the-section-names-its-source. The red on main failed that last check, since
+# its --manifests-dir copy has no "manifests as of" line; a worker on main that
+# writes the phrase itself would pass it, so the inject lane's red is weaker.
+#
+# Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
+# write). The repository is public, so the broker reads it as an unregistered
+# repository with no credential.
+#
+# No deterministic mutation safeguard, documented: the case plants nothing in
+# the fleet and the answer is read from Git.
+id: upgrades-api-deprecation-large-repo
+name: Deprecation scan of a repository over the snapshot ceiling finds the removed apiVersion in it
+prompt: >-
+  Check the repository github.com/gke-agentic/kube-agents-evals-large-gitops
+  for Kubernetes API versions removed between 1.24 and 1.27, as if our control
+  planes were on 1.24 and we planned to go to 1.27. Tell me which commit you
+  read, what you found, and what you could not read. Read only; change and
+  upgrade nothing.
+expected_output: >-
+  A deprecation section for the repository read during this run, stating its
+  source as the repository's commit ("repo manifests as of <sha>"). It names
+  the PodDisruptionBudget large-repo-pdb in clusters/prod/pdb.yaml on
+  policy/v1beta1, removed in 1.25, with policy/v1 as the replacement. It says
+  the repository was read in parts because its tree is over the broker's
+  snapshot ceiling, and names any part it did not read. It recommends (not
+  performs) the migration. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+verification_spec:
+  - name: the-section-names-its-source
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["manifests as of"]
+  # The planted manifest is found. On its own this check does not catch the
+  # defect: on main a worker found it by snapshotting the tree itself, which
+  # the-scan-read-the-repository-itself and the-section-names-its-source refuse.
+  - name: the-removed-apiversion-is-found
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["large-repo-pdb", "policy/v1beta1"]
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-deprecation-scan-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--(versions|current-version)(=.*)?$"]
+  # As in the clean-repo case: a worker whose scan failed can clone the
+  # repository another way and scan the copy as a local tree. That read is not
+  # the one this case grades.
+  - name: the-scan-read-the-repository-itself
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--manifests-dir(=.*)?$"]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]

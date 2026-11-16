@@ -73,8 +73,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -117,6 +119,15 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: `github-issue-resolver` already honours on issues.
 IGNORE_LABEL = "agent:ignore"
 
+#: The same opt-out on a forge with no labels (`capabilities` says
+#: `labels: false`): `agent:ignore` on a line of its own in the description,
+#: bare or as an HTML comment. Read only there, so a description on a forge
+#: with labels changes nothing.
+IGNORE_BODY_RE = re.compile(
+    r"^[ \t]*(?:<!--[ \t]*)?" + re.escape(IGNORE_LABEL) + r"(?:[ \t]*-->)?[ \t\r]*$",
+    re.MULTILINE,
+)
+
 #: Reason code for a repository whose host no forge module serves. Named here
 #: beside the other operator-facing strings rather than inline in
 #: `UnknownForgeHost`, the way `RepoUnparseable` takes
@@ -155,7 +166,7 @@ SANDBOX_FORGE = "/opt/vcs/libexec/platform/forge.py"
 #: Bounds the ssh hop around a forwarded verb. Not the broker's ceiling plus
 #: room -- the broker allows 300s per forge call and a verb may make several, so
 #: no single number here can sit above it. It is a bound on the verbs this
-#: module forwards, which are reads that answer in seconds, chosen so that a
+#: module forwards, which answer in seconds, chosen so that a
 #: hung hop fails the tick instead of holding the cron's slot. A verb that
 #: legitimately runs longer than this belongs on a route of its own, not on a
 #: larger constant.
@@ -453,7 +464,14 @@ def _host_of(repo: str) -> str:
         return ""
 
 
-def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) -> dict:
+def call(
+    verb: str,
+    payload: dict,
+    repo: str,
+    *,
+    retry_transient: bool = False,
+    timeout_s: Optional[float] = None,
+) -> dict:
     """One version-control verb against one repository, wherever this is running.
 
     Every forge call in this module and its consumers goes through here, so
@@ -490,24 +508,53 @@ def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) 
     safe to repeat: `proposal-comment` that failed after the forge accepted it
     would post the reviewer's answer twice, and there is no idempotency key on
     that route to make the second call a no-op.
+
+    **`timeout_s` is a ceiling on the whole call, for a caller with a deadline.**
+    `None` keeps `FORWARD_TIMEOUT_S` on the sandbox hop. A caller that must
+    answer inside its own budget passes what is left of it, so one slow verb
+    cannot outlast that budget. The ceiling is read as a deadline when the call
+    starts: with `retry_transient` the retry gets what is left of it, not a
+    second helping. Zero or less, at the start or before the retry, means
+    nothing is left: the attempt is not started and fails as
+    `SANDBOX_UNREACHABLE`, the code a timed-out hop carries, on either path. The
+    ceiling itself is enforced on the sandbox hop only. The direct path
+    (`vcs_client.forge`) has no timeout to set: the broker opener clears the
+    socket timeout after connecting, on purpose, because a clone runs for
+    minutes.
     """
     attempts = 2 if retry_transient else 1
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     for attempt in range(1, attempts + 1):
+        # The first attempt gets the ceiling as given; a retry gets what is left of it.
+        ceiling = timeout_s if attempt == 1 or deadline is None else deadline - time.monotonic()
+        if ceiling is not None and ceiling <= 0:
+            raise ForgeError(
+                REASON_SANDBOX_UNREACHABLE,
+                f"{verb} on {repo} was not started: no time left of its {timeout_s}s ceiling",
+            )
         try:
             with _as_forge_error(repo):
                 if sandbox_exec.sandbox_enabled():
-                    return _forward(verb, payload, repo)
+                    return _forward(verb, payload, repo, ceiling)
                 return vcs_client.forge(verb, dict(payload), repository=repo)
         except ForgeError as error:
             if attempt == attempts or error.reason not in TRANSIENT_CODES:
                 raise
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                raise ForgeError(
+                    REASON_SANDBOX_UNREACHABLE,
+                    f"{verb} on {repo} failed with {error.reason} and was not retried: "
+                    f"no time left of its {timeout_s}s ceiling",
+                ) from error
             LOGGER.warning(
                 "%s on %s failed with %s; retrying once", verb, repo, error.reason
             )
     raise AssertionError("unreachable")  # pragma: no cover -- the loop returns or raises
 
 
-def _forward(verb: str, payload: dict, repo: str) -> dict:
+def _forward(
+    verb: str, payload: dict, repo: str, timeout_s: Optional[float] = None
+) -> dict:
     """Ask a copy of this file inside the sandbox, and read its answer back.
 
     The payload travels as JSON on fd 0 rather than as arguments. A comment body
@@ -523,11 +570,14 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
 
     The forwarded process cannot forward again. `sandbox_enabled()` reads the
     agent pod's managed Hermes config, and the sandbox image does not carry it.
+
+    `timeout_s` is the caller's ceiling on the hop; `None` is `FORWARD_TIMEOUT_S`.
     """
+    ceiling = FORWARD_TIMEOUT_S if timeout_s is None else timeout_s
     try:
         completed = sandbox_exec.run(
             ["python3", SANDBOX_FORGE, "call", verb, "--repository", repo],
-            timeout=FORWARD_TIMEOUT_S,
+            timeout=ceiling,
             stdin=json.dumps(payload),
         )
     except sandbox_exec.SandboxUnavailable as unreachable:
@@ -539,7 +589,7 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
         ) from unreachable
     except subprocess.TimeoutExpired as expired:
         raise vcs_client.VcsError(
-            f"{verb} on {repo} did not answer within {FORWARD_TIMEOUT_S}s",
+            f"{verb} on {repo} did not answer within {ceiling}s",
             code=REASON_SANDBOX_UNREACHABLE,
         ) from expired
     if completed.returncode != 0:
@@ -642,6 +692,7 @@ class BrokerProvider:
         # answer, meaning the credential could not name itself, and is cached.
         self._viewers: dict[str, str] = {}
         self._acknowledges: dict[str, bool] = {}
+        self._labels: dict[str, bool] = {}
         # Every listing this instance read that filled its page, in the words an
         # operator reads. Accumulated rather than only logged because the
         # sweep's channel to a human is the `warnings` list it prints on stdout:
@@ -825,6 +876,31 @@ class BrokerProvider:
             self._acknowledges[repo] = bool(answer.get("acknowledge"))
         return self._acknowledges[repo]
 
+    def supports_labels(self, repo: str) -> bool:
+        """Does this repository's forge carry labels on a pull request?
+
+        From `capabilities`, like `supports_acknowledge`. A field that is not
+        in the answer -- a broker older than the field -- answers True, which
+        is what every forge was taken to have before the field existed, and so
+        does an answer that cannot be read. Only a forge that says
+        `labels: false` changes anything.
+        """
+        known = self._labels_known(repo)
+        return True if known is None else known
+
+    def _labels_known(self, repo: str) -> Optional[bool]:
+        """`supports_labels`, with None when `capabilities` could not be read."""
+        if repo not in self._labels:
+            try:
+                answer = self._verb("capabilities", {}, repo)
+            except ForgeError as error:
+                LOGGER.info("capabilities unreadable for %s: %s", repo, error)
+                return None
+            # Only a served forge's answer: an unserved host also says no labels.
+            served = bool(answer.get("forge")) and not answer.get("missing")
+            self._labels[repo] = not served or answer.get("labels") is not False
+        return self._labels[repo]
+
     # -- the operations ----------------------------------------------------
     def list_open_prs(self, repo: str) -> list[PullRequest]:
         """Every open change proposal on one repository.
@@ -834,6 +910,24 @@ class BrokerProvider:
         branch on somebody's fork, and telling those apart is the first of the
         three things `is_agent_pull_request` checks.
         """
+        nodes = self._pages(
+            "proposal-list",
+            {"state": "open", "limit": PAGE_SIZE},
+            "proposals",
+            repo,
+            "the open proposals",
+        )
+        # The description opt-out counts only on a forge with no labels, and
+        # `capabilities` is asked only when a description carries one, so a
+        # forge with labels makes the same calls as before.
+        body_ignored = {
+            id(node) for node in nodes if IGNORE_BODY_RE.search(str(node.get("body") or ""))
+        }
+        # Not known is not "has labels": a proposal that a person parked with
+        # the description line stays parked for the tick, because sweeping it
+        # costs an action on it and holding it costs one tick.
+        if body_ignored and self._labels_known(repo) is True:
+            body_ignored = set()
         return [
             PullRequest(
                 number=int(node.get("number") or 0),
@@ -844,16 +938,11 @@ class BrokerProvider:
                 head_repo=str(node.get("sourceRepo") or ""),
                 head_sha=str(node.get("sourceRevision") or ""),
                 author=str(node.get("author") or ""),
-                labels=tuple(str(name) for name in (node.get("labels") or [])),
+                labels=tuple(str(name) for name in (node.get("labels") or []))
+                + ((IGNORE_LABEL,) if id(node) in body_ignored else ()),
                 url=str(node.get("url") or ""),
             )
-            for node in self._pages(
-                "proposal-list",
-                {"state": "open", "limit": PAGE_SIZE},
-                "proposals",
-                repo,
-                "the open proposals",
-            )
+            for node in nodes
         ]
 
     def list_comments(self, repo: str, pr: PullRequest) -> list[Comment]:

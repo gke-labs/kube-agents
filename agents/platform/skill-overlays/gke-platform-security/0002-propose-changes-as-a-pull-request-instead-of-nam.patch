@@ -1,0 +1,132 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -24,8 +24,10 @@ controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
+ Security Standards), refer to the `gke-workload-security` skill; for Workload
+ Identity Service Account bindings, the `gke-workload-identity` skill.
+ 
+-> **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
+-> `k8s:get_k8s_resource`, `k8s:apply_k8s_manifest`, `gke:update_cluster`
++> **MCP Tools:** `get_cluster`, `check_k8s_auth`, `get_k8s_resource` (all on the `gke`
++> server)
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Golden Path Security Defaults
+ 
+@@ -51,14 +53,13 @@ secret rotation.
+ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
+   --format="value(secretManagerConfig.enabled)" \
+   --quiet
+-
+-# Enable if not already (Day-1 change)
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --enable-secret-manager \
+-  --secret-manager-rotation-interval=120s \
+-  --quiet
+ ```
+ 
++If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting.
++Config Connector's `ContainerCluster` has no field for it, so it has no declarative path in a
++Config Connector repository: say so, and block rather than invent a field. A Terraform repository
++carries it on the cluster resource.
++
+ > **Note:** For configuring `SecretProviderClass` manifests and mounting secrets
+ > as volumes inside application deployments, see the `gke-workload-security`
+ > skill.
+@@ -80,10 +81,10 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
+ -   Use namespace-scoped Roles over cluster-wide ClusterRoles.
+ -   Bind to specific Groups or ServiceAccounts, never to `system:authenticated`
+     or `system:unauthenticated`.
+--   Audit permissions via MCP: `k8s:check_k8s_auth(parent="...", verb="list",
++-   Audit permissions via MCP: `check_k8s_auth(parent="...", verb="list",
+     resourceType="pods", namespace="...")` (or `kubectl auth can-i --list
+     --as=<user>`).
+--   Review bindings via MCP: `k8s:get_k8s_resource(parent="...",
++-   Review bindings via MCP: `get_k8s_resource(parent="...",
+     resourceType="clusterrolebinding")` (or `kubectl get
+     clusterrolebindings,rolebindings --all-namespaces`).
+ 
+@@ -93,31 +94,17 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
+ ## Binary Authorization
+ 
+ Not enabled in golden path by default but recommended for enforcing production
+-image provenance across the cluster:
+-
+-```bash
+-# Enable Binary Authorization
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE \
+-  --quiet
+-```
++image provenance across the cluster. It is turned on with the evaluation mode
++`PROJECT_SINGLETON_POLICY_ENFORCE` (`spec.binaryAuthorization.evaluationMode`), changed as
++Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-connector`.
+ 
+ ## Shielded Nodes & GKE Sandbox Enablement
+ 
+-Enabling verifiable node boot integrity and kernel isolation features at the
+-cluster level:
+-
+-```bash
+-# Enable Shielded Nodes on an existing cluster
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --enable-shielded-nodes \
+-  --quiet
+-
+-# Enable GKE Sandbox (gVisor) runtime on an existing cluster
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --enable-gke-sandbox \
+-  --quiet
+-```
++Verifiable node boot integrity is a cluster setting and kernel isolation a node pool one. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
++YAML on the cluster's `ContainerCluster` through `gcp-config-connector`. The GKE Sandbox
++(gVisor) runtime is a node pool setting, `spec.nodeConfig.sandboxConfig.sandboxType: gvisor` on
++a `ContainerNodePool`; the field is immutable and the default pool cannot run it, so propose a
++new sandboxed node pool rather than editing an existing one.
+ 
+ > **Note:** To run workloads inside the gVisor sandbox, specify
+ > `runtimeClassName: gvisor` in your Pod specs as detailed in the
+@@ -169,26 +156,10 @@ The five most common predefined IAM roles for GKE platform and cluster access:
+ 
+ Common project-level IAM policy binding patterns for granting backend Google
+ Service Accounts (GSAs) access to external Google Cloud services before linking
+-via Workload Identity:
+-
+-```bash
+-# Grant a GSA access to Cloud Storage objects
+-gcloud projects add-iam-policy-binding <PROJECT_ID> \
+-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
+-  --role "roles/storage.objectViewer" \
+-  --quiet
+-
+-# Grant a GSA access to Cloud SQL databases
+-gcloud projects add-iam-policy-binding <PROJECT_ID> \
+-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
+-  --role "roles/cloudsql.client" \
+-  --quiet
+-
+-# Grant a GSA access to Pub/Sub subscriptions
+-gcloud projects add-iam-policy-binding <PROJECT_ID> \
+-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
+-  --role "roles/pubsub.subscriber" \
+-  --quiet
++via Workload Identity: grant the GSA `roles/storage.objectViewer` for Cloud Storage objects,
++`roles/cloudsql.client` for Cloud SQL databases, or `roles/pubsub.subscriber` for Pub/Sub
++subscriptions, each as a project-level IAM binding in Config Connector YAML through
++`gcp-config-connector`.
+ 
+ ## Resources
+ 
+@@ -198,4 +169,3 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
+ - [Binary Authorization on GKE](https://cloud.google.com/binary-authorization/docs/setting-up)
+ - [Shielded GKE Nodes](https://cloud.google.com/kubernetes-engine/docs/how-to/shielded-gke-nodes)
+ - [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods)
+-```

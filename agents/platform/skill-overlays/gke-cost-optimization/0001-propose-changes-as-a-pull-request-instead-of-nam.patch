@@ -1,0 +1,73 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -15,8 +15,9 @@ metadata:
+ This reference covers strategies and workflows for reducing Google Kubernetes
+ Engine (GKE) costs while maintaining a secure and reliable posture.
+ 
+-> **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`,
+-> `apply_k8s_manifest`, `patch_k8s_resource`, `get_cluster`
++> **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`, `get_cluster`
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Golden Path Cost Features
+ 
+@@ -48,10 +49,10 @@ apply the optimization workflows below.
+ ### 2. Configure Resource Quotas
+ 
+ Resource quotas restrict total resource consumption across tenants in
+-multi-tenant clusters, preventing runaway costs.
++multi-tenant clusters, preventing runaway costs. The quota is proposed as a pull request
++through `submit-suggestion`:
+ 
+-```bash
+-kubectl apply -f - <<EOF
++```yaml
+ apiVersion: v1
+ kind: ResourceQuota
+ metadata:
+@@ -63,7 +64,6 @@ spec:
+     requests.memory: 16Gi
+     limits.cpu: "8"
+     limits.memory: 32Gi
+-EOF
+ ```
+ 
+ ### 3. Pod Rightsizing (VPA & MPA)
+@@ -71,11 +71,10 @@ EOF
+ Adjust pod resource requests to match actual utilization. Over-provisioned
+ requests are one of the largest sources of waste.
+ 
+--   **Use VPA in Recommendation Mode**:
++-   **Use VPA in Recommendation Mode**: propose the VPA as a pull request through
++    `submit-suggestion`, wait 24+ hours for data collection, then read its recommendations.
+ 
+-```bash
+-# 1. Deploy VPA in recommendation mode
+-kubectl apply -f - <<EOF
++```yaml
+ apiVersion: autoscaling.k8s.io/v1
+ kind: VerticalPodAutoscaler
+ metadata:
+@@ -87,11 +86,9 @@ spec:
+     name: {deployment_name}
+   updatePolicy:
+     updateMode: "Off"
+-EOF
+-
+-# 2. Wait 24+ hours for data collection
++```
+ 
+-# 3. Read recommendations
++```bash
+ kubectl get vpa {deployment_name}-vpa -o jsonpath='{.status.recommendation}'
+ ```
+ 

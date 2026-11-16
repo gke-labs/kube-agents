@@ -363,6 +363,36 @@ class TriageReplyRoundTripTest(unittest.TestCase):
             )
         )
 
+    def test_a_report_with_nothing_to_apply_earns_no_row(self):
+        # The template's third shape: no manifest change is warranted, so
+        # 'What to do' is one "No action needed" bullet, with no Option letter
+        # and no call to action. The gate must refuse it, or the row would hold
+        # the thread's one INSERT OR IGNORE slot for a reply nothing can act on.
+        # The bullet is cut from the template so a reword moves it here too.
+        instructions = self.session_kv_server._triage_task_body(
+            {
+                "reason": "FailedScheduling",
+                "namespace": "checkout",
+                "kind_of_object": "Pod",
+                "name": "checkout-7d9f",
+                "message": "0/3 nodes are available: insufficient memory.",
+                "cluster": "prod-us-central1",
+            }
+        )
+        bullets = [
+            line for line in instructions.splitlines()
+            if line.startswith("- **No action needed:**")
+        ]
+        self.assertEqual(len(bullets), 1, bullets)
+        report = (
+            "## What's wrong\n\nA `checkout` pod could not schedule for 40 seconds.\n\n"
+            "## Why\n\n- The autoscaler added a node and the pod is Running now.\n\n"
+            f"## What to do\n\n{bullets[0]}\n"
+        )
+        self.assertFalse(notifier.actionable_report(report))
+        self.assertFalse(self.deliver(_Task(result=report)))
+        self.assertIsNone(self.reply("apply"))
+
     # --- the stall watch's card -----------------------------------------------
 
     STALL_PAYLOAD = {

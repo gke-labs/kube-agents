@@ -22,10 +22,15 @@ run it.
     HERMES_ROOT=~/git/hermes-agent python3 tests/memory/test_user_tag_isolation.py
 """
 
+from contextlib import closing
 import hashlib
+import json
 import os
+import sqlite3
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
@@ -42,10 +47,12 @@ except (ImportError, ValueError):
 import memory_file_import as mfi  # noqa: E402
 from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
+    SHARED_SESSION_NOTICE,
     USER_TAG_PREFIX,
     KubeAgentsMemoryProvider,
     sanitize_user_id,
 )
+from kube_agents_memory import client as kam_client  # noqa: E402
 
 # Pairs that the readable half alone maps onto one string. All are plausible
 # addresses, not adversarial input: the first two differ by one separator, the
@@ -111,6 +118,175 @@ class TestUserTagIsolation(unittest.TestCase):
                 self.assertEqual(mfi.sanitize_user_id(raw), sanitize_user_id(raw), raw)
         for edge in ("", "   ", "@@@", "  alice@corp.example  ", "slackbot"):
             self.assertEqual(mfi.sanitize_user_id(edge), sanitize_user_id(edge), repr(edge))
+
+    def test_a2a_session_resolves_identity_and_chat_type_from_session_kv(self):
+        """Under spec.mode: next, hermes-bridge records user_id and chat_type in session_kv.db."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kv_db = os.path.join(tmp, "session_kv.db")
+            state_db = os.path.join(tmp, "state.db")
+            alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-dm",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM1",
+                                "context_id": "ctx-dm",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-group",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/SPACE1",
+                                "context_id": "ctx-group",
+                                "user_id": alice_hmac,
+                                "chat_type": "group",
+                            }
+                        }),
+                    ),
+                )
+            with closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-dm', NULL, 'compression', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_cont', 'a2a-ctx-dm', NULL, NULL)")
+
+            with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
+                 patch.object(kam_client, "load_hindsight", return_value=None):
+                p_dm = KubeAgentsMemoryProvider()
+                p_dm.initialize("a2a-ctx-dm")
+                self.assertEqual(p_dm._user_tag, f"{USER_TAG_PREFIX}{sanitize_user_id(alice_hmac)}")
+                self.assertEqual(p_dm._personal_disabled_reason, "")
+                self.assertFalse(p_dm._unattended)
+
+                # Compressed continuation resolves the parent a2a-* session.
+                p_cont = KubeAgentsMemoryProvider()
+                p_cont.initialize("20261021_cont", hermes_home=tmp)
+                self.assertEqual(p_cont._user_tag, f"{USER_TAG_PREFIX}{sanitize_user_id(alice_hmac)}")
+
+                # Group conversation on A2A disables personal memory without thread_id.
+                p_group = KubeAgentsMemoryProvider()
+                p_group.initialize("a2a-ctx-group")
+                self.assertEqual(p_group._user_tag, "")
+                self.assertEqual(p_group._personal_disabled_reason, SHARED_SESSION_NOTICE)
+                self.assertFalse(p_group._unattended)
+
+                # Unattributable interactive A2A session (route missing) is NOT unattended.
+                p_missing = KubeAgentsMemoryProvider()
+                p_missing.initialize("a2a-ctx-missing")
+                self.assertEqual(p_missing._user_tag, "")
+                self.assertEqual(p_missing._personal_disabled_reason, NO_IDENTITY_NOTICE)
+                self.assertFalse(p_missing._unattended)
+
+    def test_branched_continuation_does_not_inherit_a2a_parent_route(self):
+        """Only 'compression' parents inherit the originating a2a-* route."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kv_db = os.path.join(tmp, "session_kv.db")
+            state_db = os.path.join(tmp, "state.db")
+            alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-dm",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM1",
+                                "context_id": "ctx-dm",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
+            with closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-dm', NULL, 'branched', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_branch', 'a2a-ctx-dm', NULL, NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-compressed', NULL, 'compression', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_fork', 'a2a-ctx-compressed', NULL, '{\"_branched_from\": \"a2a-ctx-compressed\"}')")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_delegate', 'a2a-ctx-compressed', NULL, '{\"_delegate_from\": \"a2a-ctx-compressed\"}')")
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-compressed",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM2",
+                                "context_id": "ctx-compressed",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
+
+            with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
+                 patch.object(kam_client, "load_hindsight", return_value=None):
+                p_branch = KubeAgentsMemoryProvider()
+                p_branch.initialize("20261021_branch", hermes_home=tmp)
+                self.assertEqual(p_branch._user_tag, "")
+                self.assertEqual(p_branch._personal_disabled_reason, NO_IDENTITY_NOTICE)
+
+                p_fork = KubeAgentsMemoryProvider()
+                p_fork.initialize("20261021_fork", hermes_home=tmp)
+                self.assertEqual(p_fork._user_tag, "")
+
+                p_del = KubeAgentsMemoryProvider()
+                p_del.initialize("20261021_delegate", hermes_home=tmp)
+                self.assertEqual(p_del._user_tag, "")
+
+                p_spoof = KubeAgentsMemoryProvider()
+                p_spoof.initialize("api-attacker-session", gateway_session_key="a2a-ctx-dm", hermes_home=tmp)
+                self.assertEqual(p_spoof._user_tag, "")
+
+    def test_non_a2a_interactive_and_unattended_prongs_and_default_user_id(self):
+        """Verify non-A2A interactive prongs (`chat_type='dm'`, `platform='slack'`),
+        unattended cron/watcher sessions, and `user_id='default'` normalization.
+        """
+        with patch.object(kam_client, "load_hindsight", return_value=None):
+            # Non-A2A interactive DM with missing user_id -> _unattended is False.
+            p_dm = KubeAgentsMemoryProvider()
+            p_dm.initialize("20261021_dm", user_id="", chat_type="dm")
+            self.assertEqual(p_dm._user_tag, "")
+            self.assertEqual(p_dm._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_dm._unattended)
+
+            # Non-A2A interactive platform session with missing user_id -> _unattended is False.
+            p_plat = KubeAgentsMemoryProvider()
+            p_plat.initialize("20261021_slack", user_id="", platform="slack")
+            self.assertEqual(p_plat._user_tag, "")
+            self.assertEqual(p_plat._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_plat._unattended)
+
+            # Non-A2A cron/watcher session with no user_id, chat_type, or platform -> _unattended is True.
+            p_cron = KubeAgentsMemoryProvider()
+            p_cron.initialize("cron-platform-audit-2026-10-21", user_id="")
+            self.assertEqual(p_cron._user_tag, "")
+            self.assertEqual(p_cron._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertTrue(p_cron._unattended)
+
+            # user_id="default" is normalized to empty rather than hashed into a shared tag.
+            p_def = KubeAgentsMemoryProvider()
+            p_def.initialize("a2a-ctx-no-route", user_id="default")
+            self.assertEqual(p_def._user_tag, "")
+            self.assertEqual(p_def._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_def._unattended)
 
 
 if __name__ == "__main__":

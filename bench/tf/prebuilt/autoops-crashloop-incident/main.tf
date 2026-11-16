@@ -227,10 +227,9 @@ resource "null_resource" "incident" {
       # Read from the watcher's own log; --since-time so a recycled lease's
       # old 'fire' line for this static namespace name cannot satisfy it.
       elapsed=0
-      until kubectl logs "deployment/${var.agent_deployment}" \
+      until grep -q "fire .*pod=${local.ns}/" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
-              --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -q "fire .*pod=${local.ns}/"; do
+              --since-time="$started_at" --tail=-1 2>/dev/null)"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no 'fire' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \

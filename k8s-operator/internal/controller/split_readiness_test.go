@@ -44,7 +44,9 @@ import (
 
 // splitReadinessAgent is the CR these tests report on. Deliberately plainer than
 // brokerPodAgent: no chat integration, because nothing here depends on the
-// relays and their absence keeps the status under test to the three workloads.
+// relays. Every install renders the A2A stack, so the tests on the three
+// split workloads stand it up (a2aStackUp and a2aGatewayWorkload) and hold
+// the status under test to the workload each is about.
 func splitReadinessAgent() *agentv1alpha1.PlatformAgent {
 	return &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -73,9 +75,7 @@ func credentialBroker(agent *agentv1alpha1.PlatformAgent, ready int32) *appsv1.D
 }
 
 // discordBotSecret is the hand-made Secret that gives the A2A gateway a chat
-// backend; without it (or the inject flag) a next install's gateway is
-// withheld on purpose (a2aGatewayBackend), which is the point of the tests
-// below that leave it out.
+// backend. Without one the gateway still runs, on the console door alone.
 func discordBotSecret(agent *agentv1alpha1.PlatformAgent) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aDiscordBotSecretName, Namespace: agent.Namespace},
@@ -108,38 +108,33 @@ func a2aProvisionJob(agent *agentv1alpha1.PlatformAgent, complete bool) *batchv1
 }
 
 // a2aStackUp is everything a next install renders beside the gateway, all
-// ready, plus the backend Secret that makes the gateway expected.
+// ready, plus a backend Secret.
 func a2aStackUp(agent *agentv1alpha1.PlatformAgent) []client.Object {
 	return []client.Object{discordBotSecret(agent), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)}
 }
 
 // a2aStateFrom is the provision state reconcileA2A would have handed the status
 // writer this pass: the Job's digest name, done when the Job in the fake client
-// reports Complete, and the gateway decision (dark when the Deployment is
-// absent and the install has no backend). It is a stand-in for the render so
-// the tests below can drive the status writer alone against exact workload
-// states; it is not the render, and it does not guard it. The render's own
-// rule is pinned where it lives (TestAGatewayIsNotRenderedWithoutAChatBackend
-// and its neighbours), and the two are driven together end to end, through
-// Reconcile, by TestTheReadyWriterReportsTheGatewayTheRenderWithheld and the
-// Degraded-path tests beside it.
+// reports Complete, and gatewayWaking when the gateway Deployment exists with no
+// ready replica and the CR carries the A2AGateway condition (the way back on an
+// install an older operator darkened). It is a stand-in for the render so the
+// tests below can drive the status writer alone against exact workload states;
+// it is not the render, and it does not guard it. The render's own rule is
+// pinned where it lives (TestAGatewayIsRenderedWithoutAChatBackend and its
+// neighbours), and the two are driven together end to end, through Reconcile,
+// by TestTheReadyWriterCountsAConsoleOnlyGateway and the Degraded-path tests
+// beside it.
 func a2aStateFrom(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) a2aProvisionState {
 	t.Helper()
 	cl := r.Client
-	if !a2aStackRendering(agent) {
-		return a2aProvisionState{}
-	}
-	state := a2aProvisionState{jobName: buildA2AProvisionJob(agent).Name}
-	// The gateway decision the render would have made: dark when the
-	// Deployment is absent and the install has no backend.
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); errors.IsNotFound(err) {
-		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
-		if berr != nil {
-			t.Fatal(berr)
-		}
-		if !configured {
-			state.gatewayDark, state.gatewayDarkReason = true, why
-		}
+	// The server count as the CR already carries it: a settled pass has
+	// nothing to write for it (busReplicasStatusCurrent).
+	state := a2aProvisionState{jobName: buildA2AProvisionJob(agent).Name, busReplicasPersisted: agent.Status.BusReplicas}
+	gw := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, gw); err == nil {
+		state.gatewayWaking = gw.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent)
+	} else if !errors.IsNotFound(err) {
+		t.Fatal(err)
 	}
 	job := &batchv1.Job{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: state.jobName, Namespace: agent.Namespace}, job); err != nil {
@@ -167,7 +162,7 @@ func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...c
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -178,27 +173,13 @@ func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...c
 	return phase, cond.Message
 }
 
-// TestReadyMeansAllThreeWorkloads is the whole point of the gating: only the
-// full set earns the phase.
-func TestReadyMeansAllThreeWorkloads(t *testing.T) {
-	agent := splitReadinessAgent()
-	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
-
-	if phase != "Ready" {
-		t.Errorf("got phase %q, want Ready: all three workloads have a ready replica", phase)
-	}
-	if want := "Gateway, shell sandbox and credential broker are all ready"; msg != want {
-		t.Errorf("got message %q, want %q", msg, want)
-	}
-}
-
 // TestAGatewayWithoutItsShellIsNotReady is the regression the split introduced.
 // Before it, the credential runtime was a native sidecar and a sandbox that
 // could not start held the gateway Pod out of readiness; afterwards the gateway
 // becomes Ready on its own while the model cannot run a single command.
 func TestAGatewayWithoutItsShellIsNotReady(t *testing.T) {
 	agent := splitReadinessAgent()
-	phase, msg := settleStatus(t, agent, readyGateway(agent), credentialBroker(agent, 1))
+	phase, msg := settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...)
 
 	if phase != "Provisioning" {
 		t.Errorf("got phase %q, want Provisioning: the agent has no shell to run commands in", phase)
@@ -210,15 +191,36 @@ func TestAGatewayWithoutItsShellIsNotReady(t *testing.T) {
 
 // TestAGatewayWithoutItsBrokerIsNotReady is the other half. Here the shell
 // exists and every credentialed command in it fails, because the Service it
-// dials has no endpoints.
+// dials has no endpoints. The message also says what that costs meanwhile
+// (gke-labs/kube-agents#2711): an eviction of the one broker pod stalled
+// chat for minutes while the CR named the Deployment and nothing else.
 func TestAGatewayWithoutItsBrokerIsNotReady(t *testing.T) {
 	agent := splitReadinessAgent()
-	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 0))
+	phase, msg := settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 0), a2aGatewayWorkload(agent, 1))...)
 
 	if phase != "Provisioning" {
 		t.Errorf("got phase %q, want Provisioning: nothing in the agent can mint a credential", phase)
 	}
-	if want := "Waiting for Deployment test-agent-credential-proxy to become ready"; msg != want {
+	want := "Waiting for Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, brokered commands fail"
+	if msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+}
+
+// With Google Chat on, the clause also names the queue the Chat messages wait
+// in: the A2A gateway pulls Chat through the broker's relay. Without it (the
+// test above) there is no such queue, and the message must not name one.
+func TestABrokerlessInstallWithGoogleChatNamesThePubSubWait(t *testing.T) {
+	agent := splitReadinessAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	_, msg := settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 0), a2aGatewayWorkload(agent, 1))...)
+
+	want := "Waiting for Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, brokered commands fail and Google Chat messages wait in Pub/Sub"
+	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
 }
@@ -228,12 +230,13 @@ func TestAGatewayWithoutItsBrokerIsNotReady(t *testing.T) {
 // of two sends them back for a second round after they have fixed it.
 func TestTheMessageNamesEveryWorkloadItIsWaitingOn(t *testing.T) {
 	agent := splitReadinessAgent()
-	phase, msg := settleStatus(t, agent, readyGateway(agent))
+	phase, msg := settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), a2aGatewayWorkload(agent, 1))...)
 
 	if phase != "Provisioning" {
 		t.Errorf("got phase %q, want Provisioning", phase)
 	}
-	want := "Waiting for StatefulSet test-agent-shell and Deployment test-agent-credential-proxy to become ready"
+	want := "Waiting for StatefulSet test-agent-shell and Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, brokered commands fail"
 	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
@@ -275,6 +278,10 @@ func TestReadSplitWorkloadsReportsAnAbsentObjectAsNotReady(t *testing.T) {
 	want := []splitWorkloadStatus{
 		{name: "test-agent-shell", kind: "StatefulSet", ready: 0},
 		{name: "test-agent-credential-proxy", kind: "Deployment", ready: 0},
+		{name: "test-agent-a2a-nats", kind: "StatefulSet", ready: 0},
+		{name: "test-agent-a2a-callout", kind: "Deployment", ready: 0},
+		{name: strings.TrimSuffix(agent.Name+a2aProvisionJobNameInfix, "-"), kind: "Job", ready: 0},
+		{name: "test-agent-a2a-gateway", kind: "Deployment", ready: 0},
 	}
 	if len(workloads) != len(want) {
 		t.Fatalf("got %d workloads, want %d: %#v", len(workloads), len(want), workloads)
@@ -286,22 +293,20 @@ func TestReadSplitWorkloadsReportsAnAbsentObjectAsNotReady(t *testing.T) {
 	}
 }
 
-// Under mode next the rest of the stack counts too: NATS, the auth callout,
-// the provisioning Job's first completion and the A2A gateway. They belong
-// here for the same reason the shell and the broker do — a next install
-// without them serves no A2A request, and the agent gateway's own readiness
+// The rest of the stack counts too: NATS, the auth callout, the provisioning
+// Job's first completion and the A2A gateway. They belong here for the same
+// reason the shell and the broker do — an install without them serves no A2A
+// request, and the agent gateway's own readiness
 // says nothing about that — and the gateway for one more reason the others do
 // not have: the operator withholds it deliberately, in
 // a2aGatewayWaitsForCallout while the auth callout is short of serving, and
 // in reconcileA2A's backend gate while the install configures no chat
 // backend. These tests are what a reader sees during those holds.
 
-// splitReadinessNextAgent is the same CR on an install that renders the A2A
-// stack.
+// splitReadinessNextAgent is the same CR; every install renders the A2A
+// stack, and the name marks the tests that count its workloads.
 func splitReadinessNextAgent() *agentv1alpha1.PlatformAgent {
-	agent := splitReadinessAgent()
-	agent.Spec.Mode = ptr.To(string(ModeNext))
-	return agent
+	return splitReadinessAgent()
 }
 
 func a2aGatewayWorkload(agent *agentv1alpha1.PlatformAgent, ready int32) *appsv1.Deployment {
@@ -311,14 +316,15 @@ func a2aGatewayWorkload(agent *agentv1alpha1.PlatformAgent, ready int32) *appsv1
 	}
 }
 
-// TestANextInstallCountsItsA2AGateway: the full set, and the sentence says so.
-func TestANextInstallCountsItsA2AGateway(t *testing.T) {
+// TestReadyMeansEveryWorkload is the whole point of the gating: only the
+// full set, the A2A gateway among it, earns the phase, and the sentence says so.
+func TestReadyMeansEveryWorkload(t *testing.T) {
 	agent := splitReadinessNextAgent()
 	objects := append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))
 	phase, msg := settleStatus(t, agent, objects...)
 
 	if phase != "Ready" {
-		t.Errorf("got phase %q, want Ready: every workload the mode renders has a ready replica", phase)
+		t.Errorf("got phase %q, want Ready: every workload the operator renders has a ready replica", phase)
 	}
 	if want := "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"; msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
@@ -345,76 +351,48 @@ func TestAWithheldA2AGatewayIsNotReady(t *testing.T) {
 	}
 }
 
-// TestATodayInstallDoesNotWaitOnAnA2AGateway keeps the dark stack dark. A today
-// install renders no A2A gateway, so requiring one would hold every one of them
-// at Provisioning forever.
-func TestATodayInstallDoesNotWaitOnAnA2AGateway(t *testing.T) {
-	agent := splitReadinessAgent()
-	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+// ---- the rest of the next stack (#1701), and the gateway with no backend
 
-	if phase != "Ready" {
-		t.Errorf("got phase %q, want Ready: a today install has no A2A gateway to wait on", phase)
-	}
-	if want := "Gateway, shell sandbox and credential broker are all ready"; msg != want {
-		t.Errorf("got message %q, want %q", msg, want)
-	}
-}
-
-// TestVersionSkewDoesNotAddASecondReasonToHoldReady. An unrecognized mode leaves
-// the A2A objects frozen rather than reconciled, on a CR the reconciler is
-// already reporting Degraded/ModeNotRecognized. Counting a gateway that nothing
-// is reconciling would report the freeze as a fault of its own, which is why
-// this reads a2aStackRendering and not a2aAgentSurface.
-func TestVersionSkewDoesNotAddASecondReasonToHoldReady(t *testing.T) {
-	agent := splitReadinessAgent()
-	agent.Spec.Mode = ptr.To("next-but-newer")
-	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
-
-	if phase != "Ready" {
-		t.Errorf("got phase %q, want Ready: the skew is the CR's problem, not a missing workload", phase)
-	}
-	if want := "Gateway, shell sandbox and credential broker are all ready"; msg != want {
-		t.Errorf("got message %q, want %q", msg, want)
-	}
-}
-
-// ---- the rest of the next stack, and a gateway dark on purpose (#1660, #1701)
-
-// TestANextInstallWithNoChatBackendIsReadyAndSaysWhy: no discord-bot Secret
-// and no door armed means the gateway is withheld on purpose, not missing.
-// Ready is true on the rest of the stack, the message says the gateway is
-// not rendered, and the A2AGateway condition carries the remedy.
-func TestANextInstallWithNoChatBackendIsReadyAndSaysWhy(t *testing.T) {
+// TestANextInstallWithNoChatBackendWaitsOnItsGateway: no discord-bot Secret
+// and no door armed. The gateway runs anyway, on the console door alone, so
+// it is a workload Ready waits on like any other, and no A2AGateway
+// condition is written. Absent, Ready names it; ready, the install is Ready
+// with the full sentence.
+func TestANextInstallWithNoChatBackendWaitsOnItsGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := splitReadinessNextAgent()
-	phase, msg := settleStatus(t, agent,
-		readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
-		a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true))
-
-	if phase != "Ready" {
-		t.Errorf("got phase %q, want Ready: the gateway is withheld on purpose and everything else is up", phase)
+	rest := func(a *agentv1alpha1.PlatformAgent) []client.Object {
+		return []client.Object{readyGateway(a), shellSandbox(a, 1), credentialBroker(a, 1),
+			a2aNATS(a, 1), a2aCallout(a, 1), a2aProvisionJob(a, true)}
 	}
-	if want := "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
-		"the A2A gateway is not running (no chat backend, see the A2AGateway condition)"; msg != want {
+	phase, msg := settleStatus(t, agent, rest(agent)...)
+	if phase != "Provisioning" {
+		t.Errorf("got phase %q, want Provisioning: the gateway runs with no backend, and it has no replica", phase)
+	}
+	if want := "Waiting for Deployment test-agent-a2a-gateway to become ready"; msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
-	cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
-	if cond == nil {
-		t.Fatal("no A2AGateway condition: the operator withheld the gateway and said nothing")
+	if cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("an A2AGateway condition was written for a gateway that runs with no backend: %+v", cond)
 	}
-	if cond.Status != metav1.ConditionFalse || cond.Reason != a2aGatewayDarkReason {
-		t.Errorf("A2AGateway = %s/%s, want False/%s", cond.Status, cond.Reason, a2aGatewayDarkReason)
+
+	up := splitReadinessNextAgent()
+	phase, msg = settleStatus(t, up, append(rest(up), a2aGatewayWorkload(up, 1))...)
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready: every workload, the console-only gateway among them, is ready", phase)
 	}
-	for _, want := range []string{a2aDiscordBotSecretName, a2aInjectBackendEnvVar} {
-		if !strings.Contains(cond.Message, want) {
-			t.Errorf("the condition's message does not name the remedy %q: %q", want, cond.Message)
-		}
+	if want := "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"; msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+	if cond := meta.FindStatusCondition(up.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("an A2AGateway condition was written over a ready gateway: %+v", cond)
 	}
 }
 
 // TestTheInjectDoorCountsAsAChatBackend: the eval install arms the door and
 // has no Discord Secret; its gateway is expected, and its absence is the
-// callout gate holding, not a dark gateway.
+// callout gate holding.
 func TestTheInjectDoorCountsAsAChatBackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	agent := splitReadinessNextAgent()
@@ -432,30 +410,70 @@ func TestTheInjectDoorCountsAsAChatBackend(t *testing.T) {
 	}
 }
 
-// TestTheDarkGatewayConditionClearsWhenABackendAppears: the condition is
-// removed on the pass that finds the Secret, on the EventWatcher pattern. No
-// gateway Deployment is seeded, so the Secret is what decides: with it the
-// absent gateway is a workload Ready waits on, not a condition.
-func TestTheDarkGatewayConditionClearsWhenABackendAppears(t *testing.T) {
+// TestALegacyConditionClearsWhenNoGatewayExists: a NoChatBackend condition
+// an older operator wrote on an install whose gateway it withheld (never
+// created). This operator creates it; with no Deployment yet there is nothing
+// to wake, so the condition is removed on the EventWatcher pattern and the
+// absent gateway is a workload Ready waits on.
+func TestALegacyConditionClearsWhenNoGatewayExists(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := splitReadinessNextAgent()
 	agent.Status.Conditions = []metav1.Condition{{
-		Type: a2aGatewayConditionType, Status: metav1.ConditionFalse, Reason: a2aGatewayDarkReason, Message: "stale",
+		Type: a2aGatewayConditionType, Status: metav1.ConditionFalse, Reason: "NoChatBackend", Message: "stale",
 		LastTransitionTime: metav1.Now(),
 	}}
-	objects := append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+	objects := []client.Object{readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+		a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)}
 	phase, msg := settleStatus(t, agent, objects...)
 	if meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType) != nil {
-		t.Error("the A2AGateway condition survived the backend appearing")
+		t.Error("the legacy A2AGateway condition survived")
 	}
 	if phase != "Provisioning" || !strings.Contains(msg, "Deployment "+a2aGatewayName(agent)) {
-		t.Errorf("got %q / %q, want Provisioning naming the gateway Deployment the backend now calls for", phase, msg)
+		t.Errorf("got %q / %q, want Provisioning naming the gateway Deployment", phase, msg)
 	}
 }
 
-// TestReadyWaitsOnEveryWorkloadTheModeRenders: NATS, the callout and the
+// TestALegacyConditionOnADarkGatewayWaitsForTheReplica: a NoChatBackend
+// condition and the gateway an older operator left at zero, now asking for
+// one replica (the render's apply) with none ready. The condition becomes
+// WaitingForReplica, with its own message, and the gateway is counted not
+// ready. Once a replica is ready the condition clears and the install is
+// Ready.
+func TestALegacyConditionOnADarkGatewayWaitsForTheReplica(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	legacy := []metav1.Condition{{
+		Type: a2aGatewayConditionType, Status: metav1.ConditionFalse, Reason: "NoChatBackend", Message: "stale",
+		LastTransitionTime: metav1.Now(),
+	}}
+	rest := func(a *agentv1alpha1.PlatformAgent) []client.Object {
+		return []client.Object{readyGateway(a), shellSandbox(a, 1), credentialBroker(a, 1),
+			a2aNATS(a, 1), a2aCallout(a, 1), a2aProvisionJob(a, true)}
+	}
+	agent := splitReadinessNextAgent()
+	agent.Status.Conditions = append([]metav1.Condition(nil), legacy...)
+	phase, msg := settleStatus(t, agent, append(rest(agent), a2aGatewayWorkload(agent, 0))...)
+	cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "WaitingForReplica" || cond.Message != a2aGatewayWakingMessage {
+		t.Errorf("A2AGateway = %+v, want False/WaitingForReplica with the way back's message", cond)
+	}
+	if phase != "Provisioning" || !strings.Contains(msg, "Deployment "+a2aGatewayName(agent)) {
+		t.Errorf("got %q / %q, want Provisioning naming the gateway Deployment", phase, msg)
+	}
+
+	up := splitReadinessNextAgent()
+	up.Status.Conditions = append([]metav1.Condition(nil), legacy...)
+	phase, _ = settleStatus(t, up, append(rest(up), a2aGatewayWorkload(up, 1))...)
+	if cond := meta.FindStatusCondition(up.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("the legacy condition survived over a ready gateway: %+v", cond)
+	}
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready", phase)
+	}
+}
+
+// TestReadyWaitsOnEveryWorkloadTheOperatorRenders: NATS, the callout and the
 // provisioning Job each hold Ready on their own and are named when they do.
-func TestReadyWaitsOnEveryWorkloadTheModeRenders(t *testing.T) {
+func TestReadyWaitsOnEveryWorkloadTheOperatorRenders(t *testing.T) {
 	agent := splitReadinessNextAgent()
 	base := func() []client.Object {
 		return []client.Object{discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1)}
@@ -586,7 +604,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 	// Settle the rest of the status the writer compares, then take the
 	// record away and persist that, so the record is the only thing the
 	// next pass finds different.
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
@@ -598,7 +616,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 		t.Fatalf("precondition: the settled CR is not Ready: %+v", ready)
 	}
 
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,79 +632,69 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 	}
 }
 
-// TestTheStatusWriterReportsThePassesOwnGatewayDecision: the render decided
-// the gateway was dark; a Secret that landed after that decision and before
-// the status write does not make the writer report a gateway the pass did
-// not create. Same pass, one answer.
-func TestTheStatusWriterReportsThePassesOwnGatewayDecision(t *testing.T) {
+// TestTheStatusWriterReadsTheReadyCountItself: the render said the gateway
+// was waking (its informer read predated the replica turning ready); the
+// status writer's own read of the ready count wins, so a pod that turned ready
+// since the render clears the condition on this pass rather than the next.
+func TestTheStatusWriterReadsTheReadyCountItself(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := splitReadinessNextAgent()
+	agent.Status.Conditions = []metav1.Condition{{
+		Type: a2aGatewayConditionType, Status: metav1.ConditionFalse, Reason: a2aGatewayWakingReason, Message: a2aGatewayWakingMessage,
+		LastTransitionTime: metav1.Now(),
+	}}
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
-			a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)).
+		WithObjects(agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+			a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true), a2aGatewayWorkload(agent, 1)).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
-	decided := a2aProvisionState{done: true, jobName: buildA2AProvisionJob(agent).Name, gatewayDark: true, gatewayDarkReason: "no chat backend is configured (decided before the Secret landed)"}
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), decided)
+	decided := a2aProvisionState{done: true, jobName: buildA2AProvisionJob(agent).Name, gatewayWaking: true}
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), decided)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if phase != "Ready" {
-		t.Fatalf("got phase %q, want Ready: the pass withheld the gateway on purpose", phase)
+		t.Fatalf("got phase %q, want Ready: the gateway's replica is ready by the writer's own read", phase)
 	}
-	cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
-	if cond == nil || cond.Message != decided.gatewayDarkReason {
-		t.Fatalf("the writer did not report the pass's own decision: %+v", cond)
-	}
-}
-
-// TestBusProvisionedLeavesWithTheStack: a flip to today tears the bus down,
-// and the record goes with it rather than describing a bus that is gone.
-func TestBusProvisionedLeavesWithTheStack(t *testing.T) {
-	agent := splitReadinessAgent()
-	agent.Status.Conditions = []metav1.Condition{{Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: busProvisionedReason, LastTransitionTime: metav1.Now()}}
-	settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
-	if busProvisioned(agent) {
-		t.Error("a today install still carries BusProvisioned")
+	if cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("the writer kept the condition off the render's stale answer: %+v", cond)
 	}
 }
 
-// TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot: the flip
-// from dark to rendered can leave phase and message unchanged (another
-// workload holding Provisioning both passes); the condition still clears.
-func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.T) {
+// TestALegacyConditionClearsEvenWhenTheReadyMessageDoesNot: a NoChatBackend
+// condition on a CR whose gateway is already ready (left by an older operator)
+// where phase and message are already what this pass writes (another workload
+// holding Provisioning). The A2AGateway term in the unchanged-status check is
+// what makes the pass write, so the condition still clears.
+func TestALegacyConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := splitReadinessNextAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, readyGateway(agent), shellSandbox(agent, 0), credentialBroker(agent, 1),
-			a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)).
+			a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true), a2aGatewayWorkload(agent, 1)).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
-	if meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType) == nil {
-		t.Fatal("precondition: the first pass did not write the dark-gateway condition")
-	}
-	// A backend appears and the gateway comes up; the sandbox is still down,
-	// so phase and message are what they were.
-	if err := cl.Create(ctx, discordBotSecret(agent)); err != nil {
+	// The legacy condition lands on the settled CR; nothing else changes.
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: a2aGatewayConditionType, Status: metav1.ConditionFalse, Reason: "NoChatBackend", Message: "stale",
+	})
+	if err := cl.Status().Update(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.Create(ctx, a2aGatewayWorkload(agent, 1)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	persisted := &agentv1alpha1.PlatformAgent{}
@@ -694,7 +702,7 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 		t.Fatal(err)
 	}
 	if meta.FindStatusCondition(persisted.Status.Conditions, a2aGatewayConditionType) != nil {
-		t.Error("the NoChatBackend condition survived on a CR whose gateway is rendered and running")
+		t.Error("the NoChatBackend condition survived on a CR whose gateway is running and ready")
 	}
 }
 
@@ -771,17 +779,6 @@ func TestADownVerifierIsReportedWithoutMovingReady(t *testing.T) {
 			}
 		}
 	})
-
-	t.Run("a today install never carries it", func(t *testing.T) {
-		agent := splitReadinessAgent()
-		phase, _ := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
-		if phase != "Ready" {
-			t.Errorf("got phase %q, want Ready", phase)
-		}
-		if cond := meta.FindStatusCondition(agent.Status.Conditions, a2aVerifierConditionType); cond != nil {
-			t.Errorf("a today install has no verifier and must not report one: %+v", cond)
-		}
-	})
 }
 
 // TestTheVerifierConditionMovesOnASettledCR is the case the first version of
@@ -822,7 +819,7 @@ func TestTheVerifierConditionMovesOnASettledCR(t *testing.T) {
 
 	settle := func() {
 		t.Helper()
-		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone,
+		if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone,
 			r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 			t.Fatal(err)
 		}
@@ -888,15 +885,17 @@ func TestTheVerifierConditionMovesOnASettledCR(t *testing.T) {
 func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 	agent := splitReadinessNextAgent()
 	now := metav1.Now()
-	darkMsg := "no chat backend configured; A2A gateway is dark"
 	agent.Status.Conditions = []metav1.Condition{{
 		Type:               a2aGatewayConditionType,
 		Status:             metav1.ConditionFalse,
-		Reason:             a2aGatewayDarkReason,
-		Message:            darkMsg,
+		Reason:             a2aGatewayWakingReason,
+		Message:            a2aGatewayWakingMessage,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}}
+	// The live object holds every condition this pass would write, the
+	// chat-less install's NoChatPlatform included, or the pass has a write.
+	setNoChatPlatformCondition(agent, noChatPlatformMsg(agent), now)
 	counter := &statusWriteCounter{}
 	scheme := setupScheme()
 	base := fake.NewClientBuilder().
@@ -907,7 +906,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 		Build()
 
 	// Cached client simulates an informer cache that has not yet observed the
-	// dark gateway status write:
+	// A2AGateway status write:
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if err := cl.Get(ctx, key, obj, opts...); err != nil {
@@ -931,10 +930,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 		t.Fatalf("reading stale agent: %v", err)
 	}
 
-	a2aState := a2aProvisionState{
-		gatewayDark:       true,
-		gatewayDarkReason: darkMsg,
-	}
+	a2aState := a2aProvisionState{gatewayWaking: true}
 
 	if err := r.syncA2AConditions(ctx, staleAgent, a2aState); err != nil {
 		t.Fatalf("syncA2AConditions failed: %v", err)
@@ -959,13 +955,12 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLive(t *testing.T) {
 	agent := splitReadinessNextAgent()
 	now := metav1.Now()
-	darkMsg := "no chat backend configured; A2A gateway is dark"
 	agent.Status.Conditions = []metav1.Condition{
 		{
 			Type:               a2aGatewayConditionType,
 			Status:             metav1.ConditionFalse,
-			Reason:             a2aGatewayDarkReason,
-			Message:            darkMsg,
+			Reason:             a2aGatewayWakingReason,
+			Message:            a2aGatewayWakingMessage,
 			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		},
@@ -978,6 +973,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 			LastTransitionTime: now,
 		},
 	}
+	setNoChatPlatformCondition(agent, noChatPlatformMsg(agent), now)
 	counter := &statusWriteCounter{}
 	scheme := setupScheme()
 	base := fake.NewClientBuilder().
@@ -988,7 +984,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 		Build()
 
 	// Cached client simulates an informer cache that has not yet observed the
-	// dark gateway and BusProvisioned status writes:
+	// A2AGateway and BusProvisioned status writes:
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if err := cl.Get(ctx, key, obj, opts...); err != nil {
@@ -1012,11 +1008,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 	}
 
 	// a2a.done is false (re-run in flight), but live object has BusProvisioned=True:
-	a2aState := a2aProvisionState{
-		gatewayDark:       true,
-		gatewayDarkReason: darkMsg,
-		done:              false,
-	}
+	a2aState := a2aProvisionState{gatewayWaking: true, done: false}
 
 	if err := r.syncA2AConditions(ctx, staleAgent, a2aState); err != nil {
 		t.Fatalf("syncA2AConditions failed: %v", err)
@@ -1032,4 +1024,3 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
 	}
 }
-

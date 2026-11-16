@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,9 +22,21 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import plugin  # noqa: E402
 
+# Two different old ages for the profiles directory: the module refuses to
+# cache a tree changed within its racy window (agent_roster.CACHE_RACY_SECONDS),
+# so a directory dated this far back is cached, and one re-dated to the second
+# age is re-read only because the cache key carries the directory's mtime.
+CACHE_AGED_SECONDS = 60
+CACHE_REAGED_SECONDS = 30
 # .../agents/chat/defaults/plugins/agent_roster/test_plugin.py -> .../agents/chat
 CHAT_AGENT_DIR = Path(__file__).resolve().parents[3]
 ROSTER_SOURCE = CHAT_AGENT_DIR / "scripts" / "agent_roster.py"
+# The image copies agents/platform/scripts beside agent_roster.py
+# (deploy/docker/Dockerfile), and the roster reads the scope through them.
+SCOPE_READER_SOURCES = [
+    CHAT_AGENT_DIR.parent / "platform" / "scripts" / name
+    for name in ("fleet_scope_targets.py", "fleet_scope_args.py")
+]
 
 
 class InjectionTest(unittest.TestCase):
@@ -32,10 +45,17 @@ class InjectionTest(unittest.TestCase):
         self.data_dir = Path(self._tmp.name)
         (self.data_dir / "scripts").mkdir()
         shutil.copy(ROSTER_SOURCE, self.data_dir / "scripts" / "agent_roster.py")
+        for source in SCOPE_READER_SOURCES:
+            shutil.copy(source, self.data_dir / "scripts" / source.name)
         self.profiles = self.data_dir / "profiles"
         self.profiles.mkdir()
+        # The roster reads the host cluster env and the scope render; drop them
+        # so a developer shell cannot leak into the block.
         self._env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.data_dir)})
         self._env.start()
+        for name in ("GKE_CLUSTER_NAME", "GKE_PROJECT_ID", "GCP_PROJECT_ID", "GKE_LOCATION",
+                     "KUBEAGENTS_SCOPE_FILE", "PLATFORM_AGENT_HOME"):
+            os.environ.pop(name, None)
         # The module handle is cached for the process; a stale one from another
         # test would silently read the wrong tree.
         plugin._roster_module = None
@@ -79,15 +99,54 @@ class InjectionTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("No specialist agents", result["context"])
 
-    def test_the_roster_is_re_read_every_turn(self):
+    def _age(self, seconds):
+        then = time.time_ns() - seconds * 1_000_000_000
+        os.utime(self.profiles, ns=(then, then))
+
+    def test_the_roster_is_re_read_when_the_tree_changes(self):
         # A cluster agent scaffolded a minute ago has to appear on the next
-        # message — that window is exactly when the user asks about it.
+        # message — that window is exactly when the user asks about it. The
+        # directory is aged past the racy window on both sides, so the second
+        # turn is a cache miss on the directory's mtime, not a racy re-read.
         self._profile("default")
         self._profile("platform", "Fleet work.")
+        self._age(CACHE_AGED_SECONDS)
+        self.assertNotIn("cluster-new", plugin.handle_pre_llm_call()["context"])
         self.assertNotIn("cluster-new", plugin.handle_pre_llm_call()["context"])
 
         self._profile("cluster-new", "Diagnostics for the new cluster.")
+        self._age(CACHE_REAGED_SECONDS)
         self.assertIn("cluster-new", plugin.handle_pre_llm_call()["context"])
+
+    def _cluster_profile(self, project, cluster, location):
+        name = f"cluster-{project}-{cluster}-{location}"
+        self._profile(name, "One cluster's runtime state.")
+        (self.profiles / name / "config.yaml").write_text(
+            f"cluster_identity:\n  cluster: {cluster}\n  location: {location}\n  project: {project}\n"
+        )
+
+    def test_a_counted_block_adds_the_lookup_footer(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        for cluster in ("a", "b", "c"):
+            self._cluster_profile("p", cluster, "us")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": "2"}):
+            context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("  - by project: p (3)", context)
+        self.assertNotIn("cluster-p-a-us", context)
+        self.assertIn("`list_agents` with `filter` set to that cluster's name", context)
+        # The standing footer still rides along: the distinct specialists are named.
+        self.assertIn("verbatim as the `assignee`", context)
+
+    def test_a_named_block_carries_no_lookup_footer(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        for cluster in ("a", "b", "c"):
+            self._cluster_profile("p", cluster, "us")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": "3"}):
+            context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("  - cluster-p-a-us (the a cluster agent", context)
+        self.assertNotIn("`list_agents` with `filter`", context)
 
     def test_missing_script_is_silent_not_fatal(self):
         # This hook runs ahead of every user turn on the front door: a raise
@@ -131,10 +190,97 @@ class InjectionTest(unittest.TestCase):
         self.assertIn("No specialist agents", context)
         self.assertNotIn("verbatim as the `assignee`", context)
 
+    def test_an_empty_fleet_with_a_host_section_still_drops_the_footer(self):
+        # render() appends the host section after the empty-fleet sentence; the
+        # footer must still stay off, since no assignee exists to copy.
+        shutil.rmtree(self.profiles)
+        env = {"GKE_CLUSTER_NAME": "h", "GKE_PROJECT_ID": "p", "GKE_LOCATION": "us-central1"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("No specialist agents", context)
+        self.assertIn("- cluster=h, project=p, location=us-central1", context)
+        self.assertNotIn("verbatim as the `assignee`", context)
+        self.assertNotIn("Host Cluster `assignee`", context)
+
     def test_a_populated_fleet_keeps_the_footer(self):
         self._profile("default")
         self._profile("platform", "Fleet work.")
-        self.assertIn("verbatim as the `assignee`", plugin.handle_pre_llm_call()["context"])
+        context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("verbatim as the `assignee`", context)
+        # No host env, no host section, so no sentence pointing at one.
+        self.assertNotIn("Host Cluster `assignee`", context)
+
+    def test_host_heading_in_profile_description_does_not_trigger_host_footer(self):
+        # Keying the host footer on free-text substring search would attach it
+        # whenever a specialist's CAPABILITIES.md quoted the heading, even on a
+        # kind install with no host section rendered.
+        self._profile("default")
+        self._profile(
+            "platform",
+            'Explains Host Cluster Identity ("this cluster" / "this host cluster"): see docs.',
+        )
+        context = plugin.handle_pre_llm_call()["context"]
+        self.assertNotIn("Host Cluster `assignee`", context)
+
+    def test_injects_host_and_fleet_scope_identity(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        self._profile(
+            "cluster-kube-agents-demo-platform-agent-host-us-central1",
+            "Read-only diagnostics for one GKE cluster.",
+        )
+        (
+            self.profiles
+            / "cluster-kube-agents-demo-platform-agent-host-us-central1"
+            / "config.yaml"
+        ).write_text(
+            "cluster_identity:\n"
+            "  cluster: platform-agent-host\n"
+            "  location: us-central1\n"
+            "  project: kube-agents-demo\n"
+        )
+        scope_file = self.data_dir / "scope.json"
+        (self.data_dir / "fleet_scope.json").write_text(
+            '{"boundary": true, "present": true, "declared": {"projects": ["gca-gke-2025"]}, '
+            '"projects": [{"id": "kube-agents-demo", "state": "in-scope", "outcome": "ok", '
+            '"via": ["management"]}, {"id": "gca-gke-2025", "state": "in-scope", '
+            '"outcome": "ok", "via": ["projects"]}]}\n'
+        )
+        scope_file.write_text('{"present": true, "projects": ["gca-gke-2025"]}\n')
+        env = {
+            "GKE_CLUSTER_NAME": "platform-agent-host",
+            "GKE_PROJECT_ID": "kube-agents-demo",
+            "GKE_LOCATION": "us-central1",
+            "KUBEAGENTS_SCOPE_FILE": str(scope_file),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            context = plugin.handle_pre_llm_call()["context"]
+
+        self.assertIn('Host Cluster Identity ("this cluster" / "this host cluster"):', context)
+        self.assertIn(
+            "assignee=cluster-kube-agents-demo-platform-agent-host-us-central1",
+            context,
+        )
+        self.assertIn("- GCP projects in scope (2): kube-agents-demo, gca-gke-2025", context)
+        self.assertIn("Host Cluster `assignee`", context)
+
+    def test_reloads_roster_module_when_script_mtime_changes(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        first = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("- platform: Fleet work.", first)
+
+        script_path = self.data_dir / "scripts" / "agent_roster.py"
+        script_path.write_text(
+            'EMPTY_ROSTER = "EMPTY"\n'
+            'def render(base=None):\n'
+            '    return "- custom-reloaded: Reloaded from updated script."\n'
+        )
+        stat = script_path.stat()
+        os.utime(script_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        second = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("- custom-reloaded: Reloaded from updated script.", second)
 
     @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits this test relies on")
     def test_an_unreadable_profiles_dir_injects_nothing(self):

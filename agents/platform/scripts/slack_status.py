@@ -11,9 +11,11 @@ Block Kit ``task_card`` per kanban card the thread follows, a fanned-out
 card's children included, so each card reads as its own line (Slack folds a
 ``plan`` block to its title, and allows one per message). A row's
 ``details`` are the card's progress notes as steps, the last one open while
-the card runs. Slack's task statuses are ``pending``, ``in_progress``,
-``complete`` and ``error`` and nothing else, so a card waiting on the user is
-``pending``. A row's title says where the card is (:func:`row_title`): its
+the card runs. A row's status here is ``pending``, ``in_progress``,
+``complete`` or ``error``, and a card waiting on the user is ``pending``. A
+``task_card`` takes only the last three, and Slack refuses a message holding
+``pending`` with ``invalid_blocks``, so a waiting row is drawn ``in_progress``
+(:data:`CARD_STATUS`) and its title says it waits. A row's title says where the card is (:func:`row_title`): its
 latest note while it runs (with a step count past one) or after it failed,
 its one-line result once complete, "waiting on you" while pending, and the
 card's title when there is none of those; in a plan of several rows it leads
@@ -123,12 +125,16 @@ REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 
 # --- the plan --------------------------------------------------------------
 
-#: Block Kit task statuses.
+#: Plan row statuses; a task_card draws them through CARD_STATUS.
 TASK_PENDING = "pending"
 TASK_RUNNING = "in_progress"
 TASK_COMPLETE = "complete"
 TASK_ERROR = "error"
 TASK_STATUSES = frozenset({TASK_PENDING, TASK_RUNNING, TASK_COMPLETE, TASK_ERROR})
+#: A row status as a ``task_card`` draws it. The block takes ``in_progress``,
+#: ``complete`` and ``error`` only; ``pending`` makes Slack refuse the whole
+#: message with ``invalid_blocks``, and the plan falls back to progress lines.
+CARD_STATUS = {TASK_PENDING: TASK_RUNNING}
 
 #: Kanban notifier kinds, by the row status each leaves. A kind not listed
 #: leaves the row as it was: ``crashed`` and ``timed_out``, which the
@@ -305,14 +311,19 @@ def _steps(lines: Sequence[str], status: str) -> list[str]:
 
 
 def task_card(task_id: str, title: str, lines: Sequence[str], status: str) -> dict:
-    """One plan row: its title and status, the card's notes as steps in ``details``."""
+    """One plan row: its title and status, the card's notes as steps in ``details``.
+
+    The steps follow the row's own status, so a waiting row's are all done
+    though its card draws ``in_progress`` (:data:`CARD_STATUS`).
+    """
+    status = status if status in TASK_STATUSES else TASK_RUNNING
     card: dict = {
         "type": "task_card",
         "task_id": str(task_id),
         "title": _clip(str(title or "").strip() or str(task_id), ROW_TITLE_MAX),
-        "status": status if status in TASK_STATUSES else TASK_RUNNING,
+        "status": CARD_STATUS.get(status, status),
     }
-    steps = _steps(lines, card["status"])
+    steps = _steps(lines, status)
     if steps:
         card["details"] = {
             "type": "rich_text",

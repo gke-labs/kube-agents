@@ -15,7 +15,6 @@
 package controller
 
 import (
-	"math"
 	"slices"
 	"sort"
 	"time"
@@ -40,13 +39,30 @@ const (
 	// ceiling far below it. A body whose addition would exceed it is refused
 	// with the baseline advanced, so an honest burst past it costs that
 	// interval's count once, and a body that is not the listener's can raise
-	// a total by at most this much per poll.
+	// a total by at most this much per poll. The three inference totals take
+	// their own ceilings (usageDeltaCeilingFor): a model call bills thousands
+	// of tokens, and one five-minute interval of a busy install is millions.
 	usageDeltaCeiling int64 = 10000
-	// usageTotalCeiling is the read-back bound on a stored total: below the
-	// int64 headroom the status field has, so that a document a namespace
-	// editor raised can neither overflow the status patch nor wrap on the next
-	// add. A document past it is treated as absent.
-	usageTotalCeiling int64 = math.MaxInt64 / 2
+	// usageTokenDeltaCeiling bounds what one LiteLLM pod's body may add to a
+	// token total in one poll: a hundred million tokens in five minutes is
+	// three hundred thousand a second, past what any model the install can
+	// reach bills through one gateway pod, so an honest interval always
+	// folds, and a body that is not LiteLLM's can raise a token total by at
+	// most this much per poll.
+	usageTokenDeltaCeiling int64 = 100_000_000
+	// usageSpendDeltaCeiling bounds what one LiteLLM pod's body may add to
+	// the spend total in one poll, in micro-dollars: a thousand dollars in
+	// five minutes, the same reasoning at the price of the dearest model.
+	usageSpendDeltaCeiling int64 = 1_000_000_000
+	// usageTotalCeiling is the read-back bound on a stored total: the largest
+	// integer a float64 holds exactly. The operator keeps a total as an int64
+	// end to end, but a reader that decodes the CR's JSON untyped, a dynamic
+	// client, jq, a collector in another language, gets a float64, and under
+	// this bound the number it reads is the number written. It is far below
+	// the int64 headroom the status field has, so a document a namespace
+	// editor raised can neither overflow the status patch nor wrap on the
+	// next add. A document past it is treated as absent.
+	usageTotalCeiling int64 = 1 << 53
 	// usageDocumentVersion is the document's layout. A later layout changes
 	// it, so that an older document is migrated where the layout allows
 	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
@@ -57,11 +73,45 @@ const (
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
-	usageCounterToolExecutions       = "toolExecutionsTotal"
-	usageCounterEventsIngested       = "eventsIngestedTotal"
-	usageCounterRemediationsProposed = "remediationsProposedTotal"
-	usageCounterRemediationsMerged   = "remediationsMergedTotal"
-	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
+	usageCounterToolExecutions        = "toolExecutionsTotal"
+	usageCounterEventsIngested        = "eventsIngestedTotal"
+	usageCounterRemediationsProposed  = "remediationsProposedTotal"
+	usageCounterChatMessagesInbound   = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures        = "brokerFailuresTotal"
+	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
+	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
+	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
+	usageCounterPositiveFeedback      = "positiveFeedbackTotal"
+	// The three inference totals, read from the LiteLLM pods: the tokens in
+	// and out, and the spend in micro-dollars (usageSpendMicrosPerUSD).
+	usageCounterInputTokens  = "inputTokensTotal"
+	usageCounterOutputTokens = "outputTokensTotal"
+	usageCounterSpendMicros  = "spendMicrosUSDTotal"
+	// The two counters an earlier release kept for the proposals merged and
+	// closed unmerged, which are readings now (usageReadingSpecs): a document
+	// that carries them has their totals and pod entries dropped on read
+	// (migrateUsageDocument). Named for the fields they projected to.
+	usageCounterRemediationsMerged         = usageExportRemediationsMerged
+	usageCounterRemediationsClosedUnmerged = usageExportRemediationsClosedUnmerged
+	// sessionsTotal is two document counters, because its halves aggregate
+	// differently (usageAggregationFor): the sessions the watcher opens for
+	// triage, read on every gateway replica over the same event stream, and
+	// the sessions the chat gateways open for conversations, each listener
+	// counting its own. The status field is their sum
+	// (usageStatusFieldSessions); neither name is a status field.
+	usageCounterSessionsTriage = "sessionsTriage"
+	usageCounterSessionsChat   = "sessionsChat"
+	// usageStatusFieldSessions is the status field the two sessions
+	// counters project to, and the name the Warning for a failed listener
+	// carries. The field is in status.usage's first schema, so it has no
+	// pruning record of its own.
+	usageStatusFieldSessions = "sessionsTotal"
+	// usageStatusFieldChatSessions is the status field the chat half alone
+	// projects to, and its pruning record's key: it arrived after the first
+	// schema, and usageExportFieldsOfRecord maps a record named for its
+	// field to that field.
+	usageStatusFieldChatSessions      = "chatSessionsTotal"
+	usageCounterToolExecutionsBlocked = "toolExecutionsBlockedTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
 	usagePodEntryKeySeparator = "/"
@@ -71,12 +121,115 @@ var (
 	// usageGatewayCounters, usageChatCounters and usageBrokerCounters are the
 	// counters each pod group's body feeds, in the order the stub source hands
 	// samples out.
-	usageGatewayCounters = []string{usageCounterEventsIngested}
-	usageChatCounters    = []string{usageCounterChatMessagesInbound}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
+	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
+	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
+	// usageA2AChatCounters are the counters the A2A gateway's body feeds: the
+	// chat counter, the chat sessions, the errored turns and the two answer
+	// ratings through its own families, and not the board's gave_up cards,
+	// which the chat_metrics listener alone serves; asking would seed an idle
+	// entry per A2A pod and name the field in that pod's Warning. The
+	// thumbs-ups are the A2A gateway's alone: the Hermes gateway's reaction
+	// hook counts thumbs-downs only, so usageChatCounters does not ask for
+	// them.
+	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageExecTierCounters are the broker counters the exec tier's pods move:
+	// the commands they run, refuse or fail. The version-control counters are
+	// the stateful broker's alone, because /v1/vcs is not served on an exec pod.
+	usageExecTierCounters = []string{usageCounterToolExecutions, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageLiteLLMCounters are the counters each LiteLLM pod's body feeds, in
+	// the order the status names them; the three share one pruning record
+	// (usageNewerFieldInference), since they arrived in one release.
+	usageLiteLLMCounters = []string{usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterPositiveFeedback, usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
+	// usageRetiredCounters are the counters an earlier release kept and this
+	// one does not: migrateUsageDocument drops them from a document.
+	usageRetiredCounters = []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged}
+	// usageQuietCounters are the counters whose advance is not activity and
+	// leaves LastMoved alone: the broker's failures, which a watcher retrying
+	// an unreachable fleet cluster through the relay produces every poll on
+	// an install nobody is using; the failed turns, each a failure whose
+	// message already moved the time; and a background card giving up, a
+	// failure, not the agent at work; and a rating either way, a person's
+	// verdict on a message that already moved it; and the three inference
+	// totals, which memory consolidation and the scheduled jobs move through
+	// LiteLLM with nobody asking, where the turn or command that billed them
+	// has already moved the time when it was activity.
+	usageQuietCounters = map[string]bool{
+		usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true, usageCounterPositiveFeedback: true,
+		usageCounterInputTokens: true, usageCounterOutputTokens: true, usageCounterSpendMicros: true,
+	}
+	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
+	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
+	// usageHumanCounters is the counter only a person moves: a chat message.
+	// An advance in it stamps LastHumanMoved as well as LastMoved. Every other
+	// counter stamps LastMoved alone: the stall-watch cron runs brokered
+	// commands and the event watcher accepts events on their own, the fleet
+	// audits open proposals with nobody asking, and a chat session begins
+	// with a message this counter already counted.
+	usageHumanCounters = map[string]bool{usageCounterChatMessagesInbound: true}
 )
+
+// usageDeltaCeilingFor is the per-poll delta ceiling a counter takes, on every
+// adding branch: the token ceiling for the two token totals, the spend
+// ceiling for the spend total, and usageDeltaCeiling for every other counter.
+func usageDeltaCeilingFor(counter string) int64 {
+	switch counter {
+	case usageCounterInputTokens, usageCounterOutputTokens:
+		return usageTokenDeltaCeiling
+	case usageCounterSpendMicros:
+		return usageSpendDeltaCeiling
+	}
+	return usageDeltaCeiling
+}
+
+// usageStatusFieldFor is the status.usage field a document counter projects
+// to: the counter's own name, except the two sessions halves, which share one.
+func usageStatusFieldFor(counter string) string {
+	if slices.Contains(usageSessionsCounters, counter) {
+		return usageStatusFieldSessions
+	}
+	return counter
+}
+
+// usageSessionsTotal is the sum of the two sessions halves in totals: the
+// value status.usage.sessionsTotal takes.
+func usageSessionsTotal(totals map[string]int64) int64 {
+	return totals[usageCounterSessionsTriage] + totals[usageCounterSessionsChat]
+}
+
+// usageFieldFloor is the status floor of the field a counter projects to: the
+// counter's own for every counter but the sessions halves, whose floor is the
+// two halves' summed floors, sessionsTotal as the seed split it
+// (usageStatusSeed). The unfolded rule reads this rather than the half's own
+// floor, because a zero floor means none of any sample is in the total, and
+// after a rollback and return the triage half's share of a non-zero status
+// may be in the chat half's floor.
+func usageFieldFloor(floors map[string]int64, counter string) int64 {
+	if slices.Contains(usageSessionsCounters, counter) {
+		return floors[usageCounterSessionsChat] + floors[usageCounterSessionsTriage]
+	}
+	return floors[counter]
+}
+
+// usageBodyRead reports whether one of read, the counters a pod has entries
+// for, comes from the same listener body as counter: some pod group's list
+// holds both. A body is read whole or not at all, so such an entry means the
+// listener was read before and counter was not asked of it then.
+func usageBodyRead(read []string, counter string) bool {
+	for _, group := range [][]string{usageGatewayCounters, usageChatCounters, usageA2AChatCounters, usageBrokerCounters, usageLiteLLMCounters} {
+		if !slices.Contains(group, counter) {
+			continue
+		}
+		for _, other := range read {
+			if other != counter && slices.Contains(group, other) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // usagePodEntryKey is the document key of one pod's entry for one counter.
 func usagePodEntryKey(uid, counter string) string {
@@ -107,9 +260,11 @@ const (
 	usageAggregateMax
 )
 
-// usageAggregationFor is the aggregation each counter takes.
+// usageAggregationFor is the aggregation each counter takes: the watcher's two
+// counters, read on every replica over the one event stream, the largest
+// delta; every other, the sum.
 func usageAggregationFor(counter string) usageAggregation {
-	if counter == usageCounterEventsIngested {
+	if counter == usageCounterEventsIngested || counter == usageCounterSessionsTriage {
 		return usageAggregateMax
 	}
 	return usageAggregateSum
@@ -135,6 +290,13 @@ type usageDocument struct {
 	// LastMoved is the poll in which a total last advanced, projected to
 	// status.usage.lastActiveTime; nil until one has.
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
+	// LastHumanMoved is the poll in which a usageHumanCounters total last
+	// advanced, projected to status.usage.lastHumanActiveTime; nil until one
+	// has. An operator from before the field ignores and drops it on its next
+	// write, and its Ready writer drops the status field too, so a rollback
+	// and return loses the time until the next message; the older operator
+	// itself loses nothing it uses.
+	LastHumanMoved *metav1.Time `json:"lastHumanMoved,omitempty"`
 	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
 	// migrated is set by migrateUsageDocument on a document it changed on read,
@@ -142,6 +304,12 @@ type usageDocument struct {
 	// says the change was the layout, not only a counter the document predated.
 	// Not serialised.
 	migrated bool
+	// retired says migrateUsageDocument dropped a retired counter's total or
+	// pod entries. Not serialised.
+	retired bool
+	// added is whether a counter this operator keeps was missing from the
+	// document and was added at its status floor.
+	added bool
 	// Unfolded names the counters migrateUsageDocument added to Totals at
 	// zero and no pod has been recorded for since: the status carried nothing
 	// for them and no pod's sample has been folded into them through this
@@ -177,9 +345,17 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 // wrote, and a zero under that floor would have usageDocumentInvalid refuse
 // the document and re-seed it, losing the interval's counts on every counter.
 // What the listeners counted during the rollback is not recovered: the pods
-// are baselined at their samples, and only a counter whose floor is zero, so
-// that none of any sample can be in the total, is recorded in Unfolded for
-// foldUsage to add whole, on this poll or on the first that reads the pod.
+// are baselined at their samples, and only a counter whose field's floor is
+// zero (usageFieldFloor), so that none of any sample can be in the total, is
+// recorded in Unfolded for foldUsage to add whole, on this poll or on the
+// first that reads the pod. The two sessions halves share one field, whose
+// floor is the halves' summed floors: with a status that carries sessions,
+// neither half is unfolded, since the triage half's share of that status sits
+// in the chat half's floor, or, under a split seed, in the triage half's own.
+// A retired counter (usageRetiredCounters) loses its total, its pod entries
+// and its unfolded mark, the same at either version, so the layout keeps its
+// version: dropping is idempotent, and every other counter keeps its baseline
+// where a re-seed would reset them all.
 // Any other version is left for usageDocumentInvalid to refuse.
 func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	if doc.Pods == nil || doc.Totals == nil {
@@ -205,13 +381,33 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	default:
 		return
 	}
+	for _, counter := range usageRetiredCounters {
+		if _, ok := doc.Totals[counter]; ok {
+			delete(doc.Totals, counter)
+			doc.retired = true
+		}
+		if i := slices.Index(doc.Unfolded, counter); i >= 0 {
+			doc.Unfolded = slices.Delete(doc.Unfolded, i, i+1)
+			doc.retired = true
+		}
+	}
+	for key, entry := range doc.Pods {
+		if entry != nil && slices.Contains(usageRetiredCounters, entry.Counter) {
+			delete(doc.Pods, key)
+			doc.retired = true
+		}
+	}
+	if doc.retired {
+		doc.migrated = true
+	}
 	for _, counter := range usageCounters {
 		if _, ok := doc.Totals[counter]; ok {
 			continue
 		}
 		doc.Totals[counter] = floors[counter]
 		doc.migrated = true
-		if floors[counter] == 0 && !usageUnfolded(doc, counter) {
+		doc.added = true
+		if usageFieldFloor(floors, counter) == 0 && !usageUnfolded(doc, counter) {
 			doc.Unfolded = append(doc.Unfolded, counter)
 		}
 	}
@@ -252,13 +448,30 @@ type usageScrapedPod struct {
 	// Clusters is the watcher's cluster gauges, nil for any pod but a gateway's.
 	// Not folded: the poll projects the largest reading as it stands.
 	Clusters *usageClusterGauges
+	// Readings and ReadingsPresent are the readings the pod's target asked
+	// for: the broker's proposal readings or the A2A gateway's people reading,
+	// nil for any other pod. Not folded either: the poll projects the largest
+	// of each field across the pods read (usageReadingsForPoll).
+	Readings        map[string]int64
+	ReadingsPresent map[usageReadingKind]bool
+	// DataVolume is the watcher's data volume reading, nil for any pod but a
+	// gateway's and for a watcher body that carried none. Not folded either.
+	DataVolume *usageDataVolume
+	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
+	// pod but the gateway's chat_metrics body. Not folded either.
+	Dispatcher *usageDispatcherReading
+	// ToolPairs is the broker's tool counter by tool and subcommand, nil for
+	// any pod but a broker's. Not folded either: the poll sums it across the
+	// broker pods read and projects the top rows (usageTopToolsForPoll).
+	ToolPairs map[usageToolPair]usageToolCounts
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the
 // status's counters, when it carries any, and the time they last moved.
 type usageSeed struct {
-	Totals    map[string]int64
-	LastMoved *metav1.Time
+	Totals         map[string]int64
+	LastMoved      *metav1.Time
+	LastHumanMoved *metav1.Time
 }
 
 // usageFoldResult is a poll's outcome: the document to keep and whether it
@@ -297,12 +510,13 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 
 	if doc == nil {
 		next := &usageDocument{
-			Version:       usageDocumentVersion,
-			AgentUID:      agentUID,
-			FirstRecorded: stamp,
-			Totals:        usageZeroTotals(),
-			LastMoved:     seed.LastMoved,
-			Pods:          map[string]*usagePodEntry{},
+			Version:        usageDocumentVersion,
+			AgentUID:       agentUID,
+			FirstRecorded:  stamp,
+			Totals:         usageZeroTotals(),
+			LastMoved:      seed.LastMoved,
+			LastHumanMoved: seed.LastHumanMoved,
+			Pods:           map[string]*usagePodEntry{},
 		}
 		for counter, total := range seed.Totals {
 			if total > 0 {
@@ -341,8 +555,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// set is the live pods the document already knew, so an entry recorded
 	// this poll, whose marker is this poll, resets no sibling.
 	markers := make(map[string]metav1.Time, len(doc.Pods))
+	// The counters the document already read on each pod, before this poll
+	// records anything: a counter first asked of a body the document already
+	// read under another counter (an upgrade that reads a new family from a
+	// listener it already scrapes) finds a sample that predates the asking,
+	// not one the pod started from zero.
+	readPods := map[string][]string{}
 	for key, entry := range doc.Pods {
 		markers[key] = entry.Marker
+		readPods[entry.PodUID] = append(readPods[entry.PodUID], entry.Counter)
 	}
 
 	candidates := map[string][]usageCandidate{}
@@ -354,6 +575,16 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// first read later is the under-count that rule already accepts, taken
 	// over a set kept per pod.
 	folded := map[string]bool{}
+	// refusedInference is the pods whose body put one of the three inference
+	// totals past its ceiling this poll, on either adding branch. The three
+	// are one reading of one process, so they refuse together: a LiteLLM pod
+	// whose history is past the token ceiling when it is first read (an
+	// operator upgrade onto a pod that has run for weeks) would otherwise
+	// keep its spend and lose its tokens, or the reverse, and the status
+	// would carry a spend with no tokens behind it. Their candidates are
+	// dropped below, baselines advanced, and the three start together from
+	// the next poll's deltas.
+	refusedInference := map[string]bool{}
 	for _, s := range ordered {
 		key := usagePodEntryKey(s.UID, s.Counter)
 		entry, known := doc.Pods[key]
@@ -362,7 +593,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// first recorded, it started from zero and none of it was seen, so
 			// the whole sample adds, under the ceiling; so does a sample for a
 			// counter the migration added unfolded, which no document and no
-			// status has seen any of; older on any other counter, or past the
+			// status has seen any of; older on any other counter, its listener
+			// already read under another counter (usageBodyRead), or past the
 			// ceiling, it is recorded and adds nothing.
 			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[key] = entry
@@ -407,7 +639,12 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// interval of messages counts. Max counters are read on every
 			// replica from the first poll, so none reaches here that way.
 			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
-			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
+			fresh := !usageBodyRead(readPods[s.UID], s.Counter) && (s.Created.After(doc.FirstRecorded.Time) || youngProcess)
+			wholeSample := fresh || unfolded
+			if wholeSample && s.Sample > usageDeltaCeilingFor(s.Counter) && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
+			if wholeSample && s.Sample <= usageDeltaCeilingFor(s.Counter) {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
@@ -441,7 +678,10 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		}
 
 		delta, adds := usageBranch(entry, s)
-		if !adds || delta > usageDeltaCeiling {
+		if !adds || delta > usageDeltaCeilingFor(s.Counter) {
+			if adds && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
 			// Refused, and because the body parsed the baseline advances to
 			// it: a refusal that kept the baseline would be repeated on every
 			// poll until the pod restarted.
@@ -459,8 +699,30 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			doc.Unfolded = nil
 		}
 	}
+	for _, counter := range usageLiteLLMCounters {
+		if len(refusedInference) == 0 {
+			break
+		}
+		kept := candidates[counter][:0]
+		for _, c := range candidates[counter] {
+			if !refusedInference[c.entry.PodUID] {
+				kept = append(kept, c)
+				continue
+			}
+			// A sibling of a refused total: dropped as the refused one was,
+			// its baseline advanced to the body it would have added.
+			if advanceUsageBaseline(c.entry, c.sample, c.startTime) {
+				changed = true
+			}
+		}
+		if len(kept) == 0 {
+			delete(candidates, counter)
+		} else {
+			candidates[counter] = kept
+		}
+	}
 
-	moved := false
+	moved, humanMoved := false, false
 	counters := make([]string, 0, len(candidates))
 	for counter := range candidates {
 		counters = append(counters, counter)
@@ -500,7 +762,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if taken && (i == best || c.delta == list[best].delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
+					humanMoved = humanMoved || usageHumanCounters[counter]
 				}
 			}
 		default:
@@ -510,7 +773,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if addUsageTotal(doc, counter, c.delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
+					humanMoved = humanMoved || usageHumanCounters[counter]
 				}
 			}
 		}
@@ -518,6 +782,9 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	if moved {
 		doc.LastMoved = &stamp
 		changed = true
+	}
+	if humanMoved {
+		doc.LastHumanMoved = &stamp
 	}
 	return usageFoldResult{Document: doc, Changed: changed}
 }

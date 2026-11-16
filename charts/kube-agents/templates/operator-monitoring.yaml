@@ -1,0 +1,28 @@
+{{- if and .Values.operator.enabled (include "kube-agents.operatorPodMonitoring" .) }}
+{{- /*
+Scraped by GKE Managed Prometheus, like the agent's pods. The manager serves
+status.usage and status.phase of every PlatformAgent as gauges
+(kubeagents_platformagent_usage, kubeagents_platformagent_usage_time_seconds,
+kubeagents_platformagent_phase; k8s-operator/internal/controller/usage_gauges.go)
+on the metrics port operator-deployment.yaml declares, so one scrape of the
+operator reads the numbers the poller wrote without touching the producers.
+The selector is the Deployment's own pod labels. operator-netpol.yaml admits
+the collector on the port and nothing else. tests/test_chart_operator_monitoring.py
+holds the port here, the containerPort and the manager's bind flag to one value.
+*/ -}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Release.Name }}-operator-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "kube-agents.operatorSelectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: {{ include "kube-agents.operatorMetricsPort" . }}
+      path: /metrics
+      interval: 30s
+{{- end }}

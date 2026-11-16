@@ -15,6 +15,7 @@ import json
 import re
 import sqlite3
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -58,7 +59,18 @@ class FindingNotFound(KeyError):
     would then be reported to the agent as a finding that does not exist."""
 
 
-SOURCES = ("inventory", "event-watcher", "audit")
+SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
+# A check family is the slug's first segment and its separator (`upgrade-`), and
+# nothing shorter or longer: what a complete claim may name with `scope.check_prefix`.
+CHECK_FAMILY_SEPARATOR = "-"
+CHECK_FAMILY_RE = re.compile(rf"^[a-z0-9]+{re.escape(CHECK_FAMILY_SEPARATOR)}$")
+
+
+def in_check_family(check: str, family: str) -> bool:
+    """Whether a stored check belongs to a family: it starts with the family,
+    or it is the family's name alone (the stored fold strips a trailing
+    separator, so `upgrade-` with nothing after it is stored as `upgrade`)."""
+    return check.startswith(family) or check == family[: -len(CHECK_FAMILY_SEPARATOR)]
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -78,11 +90,15 @@ RECURRENCE_STATES = ("resolved", "stale")
 # `surfaced`, which ends a snooze early (§3.2, §6.1).
 PATCHABLE_STATES = ("accepted", "dismissed", "snoozed", "surfaced")
 # The user's three decisions. One on any row of a gathered line covers the
-# line (§7.2): the rows of that item still waiting to be decided take it too.
+# line (§7.2): the rows of that item a message has named (`CASCADE_STATES`)
+# take it too.
 DECISION_STATES = ("accepted", "dismissed", "snoozed")
-# The states of a row still waiting to be decided, which a decision on another
-# row of its item reaches.
+# The states of a row still waiting to be decided.
 UNDECIDED_STATES = ("queued", "surfaced")
+# The rows of an item a decision reaches: the named ones. A `queued` row no
+# message has named yet (`mark_surfaced` moves every named row out of it), so
+# the user has not seen it; it stays open and is returned as left open (§7.2).
+CASCADE_STATES = ("surfaced",)
 
 VERIFY_OUTCOMES = ("still_failing", "resolved", "unverifiable")
 
@@ -98,6 +114,8 @@ PACED_PUBLISHERS = ("nudge", "first_report")
 # The two classes an item is counted under when it is added. Stored with the
 # addition so a later re-score cannot move it from one day's count to the other.
 ITEM_CLASSES = ("critical", "noncritical")
+# The key of `additions_on` that names the line of each addition that day.
+ADDITIONS_LINES_KEY = "lines"
 # The first UTC hour new criticals may be added and pending ones reminded:
 # after the last daily audit, and not the middle of the night in the US.
 REMIND_HOUR = 12
@@ -207,6 +225,7 @@ PROVIDER_NAMESPACE_RE = re.compile(r"^(?:gke|gmp)-")
 MAX_LABEL_CHARS = 500
 MAX_TEXT_CHARS = 4000
 MAX_BATCH = 500
+MAX_LIST_LIMIT = 1000  # the most rows one list_findings call returns
 
 # Rejected values are quoted back so the caller can see what it sent, but the
 # rejection happens before any length cap, and the message ends up verbatim in
@@ -535,7 +554,11 @@ def validate_finding(raw: Any) -> dict:
     if source not in SOURCES:
         raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
-    check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check")
+    # Folded as the derived id folds it (lower case, every run of other
+    # characters one separator), so a claim's `check_prefix` and a reader's
+    # "starts with `upgrade-`" reach a row however its writer spelled the
+    # check, as the id and the item key already do.
+    check = _id_segment(_text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check"))
     # Required, not defaulted: cluster names are only unique within a project,
     # so a finding that omits its project is one key collision away from
     # silently overwriting another cluster's row (and keeping its state).
@@ -620,8 +643,18 @@ def list_findings(
     severity: str = "",
     limit: int = 200,
     project: str = "",
+    check_prefix: str = "",
 ) -> list[dict]:
     clauses, params = [], []
+    if check_prefix:
+        # A family of checks in the claim's grammar (`in_check_family`), folded
+        # as the claim folds it, so a listing and a claim name the same rows; a
+        # plain prefix, since LIKE would read `_` as a wildcard.
+        family = check_prefix.lower()
+        if not CHECK_FAMILY_RE.fullmatch(family):
+            raise FindingError(f"check_prefix is {_brief(family)}; a check family is one segment and its separator, as 'upgrade-' is")
+        clauses.append("(substr(check_slug, 1, ?) = ? OR check_slug = ?)")
+        params.extend([len(family), family, family[: -len(CHECK_FAMILY_SEPARATOR)]])
     if project:
         clauses.append("project = ?")
         params.append(project)
@@ -643,7 +676,7 @@ def list_findings(
     # Sorted before the limit, not after: slicing an unordered result makes
     # which rows come back a property of insertion order.
     ordered = sorted((_row_to_finding(row) for row in rows), key=ranked_sort_key)
-    return ordered[: max(1, min(int(limit), 1000))]
+    return ordered[: max(1, min(int(limit), MAX_LIST_LIMIT))]
 
 
 def get_finding(conn: sqlite3.Connection, finding_id: str) -> dict | None:
@@ -713,8 +746,20 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
     return "updated"
 
 
-def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen: set[str]) -> int:
+def _downgrade_absent(
+    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = "", sources: frozenset = frozenset()
+) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
+
+    `check_prefix` narrows the claim to the rows whose `check_slug` starts with
+    it: a recurring sweep that reads one family of checks (the weekly upgrade
+    readiness review, `upgrade-`) is complete for that family alone, and must
+    not lower the confidence of an inventory or event-watcher row on the same
+    cluster that it never looked at. `sources` narrows it the same way to the
+    rows those sources wrote, which is what a batch without a prefix claims:
+    the onboarding sweep re-run by hand is complete for the inventory's rows,
+    not for the weekly review's. A claim with neither is refused upstream, so
+    no caller can lower every row on a cluster by accident.
 
     A sweep that died halfway produces the same silence as a fleet that got
     healthier, so a row the run did not re-report is re-ranked down at the
@@ -732,13 +777,17 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
     # row, which says nothing about whether the problem is still there. Exempting
     # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE project = ? COLLATE NOCASE "
+        "SELECT id, rubric, check_slug, source FROM findings WHERE project = ? COLLATE NOCASE "
         "AND cluster = ? COLLATE NOCASE AND state IN ('queued', 'surfaced')",
         (project, cluster),
     ).fetchall()
     downgraded = 0
-    for finding_id, raw in rows:
+    for finding_id, raw, check_slug, row_source in rows:
         if finding_id in seen:
+            continue
+        if check_prefix and not in_check_family(str(check_slug or ""), check_prefix):
+            continue
+        if sources and str(row_source or "") not in sources:
             continue
         try:
             rubric = validate_rubric(json.loads(raw))
@@ -763,15 +812,30 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
 
 
 def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None) -> dict:
-    """Upsert a batch, then apply the absence rule if the run says it was complete."""
+    """Upsert a batch, then apply the absence rule if the run says it was complete.
+
+    An empty batch is a run that found nothing: refused without a complete
+    `scope` (there is nothing to do), accepted with one, where the point is
+    that every row the claim covers was absent (§5.2). A complete claim
+    reaches the rows its `check_prefix` names, where the prefix is a check
+    family (it ends with `-`) and, when the batch is not empty, one every row
+    of the batch belongs to: whatever wrote them, or, when `scope.source`
+    names a source beside the prefix, that source's rows in the family alone;
+    without a prefix, the rows of the batch's own sources, or of
+    `scope.source`, which must be a known source and, when the batch is not
+    empty, one the batch wrote; a complete claim that names neither a prefix
+    nor a source and carries no findings is refused, since it would reach
+    every row on the cluster and no caller means that.
+    """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
-    if not findings:
+    complete = isinstance(scope, dict) and bool(scope.get("complete"))
+    if not findings and not complete:
         raise FindingError("findings is empty")
     if len(findings) > MAX_BATCH:
         raise FindingError(f"batch is {len(findings)} findings, over the {MAX_BATCH} limit")
 
-    results, seen = [], set()
+    results, seen, sources, checks = [], set(), set(), set()
     for index, raw in enumerate(findings):
         try:
             finding = validate_finding(raw)
@@ -779,12 +843,38 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
             raise FindingError(f"findings[{index}]: {exc}") from None
         results.append({"id": finding["id"], "outcome": _register_one(conn, finding)})
         seen.add(finding["id"])
+        sources.add(finding["source"])
+        checks.add(str(finding.get("check_slug") or finding.get("check") or ""))
 
     downgraded = 0
-    if isinstance(scope, dict) and scope.get("complete"):
+    if complete:
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
-        downgraded = _downgrade_absent(conn, project, cluster, seen)
+        raw_prefix = scope.get("check_prefix")
+        if raw_prefix is not None and not isinstance(raw_prefix, str):
+            raise FindingError("scope.check_prefix must be a string")
+        # Folded as the stored check is, so the two sides cannot drift.
+        check_prefix = _text(raw_prefix, "scope.check_prefix", required=False).lower()
+        if check_prefix and not CHECK_FAMILY_RE.fullmatch(check_prefix):
+            raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family is one segment and its separator, as 'upgrade-' is")
+        if check_prefix and checks and not all(in_check_family(check, check_prefix) for check in checks):
+            raise FindingError("scope.check_prefix names a family the batch did not write; a claim reaches only what the run read")
+        named = _text(scope.get("source"), "scope.source", required=False)
+        if named and named not in SOURCES:
+            raise FindingError(f"scope.source is {_brief(named)}; must be one of {list(SOURCES)}")
+        if named and sources and named not in sources:
+            raise FindingError("scope.source names a source the batch did not write; a claim reaches only what the run read")
+        if named:
+            sources = {named}
+        if check_prefix and not named:
+            # The prefix alone is the claim: the batch's sources narrow nothing
+            # further. A claim that names its source beside the prefix reaches
+            # that source's rows in the family alone, so the review's batch, empty
+            # or not, never lowers an `upgrade-` row another writer filed.
+            sources = set()
+        if not check_prefix and not sources:
+            raise FindingError("a complete scope with no findings needs check_prefix or source to say what it covers")
+        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, frozenset(sources))
 
     return {"results": results, "downgraded": downgraded}
 
@@ -857,11 +947,13 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
     """The three human transitions, the early end of a snooze, and PR reconciliation.
 
     A decision (`DECISION_STATES`) on a row that is an item at all (not
-    `rolled_up`) covers its whole item: every other row with the same
-    `item_key` that `decided_with_item` accepts takes the same state and
-    `snoozed_until`. Their ids come
+    `rolled_up`) covers the named rows of its item: every other row with the
+    same `item_key` that `decided_with_item` accepts and that is in
+    `CASCADE_STATES` takes the same state and `snoozed_until`. Their ids come
     back as `item_rows_decided`. Without it, the nudge names one id for a
-    gathered line, the user decides it, and the line stays pending.
+    gathered line, the user decides it, and the line stays pending. A
+    `queued` row of the item, which no message has named, keeps its state:
+    its id comes back as `item_rows_left_open`.
     """
     if not isinstance(patch, dict):
         raise FindingError("patch must be an object")
@@ -919,19 +1011,21 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
         decided_assignments, decided_values = decision
         key = item_key(current)
         placeholders = ", ".join("?" * len(UNDECIDED_STATES))
-        siblings = [
-            sibling["id"]
+        undecided = [
+            sibling
             for sibling in map(
                 _row_to_finding,
                 conn.execute(f"{_SELECT} WHERE state IN ({placeholders}) AND id != ?", (*UNDECIDED_STATES, finding_id)),
             )
             if item_key(sibling) == key and decided_with_item(sibling)
         ]
+        siblings = [sibling["id"] for sibling in undecided if sibling["state"] in CASCADE_STATES]
         for sibling in siblings:
             conn.execute(
                 f"UPDATE findings SET {', '.join(decided_assignments)} WHERE id = ?", (*decided_values, sibling)
             )
         result["item_rows_decided"] = siblings
+        result["item_rows_left_open"] = [sibling["id"] for sibling in undecided if sibling["state"] not in CASCADE_STATES]
     return result
 
 
@@ -1087,7 +1181,9 @@ def rolled_up(finding: Mapping) -> bool:
 
 
 def decided_with_item(finding: Mapping) -> bool:
-    """Whether a decision on another row of this row's item applies to it too (§7.2)."""
+    """Whether this row is an undecided member of its item (§7.2): what the
+    nudge's count counts. A decision on another row reaches only those of them
+    in `CASCADE_STATES`; `patch_finding` returns the others as left open."""
     return finding.get("state") in UNDECIDED_STATES and not rolled_up(finding)
 
 
@@ -1097,6 +1193,9 @@ def additions_on(conn: sqlite3.Connection, day: str) -> dict:
     Read from `findings_additions`, which only `mark_surfaced` writes and
     nothing clears: a dismissed, snoozed, resolved or recurred addition still
     spent that day's budget, and a line added twice in a day counts twice.
+    `lines` is the `item_key` of each addition that day, one entry per
+    addition, so `pace` can tell an announced line whose additions are all on
+    record from one with an addition whose marks all failed.
     """
     if not isinstance(day, str) or not DAY_RE.match(day):
         raise FindingError(f"day is {_brief(day)}; must be a UTC date, YYYY-MM-DD")
@@ -1109,7 +1208,13 @@ def additions_on(conn: sqlite3.Connection, day: str) -> dict:
         "SELECT added_class, COUNT(*) FROM findings_additions WHERE day = ? GROUP BY added_class", (day,)
     ):
         counts[added_class] = count
-    return {"day": day, **counts}
+    lines = [
+        json.loads(key)
+        for (key,) in conn.execute(
+            "SELECT item_key FROM findings_additions WHERE day = ? ORDER BY added_at, item_key", (day,)
+        )
+    ]
+    return {"day": day, **counts, ADDITIONS_LINES_KEY: lines}
 
 
 @dataclass(frozen=True)
@@ -1161,9 +1266,10 @@ class Item:
     severity: str = SEVERITIES[-1]
     # The earliest showing among the pending members, None for a new item.
     first_shown: datetime | None = None
-    # How many rows a decision on any member's id applies to (`patch_finding`):
-    # the members, and any row of the line that is neither pending nor new
-    # but still undecided, such as a shown row the sweep stopped reporting.
+    # How many rows a decision on any member's id applies to once the nudge
+    # has marked the members it names (`patch_finding`, `CASCADE_STATES`): the
+    # members, and any row of the line that is neither pending nor new but
+    # still undecided, such as a shown row the sweep stopped reporting.
     covers: int = 0
 
     @property
@@ -1240,13 +1346,15 @@ def pace(
     rows: Iterable[Mapping],
     now: datetime,
     limits: PacingLimits,
-    added_today: Mapping[str, int],
+    added_today: Mapping[str, Any],
     may_add: bool = True,
     announced: Iterable[Iterable[str]] = (),
+    announced_ids: Iterable[str] | None = None,
 ) -> PacingPlan:
     """What a paced publisher names now, from the open rows in ranked order.
 
-    `added_today` is `additions_on` for now's UTC date. The rules, in order:
+    `added_today` is `additions_on` for now's UTC date: the counts by class,
+    and `lines`, the line of each addition on record. The rules, in order:
 
     - Stop-add: while any pending item is non-critical, nothing is added.
     - Criticals are added from `REMIND_HOUR`, up to `daily_criticals` a day.
@@ -1262,7 +1370,18 @@ def pace(
     `announced` is the keys of the items already added today. One that is
     still new (every mark of it failed) is not added again, counts as an
     addition of its class, as if `added_today` held it, and holds additions
-    back as a pending item of its class would.
+    back as a pending item of its class would. `announced_ids` is the ids of
+    the members those additions named: an announced item counts as one of
+    these only while one of those ids is still among its new members, so a
+    row that joined the line later (a decision left it open) is an ordinary
+    new item. None (a record from before the ids were kept) matches on the
+    key alone. An announced item whose line has as many entries in
+    `added_today["lines"]` as it was announced today had a mark succeed in each
+    of those additions, so `added_today` already counts it: it is not counted
+    again and does not stop additions, and it waits for tomorrow rather than
+    being added twice in a day. A recorded critical still holds non-criticals
+    back, as a critical waiting for the budget does. Without `lines`, every
+    announced item still new counts as unrecorded.
     """
     now = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     items, managed = _gather(rows)
@@ -1270,9 +1389,27 @@ def pace(
 
     pending = [item for item in items if item.pending]
     new = [item for item in items if not item.pending]
-    announced_keys = {tuple(key) for key in announced}
-    unrecorded = [item for item in new if item.key in announced_keys]
-    new = [item for item in new if item.key not in announced_keys]
+    announced = [tuple(key) for key in announced]
+    announced_keys = set(announced)
+    named = None if announced_ids is None else {str(finding_id) for finding_id in announced_ids}
+
+    def was_announced(item: Item) -> bool:
+        if item.key not in announced_keys:
+            return False
+        return named is None or any(str(member.get("id")) in named for member in item.members)
+
+    # A line announced twice today with one addition on record has a second
+    # addition whose marks all failed: it is still unrecorded.
+    recorded_lines = Counter(tuple(key) for key in added_today.get(ADDITIONS_LINES_KEY) or ())
+    times_announced = Counter(announced)
+
+    def on_record(item: Item) -> bool:
+        return recorded_lines[item.key] >= times_announced[item.key]
+
+    announced_today = [item for item in new if was_announced(item)]
+    unrecorded = [item for item in announced_today if not on_record(item)]
+    recorded = [item for item in announced_today if on_record(item)]
+    new = [item for item in new if not was_announced(item)]
 
     def spent(item_class: str) -> int:
         return int(added_today.get(item_class) or 0) + sum(1 for item in unrecorded if item.item_class == item_class)
@@ -1293,9 +1430,12 @@ def pace(
         # A critical left out of `add` waits for tomorrow's budget or today's
         # hour, and a non-critical added now would hold it back behind
         # stop-add. With a daily limit of 0 no critical is ever added, so none
-        # is waiting. A critical announced today but never recorded holds them
-        # back as a pending one would.
-        critical_waiting = limits.daily_criticals > 0 and len(new_critical) > len(add)
+        # is waiting. A recorded critical left new by a failed mark waits for
+        # tomorrow too. A critical announced today but never recorded holds
+        # them back as a pending one would.
+        critical_waiting = limits.daily_criticals > 0 and (
+            len(new_critical) > len(add) or any(item.item_class == critical for item in recorded)
+        )
         critical_unrecorded = any(item.item_class == critical for item in unrecorded)
         if (
             not pending_critical
@@ -1311,6 +1451,6 @@ def pace(
         add=add,
         remind=remind,
         blocking=blocking,
-        waiting=[item for item in new if item not in add],
+        waiting=[item for item in new if item not in add] + recorded,
         rolled_up=managed,
     )

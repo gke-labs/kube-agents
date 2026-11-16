@@ -1,0 +1,10 @@
+{
+  "forges": [
+    {
+      "provider": "bitbucket-datacenter",
+      "host": "bitbucket.acme.example",
+      "token_path": "/var/run/kube-agents/forge-credentials/bitbucket-dc/token",
+      "allowed_paths": []
+    }
+  ]
+}

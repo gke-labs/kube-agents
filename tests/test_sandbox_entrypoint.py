@@ -130,6 +130,7 @@ class _SandboxEntrypointHarness(unittest.TestCase):
         # A developer shell that happens to export these must not change the mode.
         env.pop("SANDBOX_IMAGE_TREES", None)
         env.pop("SANDBOX_MOUNTINFO", None)
+        env.pop("KUBE_PROXY_URL", None)
         env.update(
             {
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -640,6 +641,9 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         names = set(match.group(1).split())
         required = {
             "CREDENTIAL_PROXY_URL",
+            # The exec tier's URL: without it a session always falls back on
+            # the stateful broker, and nothing says so.
+            "CREDENTIAL_PROXY_EXEC_URL",
             "CREDENTIAL_PROXY_TOKEN_FILE",
             "KUBE_CONTEXT_NAME",
             "GKE_PROJECT_ID",
@@ -648,6 +652,12 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             # The collectors' scope guard reads it in the session; set on the
             # container alone it never reaches them (#2840's strict pass).
             "KUBEAGENTS_SCOPE_DECLARED",
+            # The audits' auto-promotion switch, read by audit_report.py in the session.
+            "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
+            # The earned-autonomy switches, read by kubeagents_switches.py in the session.
+            "KUBEAGENTS_POST_MERGE_CHECK",
+            "KUBEAGENTS_AUTOMERGE",
+            "KUBEAGENTS_DIAL",
         }
         self.assertTrue(
             required.issubset(names),
@@ -660,6 +670,161 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         self.assertIn('SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"', content)
         self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_SCOPE_DECLARED:-false\}" >"\$SANDBOX_SCOPE_DECLARED_FILE"')
         self.assertIn('chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"', content)
+
+    def test_the_audit_auto_promote_switch_is_written_as_a_root_owned_file_too(self) -> None:
+        """audit_report.py reads this file before the forwarded variable, so a session
+        cannot turn the automatic remediation sweep back on by exporting one word."""
+        content = _ENTRYPOINT.read_text()
+        self.assertIn('SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"', content)
+        self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true\}" >"\$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"')
+        self.assertIn('chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"', content)
+
+    def test_the_autonomy_switches_are_written_as_root_owned_files_defaulting_off(self) -> None:
+        """kubeagents_switches.py reads these files before the forwarded variables, so a
+        session cannot turn a switch on (test_kubeagents_switches.py holds its paths to these)."""
+        content = _ENTRYPOINT.read_text()
+        chmod = 'chmod 0644 "$SANDBOX_POST_MERGE_CHECK_FILE" "$SANDBOX_AUTOMERGE_FILE" "$SANDBOX_DIAL_FILE"'
+        self.assertIn(chmod, content)
+        for name, path in (
+            ("POST_MERGE_CHECK", "/run/kube-agents-sandbox/post-merge-check"),
+            ("AUTOMERGE", "/run/kube-agents-sandbox/automerge"),
+            ("DIAL", "/run/kube-agents-sandbox/dial"),
+        ):
+            self.assertIn(f'SANDBOX_{name}_FILE="{path}"', content)
+            self.assertIn(f"printf '%s\\n' \"${{KUBEAGENTS_{name}:-off}}\" >\"$SANDBOX_{name}_FILE\"", content)
+
+
+class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
+    """Legacy gke-gcloud-auth-plugin kubeconfig migration and context character guard."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        stat_stub = self.bin_dir / "stat"
+        stat_stub.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-c" ] && [ "$2" = "%h %U" ]; then\n'
+            '  echo "1 agent"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exec /usr/bin/stat \"$@\"\n"
+        )
+        stat_stub.chmod(0o755)
+
+    def test_legacy_kubeconfig_with_valid_context_is_rewritten(self) -> None:
+        legacy = self.data / "kubeconfig.yaml"
+        legacy.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "current-context: gke_my-proj_us-central1-a_cluster-1\n"
+            "users:\n"
+            "- name: gke\n"
+            "  user:\n"
+            "    exec:\n"
+            "      command: gke-gcloud-auth-plugin\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        rewritten = legacy.read_text()
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_cluster-1",
+            rewritten,
+        )
+        self.assertNotIn("gke-gcloud-auth-plugin", rewritten)
+        default_kc = (self.data / ".kubeconfig").read_text()
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_default",
+            default_kc,
+        )
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_cluster-1",
+            default_kc,
+        )
+        self.assertIn("current-context: gke_my-proj_us-central1-a_default", default_kc)
+
+    def test_legacy_kubeconfig_with_unsafe_context_characters_is_skipped(self) -> None:
+        legacy = self.data / "kubeconfig.yaml"
+        original = (
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "current-context: gke_my-proj/../../evil\n"
+            "users:\n"
+            "- name: gke\n"
+            "  user:\n"
+            "    exec:\n"
+            "      command: gke-gcloud-auth-plugin\n"
+        )
+        legacy.write_text(original)
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        self.assertEqual(original, legacy.read_text())
+
+    def test_existing_kubeconfig_preserves_valid_gke_contexts_and_drops_invalid_ones(self) -> None:
+        existing_kc = self.data / ".kubeconfig"
+        existing_kc.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: gke_my-proj_us-central1-a_default\n"
+            "- name: gke_fleet-proj_us-east1_cluster-a\n"
+            "- name: gke_fleet-proj_us-east1_cluster-a\n"
+            "- name: 'gke_bad_colon:'\n"
+            "- name: non_gke_context\n"
+            "current-context: gke_my-proj_us-central1-a_default\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        default_kc = existing_kc.read_text()
+        self.assertEqual(
+            1,
+            default_kc.count(
+                "server: https://agent-kube-proxy:8443/clusters/gke_fleet-proj_us-east1_cluster-a"
+            ),
+        )
+        self.assertNotIn("gke_bad_colon", default_kc)
+        self.assertNotIn("non_gke_context", default_kc)
+
+    def test_existing_kubeconfig_with_multiple_links_or_wrong_owner_is_ignored(self) -> None:
+        stat_stub = self.bin_dir / "stat"
+        stat_stub.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-c" ] && [ "$2" = "%h %U" ]; then\n'
+            '  echo "2 agent"\n'
+            "  exit 0\n"
+            "fi\n"
+            'exec /usr/bin/stat "$@"\n'
+        )
+        stat_stub.chmod(0o755)
+        existing_kc = self.data / ".kubeconfig"
+        existing_kc.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: gke_fleet-proj_us-east1_hardlinked\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        default_kc = existing_kc.read_text()
+        self.assertNotIn("gke_fleet-proj_us-east1_hardlinked", default_kc)
 
 
 if __name__ == "__main__":

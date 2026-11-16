@@ -123,6 +123,25 @@ class FakeForge:
     def verbs(self) -> list[str]:
         return [name for name, _, _ in self.calls]
 
+
+class NoIssueTrackerForge(FakeForge):
+    """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
+
+    Every issue and label verb is refused as the broker refuses one it does not
+    serve, and `capabilities` says what the forge has.
+    """
+
+    CAPABILITIES = {"forge": "bitbucket", "verbs": ["proposal-list", "proposal-create"], "labels": False, "missing": []}
+
+    def __call__(self, name: str, payload: dict, repo: str) -> dict:
+        if name == "capabilities":
+            self.calls.append((name, dict(payload), repo))
+            return dict(self.CAPABILITIES)
+        if name.startswith("issue-") or name == "label-ensure":
+            self.calls.append((name, dict(payload), repo))
+            raise forge.UnknownForgeHost("forge.invalid")
+        return super().__call__(name, payload, repo)
+
     def bodies(self) -> list[str]:
         return [payload.get("body", "") for _, payload, _ in self.calls]
 
@@ -170,6 +189,94 @@ class WatchCase(unittest.TestCase):
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
+class NoIssueTrackerTest(WatchCase):
+    """On a forge with no issue tracker the log channel is the report, not a fault."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.forge = NoIssueTrackerForge()
+        patcher = mock.patch.object(cdw.forge, "call", self.forge)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def cross_the_threshold(self) -> str:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        rc, out = self.run_tick()
+        self.assertEqual(rc, 0)
+        return out
+
+    def test_the_alert_goes_out_as_log_only_with_no_self_error(self) -> None:
+        out = self.cross_the_threshold()
+        alerts = [line for line in out.splitlines() if line.startswith(cdw.LOG_PREFIX)]
+        self.assertEqual(1, len(alerts))
+        self.assertIn(f"ledger={cdw.LEDGER_LOG_ONLY}", alerts[0])
+        self.assertNotIn("self=error", out)
+        self.assertNotIn("issue-create", self.forge.verbs())
+        self.assertIsNone(self.state_data()["ledger"]["issue_number"])
+
+    def test_a_forge_whose_capabilities_cannot_be_read_still_reports_the_fault(self) -> None:
+        unread = NoIssueTrackerForge.__call__
+
+        def call(name: str, payload: dict, repo: str) -> dict:
+            if name == "capabilities":
+                self.forge.calls.append((name, dict(payload), repo))
+                raise forge.ForgeError("FORGE_CALL_FAILED", "down")
+            return unread(self.forge, name, payload, repo)
+
+        patcher = mock.patch.object(cdw.forge, "call", call)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        out = self.cross_the_threshold()
+        self.assertIn("self=error", out)
+        self.assertIn("ledger=error:", out)
+
+    def test_an_unserved_host_is_still_reported_as_a_fault(self) -> None:
+        # A typo in the ledger host, or gitlab.com with no GitLab configured,
+        # also answers with no verbs; that must not go quiet.
+        self.forge.CAPABILITIES = {"forge": "gitlab", "verbs": [], "labels": False, "missing": ["no credential is configured for gitlab.com"]}
+        out = self.cross_the_threshold()
+        self.assertIn("self=error", out)
+
+    def test_a_failed_close_in_the_old_repository_is_a_fault(self) -> None:
+        # Review: the move to a forge with no tracker asked about the new
+        # repository for a failure in the old one, and went quiet.
+        old = FakeForge()
+        patcher = mock.patch.object(cdw.forge, "call", old)
+        patcher.start()
+        self.cross_the_threshold()
+        patcher.stop()
+        self.assertIsNotNone(self.state_data()["ledger"]["issue_number"])
+        os.environ[cdw.LEDGER_REPO_ENV] = "ws/bitbucket-ledger"
+
+        def call(name: str, payload: dict, repo: str) -> dict:
+            if repo == LEDGER_REPO:
+                self.forge.calls.append((name, dict(payload), repo))
+                if name == "capabilities":
+                    return {"forge": "github", "verbs": list(cdw.LEDGER_ISSUE_VERBS), "labels": True, "missing": []}
+                raise forge.ForgeError("FORGE_RATE_LIMITED", "slow down")
+            return self.forge(name, payload, repo)
+
+        patcher = mock.patch.object(cdw.forge, "call", call)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.write_store(job("a", RUN_3, HARD_ERROR))
+        rc, out = self.run_tick()
+        self.assertEqual(rc, 0)
+        self.assertIn("self=error", out)
+        self.assertNotIn(f"ledger={cdw.LEDGER_LOG_ONLY}", out)
+
+    def test_a_forge_with_a_tracker_never_asks_for_capabilities(self) -> None:
+        # GitHub and GitLab make exactly the calls they made before.
+        self.forge = FakeForge()
+        patcher = mock.patch.object(cdw.forge, "call", self.forge)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cross_the_threshold()
+        self.assertEqual(self.forge.verbs(), ["issue-list", "label-ensure", "issue-create"])
+
+
 class GradingTest(unittest.TestCase):
     def test_partial_names_the_platforms_it_missed(self) -> None:
         self.assertEqual(cdw.grade_error(PARTIAL_ERROR), cdw.GRADE_PARTIAL)
@@ -187,6 +294,18 @@ class GradingTest(unittest.TestCase):
     def test_joined_errors_from_several_targets_keep_the_platform_list_clean(self) -> None:
         joined = HARD_ERROR + "; delivery to slack:C123 failed: channel_not_found"
         self.assertEqual(cdw.platforms_from(joined), ["slack", "google_chat"])
+
+    def test_a_refusal_for_two_platforms_names_both(self) -> None:
+        # The session server's no-route refusal: one sentence per gateway platform
+        # with no home channel, joined with "; " (session_kv_server.NO_CHAT_ROUTE_JOIN).
+        google_chat = ("composed but not delivered to google_chat (no home channel: set "
+                       "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)")
+        slack = ("composed but not delivered to slack (no home channel: set "
+                 "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)")
+        joined = f"{google_chat}; {slack}"
+        self.assertEqual(cdw.platforms_from(joined), ["google_chat", "slack"])
+        self.assertEqual(cdw.grade_error(joined), cdw.GRADE_HARD)
+        self.assertEqual(cdw.platforms_from(slack), ["slack"])
 
     def test_the_adapter_still_produces_the_phrases_the_grader_matches(self) -> None:
         # The guard behind the constants above: the phrases are literals here, so

@@ -59,6 +59,7 @@ TRUSTED_DIR = "/opt/vcs/libexec/platform"
 # crons, which never run in the sandbox.
 INSTRUCTION_GLOBS = (
     "agents/platform/skills/*/SKILL.md",
+    "agents/platform/skills/*/references/*.md",
     "agents/platform/SOUL.md",
     "agents/platform/AGENTS.md",
     "agents/platform/governance/*.md",
@@ -151,12 +152,14 @@ def forwarded_paths() -> dict[str, str]:
     sys.path.insert(0, str(SKILL_SCRIPTS / "github-issue-resolver/scripts"))
     try:
         import forge
+        import gke_cluster_reads
         import resolver
     finally:
         sys.path.pop(0)
 
     return {
         "forge": forge.SANDBOX_FORGE,
+        "gke_cluster_reads": gke_cluster_reads.SANDBOX_GKE_READS,
         "resolver": resolver.SANDBOX_RESOLVER,
     }
 
@@ -329,7 +332,7 @@ class SandboxDelivery(unittest.TestCase):
         for pattern in INSTRUCTION_GLOBS:
             for doc in REPO.glob(pattern):
                 for name in CALL.findall(doc.read_text()):
-                    if name in self.shared:
+                    if staged_source(name) is not None:
                         wanted.setdefault(name, []).append(
                             str(doc.relative_to(REPO))
                         )

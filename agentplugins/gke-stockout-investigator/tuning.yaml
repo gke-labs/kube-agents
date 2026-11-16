@@ -55,7 +55,7 @@ spec:
         # full remediation (load skill -> gcloud quota/reservations/capacity-advisor ->
         # kubectl -> clone the GitOps repo -> find the manifest -> edit -> branch ->
         # submit PR -> notify) exhausts it mid-flight, and a run that exhausts it
-        # cannot even produce a closing summary. Repository exploration is the main
+        # ends with a closing summary on the card, not the PR. Repository exploration is the main
         # consumer, so scale this against how much the agent must read, not against
         # how complex the alert is.
         maxTurns: 200

@@ -26,13 +26,23 @@ it is a vehicle for asserting that 0.5 is below the floor. So these do not go
 stale when the agent improves, and they are never updated because a pull request
 changed the results.
 
-**What they do not do.** They are frozen, so they cannot detect that
-devops-bench changed its output. A key renamed upstream leaves every test here
-green — the capture still carries the old name — and surfaces as a rung-3 block
-on the first live run. The parse layer's real test is that first live run;
-`test_every_captured_run_reads_as_a_live_record` only pins `load_run` against
-this sample. Re-capture when the `devops-bench` SHA in `bench/pyproject.toml`
+**What they do not do.** They are frozen, so the tests that read them as
+records cannot detect that devops-bench changed its output: a key renamed
+upstream leaves those green, since the capture still carries the old name.
+`test_grader_guard.py` is the exception for the keys the grader writes: it
+replays a capture's agent half through the pinned devops-bench's record writer
+and grades what comes out, so a renamed `scores`, `verification_report` or
+`tokens` key reds it. What stays frozen there is the answer and trajectory a
+real agent gave. `test_every_captured_run_reads_as_a_live_record` pins
+`load_run` against this sample. Re-capture when the `devops-bench` SHA in `bench/pyproject.toml`
 moves, which is the event that can change the schema.
+
+A record is also not the whole input its checks read. `test_grader_guard.py`
+replays a record's `output` and `trajectory` through the grader, but
+`report_contains` reads the harness's `final_message`, which `results.json`
+does not keep. `kanban_red_2` and `kanban_red_3` quote the probe title in a
+progress recital that was never in their `final_message`, so replayed they
+pass; the guard replays the other three.
 
 ## Provenance
 

@@ -47,20 +47,20 @@ TASK = REPO / "bench" / "tasks" / "bootstrap-inventory-ranking-delivery" / "task
 
 # The rubric the SOP's tables give each planted finding (Step 3). The four
 # criticals: a project-editor key reachable from a pod (the SOP's own worked
-# example, 288), cluster-admin held by a ServiceAccount whose token a running
-# pod mounts (B=8 for what it grants, L=6 for a long-lived broad credential
-# reachable from a pod, 288), and two serving Deployments with no ready
-# replica (L=10 with B=5, critical by the floor whatever they score).
+# example, 288), a log-shipping DaemonSet with no pod running (B=3 for a
+# load-bearing non-serving component, L=10, critical by the floor), and two
+# serving Deployments with no ready replica (L=10 with B=5, critical by the
+# floor whatever they score).
 VECTORS = {
     "invoice-worker": {"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 1.0},
-    "release-bot": {"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 0.9},
+    "log-shipper": {"B": 3, "L": 10, "detect": 2, "recover": 2, "C": 1.0},
     "quote-api": {"B": 5, "L": 10, "detect": 1, "recover": 2, "C": 1.0},
     "pricing-engine": {"B": 5, "L": 10, "detect": 1, "recover": 2, "C": 1.0},
-    "gift-cards": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 0.9},
-    "orders-db": {"B": 3, "L": 2, "detect": 2, "recover": 3, "C": 0.9},
+    "gift-cards": {"B": 3, "L": 2, "detect": 3, "recover": 2, "C": 0.9},
+    "ledger": {"B": 3, "L": 2, "detect": 2, "recover": 3, "C": 0.9},
     "prod-central": {"B": 1, "L": 1, "detect": 2, "recover": 1, "C": 1.0},
 }
-CRITICALS = ("invoice-worker", "release-bot", "quote-api", "pricing-engine")
+CRITICALS = ("invoice-worker", "log-shipper", "quote-api", "pricing-engine")
 # A rubric that scores minor, for a test that demotes a planted critical.
 MINOR = {"B": 1, "L": 1, "detect": 1, "recover": 1, "C": 1.0}
 
@@ -191,16 +191,16 @@ def test_a_report_that_lists_every_critical_fails(sandbox: Path) -> None:
 
 def test_two_criticals_padded_with_non_criticals_fail(sandbox: Path) -> None:
     # The shape the old SOP produced, with only the critical cap applied.
-    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "release-bot", "gift-cards", "orders-db"))
+    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "log-shipper", "gift-cards", "ledger"))
     result = _verify()
     assert result.status == "fail"
     assert "name 2 of the 4 item(s) the worker scored critical; they also name 2 non-critical finding(s)" in result.reason
-    assert result.raw["padded"] == ["gift-cards", "orders-db"]
+    assert result.raw["padded"] == ["gift-cards", "ledger"]
 
 
 def test_a_critical_item_naming_its_cluster_is_not_padding(sandbox: Path) -> None:
     # Every item says `in prod-central`, the object of the cluster-level Managed Prometheus finding.
-    report = _report("invoice-worker", "release-bot")
+    report = _report("invoice-worker", "log-shipper")
     assert report.count("`prod-central`") == 2
     (sandbox / "INVENTORY.delivered.md").write_text(report)
     result = _verify()
@@ -210,12 +210,12 @@ def test_a_critical_item_naming_its_cluster_is_not_padding(sandbox: Path) -> Non
 
 def test_a_deferred_critical_named_outside_the_list_does_not_count(sandbox: Path) -> None:
     rollup = "Also found: `quote-api` and `pricing-engine` are down too, and 3 more items."
-    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "release-bot", rollup=rollup))
+    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "log-shipper", rollup=rollup))
     assert _verify().status == "pass"
 
 
 def test_a_name_inside_a_longer_name_does_not_count(sandbox: Path) -> None:
-    report = _report("invoice-worker", "release-bot").replace(
+    report = _report("invoice-worker", "log-shipper").replace(
         "Left alone it stays broken", "Unlike quote-api-v2 and xpricing-engine, left alone it stays broken", 1
     )
     (sandbox / "INVENTORY.delivered.md").write_text(report)
@@ -223,7 +223,7 @@ def test_a_name_inside_a_longer_name_does_not_count(sandbox: Path) -> None:
 
 
 def test_a_name_on_an_indented_line_of_an_item_counts(sandbox: Path) -> None:
-    report = _report("invoice-worker", "release-bot").replace(
+    report = _report("invoice-worker", "log-shipper").replace(
         "   Left alone it stays broken", "   It also takes `quote-api` down. Left alone it stays broken", 1
     )
     (sandbox / "INVENTORY.delivered.md").write_text(report)
@@ -254,7 +254,7 @@ def test_no_report_fails(sandbox: Path) -> None:
 
 def test_two_or_fewer_scored_critical_is_an_error_not_a_pass(sandbox: Path) -> None:
     _write_scores(sandbox, **{"quote-api": MINOR, "pricing-engine": MINOR})
-    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "release-bot"))
+    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "log-shipper"))
     result = _verify()
     assert result.status == "error"
     assert "scored 2 item(s) critical, not more than the limit of 2" in result.reason
@@ -297,7 +297,7 @@ def test_a_provider_managed_observation_is_not_an_item(sandbox: Path) -> None:
 
 
 def test_a_batch_that_cannot_be_scored_is_an_error(sandbox: Path) -> None:
-    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "release-bot"))
+    (sandbox / "INVENTORY.delivered.md").write_text(_report("invoice-worker", "log-shipper"))
     scores = json.loads((sandbox / "INVENTORY.scores.json").read_text())
     scores["scores"].pop(next(iter(scores["scores"])))
     (sandbox / "INVENTORY.scores.json").write_text(json.dumps(scores))

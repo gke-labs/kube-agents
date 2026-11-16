@@ -22,7 +22,8 @@ label. A hand-written manifest that omits the label is caught by the review gate
 
 If your cluster is reconciled from this repository rather than installed by the chart, vendor the
 policies here by committing that source file and letting your reconciler apply it — but keep one
-copy, not two.
+copy, not two. The chart also installs `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`,
+which holds the pods the A2A gateway creates to the session pod shape; vendor it the same way.
 
 ## What does belong here
 

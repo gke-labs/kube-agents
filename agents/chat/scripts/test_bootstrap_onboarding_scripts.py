@@ -24,6 +24,7 @@ again.
 
 import contextlib
 import errno
+import importlib.util
 import http.server
 import io
 import json
@@ -33,11 +34,13 @@ import os
 import shutil
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -52,17 +55,23 @@ CLUSTER_INVENTORY_SOP = Path(__file__).resolve().parents[2] / "platform" / "gove
 import bootstrap_delivery  # noqa: E402
 import bootstrap_handoff  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
+import chat_notify  # noqa: E402
 import cluster_agent_profile  # noqa: E402
 import findings_queue  # noqa: E402
+import inventory_card  # noqa: E402
 import inventory_findings  # noqa: E402
+import inventory_presenter  # noqa: E402
 import oobe  # noqa: E402
 import profile_scaffold  # noqa: E402
 import sandbox_exec  # noqa: E402
+import test_inventory_card as card_fixtures  # noqa: E402 - the planted stack's items and scores, and the shown file select writes
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
 
 INVENTORY = "INVENTORY.md"
 DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
+# The plugin's hold on the report while the greeting is on its way (bootstrap_onboarding).
+HOLD_PREFIX = ".bootstrap_greeting_pending."
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
 SHOWN = "INVENTORY.shown.json"
@@ -75,6 +84,8 @@ SHOWN_RECORD = {
 }
 ITEMS = "INVENTORY.items.json"
 SCORES = "INVENTORY.scores.json"
+LIMITS = "INVENTORY.limits.json"
+RELAY_URL = "http://127.0.0.1:8765"
 SCORE = {
     "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
     "recommendation": {"action": "add a readinessProbe", "rationale": "traffic", "risk": "5xx"},
@@ -95,9 +106,39 @@ EXTRACTED = {
 SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clusters": ["acme/prod"]}
 
 
+# The audits note with no oobe marker: the chain's sentence, then where the summaries go.
+RUNNING_NOTE = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+
+
 def delivered(report: str) -> str:
     """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
-    return report.rstrip("\n") + "\n\n" + bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n"
+    return report.rstrip("\n") + "\n\n" + RUNNING_NOTE + "\n"
+
+
+def plant_card_files(d: Path, items=None, scores=None, shown=None, limits=None, suppressed=()) -> inventory_card.Card:
+    """Write the stage's files beside the report, the planted two-criticals fixture unless given, and
+    return the card they build.
+
+    ``scores`` None with ``items`` given writes no scores file, as a clean fleet has none. ``limits``
+    is the limits file's record, written when given; the shown file and the card follow its limit.
+    """
+    if items is None:
+        items, scores = card_fixtures.criticals_items(), card_fixtures.criticals_scores()
+    pacing = inventory_findings.limits_from(limits or {})
+    if shown is None:
+        shown = card_fixtures.shown_for(items, scores or {"scores": {}}, pacing.first_report_criticals)
+    (d / ITEMS).write_text(json.dumps({"items": items}), encoding="utf-8")
+    if scores is not None:
+        (d / SCORES).write_text(json.dumps(scores), encoding="utf-8")
+    if limits is not None:
+        (d / LIMITS).write_text(json.dumps(limits), encoding="utf-8")
+    (d / SHOWN).write_text(json.dumps(shown), encoding="utf-8")
+    return inventory_card.build({"items": items}, scores, pacing, shown, frozenset(suppressed))
+
+
+def stage_log(d: Path) -> str:
+    path = d / oobe.STAGE_LOG
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -120,6 +161,112 @@ class DeliveryDecisionTest(unittest.TestCase):
         # another pod, and main() reads it only after this says yes.
         (self.d / ALIGNED).touch()
         self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    # --- the greeting hold (bootstrap_onboarding's .bootstrap_greeting_pending.<turn>) ---
+
+    def _hold(self, turn="turn-1", age=0.0):
+        path = self.d / f"{HOLD_PREFIX}{turn}"
+        path.touch()
+        if age:
+            at = time.time() - age
+            os.utime(path, (at, at))
+        return path
+
+    def _stage_log(self):
+        path = self.d / oobe.STAGE_LOG
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_a_young_hold_keeps_the_report_behind_the_greeting(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+
+    def test_the_hold_holds_on_the_conversation_path_too(self):
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_past_the_wait_is_dropped_once_with_a_log_line(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(
+            self._stage_log(),
+            f"bootstrap_delivery: the greeting did not finish within {bootstrap_delivery.GREETING_WAIT_SECONDS} s; "
+            "delivering the report\n",
+        )
+        # The next tick finds no hold and writes nothing more.
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_the_newest_hold_decides(self):
+        (self.d / ALIGNED).touch()
+        old = self._hold("turn-old", age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        young = self._hold("turn-new")
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(old.exists() and young.exists())
+
+    def test_a_hold_without_a_human_present_is_left_alone(self):
+        # Aligned first: a touch of the marker that failed leaves this hold, and the
+        # report waits for a turn that binds, as on the path before the hold. The
+        # hold ages out on the first tick after that turn binds.
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+        (self.d / ALIGNED).touch()
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_a_directory_in_place_of_the_hold_never_raises(self):
+        (self.d / ALIGNED).touch()
+        (self.d / f"{HOLD_PREFIX}dir").mkdir()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        at = time.time() - bootstrap_delivery.GREETING_WAIT_SECONDS - 1
+        os.utime(self.d / f"{HOLD_PREFIX}dir", (at, at))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_an_unreadable_hold_never_raises(self):
+        # Only the unreadable hold's stat raises: Python 3.12's Path.exists() goes
+        # through Path.stat(), so a raise on every path would hit the aligned check.
+        (self.d / ALIGNED).touch()
+        unreadable = self._hold("turn-unreadable")
+        real_stat = Path.stat
+
+        def stat_except_the_unreadable_hold(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("no")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=stat_except_the_unreadable_hold):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+            # An unreadable hold is skipped, not fatal: a readable young one still holds.
+            self._hold("turn-readable")
+            self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        with mock.patch.object(Path, "glob", side_effect=OSError("no")):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_from_a_clock_that_moved_back_is_dropped(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=-(bootstrap_delivery.GREETING_WAIT_SECONDS + 1))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+
+    def test_main_stays_silent_under_a_young_hold(self):
+        (self.d / ALIGNED).touch()
+        (self.d / INVENTORY).write_text("# report\n", encoding="utf-8")
+        self._hold()
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+                mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
 
 
 class DeliveryMainTest(unittest.TestCase):
@@ -184,8 +331,8 @@ class DeliveryMainTest(unittest.TestCase):
         """
         (self.d / INVENTORY).write_text("report", encoding="utf-8")
         (self.d / ALIGNED).touch()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))  # winner
-        self.assertFalse(bootstrap_delivery._claim_delivery(self.d))  # loser
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))  # winner
+        self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))  # loser
 
         rc, out = self._run()
         self.assertEqual(rc, 0)
@@ -219,6 +366,507 @@ class DeliveryMainTest(unittest.TestCase):
         rc, out = self._run()
         self.assertEqual(rc, 0)
         self.assertEqual(out, delivered(report))
+
+
+# The plugin that writes what the conversation path reads, loaded from its file.
+PLUGIN_PATH = Path(__file__).resolve().parents[1] / "defaults" / "plugins" / "bootstrap_onboarding" / "plugin.py"
+CONVERSATION = {
+    "platform": "slack",
+    "conversation": "slack:D0DM/1792185148.859139",
+    "context_id": "ctx-21f41a7dc20859301d2307b8",
+    "bound_at": 1792185149.0,
+}
+NEXT_ENV = {
+    "A2A_NOTIFY_CONVERSATIONS": "slack",
+    "A2A_NOTIFY_PLATFORM": "",
+    "NATS_URL": "nats://nats.kubeagents-system:4222",
+    "A2A_BUS_USER": "agent-platform",
+    "KAGE_SLACK_UX": "false",
+}
+REFUSED = json.dumps({"error": "not a live conversation with that context"}) + "\n"
+POSTED_ANSWER = json.dumps({"message_id": "1792185200.000100", "thread_id": "1792185148.859139"}) + "\n"
+
+
+class DeliveryToConversationTest(unittest.TestCase):
+    """Under spec.mode next: the report goes into the conversation the plugin recorded."""
+
+    REPORT = "# GKE Environment Discovery Report\n\nTwo things need you.\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.dict(os.environ, NEXT_ENV),
+            mock.patch.object(bootstrap_delivery.time, "sleep"),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        marks = mock.patch.object(bootstrap_delivery, "_post_surfaced")
+        self.marks = marks.start()
+        self.addCleanup(marks.stop)
+        self.calls = []
+        self.answers = []
+
+    def _answer(self, returncode=0, stdout=POSTED_ANSWER, stderr=""):
+        self.answers.append((returncode, stdout, stderr))
+
+    def _fake_run(self, argv, **_kwargs):
+        self.calls.append(argv)
+        if "--chat-file" in argv:
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.card = json.load(handle)
+        returncode, stdout, stderr = self.answers.pop(0) if self.answers else (0, POSTED_ANSWER, "")
+        if isinstance(returncode, BaseException):
+            raise returncode
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    def _run(self):
+        buf = io.StringIO()
+        with mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=self._fake_run), \
+                contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(buf.getvalue(), "", "the conversation path never prints the report")
+        return rc
+
+    def _attempts(self):
+        return bootstrap_delivery._read_attempts(self.d)
+
+    def test_the_plugin_and_delivery_name_the_same_files(self):
+        spec = importlib.util.spec_from_file_location("_bootstrap_onboarding_plugin", PLUGIN_PATH)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(plugin.CONVERSATION_FILE, bootstrap_delivery.CONVERSATION_FILE)
+        self.assertEqual(plugin.CONVERSATION_ALIGNED_MARKER, bootstrap_delivery.CONVERSATION_ALIGNED_MARKER)
+        self.assertEqual(plugin.CONVERSATION_ATTEMPTS_FILE, bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE)
+        self.assertEqual(plugin.CONVERSATION_DONE_FILE, bootstrap_delivery.CONVERSATION_DONE_FILE)
+
+    def test_the_report_and_its_note_post_into_the_conversation_once(self):
+        self.assertEqual(self._run(), 0)
+        (argv,) = self.calls
+        self.assertEqual(
+            argv[:9],
+            ["a2a", "notify", "--platform", "slack", "--conversation", CONVERSATION["conversation"],
+             "--context", CONVERSATION["context_id"], "--timeout"],
+        )
+        self.assertNotIn("--update", argv)
+        text = argv[argv.index("--") + 1]
+        self.assertTrue(text.startswith(self.REPORT.rstrip("\n")))
+        # No platform has a home: the gateway keeps the home posts for its digest
+        # and posts none, so the note says the install has no home channel.
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
+        # Kept as onboarding's destination after delivery.
+        self.assertTrue((self.d / bootstrap_delivery.CONVERSATION_FILE).exists())
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_gateway_with_a_home_channel_keeps_the_home_sentence(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "slack"}):
+            self._run()
+        text = self.calls[0][self.calls[0].index("--") + 1]
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+
+    def test_no_home_is_said_on_every_path(self):
+        # With no home channel, later summaries post nowhere; the note says so whatever the stage did.
+        for state in (
+            {},
+            {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
+            {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
+            {oobe.STATE_DONE: True, oobe.STATE_SKIPPED: True, oobe.STATE_REASON: oobe.SKIP_NOT_NEW, oobe.STATE_AT: 1},
+        ):
+            with self.subTest(state=state):
+                oobe.write_state(self.d, state)
+                note = bootstrap_delivery._audits_note(self.d, False, home=False)
+                self.assertEqual(note.count(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE), 1)
+                self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
+
+    def test_no_home_is_said_beside_listed_summaries(self):
+        oobe.write_state(self.d, {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_DONE: True})
+        with mock.patch.object(bootstrap_delivery, "_lost_audits", return_value=[bootstrap_delivery.LostRun("compliance-audit", False, 1.0)]):
+            note = bootstrap_delivery._audits_note(self.d, False, home=False)
+        self.assertIn("not posted to the chat: `compliance-audit`.", note)
+        self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
+
+    def test_a_gateway_with_no_home_channel_says_so_through_main(self):
+        # Chat is armed but no platform has a home channel: home posts are kept for the
+        # digest, not posted, so the note says the install has none.
+        conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": "google_chat", "A2A_NOTIFY_PLATFORM": ""}), \
+                mock.patch.object(chat_notify, "HOME_FILE_DIR", str(self.d / "no-home-file")):
+            self.assertEqual(self._run(), 0)
+        text = self.calls[-1][self.calls[-1].index("--") + 1]
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+
+    def test_the_card_posts_with_its_update_key_then_the_note(self):
+        with self._card():
+            self._run()
+        report, note = self.calls
+        self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
+        self.assertIn("--chat-file", report)
+        chat, text = inventory_card.chat(self.expected)
+        self.assertEqual(self.card, chat)
+        self.assertEqual(report[report.index("--") + 1], text)
+        self.assertNotIn("--chat-file", note)
+        self.assertNotIn("--update", note)
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
+        self.assertNotIn("went as text", stage_log(self.d))
+
+    def test_the_card_is_built_from_the_stored_files_not_the_report(self):
+        with self._card():
+            self._run()
+        self.assertEqual(self.card["headline"], "First look at your fleet: two things to fix first")
+        self.assertEqual(self.card["rows"][0]["text"][:14], "invoice-worker")
+        self.assertNotIn("Two things need you", json.dumps(self.card))
+        # Marked shown from the same shown file, not from a second read of it.
+        self.assertEqual([c.args[1] for c in self.marks.call_args_list], [row for line in json.loads(
+            (self.d / SHOWN_DELIVERED).read_text(encoding="utf-8"))["items"] for row in line["ids"]])
+
+    def test_the_text_path_logs_why_there_was_no_card(self):
+        # NEXT_ENV has the flag off.
+        plant_card_files(self.d)
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("the first report went as text: KAGE_SLACK_UX is off", stage_log(self.d))
+
+    def test_the_text_path_reshapes_the_report_for_slack_with_the_flag_on(self):
+        # No files beside the report, so no card: the text is the presenter's reshape, as before.
+        report = (
+            "# GKE Environment Scan\n\nI scanned 3 clusters and 41 workloads.\n\n"
+            "1. **[critical] seeded-b admits privileged pods**\n   Enforce baseline Pod Security.\n\n"
+            "Also found: 20 more items, tracked in the findings queue.\n"
+        )
+        (self.d / INVENTORY).write_text(report, encoding="utf-8")
+        reshaped = inventory_presenter.present(report)
+        self.assertNotEqual(reshaped, report)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}):
+            self._run()
+        (argv,) = self.calls
+        self.assertNotIn("--chat-file", argv)
+        self.assertTrue(argv[argv.index("--") + 1].startswith(reshaped.rstrip("\n")))
+        self.assertIn("no INVENTORY.items.json", stage_log(self.d))
+
+    def test_a_google_chat_conversation_under_next_gets_the_card(self):
+        # The gateway lays the card out on Google Chat under next, so the conversation
+        # door sends it as a chat message there as it does on Slack.
+        conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
+        card = plant_card_files(self.d)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self._run()
+        argv = self.calls[0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertIn("--chat-file", argv)
+        self.assertEqual(argv[-1], inventory_card.chat(card)[1])
+        self.assertNotIn("which takes text", stage_log(self.d))
+
+
+    def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
+        self._answer()
+        self._answer(1, REFUSED)
+        with self._card():
+            self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts(), {})
+
+    def test_a_refusal_releases_the_claim_and_waits_before_the_next_post(self):
+        self._answer(1, REFUSED)
+        with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+            self._run()
+        mark_shown.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        attempts = self._attempts()
+        self.assertEqual(attempts["attempts"], 1)
+        self.assertIn("not a live conversation", attempts["last_reason"])
+        # Inside the wait: no post.
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+        # Past it: posted, and onboarding is done.
+        attempts["last_at"] -= bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[0] + 1
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(attempts), encoding="utf-8")
+        self._run()
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_past_the_last_attempt_the_report_waits(self):
+        record = {"attempts": bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS, "last_reason": "refused", "last_at": 0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._run()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_a_text_post_that_failed_is_retried(self):
+        # The text path accepts a possible second copy over a lost report.
+        for stdout, stderr in ((json.dumps({"error": "post failed: ratelimited"}) + "\n", ""),
+                               ("", "a2a: notify: flush: nats: connection closed"),
+                               ("", "a2a: notify: nats: authorization violation")):
+            with self.subTest(stderr=stderr or stdout):
+                (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                self._answer(1, stdout, stderr)
+                with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+                    self._run()
+                mark_shown.assert_not_called()
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.assertTrue((self.d / INVENTORY).exists())
+                self.assertFalse((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+                self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_the_text_note_is_logged_once_by_the_run_that_keeps_the_claim(self):
+        # The run whose text post failed released the claim and delivered nothing;
+        # the attempt that posts writes the one line an operator reads.
+        self._answer(1, REFUSED)
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertNotIn("went as text", stage_log(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink()
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(stage_log(self.d).count("the first report went as text: KAGE_SLACK_UX is off"), 1)
+
+    def test_a_text_post_that_may_have_landed_keeps_the_claim(self):
+        for answer in (subprocess.TimeoutExpired(["a2a"], 105), chat_notify.NOTIFY_OUTCOME_UNKNOWN, 2):
+            with self.subTest(answer=answer):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                if (self.d / DELIVERED).exists():
+                    (self.d / DELIVERED).replace(self.d / INVENTORY)
+                self._answer(answer, "", "no answer")
+                with mock.patch.object(bootstrap_delivery, "_mark_shown", return_value=True) as mark_shown:
+                    self._run()
+                mark_shown.assert_called_once()
+                self.assertTrue((self.d / COMPLETED).exists())
+                self.assertFalse((self.d / INVENTORY).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("may have landed", self._attempts()["last_reason"])
+                self.assertEqual(
+                    (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+                    bootstrap_delivery.MAYBE_POSTED,
+                )
+
+    def _card(self, **files):
+        """The flag on and the stage's files beside the report, so the card goes; ``self.expected`` is that card."""
+        self.expected = plant_card_files(self.d, **files)
+        return mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"})
+
+    def test_a_card_that_may_have_landed_is_sent_again_with_its_key(self):
+        with self._card():
+            for answer in (chat_notify.NOTIFY_OUTCOME_UNKNOWN, subprocess.TimeoutExpired(["a2a"], 105),
+                           1):
+                with self.subTest(answer=answer):
+                    self.calls.clear()
+                    (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                    self._answer(answer, "", "no answer")
+                    self._run()
+                    self.assertFalse((self.d / COMPLETED).exists())
+                    self.assertTrue((self.d / INVENTORY).exists())
+                    self.assertEqual(self._attempts()["attempts"], 1)
+            # The next attempt carries the same key, so a card that landed is edited.
+            record = self._attempts()
+            record["last_at"] -= bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[0] + 1
+            (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+            self.calls.clear()
+            self._run()
+        report = self.calls[0]
+        self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_edit_that_failed_counts_as_posted(self):
+        # The gateway holds the key, so the card from an earlier attempt is in the chat.
+        self._answer(1, json.dumps({"error": "edit failed: message_not_found"}) + "\n")
+        with self._card():
+            self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
+
+    def test_a_posted_report_records_its_outcome(self):
+        self._run()
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
+
+    def _claim(self, age):
+        (self.d / COMPLETED).touch()
+        then = time.time() - age
+        os.utime(self.d / COMPLETED, (then, then))
+
+    def test_a_claim_with_no_outcome_is_released_once_stale(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS - 30)
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists(), "a run may still be posting")
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+        self.assertEqual(self.calls, [])
+
+    def test_a_claim_with_an_outcome_retires_on_schedule(self):
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_called_once()
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_oobe_waits_for_the_outcome_before_it_retires(self):
+        oobe.write_state(self.d, {oobe.STATE_DONE: True})
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        self.assertFalse(oobe.finished(self.d, time.time()))
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self.assertTrue(oobe.finished(self.d, time.time()))
+
+    def test_retirement_outlasts_the_report_and_the_note(self):
+        self.assertGreater(bootstrap_delivery.RETIRE_AFTER_SECONDS, 2 * bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+        self.assertGreater(bootstrap_delivery.STALE_CLAIM_SECONDS, bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+
+    def test_the_last_failed_attempt_is_logged_for_an_operator(self):
+        record = {"attempts": bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1, "last_reason": "refused", "last_at": 0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._answer(1, REFUSED)
+        self._run()
+        log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        self.assertIn(f"not posted after {bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS} attempts", log)
+
+    def test_a_report_past_one_post_is_refused_before_the_claim(self):
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES + 1), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(rc, 1)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("larger than", self._attempts()["last_reason"])
+
+    def test_the_size_limit_counts_undecodable_bytes_as_posted(self):
+        # Each invalid byte decodes to a three-byte U+FFFD on the way to argv.
+        (self.d / INVENTORY).write_bytes(b"\xff" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES // 2))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bootstrap_delivery.main(self.d), 1)
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_the_gateway_answers_delivery_reads_are_the_gateway_s(self):
+        # The gateway and the agent ship in different images, so these texts cannot change.
+        source = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "notify.go").read_text(encoding="utf-8")
+        self.assertIn(f'"{bootstrap_delivery.NOTIFY_EDIT_FAILED_PREFIX} "', source)
+
+    def test_a_stale_claim_after_a_recorded_attempt_is_not_counted_twice(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        record = {"attempts": 2, "last_reason": "refused", "last_at": time.time()}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 2)
+
+    def test_the_outcome_is_recorded_before_the_note_goes(self):
+        seen = []
+
+        def run(argv, **kwargs):
+            if "--chat-file" not in argv:
+                seen.append((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+            return self._fake_run(argv, **kwargs)
+
+        with self._card(), mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(seen, [True])
+
+    def test_an_absent_route_is_retried_then_released(self):
+        delays = bootstrap_delivery.time.sleep
+        for _ in range(len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1):
+            self._answer(chat_notify.NOTIFY_ROUTE_UNAVAILABLE, "", "no gateway")
+        self._run()
+        self.assertEqual(len(self.calls), len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
+        self.assertEqual([c.args[0] for c in delays.call_args_list], list(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS))
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_the_card_marks_findings_before_the_note_goes(self):
+        order = []
+        real = self._fake_run
+
+        def run(argv, **kwargs):
+            order.append("card" if "--chat-file" in argv else "note")
+            return real(argv, **kwargs)
+
+        with self._card(), mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(order, ["card", "mark", "note"])
+
+    def test_findings_are_marked_shown_only_after_the_post(self):
+        order = []
+        self.answers = []
+        with mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
+                mock.patch.object(bootstrap_delivery, "_notify_conversation",
+                                  side_effect=lambda *a, **k: order.append("post") or (bootstrap_delivery.POSTED, "")):
+            self._run()
+        self.assertEqual(order, ["post", "mark"])
+
+    def test_a_child_env_without_the_route_claims_nothing(self):
+        for name, value in (("A2A_NOTIFY_CONVERSATIONS", ""), ("A2A_NOTIFY_CONVERSATIONS", "google_chat"),
+                            ("NATS_URL", ""), ("A2A_BUS_USER", "")):
+            with self.subTest(name=name, value=value), mock.patch.dict(os.environ, {name: value, "NATS_USER": ""}):
+                self.assertEqual(self._run(), 0)
+                self.assertEqual(self.calls, [])
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("the report waits", self._attempts()["last_reason"])
+
+    def test_an_empty_served_list_reads_as_unset_in_the_reason(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": ""}):
+            self._run()
+        self.assertIn("(A2A_NOTIFY_CONVERSATIONS=<unset>)", self._attempts()["last_reason"])
+
+    def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
+        record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+            self._run()
+        self.assertEqual(self._attempts()["last_at"], 1000.0)
+        self.assertIn("NATS_URL", self._attempts()["last_reason"])
+
+    def test_the_same_block_is_not_rewritten_each_tick(self):
+        with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+            self._run()
+            first = (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).stat().st_mtime_ns
+            with mock.patch.object(bootstrap_delivery.time, "time", return_value=time.time() + 60):
+                self._run()
+        self.assertEqual((self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).stat().st_mtime_ns, first)
+
+    def test_a_marker_without_its_conversation_never_prints_the_report(self):
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).unlink()
+        self._run()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn(bootstrap_delivery.CONVERSATION_FILE, self._attempts()["last_reason"])
+
+    def test_the_conversation_wins_over_a_job_origin_marker(self):
+        (self.d / ALIGNED).touch()
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_gateway_error_reads_only_an_answer_that_posted_nothing(self):
+        self.assertEqual(bootstrap_delivery._gateway_error(REFUSED), "not a live conversation with that context")
+        self.assertEqual(bootstrap_delivery._gateway_error(json.dumps({"message_id": "1", "error": "partly"})), "")
+        self.assertEqual(bootstrap_delivery._gateway_error("not json"), "")
+        self.assertEqual(bootstrap_delivery._gateway_error(""), "")
 
 
 class DeliveryMarksShownTest(unittest.TestCase):
@@ -352,7 +1000,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
 
     def test_a_racing_run_marks_nothing(self):
         self._shown()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
         self.assertEqual(self.posts, [])
@@ -442,6 +1090,35 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
                 (["api", "web"], {"project": "acme", "cluster": "prod", "complete": True}, False),
             ],
         )
+
+    def test_registration_records_that_the_fleet_was_checked(self):
+        self._write()
+        self._run()
+        self.assertTrue((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_clean_fleet_records_the_check_with_nothing_to_register(self):
+        self._write(items={"items": []}, scores=None)
+        self._run()
+        self.assertEqual(self.sent, [])
+        self.assertTrue((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_queue_that_does_not_answer_records_no_check(self):
+        self._write()
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=OSError("down")):
+            self._run()
+        self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_refused_batch_records_no_check(self):
+        self._write()
+        refused = urllib.error.HTTPError("http://q", 400, "bad", None, None)
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=refused):
+            self._run()
+        self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_the_check_marker_is_the_one_the_board_reads(self):
+        import board_snapshot  # agents/platform/scripts, beside this script in the image
+
+        self.assertEqual(bootstrap_delivery.FINDINGS_REGISTERED_MARKER, board_snapshot.FINDINGS_REGISTERED_MARKER)
 
     def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
         # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
@@ -541,7 +1218,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
 
     def test_a_racing_run_that_loses_the_claim_only_registers_again(self):
         self._write()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
 
@@ -645,6 +1322,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
     SANDBOX_SHOWN = "/opt/data/INVENTORY.shown.json"
     SANDBOX_ITEMS = "/opt/data/INVENTORY.items.json"
     SANDBOX_SCORES = "/opt/data/INVENTORY.scores.json"
+    SANDBOX_LIMITS = "/opt/data/INVENTORY.limits.json"
     _REAL_READ_BYTES = staticmethod(sandbox_exec.read_bytes)
 
     def setUp(self):
@@ -685,10 +1363,12 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, delivered("# Sandbox report\n"))
         self.assertTrue((self.d / COMPLETED).exists())
-        report_read, items_read, shown_read = self.read.call_args_list
+        report_read, items_read, scores_read, limits_read, shown_read = self.read.call_args_list
         self.assertEqual(report_read.args, (self.SANDBOX_REPORT,))
         self.assertEqual(report_read.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
         self.assertEqual(items_read.args, (self.SANDBOX_ITEMS,))
+        self.assertEqual(scores_read.args, (self.SANDBOX_SCORES,))
+        self.assertEqual(limits_read.args, (self.SANDBOX_LIMITS,))
         self.assertEqual(shown_read.args, (self.SANDBOX_SHOWN,))
         # The read runs as read_bytes' own default login; the rename as the
         # terminal's, which owns the sandbox's /opt/data.
@@ -735,16 +1415,61 @@ class DeliveryFromSandboxTest(unittest.TestCase):
             {c.kwargs["max_bytes"] for c in self.read.call_args_list[1:3]}, {bootstrap_delivery.BATCH_MAX_BYTES + 1}
         )
 
-    def test_an_unreachable_sandbox_after_the_claim_still_delivers(self):
+    def test_the_files_beside_the_report_are_read_once_before_the_claim(self):
+        items, scores = card_fixtures.criticals_items(), card_fixtures.criticals_scores()
+        self.beside = {
+            self.SANDBOX_ITEMS: json.dumps({"items": items}).encode("utf-8"),
+            self.SANDBOX_SCORES: json.dumps(scores).encode("utf-8"),
+            self.SANDBOX_LIMITS: b'{"first_report_criticals": 2}',
+        }
+        self.shown = json.dumps(card_fixtures.shown_for(items, scores)).encode("utf-8")
+        reads = []
+        real = self._read
+
+        def read(path, **kwargs):
+            reads.append((path, (self.d / COMPLETED).exists()))
+            return real(path, **kwargs)
+
+        self.read.side_effect = read
+        with mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}), \
+                mock.patch.object(bootstrap_delivery, "_post_surfaced") as mark:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
+        self.assertEqual(reads, [(path, False) for path in (
+            self.SANDBOX_REPORT, self.SANDBOX_ITEMS, self.SANDBOX_SCORES, self.SANDBOX_LIMITS, self.SANDBOX_SHOWN)])
+        # The shown file's two rows, marked from that one read.
+        self.assertEqual(mark.call_count, 2)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_unreachable_sandbox_on_a_file_beside_the_report_is_a_silent_retry(self):
+        # Read before the claim, like the report, so a sandbox that stops answering
+        # between the two leaves no claim behind.
+        for path in (self.SANDBOX_ITEMS, self.SANDBOX_SCORES, self.SANDBOX_LIMITS, self.SANDBOX_SHOWN):
+            for exc in (sandbox_exec.SandboxUnavailable("gone"), subprocess.TimeoutExpired(["ssh"], 30)):
+                with self.subTest(path=path, exc=type(exc).__name__):
+                    def read(p, _path=path, _exc=exc, **_kw):
+                        if p == _path:
+                            raise _exc
+                        return b"# Sandbox report\n"
+
+                    self.read.side_effect = read
+                    rc, out, err = self._run()
+                    self.assertEqual((rc, out), (0, ""))
+                    self.assertIn("did not answer", err)
+                    self.assertFalse((self.d / COMPLETED).exists())
+                    self.run_.assert_not_called()
+
+    def test_a_file_beside_the_report_that_cannot_be_read_still_delivers(self):
+        # Short of an unreachable sandbox, a read that failed is that file's problem, not the report's.
         def read(path, **_kw):
             if path == self.SANDBOX_SHOWN:
-                raise sandbox_exec.SandboxUnavailable("gone")
+                raise sandbox_exec.SandboxReadFailed("no space")
             return b"# Sandbox report\n"
 
         self.read.side_effect = read
         rc, out, err = self._run()
         self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
-        self.assertIn("could not read INVENTORY.shown.json", err)
+        self.assertIn("could not read INVENTORY.shown.json; marking nothing: no space", err)
 
     def test_no_human_means_no_sandbox_read(self):
         (self.d / ALIGNED).unlink()
@@ -852,10 +1577,1104 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertIn("could not archive INVENTORY.md in the sandbox", err)
 
     def test_a_racing_run_does_not_touch_the_sandbox_report(self):
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
         self.run_.assert_not_called()
+
+
+class DeliveryCardTest(unittest.TestCase):
+    """On the origin path, the card built from the stage's files goes through the Slack door the install
+    has; the text goes, and the stage log says why, when it cannot."""
+
+    REPORT = "# GKE Environment Scan\n\nTwo things need you.\n"
+    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
+
+    def setUp(self):
+        import slack_blocks_post
+
+        self.sbp = slack_blocks_post
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        # What the text path posts for this report with the flag on and a Slack origin.
+        self.text = inventory_presenter.present(self.REPORT)
+        self._reset()
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
+            mock.patch.object(bootstrap_delivery, "_post_surfaced"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _reset(self):
+        for path in self.d.iterdir():
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.card = plant_card_files(self.d)
+
+    def _run(self, post=lambda *a: "9.9", origin=ORIGIN, gateway=None, relay=RELAY_URL, **env):
+        """One tick. ``post`` answers the relay; ``gateway`` (an exit code) answers ``a2a notify`` under next."""
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", **env})
+        if relay is not None:
+            environ["SLACK_RELAY_URL"] = relay
+        if gateway is not None:
+            environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, gateway, "{}", "refused")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post", side_effect=post) as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.posts = poster.call_args_list
+        self.err = err.getvalue()
+        return out.getvalue()
+
+    def test_the_names_are_the_ones_the_hand_off_writes_and_select_reads(self):
+        self.assertEqual(bootstrap_delivery.LIMITS_NAME, Path(inventory_findings.DEFAULT_LIMITS_PATH).name)
+        self.assertEqual(bootstrap_delivery.LIMITS_NAME, Path(bootstrap_handoff.LIMITS_PATH).name)
+
+    def test_the_card_posts_as_blocks_into_the_origin_and_only_the_note_is_printed(self):
+        self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+        (post,) = self.posts
+        blocks, text = inventory_card.blocks(self.card)
+        self.assertEqual(post.args, ("C1", text, blocks, "1.5"))
+        self.assertEqual(blocks[-1]["elements"][0]["text"]["text"], "Fix the first one")
+        self.assertIn("First look at your fleet: two things to fix first", text)
+        # The report's prose is not read.
+        self.assertNotIn("Two things need you", json.dumps(blocks))
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
+        self.assertNotIn("went as text", stage_log(self.d))
+
+    def test_the_card_goes_through_the_gateway_under_next(self):
+        self.assertEqual(self._run(gateway=0), RUNNING_NOTE + "\n")
+        self.assertEqual(self.posts, [])
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "C1/1.5")
+        expected, text = inventory_card.chat(self.card)
+        self.assertEqual(chat, expected)
+        self.assertEqual(argv[-1], text)
+        self.assertEqual(chat["choices"][0]["text"], "Fix the first one")
+        self.assertFalse(os.path.exists(argv[argv.index("--chat-file") + 1]))
+
+    def test_a_google_chat_origin_under_next_gets_the_card_through_the_gateway(self):
+        # The home door on Google Chat: the card goes to the gateway with the thread's
+        # resource name as it is, no channel qualifier, and nothing to the Slack relay.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "google_chat"})
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), RUNNING_NOTE + "\n")
+        poster.assert_not_called()
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "spaces/A/threads/B")
+        self.assertEqual(chat, inventory_card.chat(self.card)[0])
+
+    def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
+        # The gateway serves Google Chat, so the card is built, but only Slack has a home,
+        # so the home door has nowhere to send it: the report prints as text and the log says so.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "slack", "A2A_NOTIFY_CONVERSATIONS": "google_chat,slack"})
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run") as run,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        poster.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(out.getvalue().startswith(self.text.rstrip("\n")[:40]))
+        self.assertIn("the gateway routes no home posts to google_chat", stage_log(self.d))
+
+    def test_a_skip_goes_out_as_its_own_message_after_the_card(self):
+        (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            oobe.skip(self.d, oobe.SKIP_NOT_NEW, 1000.0)
+        self.assertEqual(
+            self._run(),
+            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
+        )
+        self.assertEqual(len(self.posts), 1)
+
+    def test_the_done_card_posts_for_a_clean_fleet(self):
+        card = plant_card_files(self.d, items=[], scores=None, shown={"items": []})
+        self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+        (post,) = self.posts
+        blocks, text = inventory_card.blocks(card)
+        self.assertEqual(post.args[1:3], (text, blocks))
+        self.assertIn("First look at your fleet: done", text)
+
+    def test_an_unreadable_scores_file_beside_an_empty_item_list_still_builds_the_done_card(self):
+        # Nothing reads the scores file for an empty item list, so a truncated write or an earlier
+        # sweep's file left beside a clean sweep's items must not hold the one-time done card back.
+        for body in (b'{"scores": {', b"[1]", b"\xff"):
+            with self.subTest(body=body):
+                self._reset()
+                card = plant_card_files(self.d, items=[], scores=None, shown={"items": []})
+                (self.d / SCORES).write_bytes(body)
+                self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+                (post,) = self.posts
+                blocks, text = inventory_card.blocks(card)
+                self.assertEqual(post.args[1:3], (text, blocks))
+                self.assertIn("First look at your fleet: done", text)
+                self.assertNotIn("went as text", stage_log(self.d))
+                self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_the_limits_file_sets_the_rows(self):
+        card = plant_card_files(self.d, limits={"first_report_criticals": 1})
+        self.assertEqual(len(card.rows), 1)
+        self._run()
+        (post,) = self.posts
+        self.assertEqual(post.args[2], inventory_card.blocks(card)[0])
+        self.assertEqual(post.args[2][-1]["elements"][0]["text"]["text"], "Fix it")
+
+    def test_an_unusable_limits_file_means_the_defaults(self):
+        for body in ("nope", "[1]", '{"first_report_criticals": "many"}'):
+            with self.subTest(body=body):
+                self._reset()
+                (self.d / LIMITS).write_text(body, encoding="utf-8")
+                # select ran under the defaults too, so the recompute matches and the card goes.
+                self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+                self.assertEqual(self.posts[0].args[2], inventory_card.blocks(self.card)[0])
+                self.assertIn("using the default", self.err)
+
+    def test_a_dismissed_row_leaves_the_card(self):
+        first = json.loads((self.d / SHOWN).read_text(encoding="utf-8"))["items"][0]["ids"][0]
+        expected = plant_card_files(self.d, suppressed={first})
+        with mock.patch.object(
+            inventory_findings, "post_batch", return_value={"results": [{"id": first, "outcome": "suppressed"}]}
+        ):
+            self._run()
+        (post,) = self.posts
+        self.assertEqual(post.args[2], inventory_card.blocks(expected)[0])
+        self.assertIn("First look at your fleet: one thing to fix first", post.args[1])
+
+    def test_every_reason_the_card_falls_to_text_is_logged(self):
+        def unlink(name):
+            return lambda: (self.d / name).unlink()
+
+        def write(name, body):
+            return lambda: (self.d / name).write_text(body, encoding="utf-8")
+
+        marker = bootstrap_handoff.HANDOFF_MARKER
+        google = {"platform": "google_chat", "chat_id": "spaces/A"}
+        cases = (
+            ("the flag is off", lambda: None, self.ORIGIN, {"KAGE_SLACK_UX": "0"}, "KAGE_SLACK_UX is off", self.REPORT),
+            ("a Google Chat origin", lambda: None, google, {}, "goes to google_chat, which takes text", self.REPORT),
+            ("no origin", lambda: None, {}, {}, "a chat whose platform is not recorded", self.REPORT),
+            ("no ranking card", write(marker, f"sweep=t\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n"),
+             self.ORIGIN, {}, "filed no prioritization card", self.text),
+            ("an unreadable marker", lambda: (self.d / marker).write_bytes(b"task_id=\xff\n"),
+             self.ORIGIN, {}, "marker could not be read", self.text),
+            ("no items file", unlink(ITEMS), self.ORIGIN, {}, "no INVENTORY.items.json", self.text),
+            ("no shown file", unlink(SHOWN), self.ORIGIN, {}, "no INVENTORY.shown.json", self.text),
+            ("no scores file beside items", unlink(SCORES), self.ORIGIN, {}, "no scores file beside the items", self.text),
+            ("an unreadable scores file beside items", write(SCORES, "[1]"), self.ORIGIN, {},
+             "INVENTORY.scores.json could not be read: INVENTORY.scores.json is not a JSON object", self.text),
+            ("an items file that is not an object", write(ITEMS, "[1]"), self.ORIGIN, {},
+             "INVENTORY.items.json could not be read: INVENTORY.items.json is not a JSON object", self.text),
+            ("a shown file that is not JSON", write(SHOWN, "{not json"), self.ORIGIN, {},
+             "INVENTORY.shown.json could not be read: ", self.text),
+            ("a shown file past the cap", write(SHOWN, "x" * (bootstrap_delivery.SHOWN_MAX_BYTES + 1)), self.ORIGIN, {},
+             f"INVENTORY.shown.json could not be read: larger than {bootstrap_delivery.SHOWN_MAX_BYTES} bytes", self.text),
+            ("a shown file that differs", write(SHOWN, json.dumps({"items": [{"class": "critical", "ids": ["x"]}]})),
+             self.ORIGIN, {}, "differ from the shown file", self.text),
+            ("a score the selection refuses", lambda: (self.d / SCORES).write_text(json.dumps(
+                {**card_fixtures.criticals_scores(), "scores": {k: {**v, "recommendation": {**v["recommendation"], "risk": ""}}
+                 for k, v in card_fixtures.criticals_scores()["scores"].items()}}), encoding="utf-8"),
+             self.ORIGIN, {}, "the selection could not be recomputed", self.text),
+        )
+        for name, arrange, origin, env, reason, text in cases:
+            with self.subTest(name):
+                self._reset()
+                arrange()
+                self.assertEqual(self._run(origin=origin, **env), delivered(text))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.notifies, [])
+                log = stage_log(self.d)
+                self.assertIn("the first report went as text: ", log)
+                self.assertIn(reason, log)
+                self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_a_card_no_door_could_post_goes_as_text_and_the_log_says_why(self):
+        ok = lambda *a: "9.9"  # noqa: E731
+        cases = (
+            ("no chat id", {"platform": "slack"}, ok, None, RELAY_URL, "not a Slack chat with a chat id", 0, 0),
+            ("no relay", self.ORIGIN, ok, None, None, "no Slack relay is configured", 0, 0),
+            ("Slack refused the blocks", self.ORIGIN, self.sbp.Refused("invalid_blocks"), None, RELAY_URL,
+             "Slack refused the blocks: invalid_blocks", 1, 0),
+            ("a refusal that is not about the blocks", self.ORIGIN, self.sbp.Refused("channel_not_found"), None, RELAY_URL,
+             "Slack refused the blocks: channel_not_found", 1, 0),
+            ("the relay failed", self.ORIGIN, OSError("connection refused"), None, RELAY_URL,
+             "OSError('connection refused')", 1, 0),
+            # The first inventory is sent once, so a second copy beats none.
+            ("the post may have landed", self.ORIGIN, TimeoutError("timed out"), None, RELAY_URL,
+             "TimeoutError('timed out')", 1, 0),
+            ("the gateway refused", self.ORIGIN, ok, 1, RELAY_URL, "the gateway did not post it: refused", 0, 1),
+            ("no thread for the gateway", {"platform": "slack", "chat_id": "C1"}, ok, 0, RELAY_URL,
+             "no thread for the gateway", 0, 0),
+        )
+        for name, origin, post, gateway, relay, reason, posts, notifies in cases:
+            with self.subTest(name):
+                self._reset()
+                self.assertEqual(self._run(post=post, origin=origin, gateway=gateway, relay=relay), delivered(self.text))
+                self.assertEqual((len(self.posts), len(self.notifies)), (posts, notifies))
+                log = stage_log(self.d)
+                self.assertIn("the report card was not posted, so the text goes: ", log)
+                self.assertIn(reason, log)
+
+
+class DeliveryWithoutThreadTest(unittest.TestCase):
+    """#4058: a report nobody aligned to is filed as a ledger issue after a day, and retired after a week."""
+
+    REPORT = "# GKE Environment Discovery Report\n\nTwo things need you.\n"
+    REPO = "example-org/gitops"
+    HOUR = 60 * 60
+    DAY = 24 * HOUR
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        self.repos = [self.REPO]
+        self.gitops_repo = None
+        self.forge_calls = []
+        self.forge_kwargs = []
+        self.forge_answers = {}
+        self.forge_refusals = {}
+        self.runs = []
+        self.run_code = 0
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.dict(os.environ, {**NEXT_ENV, "A2A_NOTIFY_PLATFORM": "slack"}),
+            mock.patch.object(bootstrap_delivery.time, "sleep"),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
+            mock.patch.object(bootstrap_delivery, "_post_surfaced"),
+            mock.patch.object(bootstrap_delivery.gitops_workspace, "get_managed_github_repo_names",
+                              side_effect=lambda: list(self.repos)),
+            mock.patch.object(bootstrap_delivery.gitops_workspace, "get_gitops_repo",
+                              side_effect=lambda *a, **k: self.gitops_repo),
+            mock.patch.object(bootstrap_delivery.forge, "call", side_effect=self._forge),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=self._run_cli),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        notes = mock.patch.object(bootstrap_delivery, "_stage_note")
+        self.notes = notes.start()
+        self.addCleanup(notes.stop)
+
+    def _forge(self, verb, payload, repo, **kwargs):
+        self.forge_calls.append((verb, dict(payload), repo))
+        self.forge_kwargs.append(dict(kwargs))
+        if verb in self.forge_refusals:
+            raise bootstrap_delivery.forge.ForgeError(self.forge_refusals[verb], "nope")
+        if verb == "issue-create":
+            return self.forge_answers.get(verb, {"issue": {"number": 42, "labels": [{"name": bootstrap_delivery.REPORT_ISSUE_LABEL}]}})
+        if verb == "issue-list" and "labels" not in payload:
+            return self.forge_answers.get("issue-list-unlabelled", {"issues": []})
+        return self.forge_answers.get(verb, {"issues": []})
+
+    def _run_cli(self, argv, **_kwargs):
+        self.runs.append(argv)
+        return subprocess.CompletedProcess(argv, self.run_code, "{}\n", "")
+
+    def _filed(self, age_seconds):
+        (self.d / SCAN_FILED).write_text(
+            f"sweep=s1\ntask_id=t1\nfiled_at={int(time.time() - age_seconds)}\n", encoding="utf-8"
+        )
+
+    def _main(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(buf.getvalue(), "", "this path never prints the report")
+        return rc
+
+    def _note_texts(self):
+        return [call.args[1] for call in self.notes.call_args_list]
+
+    def _no_human_claim(self, at=None):
+        """A claim the no-human path took, aged to ``at`` when given."""
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_NO_HUMAN + "\n", encoding="utf-8")
+        if at is not None:
+            os.utime(self.d / COMPLETED, (at, at))
+
+    def test_silent_before_the_scan_is_filed(self):
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_waits_a_day_for_a_human_to_open_the_thread(self):
+        self._filed(self.HOUR)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.runs, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_files_the_report_as_a_ledger_issue_and_says_so_in_home(self):
+        self._filed(self.DAY + self.HOUR)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
+        _, create, repo = self.forge_calls[-1]
+        self.assertEqual(repo, self.REPO)
+        self.assertIn(bootstrap_delivery.REPORT_ISSUE_MARKER, create["body"])
+        self.assertIn(self.REPORT.strip(), create["body"])
+        self.assertIn("no chat thread could take it", create["body"])
+        self.assertEqual(create["labels"], [bootstrap_delivery.REPORT_ISSUE_LABEL])
+        self.assertTrue(create["title"].startswith("First-run inventory report ("))
+        self.assertTrue((self.d / COMPLETED).exists(), "the claim marks onboarding delivered")
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertTrue((self.d / bootstrap_delivery.DELIVERED_REPORT_NAME).exists())
+        record = bootstrap_delivery._filed_record(self.d)
+        self.assertEqual((record["repo"], record["number"]), (self.REPO, 42))
+        self.assertEqual(len(self.runs), 1)
+        argv = self.runs[0]
+        self.assertEqual(argv[:4], [chat_notify.A2A_CLI, "notify", "--platform", "slack"])
+        self.assertNotIn("--thread", argv)
+        self.assertIn(f"https://github.com/{self.REPO}/issues/42", argv[-1], "a link, not a slug")
+        self.assertNotIn("sweep", argv[-1], "a word the reader has never seen")
+        self.assertEqual(record["url"], f"https://github.com/{self.REPO}/issues/42")
+        self.assertIn(bootstrap_delivery.REPORT_FILED_NOTE.format(ref=f"{self.REPO}#42"), self._note_texts())
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+            self._note_texts(),
+        )
+
+    def test_a_second_run_after_filing_does_nothing(self):
+        self._filed(self.DAY + self.HOUR)
+        self._main()
+        calls, runs = len(self.forge_calls), len(self.runs)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual((len(self.forge_calls), len(self.runs)), (calls, runs))
+
+    def test_a_kept_home_line_is_delivery_enough(self):
+        self._filed(self.DAY + self.HOUR)
+        self.run_code = chat_notify.NOTIFY_KEPT
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_KEPT),
+            self._note_texts(),
+        )
+
+    def test_a_route_that_comes_back_gets_the_home_line(self):
+        self._filed(self.DAY + self.HOUR)
+        codes = [chat_notify.NOTIFY_ROUTE_UNAVAILABLE, 0]
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            return subprocess.CompletedProcess(argv, codes.pop(0), "{}\n", "")
+        with mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(len(self.runs), 2, "one retry after the route was not there")
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+            self._note_texts(),
+        )
+
+    def test_a_route_that_stays_away_is_a_log_line(self):
+        self._filed(self.DAY + self.HOUR)
+        self.run_code = chat_notify.NOTIFY_ROUTE_UNAVAILABLE
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(len(self.runs), len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
+        self.assertTrue((self.d / COMPLETED).exists(), "the issue is the record; the line is best effort")
+        self.assertTrue(any("exited 4" in n for n in self._note_texts()))
+
+    def test_the_home_line_lands_on_every_routed_platform(self):
+        self._filed(self.DAY + self.HOUR)
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            if argv[3] == "google_chat":
+                raise OSError("no a2a binary")
+            return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+        with (
+            mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack"}),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+        ):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([argv[:4] for argv in self.runs], [
+            [chat_notify.A2A_CLI, "notify", "--platform", "google_chat"],
+            [chat_notify.A2A_CLI, "notify", "--platform", "slack"],
+        ], "a failure on google_chat does not skip slack")
+        line_notes = [n for n in self._note_texts() if "the home line" in n]
+        self.assertEqual(line_notes, [
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="google_chat")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(
+                outcome=bootstrap_delivery.HOME_LINE_FAILED.format(
+                    code=bootstrap_delivery.HOME_LINE_NO_EXIT, detail=OSError("no a2a binary"))),
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="slack")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+        ])
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_no_routed_platform_posts_no_home_line(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(self.runs, [])
+
+    def test_no_gitops_repository_leaves_the_report_in_place(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = []
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertEqual(
+            bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery.NO_LEDGER_REPO_REASON,
+        )
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "the conversation path's record is untouched")
+
+    def test_the_gitops_repository_wins_among_several_on_github(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = ["example-org/other", self.REPO]
+        self.gitops_repo = self.REPO
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], self.REPO)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_a_gitops_repository_on_another_forge_falls_back_to_the_one_github_repository(self):
+        self._filed(self.DAY + self.HOUR)
+        self.gitops_repo = "gitlab.example.com/example-org/gitops"
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], self.REPO)
+
+    def test_the_retire_path_registers_the_findings_first(self):
+        self._filed(8 * self.DAY)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", return_value=set()) as reg:
+            self.assertEqual(self._main(), 0)
+        reg.assert_called_once()
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_two_repositories_are_recorded_not_guessed(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = [self.REPO, "example-org/other"]
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(
+            bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery.LEDGER_REPO_AMBIGUOUS_REASON.format(count=2),
+        )
+
+    def test_reuses_the_issue_an_earlier_run_opened(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [
+                {"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1") + "\nold"},
+                {"number": 9, "body": "other"},
+            ]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 7)
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["url"], f"https://github.com/{self.REPO}/issues/7")
+
+    def test_another_installs_issue_in_a_shared_repository_is_not_reused(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [{"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="someone-elses") + "\nold"}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
+        _, create, _ = self.forge_calls[-1]
+        self.assertIn(bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1"), create["body"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 42)
+
+    def test_a_claim_the_run_died_holding_is_released_as_stale(self):
+        """No record beside the claim on the no-human path: the stale-claim rule applies, as on the conversation path."""
+        self._filed(self.DAY + self.HOUR)
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released")
+        (self.d / bootstrap_delivery.REPORT_FILED_FILE).write_text("{}", encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "settled once the filing is on record")
+
+    def test_an_origin_path_claim_still_settles_at_once(self):
+        (self.d / COMPLETED).touch()
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_human_arriving_during_the_retire_reads_keeps_the_report(self):
+        self._filed(8 * self.DAY)
+        real = bootstrap_delivery._register_findings
+        def arrive(*a, **k):
+            (self.d / ALIGNED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=arrive):
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_the_retire_path_leaves_a_record_so_its_claim_settles(self):
+        self._filed(8 * self.DAY)
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_human_arriving_during_the_reads_gets_the_claim_back(self):
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def arrive(*a, **k):
+            (self.d / ALIGNED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=arrive):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([v for v, _, _ in self.forge_calls], [], "no issue: the thread takes the report")
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_the_brokers_url_wins_and_a_ghes_slug_builds_its_own(self):
+        self.forge_answers["issue-create"] = {"issue": {"number": 42, "html_url": "https://ghe.example.com/x/y/issues/42"}}
+        self.assertEqual(bootstrap_delivery._issue_url(self.REPO, 42, {"html_url": "https://ghe.example.com/x/y/issues/42"}),
+                         "https://ghe.example.com/x/y/issues/42")
+        self.assertEqual(bootstrap_delivery._issue_url("ghe.example.com/acme/fleet", 3, {}),
+                         "https://ghe.example.com/acme/fleet/issues/3")
+        self.assertEqual(bootstrap_delivery._issue_url("acme/fleet", 3, {"url": "not a url"}),
+                         "https://github.com/acme/fleet/issues/3")
+
+    def test_an_odd_listing_row_is_skipped_not_raised(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [{"number": None, "body": bootstrap_delivery.REPORT_ISSUE_MARKER}, {"body": bootstrap_delivery.REPORT_ISSUE_MARKER}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_unexpected_error_after_the_claim_releases_it(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery, "_file_report_issue", side_effect=KeyError("number")):
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "the claim is released, not held with nothing filed")
+        self.assertTrue((self.d / INVENTORY).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
+
+    def test_refused_creates_do_not_block_a_thread_a_human_binds_later(self):
+        """The ledger path's attempts live in their own record; the conversation path's count stays zero."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        for _ in range(bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS):
+            self._main()
+            record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+            record[bootstrap_delivery.ATTEMPTS_AT] = 0.0  # past the wait
+            (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)),
+                         bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self.assertTrue(bootstrap_delivery._conversation_ready(self.d, CONVERSATION), "the human's thread is not charged the ledger's refusals")
+
+    def test_an_origin_claim_after_a_released_ledger_claim_settles(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self._main()  # released
+        (self.d / ALIGNED).touch()
+        (self.d / COMPLETED).touch()  # the origin path's own claim, later
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_report_too_long_for_an_issue_is_counted_before_the_second_read(self):
+        """Sized as filed, header included, before the sweep files are read or anything registered."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.ISSUE_BODY_MAX_CHARS - 200), encoding="utf-8")
+        with mock.patch.object(bootstrap_delivery, "REPORT_MAX_BYTES", bootstrap_delivery.ISSUE_BODY_MAX_CHARS * 2), \
+                mock.patch.object(bootstrap_delivery, "_read_sweep_files") as sweep, \
+                mock.patch.object(bootstrap_delivery, "_register_findings") as reg:
+            self.assertEqual(self._main(), 0)
+        sweep.assert_not_called()
+        reg.assert_not_called()
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("longer than an issue body", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1, "counted, so it stops after the waits")
+
+    def test_a_claim_lost_to_an_origin_run_is_left_as_theirs(self):
+        """An origin run claimed first during this path's reads: its claim keeps its own tag and settles."""
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def origin_claims(*a, **k):
+            bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN)
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=origin_claims):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_ORIGIN)
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_two_no_human_runs_overlap_and_the_second_yields(self):
+        """A manual run beside the tick claimed first: the second run's create fails, it files nothing,
+        sends nothing, and leaves the winner's claim (and its tag) as it found it."""
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def other_claims(*a, **k):
+            self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=other_claims):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [], "nothing filed twice")
+        self.assertEqual(self.runs, [], "no second home line")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d), "the winner's filing is still owed")
+
+    def test_a_claim_that_cannot_be_written_is_not_taken(self):
+        """A tag that cannot be written is no claim at all: nothing is left behind, and the run files
+        nothing and records nothing."""
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery.os, "link", side_effect=OSError(28, "no space")):
+            self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
+            self.assertFalse((self.d / COMPLETED).exists())
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual([p.name for p in self.d.glob(COMPLETED + "*")], [], "no staged file left")
+        self.assertEqual(self.forge_calls, [], "no issue without the claim")
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self.assertTrue((self.d / INVENTORY).exists(), "the next tick retries")
+
+    def test_the_claim_never_exists_without_its_tag(self):
+        """A run killed between the create and the write must not leave an empty claim (it would read
+        as an older build's and settle unfiled): the tag is on disk before the claim's name is."""
+        real_link = os.link
+        seen = []
+
+        def linking(src, dst, *a, **k):
+            seen.append((Path(src).read_text(encoding="utf-8"), Path(dst).exists()))
+            return real_link(src, dst, *a, **k)
+
+        with mock.patch.object(bootstrap_delivery.os, "link", linking):
+            self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
+        self.assertEqual(seen, [(bootstrap_delivery.CLAIM_PATH_NO_HUMAN + "\n", False)])
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertEqual([p.name for p in self.d.glob(COMPLETED + "*")], [COMPLETED], "no staged file left")
+        self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN), "exclusive")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN, "the loser changes nothing")
+
+    def test_a_filed_record_that_does_not_land_keeps_the_report_and_the_claim(self):
+        """The issue is open but nothing on disk says so: archiving the report would leave the next run
+        nothing to read, so the issue is never found again and day seven retires a filed report."""
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery, "_record_filed", return_value=False):
+            self.assertEqual(self._main(), 0)
+        self.assertIn("issue-create", [c[0] for c in self.forge_calls])
+        self.assertTrue((self.d / INVENTORY).exists(), "the report stays for the next run")
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+        self.assertTrue((self.d / COMPLETED).exists(), "the claim stays until the stale rule releases it")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self.runs, [], "no home line until the filing is on record")
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "the stale rule releases it")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""), "read as this path's")
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0)
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "not the conversation path's")
+
+    def test_a_retire_record_that_does_not_land_keeps_the_report_and_the_claim(self):
+        self._filed(8 * self.DAY)
+        with mock.patch.object(bootstrap_delivery, "_record_retired", return_value=False):
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_stale_no_human_release_does_not_count_toward_the_cap(self):
+        """The released run may have opened the issue before it died (a record that did not land): a
+        counted release on the last allowed attempt would stop the next run short of finding it."""
+        self._filed(self.DAY + self.HOUR)
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps({
+            bootstrap_delivery.ATTEMPTS_COUNT: bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1,
+            bootstrap_delivery.ATTEMPTS_REASON: "refused", bootstrap_delivery.ATTEMPTS_AT: old - self.DAY,
+        }), encoding="utf-8")
+        self._no_human_claim(old)
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1)
+        self.assertEqual(self._main(), 0)
+        self.assertIn("issue-create", [c[0] for c in self.forge_calls], "the next run reaches the ledger again")
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+
+    def test_a_stale_no_human_claim_is_released_once_and_reclaimed_by_the_next_run(self):
+        self._filed(self.DAY + self.HOUR)
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released, nothing else this tick")
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN, "re-claimed")
+        self.assertEqual([c[0] for c in self.forge_calls].count("issue-create"), 1)
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls].count("issue-create"), 1, "no second takeover")
+        self.assertTrue((self.d / COMPLETED).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(record.get(bootstrap_delivery.ATTEMPTS_REASON, "").count("recorded no outcome"), 1)
+
+    def test_a_stale_release_is_recorded_by_the_claims_tag(self):
+        """A dead conversation-path claim counts an attempt in its record; a dead no-human one is recorded
+        in its own record, uncounted."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_CONVERSATION + "\n", encoding="utf-8")
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1, "counted")
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self._no_human_claim(old)
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1, "not charged again")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0, "uncounted")
+
+    def test_an_empty_claim_file_is_not_a_no_human_claim(self):
+        """A claim an older build wrote before the tag existed: it settles and is released as an
+        unmarked claim was, never as this path's."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).touch()
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), "")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "an origin claim, settled at once")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d), "a conversation claim waits for its outcome")
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released as a stale conversation claim")
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1)
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+
+    def test_an_older_builds_no_human_claim_is_read_by_its_marker_and_released_with_it(self):
+        """An upgrade mid-claim: the old build's empty claim with its marker beside it is this path's,
+        not a settled origin claim; the stale rule releases both files."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).touch()
+        (self.d / bootstrap_delivery.LEGACY_REPORT_CLAIMING_FILE).touch()
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / bootstrap_delivery.LEGACY_REPORT_CLAIMING_FILE).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "the conversation record is not charged")
+
+    def test_a_tagged_claim_settles_by_its_tag_not_by_what_binds_after(self):
+        """An origin claim delivered in its run stays settled when the plugin binds a conversation a
+        moment later; a conversation claim waits for its outcome whether or not the binding is still there."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_ORIGIN + "\n", encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).unlink()
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_CONVERSATION + "\n", encoding="utf-8")
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).touch()
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_an_unreadable_claim_decides_nothing_this_tick(self):
+        """A read error on the claim file is not an empty claim: no retire, no release, no record."""
+        self._filed(self.DAY + self.HOUR)
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        real = Path.read_text
+
+        def failing(self_, *a, **k):
+            if self_.name == COMPLETED:
+                raise OSError(5, "input/output error")
+            return real(self_, *a, **k)
+
+        with mock.patch.object(Path, "read_text", failing):
+            self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_UNREADABLE)
+            self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists(), "not released")
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
+
+    def test_a_humans_origin_claim_after_a_released_no_human_claim_settles_at_once(self):
+        """Nothing of the released claim is left to read: the origin claim carries its own tag and
+        settles, or the jobs never retire and every nudge is held for good."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)  # released
+        self.assertIsNone(bootstrap_delivery._claim_path(self.d))
+        (self.d / ALIGNED).touch()
+        with contextlib.redirect_stdout(io.StringIO()) as out:  # the origin path prints the report
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertIn("Discovery Report", out.getvalue())
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_ORIGIN)
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def _at_the_cap(self, age_seconds):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps({
+            bootstrap_delivery.ATTEMPTS_COUNT: bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS,
+            bootstrap_delivery.ATTEMPTS_REASON: "refused", bootstrap_delivery.ATTEMPTS_AT: time.time() - age_seconds,
+        }), encoding="utf-8")
+
+    def test_at_the_cap_an_issue_a_failed_create_opened_is_found_and_recorded(self):
+        """The fifth create opened the issue and then failed: no record, no home line, and day seven
+        would retire a filed report. The cap still gets one lookup, after the last retry wait."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        sweep = bootstrap_delivery.oobe.scan_filed(self.d)[0]
+        mine = {"number": 11, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep),
+                "labels": [{"name": bootstrap_delivery.REPORT_ISSUE_LABEL}]}
+        self.forge_answers["issue-list"] = {"issues": [mine]}
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list"], "a lookup, no create")
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 11)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / INVENTORY).exists(), "set aside as a clean filing does")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+        self.assertTrue(self.runs, "the home line went out")
+
+    def test_at_the_cap_with_no_issue_open_nothing_is_claimed_and_the_count_stands(self):
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"])
+        self.assertFalse((self.d / COMPLETED).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+        self.assertIn("no more tries", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+
+    def test_at_the_cap_a_missed_lookup_is_not_repeated_each_tick(self):
+        """A miss records nothing counted, so nothing moved the wait: the listing ran every tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "one lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertTrue(record.get(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE))
+        self.assertEqual(record.get(bootstrap_delivery.ATTEMPTS_REASON), bootstrap_delivery.REPORT_NO_ISSUE_AT_CAP_REASON.format(repo="example-org/gitops"))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_the_retire_drops_the_lookup_flag(self):
+        self._at_the_cap(8 * self.DAY)
+        self._filed(8 * self.DAY)
+        path = self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record[bootstrap_delivery.REPORT_CAP_LOOKUP_DONE] = True
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_at_the_cap_a_refused_lookup_waits_out_the_last_retry_wait_again(self):
+        """A listing the repository refuses (a lost token scope, a server error) is not a miss: no
+        done flag, but the refusal moves the wait, so the next lookup is six hours on, not next tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.forge_refusals["issue-list"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list"], "one refused lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record, "a refusal does not end the lookups")
+        self.assertIn("issue-list on", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertAlmostEqual(record[bootstrap_delivery.ATTEMPTS_AT], time.time(), delta=30)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS, "not counted")
+        record[bootstrap_delivery.ATTEMPTS_AT] = time.time() - bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] - 5
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "asked again after the wait")
+
+    def test_at_the_cap_the_lookup_waits_out_the_last_retry_wait(self):
+        self._at_the_cap(60)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+
+    def test_the_forge_calls_before_the_record_fit_under_the_stale_rule(self):
+        """A slow broker must not let the next tick release a live run's claim between its claim and
+        its record, which would open a second issue for one sweep."""
+        self.assertLessEqual(
+            bootstrap_delivery.REPORT_FORGE_CALLS_BEFORE_RECORD * bootstrap_delivery.REPORT_FORGE_CALL_TIMEOUT_SECONDS
+            + bootstrap_delivery.CLAIM_MARGIN_SECONDS,
+            bootstrap_delivery.STALE_CLAIM_SECONDS,
+        )
+        self._filed(self.DAY + self.HOUR)
+        self.assertEqual(self._main(), 0)
+        verbs = [c[0] for c in self.forge_calls]
+        self.assertEqual(verbs, ["issue-list", "issue-list", "label-ensure", "issue-create"])
+        self.assertEqual(len(verbs), bootstrap_delivery.REPORT_FORGE_CALLS_BEFORE_RECORD)
+        for kwargs in self.forge_kwargs:
+            self.assertEqual(kwargs.get("timeout_s"), bootstrap_delivery.REPORT_FORGE_CALL_TIMEOUT_SECONDS)
+
+    def test_a_stale_no_human_claim_is_recorded_in_its_own_record_uncounted(self):
+        self._filed(self.DAY + self.HOUR)
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        self.assertEqual(self._main(), 0)
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0, "a release is not a refused create")
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
+
+    def test_a_filing_this_path_made_settles_whatever_binds_a_moment_later(self):
+        self._filed(self.DAY + self.HOUR)
+        self.assertEqual(self._main(), 0)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "the filed record settles our claim, not the late binding")
+
+    def test_a_sweep_marker_that_does_not_decode_holds_this_path_not_the_tick(self):
+        (self.d / SCAN_FILED).write_bytes(b"\xff\xfe not utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_an_unlabelled_issue_is_found_beside_another_installs_labelled_one(self):
+        """A shared repository: another install's labelled issue is open, this sweep's issue carries
+        no label; the fallback listing must still run, or a second issue is opened for this sweep."""
+        self._filed(self.DAY + self.HOUR)
+        other = {"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="other-sweep"),
+                 "labels": [{"name": bootstrap_delivery.REPORT_ISSUE_LABEL}]}
+        sweep = bootstrap_delivery.oobe.scan_filed(self.d)[0]
+        mine = {"number": 9, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), "labels": []}
+        self.forge_answers["issue-list"] = {"issues": [other]}
+        self.forge_answers["issue-list-unlabelled"] = {"issues": [mine, other]}
+        self.assertEqual(self._main(), 0)
+        self.assertNotIn("issue-create", [c[0] for c in self.forge_calls], "no second issue for this sweep")
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 9)
+
+    def test_an_unlabelled_issue_is_found_again_and_noted(self):
+        """The repository refused the label: a dying run's issue is still found by its sweep marker, and the gap is logged."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list-unlabelled"] = {
+            "issues": [{"number": 11, "labels": [], "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1")}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([v for v, _, _ in self.forge_calls], ["issue-list", "issue-list"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 11)
+        self.assertIn(bootstrap_delivery.REPORT_UNLABELLED_NOTE.format(ref=f"{self.REPO}#11"), self._note_texts())
+
+    def test_an_operator_override_names_the_repository(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = ["example-org/other", self.REPO]
+        with mock.patch.dict(os.environ, {bootstrap_delivery.REPORT_LEDGER_REPO_ENV: "example-org/chosen"}):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], "example-org/chosen")
+
+    def test_an_unreadable_repository_list_is_a_reason_not_a_traceback(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery.gitops_workspace, "get_managed_github_repo_names",
+                               side_effect=RuntimeError("mount unreadable")):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("mount unreadable", bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+
+    def test_a_human_mid_greeting_is_not_nobody(self):
+        """The plugin writes its greeting hold before the aligned marker; neither is the ledger path's cue."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / ALIGNED).touch()
+        (self.d / ".bootstrap_greeting_pending.turn-1").touch()
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [], "the thread takes the report once the greeting is out")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_a_bound_conversation_without_its_marker_yet_is_not_nobody(self):
+        """Under next the plugin writes the conversation file, then the hold, then the marker."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_a_refused_create_releases_the_claim_and_waits(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertEqual(self.runs, [])
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
+        self.assertIn("FORGE_FORBIDDEN", record[bootstrap_delivery.ATTEMPTS_REASON])
+        self.assertIsNone(bootstrap_delivery._claim_path(self.d), "nothing of the claim is left")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "a later origin claim would settle at once")
+        calls = len(self.forge_calls)
+        self.assertEqual(self._main(), 0, "inside the wait after a refused create")
+        self.assertEqual(len(self.forge_calls), calls)
+
+    def test_retires_the_report_after_a_week(self):
+        self._filed(8 * self.DAY)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.runs, [])
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertIn(bootstrap_delivery.REPORT_RETIRED_NOTE.format(days=7), self._note_texts())
+
+    def test_retire_age_is_the_plugins_priming_limit(self):
+        spec = importlib.util.spec_from_file_location("bootstrap_onboarding_plugin_for_age", PLUGIN_PATH)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, plugin.SCAN_MAX_AGE_SECONDS)
+        self.assertEqual(bootstrap_delivery.REPORT_FILED_FILE, plugin.REPORT_FILED_MARKER)
+        self.assertEqual(bootstrap_delivery.REPORT_RETIRED_FILE, plugin.REPORT_RETIRED_MARKER)
+        self.assertEqual(bootstrap_delivery.FILED_URL, plugin.REPORT_FILED_URL_KEY)
+        self.assertEqual(bootstrap_delivery.FILED_AT, plugin.REPORT_FILED_AT_KEY)
+        self.assertLess(bootstrap_delivery.UNSPOKEN_FILE_AFTER_SECONDS, bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS)
+
+    def test_a_human_who_speaks_first_still_gets_the_thread(self):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [], "an aligned report takes the conversation path, not the ledger")
+        self.assertTrue(any("--conversation" in argv for argv in self.runs))
 
 
 class ScanGateTest(unittest.TestCase):
@@ -1052,6 +2871,10 @@ class ScanGateTest(unittest.TestCase):
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        # The hand-off predicts a past-cap cluster's collector file from this.
+        for agent in agents.values():
+            self.assertEqual(sorted(agent["identity"]), ["cluster", "location", "project"])
+            self.assertIn(agent["identity"]["cluster"], agent["cluster_label"])
         self.assertEqual(sorted(agents), sorted([short, hashed]))
         self.assertEqual(agents[short]["key"], f"{prefix}{short}")
         self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
@@ -1406,6 +3229,75 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
         self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
 
+    def test_a_reconcile_that_deferred_creates_defers_the_sweep_and_ends_the_failure_streak(self):
+        # EXIT_CREATES_DEFERRED: the run created its cap's worth and left the rest for
+        # the next tick. Progress, not failure: the sweep waits, the streak of failed
+        # ticks before it is over, as on exit 0, and the counts the reconcile logged
+        # are repeated for the gate's reader.
+        import cluster_agent_reconcile as rec
+        self.assertEqual(bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED)
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, "",
+                "[CLUSTER-RECONCILE] Done: created=100 failed=0 deferred=150 pruned=0 kept=0 no_identity=0 unknown=0.\n")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+        self.assertIsNone(bootstrap_scan_gate._reconcile_since(self.d))
+        self.assertIn("deferred the rest to the next tick", err.getvalue())
+        self.assertIn("created=100 failed=0 deferred=150", err.getvalue())
+
+    def test_a_failure_streak_before_the_first_batch_does_not_give_up_mid_fleet(self):
+        # A fresh install fails its first ticks while IAM propagates, then the fleet
+        # starts arriving in batches that run past the give-up window those failures
+        # opened. The first batch ended the streak, so the clock has nothing to fire
+        # on: every deferred tick waits, and the finishing one files the sweep.
+        t0 = 1_700_000_000.0
+        clock = [t0 + 60.0]
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS, t0)
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        err = io.StringIO()
+        ticks = []
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(bootstrap_scan_gate.time, "time", lambda: clock[0]), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            clock[0] = t0 + bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS + 60.0
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(ticks, [False, False, True])
+        self.assertNotIn("filing the sweep anyway", err.getvalue())
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
+    def test_a_fleet_of_three_batches_files_the_sweep_on_the_third_tick(self):
+        # 250 clusters at the default cap: two ticks that defer, then the one that
+        # finishes; no attempt is spent along the way, so the ceiling never fires.
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ticks = [bootstrap_scan_gate.ensure_cluster_agents(self.d) for _ in range(3)]
+        self.assertEqual(ticks, [False, False, True])
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 
@@ -1452,6 +3344,26 @@ class ScanGateTest(unittest.TestCase):
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
+    def test_step_3_names_the_collector_once_per_cluster(self):
+        # Three by-hand SOP walks do not fit the platform worker's turn budget
+        # (#4115): the sweep completed with one past-cap cluster recorded, or ran
+        # past the hand-off's wait. Step 3 is one command per cluster, and the
+        # by-hand walk is the fallback for a cluster the script cannot reach.
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH, body)
+        self.assertIn("--project <project> --location <location> --cluster <cluster>", body)
+        self.assertIn(bootstrap_scan_gate.SWEEP_DIR + "/<project>__<location>__<cluster>.json", body)
+        self.assertIn("Do not copy the object anywhere: the gate takes it from the file", body)
+        self.assertIn("one `{project, location, cluster, gaps}` entry per cluster Step 3 audited", body)
+        self.assertIn("only where the script itself cannot run", body)
+        # The constant is the sandbox path of a file this repository ships: the
+        # staged root /opt/data/profiles/platform/ maps onto agents/platform/.
+        staged_root = "/opt/data/profiles/platform/"
+        self.assertTrue(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH.startswith(staged_root))
+        relative = bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH[len(staged_root):]
+        self.assertTrue((Path(__file__).resolve().parents[2] / "platform" / relative).is_file(), relative)
+        self.assertIn("`timeout` set to 600", body)
+
     def test_cluster_cards_are_keyed_by_profile_name(self):
         # The gate re-files a missing card every tick until the hand-off; the
         # key is what keeps a repeat from duplicating one.
@@ -1459,14 +3371,140 @@ class ScanGateTest(unittest.TestCase):
         keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])
 
+    def test_the_roster_is_capped_for_the_first_run_in_profile_order(self):
+        # #3702: the first so many by profile name get cards and are listed in
+        # the sweep card; the rest stay off the roster, so the sweep audits them.
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}):
+            roster = bootstrap_scan_gate.cluster_agents()
+            body = bootstrap_scan_gate._task_body()
+        self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
+        for name in sorted(names)[:2]:
+            self.assertIn(f"`{name}`", body)
+        for name in sorted(names)[2:]:
+            self.assertNotIn(f"`{name}`", body)
+        # The clusters past the cap are named as having agents, so the worker
+        # audits them without reporting them as lacking one.
+        self.assertIn("Past the first-run cap", body)
+        self.assertIn("This fleet is past the first-run cap, so they include at least the clusters", body)
+        for i in range(5):
+            if f"cluster-proj-c{i}-us-east4" in sorted(names)[2:]:
+                self.assertIn(f"`c{i}`", body.split("Past the first-run cap", 1)[1])
+
+    def test_the_sweep_marker_records_the_agents_past_the_cap(self):
+        [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}):
+            ready = bootstrap_scan_gate.cluster_agents(capped=False)
+            bootstrap_scan_gate._mark_filed(
+                self.d, "t_sweep", uncarded=len(ready) - bootstrap_scan_gate.bootstrap_handoff.first_run_cluster_cards(self.d)
+            )
+        self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), 3)
+
+    def test_filing_the_sweep_records_the_agents_past_the_cap(self):
+        # The real file_scan_task, so the count it writes is the one under test.
+        [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        filed = []
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: filed.append(cmd) or '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ready = bootstrap_scan_gate.cluster_agents(capped=False)
+            self.assertEqual(self._orig(self.d), "t_real")
+        self.assertEqual(len(filed), 1)
+        self.assertIn("uncarded=3\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("cap=2\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("carded=" + ",".join(a["key"] for a in ready[:2]) + "\n", (self.d / SCAN_FILED).read_text())
+        self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), len(ready) - 2)
+
+    def test_a_filed_sweep_keeps_the_cap_it_was_filed_under(self):
+        # #3702: the hand-off's roster holds to the marker's cap, so raising the
+        # file mid-sweep cannot card a cluster the sweep card gave its worker.
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("4")
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\nuncarded=3\ncap=2\n")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
+
+    def test_a_filed_sweep_cards_only_the_agents_its_marker_lists(self):
+        # #3702: a profile that sorts first but was not ready when the sweep was
+        # filed is the sweep worker's, even with a slot free under the cap.
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(4))
+        prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
+        (self.d / SCAN_FILED).write_text(
+            f"task_id=t_sweep\nfiled_at=1\ncap=3\ncarded={prefix}{names[1]},{prefix}{names[2]}\n"
+        )
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[1:3])
+
+    def test_filing_the_sweep_lists_the_roster_once(self):
+        # A second listing could fail or see another roster; the marker records
+        # what the card listed.
+        agents = [{"name": f"cluster-c{i}", "key": f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}cluster-c{i}",
+                   "title": f"t{i}", "cluster_label": f"`c{i}`"} for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        listing = mock.Mock(side_effect=[agents, agents[:1], []])
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", listing), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        listing.assert_called_once_with(capped=False)
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertIn("uncarded=3\n", marker)
+        self.assertIn(f"carded={agents[0]['key']},{agents[1]['key']}\n", marker)
+
+    def test_an_empty_listing_at_filing_pins_nothing(self):
+        # The listing returns [] when it fails as well as when there are no
+        # Cluster Agents. Pinned as empty, a failed listing would leave every
+        # Cluster Agent uncarded; unpinned, the next tick cards the live roster
+        # under the cap.
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", mock.Mock(return_value=[])), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertNotIn("carded=", marker)
+        self.assertNotIn("uncarded=", marker)
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5))
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[:2])
+
+    def test_a_roster_under_the_cap_is_listed_whole(self):
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]
+        self.assertEqual([a["name"] for a in bootstrap_scan_gate.cluster_agents()], sorted(names))
+        body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("Past the first-run cap", body)
+        self.assertIn("On a fleet under the first-run cap there are usually none.", body)
+
     def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
             rc, out = self._run()
         self.assertEqual((rc, out, self.filed), (0, "", []))
         hand_off.assert_called_once_with(
-            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents,
+            full_roster=mock.ANY,
         )
+        # The uncapped roster, for the time limit of a sweep the marker did not pin.
+        with mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=["x"]) as listing:
+            self.assertEqual(hand_off.call_args.kwargs["full_roster"](), ["x"])
+        listing.assert_called_once_with(capped=False)
 
     def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
@@ -1671,6 +3709,10 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
+        self.relay_db = self.d / "session_kv.db"
+        patcher = mock.patch.dict(os.environ, {bootstrap_delivery.SESSION_KV_DB_ENV: str(self.relay_db)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _slug_table() -> set[str]:
@@ -1711,7 +3753,9 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_no_marker_says_the_audits_will_run(self):
         # The stage writes its marker on its first tick after the ranking card, which delivery can beat.
-        self.assertEqual(self._note(), bootstrap_delivery.AUDITS_RUNNING_NOTE)
+        self.assertEqual(
+            self._note(), f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+        )
 
     def test_a_skip_says_the_report_does_not_cover_the_checks(self):
         for reason in (oobe.SKIP_NOT_NEW, oobe.SKIP_UNSETTLED, oobe.SKIP_NO_SWEEP):
@@ -1719,7 +3763,7 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self._skipped(reason)
                 self.assertEqual(
                     self._note(),
-                    f"The first-run audits did not run: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
+                    f"The audits did not run as part of onboarding: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
                 )
 
     def test_a_skip_an_older_stage_recorded_for_no_repository_says_the_report_covers_them(self):
@@ -1728,13 +3772,13 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
         self.assertEqual(
             self._note(),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_COVERED_NOTE}",
         )
         # A report no cluster's audit reached covers nothing, whatever the older stage recorded.
         self.assertEqual(
             self._note(no_coverage=True),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
         )
 
@@ -1744,19 +3788,58 @@ class FirstRunAuditsTest(unittest.TestCase):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep2\nfiled_at=2000\n", encoding="utf-8")
         self.assertEqual(
             self._note(),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
         )
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
-        self.assertIn("does not cover", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+        # The skips come a day or more after the sweep, when the scheduled audits have usually run,
+        # so the note speaks for this report, not for what the audits have done.
+        self.assertIn(
+            f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE
+        )
+        for note in (bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE, bootstrap_delivery.AUDITS_NONE_STARTED_NOTE):
+            self.assertNotIn("nothing has checked", note.lower())
+            self.assertIn("this report", note.lower())
+
+    def test_the_covered_note_claims_only_the_older_scans_own_checks(self):
+        covered = bootstrap_delivery.AUDITS_COVERED_NOTE.split("so this report covers them", 1)[0]
+        self.assertNotIn("RBAC", covered)
+        self.assertIn(f"not the rest of {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_COVERED_NOTE)
+
+    def test_no_other_note_names_a_check_outside_the_posture_lines_words(self):
+        # The current scan's report names its checks and the audits' areas; a note listing workload
+        # checks by name would be an exclusion list the scan's table and the audit rosters outgrow.
+        old_scan = ("probe", "requests and limits", "autoscaling", "NetworkPolicy", "pod security", "Workload checks")
+        notes = {
+            name: value
+            for name, value in vars(bootstrap_delivery).items()
+            if name.startswith("AUDITS_") and isinstance(value, str) and name != "AUDITS_COVERED_NOTE"
+        }
+        self.assertIn("AUDITS_STARTED_NOTE", notes)
+        self.assertIn("AUDITS_LOST_NOTE", notes)
+        for name, value in notes.items():
+            for words in old_scan:
+                with self.subTest(note=name, words=words):
+                    self.assertNotIn(words, value)
+
+    def test_the_posture_lines_checks_are_the_slug_table(self):
+        self.assertEqual({slug for slug, _ in inventory_findings.SCAN_CHECKS}, self._slug_table())
+
+    def test_every_first_run_audit_has_an_area(self):
+        # The four posture audits are the families; the retrospective, the chain's fifth job, is
+        # named by what it is, so no first-run audit falls back to its backticked id.
+        self.assertTrue(set(inventory_findings.AUDIT_FAMILIES) <= set(oobe.FIRST_RUN_AUDITS))
+        for audit in oobe.FIRST_RUN_AUDITS:
+            self.assertNotIn("`", bootstrap_delivery._area(audit), audit)
 
     def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
         self._skipped(oobe.SKIP_NOT_NEW)
         self.assertEqual(
             self._note(no_coverage=True),
-            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
         )
 
     def test_the_delivery_reads_no_coverage_off_the_hand_off_marker(self):
@@ -1767,66 +3850,102 @@ class FirstRunAuditsTest(unittest.TestCase):
         )
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
         self._skipped(oobe.SKIP_NOT_NEW)
-        out = io.StringIO()
-        with (
-            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
         self.assertEqual(
-            out.getvalue(),
-            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            self._deliver(),
+            f"# Report\n\nThe audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
             f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}\n",
         )
 
     def test_a_chain_under_way_says_the_audits_are_running(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"], oobe.STATE_DONE: False})
-        self.assertEqual(note, bootstrap_delivery.AUDITS_RUNNING_NOTE)
+        self.assertEqual(note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}")
 
-    def test_a_finished_chain_says_which_audits_ran(self):
+    def test_a_finished_chain_says_which_audits_the_stage_started(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
-                      "`stockout-prevention`.", note)
-        self.assertIn("Each posts", note)
-        self.assertNotIn("Not run", note)
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
+        # The onboarding sentence names the audits by area; ids appear only where a request names one.
+        self.assertNotIn("`", note)
+        self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_HOME_SENTENCE))
+        self.assertNotIn("Did not run", note)
 
-    def test_held_and_given_up_audits_are_named_as_not_run(self):
+    def test_held_and_given_up_audits_are_named_as_not_started(self):
         note = self._note({
             oobe.STATE_FIRED: ["fleet-wide-cost-analysis", "stockout-prevention"],
             oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
             oobe.STATE_GAVE_UP: ["obtainability-audit"],
             oobe.STATE_DONE: True,
         })
-        self.assertIn("which have started: `fleet-wide-cost-analysis`, `stockout-prevention`.", note)
-        self.assertTrue(note.endswith(
-            f"Not run: `compliance-audit` (disabled), `obtainability-audit` ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
-        ))
+        self.assertIn("The capacity and cost audits started as part of onboarding.", note)
+        self.assertIn(
+            "Did not run as part of onboarding: the security and RBAC audit (disabled), "
+            f"the reliability audit ({bootstrap_delivery.AUDITS_GAVE_UP_REASON}).", note
+        )
 
-    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_ran(self):
+    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_started(self):
         for state in (
             {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
             {oobe.STATE_GAVE_UP: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
         ):
             with self.subTest(state=state):
                 note = self._note(state)
-                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
-                self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
-                self.assertNotIn("now running", note)
-                self.assertNotIn("which have started", note)
+                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_STARTED_NOTE))
+                self.assertIn("Did not run as part of onboarding: the security and RBAC audit (", note)
+                self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
 
-    def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
+    def test_a_chain_under_way_names_a_held_audit_as_not_started(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
                            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
         self.assertEqual(
-            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: `compliance-audit` ({oobe.HOLD_MISSING})."
+            note,
+            f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Did not run as part of onboarding: the security and RBAC audit "
+            f"({oobe.HOLD_MISSING}). {bootstrap_delivery.AUDITS_HOME_SENTENCE}",
         )
 
-    def test_the_text_delivery_closes_with_the_skip(self):
+    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True,
+             status: str = "completed") -> None:
+        """An ended run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        extra = ", finished_at TEXT, delivery_outcome TEXT" if columns else ""
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT{extra})")
+            stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
+            if columns:
+                conn.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?)",
+                             (audit, status, stamp(claimed_at), stamp(claimed_at + 60), outcome))
+            else:
+                conn.execute("INSERT INTO executions VALUES (?, ?, ?)", (audit, status, stamp(claimed_at)))
+
+    def _relay(self, audit: str, posted_at: float, run: str = "r1") -> None:
+        """The chat relay's record that it posted ``audit``'s report at ``posted_at``, as session-kv writes it.
+
+        ``run`` is the stamp of the report record it marked posted (``_stamp``), or a placeholder: the
+        note does not read it.
+        """
+        with sqlite3.connect(self.relay_db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
+                         "run TEXT NOT NULL, posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                         "PRIMARY KEY (profile, job_id))")
+            conn.execute("INSERT OR REPLACE INTO audit_report_runs VALUES ('platform', ?, ?, ?)",
+                         (audit, run, datetime.fromtimestamp(posted_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+
+    @staticmethod
+    def _stamp(at: float) -> str:
+        """The ``run`` stamp the audit's ``start`` gives a report record written at ``at``."""
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        return datetime.fromtimestamp(at, timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)
+
+    def _filed(self, at: float) -> None:
+        (self.d / SCAN_FILED).write_text(f"task_id=t_sweep\nfiled_at={at}\n", encoding="utf-8")
+
+    def _deliver(self) -> str:
+        """What the text path prints: the report and its note."""
         (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
         (self.d / ALIGNED).touch()
-        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
-        self._skipped(oobe.SKIP_NOT_NEW)
         out = io.StringIO()
         with (
             mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
@@ -1834,12 +3953,552 @@ class FirstRunAuditsTest(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        return out.getvalue()
+
+    @staticmethod
+    def _lost(note: str) -> str:
+        """The audits the note lists as not posted."""
+        return note.partition("not posted to the chat:")[2].partition(". To see them")[0]
+
+    def _finished_chain(self, outcome: str | None) -> dict:
+        """Every audit in the chain marked and completed after its mark, each run's delivery ending ``outcome``."""
+        now = time.time()
+        marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
+        for audit in oobe.FIRST_RUN_AUDITS:
+            self._run(audit, marks[audit] + 30, outcome)
+        return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
+
+    def test_audits_that_finished_before_a_home_channel_are_listed_with_a_request(self):
+        note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
+        # No home-channel promise beside summaries that were not posted.
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
+        self.assertIn(
+            "These ran, but their summaries were not posted to the chat: "
+            "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`, `upgrade-retrospective`. "
+            "To see them, send me: `Show me the latest report of each of these fleet audits from the report store: "
+            "fleet-wide-cost-analysis, compliance-audit, obtainability-audit, stockout-prevention, upgrade-retrospective.`", note)
+        self.assertNotIn("Ask me", note)
+
+    def test_a_skip_names_the_scheduled_runs_that_lost_their_summaries(self):
+        # SKIP_NOT_NEW fires a day after the sweep; the daily audits ran meanwhile with no home channel.
+        now = time.time()
+        self._filed(now - 2 * 86400)
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("stockout-prevention", now - 80000, "suppressed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertTrue(note.startswith(f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}."))
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        # Every "did not run" is scoped to onboarding, so it holds beside an audit that ran on its schedule.
+        self.assertEqual(note.count("did not run"), note.count("did not run as part of onboarding"))
+
+    def test_held_and_given_up_audits_that_ran_on_schedule_are_named(self):
+        # A held audit re-enabled by an operator, and a given-up one whose schedule recovered.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("obtainability-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({
+            oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
+            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
+            oobe.STATE_GAVE_UP: ["obtainability-audit"],
+            oobe.STATE_DONE: True,
+        })
+        self.assertEqual(self._lost(note), " `compliance-audit`, `obtainability-audit`")
+        # The stage sentence reports the stage, so it does not contradict the list.
+        self.assertIn("Did not run as part of onboarding: the security and RBAC audit (disabled)", note)
+        self.assertNotIn("Not run", note)
+
+    def test_the_other_shipped_fleet_audits_are_named(self):
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("gce-compute-fleet-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: [], oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS},
+                           oobe.STATE_DONE: True})
+        # First-run audits first, in chain order, then the rest in roster order.
+        self.assertEqual(self._lost(note), " `compliance-audit`, `gce-compute-fleet-audit`")
+        self.assertIn("report store: compliance-audit, gce-compute-fleet-audit.`", note)
+
+    def test_a_run_that_ended_before_the_sweep_is_not_this_onboardings(self):
+        now = time.time()
+        self._run("compliance-audit", now - 7200, bootstrap_delivery.DELIVERY_FAILED)
+        self._filed(now - 3600)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertNotIn("not posted", self._note())
+
+    def test_a_failed_run_whose_notice_was_not_posted_is_named_apart_with_no_request(self):
+        # A failed run wrote no report, so the store request cannot fetch what was lost.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("ai-security-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("compliance-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertIn("report store: compliance-audit.`", note)
+        self.assertTrue(note.endswith(
+            "These failed, and their failure notices were not posted to the chat: `ai-security-audit`."
+        ))
+        self.assertNotIn("before anyone", note)  # nothing checks the crash against when the chat was opened
+
+    def test_a_crashed_run_does_not_hide_an_earlier_lost_summary(self):
+        # The earlier run's report is in the store; the crash after it is named, and so is that report.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("obtainability-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("obtainability-audit", now - 900, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertIn("report store: compliance-audit.`", note)
+        self.assertTrue(note.endswith(
+            "their failure notices were not posted to the chat: `compliance-audit`, `obtainability-audit`."))
+
+    def test_a_posted_failure_notice_does_not_hide_an_earlier_lost_summary(self):
+        # The relay posted the crash's failure notice, not the earlier run's report, which is still in the store.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_a_consumed_failure_notice_settles_no_earlier_run(self):
+        # Oldest first: a lost summary, a delivered run that posted nothing (a silence marker the scheduler
+        # let through) after its `start` wrote the record, a crash before `start` whose notice posted. The
+        # notice replaced the relay's one row for the job with the record's stamp and its own time, which
+        # says nothing about the run between, so the lost summary is named. The same row is left when the
+        # delivered run did post; naming it then costs one question, not a report.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, "delivered")
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940, run=self._stamp(now - 1990))
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_without_a_relay_record_a_crashed_run_whose_notice_was_delivered_does_not_hide_an_earlier_lost_summary(self):
+        # No session_kv.db to ask: the crashed run's delivered failure notice stands, and the earlier run's
+        # report, still in the store, is named.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, "delivered", status="failed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_a_scheduled_run_in_flight_does_not_hide_an_earlier_lost_summary(self):
+        # The running row is not an ended run; the completed one before it still lost its summary.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', ?, NULL, NULL)",
+                         (datetime.fromtimestamp(time.time() - 30, timezone.utc).isoformat(),))
+        self.assertIn("`compliance-audit`", self._lost(self._note(state)))
+
+    def test_outcomes_are_read_by_name(self):
+        for outcome, lost in (("failed", True), ("delivered", False), ("queued", False), ("not_configured", False),
+                              ("suppressed", False), ("suppressed_acked", False), (None, False), ("new-value", True)):
+            with self.subTest(outcome=outcome):
+                self._tmp.cleanup()
+                self.d.mkdir()
+                note = self._note(self._finished_chain(outcome))
+                self.assertEqual("not posted" in note, lost)
+
+    def test_a_relay_post_settles_a_failed_outcome_as_posted(self):
+        # The plugin answers an error for a post that reached one platform and missed another.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("compliance-audit", state[oobe.STATE_MARKS]["compliance-audit"] + 60)
+        lost = self._lost(self._note(state))
+        self.assertNotIn("`compliance-audit`", lost)
+        self.assertIn("`stockout-prevention`", lost)
+
+    def test_a_later_delivered_run_with_no_relay_post_does_not_hide_a_lost_summary(self):
+        # A silence marker the scheduler let through is recorded `delivered`, and the relay posts nothing.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("compliance-audit", state[oobe.STATE_MARKS]["compliance-audit"] - 86400)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        self.assertIn("`compliance-audit`", self._lost(self._note(state)))
+
+    def test_a_later_delivered_run_the_relay_posted_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 20, "delivered")
+        self._relay("compliance-audit", time.time() - 10)
+        lost = self._lost(self._note(state))
+        self.assertNotIn("`compliance-audit`", lost)
+        self.assertIn("`stockout-prevention`", lost)
+
+    def test_with_no_relay_record_a_later_delivered_run_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        note = self._note(state)
+        self.assertNotIn("`compliance-audit`", self._lost(note))
+        self.assertIn("audits note takes each run's delivery outcome as it is", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_a_run_going_at_the_mark_counts_by_its_finish(self):
+        now = time.time()
+        # Claimed before the mark, finished after it: the stage took it as the audit's answer.
+        self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
+                           oobe.STATE_DONE: True})
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+
+    def test_a_suppressed_acked_run_is_silent(self):
+        now = time.time()
+        self._run("compliance-audit", now - 1200, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 600, "suppressed_acked")
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 1300},
+                           oobe.STATE_DONE: True})
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+
+    def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        for mark in ("1790000000", None, [1]):
+            with self.subTest(mark=mark):
+                note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
+                                   oobe.STATE_DONE: True})
+                self.assertEqual(self._lost(note), " `compliance-audit`")
+
+    def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
+        # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        for outcome in ("suppressed", None):
+            self._run("compliance-audit", now - 600, outcome)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
+                           oobe.STATE_DONE: True})
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+
+    def test_each_outcome_lists_the_audit_by_its_class(self):
+        # (listed when it is the only run, listed when it follows a refused run)
+        expected = {
+            "failed": (True, True),
+            "suppressed": (False, True),
+            "suppressed_acked": (False, True),
+            None: (False, True),
+            "delivered": (False, False),
+            "queued": (False, False),
+            "not_configured": (False, False),
+            # A value Hermes does not write today reads as lost, so a renamed failure still names the audit.
+            "a-value-hermes-added-later": (True, True),
+        }
+        for outcome, (alone, after_failed) in expected.items():
+            with self.subTest(outcome=outcome):
+                for runs, listed in (
+                    ([(1.0, 2.0, outcome, "completed")], alone),
+                    ([(1.0, 2.0, "failed", "completed"), (3.0, 4.0, outcome, "completed")], after_failed),
+                ):
+                    # No relay record, so each outcome is read as it stands.
+                    got = bootstrap_delivery._lost_audits(("compliance-audit",), {"compliance-audit": runs}, {}, None)
+                    self.assertEqual([(r.audit, r.crashed) for r in got], [("compliance-audit", False)] if listed else [])
+
+    # --- the re-send stage ------------------------------------------------------
+
+    def _roster(self, names: dict[str, str]) -> None:
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        (cron / oobe.ROSTER_FILE).write_text(
+            json.dumps({"jobs": [{"id": job_id, "name": name} for job_id, name in names.items()]}), encoding="utf-8"
+        )
+
+    def _resend(self, home: str, answers=None, now: float | None = None) -> list[tuple[urllib.request.Request, dict]]:
+        """One tick of the re-send stage with the projected home channel ``home``; the relay's requests, decoded.
+
+        ``answers`` is what each request gets, in order: a dict the relay answers with, or an exception to raise;
+        the last one repeats.
+        """
+        answers = list(answers or [{"status": "delivered"}])
+        requests: list[tuple[urllib.request.Request, dict]] = []
+
+        def urlopen(request, timeout=None):
+            requests.append((request, json.loads(request.data.decode("utf-8"))))
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(answer, BaseException):
+                raise answer
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = json.dumps(answer).encode("utf-8")
+            return response
+
+        env = {bootstrap_delivery.SESSION_KV_AUTH_ENV: "kv-key", bootstrap_delivery.FINDINGS_ENDPOINT_ENV: "http://relay.test"}
+        with (
+            mock.patch.object(chat_notify, "home_file_value", return_value=home),
+            mock.patch.object(urllib.request, "urlopen", urlopen),
+            mock.patch.dict(os.environ, env),
+        ):
+            bootstrap_delivery.resend_lost_summaries(self.d, time.time() if now is None else now)
+        return requests
+
+    def _stage_log(self) -> str:
+        try:
+            return (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
+    def _lost_first_run(self, audit: str = "fleet-wide-cost-analysis", age: float = 600) -> float:
+        """A first-run ``audit`` whose run was claimed ``age`` seconds ago with its summary refused; its claim time.
+
+        The sweep and the stage's mark come before the run, so the onboarding window holds it whatever ``age``.
+        """
+        now = time.time()
+        self._filed(now - age - 120)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: [audit], oobe.STATE_MARKS: {audit: now - age - 60}})
+        self._run(audit, now - age, bootstrap_delivery.DELIVERY_FAILED)
+        # The relay's database exists, with no row for the audit: nothing was posted.
+        with sqlite3.connect(self.relay_db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
+                         "run TEXT NOT NULL, posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (profile, job_id))")
+        return now - age
+
+    def test_a_lost_summary_waits_while_no_home_channel_is_projected(self):
+        self._lost_first_run()
+        self.assertEqual(self._resend(""), [])
+        self.assertFalse((self.d / bootstrap_delivery.RESENT_FILE).exists())
+        self.assertEqual(self._stage_log(), "")
+
+    def test_a_lost_summary_is_re_sent_through_the_relay_once_the_home_channel_is_projected(self):
+        claimed = self._lost_first_run()
+        self._roster({"fleet-wide-cost-analysis": "Fleet-wide cost analysis"})
+        requests = self._resend("C0123")
+        self.assertEqual(len(requests), 1)
+        request, body = requests[0]
+        self.assertEqual(request.full_url, "http://relay.test" + bootstrap_delivery.CRON_REPORTS_PATH)
+        self.assertEqual(request.get_header("Authorization"), "Bearer kv-key")
+        self.assertEqual(body["job_id"], "fleet-wide-cost-analysis")
+        self.assertEqual(body["profile"], oobe.PLATFORM_PROFILE)
+        self.assertEqual(body["title"], "Fleet-wide cost analysis")
+        # The scheduler-leg key, so the relay reads the audit's own record and posts that, not this text.
+        self.assertEqual(body[bootstrap_delivery.SCHEDULER_LEG_KEY], [])
+        self.assertIn("fleet audits from the report store: fleet-wide-cost-analysis.", body["report"])
+        self.assertIn("re-sent the fleet-wide-cost-analysis summary to the home channel: the relay answered delivered",
+                      self._stage_log())
+        self.assertEqual(bootstrap_delivery._resend_state(self.d),
+                         {"fleet-wide-cost-analysis": {"tries": 1, "posted": True}})
+        # The relay's row, written when it posted, settles the audit: the next tick sends nothing.
+        self._relay("fleet-wide-cost-analysis", claimed + 300)
+        self.assertEqual(self._resend("C0123"), [])
+        # The chain's own state file is not touched: an empty one still means the chain has not started.
+        self.assertNotIn(bootstrap_delivery.RESENT_FILE, oobe.read_state(self.d))
+
+    def test_without_a_roster_name_the_title_is_the_job_id(self):
+        self._lost_first_run()
+        _request, body = self._resend("C0123")[0]
+        self.assertEqual(body["title"], "fleet-wide-cost-analysis")
+
+    def test_a_lost_answer_counts_as_a_try_and_the_relay_record_decides(self):
+        claimed = self._lost_first_run()
+        lost = urllib.error.URLError("timed out")
+        self.assertEqual(len(self._resend("C0123", [lost])), 1)
+        self.assertIn("no answer from the relay, which may have posted", self._stage_log())
+        self.assertEqual(bootstrap_delivery._resend_state(self.d),
+                         {"fleet-wide-cost-analysis": {"tries": 1, "posted": False}})
+        # No row: the relay did not post, and the next tick asks again.
+        self.assertEqual(len(self._resend("C0123", [lost])), 1)
+        # A row: it had posted, and the next tick leaves it alone.
+        self._relay("fleet-wide-cost-analysis", claimed + 300)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_relay_that_keeps_refusing_is_asked_at_most_the_cap(self):
+        self._lost_first_run()
+        def refused():
+            return urllib.error.HTTPError(
+                "http://relay.test", 502, "Bad Gateway", {}, io.BytesIO(b"composed but not delivered to slack")
+            )
+
+        for _ in range(bootstrap_delivery.RESEND_MAX_ATTEMPTS):
+            self.assertEqual(len(self._resend("C0123", [refused()])), 1)
+        self.assertEqual(self._resend("C0123", [refused()]), [])
+        self.assertEqual(self._stage_log().count("the relay answered 502: composed but not delivered to slack"),
+                         bootstrap_delivery.RESEND_MAX_ATTEMPTS)
+
+    def test_a_run_older_than_the_relay_record_window_is_not_re_sent(self):
+        # The relay posts a "did not finish" notice for a record past its age; this stage does not ask for one.
+        for age, sent in ((bootstrap_delivery.RESEND_WINDOW_SECONDS - 60, 1), (bootstrap_delivery.RESEND_WINDOW_SECONDS + 60, 0)):
+            with self.subTest(age=age):
+                self.setUp()
+                self._lost_first_run(age=age)
+                self.assertEqual(len(self._resend("C0123")), sent)
+        self.assertLessEqual(bootstrap_delivery.RESEND_WINDOW_SECONDS, 2 * 60 * 60 - 10 * 60)
+
+    def test_an_answered_re_send_is_settled_when_a_later_run_of_the_audit_failed(self):
+        # A relay row settles the earlier run in _lost_audits only until a later run fails: the row then
+        # reads as that run's notice, and the earlier run is judged by its outcome again. Asking the relay
+        # again would post a "did not finish" notice. The answer settles it instead.
+        claimed = self._lost_first_run(age=900)
+        self._run("fleet-wide-cost-analysis", claimed + 600, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self.assertEqual(len(self._resend("C0123")), 1)
+        self._relay("fleet-wide-cost-analysis", claimed + 660)
+        for _ in range(3):
+            self.assertEqual(self._resend("C0123"), [])
+        self.assertEqual(self._stage_log().count("re-sent the fleet-wide-cost-analysis summary"), 1)
+
+    def test_a_delivered_answer_without_a_relay_row_is_not_asked_again(self):
+        # A relay that cannot tell the job for a fleet audit posts the request text and writes no row.
+        self._lost_first_run()
+        self.assertEqual(len(self._resend("C0123")), 1)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_crashed_run_is_not_re_sent(self):
+        now = time.time()
+        self._filed(now - 3600)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 700}})
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("obtainability-audit", now)  # the relay's database exists
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_lost_summary_outside_the_first_run_chain_is_not_re_sent(self):
+        now = time.time()
+        self._filed(now - 3600)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self._run("ai-security-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("obtainability-audit", now)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_without_the_relay_record_nothing_is_re_sent(self):
+        # Without it a post this stage made cannot be told from a lost one; a second copy is the worse loss.
+        self._lost_first_run()
+        self.relay_db.unlink()
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_posted_run_is_not_pending(self):
+        claimed = self._lost_first_run()
+        self._relay("fleet-wide-cost-analysis", claimed + 60)
+        self.assertEqual(bootstrap_delivery.pending_resends(self.d, oobe.read_state(self.d), time.time()), [])
+
+    def test_a_run_from_before_the_mark_is_not_the_first_run(self):
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC audit started as part of onboarding.", note)
+        self.assertNotIn("not posted", note)
+
+    def test_a_store_without_the_outcome_column_lists_nothing(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, None, columns=False)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertNotIn("not posted", note)
+        # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
+        self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_an_unreadable_store_says_the_records_could_not_be_read(self):
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True)
+        (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
+        note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
+        self.assertIn("I could not read the audit run records", note)
+        self.assertIn("report store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit, "
+                      "stockout-prevention, upgrade-retrospective, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
+                      "gcp-networking-fabric-audit, gce-compute-fleet-audit.`", note)
+        self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_an_unreadable_sweep_marker_keeps_the_coverage_caveat_on_the_legacy_skip(self):
+        # The legacy skip's own marker read raised past _audits_note, and the whole-note fallback lost the caveat.
+        (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        note = self._note()
+        self.assertTrue(note.startswith(f"The audits did not run as part of onboarding: "
+                                        f"{bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}."))
+        self.assertIn(bootstrap_delivery.AUDITS_NOT_COVERED_NOTE, note)
+        self.assertNotIn("I could not read the audit run records", note)
+
+    def test_an_unreadable_sweep_marker_reads_every_run(self):
+        now = time.time()
+        (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertEqual(self._lost(self._note()), " `compliance-audit`")
+
+    def test_a_note_that_raises_still_delivers_the_report_before_any_claim_is_lost(self):
+        with mock.patch.object(bootstrap_delivery, "_stage_sentences", side_effect=RuntimeError("boom")):
+            out = self._deliver()
+        self.assertIn("# Report", out)
+        self.assertIn("I could not read the audit run records", out)
+        self.assertIn("the audits note failed", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_a_raise_reading_the_runs_keeps_the_stage_sentence(self):
+        self._skipped(oobe.SKIP_NOT_NEW)
+        with mock.patch.object(bootstrap_delivery, "_relay_posts", side_effect=PermissionError("denied")):
+            note = self._note()
+        self.assertIn(bootstrap_delivery.AUDITS_NOT_COVERED_NOTE, note)
+        self.assertIn("I could not read the audit run records", note)
+        self.assertIn("could not tell which summaries were posted", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_the_note_is_built_before_the_claim(self):
+        claimed = []
+        real = bootstrap_delivery._claim_delivery
+        with mock.patch.object(bootstrap_delivery, "_claim_delivery",
+                               side_effect=lambda d, tag: claimed.append(True) or real(d, tag)), \
+                mock.patch.object(bootstrap_delivery, "_safe_audits_note",
+                                  side_effect=lambda *a, **k: self.assertEqual(claimed, []) or "NOTE-BUILT-FIRST"):
+            self.assertIn("NOTE-BUILT-FIRST", self._deliver())
+
+    def test_the_text_delivery_carries_the_lost_summaries(self):
+        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self._filed(1)
+        self.assertIn("stockout-prevention, upgrade-retrospective.`\n", self._deliver())
+
+    def test_the_text_delivery_closes_with_the_skip(self):
+        self._filed(1)
+        self._skipped(oobe.SKIP_NOT_NEW)
         self.assertEqual(
-            out.getvalue(),
-            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            self._deliver(),
+            f"# Report\n\nThe audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
             f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
         )
 
+    def test_the_relay_record_it_reads_is_the_one_session_kv_writes(self):
+        server = (Path(__file__).resolve().parents[2] / "platform" / "scripts" / "session_kv_server.py").read_text()
+        table = server[server.index("CREATE TABLE IF NOT EXISTS audit_report_runs"):]
+        table = table[:table.index(")")]
+        for column in ("profile", "job_id", "posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"):
+            self.assertIn(column, table)
+        self.assertIn(f'os.getenv("{bootstrap_delivery.SESSION_KV_DB_ENV}", '
+                      f'"{bootstrap_delivery.DEFAULT_SESSION_KV_DB_PATH}")', server)
+        # The re-send stage's request is the relay plugin's: the route, and the key that marks a delivery leg.
+        self.assertIn(f'@app.post("{bootstrap_delivery.CRON_REPORTS_PATH}"', server)
+        self.assertIn(f'SCHEDULER_LEG_KEY = "{bootstrap_delivery.SCHEDULER_LEG_KEY}"', server)
+        for key in (bootstrap_delivery.REQUEST_JOB_KEY, bootstrap_delivery.REQUEST_PROFILE_KEY,
+                    bootstrap_delivery.REQUEST_TITLE_KEY, bootstrap_delivery.REQUEST_REPORT_KEY):
+            self.assertIn(f'request_data.get("{key}")', server)
+
+    def test_the_request_covers_every_shipped_fleet_audit(self):
+        # A fleet audit added to the roster, or to the first-run chain, needs a request the note can send.
+        roster = json.loads((Path(__file__).resolve().parents[2] / "platform" / "cron" / "jobs.json").read_text())
+        jobs = roster["jobs"] if isinstance(roster, dict) else roster
+        shipped = {j["id"] for j in jobs if "fleet-audit" in (j.get("skills") or []) and j.get("deliver") == "chat"}
+        checked = set(bootstrap_delivery._checked_audits())
+        self.assertEqual(checked, shipped | set(oobe.FIRST_RUN_AUDITS))
+        # Each one the store request asks for has a report in the store.
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        self.assertEqual(sorted(checked - set(audit_report.AUDITS)), [])
+
+    def test_the_request_is_the_nightly_cases_prompt(self):
+        # bench/tasks/fleet-audit-request-line grades the request on a live install; the two texts stay one.
+        import yaml
+
+        case = Path(__file__).resolve().parents[3] / "bench" / "tasks" / "fleet-audit-request-line" / "task.yaml"
+        data = yaml.safe_load(case.read_text(encoding="utf-8"))
+        self.assertEqual(data["prompt"], bootstrap_delivery._request(bootstrap_delivery._checked_audits()))
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,10 +7,13 @@ engine to use. A copy that carries no version has no default, and each script
 then falls back to something the install never asked for — `main`'s engine, or a
 refusal that reads like a missing flag.
 
-GitHub Pages serves copies built from `main`, so they are exactly those
-unstamped copies. Documentation and agent skills therefore point at release
-artifacts (`raw.githubusercontent.com/.../<RELEASE_VERSION>/...` or the release
-bundle) rather than at the Pages copies, and this test keeps it that way.
+GitHub Pages stages `install.sh`, `upgrade.sh` and `uninstall.sh` from the
+latest published GA release (`X.Y.Z`), so those URLs carry a stamped version
+but move whenever a new GA release deploys to Pages rather than naming a fixed
+version. Documentation and agent skills therefore point at version-pinned
+release artifacts (`raw.githubusercontent.com/.../<RELEASE_VERSION>/...` or the
+release bundle) rather than at the unpinned Pages URLs, and this test keeps it
+that way.
 """
 
 import pathlib
@@ -20,9 +23,9 @@ import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The three front doors served unstamped from GitHub Pages.
+# The three unpinned front doors served at the GitHub Pages root.
 _PAGES_SCRIPT_URL = re.compile(r"gke-labs\.github\.io/kube-agents/(?:install|upgrade|uninstall)\.sh")
-# The same problem by another route: a raw/blob URL pinned to a moving branch.
+# Moving branch URLs carry no baked version on main (`BAKED_RELEASE_VERSION=""`).
 _MOVING_RAW_URL = re.compile(
     r"(?:raw\.githubusercontent\.com/gke-labs/kube-agents/(?:refs/heads/)?(?:main|HEAD)/|"
     r"github\.com/gke-labs/kube-agents/(?:raw/(?:refs/heads/)?(?:main|HEAD)/|blob/(?:refs/heads/)?(?:main|HEAD)/(?:install|upgrade|uninstall)\.sh))"
@@ -92,7 +95,7 @@ class ReleasePinnedEntryPointsTest(unittest.TestCase):
         return found
 
     def test_no_document_points_at_the_pages_copies(self):
-        """The Pages copies are built from main and carry no baked version."""
+        """The Pages script URLs move across GA releases instead of pinning a version."""
         offenders = self._offenders(_PAGES_SCRIPT_URL)
         self.assertEqual(
             offenders,
@@ -101,7 +104,7 @@ class ReleasePinnedEntryPointsTest(unittest.TestCase):
         )
 
     def test_no_document_fetches_a_script_from_a_moving_branch(self):
-        """A raw URL on main is the same unstamped copy by another route."""
+        """A raw URL on main serves an unstamped script with no baked release version."""
         offenders = self._offenders(_MOVING_RAW_URL)
         self.assertEqual(
             offenders,

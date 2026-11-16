@@ -97,7 +97,26 @@ const (
 	// conversations evict the oldest idle one (see conversationLocked); a client that wants a task after eviction is told it is
 	// not found, which is the protocol's own answer for a task the server
 	// no longer holds.
-	a2aMaxTasks         = 4096
+	a2aMaxTasks = 4096
+	// The reasons in a not-found error's data (a2aTaskNotHeld), which a client
+	// reads instead of parsing the message. Neither says the task failed: the
+	// door forgot it, and the task may have run, or may still be running.
+	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
+	// stay inside its bounds, running or not.
+	a2aNotHeldEvicted = "evicted"
+	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
+	// door keeps tasks in the active gateway's memory only, so a task
+	// submitted before servingSince, before a restart or failover, is
+	// unknown here: its executor may have finished it or may still be
+	// running it. Also the answer for an id that is another caller's or
+	// that no door minted, so it confirms nothing about ids the caller
+	// can't read.
+	a2aNotHeldSinceServing = "not-held-since-serving"
+
+	// a2aMaxEvictedIDs bounds the ids the door remembers having evicted,
+	// so a caller asking after one is told it was evicted, not that the
+	// door never held it (a2aTaskNotHeld).
+	a2aMaxEvictedIDs    = a2aMaxTasks
 	a2aMaxConversations = 1024
 	// a2aMaxResultBytes bounds the artifact the door keeps. A longer
 	// deliverable is cut at a rune boundary and the Task says so in
@@ -169,6 +188,11 @@ type a2aTask struct {
 	// it arrived, so an empty result is distinguishable from none.
 	result    string
 	delivered bool
+	// cardStopText and cardStop are a canceled task's card-stop result
+	// (CardStopObserver): rendered as its one artifact when the task ends
+	// canceled, and never otherwise.
+	cardStopText string
+	cardStop     *lib.Part
 	// resultCutFrom is the deliverable's length when it exceeded
 	// a2aMaxResultBytes; zero when it was kept whole.
 	resultCutFrom int
@@ -294,6 +318,13 @@ type A2ADoor struct {
 	convOrder     []string
 	tasks         map[string]*a2aTask
 	taskOrder     []string
+	// evicted is each task id the door dropped to stay inside its bounds,
+	// with its caller, oldest first in evictedOrder; servingSince is when
+	// this gateway's door started serving. Together they tell a caller why
+	// a task isn't held (a2aTaskNotHeld).
+	evicted      map[string]string
+	evictedOrder []string
+	servingSince time.Time
 	// retainedBytes is the tasks' bytes summed, for the budget.
 	retainedBytes int
 	submissions   map[string]*a2aOutcome
@@ -304,6 +335,9 @@ type A2ADoor struct {
 	// notify is closed and replaced whenever anything changes; see the
 	// inject door for why one channel serves the whole adapter.
 	notify chan struct{}
+	// claimWaiting counts the calls asleep in claimTurnIf waiting for a
+	// slot, under mu; tests poll it to know a call has queued.
+	claimWaiting int
 
 	handlerMu sync.RWMutex
 	handler   func(InboundMessage)
@@ -407,6 +441,9 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 	d.handlerMu.Lock()
 	d.handler = handler
 	d.handlerMu.Unlock()
+	d.mu.Lock()
+	d.servingSince = time.Now()
+	d.mu.Unlock()
 	defer func() {
 		d.handlerMu.Lock()
 		d.handler = nil
@@ -681,7 +718,7 @@ func (d *A2ADoor) send(r *http.Request, verified string, handler func(InboundMes
 		// caller's own and still running.
 		task, ok := d.taskFor(msg.TaskID, caller)
 		if !ok {
-			return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+msg.TaskID, nil)
+			return d.a2aTaskNotHeld(req.ID, msg.TaskID, caller)
 		}
 		if task.terminal {
 			return rpcFail(req.ID, rpcInvalidParams, "task "+msg.TaskID+" is over; start a new one", nil)
@@ -825,7 +862,7 @@ func (d *A2ADoor) get(r *http.Request, verified string, req rpcRequest) rpcRespo
 		return rpcFail(req.ID, rpcInvalidParams, "id is required", nil)
 	}
 	if _, ok := d.taskFor(params.ID, caller); !ok {
-		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
 	obj := d.taskObject(params.ID)
 	if params.HistoryLength != nil && *params.HistoryLength >= 0 && *params.HistoryLength < len(obj.History) {
@@ -852,15 +889,18 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	}
 	task, ok := d.taskFor(params.ID, caller)
 	if !ok {
-		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
-	}
-	if task.terminal {
-		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
 	if task.cancelPublished {
 		// A retry (a lost response, a client timeout during the claim):
 		// the cancel is on the bus already, which is what this call asks.
+		// Checked before the terminal, so a retry that arrives after the
+		// executor's terminal still gets the task back, now ended, and not
+		// a refusal for a cancel that took.
 		return rpcOK(req.ID, d.taskObject(params.ID))
+	}
+	if task.terminal {
+		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
 	}
 	key, contextID := task.key, task.contextID
 	messageID := a2aInboundIDPrefix + randHex(messageIDHexWidth)
@@ -871,9 +911,32 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	// still runs has still asked for the stop, and a cancel never handed
 	// over leaves the stray running with nobody to stop it. The bound alone
 	// ends the claim; the wait below stays on the request's context.
-	prior, ok := d.claimTurn(context.WithoutCancel(r.Context()), key, caller, contextID, user, deadline)
-	if !ok {
+	//
+	// A call queued behind another cancel for this task (a client that timed
+	// out and retried, #5777) looks again on every pass of its wait, in the
+	// claim's critical section: the first may have put the cancel on the bus, or
+	// the task may have ended, and a second stop would be answered without a
+	// publish and read as a refusal.
+	var gone, done, ended bool
+	var state lib.TaskState
+	prior, got := d.claimTurnIf(context.WithoutCancel(r.Context()), key, caller, contextID, user, deadline, func() bool {
+		t := d.tasks[params.ID]
+		gone = t == nil
+		if !gone {
+			done, ended, state = t.cancelPublished, t.terminal, t.state
+		}
+		return !gone && !done && !ended
+	})
+	switch {
+	case got == turnRefused:
 		return rpcFail(req.ID, rpcInternalError, earlierTurnNote(), nil)
+	case got == turnNotNeeded && gone:
+		// Evicted while the call waited: no longer held, as tasks/get says.
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
+	case got == turnNotNeeded && done:
+		return rpcOK(req.ID, d.taskObject(params.ID))
+	case got == turnNotNeeded:
+		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(state), nil)
 	}
 	handler(InboundMessage{
 		Conversation: key,
@@ -897,8 +960,38 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 // against. It also mints the conversation, so Roster answers inside the
 // turn.
 func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, user lib.Message, deadline time.Time) (a2aPrior, bool) {
+	prior, got := d.claimTurnIf(ctx, key, caller, contextID, user, deadline, nil)
+	return prior, got == turnClaimed
+}
+
+// turnClaim is how claimTurnIf ended.
+type turnClaim int
+
+const (
+	// turnRefused: no slot, by the deadline or the context.
+	turnRefused turnClaim = iota
+	// turnClaimed: the slot is this caller's, until TurnFinished.
+	turnClaimed
+	// turnNotNeeded: stillWanted said the turn was no longer needed, on some
+	// pass of the wait, so nothing was claimed.
+	turnNotNeeded
+)
+
+// claimTurnIf is claimTurn with a check: on every pass, before the slot
+// is looked at, stillWanted (if set) runs under d.mu, and a false answer
+// returns without claiming. A cancel queued behind the first cancel for the
+// same task uses it (#5777): it answers as soon as the first puts the
+// cancel on the bus (CancelPublished wakes the waiters), even while that
+// turn still holds the slot, and the check is in the same critical section
+// as a claim, so nothing slips between them. Waiters are woken together
+// (wakeLocked), so one that claims nothing strands no other.
+func (d *A2ADoor) claimTurnIf(ctx context.Context, key, caller, contextID string, user lib.Message, deadline time.Time, stillWanted func() bool) (a2aPrior, turnClaim) {
 	for {
 		d.mu.Lock()
+		if stillWanted != nil && !stillWanted() {
+			d.mu.Unlock()
+			return a2aPrior{}, turnNotNeeded
+		}
 		conv := d.conversationLocked(key)
 		conv.caller = caller
 		conv.contextID = contextID
@@ -914,18 +1007,30 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 				// message is not handed over at all (the inject door's
 				// claimTurn, which handleInbound's routing relies on).
 				d.mu.Unlock()
-				return a2aPrior{}, false
+				return a2aPrior{}, turnRefused
 			}
 			conv.busy = true
 			conv.pending = user
 			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: conv.tasks.total, posts: conv.turnPosts.total}
 			d.mu.Unlock()
-			return prior, true
+			return prior, turnClaimed
 		}
 		wait := d.notify
+		d.claimWaiting++
 		d.mu.Unlock()
-		if !d.sleep(ctx, wait, deadline) {
-			return a2aPrior{}, false
+		awake := d.sleep(ctx, wait, deadline)
+		d.mu.Lock()
+		d.claimWaiting--
+		// A last look at the deadline: what stillWanted waits on may have
+		// landed with it, and a refusal then would be for a turn that
+		// wasn't needed.
+		notNeeded := !awake && stillWanted != nil && !stillWanted()
+		d.mu.Unlock()
+		if notNeeded {
+			return a2aPrior{}, turnNotNeeded
+		}
+		if !awake {
+			return a2aPrior{}, turnRefused
 		}
 	}
 }
@@ -1371,6 +1476,42 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 	d.wakeLocked()
 }
 
+// TaskCardStop records a canceled task's card-stop result (CardStopObserver):
+// the gateway's text for it and the cardStop part, the caller's own
+// session's card IDs and titles. Bounded like a deliverable.
+func (d *A2ADoor) TaskCardStop(conversation, taskID, text string, cardStop lib.Part) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	task, ok := d.tasks[taskID]
+	if !ok {
+		conv := d.conversationLocked(conversation)
+		task = &a2aTask{id: taskID, key: conversation, contextID: conv.contextID, caller: conv.caller, created: time.Now()}
+		d.tasks[taskID] = task
+		d.taskOrder = append(d.taskOrder, taskID)
+	}
+	task.resultCutFrom = 0
+	if whole := len(text) + len(cardStop.Data); whole > a2aMaxResultBytes {
+		// A part cut mid-JSON reads as nothing; the text alone says it, cut
+		// and marked as a cut deliverable is (metadata.resultTruncatedFrom).
+		task.resultCutFrom = whole
+		text, cardStop = truncateRunes(text, a2aMaxResultBytes), lib.Part{}
+	}
+	before := len(task.cardStopText)
+	if task.cardStop != nil {
+		before += len(task.cardStop.Data)
+	}
+	d.chargeLocked(task, len(text)+len(cardStop.Data)-before)
+	task.cardStopText = text
+	task.cardStop = nil
+	if cardStop.Kind != "" {
+		part := cardStop
+		task.cardStop = &part
+	}
+	task.updated = time.Now()
+	d.enforceBudgetLocked(task)
+	d.wakeLocked()
+}
+
 // TaskDelivered records the deliverable the relay hands over whole before
 // posting it in chunks (DeliverableObserver). It is the task's one artifact;
 // the posts stay what they are, the task's history.
@@ -1423,8 +1564,63 @@ func (d *A2ADoor) evictOldestTaskLocked(keep *a2aTask) {
 	if old := d.tasks[oldest]; old != nil && old != keep {
 		d.retainedBytes -= old.bytes
 		delete(d.tasks, oldest)
+		d.rememberEvictedLocked(oldest, old.caller)
 	}
 	d.taskOrder = d.taskOrder[1:]
+}
+
+// rememberEvictedLocked records an evicted task's id and caller, dropping
+// the oldest record past a2aMaxEvictedIDs. Caller holds d.mu.
+func (d *A2ADoor) rememberEvictedLocked(taskID, caller string) {
+	if d.evicted == nil {
+		d.evicted = map[string]string{}
+	}
+	if _, ok := d.evicted[taskID]; !ok {
+		d.evictedOrder = append(d.evictedOrder, taskID)
+	}
+	d.evicted[taskID] = caller
+	for len(d.evictedOrder) > a2aMaxEvictedIDs {
+		delete(d.evicted, d.evictedOrder[0])
+		d.evictedOrder = d.evictedOrder[1:]
+	}
+}
+
+// a2aNotHeldData is the data of a door not-found error: why the door
+// doesn't hold the task, when this gateway started serving the door, and
+// that the task's outcome is unknown here (MayHaveRun): a caller that
+// resubmits with a new messageId starts it again, possibly twice. The
+// door's messageId dedupe is in the same memory, so a repeated messageId
+// doesn't dedupe across a restart either; on the same gateway it still
+// names the original task, so reusing an evicted task's messageId doesn't
+// start a fresh run.
+type a2aNotHeldData struct {
+	Reason       string `json:"reason"`
+	ServingSince string `json:"servingSince"`
+	MayHaveRun   bool   `json:"mayHaveRun"`
+}
+
+// a2aTaskNotHeld is the protocol's task-not-found error (-32001) for a
+// task the door doesn't hold for this caller, with a2aNotHeldData saying
+// why. Only the caller's own evicted task is told it was evicted; every
+// other miss reads the same, so the answer confirms no id another caller
+// holds.
+func (d *A2ADoor) a2aTaskNotHeld(id json.RawMessage, taskID, caller string) rpcResponse {
+	d.mu.Lock()
+	evictedCaller, wasEvicted := d.evicted[taskID]
+	since := d.servingSince
+	d.mu.Unlock()
+	data := a2aNotHeldData{Reason: a2aNotHeldSinceServing, ServingSince: since.UTC().Format(time.RFC3339Nano), MayHaveRun: true}
+	if wasEvicted && evictedCaller == caller {
+		data.Reason = a2aNotHeldEvicted
+		return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
+			"; the door held it and evicted it to stay inside its bounds, so its outcome is unknown here: "+
+			"it may have run or may still be running. Resubmitting with a new messageId starts it again; "+
+			"reusing the original messageId does not", data)
+	}
+	return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
+		"; the A2A door keeps tasks in the active gateway's memory only, and this gateway has served the door since "+
+		data.ServingSince+": a task submitted before then is unknown here and may have run or may still be running. "+
+		"Resubmitting starts it again, and a repeated messageId doesn't dedupe across a restart", data)
 }
 
 // CancelPublished records that a cancel reached the bus.
@@ -1500,6 +1696,17 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		// relay handed nothing for (a non-text result, a heal with no
 		// artifact on the stream) renders no artifact rather than a guess.
 		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(task.result)}}
+	}
+	if state == lib.StateCanceled && task.cardStopText != "" {
+		// A canceled task shows only its card-stop result (TaskCardStop):
+		// whether the turn's cards stopped, as text and as the cardStop
+		// part the card-stop control returns (#5528). Any other output a
+		// canceled turn produced stays unrendered.
+		parts := textParts(task.cardStopText)
+		if task.cardStop != nil {
+			parts = append(parts, *task.cardStop)
+		}
+		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: parts}}
 	}
 	metadata := map[string]any{"backend": a2aBackendForCaller(task.caller)}
 	if task.resultCutFrom > 0 {

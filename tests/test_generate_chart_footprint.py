@@ -122,6 +122,15 @@ def _scale_shell_statefulset(docs):
     doc["spec"]["replicas"] = 2
 
 
+def _rename_agent_data_claim(docs):
+    _find_doc(docs, "PersistentVolumeClaim", gcf._AGENT_DATA_CLAIM)["metadata"]["name"] = "renamed-data"
+
+
+def _resize_agent_data_claim(docs):
+    claim = _find_doc(docs, "PersistentVolumeClaim", gcf._AGENT_DATA_CLAIM)
+    claim["spec"]["resources"]["requests"]["storage"] = "10Gi"
+
+
 def _scale_cred_proxy_deployment(docs):
     doc = _find_doc(docs, "Deployment", gcf._CRED_PROXY_WORKLOAD)
     doc["spec"]["replicas"] = 3
@@ -132,19 +141,53 @@ def _scale_gateway_deployment(docs):
     doc["spec"]["replicas"] = 2
 
 
-@contextlib.contextmanager
-def _golden_with(mutate):
-    """Run the block against the committed golden with `mutate` applied to its documents."""
-    docs = [doc for doc in yaml.safe_load_all(gcf._GOLDEN_MANIFEST.read_text()) if doc]
-    mutate(docs)
+def _mutated_copy(golden, mutate):
+    docs = [doc for doc in yaml.safe_load_all(golden.read_text()) if doc]
+    if mutate:
+        mutate(docs)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
         yaml.safe_dump_all(docs, fh)
-        path = pathlib.Path(fh.name)
+        return pathlib.Path(fh.name)
+
+
+@contextlib.contextmanager
+def _golden_with(mutate):
+    """Run the block against the committed golden with `mutate` applied."""
+    path = _mutated_copy(gcf._GOLDEN_MANIFEST, mutate)
     try:
         with unittest.mock.patch.object(gcf, "_GOLDEN_MANIFEST", path):
             yield path
     finally:
         path.unlink(missing_ok=True)
+
+
+def _scale_callout_deployment(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+    doc["spec"]["replicas"] = 3
+
+
+def _drop_bridge(docs):
+    spec = _gateway_pod_spec(docs)
+    spec["containers"] = [c for c in spec["containers"] if c["name"] != "hermes-bridge"]
+
+
+def _drop_nats_exporter(docs):
+    doc = _find_doc(docs, "StatefulSet", "platformagent-a2a-nats")
+    spec = doc["spec"]["template"]["spec"]
+    spec["containers"] = [c for c in spec["containers"] if c["name"] != "nats-exporter"]
+
+
+def _drop_console_cpu_limit(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-console")
+    for container in doc["spec"]["template"]["spec"]["containers"]:
+        container.get("resources", {}).get("limits", {}).pop("cpu", None)
+
+
+def _add_callout_container(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+    doc["spec"]["template"]["spec"]["containers"].append(
+        _container("callout-metrics", requests={"cpu": "10m", "memory": "16Mi"})
+    )
 
 
 def _container(name="c", requests=None, limits=None):
@@ -337,7 +380,7 @@ class ExtractFootprintTest(unittest.TestCase):
         cls.op = cls.data["operatorRendered"]
 
     def test_shape(self):
-        for key in ("agentPod", "shellSandbox", "credentialProxy", "storage"):
+        for key in ("agentPod", "shellSandbox", "credentialProxy", "kubeProxy", "storage"):
             self.assertIn(key, self.op)
         self.assertIn("base", self.op["agentPod"])
         self.assertIn("dashboard", self.op["agentPod"])
@@ -368,8 +411,28 @@ class ExtractFootprintTest(unittest.TestCase):
         self.assertNotEqual(base["cpuMillisRequest"], 1250 + 100 + 10)
 
     def test_claims_are_counted(self):
-        self.assertEqual(self.op["storage"]["persistentVolumeClaims"], 4)
-        self.assertEqual(self.op["storage"]["storageBytesRequest"], 22 * _GIB)
+        # The agent's data claim, the image-tree cache, the shell's two claims and one
+        # JetStream claim per NATS server.
+        self.assertEqual(self.op["storage"]["persistentVolumeClaims"], 7)
+        self.assertEqual(self.op["storage"]["storageBytesRequest"], 222 * _GIB)
+
+    def test_the_two_data_claims_and_their_default_size_are_recorded(self):
+        """The agent's data claim and the sandbox's, which spec.storage.size sizes together."""
+        self.assertEqual(self.op["storage"]["dataClaims"], 2)
+        self.assertEqual(self.op["storage"]["dataClaimRequest"], "50Gi")
+        self.assertEqual(self.op["storage"]["dataClaimBytesRequest"], 50 * _GIB)
+
+    def test_a_renamed_data_claim_is_an_error_rather_than_a_smaller_count(self):
+        with _golden_with(_rename_agent_data_claim):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn(gcf._AGENT_DATA_CLAIM, str(caught.exception))
+
+    def test_data_claims_of_different_sizes_are_an_error(self):
+        with _golden_with(_resize_agent_data_claim):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("different sizes", str(caught.exception))
 
     def test_a_renamed_container_is_an_error_rather_than_a_zero(self):
         """Finding containers by name means a rename must fail loudly, not sum to 0."""
@@ -386,13 +449,15 @@ class ExtractFootprintTest(unittest.TestCase):
         self.assertEqual(shell["pods"], 2)
         self.assertEqual(shell["cpuMillisRequest"], baseline_shell["cpuMillisRequest"] * 2)
         self.assertEqual(shell["memoryBytesRequest"], baseline_shell["memoryBytesRequest"] * 2)
-        # Shell StatefulSet has 2 volumeClaimTemplates (data=10Gi, sshd=1Gi), so scaling from
-        # 1 to 2 replicas adds 2 claims (baseline 4 -> 6) and 11Gi storage (baseline 22Gi -> 33Gi).
-        self.assertEqual(data["operatorRendered"]["storage"]["persistentVolumeClaims"], 6)
+        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=1Gi), so scaling from
+        # 1 to 2 replicas adds 2 claims (baseline 7 -> 9) and 51Gi storage (baseline 222Gi -> 273Gi).
+        self.assertEqual(data["operatorRendered"]["storage"]["persistentVolumeClaims"], 9)
         self.assertEqual(
             data["operatorRendered"]["storage"]["storageBytesRequest"],
-            self.op["storage"]["storageBytesRequest"] + 11 * _GIB,
+            self.op["storage"]["storageBytesRequest"] + 51 * _GIB,
         )
+        # Each sandbox replica's data claim follows spec.storage.size too.
+        self.assertEqual(data["operatorRendered"]["storage"]["dataClaims"], 3)
 
     def test_cred_proxy_replicas_multiplies_pods_and_resources(self):
         with _golden_with(_scale_cred_proxy_deployment):
@@ -427,6 +492,169 @@ class ExtractFootprintTest(unittest.TestCase):
         with unittest.mock.patch.object(gcf, "_GOLDEN_MANIFEST", missing):
             with self.assertRaises(FileNotFoundError):
                 gcf.extract_footprint()
+
+
+class A2AStackFootprintTest(unittest.TestCase):
+    """The A2A stack, summed from the golden beside the operator's other workloads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = gcf.extract_footprint()
+        cls.following = cls.data["operatorRendered"]
+        cls.docs = [doc for doc in yaml.safe_load_all(gcf._GOLDEN_MANIFEST.read_text()) if doc]
+
+    def test_shape(self):
+        for key in (
+            "agentPod", "a2aNats", "a2aCallout", "a2aVerifier", "a2aConsole", "a2aGateway",
+            "a2aProvision", "storage",
+        ):
+            self.assertIn(key, self.following)
+        self.assertEqual(
+            set(self.following["agentPod"]), {"base", "dashboard", "hermesBridge", "hermesBridgeCli"}
+        )
+
+    def test_the_cli_bridge_is_the_agent_containers_size(self):
+        """Under A2A_BRIDGE_EXECUTOR=cli the operator copies the agent container's resources."""
+        (agent,) = [
+            c for c in _gateway_pod_spec(self.docs)["containers"] if c["name"] == "platform-agent"
+        ]
+        cli = self.following["agentPod"]["hermesBridgeCli"]
+        self.assertEqual(cli["pods"], 0)
+        self.assertEqual(cli["cpuMillisRequest"], gcf.parse_cpu_millis(agent["resources"]["requests"]["cpu"]))
+        self.assertEqual(cli["memoryBytesLimit"], gcf.parse_bytes(agent["resources"]["limits"]["memory"]))
+
+    def test_each_workload_is_its_golden_containers_times_its_replicas(self):
+        for key, (kind, name, names) in gcf._A2A_WORKLOADS.items():
+            with self.subTest(key=key):
+                doc = _find_doc(self.docs, kind, name)
+                replicas = doc["spec"].get("replicas", 1)
+                found = [
+                    c for c in doc["spec"]["template"]["spec"]["containers"]
+                    if c["name"] in names
+                ]
+                self.assertEqual(len(found), len(names))
+                entry = self.following[key]
+                self.assertEqual(entry["pods"], replicas)
+                self.assertEqual(
+                    entry["cpuMillisRequest"],
+                    sum(gcf.parse_cpu_millis(c["resources"]["requests"]["cpu"]) for c in found) * replicas,
+                )
+                self.assertEqual(
+                    entry["memoryBytesRequest"],
+                    sum(gcf.parse_bytes(c["resources"]["requests"]["memory"]) for c in found) * replicas,
+                )
+
+    def test_the_nats_entry_counts_the_exporter_sidecar(self):
+        self.assertEqual(gcf._A2A_WORKLOADS["a2aNats"][2], ("nats", "reloader", "nats-exporter"))
+
+    def test_surges_follows_each_workloads_strategy(self):
+        for key, (kind, name, _) in gcf._A2A_WORKLOADS.items():
+            with self.subTest(key=key):
+                doc = _find_doc(self.docs, kind, name)
+                strategy = (doc["spec"].get("strategy") or {}).get("type")
+                self.assertEqual(
+                    self.following[key]["surges"], kind == "Deployment" and strategy != "Recreate"
+                )
+        self.assertTrue(self.following["a2aCallout"]["surges"])
+        self.assertFalse(self.following["a2aNats"]["surges"])
+
+    def test_a_rolling_update_without_surge_does_not_surge(self):
+        def no_surge(docs):
+            doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+            doc["spec"]["strategy"] = {
+                "type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}
+            }
+        with _golden_with(no_surge):
+            self.assertFalse(gcf.extract_footprint()["operatorRendered"]["a2aCallout"]["surges"])
+
+    def test_the_bridge_adds_resources_but_no_pod(self):
+        bridge = self.following["agentPod"]["hermesBridge"]
+        self.assertEqual(bridge["pods"], 0)
+        self.assertGreater(bridge["cpuMillisRequest"], 0)
+
+    def test_the_jetstream_claims_are_in_the_totals_and_counted_apart(self):
+        storage = self.following["storage"]
+        # One 40Gi JetStream claim per NATS server, three by default, beside the agent's
+        # data claim, the shell's, Hindsight's and the image-tree cache.
+        self.assertEqual(storage["busClaims"], 3)
+        self.assertEqual(storage["busClaimBytesRequest"], 3 * 40 * _GIB)
+        self.assertEqual(storage["busClaimRequest"], "120Gi")
+        self.assertEqual(storage["persistentVolumeClaims"], 4 + 3)
+        self.assertEqual(storage["storageBytesRequest"], 102 * _GIB + 3 * 40 * _GIB)
+        # The data claims are the two spec.storage.size sizes, not the bus's.
+        self.assertEqual(storage["dataClaims"], 2)
+
+    def test_the_standing_delta_is_the_documented_figure(self):
+        """The A2A stack's standing requests, provisioning Job aside: 1580m and 2896Mi,
+        with the default three NATS servers, each with the JetStream metrics exporter
+        beside it (#4477), and the profile dispatcher (960m and 1648Mi with one server)."""
+        standing = [k for k in self.following if k.startswith("a2a") and k != "a2aProvision"]
+        bridge = self.following["agentPod"]["hermesBridge"]
+        cpu = sum(self.following[k]["cpuMillisRequest"] for k in standing) + bridge["cpuMillisRequest"]
+        memory = sum(self.following[k]["memoryBytesRequest"] for k in standing) + bridge["memoryBytesRequest"]
+        self.assertEqual((cpu, memory), (1580, 2896 * _MIB))
+
+    def test_replicas_scale_a_workload(self):
+        with _golden_with(_scale_callout_deployment):
+            callout = gcf.extract_footprint()["operatorRendered"]["a2aCallout"]
+        self.assertEqual(callout["pods"], 3)
+        self.assertEqual(callout["cpuMillisRequest"], 3 * 50)
+
+    def test_a_golden_without_the_bridge_is_an_error(self):
+        """A first-pass golden has no bridge; it must not pass as a smaller footprint."""
+        with _golden_with(_drop_bridge):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("RunSettledGoldenTest", str(caught.exception))
+
+    def test_a_summed_container_without_a_cpu_limit_is_an_error(self):
+        """A limits.cpu quota refuses such a pod, and the preflight would sum its limit as
+        zero and never see it (#3847, the console)."""
+        with _golden_with(_drop_console_cpu_limit):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        message = str(caught.exception)
+        self.assertIn("'console'", message)
+        self.assertIn("declares no cpu limit", message)
+
+    def test_a_missing_a2a_container_is_an_error(self):
+        """A golden without one of a workload's listed containers (here the NATS
+        exporter, #4477) must not pass as a smaller footprint."""
+        with _golden_with(_drop_nats_exporter):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("container 'nats-exporter' of StatefulSet/", str(caught.exception))
+
+    def test_an_unaccounted_a2a_container_is_an_error(self):
+        with _golden_with(_add_callout_container):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("callout-metrics", str(caught.exception))
+
+    def test_a_golden_without_an_a2a_workload_is_an_error(self):
+        """A golden rendered without the A2A stack must not pass as a smaller footprint."""
+        def drop_console(docs):
+            docs[:] = [d for d in docs if (d.get("metadata") or {}).get("name") != "platformagent-a2a-console"]
+        with _golden_with(drop_console):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("container 'console' of Deployment/platformagent-a2a-console not found", str(caught.exception))
+
+    def test_a_golden_without_the_provisioning_job_is_an_error(self):
+        def drop_job(docs):
+            docs[:] = [d for d in docs if d.get("kind") != "Job"]
+        with _golden_with(drop_job):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("Job running 'provision' in the golden, found 0", str(caught.exception))
+
+    def test_a_golden_without_the_jetstream_claim_is_an_error(self):
+        def drop_claim(docs):
+            _find_doc(docs, "StatefulSet", "platformagent-a2a-nats")["spec"].pop("volumeClaimTemplates", None)
+        with _golden_with(drop_claim):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("no volumeClaimTemplate on platformagent-a2a-nats", str(caught.exception))
 
 
 class MainExitCodeTest(unittest.TestCase):
@@ -559,6 +787,15 @@ class CompletenessGuardTest(unittest.TestCase):
     def setUpClass(cls):
         cls.baseline = gcf.extract_footprint()
 
+    def test_the_limits_guard_names_each_missing_limit(self):
+        spec = {"containers": [_container("box", requests={"cpu": "10m", "memory": "16Mi"}, limits={"memory": "32Mi"})]}
+        with self.assertRaises(ValueError) as caught:
+            gcf._check_limits({"Deployment/box": spec}, {gcf._container_key("Deployment/box", "box")})
+        self.assertIn("'box' in Deployment/box declares no cpu limit", str(caught.exception))
+        self.assertNotIn("no memory limit", str(caught.exception))
+        # An unsummed container is the completeness guard's business, not this one's.
+        gcf._check_limits({"Deployment/box": spec}, set())
+
     def test_the_committed_golden_passes(self):
         """Every pod-bearing workload the operator renders today is summed or ignored."""
         self.assertIn("operatorRendered", self.baseline)
@@ -655,3 +892,42 @@ class CompletenessGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecTierFootprintTest(unittest.TestCase):
+    """The exec tier's per-replica entry, read from its one-replica golden."""
+
+    def test_the_entry_is_one_exec_replica_and_stays_out_of_operator_rendered(self):
+        data = gcf.extract_footprint()
+        self.assertNotIn("credentialProxyExecTier", data["operatorRendered"])
+        entry = data["operatorRenderedPerReplica"]["credentialProxyExecTier"]
+        golden = yaml.safe_load_all(gcf._EXEC_TIER_GOLDEN_MANIFEST.read_text())
+        container = next(
+            c
+            for doc in golden
+            if doc and doc.get("kind") == "Deployment" and doc["metadata"]["name"] == gcf._EXEC_TIER_WORKLOAD
+            for c in doc["spec"]["template"]["spec"]["containers"]
+            if c["name"] == gcf._CRED_PROXY_CONTAINER
+        )
+        res = container["resources"]
+        self.assertEqual(entry["pods"], 1)
+        self.assertEqual(entry["cpuMillisRequest"], gcf.parse_cpu_millis(res["requests"]["cpu"]))
+        self.assertEqual(entry["cpuMillisLimit"], gcf.parse_cpu_millis(res["limits"]["cpu"]))
+        self.assertEqual(entry["memoryBytesRequest"], gcf.parse_bytes(res["requests"]["memory"]))
+        self.assertEqual(entry["ephemeralStorageBytesLimit"], gcf.parse_bytes(res["limits"]["ephemeral-storage"]))
+        self.assertEqual((entry["cpuMillisRequest"], entry["memoryBytesRequest"]), (2000, 2 * _GIB))
+        self.assertGreater(entry["ephemeralStorageBytesLimit"], 0)
+
+    def test_an_extra_container_in_the_exec_pod_fails_rather_than_undercounts(self):
+        docs = list(yaml.safe_load_all(gcf._EXEC_TIER_GOLDEN_MANIFEST.read_text()))
+        for doc in docs:
+            if doc and doc.get("kind") == "Deployment" and doc["metadata"]["name"] == gcf._EXEC_TIER_WORKLOAD:
+                doc["spec"]["template"]["spec"]["containers"].append(
+                    {"name": "new-sidecar", "resources": {"requests": {"cpu": "1"}}})
+        with tempfile.TemporaryDirectory() as tmp:
+            golden = pathlib.Path(tmp) / "platformagent-exec-1.yaml"
+            golden.write_text(yaml.safe_dump_all(docs))
+            with unittest.mock.patch.object(gcf, "_EXEC_TIER_GOLDEN_MANIFEST", golden):
+                with self.assertRaises(ValueError) as caught:
+                    gcf._exec_tier_entry()
+        self.assertIn("new-sidecar", str(caught.exception))

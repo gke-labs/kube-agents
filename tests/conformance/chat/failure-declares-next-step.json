@@ -1,0 +1,25 @@
+{
+  "name": "failure-declares-next-step",
+  "source": "deploy/docker/patches/test_slack_ux_failure.py::DECLARED_REPLY",
+  "notes": "Mock 06 with its step declared: the reply's last line, [next: check seeded-a], is its one button in place of 'Try again', and the line is not shown. The question stays.",
+  "input": {
+    "reply": "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?\n\n[next: check seeded-a]",
+    "wake": "Task t_f1 gave up."
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I couldn't find seeded-z.",
+        "detail": "The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?",
+        "choices": [
+          {
+            "text": "check seeded-a",
+            "next": true
+          }
+        ]
+      }
+    }
+  ]
+}

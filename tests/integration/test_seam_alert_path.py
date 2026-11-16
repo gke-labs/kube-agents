@@ -147,7 +147,9 @@ class AlertPathTest(unittest.TestCase):
         )
 
     def test_the_daily_ceiling_suppresses_and_reports_rather_than_posting(self):
-        kv = self.start_kv(env={"ALERT_DAILY_LIMIT_CRITICAL": "2"})
+        # The three injects name one workload, which the daemon folds by default
+        # before the ceiling is asked; this test is about the ceiling's answer.
+        kv = self.start_kv(env={"ALERT_DAILY_LIMIT_CRITICAL": "2", "INCIDENT_WORKLOAD_DEDUP_SECONDS": "0"})
         for expected in ("injected", "injected", "suppressed"):
             session_id = self._create_session(kv)
             status, body = self._inject(kv, session_id)

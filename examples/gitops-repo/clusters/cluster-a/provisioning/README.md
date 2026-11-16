@@ -28,3 +28,8 @@ The Platform Agent authors the KCC YAML here through its
 [`gcp-config-connector` skill](../../../../../agents/platform/skills/gcp-config-connector/SKILL.md):
 one pull request per change, create or acquire decided read-only beforehand,
 `cnrm.cloud.google.com/deletion-policy: abandon` on every resource, and no apply from the agent.
+It authors the HCL through its
+[`gcp-terraform` skill](../../../../../agents/platform/skills/gcp-terraform/SKILL.md): edits in the
+repository's own style, an `import` block for a resource that exists but is not here, a replacement
+only when the request names it and called out first in the pull request, deletion protection never
+changed, and no `init`, `plan` or `apply` from the agent.

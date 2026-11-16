@@ -53,6 +53,20 @@ import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "autoops-incident" / "main.tf"
+_VARIABLES = _MODULE.with_name("variables.tf")
+
+#: Where the operator names the gateway Pod's container that runs the watcher,
+#: and the stack's default that has to match it (#3681: the default kept
+#: naming envoy-credential-proxy after #913 moved the watcher).
+_OPERATOR_MANIFESTS = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+)
+_OPERATOR_CONTAINER_RE = re.compile(
+    r'^\s*agentAPIAuthContainerName\s*=\s*"([^"]+)"', re.M
+)
+_AGENT_CONTAINER_DEFAULT_RE = re.compile(
+    r'variable "agent_container" \{.*?^\s*default\s*=\s*"([^"]+)"', re.S | re.M
+)
 
 #: The create-time provisioner is the first `command = <<-EOT` block in the
 #: module; the destroy-time one is the second.
@@ -75,9 +89,16 @@ _INTERPOLATIONS = {
     "var.host_cluster_location": "us-central1",
     "var.agent_deployment": "platform-agent-gateway",
     "var.agent_namespace": "kubeagents-system",
-    "var.agent_container": "envoy-credential-proxy",
+    "var.agent_container": "agent-api-auth",
     "var.allocate_mib": "96",
     "var.memory_limit_mib": "64",
+    "var.replicas": "1",
+    "local.watcher_handled": "fire",
+    # The OOM shape and the incident wait: what the incumbent case plants.
+    "var.crash_seconds": "0",
+    "var.wait_for": "incident",
+    "var.gitops_manifest_path": "",
+    "var.start_settle_seconds": "0",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will
@@ -89,9 +110,12 @@ _OWNER_LABEL = "kube-agents-bench"
 #: healthy path: no leftover namespace, debounce already cleared, watcher fires.
 #: `NS_OWNER` uses `${VAR-default}` rather than `${VAR:-default}` so a test can
 #: set it empty to mean "the namespace carries no managed-by label".
+#: `POD_CONTAINERS` is the gateway pod's container list as step 0a reads it:
+#: the native sidecars first, then the regular containers.
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
+  *"get deployment"*jsonpath*)  echo "${POD_CONTAINERS-agent-api-auth platform-agent}"; exit 0 ;;
   *"get namespace"*jsonpath*)   echo "${NS_OWNER-%(owner)s}"; exit 0 ;;
   *"get namespace"*"-o yaml"*)  echo "kind: Namespace"; exit 0 ;;
   *"get namespace"*)            exit "${NS_EXISTS_RC:-1}" ;;
@@ -101,6 +125,9 @@ case "$*" in
   *"logs "*)
     if [ "${WATCHER_FIRES:-1}" = "1" ]; then
       echo "fire BackOff pod=%(ns)s/%(workload)s-abc123 -> sid=s1 (mode=live)"
+    fi
+    if [ "${WATCHER_FOLDS:-0}" = "1" ]; then
+      echo "folded BackOff pod=%(ns)s/%(workload)s-abc123 (sid=s1) -- the workload's incident is already open"
     fi
     exit 0 ;;
   *) exit 0 ;;
@@ -118,17 +145,19 @@ exit 0
 
 #: The plant polls on 10-second sleeps and its timeouts are minutes long.
 #: `STUB_SLEEP` buys back a little real time for the signal test, which needs
-#: the script still running when it sends SIGTERM.
-_SLEEP_STUB = '#!/bin/bash\nexec /bin/sleep "${STUB_SLEEP:-0}"\n'
+#: the script still running when it sends SIGTERM. Every invocation is recorded
+#: to $CALLS so tests can assert settle sleeps and ordering after the poll.
+_SLEEP_STUB = '#!/bin/bash\necho "sleep $*" >> "$CALLS"\nexec /bin/sleep "${STUB_SLEEP:-0}"\n'
 
 #: Bounds for the signal test's two waits -- for the plant to reach the watcher
 #: poll, and for it to finish once signalled. Generous, because blowing either
 #: is a hang rather than a red.
 _SIGNAL_TIMEOUT_SECONDS = 60
 _SIGNAL_POLL_SECONDS = 0.05
+_TF_BIN = shutil.which("tofu") or shutil.which("terraform")
 
 
-def _render_plant() -> str:
+def _render_plant(overrides: "dict[str, str] | None" = None) -> str:
     """Render the create-time provisioner the way Terraform would.
 
     `<<-EOT` strips the indentation common to every line -- which matters, since
@@ -144,14 +173,17 @@ def _render_plant() -> str:
     sentinel = "\x00"
     body = body.replace("$${", sentinel)
 
+    interpolations = dict(_INTERPOLATIONS)
+    if overrides:
+        interpolations.update(overrides)
     unresolved = []
 
     def substitute(match: "re.Match[str]") -> str:
         expression = match.group(1).strip()
-        if expression not in _INTERPOLATIONS:
+        if expression not in interpolations:
             unresolved.append(expression)
             return match.group(0)
-        return _INTERPOLATIONS[expression]
+        return interpolations[expression]
 
     body = re.sub(r"\$\{([^}]*)\}", substitute, body)
     body = body.replace(sentinel, "${")
@@ -224,6 +256,18 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_a_recurrence_without_the_repository_fails_before_touching_a_pod(self):
+        # wait_for = recurrence grades the replaced pod against an open fix, so
+        # with no repository or token to find that fix in it must stop rather
+        # than replace the pod and grade a recurrence nobody can attribute.
+        recurring = self._plant.replace('[ "incident" = "recurrence" ]', '[ "recurrence" = "recurrence" ]')
+        self.assertNotEqual(recurring, self._plant, "the recurrence step's guard moved; update this test")
+        self._script.write_text(recurring)
+        completed, calls = self._run(BENCH_GITOPS_REPO="", BENCH_GITHUB_TOKEN="", GITHUB_TOKEN="")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("wait_for = recurrence needs BENCH_GITOPS_REPO", completed.stderr)
+        self.assertEqual(self._indices(calls, "delete pod"), [], f"a pod was replaced:\n{chr(10).join(calls)}")
+
     def test_healthy_run_deletes_nothing(self):
         completed, calls = self._run()
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -233,6 +277,19 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             "the plant deleted a namespace on a run that succeeded and found "
             f"nothing left over:\n{chr(10).join(calls)}",
         )
+
+    def test_a_folded_event_is_not_an_incident_unless_the_case_accepts_it(self):
+        # A case waiting on its own card gets none for a folded event, so by
+        # default only `fire` ends the wait; incident-triage-workload-fold
+        # grades the fold and sets accept_folded, rendered here as the pattern.
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertNotEqual(completed.returncode, 0, "a folded event ended the wait for a case that did not accept it")
+
+        accepting = self._plant.replace('grep -qE "fire ', 'grep -qE "(fire|folded) ')
+        self.assertNotEqual(accepting, self._plant, "the watcher poll's pattern moved; update this test")
+        self._script.write_text(accepting)
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_leftover_namespace_is_deleted_before_the_workload_is_planted(self):
         # The self-heal, and the half that recovers a cluster already holding a
@@ -370,6 +427,49 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             f"to fetch the host cluster's credentials:\n{chr(10).join(calls)}",
         )
 
+    def test_a_container_the_pod_lacks_fails_before_anything_is_planted(self):
+        # #3681: the watcher moved out of envoy-credential-proxy (#913) while
+        # this stack kept reading that container's log with stderr discarded,
+        # so every run spent the 300s watcher wait and blamed the watcher. The
+        # pod here carries the post-#913 layout minus agent-api-auth.
+        completed, calls = self._run(
+            POD_CONTAINERS="platform-agent platform-agent-dashboard fluent-bit"
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("has no container 'agent-api-auth'", completed.stderr)
+        self.assertEqual(
+            self._indices(calls, "apply -f -") + self._indices(calls, "logs "),
+            [],
+            "the plant went on to plant and poll against a container the pod "
+            f"does not have:\n{chr(10).join(calls)}",
+        )
+
+    def test_the_container_check_reads_native_sidecars(self):
+        # agent-api-auth is a native sidecar, so it is listed only under
+        # initContainers. A check reading .containers alone would refuse every
+        # run on a real install, which the stub's canned answer cannot show.
+        _, calls = self._run()
+        checks = self._indices(calls, "get deployment")
+        self.assertTrue(checks, f"no container check ran:\n{chr(10).join(calls)}")
+        self.assertIn(".spec.template.spec.initContainers[*].name", calls[checks[0]])
+        self.assertIn(".spec.template.spec.containers[*].name", calls[checks[0]])
+
+    def test_the_default_container_is_the_one_the_operator_runs_the_watcher_in(self):
+        operator = _OPERATOR_CONTAINER_RE.search(_OPERATOR_MANIFESTS.read_text())
+        default = _AGENT_CONTAINER_DEFAULT_RE.search(_VARIABLES.read_text())
+        self.assertIsNotNone(
+            operator, f"agentAPIAuthContainerName not found in {_OPERATOR_MANIFESTS}"
+        )
+        self.assertIsNotNone(
+            default, f"agent_container default not found in {_VARIABLES}"
+        )
+        self.assertEqual(
+            default.group(1),
+            operator.group(1),
+            "the stack would read the watcher's log from a container the "
+            "gateway Pod does not run it in",
+        )
+
     def test_a_wedged_leftover_namespace_fails_with_its_own_message(self):
         # A namespace stuck on a finalizer cannot be planted over. Failing here
         # names the real cause; letting it through spends the watcher timeout
@@ -377,6 +477,122 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
         completed, _ = self._run(NS_EXISTS_RC=0, NS_DELETE_RC=1)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("could not clear the leftover", completed.stderr)
+
+    def test_start_settle_seconds_waits_after_watcher_poll_only_when_positive(self):
+        # At the default 0, single-card cases pay no extra sleep after `fire`.
+        completed, calls = self._run()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("Waiting ", completed.stdout)
+        logs_calls = self._indices(calls, "logs ")
+        self.assertTrue(logs_calls, f"no watcher poll ran:\n{chr(10).join(calls)}")
+        self.assertEqual(
+            [i for i in self._indices(calls, "sleep ") if i > max(logs_calls)],
+            [],
+            f"the default 0s plant slept after the watcher poll:\n{chr(10).join(calls)}",
+        )
+
+        # With a positive settle duration, the plant prints its settle line and
+        # sleeps strictly after `k8s-event-watcher` handles the pod.
+        self._calls.unlink(missing_ok=True)
+        settled = _render_plant({"var.start_settle_seconds": "7"})
+        self.assertNotEqual(settled, self._plant)
+        self._script.write_text(settled)
+        completed, calls = self._run()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        handled_msg = "k8s-event-watcher handled a pod"
+        waiting_msg = "Waiting 7s for the incident cards to settle before the board read."
+        self.assertIn(handled_msg, completed.stdout)
+        self.assertIn(waiting_msg, completed.stdout)
+        self.assertLess(
+            completed.stdout.index(handled_msg),
+            completed.stdout.index(waiting_msg),
+        )
+        logs_calls = self._indices(calls, "logs ")
+        settle_sleeps = self._indices(calls, "sleep 7")
+        self.assertTrue(logs_calls, f"no watcher poll ran:\n{chr(10).join(calls)}")
+        self.assertTrue(
+            settle_sleeps, f"no `sleep 7` settle ran:\n{chr(10).join(calls)}"
+        )
+        self.assertLess(
+            max(logs_calls),
+            settle_sleeps[0],
+            f"`sleep 7` ran before the watcher poll finished:\n{chr(10).join(calls)}",
+        )
+
+    def test_start_settle_seconds_declares_whole_number_validation(self):
+        # main.tf gates the settle with `[ "${var.start_settle_seconds}" != "0" ]`
+        # (avoiding bash's 64-bit integer `-gt` grammar) and variables.tf bounds
+        # `start_settle_seconds` to whole numbers in `0..86400`. Pin the exact
+        # validation condition text so CI environments without `tofu` or
+        # `terraform` still fail on any edit that weakens or appends to the rule.
+        block = re.search(
+            r'variable "start_settle_seconds"\s*\{(.*?)\n\}',
+            _VARIABLES.read_text(),
+            re.S,
+        )
+        self.assertIsNotNone(
+            block, f"start_settle_seconds variable block not found in {_VARIABLES}"
+        )
+        condition = re.search(
+            r"validation\s*\{[^}]*?\bcondition\s*=\s*([^\n]+)",
+            block.group(1),
+            re.S,
+        )
+        self.assertIsNotNone(
+            condition,
+            f"validation condition not found on start_settle_seconds in {_VARIABLES}",
+        )
+        self.assertEqual(
+            condition.group(1).strip(),
+            "var.start_settle_seconds >= 0 && var.start_settle_seconds <= 86400 && floor(var.start_settle_seconds) == var.start_settle_seconds",
+        )
+
+    @unittest.skipUnless(_TF_BIN, "needs a tofu or terraform binary")
+    def test_start_settle_seconds_validation_evaluated_by_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy2(_VARIABLES, pathlib.Path(tmp) / "variables.tf")
+            init = subprocess.run(
+                [_TF_BIN, f"-chdir={tmp}", "init", "-input=false", "-no-color"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(init.returncode, 0, init.stderr)
+
+            def plan(val: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        _TF_BIN,
+                        f"-chdir={tmp}",
+                        "plan",
+                        "-input=false",
+                        "-no-color",
+                        "-var",
+                        "host_cluster_name=platform-agent-host",
+                        "-var",
+                        "host_cluster_location=us-central1",
+                        "-var",
+                        f"start_settle_seconds={val}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+
+            for accepted in ("0", "180", "86400"):
+                with self.subTest(accepted=accepted):
+                    res = plan(accepted)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+            for refused in ("2.5", "-1", "86401", "10000000000000000000"):
+                with self.subTest(refused=refused):
+                    res = plan(refused)
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(
+                        "start_settle_seconds must be a whole number of seconds between 0 and 86400",
+                        res.stderr,
+                    )
 
 
 if __name__ == "__main__":

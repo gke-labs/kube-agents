@@ -51,8 +51,6 @@ validated: false
 
 domain: cluster-debugging
 
-owner: maintainers
-
 fixtures:
   - stalled-controller
 

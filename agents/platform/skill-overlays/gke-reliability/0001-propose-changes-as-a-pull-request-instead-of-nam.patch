@@ -1,0 +1,21 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -16,7 +16,9 @@ This reference covers high availability and reliability configuration for GKE
+ clusters and workloads.
+ 
+ > **MCP Tools:** `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`,
+-> `apply_k8s_manifest`, `list_k8s_events`
++> `list_k8s_events`
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Golden Path Reliability Defaults
+ 

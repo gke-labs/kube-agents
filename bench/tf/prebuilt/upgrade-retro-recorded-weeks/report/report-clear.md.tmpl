@@ -1,0 +1,47 @@
+# Upgrade retrospective 2026-01-02
+
+Window since 2026-09-28T18:00:00Z; projects: {{PROJECT}}; generated 2026-01-02T03:04:05Z.
+
+## Errors
+
+_none_
+
+## Warnings
+
+_none_
+
+## Info
+
+### {{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}} — clean
+
+**What happened.** upgraded (control plane moved; pool default-pool moved); channel REGULAR; cluster status RUNNING.
+
+| Target | Before | After |
+| --- | --- | --- |
+| control plane | 1.33.4-gke.1134000 | 1.33.5-gke.1080000 |
+| pool `default-pool` | 1.33.4-gke.1134000 | 1.33.5-gke.1080000 |
+
+| Operation | Target | Start | End | Duration | Status | Error |
+| --- | --- | --- | --- | --- | --- | --- |
+| UPGRADE_MASTER | control plane | 2026-10-10T03:27:00Z | 2026-10-10T03:35:00Z | 8 min | DONE |  |
+| UPGRADE_NODES | default-pool | 2026-10-11T03:26:00Z | 2026-10-11T03:31:00Z | 5 min | DONE |  |
+
+**Next upgrade.** channel REGULAR; target 1.33.5-gke.1080000; cluster at 1.33.5-gke.1080000, at or ahead of the target. Window: daily 03:00Z for 4h; next opens 2026-10-20T03:00:00Z. Exclusions: none.
+
+**Gate.** clear: no Error or Warning the upgrade brought, and no container past the log-volume thresholds. Before: 2026-10-03T03:27:00Z to 2026-10-10T03:27:00Z; after: 2026-10-11T03:31:00Z to 2026-10-18T03:31:00Z.
+**Log volume by container.** total 405.6 MiB -> 413.8 MiB per week; none past the thresholds (2.0x and 1.0 GiB per week); the largest: kube-system/konnectivity-agent: 298.0 MiB -> 301.5 MiB per week (1.01x); kube-system/fluentbit: 0 B -> 1.0 MiB per week (new); kube-system/gke-metadata-server: 17.3 MiB -> 18.2 MiB per week (1.06x); gmp-system/prometheus: 15.1 MiB -> 15.6 MiB per week (1.04x); kube-system/netd: 29.7 MiB -> 30.1 MiB per week (1.01x).
+
+**Risks present.** no catalogue shape found; checked: budgets allowing no disruption and single-replica workloads behind a budget (1); selectors on beta.kubernetes.io / failure-domain.beta.kubernetes.io labels (12); images on a retired registry host (20); in-tree gcePersistentDisk volumes and kubernetes.io/gce-pd StorageClasses (19); DaemonSets on hostNetwork (17) or mounting the containerd socket (13); emptyDir or local-SSD volumes whose name suggests state (4); GPU workloads pinning a CUDA version (18); fail-closed webhooks whose Service has no ready endpoint (7); pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14; pinned tags only, floating tags such as 8-jre are not matched); not checked statically: a multi-process container (15) is not visible from the spec.
+
+**Baseline recorded.** control plane 1.33.5-gke.1080000; pools default-pool 1.33.5-gke.1080000; 14 pods, 2 budgets, 0 shapes. Symptom baseline recorded: 0 symptom(s), 0 first seen. Guards written: 0.
+
+Unchanged clusters:
+
+- {{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}} at 1.32.9-gke.1185000; last upgrade operation none recorded; next target 1.33.5-gke.1080000 (behind); last reviewed 2026-10-12T18:00:00Z
+- {{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}} at 1.33.4-gke.1134000; last upgrade operation none recorded; next target 1.33.5-gke.1080000 (behind); last reviewed 2026-10-12T18:00:00Z
+- {{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}} at 1.33.4-gke.1134000; last upgrade operation none recorded; next target 1.33.5-gke.1080000 (behind); last reviewed 2026-10-12T18:00:00Z
+
+Families:
+
+- seeded-held: no member upgraded in this run's window; members: {{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}
+- seeded-regular: first upgraded {{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}} (gate clear: no Error or Warning the upgrade brought, and no container past the log-volume thresholds); rollout go; waiting: {{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}, {{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}

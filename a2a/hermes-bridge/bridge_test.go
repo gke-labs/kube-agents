@@ -47,7 +47,9 @@ func startServerNoVerifier(t *testing.T) (*natsserver.Server, string) {
 	return startServerOpt(t, false)
 }
 
-func startServerOpt(t *testing.T, withVerifier bool) (*natsserver.Server, string) {
+// startServerOpt starts the test server; each mutate sees its options
+// before it starts.
+func startServerOpt(t *testing.T, withVerifier bool, mutate ...func(*natsserver.Options)) (*natsserver.Server, string) {
 	t.Helper()
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
@@ -56,6 +58,9 @@ func startServerOpt(t *testing.T, withVerifier bool) (*natsserver.Server, string
 		StoreDir:  t.TempDir(),
 		NoLog:     true,
 		NoSigs:    true,
+	}
+	for _, m := range mutate {
+		m(opts)
 	}
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -391,10 +396,21 @@ func fold(t *testing.T, c *lib.Client, taskID string) *lib.Task {
 	return task
 }
 
+// terminalWait is how long waitTerminal polls for a task's terminal; a
+// test whose task does more work than that admits passes its own budget to
+// waitTerminalFor.
+const terminalWait = 20 * time.Second
+
 func waitTerminal(t *testing.T, c *lib.Client, taskID string) *lib.Task {
 	t.Helper()
+	return waitTerminalFor(t, c, taskID, terminalWait)
+}
+
+// waitTerminalFor is waitTerminal with the caller's budget.
+func waitTerminalFor(t *testing.T, c *lib.Client, taskID string, d time.Duration) *lib.Task {
+	t.Helper()
 	var task *lib.Task
-	waitFor(t, 20*time.Second, "terminal event on "+taskID, func() bool {
+	waitFor(t, d, "terminal event on "+taskID, func() bool {
 		got, err := c.TasksGet(testCtx(t), "platform", taskID)
 		if err != nil {
 			return false

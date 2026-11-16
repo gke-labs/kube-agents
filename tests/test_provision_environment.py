@@ -39,7 +39,6 @@ from tests.testing.release import (
     MOCK_CR_NOT_READY,
     MOCK_CR_READY_AT_GENERATION_2,
     MOCK_CR_STALE_READY,
-    MOCK_GATEWAY_DARK_REASON,
     MOCK_MODE_CONTEXT,
     write_mode_kubectl_stub,
 )
@@ -129,6 +128,7 @@ exit 0
                 f"--gcp-region={MOCK_GCP_REGION} "
                 f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME} "
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
+                f"--mode=today "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
                 f"--google-chat-home-channel=spaces/TEST12345 "
@@ -293,6 +293,7 @@ exit 0
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
                     "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+                    "TEARDOWN_RETRY_WAIT_SECONDS": "0",
                 }
             )
 
@@ -306,9 +307,11 @@ exit 0
 
             self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
             calls = recorded_calls.read_text().splitlines()
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(calls[0], MOCK_UNINSTALL_FAIL_SIGNAL)
-            self.assertEqual(calls[1], MOCK_INSTALL_SUCCESS_SIGNAL)
+            # teardown_common.sh runs a failed uninstall.sh twice.
+            self.assertEqual(
+                calls,
+                [MOCK_UNINSTALL_FAIL_SIGNAL, MOCK_UNINSTALL_FAIL_SIGNAL, MOCK_INSTALL_SUCCESS_SIGNAL],
+            )
 
 
 class TeardownOutcomeTest(unittest.TestCase):
@@ -363,6 +366,9 @@ exit 0
                 # get_isolated_test_env strips GITHUB_*, so the job-summary
                 # path only exists when a test asks for it.
                 "GITHUB_STEP_SUMMARY": str(summary),
+                # teardown_common.sh's retry wait, off: a test checks the
+                # attempts, not the clock.
+                "TEARDOWN_RETRY_WAIT_SECONDS": "0",
                 **(extra_env or {}),
             }
         )
@@ -396,6 +402,19 @@ exit 0
         self.assertIn("Environment teardown failed (exit 1)", summary)
         self.assertIn("teardown blew up here", summary)
         self.assertEqual(calls[-1], MOCK_INSTALL_SUCCESS_SIGNAL)
+
+    def test_a_failed_teardown_is_tried_twice_before_it_is_reported(self):
+        """The pre-install teardown shares teardown_run's retry.
+
+        Run 41106670355 stopped here under TEARDOWN_STRICT on a credentials
+        503 that one more uninstall.sh would have outlived.
+        """
+        proc, calls, _ = self._run(
+            uninstall_exit=1, extra_env={"TEARDOWN_STRICT": "true"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(calls.count(MOCK_UNINSTALL_FAIL_SIGNAL), 2, calls)
+        self.assertIn("attempt 2 of 2", proc.stderr)
 
     def test_strict_mode_stops_before_provisioning(self):
         proc, calls, summary = self._run(
@@ -750,8 +769,9 @@ class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
 class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
     """A GitHub variable a human typed still means what it meant in install.env.
 
-    These settings reach install.sh as `--enable-*` flags, whose validator
-    matches exactly true|false and exits 1 naming the flag. The same variables
+    These settings reach install.sh as boolean flags (`--enable-*`,
+    `--vertex-manage-serving-project`), whose validators match exactly
+    true|false and exit 1 naming the flag. The same variables
     also reach it through the rendered install.env, where is_truthy accepts
     True/yes/y/1/on. An environment spelled `True` deployed fine on the file
     route, so it has to keep deploying on the flag route.
@@ -764,6 +784,9 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GKE_BACKUP_PLAN": "--enable-gke-backup-plan",
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
+        "WEB_CONSOLE_ENABLED": "--enable-web-console",
+        "ENABLE_DRIFT_DETECTOR": "--enable-drift-detector",
+        "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
     }
 
     def _install_call(self, tmp_dir):
@@ -771,6 +794,24 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
 
     def _run_recording(self, overrides):
         return self._run(overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n')
+
+    def test_a_rebuild_with_the_minter_names_the_project_wide_key(self):
+        """After the teardown the state holds no minter, so unnamed the install would derive names with no key (#3504)."""
+        body = (f'echo "minter: $KMS_KEYRING|$KMS_KEY|${{GITHUB_MINTER_GSA_NAME:-}}|${{GITHUB_MINTER_KSA_NAME:-}}"'
+                f' >> "{MOCK_CALLS_LOG}"\n')
+        proc, tmp_dir = self._run(
+            {"GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "12345"}, install_body=body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("minter: github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa"
+                      "|kubeagents-github-minter",
+                      self._install_call(tmp_dir))
+        # An environment's own names win, and one without the minter gets none.
+        proc, tmp_dir = self._run(
+            {"GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "12345", "KMS_KEYRING": "env-ring",
+             "KMS_KEY": "env-key"}, install_body=body)
+        self.assertIn("minter: env-ring|env-key|", self._install_call(tmp_dir))
+        proc, tmp_dir = self._run({}, install_body=body)
+        self.assertIn("minter: |||", self._install_call(tmp_dir))
 
     def test_a_truthy_spelling_reaches_the_flag_as_true(self):
         for name, flag in self._TOGGLES.items():
@@ -819,6 +860,24 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
                     (tmp_dir / MOCK_CALLS_LOG).exists(),
                     "the guard must fire before install.sh is invoked",
                 )
+
+    def test_a_misspelt_helm_upgrade_install_is_refused_before_the_teardown(self):
+        """HELM_UPGRADE_INSTALL is no flag, but its generator refuses a typo too.
+
+        That refusal comes from install.sh's tfvars generator, after the
+        teardown, so the same guard runs first. Recognised spellings pass.
+        """
+        proc, tmp_dir = self._run_recording({"HELM_UPGRADE_INSTALL": "ture"})
+        self.assertNotEqual(proc.returncode, 0, "a non-boolean spelling must not provision")
+        combined = proc.stdout + proc.stderr
+        self.assertIn("HELM_UPGRADE_INSTALL", combined)
+        self.assertIn("::error", combined)
+        self.assertNotIn("Tearing down the existing environment", combined)
+        self.assertFalse((tmp_dir / MOCK_CALLS_LOG).exists())
+        for spelling in ("true", "True", "false", "off"):
+            with self.subTest(spelling=spelling):
+                proc, _ = self._run_recording({"HELM_UPGRADE_INSTALL": spelling})
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_a_whitespace_only_value_is_refused_rather_than_read_as_false(self):
         """A space is not an answer, and `false` is the dangerous guess.
@@ -940,6 +999,17 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("install:", (tmp_dir / MOCK_CALLS_LOG).read_text())
 
+    def test_the_home_channel_policy_flag_follows_the_variable(self):
+        """Set, it reaches install.sh as the flag; unset, no flag at all, so
+        install.sh's own default (auto) stays in charge."""
+        tokens = {**self._ENABLED, "SLACK_BOT_TOKEN": self._BOT, "SLACK_APP_TOKEN": self._APP}
+        proc, tmp_dir = self._run_recording({**tokens, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--slack-home-channel-policy=manual", (tmp_dir / MOCK_CALLS_LOG).read_text())
+        proc, tmp_dir = self._run_recording(tokens)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--slack-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
     def test_an_environment_without_slack_is_never_asked_for_tokens(self):
         """Which is every environment but the ones that opt in."""
         for overrides in ({}, {"SLACK_ENABLED": "false"}):
@@ -977,7 +1047,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-callout -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-verifier -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-gateway -n {ns} --timeout=GATE",
-        "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=GATEWAY",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-gateway -n {ns} --timeout=GATE",
     ]
 
@@ -1032,9 +1101,9 @@ class PlatformAgentModeTest(unittest.TestCase):
         for line in lines:
             if "-o jsonpath=" in line:
                 tag = next(
-                    (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                    (c for c in ("BusProvisioned", "BusCredentialsReady") if c in line),
                     "READ",
-                ).replace("A2AGateway", "GATEWAY")
+                )
                 line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
             if line.startswith("kubectl "):
                 match = re.search(r"--timeout=(\d+)s$", line)
@@ -1066,7 +1135,8 @@ class PlatformAgentModeTest(unittest.TestCase):
                 self.assertTrue(calls[1].startswith("install: "), calls)
                 for call in calls:
                     self.assertIn("[PLATFORM_AGENT_MODE=<absent>]", call)
-                self.assertNotIn("--mode", calls[1])
+                # Named: install.sh's own first-install default is next.
+                self.assertIn(" --mode=today ", calls[1])
 
     def test_next_installs_with_todays_arguments_then_patches_and_gates(self):
         _, today_calls = self._run({})
@@ -1079,7 +1149,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             calls[0], today_calls[0].replace("<absent>", "next")
         )
         self.assertEqual(
-            calls[1], today_calls[1].replace("<absent>", "next")
+            calls[1], today_calls[1].replace("<absent>", "next").replace(" --mode=today ", " --mode=next ")
         )
         self.assertEqual(calls[2:], self._expected_gate())
 
@@ -1116,23 +1186,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
-    def test_a_dropped_gateway_read_is_retried(self):
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"}, gateway_read_failures=2)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        normalised = self._normalise(calls)
-        self.assertEqual(normalised.count(self._expected_gate()[-2]), 3)
-        self.assertEqual(normalised[-1], self._expected_gate()[-1])
-
-    def test_a_gateway_read_that_never_succeeds_fails_the_step_with_the_state(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
-            gateway_read_failures=1000,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("::error title=mode next: A2AGateway unreadable::", proc.stdout)
-        self.assertTrue(any("-l app.kubernetes.io/part-of=a2a-next" in c for c in calls), calls)
-        self.assertFalse(any("a2a-gateway" in c and "rollout status" in c for c in calls), calls)
-
     def test_next_is_refused_on_a_long_lived_environment_before_the_teardown(self):
         for spelling in ("true", "1", "yes"):
             with self.subTest(spelling=spelling):
@@ -1157,13 +1210,15 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("did not roll out", proc.stdout)
 
-    def test_a_withheld_gateway_is_reported_not_waited_for(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next"}, gateway_reason=MOCK_GATEWAY_DARK_REASON
-        )
+    def test_the_gate_always_waits_on_the_a2a_gateway(self):
+        # Every next install runs the gateway (on the console door alone with
+        # no chat backend), so the gate reads no condition that could make it
+        # skip the rollout, and the last thing it waits on is that rollout.
+        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self._normalise(calls)[2:], self._expected_gate()[:-1])
-        self.assertIn("configures no chat backend", proc.stdout)
+        self.assertEqual(self._normalise(calls)[-1], self._expected_gate()[-1])
+        self.assertFalse(any("A2AGateway" in c for c in calls), calls)
+        self.assertNotIn("no chat backend", proc.stdout)
 
     def test_a_mode_that_is_not_a_mode_is_refused_before_the_teardown(self):
         for value in ("Next", "nxt", "today ", "TODAY"):
@@ -1342,6 +1397,7 @@ exit 0
             "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
             "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
             "PROVISION_STOCKOUT_WAIT_SECONDS": "0",
+            "TEARDOWN_RETRY_WAIT_SECONDS": "0",
         }
         base.update(overrides or {})
         proc = subprocess.run(
@@ -1376,7 +1432,8 @@ exit 0
             uninstall_exit_after_first=5, overrides={"TEARDOWN_STRICT": "true"},
         )
         self.assertEqual(proc.returncode, 5, "the retry's teardown failed and strict mode stops the run with its code")
-        self.assertEqual(sequence, ["uninstall", "install", "uninstall"])
+        # The failed teardown is itself run twice by teardown_common.sh.
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "uninstall"])
 
     def test_the_zone_pool_exhausted_wording_is_retried_too(self):
         proc, calls = self._run(failures=1, message=self.EXHAUSTED)

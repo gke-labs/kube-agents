@@ -1,0 +1,123 @@
+# Upgrade-failure catalogue entry 20 (images on a retired registry), in the
+# shape the seeded fleet plants it: retired-registry-image on seeded-a, a
+# Deployment (legacy-registry-pull, in seeded-shapes) pulling
+# k8s.gcr.io/pause:3.9 with imagePullPolicy Always. k8s.gcr.io stopped
+# receiving images in 2023 and answers by redirect to registry.k8s.io; every
+# node rebuild pulls the image again from the old host, and the day the
+# redirect stops, or a node image or registry policy refuses the host, the
+# rebuilt node cannot start the pod.
+#
+# The prompt names no image and no registry. It asks which workloads pull
+# from a retired registry hostname, and for the answer to end in one declared
+# line per such workload, in a fixed form; the deterministic objectives read
+# the planted workload's line and nothing else.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The registry host may carry its scheme (`https://k8s.gcr.io`).
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the image reference. Repointing it at registry.k8s.io
+# is the heal that passes every objective and empties the fixture.
+id: upgrades-retired-registry-image-named
+name: The image pulled from a retired registry is named before the node rebuild that would re-pull it
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project are upgraded,
+  tell me which workloads pull images from a registry hostname that has been
+  retired and now answers only by redirect, and what a node rebuild would do
+  to them if that host stopped answering. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your
+  answer with one line per such workload in exactly this form, no other words
+  on the line: "<cluster>/<namespace>/<workload>: image <image reference>;
+  registry host <hostname>; retired: <yes|no>".
+
+expected_output: >-
+  It reads the container images on the seeded clusters and names
+  legacy-registry-pull in seeded-shapes on seeded-a: k8s.gcr.io/pause:3.9,
+  pulled with imagePullPolicy Always from k8s.gcr.io, which was frozen in
+  2023 and redirects to registry.k8s.io, so every rebuilt node pulls from a
+  host that may stop answering and the pod then sits in ImagePullBackOff. It
+  recommends repointing the image at registry.k8s.io, and performs no
+  change. It cites no CVE identifiers and ends with the declared line for
+  each such workload, the planted one reading "image k8s.gcr.io/pause:3.9;
+  registry host k8s.gcr.io; retired: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - retired-registry-image
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-workload-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+
+  - name: the-declared-line-names-the-retired-host
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?:https?://)?k8s\.gcr\.io(?: ?\([^)\n;]*\))?; retired: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?(?!(?:https?://)?k8s\.gcr\.io(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; retired: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-host-is-retired
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?legacy-registry-pull(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: image:? ?[^ :;\n][^;\n]*; registry host:? ?[^ :;\n][^;\n]*; retired: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The image still names the retired host.
+  - name: the-planted-image-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: retired-registry-image
+      kind: deployment
+      resource_name: legacy-registry-pull
+      namespace: seeded-shapes
+      path: spec.template.spec.containers[0].image
+      op: eq
+      value: k8s.gcr.io/pause:3.9

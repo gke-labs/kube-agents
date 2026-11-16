@@ -40,19 +40,21 @@ The repo is named literally in both: Phase −1 runs before Phase 0 defines `$RE
 
 ```bash
 # Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
-# actually read, the commit graph, and the open threads. The filter reports the
-# commits *after* the review's commit, which is what the currency test needs.
+# actually read, the commit graph, the open threads, and the contested ones: a
+# resolved thread whose last reply starts with `declined` or `deferred`, in any
+# case and with or without a colon. The filter reports the commits *after* the
+# review's commit, which is what the currency test needs.
 gh api graphql -f query='
 query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
   headRefOid isDraft state author{login}
   reviews(last:20){nodes{author{login} state submittedAt body commit{oid}}}
   commits(last:100){nodes{commit{oid messageHeadline parents(first:2){totalCount nodes{oid}}}}}
-  reviewThreads(first:100){nodes{isResolved path}}
+  reviewThreads(first:100){nodes{isResolved path last: comments(last:1){nodes{body}}}}
 }}}' -F pr=<N> --jq '.data.repository.pullRequest as $p
 | ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
 | ($p.commits.nodes | map(.commit)) as $cs
 | ($cs | map(.oid) | index($r.commit.oid // "")) as $i
-| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length)",
+| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length) contested=\([$p.reviewThreads.nodes[]|select(.isResolved and ((.last.nodes[0].body // "") | ascii_downcase | test("^(declined|deferred)\\b")))]|length)",
   (if $r == null then "lastbot: NONE"
    else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
         ($r.body | split("\n") | [.[0], (.[] | select(startswith("### Findings outside") or startswith("#### ") or startswith("_This was a")))] | join("\n")),
@@ -70,10 +72,10 @@ Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: 
 has been observed returning an empty body against this repo while `/pulls/<N>/comments` worked.
 (REST does carry the review's `commit_id`, so that is not the reason — availability is.)
 
-Keep the filter's `.[0]` / `startswith` shape if you edit it. `gh --jq` is gojq, but the same
-program gets piped through real `jq` often enough that it has to run in both, and jq rejects a field
-access applied straight to a function call — `capture("…").s` compiles under gojq and is a syntax
-error under jq 1.6.
+Keep the filter's `.[0]` / `startswith` / `test` shape if you edit it. `gh --jq` is gojq, but the
+same program gets piped through real `jq` often enough that it has to run in both, and jq rejects a
+field access applied straight to a function call — `capture("…").s` compiles under gojq and is a
+syntax error under jq 1.6.
 
 All three page sizes are caps rather than promises:
 
@@ -415,7 +417,9 @@ Otherwise proceed. If a prior review exists but new commits landed, review the c
 and note in your report which findings from the prior review the new commits resolved. Read the
 existing PR conversation carefully either way — a finding the author has already answered in a
 thread is either resolved (drop it) or contested (address their argument directly rather than
-restating the claim).
+restating the claim). A resolved thread whose last reply starts with `declined` or `deferred`, in
+any case and with or without a colon, is contested, not settled: the author resolves a declined bot
+finding after the reply, so read it and rule on the decline.
 
 ### Phase 2b — Establish intent
 
@@ -427,8 +431,8 @@ does, is itself a finding.
 ### Phase 3 — Find the candidates and verify them
 
 Run `$MAIN_ROOT/.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method
-and the canonical home for the ten angles and the verification discipline; read it now and work it
-in order — intent, angles A–J, then the verification step, which is not optional.
+and the canonical home for the eleven angles and the verification discipline; read it now and work
+it in order — intent, angles A–K, then the verification step, which is not optional.
 
 Its step 1 is already satisfied: you are a subagent that did not write this change, which is the
 separation it asks for. Do not spawn another one. Start at its step 2.
@@ -518,12 +522,13 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 
 One thing the skill has no way to know about:
 
-- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"` and read the
-  `tide` status on the head commit, which states its reason outright. Do not read
-  `mergeStateStatus`: every open pull request in this repository reads `BLOCKED` or `DIRTY` and
-  none reads `CLEAN`, so it distinguishes nothing —
-  `docs/pull-request-workflow.md`, "How a change merges", says why. `DIRTY` is the one signal it
-  does carry, and it means the conflict you have probably already found.
+- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"`, then read
+  the `Smoke gate`, `Merge labels` and smoke statuses on the head commit, the labels, and whether
+  auto-merge is on. A gate shows on the head only when it is green.
+  `docs/pull-request-workflow.md`, "How a change merges", has the commands, says what each one
+  means, and links the queue page that lists the queued pull requests. Do not read `mergeStateStatus` as a verdict: open pull requests here commonly read
+  `BLOCKED`. `DIRTY` is the one signal it does carry, and it means the conflict you have probably
+  already found.
 
 The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
 "single confident first pass" constraint does, and it covers the saved file, the PR comment, and
@@ -540,8 +545,8 @@ the files already in that directory:
   read, so a narrowed pass that records only the SHA reads exactly like a full one and cancels it;
 - **Intent** — the one-sentence claim from Phase 2b, so the next reader knows what the findings were
   measured against;
-- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what `tide`
-  says it is waiting for. When the PR conflicts with its base, say so here and state
+- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what the merge
+  queue is waiting for: a gate, a label, or a required check. When the PR conflicts with its base, say so here and state
   that the review covers the PR as authored, not as merged. In `since` mode say that too: the
   verdict speaks for the commits you read, not for the pull request;
 - **Checks run** — commands executed and what they showed;
@@ -602,8 +607,8 @@ The rules that decide whether it lands:
 
 - `event` is `COMMENT`. Never `APPROVE`, never `REQUEST_CHANGES` — that is the human's signature,
   not yours.
-- **`/lgtm` is the same signature by another route, and here it is the merge itself.** Tide merges
-  on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from an account the
+- **`/lgtm` is the same signature by another route, and here it is the merge itself.** The merge
+  queue takes a pull request on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from an account the
   `OWNERS` files name under `reviewers` or `approvers` for one of the changed paths; Prow ignores
   collaborator status here (`owners.skip_collaborators`). `/approve` sets the other label. Neither
   goes out on my behalf unless I asked for it, and nor does `/hold`, which blocks somebody else's

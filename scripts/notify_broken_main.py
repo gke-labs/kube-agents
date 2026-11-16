@@ -119,7 +119,6 @@ Test: cd scripts && python3 -m unittest test_notify_broken_main
 """
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -134,7 +133,6 @@ from github_api import (
     PER_PAGE,
     REQUEST_ATTEMPTS,
     REQUEST_RETRY_CEILING,
-    REQUEST_RETRY_SECONDS,
     GitHubAPI as BaseGitHubAPI,
     _retry_delay,
     is_refusal,
@@ -172,6 +170,7 @@ WATCHED_WORKFLOWS = (
     "Actionlint",
     "Docker Build",
     "Documentation Checks",
+    "k8s-api-proxy Tests",
     "Operator Tests",
     "Python Unit Tests",
     "Validate Repo Structure",
@@ -352,13 +351,13 @@ def _commit_subject(run):
 def _author(run):
     """Who wrote the change, which is not who pushed it.
 
-    Nothing merges to main by hand here -- Prow's Tide does, so `actor` and
-    `triggering_actor` are both `google-oss-prow[bot]` on every push and naming
-    either tells a reader nothing. The squash commit keeps the pull request
-    author (`Brad Hoekstra` on 277de10, with GitHub itself as committer), so
-    that is the field to read. It is a display name and not a login, so it
-    renders as plain text; the pull request link beside it is the one worth
-    following.
+    Nothing merges to main by hand here -- the merge queue does, so `actor` and
+    `triggering_actor` are both `github-merge-queue[bot]` on every push and
+    naming either tells a reader nothing. The squash commit keeps the pull
+    request author (`Fuxiao G` on f0ad3a3, #4802, with GitHub itself as
+    committer), so that is the field to read. It is a display name and not a
+    login, so it renders as plain text; the pull request link beside it is the
+    one worth following.
     """
     name = ((run.get("head_commit") or {}).get("author") or {}).get("name")
     if name:

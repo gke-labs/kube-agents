@@ -439,6 +439,156 @@ class TestRegistration(QueueTestCase):
 
         self.assertEqual(fq.get_finding(self.conn, elsewhere_id)["rubric"]["C"], 1.0)
 
+    def test_a_check_prefix_scopes_absence_to_its_own_family(self):
+        # The weekly upgrade readiness review is complete for the `upgrade-`
+        # family on a cluster and for nothing else: an inventory row it never
+        # looked at keeps its confidence, the upgrade row it no longer reports
+        # loses it.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(sample(), upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})  # empty batch, prefixed claim
+
+        self.assertEqual(result, {"results": [], "downgraded": 1})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 0.6)
+        self.assertIsNotNone(fq.get_finding(self.conn, upgrade_id)["absent_since"])
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+        self.assertIsNone(fq.get_finding(self.conn, inventory_id)["absent_since"])
+
+    def test_a_complete_claim_without_a_prefix_reaches_its_own_source_only(self):
+        # The onboarding sweep re-run by hand sends no prefix; its claim is
+        # complete for the inventory's rows and must not touch the weekly
+        # review's rows on the same cluster.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        stale = sample(object="Deployment/ledger")
+        self.register(sample(), stale, upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale_id = fq.validate_finding(stale)["id"]
+
+        result = self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_reaches_the_family_whatever_wrote_it(self):
+        # A prefix-alone claim (the review's batch names its source too; see the next test):
+        # The claim is the family, so an `upgrade-` row another source wrote and
+        # the review no longer reports loses confidence too, while the inventory
+        # row outside the family keeps it.
+        foreign = sample(source="inventory", check="upgrade-pool-skew", namespace="", object="old-pool")
+        self.register(sample(), foreign)
+        foreign_id = fq.validate_finding(foreign)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+        mine = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+
+        result = self.register(mine, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_that_names_its_source_reaches_only_its_rows_in_the_family(self):
+        # The review's batch names its family and its source: an `upgrade-` row the audit
+        # stream filed (`upgrade-blocked`) keeps its confidence, and the review's own row the
+        # week no longer reports loses it, empty batch or not.
+        audit = sample(source="audit", check="upgrade-blocked", namespace="", object="prod-eu")
+        stale = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="old-pool")
+        self.register(audit, stale)
+        audit_id, stale_id = fq.validate_finding(audit)["id"], fq.validate_finding(stale)["id"]
+        mine = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+        scope = {"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-", "source": "upgrade-readiness"}
+
+        result = self.register(mine, scope=scope)
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, audit_id)["rubric"]["C"], 1.0)
+        # The empty batch of a clean read reaches the review's own rows in the family, both of
+        # them now, and still not the audit's.
+        self.register(stale)
+        self.assertEqual(self.register(scope=scope)["downgraded"], 2)
+        self.assertEqual(fq.get_finding(self.conn, audit_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_must_name_the_batchs_own_family(self):
+        upgrade = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        crash = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        # A crashloop batch cannot claim the review's family.
+        with self.assertRaises(fq.FindingError):
+            self.register(crash, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        # A prefix that is not a family (no trailing separator) reaches too much.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade"})
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": ["upgrade-"]})
+        # One segment and its separator: neither a sub-family nor the bare separator.
+        for prefix in ("upgrade-pool-", "-", "upgrade_"):
+            with self.assertRaises(fq.FindingError):
+                self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": prefix})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+        # Folded like the stored check: a capitalised prefix reaches the row.
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "Upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
+        # A check that is only its family's name (stored without the separator) belongs to the family.
+        bare = sample(source="upgrade-readiness", check="upgrade-", namespace="", object="bare-pool")
+        self.register(bare)
+        bare_id = fq.validate_finding(bare)["id"]
+        self.assertEqual(fq.get_finding(self.conn, bare_id)["check"], "upgrade")
+        self.assertEqual(self.register(bare, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["results"][0]["outcome"], "updated")
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["downgraded"], 1)
+
+    def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
+        odd = sample(source="upgrade-readiness", check="Upgrade_Pool Skew", namespace="", object="old-pool")
+        self.register(odd)
+        odd_id = fq.validate_finding(odd)["id"]
+        self.assertEqual(fq.get_finding(self.conn, odd_id)["check"], "upgrade-pool-skew")
+        self.assertTrue(odd_id.startswith("upgrade-pool-skew."))
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
+
+    def test_scope_source_must_be_known_and_one_the_batch_wrote(self):
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "audits"})
+        # A batch of inventory rows cannot claim the event watcher's rows.
+        with self.assertRaises(fq.FindingError):
+            self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "event-watcher"})
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 1.0)
+        self.assertEqual(self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"})["downgraded"], 1)
+
+    def test_an_empty_batch_needs_a_complete_scope(self):
+        with self.assertRaises(fq.FindingError):
+            self.register()
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu"})
+        # Complete and empty, but naming neither a prefix nor a source: it would
+        # reach every row on the cluster, which no caller means.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"}), {"results": [], "downgraded": 0})
+
+    def test_a_mixed_batch_claims_completeness_for_its_sources_only(self):
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        other = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        self.register(sample(), upgrade, other)
+        other_id = fq.validate_finding(other)["id"]
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+
+        self.register(sample(), sample(source="event-watcher", check="crashloop", object="Deployment/other"), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, other_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+
     def test_absence_does_not_reach_a_state_the_user_set(self):
         accepted = sample(object="Deployment/ledger")
         self.register(sample(), accepted)
@@ -799,6 +949,20 @@ class TestListing(QueueTestCase):
         self.assertEqual(len(fq.list_findings(self.conn, state="queued")), 3)
         self.assertEqual(len(fq.list_findings(self.conn, cluster="prod-eu", severity="major")), 1)
 
+    def test_a_check_prefix_lists_one_family_before_the_limit(self):
+        self.register(sample(check="upgrade-drain-blocking-budget", object="PodDisruptionBudget/pinned"))
+        self.assertEqual({f["check"] for f in fq.list_findings(self.conn, check_prefix="probes-")}, {"probes-readiness"})
+        self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-")], ["upgrade-drain-blocking-budget"])
+        # The family is selected before the page is cut, so a page of one holds a row of it,
+        # whatever the other families' rank.
+        self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-", limit=1)], ["upgrade-drain-blocking-budget"])
+        # The claim's grammar: folded, the bare family name included, and a malformed family refused.
+        self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="Upgrade-")], ["upgrade-drain-blocking-budget"])
+        self.register(sample(check="upgrade-", object="PodDisruptionBudget/bare"))
+        self.assertEqual(sorted(f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-")), ["upgrade", "upgrade-drain-blocking-budget"])
+        with self.assertRaises(fq.FindingError):
+            fq.list_findings(self.conn, check_prefix="probes_")
+
     def test_bad_filters_are_refused(self):
         with self.assertRaises(fq.FindingError):
             fq.list_findings(self.conn, state="pending")
@@ -975,7 +1139,7 @@ class TestPacingSchema(unittest.TestCase):
         decision = fq.pace(fq.ranked_findings(conn), at(6, 12), fq.PacingLimits(), NONE_ADDED)
         self.assertEqual(ids(decision.add), [["pulled-critical"], ["never-named"]])
         self.assertEqual(ids(decision.remind), [["named-critical"], ["named-critical-2"]])
-        self.assertEqual(fq.additions_on(conn, "2026-10-05"), {"day": "2026-10-05", "critical": 0, "noncritical": 0})
+        self.assertEqual(fq.additions_on(conn, "2026-10-05"), {"day": "2026-10-05", "critical": 0, "noncritical": 0, "lines": []})
         self.assertEqual(fq.register_findings(conn, [sample()])["results"][0]["outcome"], "created")
 
     def test_a_table_with_the_pacing_columns_gains_absent_since_and_reads_as_still_reported(self):
@@ -1104,7 +1268,19 @@ class TestAdditions(QueueTestCase):
         fq.patch_finding(self.conn, snoozed, {"state": "snoozed", "snoozed_until": "2026-12-01"})
 
         self.assertEqual(fq.ranked_findings(self.conn), [])
-        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 2, "noncritical": 0})
+        additions = fq.additions_on(self.conn, self.DAY)
+        self.assertEqual({k: additions[k] for k in ("day", "critical", "noncritical")}, {"day": self.DAY, "critical": 2, "noncritical": 0})
+
+    def test_additions_name_the_line_of_each_addition(self):
+        members = [sample(object=f"Deployment/d{i}") for i in range(2)]
+        other = sample(check="b", rubric=CRITICAL_RUBRIC)
+        self.register(*members, other)
+        for member in members:
+            self.add(member, "noncritical")
+        self.add(other)
+        lines = fq.additions_on(self.conn, self.DAY)["lines"]
+        self.assertEqual(sorted(map(tuple, lines)), sorted({fq.item_key(fq.validate_finding(f)) for f in (*members, other)}))
+        self.assertEqual(fq.additions_on(self.conn, "2026-10-07")["lines"], [])
 
     def test_a_gathered_line_is_one_addition(self):
         members = [sample(object=f"Deployment/d{i}") for i in range(3)]
@@ -1122,6 +1298,8 @@ class TestAdditions(QueueTestCase):
         self.register(second)
         self.add(second, when=at(6, 13))
         self.assertEqual(fq.additions_on(self.conn, self.DAY)["critical"], 2)
+        key = list(fq.item_key(fq.validate_finding(first)))
+        self.assertEqual(fq.additions_on(self.conn, self.DAY)["lines"], [key, key])
 
     def test_a_recurrence_refunds_nothing(self):
         first, second = sample(check="a", rubric=CRITICAL_RUBRIC), sample(check="b", rubric=CRITICAL_RUBRIC)
@@ -1144,7 +1322,7 @@ class TestAdditions(QueueTestCase):
         self.register(pulled, joined)
         fq.mark_surfaced(self.conn, fq.validate_finding(pulled)["id"])
         fq.mark_surfaced(self.conn, fq.validate_finding(joined)["id"], publisher="nudge")
-        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 0, "noncritical": 0})
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 0, "noncritical": 0, "lines": []})
 
     def test_the_first_report_is_a_paced_publisher(self):
         # bootstrap_delivery.py marks each row of the report's items with one run.
@@ -1154,7 +1332,7 @@ class TestAdditions(QueueTestCase):
             fid = fq.validate_finding(member)["id"]
             fq.mark_surfaced(self.conn, fid, publisher="first_report", added_class="critical", run="2026-10-07T09:00:00Z")
             self.assertIsNotNone(fq.get_finding(self.conn, fid)["first_shown_at"])
-        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 1, "noncritical": 0})
+        self.assertEqual(fq.additions_on(self.conn, self.DAY), {"day": self.DAY, "critical": 1, "noncritical": 0, "lines": [["probes-readiness", "acme-prod", "prod-eu"]]})
 
     def test_a_day_must_be_a_date(self):
         for day in ("", "yesterday", "2026-10-06T00:00:00", None, "2026-99-99", "2026-02-30", "20261006", "٢٠٢٦-١٠-٠٦"):
@@ -1172,14 +1350,24 @@ class TestDecisionCoversItem(QueueTestCase):
         for fid in self.member_ids[:2]:
             fq.mark_surfaced(self.conn, fid, publisher="nudge")
 
-    def test_a_decision_on_one_id_decides_the_line(self):
+    def test_a_decision_on_one_id_decides_the_named_rows_of_the_line(self):
         result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "snoozed", "snoozed_until": "2026-12-01"})
-        self.assertEqual(sorted(result["item_rows_decided"]), sorted(self.member_ids[1:]))
-        for fid in self.member_ids:
+        self.assertEqual(result["item_rows_decided"], [self.member_ids[1]])
+        for fid in self.member_ids[:2]:
             row = fq.get_finding(self.conn, fid)
             self.assertEqual(row["state"], "snoozed")
             self.assertIsNotNone(row["snoozed_until"])
         self.assertEqual(fq.get_finding(self.conn, fq.validate_finding(self.other)["id"])["state"], "queued")
+
+    def test_a_queued_sibling_no_message_named_stays_open(self):
+        # member 2 joined the line and was never named: the user has not seen it.
+        result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "dismissed"})
+        self.assertEqual(result["item_rows_left_open"], [self.member_ids[2]])
+        row = fq.get_finding(self.conn, self.member_ids[2])
+        self.assertEqual((row["state"], row["snoozed_until"]), ("queued", None))
+        # Once a message names it, the next decision on the line reaches it.
+        fq.mark_surfaced(self.conn, self.member_ids[2])
+        self.assertEqual(fq.patch_finding(self.conn, self.member_ids[1], {"state": "dismissed"})["item_rows_left_open"], [])
 
     def test_deciding_the_named_id_clears_stop_add(self):
         rows = fq.ranked_findings(self.conn)
@@ -1193,7 +1381,7 @@ class TestDecisionCoversItem(QueueTestCase):
         self.assertEqual(fq.pace(rows, at(6, 12), fq.PacingLimits(), NONE_ADDED).blocking, [])
 
     def test_decided_rows_and_other_transitions_stay_per_row(self):
-        # A never-shown member of the line is in the item too.
+        # A decision on the never-named member itself still reaches the named ones.
         accepted = fq.patch_finding(self.conn, self.member_ids[2], {"state": "accepted"})
         self.assertEqual(sorted(accepted["item_rows_decided"]), sorted(self.member_ids[:2]))
         # Rows already decided keep their decision.
@@ -1382,6 +1570,79 @@ class TestPace(QueueTestCase):
         plan = fq.pace(rows, at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
         self.assertEqual(ids(plan.add), [["c-new"]])
         plan = fq.pace(rows[1:2] + rows[3:], at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
+        self.assertEqual(plan.add, [])
+
+    def test_a_row_that_joined_an_announced_line_later_is_a_new_item(self):
+        # #4262: K was announced with m0, whose decision left m1 (queued) open.
+        # m1 was never announced, so it is added and named like any new item,
+        # and it holds nothing back.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[key], announced_ids=["m0"])
+        self.assertEqual(ids(plan.add), [["m1"], ["n0"]])
+
+    def test_an_announced_member_still_new_keeps_its_line_unrecorded(self):
+        # Every mark of m0 failed, and m1 joined the line since: the line is
+        # still the announced item, which stops additions as before.
+        rows = [row("m0", "major", check="K"), row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED, announced=[fq.item_key(rows[0])], announced_ids=["m0"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["n0"]])
+
+    def test_a_line_whose_marks_partly_failed_counts_once(self):
+        # #5329: K was added with m0 and m1. The mark of m0 succeeded, so the
+        # day holds K's addition; the mark of m1 failed, so m1 is still new.
+        # A decision on m0 left m1 open. K is not counted a second time, holds
+        # nothing back, and is not added again today.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        # Two additions today under a cap of three: counting K again would
+        # fill the cap and leave n0 out.
+        added = {"critical": 0, "noncritical": 2, "lines": [list(key), ["other", "", "prod"]]}
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, added, announced=[key], announced_ids=["m0", "m1"])
+        self.assertEqual(ids(plan.add), [["n0"]])
+        self.assertEqual(ids(plan.waiting), [["m1"]])
+        # The next day m1 is an ordinary new item.
+        plan = fq.pace(rows, at(7, 17), self.LIMITS, NONE_ADDED)
+        self.assertEqual(ids(plan.add), [["m1"], ["n0"]])
+
+    def test_a_second_addition_of_a_line_whose_marks_all_failed_is_unrecorded(self):
+        # K was added at 16:00 and recorded; m0 was decided. m2 joined K and
+        # was added again at 17:00, and every mark of m2 failed. The day holds
+        # one addition of K for two announcements, so m2 is unrecorded and
+        # stops additions.
+        rows = [row("m2", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        added = {"critical": 0, "noncritical": 1, "lines": [list(key)]}
+        plan = fq.pace(rows, at(6, 18), self.LIMITS, added, announced=[key, key], announced_ids=["m0", "m2"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["n0"]])
+
+    def test_a_recorded_critical_left_new_holds_noncriticals_back(self):
+        # A critical K, with the mark of m1 failed and m0 decided: m1 waits for
+        # tomorrow, and a non-critical added now would hold it back behind
+        # stop-add.
+        rows = [row("m1", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        added = {"critical": 1, "noncritical": 0, "lines": [list(key)]}
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, added, announced=[key], announced_ids=["m0", "m1"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(sorted(ids(plan.waiting)), [["m1"], ["n0"]])
+
+    def test_a_line_whose_marks_all_failed_still_counts_and_holds_back(self):
+        # No mark of K succeeded, so the day does not hold it: it counts once
+        # as unrecorded and stops additions, as before.
+        rows = [row("m0", "major", check="K"), row("m1", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        added = {"critical": 0, "noncritical": 0, "lines": []}
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, added, announced=[key], announced_ids=["m0", "m1"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["n0"]])
+
+    def test_announced_keys_without_ids_match_on_the_key_alone(self):
+        # A record from before the ids were kept: the joined row is held back, as it was.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[fq.item_key(rows[0])])
         self.assertEqual(plan.add, [])
 
     def test_an_announced_but_unrecorded_noncritical_stops_every_addition(self):

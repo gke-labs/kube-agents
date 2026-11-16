@@ -18,8 +18,9 @@ Per project, in a temporary directory of its own:
     scripts/verify_ci_pool_project.py --project-id <p> --checks <read-only set> --report <file>
 
 The checks are the verifier's POOL_STATE_CHECKS: the project and its APIs,
-IAM, Artifact Registry, the clusters and state bucket, and the KMS half of
-the token minter, and the GitOps repository's default branch. Every GCP
+IAM, Artifact Registry, the clusters and state bucket, the self-managed forge
+pieces, the GitOps repository's default branch, the eval nightlies' Gemini
+Developer API key with its secret, and the KMS half of the token minter. Every GCP
 read runs as the bot itself (eval-dashboard-publisher@kube-agents-prow),
 which needs the project-level read roles bench/tf/fleet grants it
 (`pool_state_readers`); a project without them scans as "not checked" with
@@ -29,7 +30,8 @@ repository with whatever GitHub credential the job puts in GH_TOKEN, and is
 fixtures (fixture_state.py already does), the warm-cache reader grants in the
 Prow project (warm_cache), the GitHub-reading checks that need a credential
 the bot must not hold (github_repo_and_app, gitops_declaration,
-ledger_read_credential), the minter check's signing half (token_minter; the
+gitops_workload_manifest, ledger_read_credential) and the GitLab read of the same
+fixture (gitlab_workload_manifest), the minter check's signing half (token_minter; the
 scan runs token_minter_kms), the mapping (about the checkout, not the project).
 
 The project list is `gitops_repo_for_project()` in hack/ci-deploy.sh, read
@@ -144,7 +146,7 @@ KEY_CHECKED = "checked"
 KEY_DRIFTED_PROJECTS = "drifted_projects"
 
 DEFAULT_WORKERS = 6
-# The five checks make about twenty gcloud calls; a healthy project takes
+# The eight checks make about thirty gcloud calls; a healthy project takes
 # under a minute. The ceiling is for a hung API.
 DEFAULT_PROJECT_TIMEOUT_S = 600
 

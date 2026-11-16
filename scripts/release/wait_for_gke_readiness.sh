@@ -22,7 +22,7 @@ source "${SCRIPT_DIR}/platform_agent_mode.sh"
 # litellm sets no progressDeadlineSeconds and so runs on Kubernetes' 600s
 # default; the gateway's is pinned at 1800s by the operator
 # (gatewayProgressDeadlineSeconds) against a 905s startupProbe budget from
-# agentAPIProbe(10, 90). Both values below are sized for these Deployments:
+# agentAPIProbeInitialDelaySeconds plus the agentAPIStartupProbe* constants. Both values below are sized for these Deployments:
 # litellm is gated at 420s and the gateway at 1500s (matching upgrade.sh),
 # the latter after 180s and 900s reported red on deploys that had succeeded.
 #

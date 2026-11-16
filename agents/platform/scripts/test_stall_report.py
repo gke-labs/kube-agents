@@ -2,6 +2,7 @@
 """Unit tests for stall_report.py: fixture objects, kubectl stubbed."""
 
 import io
+import json
 import os
 import sys
 import unittest
@@ -65,9 +66,26 @@ class FakeResolver(stall_report.NameResolver):
         self.existing = existing
 
 
-def analyze(objects, events=(), existing=None, override=None):
+class FakeReader:
+    """Answers the scaled-to-zero reads from {args tuple: listing}; anything
+    else reads as an empty list. `calls` records every read."""
+
+    def __init__(self, listings=None):
+        self.listings = listings or {}
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(tuple(args))
+        listing = self.listings.get(tuple(args), {"items": []})
+        if isinstance(listing, Exception):
+            raise listing
+        return listing
+
+
+def analyze(objects, events=(), existing=None, override=None, listings=None):
     resolver = FakeResolver(existing or {})
-    return stall_report.analyze(list(objects), list(events), resolver, NOW, override)
+    scale = stall_report.ScaleResolver(reader=FakeReader(listings))
+    return stall_report.analyze(list(objects), list(events), resolver, NOW, override, scale)
 
 
 def healthy_deployment(name="web") -> dict:
@@ -140,6 +158,39 @@ class StaleConditions(unittest.TestCase):
         dep = healthy_deployment()
         dep["status"]["conditions"] = [condition("Progressing", "True", 2, "ReplicaSetUpdated"), condition("Available", "False", 2)]
         self.assertEqual(analyze([dep]), [])
+
+    def test_config_connector_in_progress_states_are_not_stalls(self):
+        for reason in ("Updating", "Deleting"):
+            with self.subTest(reason=reason):
+                sql = obj("SQLInstance", "orders-db", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, reason)]})
+                self.assertEqual(analyze([sql]), [])
+                # A create in progress lags its generation too; not a row either.
+                sql["metadata"]["generation"] = 2
+                sql["metadata"]["managedFields"] = [managed(40)]
+                self.assertEqual(analyze([sql]), [])
+        failed = obj("SQLInstance", "orders-db", status={"conditions": [condition("Ready", "False", 20, "UpdateFailed")]})
+        rows = analyze([failed])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False UpdateFailed"])
+
+    def test_dependency_not_ready_waits_an_hour(self):
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool]), [])
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        rows = analyze([pool])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False DependencyNotReady"])
+        self.assertEqual(rows[0]["stalled_for"], "1h10m")
+        # A run-wide threshold above the hour applies to it as to every kind.
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool], override=120), [])
+        # Its generation lag waits the same hour, so a spec edit while it
+        # waits on its parent is not a row sooner than the condition.
+        pool = obj("ContainerNodePool", "pool-a", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        pool["metadata"]["generation"] = 2
+        pool["metadata"]["managedFields"] = [managed(40)]
+        self.assertEqual(analyze([pool]), [])
+        pool["metadata"]["managedFields"] = [managed(70)]
+        pool["status"]["conditions"] = [condition("Ready", "False", 70, "DependencyNotReady")]
+        self.assertEqual(sorted(r["heuristic"] for r in analyze([pool])), ["generation-lag", "stale-condition"])
 
     def test_unrelated_condition_types_are_ignored(self):
         hpa = obj("HorizontalPodAutoscaler", "web", status={"conditions": [condition("ScalingLimited", "False", 500)]})
@@ -242,6 +293,121 @@ class StaleConditions(unittest.TestCase):
         )
         rows = analyze([route])
         self.assertEqual([r["detail"] for r in rows], ["parents[shared] Accepted=False NotAllowedByListeners"])
+
+
+def workload(kind, name, replicas, labels, namespace=NAMESPACE):
+    return {"kind": kind, "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "spec": {"replicas": replicas, "template": {"metadata": {"labels": labels}}}}
+
+
+def off_gateway(name="edge", class_name="eg", listener_programmed="True"):
+    return obj(
+        "Gateway",
+        name,
+        spec={"gatewayClassName": class_name, "listeners": [{"name": "http"}]},
+        status={
+            "conditions": [condition("Accepted", "True", 600), condition("Programmed", "False", 600, "NoResources")],
+            "listeners": [{"name": "http", "attachedRoutes": 1, "conditions": [condition("Programmed", listener_programmed, 600, "Invalid")]}],
+        },
+        managed_fields=[managed(600)],
+    )
+
+
+ENVOY = "gateway.envoyproxy.io/gatewayclass-controller"
+ENVOY_SELECTOR = f"gateway.envoyproxy.io/owning-gateway-name=edge,gateway.envoyproxy.io/owning-gateway-namespace={NAMESPACE}"
+
+
+def gateway_class(name, controller):
+    return {("get", "gatewayclasses.gateway.networking.k8s.io", name): {"kind": "GatewayClass", "metadata": {"name": name}, "spec": {"controllerName": controller}}}
+
+
+def envoy_proxy(replicas, namespace="envoy-gateway-system"):
+    """Envoy Gateway's proxy for Gateway edge, in its controller namespace;
+    the Gateway's own namespace holds none."""
+    return {
+        ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", namespace): {"items": [workload("Deployment", f"envoy-{NAMESPACE}-edge-abc", replicas, {}, namespace=namespace)]},
+    }
+
+
+class ScaledToZero(unittest.TestCase):
+    """A Gateway whose in-cluster proxy is scaled to zero on purpose."""
+
+    def test_the_programmed_row_goes_when_the_envoy_proxy_is_at_zero(self):
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(0)}
+        self.assertEqual(analyze([off_gateway()], listings=listings), [])
+
+    def test_the_programmed_row_stays_when_the_envoy_proxy_runs(self):
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(1)}
+        rows = analyze([off_gateway()], listings=listings)
+        self.assertEqual([r["detail"] for r in rows], ["Programmed=False NoResources"])
+
+    def test_every_other_row_of_the_gateway_stays(self):
+        # A listener that is not programmed, and a missing certificate, are
+        # not what a scale to zero causes.
+        gateway = off_gateway(listener_programmed="False")
+        gateway["spec"]["listeners"][0]["tls"] = {"certificateRefs": [{"name": "edge-tls"}]}
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(0)}
+        rows = analyze([gateway], existing={("secrets", NAMESPACE): set()}, listings=listings)
+        self.assertEqual(
+            sorted(r["detail"] for r in rows),
+            ["listeners[0].tls.certificateRefs -> Secret/edge-tls not found", "listeners[http] Programmed=False Invalid"],
+        )
+
+    def test_another_controllers_proxy_is_found_by_the_standard_label_in_the_gateways_namespace(self):
+        listings = {
+            **gateway_class("istio", "istio.io/gateway-controller"),
+            ("get", "deployments", "-l", "gateway.networking.k8s.io/gateway-name=edge", "-n", NAMESPACE): {"items": [workload("Deployment", "edge-istio", 0, {})]},
+        }
+        self.assertEqual(analyze([off_gateway(class_name="istio")], listings=listings), [])
+
+    def test_a_zero_replica_deployment_in_another_namespace_does_not_silence_the_gateway(self):
+        # Only the Gateway's namespace and Envoy Gateway's controller
+        # namespace are read; a look-alike planted elsewhere is never seen.
+        reader = FakeReader({**gateway_class("eg", ENVOY), **envoy_proxy(0, namespace="tenant-b")})
+        rows = stall_report.analyze([off_gateway()], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            sorted(c for c in reader.calls if c[1] == "deployments"),
+            [("get", "deployments", "-l", ENVOY_SELECTOR, "-n", "envoy-gateway-system"), ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", NAMESPACE)],
+        )
+
+    def test_a_gateway_with_no_in_cluster_proxy_keeps_the_row(self):
+        # GKE's managed classes run no proxy Deployment, so none is found.
+        listings = gateway_class("gke-l7-rilb", "networking.gke.io/gateway")
+        self.assertEqual(len(analyze([off_gateway(class_name="gke-l7-rilb")], listings=listings)), 1)
+
+    def test_a_failed_read_keeps_the_row(self):
+        listings = {**gateway_class("eg", ENVOY), ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", NAMESPACE): RuntimeError("forbidden"), **envoy_proxy(0)}
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(len(analyze([off_gateway()], listings=listings)), 1)
+        self.assertIn("scaled-to-zero check could not read", err.getvalue())
+
+    def test_a_route_is_left_alone(self):
+        route = obj(
+            "HTTPRoute",
+            "web",
+            spec={"parentRefs": [{"name": "edge", "sectionName": "htps"}], "rules": [{"backendRefs": [{"name": "web", "port": 80}]}]},
+            status={"parents": [{"parentRef": {"name": "edge"}, "conditions": [condition("Accepted", "False", 600, "NoMatchingParent")]}]},
+        )
+        reader = FakeReader({**gateway_class("eg", ENVOY), **envoy_proxy(0)})
+        rows = stall_report.analyze([route], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual([r["detail"] for r in rows], ["parents[edge] Accepted=False NoMatchingParent"])
+        self.assertEqual(reader.calls, [])
+
+    def test_a_healthy_gateway_costs_no_read(self):
+        gateway = off_gateway()
+        gateway["status"]["conditions"][1] = condition("Programmed", "True", 600)
+        reader = FakeReader()
+        rows = stall_report.analyze([gateway, healthy_deployment()], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual((rows, reader.calls), ([], []))
+
+    def test_a_workload_scaled_to_zero_leaves_no_scheduling_rows(self):
+        # Its Pods are deleted, so their FailedScheduling events name no
+        # object in the scan and are not reported.
+        dep = healthy_deployment()
+        dep["spec"]["replicas"] = 0
+        events = [warning("Pod", "web-abc-123", 9, first_ago=60, last_ago=1, reason="FailedScheduling")]
+        self.assertEqual(analyze([dep], events=events), [])
 
 
 class RepeatingWarnings(unittest.TestCase):
@@ -454,8 +620,60 @@ class Helpers(unittest.TestCase):
     def test_kubectl_names_strips_the_resource_prefix(self):
         with patch.object(stall_report, "run_kubectl", return_value=(0, "secret/a\nsecret/b\n", "")):
             self.assertEqual(stall_report.kubectl_names("secrets", NAMESPACE), {"a", "b"})
-        with patch.object(stall_report, "run_kubectl", return_value=(1, "", "forbidden")):
-            self.assertIsNone(stall_report.kubectl_names("secrets", NAMESPACE))
+        with patch.object(stall_report, "run_kubectl", return_value=(1, "", "Error from server (ServiceUnavailable): the server is currently unable to handle the request")):
+            self.assertIsNone(stall_report.kubectl_names("secrets", NAMESPACE), "failed for the moment: None")
+        for refusal in ("Error from server (Forbidden): secrets is forbidden: User cannot list resource", 'error: the server doesn\'t have a resource type "gateways"'):
+            with patch.object(stall_report, "run_kubectl", return_value=(1, "", refusal)):
+                with redirect_stderr(io.StringIO()):
+                    self.assertIs(stall_report.kubectl_names("secrets", NAMESPACE), stall_report.REFUSED, "refused for good: REFUSED")
+        resolver = stall_report.NameResolver(lister=lambda resource, ns: stall_report.REFUSED)
+        self.assertIsNone(resolver.exists("Secret", NAMESPACE, "tls"), "a refused kind is unresolvable, as an unreadable one is")
+
+
+class Exempt(unittest.TestCase):
+    """The stall watch's opt-out annotation marks the rows; it hides nothing here."""
+
+    @staticmethod
+    def wedged(name, annotations=None):
+        dep = healthy_deployment(name)
+        dep["status"]["conditions"] = [condition("Progressing", "False", 30, "ProgressDeadlineExceeded")]
+        if annotations is not None:
+            dep["metadata"]["annotations"] = annotations
+        return dep
+
+    def run_main(self, objects, *argv):
+        with patch.object(stall_report, "collect", return_value=(objects, [])):
+            with patch.object(stall_report, "NameResolver", lambda: FakeResolver({})):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(stall_report.main(["--namespace", NAMESPACE, *argv]), 0)
+        return out.getvalue()
+
+    def test_the_exempt_field_comes_from_the_objects_annotation(self):
+        rows = analyze([
+            self.wedged("exempt", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE}),
+            self.wedged("other-value", {stall_report.EXEMPT_ANNOTATION: "yes"}),
+            self.wedged("unrelated", {"team": "payments"}),
+            self.wedged("bare"),
+        ])
+        self.assertEqual({r["object"]: r[stall_report.EXEMPT_FIELD] for r in rows}, {
+            "Deployment/exempt": True,
+            "Deployment/other-value": False,
+            "Deployment/unrelated": False,
+            "Deployment/bare": False,
+        })
+
+    def test_json_rows_carry_the_field_and_the_count_is_unchanged(self):
+        report = json.loads(self.run_main([self.wedged("web", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE})], "--json"))
+        self.assertEqual(report["stalled_resources"], 1)
+        self.assertIs(report["findings"][0][stall_report.EXEMPT_FIELD], True)
+
+    def test_the_table_is_the_same_with_or_without_the_annotation(self):
+        exempt = self.run_main([self.wedged("web", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE})])
+        plain = self.run_main([self.wedged("web")])
+        self.assertEqual(exempt, plain)
+        self.assertEqual(exempt.splitlines()[0].split(), list(stall_report.TABLE_COLUMNS))
+        self.assertEqual(exempt.splitlines()[-1], "stalled resources: 1")
 
 
 class Main(unittest.TestCase):
@@ -510,9 +728,30 @@ class Main(unittest.TestCase):
         self.assertEqual([o["kind"] for o in objects], ["deployments", "gateways"])
         self.assertEqual(events, [{"kind": "events"}])
 
+    def test_a_listing_the_shim_cut_with_exit_74_is_a_warning_the_same_way(self):
+        """The credential-proxy shim exits 74 on a cut reply (the counts after
+        its marker); the cut kind is still skipped with a warning and the
+        other kinds still count."""
+        cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
+
+        def fake_kubectl(args):
+            if args[1] == "pods":
+                return 74, cut, "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n"
+            if args[1] == "events":
+                return 0, '{"items":[]}', ""
+            return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"web"}}]}', ""
+
+        with patch.object(stall_report, "run_kubectl", side_effect=fake_kubectl):
+            with redirect_stderr(io.StringIO()) as err:
+                objects, events = stall_report.collect(NAMESPACE, "deployments,pods,replicasets")
+        self.assertEqual([o["metadata"]["name"] for o in objects], ["web", "web"])
+        self.assertIn("warning: credential proxy output truncated at 8388608 bytes", err.getvalue())
+        self.assertIn(f"warning: pods in {NAMESPACE} not scanned; its objects are missing from the count", err.getvalue())
+
     def test_collect_keeps_the_other_kinds_when_one_listing_is_cut(self):
-        """The sandbox's kubectl is the credential-proxy shim, which returns the
-        prefix of an over-cap reply with exit 0 and a stderr note."""
+        """The sandbox's kubectl is the credential-proxy shim, which returned
+        the prefix of an over-cap reply with exit 0 and a stderr note; it now
+        exits 74, and this is the older shim's shape."""
         cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
 
         def fake_kubectl(args):
@@ -552,6 +791,396 @@ class Main(unittest.TestCase):
         self.assertEqual(len(objects), 1)
         self.assertEqual(events, [])
         self.assertIn(f"warning: events in {NAMESPACE} not read; repeating-warnings is not checked", err.getvalue())
+
+
+# --------------------------------------------------------------------------
+# cluster mode: recorded kubectl output, split per namespace
+# --------------------------------------------------------------------------
+
+# The second namespace the cluster-mode tests ask for, beside NAMESPACE. Not
+# named for its value: CodeQL's private-data heuristic reads `billing` in a
+# variable's name as a source, and the script's stderr warnings as sinks.
+SECOND_NAMESPACE = "billing"
+OTHER = "other"
+GATEWAYS = "gateways.gateway.networking.k8s.io"
+CLUSTER_KINDS = f"deployments,{GATEWAYS}"
+CUT_STDERR = "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n"
+
+
+def in_namespace(o: dict, namespace: str) -> dict:
+    out = json.loads(json.dumps(o))
+    out["metadata"]["namespace"] = namespace
+    return out
+
+
+def lagging_deployment(name="web", namespace=NAMESPACE) -> dict:
+    """generation 1 ahead of observedGeneration 0 for half an hour, and an
+    envFrom naming a ConfigMap that is not there: two rows."""
+    return in_namespace(
+        obj(
+            "Deployment",
+            name,
+            spec={"replicas": 1, "template": {"spec": {"containers": [{"name": "app", "envFrom": [{"configMapRef": {"name": "feature-flags"}}]}]}}},
+            status={"observedGeneration": 0, "conditions": [condition("Available", "True", 300, "MinimumReplicasAvailable")]},
+            managed_fields=[managed(30)],
+        ),
+        namespace,
+    )
+
+
+def deadline_deployment(name="batch", namespace=SECOND_NAMESPACE) -> dict:
+    return in_namespace(
+        obj(
+            "Deployment",
+            name,
+            spec={"replicas": 1},
+            status={"observedGeneration": 1, "conditions": [condition("Progressing", "False", 40, "ProgressDeadlineExceeded")]},
+            managed_fields=[managed(300)],
+        ),
+        namespace,
+    )
+
+
+def stale_gateway(name="edge", namespace=NAMESPACE) -> dict:
+    return in_namespace(
+        obj(
+            "Gateway",
+            name,
+            spec={"gatewayClassName": "gke-l7", "listeners": [{"name": "https", "tls": {"certificateRefs": [{"name": "edge-tls"}]}}]},
+            status={"listeners": [{"name": "https", "conditions": [condition("ResolvedRefs", "False", 50, "InvalidCertificateRef")]}]},
+            managed_fields=[managed(300)],
+        ),
+        namespace,
+    )
+
+
+def raw_item(o: dict) -> dict:
+    """An item as the raw API lists it: no kind or apiVersion of its own."""
+    out = json.loads(json.dumps(o))
+    out.pop("kind", None)
+    out.pop("apiVersion", None)
+    return out
+
+
+class RecordedCluster:
+    """A cluster of three namespaces as kubectl prints it, answering both the
+    cluster-wide reads of cluster mode and the per-namespace reads of the
+    namespace path from the same objects, so the two paths can be compared.
+    `cut` names kinds whose chunked reply the broker cut; `raw_cut_until`
+    is the page size at and above which a raw deployments page is cut;
+    `raw_rc` fails every raw deployments page; `events_cut` cuts the raw
+    and the chunked events reads."""
+
+    def __init__(self, cut=(), raw_cut_until=0, raw_rc=0, events_cut=False, secrets_rc=1, configmaps_rc=0, namespace_configmaps=None, billing_reference=False):
+        self.cut = set(cut)
+        self.raw_cut_until = raw_cut_until
+        self.raw_rc = raw_rc
+        self.events_cut = events_cut
+        self.secrets_rc = secrets_rc
+        # The cluster-wide configmaps listing's exit code; the per-namespace one always answers.
+        self.configmaps_rc = configmaps_rc
+        # Per namespace, what its own configmaps listing does: "ok" (the
+        # default), "transient" (a 503 this time) or "forbidden".
+        self.namespace_configmaps = dict(namespace_configmaps or {})
+        # Give billing's Deployment an envFrom naming a ConfigMap billing does
+        # not have, so billing carries a dangling reference too.
+        self.billing_reference = billing_reference
+        self.calls = []
+        self.deployments = [lagging_deployment(), healthy_deployment("api"), deadline_deployment(), deadline_deployment("hidden", OTHER)]
+        if billing_reference:
+            self.deployments[2]["spec"]["template"] = {"spec": {"containers": [{"name": "app", "envFrom": [{"configMapRef": {"name": "feature-flags"}}]}]}}
+        self.gateways = [stale_gateway()]
+        self.events = [self.event("web", NAMESPACE), self.event("hidden", OTHER)]
+        self.configmaps = {(NAMESPACE, "present"), (SECOND_NAMESPACE, "cfg")}
+
+    @staticmethod
+    def event(name, namespace):
+        event = warning("Deployment", name, 5, 30, 1)
+        event["metadata"] = {"name": f"{name}.18a", "namespace": namespace}
+        event["involvedObject"]["namespace"] = namespace
+        return event
+
+    def listing(self, items):
+        return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        if args[:2] == ["get", "--raw"]:
+            url = stall_report.urllib.parse.urlparse(args[2])
+            query = dict(stall_report.urllib.parse.parse_qsl(url.query))
+            if url.path == "/apis/apps/v1/deployments":
+                if self.raw_rc:
+                    return self.raw_rc, "", "error: the server does not allow this method"
+                if int(query["limit"]) >= self.raw_cut_until > 0:
+                    return 74, '{"kind":"DeploymentList","items":[{"metadata":{"name":"a', CUT_STDERR
+                first, second = [raw_item(d) for d in self.deployments[:2]], [raw_item(d) for d in self.deployments[2:]]
+                if query.get("continue"):
+                    return 0, json.dumps({"kind": "DeploymentList", "apiVersion": "apps/v1", "metadata": {}, "items": second}), ""
+                return 0, json.dumps({"kind": "DeploymentList", "apiVersion": "apps/v1", "metadata": {"continue": "tok1"}, "items": first}), ""
+            if url.path == "/api/v1/events":
+                assert query.get("fieldSelector") == "type=Warning", query
+                if self.events_cut:
+                    return 74, "", CUT_STDERR
+                return 0, json.dumps({"kind": "EventList", "apiVersion": "v1", "metadata": {}, "items": [raw_item(e) for e in self.events]}), ""
+            raise AssertionError(f"unexpected raw read {args}")
+        resource = args[1]
+        if "--all-namespaces" in args:
+            assert stall_report.CHUNK_SIZE_ARG in args, args
+            if args[-1] == stall_report.NAME_COLUMNS:
+                if resource == "secrets":
+                    return self.secrets_rc, "", "Error from server (Forbidden): secrets is forbidden"
+                assert resource == "configmaps", args
+                if self.configmaps_rc:
+                    return self.configmaps_rc, "", "Error from server (ServiceUnavailable): the server is currently unable to handle the request"
+                return 0, "".join(f"{ns}   {name}\n" for ns, name in sorted(self.configmaps)), ""
+            if resource in self.cut:
+                return 74, '{"kind":"List","items":[{"metadata":{"name":"a', CUT_STDERR
+            if resource == GATEWAYS:
+                return 0, self.listing(self.gateways), ""
+            if resource == "events":
+                if self.events_cut:
+                    return 74, "", CUT_STDERR
+                return 0, self.listing(self.events), ""
+            raise AssertionError(f"unexpected cluster-wide read {args}")
+        namespace = args[args.index("-n") + 1]
+        if args[-1] == "name":
+            if resource == "secrets":
+                return self.secrets_rc, "", "Error from server (Forbidden): secrets is forbidden"
+            mode = self.namespace_configmaps.get(namespace, "ok")
+            if mode == "transient":
+                return 1, "", "Error from server (ServiceUnavailable): the server is currently unable to handle the request"
+            if mode == "forbidden":
+                return 1, "", "Error from server (Forbidden): configmaps is forbidden"
+            return 0, "".join(f"configmap/{name}\n" for ns, name in sorted(self.configmaps) if ns == namespace), ""
+        if resource == "deployments":
+            return 0, self.listing([d for d in self.deployments if d["metadata"]["namespace"] == namespace]), ""
+        if resource == GATEWAYS:
+            return 0, self.listing([g for g in self.gateways if g["metadata"]["namespace"] == namespace]), ""
+        if resource == "events":
+            return 0, self.listing([e for e in self.events if e["involvedObject"]["namespace"] == namespace]), ""
+        raise AssertionError(f"unexpected namespaced read {args}")
+
+    def namespace_path(self, namespace):
+        """The findings the per-namespace path gives, from the same objects."""
+        with patch.object(stall_report, "run_kubectl", self):
+            objects, events = stall_report.collect(namespace, CLUSTER_KINDS)
+            return stall_report.analyze(objects, events, stall_report.NameResolver(), NOW)
+
+
+class ClusterMode(unittest.TestCase):
+    def report(self, cluster, namespaces=(NAMESPACE, SECOND_NAMESPACE), kinds=CLUSTER_KINDS, extra=None):
+        with patch.object(stall_report, "run_kubectl", cluster):
+            with redirect_stderr(io.StringIO()) as err:
+                report = stall_report.report_cluster(list(namespaces), kinds, extra or {}, NOW)
+        return report, err.getvalue()
+
+    def test_each_namespace_gets_the_findings_the_namespace_read_gives(self):
+        cluster = RecordedCluster()
+        report, _ = self.report(cluster)
+        cluster_reads = len(cluster.calls)
+        self.assertEqual(sorted(report["namespaces"]), sorted([NAMESPACE, SECOND_NAMESPACE]), "the namespace not asked for is not reported")
+        for namespace in (NAMESPACE, SECOND_NAMESPACE):
+            with self.subTest(namespace=namespace):
+                expected = RecordedCluster().namespace_path(namespace)
+                self.assertEqual(json.dumps(report["namespaces"][namespace]["findings"]), json.dumps(expected))
+                self.assertEqual(report["namespaces"][namespace]["stalled_resources"], stall_report.stalled_object_count(expected))
+        heuristics = sorted(f["heuristic"] for f in report["namespaces"][NAMESPACE]["findings"])
+        self.assertEqual(heuristics, ["dangling-reference", "generation-lag", "repeating-warnings", "stale-condition"], "every heuristic fires from the cluster-wide read")
+        self.assertEqual([f["object"] for f in report["namespaces"][SECOND_NAMESPACE]["findings"]], ["Deployment/batch"])
+        self.assertEqual(report["fallback"], [])
+        self.assertFalse(report["events_fallback"])
+        # Two raw pages of deployments, one chunked read of gateways, one raw
+        # page of events, and one listing each of configmaps (the envFrom)
+        # and secrets (the listener's certificateRefs) for the dangling
+        # references, the secrets listing forbidden across every namespace
+        # and so tried once per namespace with a reference, forbidden there
+        # too: seven calls for the cluster, against five per namespace.
+        self.assertEqual(cluster_reads, 7, cluster.calls)
+        self.assertEqual(cluster.calls[0], ["get", "--raw", "/apis/apps/v1/deployments?limit=500"])
+        self.assertEqual(cluster.calls[1], ["get", "--raw", "/apis/apps/v1/deployments?limit=500&continue=tok1"])
+        self.assertEqual(cluster.calls[2], ["get", GATEWAYS, "--all-namespaces", "--chunk-size=500", "--show-managed-fields", "-o", "json"])
+        self.assertEqual(cluster.calls[3], ["get", "--raw", "/api/v1/events?limit=500&fieldSelector=type%3DWarning"])
+        self.assertEqual(cluster.calls[4], ["get", "configmaps", "--all-namespaces", "--chunk-size=500", "--no-headers", "-o", stall_report.NAME_COLUMNS])
+        self.assertEqual(cluster.calls[5][:2], ["get", "secrets"])
+        self.assertEqual(cluster.calls[5][-1], stall_report.NAME_COLUMNS, "names only: no Secret body crosses")
+        self.assertEqual(cluster.calls[6], ["get", "secrets", "-n", NAMESPACE, "-o", "name"], "the per-namespace listing a failed cluster-wide one falls back to")
+
+    def test_a_chunked_reply_the_broker_cut_leaves_the_kind_to_the_per_namespace_read(self):
+        report, err = self.report(RecordedCluster(cut=[GATEWAYS]))
+        self.assertEqual(report["fallback"], [GATEWAYS])
+        self.assertNotIn("Gateway/edge", [f["object"] for f in report["namespaces"][NAMESPACE]["findings"]])
+        self.assertIn("Deployment/web", [f["object"] for f in report["namespaces"][NAMESPACE]["findings"]], "the kinds read whole are still analysed")
+        self.assertIn(f"warning: {GATEWAYS} across every namespace was cut; read per namespace instead", err)
+
+    def test_a_cut_raw_page_is_asked_for_again_at_half_the_size(self):
+        cluster = RecordedCluster(raw_cut_until=500)
+        report, _ = self.report(cluster)
+        self.assertEqual(report["fallback"], [])
+        pages = [c[2] for c in cluster.calls if "deployments" in c[2]]
+        self.assertEqual(pages[:2], ["/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/deployments?limit=250"])
+        self.assertEqual(len(report["namespaces"][SECOND_NAMESPACE]["findings"]), 1)
+
+    def test_a_raw_page_cut_at_the_smallest_size_falls_back_and_a_failed_raw_read_does_too(self):
+        cluster = RecordedCluster(raw_cut_until=1)
+        report, err = self.report(cluster)
+        self.assertEqual(report["fallback"], ["deployments"])
+        sizes = [int(c[2].rsplit("limit=", 1)[1].split("&")[0]) for c in cluster.calls if "deployments" in c[2]]
+        self.assertEqual(sizes, [500, 250, 125, 62, 31], "halved down to the floor, then given up")
+        self.assertIn("cut at a page of 31; read per namespace instead", err)
+        report, err = self.report(RecordedCluster(raw_rc=1))
+        self.assertEqual(report["fallback"], ["deployments"])
+        self.assertIn("/apis/apps/v1/deployments page failed (1); read per namespace instead", err)
+        self.assertEqual([f["object"] for f in report["namespaces"][NAMESPACE]["findings"]], ["Gateway/edge"])
+
+    def test_events_no_cluster_wide_read_could_read_whole_are_said_so(self):
+        cluster = RecordedCluster(events_cut=True)
+        report, _ = self.report(cluster)
+        self.assertTrue(report["events_fallback"])
+        self.assertEqual([c[1] for c in cluster.calls if c[1] == "events"], ["events"], "the chunked read is tried after the raw one")
+        self.assertNotIn("repeating-warnings", [f["heuristic"] for f in report["namespaces"][NAMESPACE]["findings"]])
+
+    def test_an_object_named_with_its_kind_is_left_to_the_per_namespace_read(self):
+        cluster = RecordedCluster()
+        report, _ = self.report(cluster, kinds="deployments/web")
+        self.assertEqual(report["fallback"], ["deployments/web"])
+        self.assertEqual([c for c in cluster.calls if "deployments" in c[-1] or c[1] == "deployments/web"], [], "no cluster-wide read of one object")
+
+    def test_an_empty_kind_list_reads_no_kind_and_the_extras_are_read_where_asked(self):
+        cluster = RecordedCluster()
+        report, _ = self.report(cluster, kinds="", extra={SECOND_NAMESPACE: ["deployments"]})
+        self.assertEqual(report["namespaces"][NAMESPACE]["findings"], [], "payments asked for nothing")
+        self.assertEqual([f["object"] for f in report["namespaces"][SECOND_NAMESPACE]["findings"]], ["Deployment/batch"])
+        self.assertEqual([c[1] for c in cluster.calls if c[1] == GATEWAYS], [])
+
+    def test_a_failed_cluster_wide_referent_listing_falls_back_to_the_per_namespace_listing(self):
+        # The configmaps listing across every namespace fails (an aggregated
+        # API hiccup, a cut): the references are resolved per namespace, as
+        # the namespace read resolves them, and the dangling-reference row
+        # stands rather than clearing on a listing that failed.
+        cluster = RecordedCluster(configmaps_rc=1)
+        report, err = self.report(cluster)
+        expected = RecordedCluster().namespace_path(NAMESPACE)
+        self.assertEqual(json.dumps(report["namespaces"][NAMESPACE]["findings"]), json.dumps(expected))
+        self.assertIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][NAMESPACE]["findings"]])
+        self.assertIn("references to configmaps are resolved per namespace instead", err)
+        self.assertEqual([c for c in cluster.calls if c[1] == "configmaps" and "-n" in c], [["get", "configmaps", "-n", NAMESPACE, "-o", "name"]], "one per-namespace listing, for the namespace with the reference")
+
+    def test_a_kind_resolved_per_namespace_stays_resolved_in_the_next_namespace(self):
+        # Two namespaces with a dangling ConfigMap reference, the cluster-wide
+        # listing failed: the first namespace's own listing answers, and the
+        # second namespace gets its row too. A memo that tripped on any
+        # answer would lose the second row.
+        cluster = RecordedCluster(configmaps_rc=1, billing_reference=True)
+        report, _ = self.report(cluster)
+        for namespace in (NAMESPACE, SECOND_NAMESPACE):
+            with self.subTest(namespace=namespace):
+                self.assertIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][namespace]["findings"]])
+                self.assertEqual(json.dumps(report["namespaces"][namespace]["findings"]), json.dumps(RecordedCluster(billing_reference=True).namespace_path(namespace)))
+        self.assertEqual([c[3] for c in cluster.calls if c[1] == "configmaps" and "-n" in c], [NAMESPACE, SECOND_NAMESPACE], "one per-namespace listing for each namespace with a reference")
+
+    def test_a_per_namespace_listing_that_fails_for_the_moment_skips_that_namespace_only(self):
+        # The first namespace's own listing hits a 503: its reference goes
+        # unchecked this tick, with the warning, and the kind is asked for
+        # again in the next namespace, which gets its row.
+        cluster = RecordedCluster(configmaps_rc=1, namespace_configmaps={NAMESPACE: "transient"}, billing_reference=True)
+        report, err = self.report(cluster)
+        self.assertNotIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][NAMESPACE]["findings"]])
+        self.assertIn(f"cannot list configmaps in {NAMESPACE}; references to configmaps are not checked", err)
+        self.assertIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][SECOND_NAMESPACE]["findings"]], "the next namespace still gets its row")
+        self.assertEqual([c[3] for c in cluster.calls if c[1] == "configmaps" and "-n" in c], [NAMESPACE, SECOND_NAMESPACE])
+
+    def test_a_per_namespace_listing_refused_outright_is_not_asked_for_again(self):
+        cluster = RecordedCluster(configmaps_rc=1, namespace_configmaps={NAMESPACE: "forbidden", SECOND_NAMESPACE: "forbidden"}, billing_reference=True)
+        report, _ = self.report(cluster)
+        for namespace in (NAMESPACE, SECOND_NAMESPACE):
+            self.assertNotIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][namespace]["findings"]])
+        self.assertEqual([c[3] for c in cluster.calls if c[1] == "configmaps" and "-n" in c], [NAMESPACE], "refused in the first namespace: not asked for in the second")
+
+    def test_the_cluster_resolver_lists_a_referent_kind_once_and_falls_back_per_namespace_when_it_cannot(self):
+        calls = []
+        namespaced = []
+
+        def lister(resource):
+            calls.append(resource)
+            return None if resource in ("secrets", "services") else {(NAMESPACE, "present")}
+
+        def namespace_lister(resource, namespace):
+            namespaced.append((resource, namespace))
+            if resource == "secrets":
+                return stall_report.REFUSED
+            if resource == "services" and namespace == NAMESPACE:
+                return None  # a 503 this time
+            return {"svc"}
+
+        resolver = stall_report.ClusterNameResolver(lister=lister, namespace_lister=namespace_lister)
+        self.assertTrue(resolver.exists("ConfigMap", NAMESPACE, "present"))
+        self.assertFalse(resolver.exists("ConfigMap", SECOND_NAMESPACE, "present"), "the namespace is part of the name")
+        self.assertFalse(resolver.exists("ConfigMap", NAMESPACE, "absent"))
+        self.assertIsNone(resolver.exists("Service", NAMESPACE, "svc"), "a per-namespace listing that failed this time leaves this namespace unchecked")
+        self.assertTrue(resolver.exists("Service", SECOND_NAMESPACE, "svc"), "and the kind is asked for again in the next namespace")
+        self.assertFalse(resolver.exists("Service", SECOND_NAMESPACE, "gone"))
+        self.assertIsNone(resolver.exists("Secret", NAMESPACE, "tls"), "a kind refused per namespace too stays unresolved")
+        self.assertIsNone(resolver.exists("Secret", SECOND_NAMESPACE, "tls"))
+        self.assertIsNone(resolver.exists("Secret", SECOND_NAMESPACE, "other"))
+        self.assertIsNone(resolver.exists("Thing", NAMESPACE, "x"), "a kind with no resource is left alone")
+        self.assertEqual(calls, ["configmaps", "services", "secrets"], "one cluster-wide listing per kind")
+        self.assertEqual(
+            namespaced,
+            [("services", NAMESPACE), ("services", SECOND_NAMESPACE), ("secrets", NAMESPACE)],
+            "the per-namespace listing once per kind and namespace it fell back for; a kind refused outright is not asked for in the next namespace, a kind unreadable this time is",
+        )
+
+    def test_a_cut_referent_listing_leaves_references_unresolved(self):
+        with patch.object(stall_report, "run_kubectl", return_value=(0, "payments   present\n", "credential proxy output truncated\n")):
+            with redirect_stderr(io.StringIO()):
+                self.assertIsNone(stall_report.kubectl_names_cluster_wide("configmaps"))
+        with patch.object(stall_report, "run_kubectl", return_value=(0, "payments   present\nbilling   cfg\n", "")):
+            self.assertEqual(stall_report.kubectl_names_cluster_wide("configmaps"), {("payments", "present"), ("billing", "cfg")})
+
+    def test_the_raw_collections_are_inside_the_brokers_allowlist_and_the_cut_marker_is_the_shims(self):
+        import command_policy
+        import credential_proxy_client
+
+        for name, (path, kind, api_version) in stall_report.RAW_COLLECTIONS.items():
+            with self.subTest(name=name):
+                self.assertIn(path, command_policy.KUBECTL_RAW_COLLECTIONS, "a raw read of a path the broker does not list is refused")
+                self.assertEqual(path.rsplit("/", 1)[1], name.split(".", 1)[0])
+                self.assertEqual(path.split("/")[-2], api_version.split("/")[-1])
+        self.assertIn(stall_report.EVENTS_COLLECTION[0], command_policy.KUBECTL_RAW_COLLECTIONS)
+        self.assertLessEqual({stall_report.RAW_LIMIT_KEY, stall_report.RAW_CONTINUE_KEY, stall_report.RAW_FIELD_SELECTOR_KEY}, command_policy.KUBECTL_RAW_QUERY_KEYS)
+        self.assertNotIn("secrets", stall_report.RAW_COLLECTIONS)
+        self.assertEqual(stall_report.PROXY_TRUNCATED_TEXT, credential_proxy_client.OUTPUT_TRUNCATED_MARKER)
+        self.assertEqual(stall_report.EXIT_OUTPUT_TRUNCATED, credential_proxy_client.EXIT_OUTPUT_TRUNCATED)
+        self.assertNotIn(stall_report.EVENTS_RESOURCE, stall_report.RAW_COLLECTIONS, "events have their own collection, read with the Warning selector")
+        for excluded in stall_report.SCAN_EXCLUDED_RESOURCES:
+            self.assertNotIn(excluded, stall_report.RAW_COLLECTIONS)
+
+    def test_extra_kinds_are_parsed_per_namespace(self):
+        self.assertEqual(stall_report.parse_extra_kinds(["billing=a,b", "billing=c", "web=d"]), {"billing": ["a", "b", "c"], "web": ["d"]})
+        with self.assertRaises(ValueError):
+            stall_report.parse_extra_kinds(["billing"])
+
+    def test_main_cluster_mode_prints_the_report_and_needs_json(self):
+        report = {"namespaces": {NAMESPACE: {"namespace": NAMESPACE, "stalled_resources": 0, "findings": []}}, "fallback": [], "events_fallback": False}
+        with patch.object(stall_report, "report_cluster", return_value=report) as mocked:
+            with redirect_stdout(io.StringIO()) as out:
+                rc = stall_report.main(["--namespaces", f"{NAMESPACE},{SECOND_NAMESPACE}", "--kind", "deployments", "--extra-kinds", f"{SECOND_NAMESPACE}=jobs", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), report)
+        self.assertEqual(mocked.call_args.args[:3], ([NAMESPACE, SECOND_NAMESPACE], "deployments", {SECOND_NAMESPACE: ["jobs"]}))
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                stall_report.main(["--namespaces", NAMESPACE])
+            for empty in ("", ","):
+                with self.subTest(namespaces=empty), patch.object(stall_report, "report_cluster") as untouched:
+                    with self.assertRaises(SystemExit):
+                        stall_report.main(["--namespaces", empty, "--json"])
+                    untouched.assert_not_called()
+            with self.assertRaises(SystemExit):
+                stall_report.main(["--namespace", NAMESPACE, "--extra-kinds", "a=b", "--json"])
+        with patch.object(stall_report, "report_cluster", side_effect=RuntimeError("kubectl api-resources failed")):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(stall_report.main(["--namespaces", NAMESPACE, "--json"]), 2)
 
 
 if __name__ == "__main__":

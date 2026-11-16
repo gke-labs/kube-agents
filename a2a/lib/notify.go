@@ -11,6 +11,10 @@ const (
 	NotifySubjectGchat = "chat.notify.gchat"
 	// NotifySubjectSlack is the subject a Slack notify is published on.
 	NotifySubjectSlack = "chat.notify.slack"
+	// NotifySubjectConsole is the subject a console notify is published on.
+	// The console has no home channel, so it serves conversation requests
+	// only.
+	NotifySubjectConsole = "chat.notify.console"
 	// NotifyReplyPrefix is the namespace a notify's reply subject must sit
 	// under: the gateway answers there and nowhere else, and the agent
 	// principal is the one reader of it.
@@ -21,19 +25,26 @@ const (
 	NotifyPlatformGchat = "google_chat"
 	// NotifyPlatformSlack is Slack's, as Hermes spells it (`--to slack`).
 	NotifyPlatformSlack = "slack"
+	// NotifyPlatformConsole is the console door's. Hermes has no console
+	// platform of its own; this is the name the agent side records on a
+	// console conversation's route.
+	NotifyPlatformConsole = "console"
 )
 
 // NotifySubjects maps a caller's platform name to its notify subject.
 var NotifySubjects = map[string]string{
-	NotifyPlatformGchat: NotifySubjectGchat,
-	NotifyPlatformSlack: NotifySubjectSlack,
+	NotifyPlatformGchat:   NotifySubjectGchat,
+	NotifyPlatformSlack:   NotifySubjectSlack,
+	NotifyPlatformConsole: NotifySubjectConsole,
 }
 
 // NotifyRequest is the body of a chat.notify request.
 type NotifyRequest struct {
 	// Text is the message, chunked under the backend cap on the way out,
-	// except on a conversation request with an Update key, which is one
-	// message (an edit reaches one) and is cut to one chunk.
+	// except on a request with an Update key, which is one message (an
+	// edit reaches one): a conversation's is cut to one chunk; a home
+	// thread's goes whole when its Chat is laid out, as text when it fits
+	// one chunk, and otherwise chunked and unkeyed as an unkeyed post.
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it
@@ -50,7 +61,9 @@ type NotifyRequest struct {
 	// Blocks, when set, is a Slack Block Kit array posted as one message
 	// with Text as its notification and fallback text (the fleet audit's
 	// report card). Only a backend that renders blocks takes it; any other
-	// refuses the request rather than dropping the blocks.
+	// refuses the request rather than dropping the blocks, and a request
+	// with Blocks and an Update key is refused: the gateway edits chat
+	// messages and text by key, not Block Kit.
 	Blocks json.RawMessage `json:"blocks,omitempty"`
 	// Conversation, with ContextID, aims the request at a conversation the
 	// gateway holds (its session-record key, e.g. "gchat:spaces/A/threads/B")
@@ -61,13 +74,28 @@ type NotifyRequest struct {
 	ContextID    string `json:"context_id,omitempty"`
 	// Chat and Update carry a card's work after its task ends, on a request
 	// aimed at a conversation: Chat a kube-agents.chat/v1 object, with Text
-	// its fallback, laid out by a backend that renders it (Slack) and posted
-	// as Text by any other; Update a sender-chosen key whose later request
-	// edits the message the first posted in the same conversation. A home
-	// channel request may carry Chat too (the fleet-audit or first-inventory card), laid
-	// out the same way; it ignores Update.
+	// its fallback, laid out by a backend that renders it (Slack, Google
+	// Chat) and posted as Text by any other; Update a sender-chosen key
+	// whose later request edits the message the first posted in the same
+	// conversation or home-channel thread. A home channel request may carry
+	// Chat too (the fleet-audit or first-inventory card), laid out the same
+	// way, and Update: one with no Thread binds its key to the thread it
+	// starts (the event watcher's alert, which its triage edits).
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
+	// AnswerTo, on a conversation request, says the post answers an ask:
+	// it is the delivered report of the card whose completion settled every
+	// card of the ask's plan, and its value is that plan's Update key, which
+	// names the ask (the chain the key's first mark bound). A backend that
+	// draws rating controls draws them on it (answer feedback). The CLI
+	// refuses it on a home channel request, and the gateway ignores it with
+	// Update, which names a message edited in place rather than an answer.
+	AnswerTo string `json:"answer_to,omitempty"`
+	// ReplyTo, on a request aimed at a conversation, is the id of the
+	// gateway task whose turn filed the work this reports on, when the
+	// sender knows it. Only the console passes it on (its frame's replyTo),
+	// so a console client can join a report to the turn it answers.
+	ReplyTo string `json:"reply_to,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it
@@ -78,4 +106,13 @@ type NotifyReply struct {
 	MessageID string `json:"message_id,omitempty"`
 	ThreadID  string `json:"thread_id,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Retry marks a refusal that says nothing about the request: the gateway
+	// is stopping, or couldn't read the conversation's record in time.
+	// Nothing was posted, and the same request may land later, so a sender
+	// waits rather than counting it against the destination.
+	Retry bool `json:"retry,omitempty"`
+	// Kept says the refusal in Error is a home post the gateway kept for the
+	// digest it posts once a home channel is set: nothing was posted now, and
+	// a sender that would retry or re-send should treat the post as handled.
+	Kept bool `json:"kept,omitempty"`
 }

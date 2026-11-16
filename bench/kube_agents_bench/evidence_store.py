@@ -16,7 +16,10 @@ was worse than the problem. See ``docs/designs/eval-scorer.md``.
 
 The GCS layout is one immutable object per batch, filed under its version key::
 
-    gs://<bucket>/<prefix>/<case-id>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>/<stamp>-<build>.jsonl
+    gs://<bucket>/<prefix>/<case-id>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>[-<mode>]/<stamp>-<build>.jsonl
+
+The ``-<mode>`` suffix appears only for a key whose mode is not ``today``, so
+every today-mode directory is the one it always was.
 
 never appended to, because the grant this is built for is
 ``roles/storage.objectCreator`` -- create yes, overwrite and delete no. That
@@ -31,7 +34,7 @@ by key means a prefix stops growing the moment the key changes: a model bump
 freezes the old directory forever and starts a new one, so no single prefix
 grows without bound while the software moves. It also makes the store
 navigable, which a hash would not: listing a case shows which setups have been
-screened, and ``*/gemini-3.1-pro-preview/**`` finds every case a given judge
+screened, and ``*/<judge-model>/**`` finds every case a given judge
 scored.
 
 THE PATH IS AN INDEX, NEVER THE TRUTH. Every record carries its own ``key`` and
@@ -70,6 +73,10 @@ from pathlib import Path
 #: as a key accumulates years of history. When it does bind, the reader says
 #: so: a cap that is silent reads as "I considered everything" when it did not.
 DEFAULT_MAX_OBJECTS = 200
+
+#: The version key's default mode (``baselines.MODE_TODAY``, not imported:
+#: baselines imports this module). A key in it adds no path suffix.
+DEFAULT_KEY_MODE = "today"
 
 #: Seconds before a `gcloud storage` call is treated as unreachable.
 DEFAULT_TIMEOUT = 60
@@ -128,7 +135,8 @@ def _sanitize(text: str) -> str:
 
 
 def _key_segments(key: dict | None) -> list[str]:
-    """The version key as directories: setup, judge, then the three integers.
+    """The version key as directories: setup, judge, then the three integers,
+    with ``-<mode>`` on the last segment for a mode other than today.
 
     Readable on purpose. `ls` on a case shows which setups were screened, and
     `*/<judge>/**` finds every case a judge scored -- neither of which a hash
@@ -144,6 +152,9 @@ def _key_segments(key: dict | None) -> list[str]:
         f"{key.get('scoring_version') or 'unknown'}"
         f"-f{key.get('fleet')}-v{key.get('verifiers')}"
     )
+    mode = key.get("mode") or DEFAULT_KEY_MODE
+    if mode != DEFAULT_KEY_MODE:
+        versions += f"-{mode}"
     return [
         _sanitize(key.get("setup_id") or "unknown-setup"),
         _sanitize(key.get("judge_model") or "unknown-judge"),

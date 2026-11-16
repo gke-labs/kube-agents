@@ -1,0 +1,40 @@
+# The stack-bearing cases of the nightly's main part that run in main-b.
+#
+# One case id per line. `#` starts a comment, blank lines are skipped.
+# hack/ci-eval-pr.sh reads this file and its siblings nightly-main-b.txt to
+# nightly-main-e.txt under EVAL_NIGHTLY_PART=main-a to main-e, which run the
+# nightly's main part as five periodics on five leased projects (#3384,
+# #4238). A stack-bearing case -- one whose task names a stack and takes
+# lock-infra -- runs in the shard whose list names it, and in main-a when no
+# list does. main-a is meant to hold only the onboarding cases' chain
+# (unit_state_lock in the script), which ran 380-480 min a night on its own
+# in November 2026, so every other stack case belongs on one of the four
+# lists, and the lists balance the four stack chains. A case without a stack
+# is placed by its name alone (the script's comment says how), so it needs
+# no line here.
+#
+# The choice is by name, not computed from the matrix, so the five jobs agree
+# on it when a merge that adds or drops other cases lands between their
+# checkouts; a merge that edits a list can run a moved case in two shards, or
+# in none, for that one night.
+#
+# scripts/test_ci_eval_nightly.py holds the four shards' stack time
+# (unit_cost_hint in the script, summed per shard) to within one case's
+# worth of each other, fails on a line that names no stack-bearing main case
+# or that another list also names, and fails when a stack case outside the
+# onboarding chain is on no list. Adding a stack case to the nightly
+# therefore fails that test until the case is listed. The onboarding cases
+# stay in main-a whatever the lists say.
+#
+# Dealt on 2026-11-06 (#4238) by unit_cost_hint, largest first into the
+# shortest chain: 6600s here.
+ai-security-manual-names-reconciler
+ai-security-planted-model-audit
+autoops-warning-event-triage
+findings-decision-covers-item
+fleet-audit-on-demand-run-reports
+gitops-drift-deleted-policy-triage
+gitops-drift-out-of-band-triage
+upgrades-rollout-family-held-by-canary-gate
+# Added 2026-11-10 when the case joined the nightly (#5261): the shortest chain then.
+first-install-hello-filed

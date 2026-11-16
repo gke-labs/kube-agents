@@ -1,0 +1,7 @@
+2026-10-21T03:35:00.2305893Z Uses: gke-labs/kube-agents/.github/workflows/rc-create-tag.yml@refs/heads/main (cbbe2541ba1fb8b78770b40c09109bf939bf519c)
+2026-10-21T03:35:00.2308558Z ##[group] Inputs
+2026-10-21T03:35:00.2308985Z   commit_sha: cbbe2541ba1fb8b78770b40c09109bf939bf519c
+2026-10-21T03:35:00.2309582Z   rc_tag: rc_2610210122_cbbe254
+2026-10-21T03:35:00.2310129Z   is_scheduled: false
+2026-10-21T03:35:00.2310488Z ##[endgroup]
+2026-10-21T03:35:00.2310928Z Complete job name: Step 1 - Create Release Candidate Tag / create-tag

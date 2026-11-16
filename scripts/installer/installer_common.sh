@@ -93,6 +93,142 @@ readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+# The least a spend ceiling can be when it is on, in US dollars. The chart
+# splits the amount across the gateway replicas and renders each share with
+# four decimals, refusing a share that rounds to 0; a cent keeps the share above
+# that floor at up to 100 replicas, and the refusal happens here, before any
+# apply, rather than in the Helm render. The chart's values.schema.json and the
+# composition's litellm_budget validation carry the same floor.
+readonly LITELLM_BUDGET_MIN_USD="0.01"
+
+# ─── Data volume size ─────────────────────────────
+# The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
+# disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+# A GSA account id is 6-30 characters. A cluster name too long for
+# "<cluster>-minter" keeps this many of its characters, plus this many hex
+# characters of its hash (minter_derived_names).
+readonly MINTER_GSA_ID_MAX_LEN=30
+readonly MINTER_GSA_CLUSTER_PREFIX_LEN=18
+readonly MINTER_GSA_HASH_LEN=4
+# The platform names the home-channel warning uses, as the operator's
+# HomeChannelUnset condition spells them.
+readonly NEXT_HOME_CHANNEL_GCHAT_PLATFORM="Google Chat"
+readonly NEXT_HOME_CHANNEL_SLACK_PLATFORM="Slack"
+
+# ─── Release footprint summary ────────────────────
+# What install.sh's pre-flight summary prints about the cluster footprint and
+# its modeled cost (print_footprint_summary). The chart owns the arithmetic
+# (kube-agents.footprintSummary in charts/kube-agents/templates/_helpers.tpl);
+# the installer renders that template through a throwaway chart holding only
+# the chart's helpers, values and footprint file plus a one-template probe, so
+# it prints the figures the chart's notes carry without crossing any other
+# template's gates (a minter without an App ID, a console on a cluster without
+# NetworkPolicy), told the cluster's shape the way the chart probes it, since
+# the notes on an Autopilot cluster count the credential proxy at the
+# operator's Autopilot requests. The apply goes through Terraform, which shows no notes, so
+# this summary is the one place the front door prints them; after the apply,
+# `helm get notes` is the command that does.
+readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
+readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
+readonly FOOTPRINT_PROBE_KEY="summary"
+readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
+readonly FOOTPRINT_PROBE_RELEASE="footprint-summary"
+# The block scalar's indent in the probe: what the template indents the summary
+# by, and what the extractor strips.
+readonly FOOTPRINT_PROBE_INDENT=4
+# The tfvars key the cluster shape is written under; the rates the summary
+# applies are Autopilot's, which price pod requests, and a Standard cluster is
+# billed for its node pools instead.
+readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
+readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
+# The API the chart's kube-agents.gkeAutopilot probes to count the credential
+# proxy at the operator's Autopilot requests. `helm template` sees no cluster,
+# so the render is told the cluster serves it whenever the tfvars' cluster_mode
+# is not standard; otherwise the installer's figure would carry the Standard
+# pair footprint.yaml records while the notes on the cluster carry the
+# Autopilot pair.
+readonly FOOTPRINT_AUTOPILOT_API_VERSION="auto.gke.io/v1/AllowlistedWorkload"
+# The tfvars key the release namespace is written under, for the `helm get
+# notes` hint; the placeholder stands in when the file does not carry it.
+readonly FOOTPRINT_NAMESPACE_KEY="namespace"
+readonly FOOTPRINT_NAMESPACE_PLACEHOLDER="<namespace>"
+# The variables files Terraform loads on its own from the directory holding the
+# generated terraform.tfvars; an extra_helm_values carried in one reaches the
+# apply but not the footprint render. Assigned, then marked readonly (bash 3.2).
+FOOTPRINT_AUTOLOADED_TFVARS_GLOBS=("*.auto.tfvars" "*.auto.tfvars.json" "terraform.tfvars.json")
+readonly FOOTPRINT_AUTOLOADED_TFVARS_GLOBS
+# The variables Terraform reads extra command-line arguments from: a
+# -var-file=<path> in one brings a file from anywhere on disk to the apply, and
+# a -var can carry extra_helm_values itself. Either reaches the apply and not
+# the footprint render; -auto-approve alone (the route lifecycle.sh reads from
+# TF_CLI_ARGS_apply) carries no values and is not matched.
+FOOTPRINT_TF_CLI_ARGS_VARS=("TF_CLI_ARGS" "TF_CLI_ARGS_plan" "TF_CLI_ARGS_apply")
+readonly FOOTPRINT_TF_CLI_ARGS_VARS
+readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+[[:punct:]]?extra_helm_values'
+# The footprint-shaping settings, read from the terraform.tfvars the generator
+# wrote (the composition's input) and passed to the chart under the key
+# terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
+# one pair per line.
+readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+memory_provider=platformAgent.harness.memory.provider
+hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
+web_console_enabled=webConsole.enabled
+enable_github_minter=githubMinter.enabled
+platform_agent_mode=platformAgent.mode"
+
+# ─── OpenAI-compatible model server ───────────────────────────────────────────
+# The ports a base URL without one is dialled on, and the TCP port range.
+readonly HTTP_DEFAULT_PORT=80
+readonly HTTPS_DEFAULT_PORT=443
+readonly TCP_PORT_MIN=1
+readonly TCP_PORT_MAX=65535
+# The bounds the operator holds the gateway's model-server egress rule to: at
+# most this many CIDRs, none broader than these prefixes, none touching IPv4
+# link-local space or the metadata server's addresses. An entry it refuses
+# drops the whole rule, so the installer refuses it first.
+readonly OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS=50
+readonly OPENAI_COMPATIBLE_MIN_IPV4_PREFIX=12
+readonly OPENAI_COMPATIBLE_MIN_IPV6_PREFIX=48
+readonly LINK_LOCAL_IPV4_NETWORK="169.254.0.0"
+readonly LINK_LOCAL_IPV4_PREFIX=16
+readonly LINK_LOCAL_IPV6_NETWORK="fe80::"
+readonly LINK_LOCAL_IPV6_PREFIX=10
+# The IPv6 metadata server address, the one metadata address outside 169.254/16.
+readonly IPV6_METADATA_ADDRESS="fd20:ce::254"
+# The /48 holding it, which the chart refuses whole, and the IPv4-mapped block
+# (::ffff:0:0/96), which the operator reads as the IPv4 block it maps.
+readonly IPV6_METADATA_NETWORK="fd20:ce::"
+readonly IPV6_METADATA_PREFIX=48
+readonly IPV4_MAPPED_IPV6_NETWORK="::ffff:0:0"
+readonly IPV4_MAPPED_IPV6_PREFIX=96
+# Address widths, an IPv4 octet's width and largest value, and the longest name
+# Kubernetes takes for a Secret (a DNS subdomain).
+readonly IPV4_ADDRESS_BITS=32
+readonly IPV6_ADDRESS_BITS=128
+readonly IPV6_GROUP_COUNT=8
+readonly IPV6_GROUP_BITS=16
+readonly IPV4_OCTET_BITS=8
+readonly IPV4_OCTET_MAX=255
+readonly K8S_SECRET_NAME_MAX_LENGTH=253
+# A Kubernetes Secret name (a lowercase DNS subdomain), and a LiteLLM provider
+# slug (azure, bedrock, ...): the chart checks both with the same patterns.
+readonly K8S_SECRET_NAME_PATTERN='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+readonly LITELLM_PROVIDER_SLUG_PATTERN='^[a-z][a-z0-9_]*$'
+# A dotted-quad host, and one in the ranges the gateway's port-443 rule excepts
+# (RFC 1918, link-local, CGNAT), the chart's own patterns: such a host needs
+# CIDRs even on 443.
+readonly IPV4_LITERAL_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+readonly PRIVATE_IPV4_LITERAL_PATTERN='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
+# An in-cluster Service with its namespace (captured), <svc>.<ns>.svc or
+# <svc>.<ns>.svc.cluster.local, and a two-label host, which is a hostname but
+# may be a Service written without .svc. The chart's own patterns.
+readonly SERVICE_HOST_PATTERN='^[^.]+\.([^.]+)\.svc(\.cluster\.local)?\.?$'
+# A host that ends like a Service name; one not matching the pattern above is
+# an in-cluster name with a part missing, refused as the chart refuses it.
+readonly SERVICE_SUFFIX_PATTERN='\.(svc|cluster\.local)\.?$'
+readonly TWO_LABEL_HOST_PATTERN='^[^.]*\.[^.]*$'
 
 # ─── Scoped service account pool ──────────────────────────────────────────────
 # SCOPED_SA_POOL_ENABLED arms the pool (the composition's scoped_pool_enabled,
@@ -120,6 +256,16 @@ readonly HELM_LOCK_POLL_INTERVAL_DEFAULT=10
 # Timeout for rolling back a stuck pending release to the last healthy revision.
 readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 
+# ─── Cloud KMS Propagation Defaults ───────────────────────────────────────────
+# Defaults for Cloud KMS resource creation retry across the first-enablement
+# propagation window. Matching lifecycle.sh:203-204 without colliding with exported
+# variables or lifecycle.sh re-declarations.
+readonly KMS_API_PROPAGATION_DEFAULT_ATTEMPTS=5
+readonly KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS=60
+# Cloud KMS answers some requests with 403 for a few minutes after a project's
+# first enablement. Declared without readonly so sourcing lifecycle.sh does not collide.
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+
 # ─── Chart contract ───────────────────────────────────────────────────────────
 # Names the kube-agents chart fixes and the front doors address by name: the
 # Helm release, the operator and agent Deployments, and the Secret the agent's
@@ -127,6 +273,13 @@ readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 # install configuration and do not belong in install.defaults.env; they are
 # named here so that no front door spells one differently from the others.
 readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
+# The web console's Service (charts/kube-agents/templates/web-console.yaml
+# names it <release>-web-console) and the port it listens on, which the chart
+# fixes at 8080.
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_SERVICE="${KUBE_AGENTS_HELM_RELEASE}-web-console"
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_PORT="8080"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
@@ -150,11 +303,21 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The design document a spec.mode switch points the operator at.
-readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# The A2A gateway Deployment that holds Slack under spec.mode next, and its
+# container.
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT="platform-agent-a2a-gateway"
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_CONTAINER="gateway"
+# The operator's page for a spec.mode switch, which links the design document
+# (docs/designs/spec-mode-switch.md) for what the switch changes inside.
+readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"
 # The Slack app setup page's allowlist section, which says how to find a
 # member ID; refuse_next_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+# The same page's home channel section, which next_home_channel_unset_remedy
+# points at.
+readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 # A Slack home channel the A2A gateway arms its notify route on: a public
 # (C...) or private (G...) channel id, the prefix letter then two or more of
 # A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
@@ -163,6 +326,32 @@ readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/sla
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# spec.integration.slack.homeChannelPolicy on the PlatformAgent: "auto" (the
+# default, also empty) or "manual". The CRD enum (HomeChannelPolicy in
+# k8s-operator/api/v1alpha1/platformagent_types.go) is the source of the two
+# values and is exact: the API server rejects any other spelling, so the
+# installer matches exactly too, with no trim or case folding. Terraform's
+# slack_home_channel_policy validation holds the same three values.
+readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
+readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
+# The prefix of a Google Chat space's resource name, the only home channel
+# form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+# The gateway and the operator hold the same rule; keep the three in step
+# (docs/README.md lists them; a test checks all three agree).
+readonly GCHAT_SPACE_PREFIX="spaces/"
+# What Go's strings.TrimSpace strips (unicode.IsSpace), as UTF-8: ASCII
+# whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000. The operator and the gateway trim a home channel this
+# way, so a value pasted with a no-break space is still the space they use.
+# Assigned, then marked readonly: a `readonly -a` here is local to the
+# function the front doors source this file from, on bash 3.2 (macOS).
+GO_TRIMSPACE_CHARS=(
+  $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
+  $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
+  $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
+  $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
+)
+readonly GO_TRIMSPACE_CHARS
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -298,6 +487,9 @@ readonly SCOPE_PROBE_UNDECIDED=2
 # is nothing live to protect, not that the read failed.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
 readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# gcloud's answer for a cluster that does not exist. Any other describe failure
+# (auth expiry, a 403, a network blip) is a cluster that could not be read.
+readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -385,18 +577,347 @@ normalize_memory_vars() {
 }
 
 # Model provider → the model the install defaults to for that provider. The
-# names live in install.defaults.env; vertex_ai (and anything unrecognised,
-# which the validator rejects separately) takes the Gemini one.
+# names live in install.defaults.env; vertex_ai takes the Gemini one. No
+# default for openai_compatible (the model is whatever the server serves) or
+# for a LiteLLM provider slug outside the table (the install has to name it).
 default_model_for_provider() {
   case "${1:-}" in
+    gemini | vertex_ai) echo "$DEFAULT_MODEL_GEMINI" ;;
     openai) echo "$DEFAULT_MODEL_OPENAI" ;;
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
-    *) echo "$DEFAULT_MODEL_GEMINI" ;;
+    sap) echo "$DEFAULT_MODEL_SAP" ;;
+    *) echo "" ;;
   esac
 }
 
+# The providers the installer and the chart know by name: a menu entry, a
+# default model (openai_compatible excepted), and their own credential path.
+is_table_model_provider() {
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible|sap)$ ]]
+}
+
+# Those, or any other LiteLLM provider slug (azure, bedrock, databricks, ...),
+# which the chart accepts when MODEL_DEFAULT_NAME names the model and whose
+# credentials arrive through LITELLM_ENV_SECRET_NAME. chatgpt is a slug the
+# chart refuses by name (a subscription needs an OAuth token store it does
+# not ship), so it is refused here too, before anything is built.
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
+  [ "${1:-}" != "chatgpt" ] && { is_table_model_provider "${1:-}" || [[ "${1:-}" =~ $LITELLM_PROVIDER_SLUG_PATTERN ]]; }
+}
+
+# A provider outside the table has no default model, so the chart refuses to
+# render it without one; refused here first, for the MODEL_MAX_TOKENS reason.
+# $1 the provider, $2 the model.
+validate_model_provider_inputs() {
+  local provider="${1:-}" model="${2:-}"
+  if ! is_table_model_provider "$provider" && [ -z "$model" ]; then
+    print_error "MODEL_PROVIDER='${provider}' is a LiteLLM provider slug outside the installer's table, which has no default model: set --model-default-name (MODEL_DEFAULT_NAME in install.env) to the model it serves."
+    return 1
+  fi
+}
+
+# LITELLM_ENV_SECRET_NAME: the Secret the gateway reads as environment
+# variables. Empty is allowed (nothing is mounted); anything else must be a
+# name Kubernetes takes, as the chart checks. $1 the name.
+validate_litellm_env_secret_name() {
+  local name="${1:-}"
+  if [ -n "$name" ] &&
+    { [ "${#name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] || [[ ! "$name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
+    print_error "LITELLM_ENV_SECRET_NAME='${name}' is not a valid Kubernetes Secret name."
+    return 1
+  fi
+}
+
+# An OpenAI-compatible base URL → "<host> <port>", the host lowercased and an
+# IPv6 literal's brackets kept, the port the scheme's default when the URL names
+# none. Fails, as the chart's render does, for anything that is not http:// or
+# https:// with a host and a port in range, and for userinfo, a query or a
+# fragment before the path, which leave the host unreadable (and userinfo would
+# put a credential in the gateway's ConfigMap). $1 the URL.
+openai_compatible_url_host_port() {
+  local url="${1:-}" rest authority host after_host port
+  case "$url" in
+    http://*) rest="${url#http://}"; port="$HTTP_DEFAULT_PORT" ;;
+    https://*) rest="${url#https://}"; port="$HTTPS_DEFAULT_PORT" ;;
+    *) return 1 ;;
+  esac
+  authority="${rest%%/*}"
+  case "$authority" in *[?#@]*) return 1 ;; esac
+  if [[ "$authority" =~ ^(\[[0-9A-Fa-f:.]+\])(.*)$ ]] || [[ "$authority" =~ ^([A-Za-z0-9._-]+)(.*)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    after_host="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if [ -n "$after_host" ]; then
+    [[ "$after_host" =~ ^:([0-9]+)$ ]] || return 1
+    port="${BASH_REMATCH[1]}"
+    # The chart reads the port with atoi, so :0443 is 443 there; strip the
+    # leading zeros here so the two agree on the port and on what it needs.
+    port="${port#"${port%%[!0]*}"}"
+    port="${port:-0}"
+  fi
+  is_tcp_port "$port" || return 1
+  printf '%s %s\n' "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" "$port"
+}
+
+# A whole number in the TCP port range. $1 the value.
+is_tcp_port() {
+  [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge "$TCP_PORT_MIN" ] && [ "$((10#$1))" -le "$TCP_PORT_MAX" ]
+}
+
+# The namespace of the in-cluster Service a base URL's host names, or nothing
+# when it names none. The chart's rule, so the two agree on which URLs need a
+# target port and which need CIDRs: <svc> is a Service in the release's own
+# namespace, <svc>.<ns>.svc and <svc>.<ns>.svc.cluster.local one in <ns>, and
+# any other shape (a two-label host such as openrouter.ai, an IP literal) is
+# not a Service. $1 the host.
+openai_compatible_service_namespace() {
+  local host="${1:-}"
+  [[ "$host" == \[* ]] && return 0
+  [[ "$host" =~ $IPV4_LITERAL_PATTERN ]] && return 0
+  if [[ "$host" != *.* ]]; then
+    printf '%s\n' "${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  elif [[ "$host" =~ $SERVICE_HOST_PATTERN ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# Why the chart or the operator would refuse one egress CIDR for the gateway's
+# model-server rule, or nothing when neither would: not in CIDR form, broader
+# than the operator's floors, overlapping IPv4 or IPv6 link-local space, inside
+# the IPv6 metadata server's /48, or IPv4-mapped. The chart fails the render
+# after the cluster is built, and the operator drops the whole rule over one bad
+# entry, leaving the server unreachable with no error. $1 the entry.
+openai_compatible_cidr_refusal() {
+  local cidr="${1:-}" address prefix
+  address="${cidr%/*}"
+  prefix="${cidr##*/}"
+  if [ "$address" = "$cidr" ] || [[ ! "$prefix" =~ ^[0-9]{1,3}$ ]]; then
+    printf "'%s' is not in CIDR form (address/prefix)" "$cidr"
+    return 0
+  fi
+  prefix="$((10#$prefix))"
+  # No leading zeros in an octet: the operator's parser refuses them.
+  if [[ "$address" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
+    local octet value=0 overlap_bits link_local_value=0
+    for octet in "${BASH_REMATCH[@]:1}"; do
+      if [ "$((10#$octet))" -gt "$IPV4_OCTET_MAX" ]; then
+        printf "'%s' is not an IPv4 CIDR" "$cidr"
+        return 0
+      fi
+      value=$(( (value << IPV4_OCTET_BITS) | 10#$octet ))
+    done
+    if [ "$prefix" -gt "$IPV4_ADDRESS_BITS" ]; then
+      printf "'%s' is not an IPv4 CIDR" "$cidr"
+      return 0
+    fi
+    if [ "$prefix" -lt "$OPENAI_COMPATIBLE_MIN_IPV4_PREFIX" ]; then
+      printf "'%s' is broader than /%s" "$cidr" "$OPENAI_COMPATIBLE_MIN_IPV4_PREFIX"
+      return 0
+    fi
+    for octet in ${LINK_LOCAL_IPV4_NETWORK//./ }; do
+      link_local_value=$(( (link_local_value << IPV4_OCTET_BITS) | octet ))
+    done
+    overlap_bits="$prefix"
+    [ "$overlap_bits" -le "$LINK_LOCAL_IPV4_PREFIX" ] || overlap_bits="$LINK_LOCAL_IPV4_PREFIX"
+    if [ "$(( value >> (IPV4_ADDRESS_BITS - overlap_bits) ))" -eq "$(( link_local_value >> (IPV4_ADDRESS_BITS - overlap_bits) ))" ]; then
+      printf "'%s' overlaps link-local %s/%s, where the metadata server answers" "$cidr" "$LINK_LOCAL_IPV4_NETWORK" "$LINK_LOCAL_IPV4_PREFIX"
+    fi
+    return 0
+  fi
+  if [[ "$address" == *:* ]]; then
+    local groups
+    if ! groups="$(ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
+      printf "'%s' is not an IPv6 CIDR" "$cidr"
+      return 0
+    fi
+    if [ "$prefix" -lt "$OPENAI_COMPATIBLE_MIN_IPV6_PREFIX" ]; then
+      printf "'%s' is broader than /%s" "$cidr" "$OPENAI_COMPATIBLE_MIN_IPV6_PREFIX"
+      return 0
+    fi
+    # Past the /48 floor, overlapping the metadata /48 means lying inside it.
+    # The IPv4-mapped test reads the address alone, as the chart does.
+    if ipv6_prefixes_overlap "$groups" "$prefix" "$(ipv6_groups "$LINK_LOCAL_IPV6_NETWORK")" "$LINK_LOCAL_IPV6_PREFIX"; then
+      printf "'%s' overlaps IPv6 link-local %s/%s" "$cidr" "$LINK_LOCAL_IPV6_NETWORK" "$LINK_LOCAL_IPV6_PREFIX"
+    elif ipv6_prefixes_overlap "$groups" "$prefix" "$(ipv6_groups "$IPV6_METADATA_NETWORK")" "$IPV6_METADATA_PREFIX"; then
+      printf "'%s' is inside %s/%s, which holds the IPv6 metadata server address %s" "$cidr" "$IPV6_METADATA_NETWORK" "$IPV6_METADATA_PREFIX" "$IPV6_METADATA_ADDRESS"
+    elif ipv6_prefixes_overlap "$groups" "$IPV4_MAPPED_IPV6_PREFIX" "$(ipv6_groups "$IPV4_MAPPED_IPV6_NETWORK")" "$IPV4_MAPPED_IPV6_PREFIX"; then
+      printf "'%s' is an IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps; give that IPv4 CIDR instead" "$cidr"
+    fi
+    return 0
+  fi
+  printf "'%s' is not in CIDR form (address/prefix)" "$cidr"
+}
+
+# An IPv6 address → its eight groups as decimal numbers, space-separated, with
+# "::" expanded. Fails for anything else, an embedded IPv4 tail included.
+# $1 the address.
+ipv6_groups() {
+  local address="${1:-}" head tail group count=0 out="" missing
+  [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  case "$address" in *::*::*) return 1 ;; esac
+  # A colon at either end that is not part of "::" leaves an empty group, which
+  # the chart and Go's parser refuse; bash's split would drop a trailing one.
+  if [[ "$address" =~ ^:[^:] ]] || [[ "$address" =~ [^:]:$ ]]; then
+    return 1
+  fi
+  head="$address" tail=""
+  if [[ "$address" == *::* ]]; then
+    head="${address%%::*}"
+    tail="${address#*::}"
+  fi
+  local IFS=:
+  # shellcheck disable=SC2206  # the split on colons is the point
+  local head_groups=($head) tail_groups=($tail)
+  count=$(( ${#head_groups[@]} + ${#tail_groups[@]} ))
+  if [[ "$address" == *::* ]]; then
+    [ "$count" -lt "$IPV6_GROUP_COUNT" ] || return 1
+  else
+    [ "$count" -eq "$IPV6_GROUP_COUNT" ] || return 1
+  fi
+  for group in ${head_groups[@]+"${head_groups[@]}"}; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$((16#$group)) "
+  done
+  for ((missing = IPV6_GROUP_COUNT - count; missing > 0; missing--)); do
+    out+="0 "
+  done
+  for group in ${tail_groups[@]+"${tail_groups[@]}"}; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$((16#$group)) "
+  done
+  printf '%s\n' "${out% }"
+}
+
+# Whether two IPv6 prefixes overlap: they agree on the bits the shorter one
+# fixes. $1 and $3 the groups (ipv6_groups), $2 and $4 the prefix lengths.
+ipv6_prefixes_overlap() {
+  local -a left_groups right_groups
+  read -r -a left_groups <<< "$1"
+  read -r -a right_groups <<< "$3"
+  local bits="$2" index group_bits shift_by
+  [ "$4" -ge "$bits" ] || bits="$4"
+  for ((index = 0; index < IPV6_GROUP_COUNT && bits > 0; index++)); do
+    group_bits="$bits"
+    [ "$group_bits" -le "$IPV6_GROUP_BITS" ] || group_bits="$IPV6_GROUP_BITS"
+    shift_by=$((IPV6_GROUP_BITS - group_bits))
+    [ $(( left_groups[index] >> shift_by )) -eq $(( right_groups[index] >> shift_by )) ] || return 1
+    bits=$((bits - group_bits))
+  done
+  return 0
+}
+
+# openai_compatible needs values the chart refuses to render without, and an
+# egress shape the operator accepts, so check them before anything is built
+# rather than at helm_release, after the cluster and IAM. The chart's rules:
+# a model name and an http(s) base URL; an in-cluster Service needs the server
+# pod's port (NetworkPolicy matches after Service translation); any other host
+# needs the CIDRs it is reached at, unless it is a public endpoint on 443,
+# which the gateway's existing egress rule reaches. Each CIDR is held to the
+# operator's rules as well (openai_compatible_cidr_refusal). Quiet for any
+# other provider. $1 provider, $2 model, $3 base URL, $4 target port,
+# $5 egress CIDRs (comma- or space-separated), $6 CA bundle Secret name.
+validate_openai_compatible_inputs() {
+  local provider="${1:-}" model_name="${2:-}" api_base="${3:-}" target_port="${4:-}"
+  local egress_cidrs="${5:-}" ca_bundle_name="${6:-}"
+  [ "$provider" = "openai_compatible" ] || return 0
+  if [ -z "$model_name" ]; then
+    print_error "openai_compatible has no default model: set --model-default-name (MODEL_DEFAULT_NAME in install.env) to the model the server serves."
+    return 1
+  fi
+  if [ -z "$api_base" ]; then
+    print_error "openai_compatible needs the server's base URL including /v1: set --openai-compatible-api-base (OPENAI_COMPATIBLE_API_BASE in install.env)."
+    return 1
+  fi
+  local host_port host port
+  if ! host_port="$(openai_compatible_url_host_port "$api_base")"; then
+    # Not echoed: the userinfo this refuses may be the key itself.
+    print_error "OPENAI_COMPATIBLE_API_BASE is not an http:// or https:// URL with a host, an optional port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}, and no userinfo, query or fragment before the path (a key belongs in OPENAI_COMPATIBLE_API_KEY)."
+    return 1
+  fi
+  host="${host_port% *}"
+  port="${host_port##* }"
+
+  local cidr refusal cidr_count=0
+  while IFS= read -r cidr; do
+    [ -n "$cidr" ] || continue
+    cidr_count=$((cidr_count + 1))
+    refusal="$(openai_compatible_cidr_refusal "$cidr")"
+    if [ -n "$refusal" ]; then
+      print_error "OPENAI_COMPATIBLE_EGRESS_CIDRS: ${refusal}. The gateway's NetworkPolicy would drop the whole rule."
+      return 1
+    fi
+  done <<< "$(csv_list_items "$egress_cidrs")"
+  if [ "$cidr_count" -gt "$OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS" ]; then
+    print_error "OPENAI_COMPATIBLE_EGRESS_CIDRS lists ${cidr_count} CIDRs; the gateway's NetworkPolicy takes at most ${OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS}."
+    return 1
+  fi
+
+  # Checked whatever the host: only a Service reads it, but the generator
+  # writes it as a bare number either way.
+  if [ -n "$target_port" ] && ! is_tcp_port "$target_port"; then
+    print_error "OPENAI_COMPATIBLE_TARGET_PORT='${target_port}' is not a port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}."
+    return 1
+  fi
+
+  local service_namespace
+  service_namespace="$(openai_compatible_service_namespace "$host")"
+  if [ -z "$service_namespace" ] && [[ "$host" != \[* ]] && [[ "$host" =~ $SERVICE_SUFFIX_PATTERN ]]; then
+    print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' ends like an in-cluster Service name but is not <svc>.<ns>.svc or <svc>.<ns>.svc.cluster.local, so the gateway could not be given an egress rule for it. Write the Service with both its name and its namespace."
+    return 1
+  fi
+  if [ -n "$service_namespace" ]; then
+    if [[ ! "$service_namespace" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names a Service in namespace '${service_namespace}', which is not a valid namespace name."
+      return 1
+    fi
+    if [ -z "$target_port" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names an in-cluster Service: set --openai-compatible-target-port (OPENAI_COMPATIBLE_TARGET_PORT in install.env) to the server pod's port. The gateway's NetworkPolicy matches the pod's port, not the Service's."
+      return 1
+    fi
+  elif [ "$cidr_count" -eq 0 ]; then
+    # <a>.<b> is a hostname here, but it is also the short form of an
+    # in-cluster Service, so a mistaken Service gets the hint -- not when <b>
+    # is already "svc": that host is missing its namespace.
+    local service_hint=""
+    if [[ "$host" =~ $TWO_LABEL_HOST_PATTERN ]] && [[ "${host#*.}" != "svc" ]]; then
+      service_hint=" If this is an in-cluster Service, write it as <svc>.<ns>.svc (${host}.svc)."
+    fi
+    # Any host that is not a Service ignores the port, so a set one means a
+    # Service was meant (the chart refuses the same).
+    if [ -n "$target_port" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' is a hostname, not an in-cluster Service, so OPENAI_COMPATIBLE_TARGET_PORT is not used and no egress rule would reach the server.${service_hint}"
+      return 1
+    fi
+    if [[ "$host" == \[* ]] || [[ "$host" =~ $PRIVATE_IPV4_LITERAL_PATTERN ]]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names a private or IPv6 address, which the gateway's port-${HTTPS_DEFAULT_PORT} rule does not reach: set --openai-compatible-egress-cidrs (OPENAI_COMPATIBLE_EGRESS_CIDRS in install.env) to the ranges the server is reached at."
+      return 1
+    fi
+    if [ "$port" != "$HTTPS_DEFAULT_PORT" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' is not an in-cluster Service and is reached on port ${port}: set --openai-compatible-egress-cidrs (OPENAI_COMPATIBLE_EGRESS_CIDRS in install.env) to the private ranges the server is reached at. NetworkPolicy cannot match a DNS name, and without them the gateway reaches only public addresses on ${HTTPS_DEFAULT_PORT}.${service_hint}"
+      return 1
+    fi
+    # A two-label host on 443 may be a public endpoint or a short in-cluster
+    # Service name; neither the chart nor this can tell, so it passes, as in
+    # the chart's NOTES, with a warning.
+    if [ -n "$service_hint" ]; then
+      print_warning "OPENAI_COMPATIBLE_API_BASE='${api_base}' is read as a public hostname, so the gateway gets no egress rule for it.${service_hint}"
+    fi
+  fi
+
+  # Allowed, as the chart allows it, but said: install.sh and Terraform never
+  # show the chart's NOTES, where the same warning lives.
+  if [ -z "$service_namespace" ] && [[ "$api_base" == http://* ]]; then
+    print_warning "OPENAI_COMPATIBLE_API_BASE='${api_base}' is plain http to a server outside the cluster: prompts, which can carry cluster data, and OPENAI_COMPATIBLE_API_KEY cross the network unencrypted. Serve the endpoint over https."
+  fi
+
+  if [ -n "$ca_bundle_name" ] &&
+    { [ "${#ca_bundle_name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] ||
+      [[ ! "$ca_bundle_name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
+    print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
+    return 1
+  fi
 }
 
 # MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
@@ -404,6 +925,21 @@ is_valid_model_provider() {
 # reaches terraform.tfvars as a bare word HCL cannot parse.
 is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# LITELLM_BUDGET_USD: a non-negative amount in US dollars, digits with an
+# optional decimal part, 0 meaning no ceiling. The same shape the chart's
+# litellm.budget.usd schema (a number at or above 0) and the composition's
+# litellm_budget validation take; refused here first, for the MODEL_MAX_TOKENS
+# reason.
+is_non_negative_decimal() {
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# LITELLM_BUDGET_PERIOD: a LiteLLM duration, a whole number above zero and a
+# unit of s, m, h, d, w or mo, the chart's litellm.budget.period.
+is_valid_litellm_budget_period() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(s|m|h|d|w|mo)$ ]]
 }
 
 # LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
@@ -416,6 +952,142 @@ is_valid_redaction_ip_action() {
 # chart's platformAgent.mode and the composition's platform_agent_mode take too.
 is_valid_platform_agent_mode() {
   [[ "${1:-}" =~ ^(today|next)$ ]]
+}
+
+# PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
+# most 64Ti, what the composition's platform_agent_storage_size validation
+# takes. The CRD's spec.storage.size takes any quantity; this is the narrower
+# subset a disk is sized in. A number with more digits than the limit in Mi is
+# over it in every unit, which keeps the multiply inside Bash's int64.
+is_valid_platform_agent_storage_size() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
+  local unit="${BASH_REMATCH[1]}" number mi_per_unit
+  number="${1%"$unit"}"
+  [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
+  case "$unit" in
+    Mi) mi_per_unit=1 ;;
+    Gi) mi_per_unit=1024 ;;
+    Ti) mi_per_unit=1048576 ;;
+  esac
+  [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
+# The value of a top-level `key = value` assignment in a terraform.tfvars file,
+# unquoted, or nothing when the key is absent. Only the scalar shape the
+# generator writes (write_tfvars_from_state): a quoted string or a bare
+# boolean on one line, with an optional trailing comment.
+tfvars_scalar() {
+  local file="$1" key="$2"
+  [ -r "$file" ] || return 0
+  sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*[^\"# ])\"?.*$/\1/p" "$file" | head -n 1
+}
+
+# Renders the chart's footprint summary for the install terraform.tfvars
+# describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
+# $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
+# the chart is not in the checkout, or the render refuses; the caller decides
+# whether that is worth more than a warning.
+render_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
+  chart_dir="${repo_dir}/${FOOTPRINT_CHART_SUBDIR}"
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "helm is not on PATH" >&2
+    return 1
+  fi
+  if [ ! -f "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" ] || [ ! -f "${chart_dir}/Chart.yaml" ]; then
+    echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
+    return 1
+  fi
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
+  # only template beside the probe. values.schema.json comes too, so a value
+  # the chart would refuse is refused here as well.
+  cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
+  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
+  mkdir -p "$probe_dir/templates"
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  # A ConfigMap, so the output is one YAML document helm's manifest sorter
+  # reads; the block scalar keeps the summary's lines as they are.
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+  local -a set_args=()
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    key="${pair%%=*}"
+    value="$(tfvars_scalar "$tfvars_file" "$key")"
+    [ -n "$value" ] || continue
+    set_args+=(--set "${pair#*=}=${value}")
+  done <<< "$FOOTPRINT_TFVARS_VALUE_MAP"
+  if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" != "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+    set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
+  fi
+  local rendered rc=0
+  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rm -rf "$probe_dir"
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$rendered" >&2
+    return "$rc"
+  fi
+  # The block scalar's lines, their indent removed.
+  local pad
+  printf -v pad '%*s' "$FOOTPRINT_PROBE_INDENT" ''
+  printf '%s\n' "$rendered" | sed -n -E "/^  ${FOOTPRINT_PROBE_KEY}: \|\$/,\$ { /^  ${FOOTPRINT_PROBE_KEY}: \|\$/d; s/^${pad}//p; }"
+}
+
+# install.sh's step 11 entry for the footprint: the rendered summary, indented
+# under the bullet the caller printed, or a warning naming why it could not be
+# rendered. Never fails: the summary informs the confirmation and decides
+# nothing, so a chart that cannot be rendered here is reported and the run goes
+# on to the apply, where the same render failing is the error that stops it.
+# Two things the render cannot see are said under it when they apply: a
+# Standard cluster, whose bill is its node pools rather than the pod requests
+# the Autopilot rates price, and chart values carried through the
+# composition's extra_helm_values (TF_VAR_extra_helm_values, a -var or
+# -var-file in a TF_CLI_ARGS* variable, or a variables file Terraform
+# auto-loads beside the generated one), which reach the apply but not this
+# render.
+#
+# True when extra_helm_values may reach the apply unseen: TF_VAR_extra_helm_values
+# is set, a FOOTPRINT_TF_CLI_ARGS_VARS variable carries a -var-file or a -var
+# naming it, or a file matching FOOTPRINT_AUTOLOADED_TFVARS_GLOBS sits beside $1.
+footprint_extra_values_may_apply_unseen() {
+  local tfvars_dir glob name
+  [ -z "${TF_VAR_extra_helm_values:-}" ] || return 0
+  for name in "${FOOTPRINT_TF_CLI_ARGS_VARS[@]}"; do
+    if [[ "${!name:-}" =~ $FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN ]]; then
+      return 0
+    fi
+  done
+  tfvars_dir="$(dirname "$1")"
+  for glob in "${FOOTPRINT_AUTOLOADED_TFVARS_GLOBS[@]}"; do
+    if compgen -G "${tfvars_dir}/${glob}" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The apply goes through Terraform, which renders the chart's notes and shows
+# none, so the hints name the one command that prints them afterwards.
+print_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
+  namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
+  notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+    printf '%s\n' "$summary" | sed 's/^/      /'
+    if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+      print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
+    fi
+    if footprint_extra_values_may_apply_unseen "$tfvars_file"; then
+      print_info "Chart values set through the composition's extra_helm_values are not in this figure; after the apply, '${notes_cmd}' prints it for the release as applied."
+    fi
+  else
+    print_warning "Could not render the release footprint summary: $(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')"
+    print_info "The chart's notes carry the same figures, and the apply shows none (Terraform discards them); after the apply, '${notes_cmd}' prints them."
+  fi
+  rm -f "$err_file"
 }
 
 # The PlatformAgent and its release, read once for the scope check and the
@@ -581,13 +1253,11 @@ effective_platform_agent_mode() {
 # in the composition's extra_helm_values is merged over it and wins, and is
 # not seen here (platform_agent_mode_extra_values_caveat says so).
 platform_agent_mode_after_apply() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" rendered="$PLATFORM_AGENT_MODE_UNSET"
-  [ "$key" = "next" ] && rendered="$key"
-  if [ "$rendered" = "$record" ]; then
-    printf '%s' "$live"
-  else
-    printf '%s' "$rendered"
-  fi
+  # Compatibility shim, removed with the mode switch: the CRD defaults
+  # spec.mode to next and the webhook rewrites today, so every apply leaves
+  # next whatever the record, the CR or the key says. The switch notice, the
+  # retag note and the chat checklists read the mode from here.
+  printf '%s' next
 }
 
 # Said under every mode notice that names what an apply does: the
@@ -607,25 +1277,30 @@ platform_agent_mode_extra_values_caveat() {
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
 # Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. A read that failed is not empty: the
+# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   if [ "$from" = "$to" ]; then
     if [ "$to" != "$key" ]; then
-      print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but the PlatformAgent carries spec.mode ${to}, set outside this installer, and this apply leaves it there: the release already renders ${key}, so Helm has no change to send."
-      print_info "To switch it, patch spec.mode on the CR, or apply once with PLATFORM_AGENT_MODE=${to} and then with ${key} (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+      print_info "install.env resolves PLATFORM_AGENT_MODE to ${key}, but spec.mode stays next: the CRD defaults it and the webhook rewrites today (${PLATFORM_AGENT_MODE_SWITCH_DOC}). Set PLATFORM_AGENT_MODE=next in install.env, or remove the key, to end this note."
       platform_agent_mode_extra_values_caveat
     fi
     return 0
   fi
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat and Slack, either or both."
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
@@ -649,18 +1324,27 @@ note_platform_agent_mode_not_applied() {
   running="$(effective_platform_agent_mode "$live")"
   full="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   [ "$running" != "$full" ] || return 0
-  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
-  print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
+  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run installs an operator whose CRD defaults spec.mode to ${full}: the install runs the A2A stack after it whatever the key says."
+  print_info "Set PLATFORM_AGENT_MODE=next in install.env, or remove the key (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
   platform_agent_mode_extra_values_caveat
 }
 
 # Whether Slack is consumed by the A2A gateway after this apply: the
 # operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
-# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
-# the gateway when both are on, and Slack stays on the today path. $1 the
-# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+# which is Slack enabled; the mode argument is the shim part 2 of the
+# today removal deletes. The gateway runs Google Chat beside it, so Chat
+# does not change the answer. $1 the mode the apply
+# renders, $2 SLACK_ENABLED.
 slack_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+}
+
+# Whether Google Chat is consumed by the A2A gateway after this apply: the
+# operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
+# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
+# GOOGLE_CHAT_ENABLED.
+google_chat_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
 }
 
 # The three checks behind refuse_next_slack_gateway_settings, one per
@@ -677,18 +1361,53 @@ slack_allowlist_emails() {
   printf '%s' "$emails"
 }
 
-# A Slack home channel ($1), trimmed, when it is set and is not a channel id
-# (SLACK_HOME_CHANNEL_ID_RE).
+# A Slack home channel ($1), trimmed as the operator trims it (trim_go_space),
+# when it is set and is not a channel id (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
   # The C locale: under a legacy collation (glibc before 2.28) the range
   # A-Z also matches lowercase, which the gateway's rune comparison refuses.
   local LC_ALL=C
-  local home="${1:-}"
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home
+  home="$(trim_go_space "${1:-}")"
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
+}
+
+# $1 with what Go's strings.TrimSpace strips (GO_TRIMSPACE_CHARS) removed
+# from both ends. Byte-wise, so the result does not depend on the locale.
+trim_go_space() {
+  local LC_ALL=C value="${1:-}" sp trimmed=false
+  until $trimmed; do
+    trimmed=true
+    for sp in "${GO_TRIMSPACE_CHARS[@]}"; do
+      if [[ "$value" == "$sp"* ]]; then value="${value#"$sp"}"; trimmed=false; fi
+      if [[ "$value" == *"$sp" ]]; then value="${value%"$sp"}"; trimmed=false; fi
+    done
+  done
+  printf '%s' "$value"
+}
+
+# A Google Chat home channel ($1), trimmed, when it is set and is not a bare
+# space name: "spaces/" and an id with no further "/". The gateway's
+# gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
+# its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
+# rule.
+gchat_home_channel_not_a_space_name() {
+  local home id
+  home="$(trim_go_space "${1:-}")"
+  [ -n "$home" ] || return 0
+  id="${home#"$GCHAT_SPACE_PREFIX"}"
+  if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# Whether a Google Chat allowlist ($1) holds no address once split the way
+# hcl_csv_list renders it, which drops blank items: the operator then renders
+# allow-all for the gateway.
+gchat_allowlist_is_empty() {
+  [ -z "$(csv_list_items "${1:-}")" ]
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -744,7 +1463,7 @@ slack_bot_token_has_separator() {
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
   local emails bad_home count refused=false via say=print_error lead=""
-  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
@@ -767,7 +1486,7 @@ refuse_next_slack_gateway_settings() {
   if [ -n "$count" ]; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    print_info "The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or turn Slack off (SLACK_ENABLED=false)."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -783,9 +1502,204 @@ refuse_next_slack_gateway_settings() {
 # loaded, or what install.sh exported, plus a token the tfvars generator
 # recovered from the live Secret. $1 and $2 are the other's $7 and $8.
 refuse_next_slack_gateway_settings_from_env() {
-  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+  refuse_next_slack_gateway_settings "$(platform_agent_mode_after_apply "" "" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}")" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
+}
+
+# Under spec.mode next the A2A gateway, not the agent, makes the agent's
+# proactive posts (alerts, drift reports, scheduled reports), and it arms them
+# only on a home channel. A reply in a conversation still arrives without one,
+# so an install with none looks healthy while every unprompted post is refused
+# by the gateway and kept for one digest (#3320). With two platforms on the
+# gateway and one home set, the agent sends home posts to that home instead.
+# The front doors warn rather than refuse: some installs want chat with no
+# posts, and a CI install never posts. The operator reports the same
+# state as the HomeChannelUnset condition.
+#
+# The install.env keys of the home channels the gateway's chat backends lack,
+# one per line, Google Chat first as in the operator's condition, or nothing:
+# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED, $4
+# SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL. The backends follow the
+# operator: the gateway holds each platform that is enabled
+# (google_chat_moves_to_a2a_gateway, slack_moves_to_a2a_gateway).
+next_home_channel_unset_key() {
+  local home
+  if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
+    home="${5:-}"
+    home="$(trim_go_space "$home")"
+    [ -n "$home" ] || printf '%s\n' GOOGLE_CHAT_HOME_CHANNEL
+  fi
+  if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
+    home="${4:-}"
+    home="$(trim_go_space "$home")"
+    [ -n "$home" ] || printf '%s\n' SLACK_HOME_CHANNEL
+  fi
+  return 0
+}
+
+# The gateway platform that has a home channel, as the operator names it in
+# the HomeChannelUnset condition, or nothing: next_home_channel_unset_key's
+# five arguments. Google Chat first, as the agent picks where home posts go
+# (chat_notify.routed_platforms). A Chat home counts only as a space name, and
+# a Slack home only as a channel id: the gateway arms no route for anything
+# else (the operator's slackChannelID). It cannot see a Slack channel
+# the gateway learned from a mention, which only the cluster records: with
+# that channel learned, the warning for Google Chat still says the gateway
+# keeps its posts, while the agent sends them to Slack. Called when a key is
+# unset, so the platform it prints is the other one.
+next_home_channel_set_platform() {
+  local home
+  if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
+    home="$(trim_go_space "${5:-}")"
+    if [ -n "$home" ] && [ -z "$(gchat_home_channel_not_a_space_name "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_GCHAT_PLATFORM"
+      return 0
+    fi
+  fi
+  if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
+    home="$(trim_go_space "${4:-}")"
+    if [ -n "$home" ] && [ -z "$(slack_home_channel_not_an_id "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_SLACK_PLATFORM"
+    fi
+  fi
+  return 0
+}
+
+# The warning for one of those keys ($1), one line. $2 is
+# next_home_channel_set_platform's answer: the agent sends home posts to every
+# routed platform with a home channel, so with one set the posts go there, and
+# the gateway keeps them only when no platform has one.
+next_home_channel_unset_message() {
+  if [ -n "${2:-}" ]; then
+    printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set they go to ${2}'s home channel meanwhile; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+    return 0
+  fi
+  printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set it refuses them and keeps them for one digest; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+}
+
+# What to set for that key ($1); $2 is "flags" when install.sh's flags can
+# set it too.
+next_home_channel_unset_remedy() {
+  local via="install.env"
+  case "${1:-}" in
+    SLACK_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the channel you want. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      ;;
+    GOOGLE_CHAT_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      ;;
+  esac
+}
+
+# Set by warn_next_home_channel_unset, and again by install.sh from the mode
+# after the apply, so the front door's closing summary can say it again where
+# the reader of a non-interactive run's log will see it. One key per line.
+NEXT_HOME_CHANNEL_UNSET_KEY=""
+# Set beside it: next_home_channel_set_platform's answer for the same apply.
+NEXT_HOME_CHANNEL_SET_PLATFORM=""
+
+# Warns for each of the gateway's chat backends the apply leaves without a
+# home channel, and records the keys for the closing summary. Takes
+# next_home_channel_unset_key's five arguments, then "flags" as $6. Never
+# refuses.
+warn_next_home_channel_unset() {
+  local key
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+  NEXT_HOME_CHANNEL_SET_PLATFORM="$(next_home_channel_set_platform "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "$(next_home_channel_unset_message "$key" "$NEXT_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${6:-}")"
+  done
+  return 0
+}
+
+# warn_next_home_channel_unset on the exported keys; $1 is its $6.
+warn_next_home_channel_unset_from_env() {
+  warn_next_home_channel_unset "$(platform_agent_mode_after_apply "" "" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}")" \
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+    "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
+}
+
+# The closing summary's block, when warn_next_home_channel_unset found a key
+# empty: printed last, so a non-interactive log ends on it. $1 "flags".
+print_next_home_channel_unset_summary() {
+  local key
+  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  echo ""
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$key" "$NEXT_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${1:-}")"
+  done
+}
+
+# Set by print_chat_setup_checklists: "true" when it printed a checklist.
+CHAT_SETUP_CHECKLIST_PRINTED="false"
+
+# The commands that print the chat setup checklist for each chat platform that
+# is on, one per line, for a reader to paste later. They name the run's
+# install.env, which need not be the checkout's; the front door has made
+# INSTALL_ENV_FILE absolute.
+print_chat_checklist_commands() {
+  local printers
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_gchat.sh"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_slack.sh"
+  fi
+  return 0
+}
+
+# The chat setup checklists after an apply, and the closing summary's key: $1
+# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
+# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
+# which every caller has exported by then; what the apply used wins over
+# install.env in the printers. Returns 0 whatever it printed, because the
+# front doors call it bare under set -e.
+# shellcheck disable=SC2034  # both globals are read by install.sh
+print_chat_setup_checklists() {
+  local mode="${1:-}" printers failed="false"
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CHAT_SETUP_CHECKLIST_PRINTED="false"
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  NEXT_HOME_CHANNEL_SET_PLATFORM="$(next_home_channel_set_platform "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  # --dry-run: a printer changes nothing, yet load_state would otherwise ask
+  # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
+  # vars.sh, which no front door writes.
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
+      GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
+      GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
+      GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
+      GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
+      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
+      SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
+      SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if [ "$failed" = "true" ]; then
+    print_warning "A chat setup checklist did not print in full. Show it again with:"
+    print_chat_checklist_commands
+  fi
+  return 0
 }
 
 # Said when a read the notice needs failed, so the run does not go on as if
@@ -795,6 +1709,13 @@ _platform_agent_mode_unread() {
   print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
   print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
+
+# The spec.mode the CR carries after this apply, for the chat checklists that
+# follow it: the key, unless the reads below show a CR the apply leaves on
+# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
+# composition's extra_helm_values is not followed: the installer cannot read
+# it (platform_agent_mode_extra_values_caveat).
+PLATFORM_AGENT_MODE_AFTER_APPLY=""
 
 # The front door's call, after the scope check beside it: $1 namespace, $2
 # the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
@@ -807,8 +1728,13 @@ _platform_agent_mode_unread() {
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh and upgrade.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(platform_agent_mode_after_apply "" "" "$key")"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -838,7 +1764,41 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# After announce_platform_agent_mode_for_apply, from the reads it left:
+# succeeds unless they show that no install runs next, that is no cluster, no
+# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
+# that records today (the next apply recreates the CR from it). A read that
+# failed or did not happen is not today. upgrade.sh refuses a keyless
+# install.env on this, since such a file renders today.
+platform_agent_install_may_run_next() {
+  local live record
+  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
+  case "${PLATFORM_AGENT_CR_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  if [ -n "$live" ]; then
+    [ "$(effective_platform_agent_mode "$live")" = "next" ]
+    return
+  fi
+  case "${PLATFORM_AGENT_RECORD_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
+  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  [ "$(effective_platform_agent_mode "$record")" = "next" ]
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
@@ -1084,12 +2044,17 @@ load_install_env() {
   # switch the install's component stack for one run, and the next run from a
   # clean shell would switch it back and retire the A2A stack.
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
   # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
   # --gitops-host are the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY \
+    GITOPS_SWITCH_FROM_FORGE GITOPS_SWITCH_FROM_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -1392,8 +2357,8 @@ check_github_org_is_organization() {
   local where="GitHub"
   [ -n "$host" ] && where="$host"
   [ -z "$org" ] && return 0
-  # A GitLab install has no token minter, so no GitHub account to check.
-  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
+  # A GitLab or Bitbucket install has no token minter, so no GitHub account to check.
+  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "github" ] || return 0
 
   if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
     print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
@@ -1446,6 +2411,74 @@ tf_state_prefix() {
   echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
 }
 
+# ─── Cloud KMS ─────────────────────────────────────────────────────────────────
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement install.sh performs
+# seconds before creating the key ring and key.
+
+_sanitize_kms_int() {
+  local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
+  if [ -z "$val" ]; then
+    echo "$default_val"
+    return 0
+  fi
+  if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
+    echo "$val"
+  else
+    if [ -n "$name" ]; then
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      else
+        echo -e "  ⚠ ${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      fi
+    fi
+    echo "$default_val"
+  fi
+}
+
+# Retries a Cloud KMS command on Cloud KMS's first-enablement 403
+# (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
+# for a few minutes after being enabled. Output of the command is preserved and
+# echoed on completion; retry warnings are printed to stderr.
+retry_kms_create() {
+  local max_attempts
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" "$KMS_API_PROPAGATION_DEFAULT_ATTEMPTS" 0 "KMS_API_PROPAGATION_ATTEMPTS")"
+  local wait_seconds
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" "$KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS" 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
+  local attempt=1 status=0 output=""
+  while :; do
+    output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+    if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$output"; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        if type print_warning >/dev/null 2>&1; then
+          print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        else
+          echo -e "  ⚠ Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        print_warning "Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      else
+        echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        echo -e "  ⚠ Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      fi
+      sleep "$wait_seconds"
+      continue
+    fi
+    [ -n "$output" ] && printf '%s\n' "$output"
+    return "$status"
+  done
+}
+
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.
 # The token minter cannot pass readiness without one, so the generator,
 # install.sh and upgrade.sh all ask before enabling it; one pipeline here so
@@ -1458,11 +2491,64 @@ kms_key_enabled_version() {
       --filter='state=ENABLED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
 }
 
+# The basename of the first DESTROY_SCHEDULED version of a Cloud KMS key, or
+# nothing: what any destroy of the key leaves (a raw `terraform destroy`, or an
+# apply with enable_github_minter = false), and what a restore can still undo
+# until the destruction time. Every failure reads as "none".
+kms_key_scheduled_version() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  { gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
+}
+
+# The basename of the first DISABLED version of a Cloud KMS key, or nothing:
+# what a restore leaves until the version is enabled. Every failure reads as
+# "none".
+kms_key_disabled_version() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  { gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DISABLED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
+}
+
+# For a minter key with no ENABLED version: when its versions are scheduled for
+# destruction, prints how to restore them and returns 0; when they are only
+# disabled, prints how to enable them and returns 0; otherwise prints nothing
+# and returns 1, so the caller's import advice stands. The advice is gcloud's
+# restore and enable, which work whether or not the key is in Terraform state:
+# the next apply's adopt_kms imports a key that is out of it. A lifecycle.sh
+# adopt-kms run would need this install's checkout and state backend, which
+# install.sh and upgrade.sh do not have in hand at this point.
+print_minter_restore_advice() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  if [ -n "$(kms_key_scheduled_version "$key" "$keyring" "$location" "$project")" ]; then
+    print_info "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+    print_info "Restore them rather than re-importing the key; a restore works only until their destruction time."
+    print_info "Restore and enable each version with gcloud, then re-run:"
+    print_info "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+    print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    return 0
+  fi
+  [ -n "$(kms_key_disabled_version "$key" "$keyring" "$location" "$project")" ] || return 1
+  print_info "Its versions are disabled, as a restore leaves them."
+  print_info "Enable each version with gcloud rather than re-importing the key, then re-run:"
+  print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+  print_info "If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key with install.sh --kms-key instead."
+  return 0
+}
+
 # ─── terraform.tfvars Generation ──────────────────────────────────────────────
 # HCL string literal with backslashes and double quotes escaped.
 hcl_str() {
   local s="${1//\\/\\\\}"
   s="${s//\"/\\\"}"
+  # HCL reads ${ and %{ in a quoted string as a template sequence; doubling
+  # the first character writes them literally. Through variables, because
+  # bash 3.2 and bash 5 read escapes in a replacement string differently.
+  local tpl='${' tpl_lit='$${' dir='%{' dir_lit='%%{'
+  s="${s//"$tpl"/$tpl_lit}"
+  s="${s//"$dir"/$dir_lit}"
   printf '"%s"' "$s"
 }
 
@@ -1534,6 +2620,21 @@ require_scope_max_projects() {
     fi
   fi
   print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# SLACK_HOME_CHANNEL_POLICY is empty, auto or manual, or the run stops before
+# a file is written and names the key: it renders
+# spec.integration.slack.homeChannelPolicy, whose CRD enum accepts only those
+# two spellings (SLACK_HOME_CHANNEL_POLICY_AUTO, _MANUAL). $1 the value; $2 is
+# "flags" when install.sh's flag can set it too, so the remedy names it.
+require_slack_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$SLACK_HOME_CHANNEL_POLICY_AUTO" | "$SLACK_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel-policy"
+  print_error "SLACK_HOME_CHANNEL_POLICY is '${value}', which is not ${SLACK_HOME_CHANNEL_POLICY_AUTO} or ${SLACK_HOME_CHANNEL_POLICY_MANUAL} (empty means ${SLACK_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.slack.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
   return 1
 }
 
@@ -1714,7 +2815,12 @@ live_github_app_id() {
 # GitOps came from install.sh's flags, which earlier releases did not record
 # in install.env, so the next upgrade.sh rendered from the file alone. Run
 # after the generator (TFVARS_ENABLE_GITHUB_MINTER). Prints the exact lines to
-# append, with the live values filled in, so the fix needs no docs.
+# set, with the live values filled in, so the fix needs no docs. A minter
+# that this install did not make (see below) is not removed by the apply, so
+# it asks for no GITHUB_APP_ID; there it refuses a run that would drop or
+# change the PlatformAgent's GitOps repository (its owner, name or host), a
+# PlatformAgent or repository it cannot read, and a run that would render the
+# chart's own minter over the other one.
 # $1 namespace, $2 the install.env path, $3 SCOPE_CHECK_MODE_WARN for a run
 # that applies nothing (it warns and returns 0).
 refuse_apply_dropping_live_gitops() {
@@ -1764,10 +2870,14 @@ refuse_apply_dropping_live_gitops() {
     return 1
   fi
   [ -z "$minter_out" ] || minter="present"
+  local cr_read="true"
   cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
-  # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
-  IFS=$'\t' read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) )" || cr_read="false"
+  # "<org> <owner/repo or repo> <declared> <host>" of the GitOps repository,
+  # from either spelling; declared is 1 when the CR names one, readable or not,
+  # and host is its forge's host, "" for github.com in any spelling.
+  local live_declared="" live_host=""
+  IFS=$'\t' read -r live_org live_repo live_declared live_host <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
 import json, sys
 try:
     items = (json.load(sys.stdin) or {}).get("items") or []
@@ -1775,6 +2885,7 @@ except ValueError:
     items = []
 integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
 gh = integ.get("github") or {}
+host = ""
 repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
 ns = ""
 if repo.strip() in ("None", "none"):
@@ -1789,6 +2900,9 @@ if not repo:
             # The namespace qualifies a bare name only; a path with an owner
             # names its own (as the operator resolves it).
             ns = r.get("namespace") or forge.get("namespace") or ""
+            host = (forge.get("host") or "").strip().lower()
+            if host in ("github.com", "www.github.com", "ssh.github.com"):
+                host = ""
             break
 def path_of(ref):
     # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
@@ -1814,16 +2928,108 @@ elif not org:
 # operator would refuse (anything but A-Za-z0-9_.-) is printed as unknown.
 import re
 ok = re.compile(r"^[A-Za-z0-9_.-]+$")
-print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-"))
-' 2>/dev/null) || printf '%s\t%s' - -)"
+print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-") + "\t" + ("1" if repo else "0")
+      + "\t" + (host if re.match(r"^[a-z0-9.-]*$", host) else "-"))
+' 2>/dev/null) || printf '%s\t%s\t%s\t%s' - - 1 -)"
   [ "$live_org" = "-" ] && live_org=""
   [ "$live_repo" = "-" ] && live_repo=""
-  # Only a running minter is something the apply destroys. A GitOps repository
-  # with no minter (the App ID left blank, or the minter deferred) renders the
-  # same either way, so there is nothing here to protect.
+  # Only an install where a minter runs is guarded here. A GitOps repository
+  # with no minter (the App ID left blank, or the minter deferred) is out of
+  # this check's scope.
   [ -n "$minter" ] || return 0
   repo_name="$live_repo"
   [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  # A minter that this install did not make. Three signals, and all must say
+  # so: the release record (helm get values) has githubMinter.enabled false,
+  # which the chart's minter and the composition's minter module (its service
+  # account and Cloud KMS key) both follow, and the Deployment carries no
+  # meta.helm.sh annotations that name this release, so Helm does not delete
+  # it. That is a minter made by hand, by the kustomize dev path (make
+  # deploy-github) or by another Helm release. The apply removes nothing of
+  # it, so the run needs no GITHUB_APP_ID. A read that fails keeps the
+  # refusals further down.
+  local record_minter="" owner=""
+  record_minter="$( (trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$ctx" -o json 2>/dev/null) |
+    (trap - ERR; python3 -c '
+import json, sys
+try:
+    values = json.load(sys.stdin) or {}
+except ValueError:
+    sys.exit(0)
+print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else "false")
+' 2>/dev/null) || true)"
+  # A third signal for the composition's half: the minter module (its service
+  # account, Cloud KMS key and their bindings) must not be in this install's
+  # Terraform state. An apply that turned the minter off and stopped after
+  # the Helm release, before the module's destroy, leaves the record false and
+  # the module in state, and the next apply would destroy it under a minter
+  # made by hand on the same names. A state that cannot be read keeps the
+  # refusals further down.
+  local state_rc=0
+  if [ "$record_minter" = "false" ]; then
+    tf_state_manages_module "module.github_minter" >/dev/null 2>&1 || state_rc=$?
+  fi
+  if [ "$record_minter" = "false" ] && [ "$state_rc" -eq 1 ] &&
+    owner="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+      get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" \
+      -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}/{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null) )" &&
+    [ "$owner" != "${KUBE_AGENTS_HELM_RELEASE}/${namespace}" ]; then
+    if [ "$minter_stays_on" = "true" ]; then
+      # The chart renders its own minter under the same names, and Helm does
+      # not take over objects that another owner made: the apply would fail
+      # on them, after the cluster work.
+      "$say" "${lead}a GitHub token minter that this install did not make runs in namespace '${namespace}', and this run renders the chart's own minter under the same names. Helm does not take over objects it does not own, so the apply would fail on them."
+      print_info "Remove the other minter first, all of its objects: make -C k8s-operator undeploy-github with the same GITHUB_MINTER_KSA_NAME exported if it came from the kustomize path, or turn it off in the Helm release that made it; and delete the github-app-credentials Secret if you made it by hand. Or keep the other minter: set GITHUB_APP_ID empty in ${file} (and, with install.sh, give no --github-app-id). Then re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    # The apply removes no minter, but it renders the PlatformAgent's GitOps
+    # repository from GITOPS_ORG and GITOPS_REPO, so a run that does not name
+    # the live repository would take it out of the CR, or point the CR at
+    # another one. A CR that cannot be read, or a repository that cannot be
+    # named, is refused, as it cannot be compared.
+    if [ "$cr_read" != "true" ]; then
+      "$say" "${lead}the PlatformAgent in namespace '${namespace}' could not be read, so this run cannot tell whether the apply keeps its GitOps repository."
+      print_info "Fix the read (kubectl get platformagents -n ${namespace} --context ${ctx}) and re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local remove_hint="KUBE_AGENTS_REMOVE_GITOPS=true in the environment skips this check: the apply then renders the repository that GITOPS_ORG and GITOPS_REPO name, or none when GITOPS_ORG is empty."
+    if [ "$live_declared" = "1" ] && { [ -z "$live_org" ] || [ -z "$repo_name" ] || [ "$live_host" = "-" ]; }; then
+      # A repository the CR names in a form this check cannot read: no keys
+      # can be compared with it, so none are offered.
+      "$say" "${lead}the PlatformAgent names a GitOps repository that this check cannot read, so this run cannot tell whether the apply keeps it. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "See what it names: kubectl get platformagents -n ${namespace} --context ${ctx} -o jsonpath='{.items[0].spec.integration}'. To go on, remove the other minter (this check then does not run), or: ${remove_hint}"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local run_host=""
+    [ "${GITOPS_FORGE:-github}" = "github" ] && run_host="${GITOPS_HOST:-}"
+    if [ "$live_declared" = "1" ] &&
+      { [ "${GITOPS_ORG:-}" != "$live_org" ] || [ "${GITOPS_REPO:-}" != "$repo_name" ] || [ "$run_host" != "$live_host" ]; }; then
+      "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo}${live_host:+ at ${live_host}}, but this run's GITOPS_ORG, GITOPS_REPO and GITOPS_HOST (from ${file}, or the installer's defaults where it sets none) do not name that repository, so the apply would take it out of the PlatformAgent or point the PlatformAgent at another one. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
+      [ "${GITOPS_ORG:-}" = "$live_org" ] || print_info "  GITOPS_ORG=${live_org}"
+      [ "${GITOPS_REPO:-}" = "$repo_name" ] || print_info "  GITOPS_REPO=${repo_name}"
+      if [ "$run_host" != "$live_host" ]; then
+        if [ -n "$live_host" ]; then
+          print_info "  GITOPS_FORGE=github"
+          print_info "  GITOPS_HOST=${live_host}"
+        else
+          print_info "  GITOPS_HOST= (empty: the repository is on github.com)"
+        fi
+      fi
+      print_info "$remove_hint"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    print_info "A ${GITHUB_MINTER_DEPLOYMENT} Deployment runs in namespace '${namespace}', but this install did not make it (the ${KUBE_AGENTS_HELM_RELEASE} release renders no minter, and does not own the Deployment), so the apply leaves it as it is${live_repo:+, and the PlatformAgent keeps its GitOps repository ${live_repo}}."
+    return 0
+  fi
   # The minter stays on, so nothing is destroyed; but a run that fell back to
   # an auto-selected organisation or the default repository name would point
   # the running minter at another repository, and record it. Said before the
@@ -1836,10 +3042,6 @@ print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "
     return 0
   fi
   app_id="$(live_github_app_id "$namespace")"
-  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    say=print_warning
-    lead="An applying run would be refused: "
-  fi
   # All three keys set and matching what runs: the keys are right, and the
   # generator left the minter off because its Cloud KMS key check found no
   # ENABLED key version (or could not list them). Say that, not "set these".
@@ -2103,10 +3305,12 @@ check_scope_container_access() {
   # Every probe below is called in a `||` list: the front doors run under
   # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
   # not an error, on the bare call upgrade.sh --plan makes as well as on the
-  # `|| exit 1` call the applying modes make.
+  # `|| exit 1` call the applying modes make. Each clears the ERR trap inside
+  # its substitution: bash 3.2 fires an inherited one there on the probe's
+  # non-zero return, before the `||` is consulted.
   if ! _scope_asset_api_enabled "$project"; then
     rc=0
-    constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
+    constraint="$(trap - ERR; _scope_policy_denying_asset_api "$project")" || rc=$?
     if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
       failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
     elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
@@ -2117,7 +3321,7 @@ check_scope_container_access() {
     undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
   else
     local IFS=$', \t\n'
@@ -2126,7 +3330,7 @@ check_scope_container_access() {
     for entry in $folders; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -2136,7 +3340,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -2146,7 +3350,7 @@ check_scope_container_access() {
     for entry in $organizations; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -2156,7 +3360,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -2273,11 +3477,12 @@ check_scope_export_sink_access() {
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects ($(_scope_terraform_token_remedy))")
   else
     # Each probe is called in a `||` list: a denied answer is an answer, not
-    # an error, under the front doors' ERR trap. Globbing off around the
+    # an error, under the front doors' ERR trap, which each clears inside its
+    # substitution as the container preflight does. Globbing off around the
     # unquoted split, as the container preflight has it: an entry carrying a
     # glob character would otherwise be replaced by the files it matches.
     case "$-" in *f*) had_noglob=true ;; esac
@@ -2288,7 +3493,7 @@ check_scope_export_sink_access() {
         continue
       fi
       rc=0
-      reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         # The state is read on the first denial alone: a run with every
         # project granted never reads it.
@@ -2301,7 +3506,7 @@ check_scope_export_sink_access() {
           # it: the plan refreshes it, and a 403 or 404 above may mean the
           # project itself is not visible.
           rc=0
-          reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
+          reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
           if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
             failures+=("${identity} cannot read this install's drift audit-log sink in project '${entry}' (${SCOPE_SINK_GET_PERMISSION}), or the project is not visible to it, and cannot create one (${SCOPE_SINK_CREATE_PERMISSION}); the plan reads the sink and would fail there, or the apply would at that project's read, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity, or ${SCOPE_SINK_READ_ROLE} there for an apply that leaves the sink as it is.")
           else
@@ -2744,11 +3949,11 @@ sys.exit(granted if sys.argv[1] in held else denied)
       # cloud-platform scope (the remedy is the token's scope, not a grant),
       # and the Resource Manager API being off in the credential's quota
       # project (the apply enables that API before it binds).
-      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
+      if grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN" <<<"$body"; then
         printf '%s' "$SCOPE_PROBE_TOKEN_SCOPE_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
-      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
+      if grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN" <<<"$body"; then
         printf '%s' "$SCOPE_PROBE_API_OFF_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
@@ -2823,7 +4028,7 @@ tf_state_read() {
   if ! state="$(gcloud storage cat "$object" 2>"$err_file")"; then
     err="$(cat "$err_file" 2>/dev/null)"
     rm -f "$err_file"
-    if printf '%s' "$err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+    if grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$err"; then
       return 1
     fi
     # >&2 because the front doors' print_warning writes to stdout, and this
@@ -2909,6 +4114,34 @@ sys.exit(0 if managed else 1)
 ' "$1" "$2" "$TF_STATE_RC_UNREADABLE"
 }
 
+# Whether this install's Terraform state manages any resource in module $1
+# (for example module.github_minter, which the state records as
+# module.github_minter[0]): managed mode, with at least one instance. Returns
+# 1 when it does not or there is no state, and TF_STATE_RC_UNREADABLE when the
+# state could not be read or parsed, which a caller must not read as "no".
+tf_state_manages_module() {
+  local state
+  state=$(tf_state_read) || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+module, unreadable = sys.argv[1], int(sys.argv[2])
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(unreadable)
+def in_module(address):
+    address = address or ""
+    return address == module or address.startswith(module + "[") or address.startswith(module + ".")
+managed = any(
+    in_module(r.get("module"))
+    and r.get("mode") == "managed"
+    and len(r.get("instances", [])) > 0
+    for r in doc.get("resources", [])
+)
+sys.exit(0 if managed else 1)
+' "$1" "$TF_STATE_RC_UNREADABLE"
+}
+
 # The account ids of every google_service_account this install's state
 # manages, one per line. Empty when there is no state; tf_state_read's return
 # code when there is none or it could not be read, so a caller can tell
@@ -2962,6 +4195,136 @@ sys.exit(0)
 ' "$TF_PUBSUB_SUBSCRIPTION_TYPE" "$TF_CHAT_EVENTS_SUBSCRIPTION_NAME" "$TF_RESOURCE_MODE_MANAGED" "$TF_STATE_RC_UNREADABLE"
 }
 
+# ─── The minter's per-install names (#3504) ──────────────────────────────────
+# The token minter's key ring, key and GSA used to default to one fixed name
+# per project, so a second install that took the defaults adopted the first
+# install's App key. A new install now derives them from its cluster, and its
+# KSA too (#5282): Workload Identity's member names the project, namespace and
+# KSA but no cluster, so with one KSA name every install in a project could act
+# as every install's minter GSA. An install whose state already holds a
+# minter keeps the names in its state: a KMS key ring or key cannot be deleted,
+# and renaming one plans a replacement that would leave the old key and its
+# versions behind.
+
+# The names a new install derives from its cluster, separated by |: key ring,
+# key, GSA, KSA. A GSA id is 6-30 characters, so a cluster name too long for
+# "<cluster>-minter" keeps its first 18 characters and gains four hex
+# characters of its hash, which keeps two long names that share a prefix apart.
+# The KSA needs no such cut: a GKE cluster name is at most 40 characters, so
+# "<cluster>-github-minter" fits a 63-character DNS label.
+minter_derived_names() {
+  local cluster=$1 gsa prefix hash
+  gsa="${cluster}-minter"
+  if [ "${#gsa}" -gt "$MINTER_GSA_ID_MAX_LEN" ]; then
+    # python3 rather than shasum, which needs perl: slim images lack it.
+    hash="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:int(sys.argv[2])])' \
+      "$cluster" "$MINTER_GSA_HASH_LEN")"
+    prefix="${cluster:0:$MINTER_GSA_CLUSTER_PREFIX_LEN}"
+    prefix="${prefix%-}"
+    gsa="${prefix}-${hash}-minter"
+  fi
+  printf '%s|%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa" "${cluster}-github-minter"
+}
+
+# The minter's key ring, key, GSA and KSA names as this install's state
+# records them (module.github_minter[0]; the KSA is the one its Workload
+# Identity member names), separated by |; a field the state doesn't hold is
+# empty, and all four are when there is no minter in state or no state.
+# tf_state_read's return code when the state could not be read.
+# shellcheck disable=SC2120
+tf_state_minter_names() {
+  trap - ERR
+  local state
+  state=$(tf_state_read "$@") || return $?
+  printf '%s' "$state" | python3 -c '
+import json, re, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(int(sys.argv[1]))
+want = {"google_kms_key_ring": "name", "google_kms_crypto_key": "name", "google_service_account": "account_id"}
+found = {}
+ksa = ""
+for r in doc.get("resources", []):
+    if r.get("module") != "module.github_minter[0]" or r.get("mode") != "managed":
+        continue
+    if r.get("type") == "google_service_account_iam_member" and r.get("name") == "workload_identity":
+        for i in r.get("instances", []):
+            # serviceAccount:<project>.svc.id.goog[<namespace>/<ksa>]
+            m = re.search(r"\[[^/\]]+/([^\]]+)\]$", (i.get("attributes") or {}).get("member") or "")
+            if m:
+                ksa = m.group(1)
+        continue
+    attr = want.get(r.get("type"))
+    if not attr or r.get("name") != "minter":
+        continue
+    for i in r.get("instances", []):
+        value = (i.get("attributes") or {}).get(attr)
+        if value:
+            found[r["type"]] = value
+print("|".join([found.get(t, "") for t in want] + [ksa]))
+' "$TF_STATE_RC_UNREADABLE"
+}
+
+# The install a minter key's owner labels name, as <cluster>/<namespace>
+# (lifecycle.sh's MINTER_OWNER_*_LABEL; set by the composition's owner_labels),
+# or nothing for a key with no owner labels. Returns 1 when the key can't be
+# described (absent, or not readable by this identity: lifecycle.sh's own check
+# decides then), 2 when it exists and its labels can't be read.
+minter_key_owner() {
+  local ring=$1 key=$2 location=$3 project=$4 labels pair cluster="" namespace=""
+  (trap - ERR; gcloud kms keys describe "$key" --keyring "$ring" --location "$location" \
+    --project "$project" --format='value(name)' >/dev/null 2>&1) || return 1
+  labels="$(trap - ERR; gcloud kms keys describe "$key" --keyring "$ring" --location "$location" \
+    --project "$project" --format='value(labels)' 2>/dev/null)" || return 2
+  local IFS=';'
+  for pair in $labels; do
+    case "$pair" in
+      kube-agents-cluster=*)   cluster="${pair#*=}" ;;
+      kube-agents-namespace=*) namespace="${pair#*=}" ;;
+    esac
+  done
+  unset IFS
+  if [ -n "${cluster}${namespace}" ]; then
+    printf '%s/%s\n' "${cluster:-?}" "${namespace:-?}"
+  fi
+}
+
+# This install's default minter names, separated by |: key ring, key, GSA,
+# KSA. An install with a minter in its state gets the names it holds (a field
+# the state lacks falls back to the project-wide default it was created under). An
+# install with none gets the names derived from its cluster. When the state
+# can't be read, nothing can be said about which install this is, so it gets
+# the project-wide defaults an existing install was created with, and says so:
+# a new install there should set its names.
+minter_name_defaults() {
+  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa="" ksa=""
+  names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
+  if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}, KSA ${DEFAULT_GITHUB_MINTER_KSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and GITHUB_MINTER_KSA_NAME to names of its own." >&2
+    printf '%s|%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME" "$DEFAULT_GITHUB_MINTER_KSA_NAME"
+    return 0
+  fi
+  IFS='|' read -r ring key gsa ksa <<<"$names"
+  if [ -n "${ring}${key}${gsa}${ksa}" ]; then
+    # A state with no binding yet is an apply that stopped partway. Its KSA is
+    # the derived one when its GSA is, since both came from one run's names:
+    # the shared default here would hand a new install the name #5282 exists
+    # to retire.
+    if [ -z "$ksa" ]; then
+      local derived_gsa derived_ksa
+      IFS='|' read -r _ _ derived_gsa derived_ksa <<<"$(minter_derived_names "$cluster")"
+      if [ -n "$gsa" ] && [ "$gsa" = "$derived_gsa" ]; then
+        ksa="$derived_ksa"
+      fi
+    fi
+    printf '%s|%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" \
+      "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}" "${ksa:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
+    return 0
+  fi
+  minter_derived_names "$cluster"
+}
+
 # Refuse an apply that would stop on a service account this install does not
 # own. Every GSA the composition creates has ONE fixed name per project while
 # state is kept per cluster, so the second install in a project -- or a
@@ -3004,7 +4367,7 @@ check_service_account_ownership() {
   fi
   for line in "${candidates[@]}"; do
     IFS=$'\t' read -r label key account_id <<<"$line"
-    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+    if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
     email="${account_id}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -3029,7 +4392,7 @@ check_service_account_ownership() {
   while IFS= read -r email; do
     [ -n "$email" ] || continue
     account_id="${email%%@*}"
-    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+    if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
     # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
@@ -3041,6 +4404,16 @@ check_service_account_ownership() {
   for line in ${foreign[@]+"${foreign[@]}"}; do
     IFS=$'\t' read -r label key account_id email <<<"$line"
     print_error "Service account '${account_id}' (${label}) already exists in project '${PROJECT_ID}' and is not managed by this install's Terraform state (gs://$(tf_state_bucket)/$(tf_state_prefix))."
+    # A minter GSA names the install that owns it in its description (#3504);
+    # say whose it is when it does. A describe that fails says nothing extra.
+    if [ "$key" = "GITHUB_MINTER_GSA_NAME" ]; then
+      local owner
+      owner="$(trap - ERR; gcloud iam service-accounts describe "$email" --project "${PROJECT_ID}" \
+        --format='value(description)' 2>/dev/null)" || owner=""
+      if [[ "$owner" == *"for install "* ]]; then
+        print_info "Its description names its owner: ${owner}."
+      fi
+    fi
     print_info "Applying would stop on a 409 creating it. If another kube-agents install in this project owns it, give this install its own name: set ${key}=<a-different-name> in install.env, or on a first install, which has no install.env yet, run ${key}=<a-different-name> ./install.sh ... and the name is recorded in the install.env it creates. If it is left over from an install removed without uninstall.sh, delete it first: gcloud iam service-accounts delete ${email} --project ${PROJECT_ID}"
   done
   return 1
@@ -3438,7 +4811,7 @@ live_hindsight_state() {
     out="$({ trap - ERR; kubectl get "$kind" "$name" -n "$namespace" --context "$expected_ctx" \
       --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" --ignore-not-found -o name; } 2>&1)" || rc=$?
     if [ "$rc" -eq 0 ]; then
-      if printf '%s\n' "$out" | grep -qE "(^|/)${name}\$"; then
+      if grep -qE "(^|/)${name}\$" <<<"$out"; then
         LIVE_HINDSIGHT_STATE="present"
         return 0
       fi
@@ -3449,7 +4822,7 @@ live_hindsight_state() {
     # function is entitled to believe -- it can only come from a server that
     # answered -- and it still arrives on older kubectl builds, and for a
     # namespace that does not exist, where --ignore-not-found does not apply.
-    if printf '%s' "$out" | grep -qF 'Error from server (NotFound)'; then
+    if grep -qF 'Error from server (NotFound)' <<<"$out"; then
       absent=$((absent + 1))
       continue
     fi
@@ -3547,6 +4920,34 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
   return 1
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the cluster does not exist. The tfvars generator and install.sh's mode
+# settle both ask this, so they cannot disagree about what absence is.
+gke_describe_error_is_not_found() {
+  grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
+}
+
+is_existing_cluster_network_policy_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
+  [ "$create_cluster_flag" = "false" ] || return 0
+
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    return 2
+  fi
+  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
+  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
+  return 0
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -3637,7 +5038,7 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! printf '%s' "$describe_err" | grep -qiE "not.?found|404"; then
+    if ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -3710,7 +5111,7 @@ write_tfvars_from_state() {
   expected_ctx="$(gke_context_name)"
   if command -v kubectl >/dev/null 2>&1 &&
     [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
+    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
       [ -z "${!secret_key:-}" ] || continue
       # Every stage exits 0 on its own (|| true inside the substitution):
       # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
@@ -3874,9 +5275,9 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  # A GitLab install has no GitHub App: the GitOps repository is on GitLab and
-  # the composition refuses the minter beside it.
-  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+  # A GitLab or Bitbucket install has no GitHub App: the GitOps repository is
+  # on that forge and the composition refuses the minter beside it.
+  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" != "github" ]; then
     :
   elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
@@ -3886,7 +5287,9 @@ write_tfvars_from_state() {
       enable_github_minter="true"
     else
       print_warning "GitHub minter deferred: its KMS signing key has no ENABLED version, no App private key PEM is at hand (GITHUB_PEM_PATH), and a minter deployed without the key never passes readiness."
-      print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
+      print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+        "$(derive_kms_location "${REGION}")" "${PROJECT_ID}" ||
+        print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
     fi
   fi
 
@@ -3973,6 +5376,31 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # The gateway's spend ceiling, checked for the MODEL_MAX_TOKENS reason. Empty
+  # takes the defaults (0, no ceiling), and the period is read only beside an
+  # amount above zero, as it is in the chart. The amount is compared as text:
+  # 0 and 0.0 both mean off, and the variable reaches terraform.tfvars only
+  # when it is on, so an install without a ceiling keeps the file it had.
+  local litellm_budget_usd="${LITELLM_BUDGET_USD:-$DEFAULT_LITELLM_BUDGET_USD}"
+  local litellm_budget_period="${LITELLM_BUDGET_PERIOD:-$DEFAULT_LITELLM_BUDGET_PERIOD}"
+  if ! is_non_negative_decimal "$litellm_budget_usd"; then
+    print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is not an amount in US dollars. Set a number at or above 0, such as 25 or 2.50, or leave it empty, in install.env."
+    return 1
+  fi
+  local litellm_budget_on="false"
+  if [[ ! "$litellm_budget_usd" =~ ^0+(\.0+)?$ ]]; then
+    litellm_budget_on="true"
+    # Below the floor the chart's per-replica share rounds to nothing and its
+    # render refuses the value at helm_release apply; refused here instead.
+    if awk -v amount="$litellm_budget_usd" -v floor="$LITELLM_BUDGET_MIN_USD" 'BEGIN { exit !(amount + 0 < floor + 0) }'; then
+      print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is under ${LITELLM_BUDGET_MIN_USD} USD, the least a ceiling can be when it is on (the chart splits it across the gateway replicas and renders each share with four decimals). Set 0 for no ceiling, or at least ${LITELLM_BUDGET_MIN_USD}, in install.env."
+      return 1
+    fi
+    if ! is_valid_litellm_budget_period "$litellm_budget_period"; then
+      print_error "LITELLM_BUDGET_PERIOD='${litellm_budget_period}' is not a LiteLLM duration. Set a whole number and s, m, h, d, w or mo, such as 1d, or leave it empty, in install.env."
+      return 1
+    fi
+  fi
   # The daily alert ceilings, checked for the MODEL_MAX_TOKENS reason. An
   # empty key is not written, so the agent image keeps its default for that
   # bucket. No install.defaults.env entry exists for these keys, because
@@ -3994,6 +5422,20 @@ write_tfvars_from_state() {
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
   require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Same reason: the CRD accepts two spellings, and Terraform's validation
+  # would name the variable after the interview, or after the Day-2 menu has
+  # rewritten install.env. Every route to Terraform passes here.
+  require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
+  # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
+  # openai_compatible without these, and upgrade.sh regenerates without
+  # install.sh's interview.
+  validate_openai_compatible_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" \
+    "${OPENAI_COMPATIBLE_API_BASE:-}" "${OPENAI_COMPATIBLE_TARGET_PORT:-}" \
+    "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}" "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}" || return 1
+  # Same reason: a provider slug with no model, or a Secret name the chart
+  # refuses, stops here with the file untouched.
+  validate_model_provider_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" || return 1
+  validate_litellm_env_secret_name "${LITELLM_ENV_SECRET_NAME:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
   # regenerate from install.env without install.sh's checks. A misspelt toggle
   # is refused rather than read as off, which would forward requests
@@ -4025,7 +5467,28 @@ write_tfvars_from_state() {
     print_error "SCOPED_SA_POOL_ENABLED='${scoped_pool_enabled}' is neither true nor false. Fix it in install.env."
     return 1
   fi
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ] && ! is_bool_spelling "$DISALLOW_SECRETS_READ"; then
+    print_error "DISALLOW_SECRETS_READ='${DISALLOW_SECRETS_READ}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
+  # The same reason, with a sharper edge: read as off, a misspelt value
+  # revokes the gateway's role on the serving project at the next apply, and
+  # a long-lived environment's reconcile renders this key from a GitHub
+  # variable a human typed.
+  local vertex_manage_serving_project="${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+  if ! is_bool_spelling "$vertex_manage_serving_project"; then
+    print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  # The same again: read as off, a misspelt value leaves the release's
+  # upgrade_install off, and the apply it was set to rescue fails with the
+  # "cannot re-use a name" it was set to prevent, naming nothing (#4108).
+  local helm_upgrade_install="${HELM_UPGRADE_INSTALL:-$DEFAULT_HELM_UPGRADE_INSTALL}"
+  if ! is_bool_spelling "$helm_upgrade_install"; then
+    print_error "HELM_UPGRADE_INSTALL='${helm_upgrade_install}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
@@ -4034,6 +5497,40 @@ write_tfvars_from_state() {
   if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
+  fi
+  # The data volume size, for the same reason.
+  local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
+  if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
+    print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
+  # Refused when the web console is on and the operator has accepted an
+  # unconfined cluster: the web console holds the Platform Agent's API key with
+  # no login of its own, and its deny-all-ingress NetworkPolicy is the only
+  # thing keeping other pods in the cluster from reaching it. Checked here so
+  # upgrade.sh and `install.sh --menu` cannot write a tfvars that enables the
+  # console when both keys are set in install.env without install.sh's
+  # preflight, when the cluster still enforces no NetworkPolicy. install.sh
+  # (which passes KUBE_AGENTS_GENERATE_API_SERVER_KEY=true) defers this check to
+  # check_existing_cluster_network_policy_preflight. On an adopted cluster that
+  # enforces NetworkPolicy (Autopilot, or a Standard cluster that has since
+  # enabled Dataplane V2 or Calico on the "confine it later" route), the live
+  # probe below finds enforcement active and lets upgrade.sh and --menu proceed
+  # despite a stale ACCEPT_NO_NETWORK_POLICY=true.
+  if ! is_truthy "${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-false}" && \
+     is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"; then
+    local np_rc=0
+    is_existing_cluster_network_policy_satisfied "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$create_cluster" || np_rc=$?
+    if [ "$np_rc" -eq 2 ]; then
+      print_error "Could not query NetworkPolicy configuration for existing cluster '${CLUSTER_NAME}'."
+      print_info "Failed to read cluster details from GCP while validating WEB_CONSOLE_ENABLED=true with ACCEPT_NO_NETWORK_POLICY=true. Check cluster name, region, permissions, and network connectivity."
+      return 1
+    elif [ "$np_rc" -ne 0 ]; then
+      print_error "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true."
+      print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement on the cluster (and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or set WEB_CONSOLE_ENABLED=false in install.env."
+      return 1
+    fi
   fi
 
   local old_umask
@@ -4056,6 +5553,8 @@ write_tfvars_from_state() {
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
+    echo "# The minter's KSA, the other half of its Workload Identity binding."
+    echo "github_minter_ksa_name           = $(hcl_str "${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}")"
     echo ""
     echo "# GKE database encryption. install.sh's existing-cluster step reads the"
     echo "# same two keys, so a create and an adoption encrypt with one key."
@@ -4087,6 +5586,18 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    # Only when set, so an install without one keeps the file it had.
+    if [ -n "${LITELLM_ENV_SECRET_NAME:-}" ]; then
+      echo "litellm_env_secret_name = $(hcl_str "${LITELLM_ENV_SECRET_NAME}")"
+    fi
+    # Only for this provider, so every other install's file stays as it was.
+    # The target port is 0, the variable's "unset", when empty.
+    if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then
+      echo "openai_compatible_api_base       = $(hcl_str "${OPENAI_COMPATIBLE_API_BASE:-}")"
+      echo "openai_compatible_target_port    = $((10#${OPENAI_COMPATIBLE_TARGET_PORT:-0}))"
+      echo "openai_compatible_egress_cidrs   = $(hcl_csv_list "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}")"
+      echo "openai_compatible_ca_secret_name = $(hcl_str "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}")"
+    fi
     echo ""
     echo "# The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the"
     echo "# keys that are set. A bucket that is not here keeps the image default."
@@ -4102,6 +5613,10 @@ write_tfvars_from_state() {
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
     echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
     echo ""
+    echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
+    echo "# install.env). The composition passes the chart nothing for the default."
+    echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
+    echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
     if is_truthy "$redaction_enabled"; then
@@ -4114,6 +5629,13 @@ write_tfvars_from_state() {
     else
       echo "litellm_redaction = { enabled = false }"
     fi
+    # Only while on, so an install without a ceiling keeps the file it had.
+    if [ "$litellm_budget_on" = "true" ]; then
+      echo ""
+      echo "# The gateway's spend ceiling (LITELLM_BUDGET_USD, LITELLM_BUDGET_PERIOD in"
+      echo "# install.env), split across the gateway's replicas by the chart."
+      echo "litellm_budget = { usd = ${litellm_budget_usd}, period = $(hcl_str "$litellm_budget_period") }"
+    fi
     echo ""
     echo "# The scoped service account pool (SCOPED_SA_POOL_ENABLED,"
     echo "# SCOPED_SA_POOL_MAX_ACCOUNTS in install.env): one reader service account per"
@@ -4122,12 +5644,18 @@ write_tfvars_from_state() {
     if [ -n "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" ]; then
       echo "scoped_pool_max_accounts = ${SCOPED_SA_POOL_MAX_ACCOUNTS}"
     fi
+    if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+      echo "disallow_secrets_read    = $(hcl_bool "$DISALLOW_SECRETS_READ")"
+    fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
       echo "openai_api_key    = $(hcl_str "${OPENAI_API_KEY:-}")"
       echo "anthropic_api_key = $(hcl_str "${ANTHROPIC_API_KEY:-}")"
+      if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then
+        echo "openai_compatible_api_key = $(hcl_str "${OPENAI_COMPATIBLE_API_KEY:-}")"
+      fi
       if [ -n "${SESSION_KV_API_KEY:-}" ] || [ -n "${SESSION_KV_SALT:-}" ]; then
         echo "# Recovered from the live Secret: an adoption re-install must keep the"
         echo "# salt, or every chat identity re-pseudonymises."
@@ -4186,6 +5714,7 @@ write_tfvars_from_state() {
     echo "slack_allowed_users     = $(hcl_csv_list "${SLACK_ALLOWED_USERS:-}")"
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
+    echo "slack_home_channel_policy = $(hcl_str "${SLACK_HOME_CHANNEL_POLICY:-}")"
     echo ""
     # Written only for a GitLab install, so a GitHub one renders the exact
     # lines it always has. GITOPS_REPO is the project's full path there.
@@ -4198,6 +5727,19 @@ write_tfvars_from_state() {
       # it always has.
       if [ -n "${GITOPS_CA_SECRET:-}" ]; then
         echo "gitlab_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+    elif [ "${GITOPS_FORGE:-}" = "bitbucket" ] || [ "${GITOPS_FORGE:-}" = "bitbucket-datacenter" ]; then
+      # A Bitbucket install, Cloud or Data Center: the neutral variables.
+      # GITOPS_REPO is workspace/slug on Cloud and KEY/slug on Data Center.
+      echo "gitops_forge              = $(hcl_str "${GITOPS_FORGE}")"
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitops_repo_path          = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitops_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_BITBUCKET_TOKEN_SECRET:-bitbucket-forge-token}}")"
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitops_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+      if [ -n "${GITOPS_IDENTITY:-}" ]; then
+        echo "gitops_identity           = $(hcl_str "${GITOPS_IDENTITY}")"
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
@@ -4219,12 +5761,28 @@ write_tfvars_from_state() {
     if [ -n "${KMS_KEY:-}" ]; then
       echo "github_minter_kms_key = $(hcl_str "${KMS_KEY}")"
     fi
+    # An unlabelled minter key this run named explicitly, which lifecycle.sh
+    # adopts as this install's own and the apply labels (confirm_minter_key_owner).
+    if [ -n "${MINTER_ADOPT_KEY:-}" ]; then
+      echo "github_minter_adopt_unlabelled_kms_key = $(hcl_str "${MINTER_ADOPT_KEY}")"
+    fi
+    # The one minter key lifecycle.sh may adopt from another install, or from
+    # outside any install, as <keyring>/<key> (#3504). Unset adopts only this
+    # install's own.
+    if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+      echo "github_minter_shared_kms_key = $(hcl_str "${MINTER_SHARED_KEY}")"
+    fi
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"
+    echo ""
+    # Read from install.env (or the environment) only: no flag or interview
+    # question sets it, so install.sh exports nothing over it. See the variable.
+    echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"
+    echo "web_console_enabled      = $(hcl_bool "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}")"
     echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-$DEFAULT_MEMORY_ENABLED}")"
     echo "memory_provider          = $(hcl_str "$memory_provider")"
     echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}")"
@@ -4277,6 +5835,7 @@ write_tfvars_from_state() {
   export TF_VAR_gemini_api_key="${GEMINI_API_KEY:-}"
   export TF_VAR_openai_api_key="${OPENAI_API_KEY:-}"
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  export TF_VAR_openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"

@@ -50,17 +50,29 @@ class RuntimeChatBackend:
     """One target-bound facade over the existing chat and runtime providers."""
 
     def __init__(self, target: DeploymentTarget) -> None:
+        self._target = target
         self._chat = agent_chat.AgentChatProvider(target)
         self._runtime = agent_runtime.AgentRuntimeProvider(target)
 
     def run(self, *args, **kwargs) -> ChatRunResult:
-        return self._chat.run(*args, **kwargs)
+        # Each action that changes the runtime drops the held discovery
+        # answers, so the reads that follow it look at the cluster again.
+        try:
+            return self._chat.run(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def resolve_approval(self, *args, **kwargs) -> ChatRunResult:
-        return self._chat.resolve_approval(*args, **kwargs)
+        try:
+            return self._chat.resolve_approval(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def stop(self, *args, **kwargs) -> None:
-        self._chat.stop(*args, **kwargs)
+        try:
+            self._chat.stop(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def get_task_updates(self, *args, **kwargs) -> TaskUpdateResult:
         return self._runtime.get_task_updates(*args, **kwargs)
@@ -70,15 +82,19 @@ BackendFactory = Callable[[], ChatBackend]
 
 
 def persisted_backend_factory(account: str) -> BackendFactory:
-    """Resolve the portal's verified connection when an interaction starts."""
+    """Resolve the portal's verified connection and keep one backend per target.
 
-    def build() -> ChatBackend:
+    The settlement poll calls the factory every iteration; a fresh backend each
+    time spawned the kubeconfig probe before every read.
+    """
+
+    def resolve_target() -> DeploymentTarget:
         connection = load_connection(account)
         if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."
             )
-        return RuntimeChatBackend(connection.target)
+        return connection.target
 
-    return build
+    return agent_runtime.held_per_target(resolve_target, RuntimeChatBackend)

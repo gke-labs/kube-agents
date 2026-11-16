@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plant and remove the findings-queue rows of bench/tasks/findings-decision-covers-item.
+"""Plant and remove the findings-queue rows of bench/tasks/findings-decision-covers-item
+and bench/tasks/findings-decision-leaves-unnamed-open (the stack's findings_file).
 
 main.tf runs this in the agent container as `python3 - <mode> <base url> <rows, base64>`:
 the Session KV server answers there on loopback, and the container's environment
@@ -21,10 +22,16 @@ server has (POST /v1/findings, PATCH /v1/findings/{id}, POST /v1/findings/{id}/v
 and GET /v1/findings), so it plants the same rows on a build without the item-wide
 decision as on one with it.
 
-plant: registers the rows (findings.json), then sets each to `surfaced`. The route
-sets `surfaced` from any state and it is not a decision, so this also returns a row
-an earlier run left dismissed, accepted or snoozed to undecided without touching its
-siblings. Exits 1 unless the read-back finds every row surfaced.
+plant: registers the rows (the stack's findings file), then sets each to `surfaced`.
+The route sets `surfaced` from any state and it is not a decision, so this also
+returns a row an earlier run left dismissed, accepted or snoozed to undecided
+without touching its siblings. A row with `"plant_state": "queued"` (a key only
+this script reads; it is stripped before the rows are registered) is left as
+registration writes it, `queued`: no message has named it. Registration leaves an
+existing open row's state alone and a dismissed one dismissed, so a row an earlier
+run left in another state is first set to `surfaced` and recorded resolved, and
+registered again, which reopens it as `queued`. Exits 1 unless the read-back finds
+every row in its planted state.
 
 teardown: records every open row of the rows' projects as resolved, which takes it
 off the open list. A dismissed row stays dismissed, which is closed too. The projects
@@ -46,6 +53,11 @@ ROW_LIMIT = 1000
 # findings_queue.py's STATES that are still on the open list.
 OPEN_STATES = ("queued", "surfaced", "accepted", "snoozed")
 PLANTED_STATE = "surfaced"
+# The plant-only key that leaves a row as registration writes it.
+PLANT_STATE_KEY = "plant_state"
+QUEUED_STATE = "queued"
+REOPEN_OUTCOME = "resolved"
+REOPEN_NOTE = "bench plant: reopen a row an earlier run left decided"
 TEARDOWN_OUTCOME = "resolved"
 TEARDOWN_NOTE = "bench teardown: a row bench/tf/prebuilt/findings-item planted"
 
@@ -68,19 +80,37 @@ def rows_in(base, project):
     return call(base, "GET", "/v1/findings?" + query)["findings"]
 
 
-def plant(base, rows):
-    registered = call(base, "POST", "/v1/findings", {"findings": rows})["results"]
-    ids = [result["id"] for result in registered]
-    for finding_id in ids:
-        call(base, "PATCH", "/v1/findings/" + urllib.parse.quote(finding_id, safe=""), {"state": PLANTED_STATE})
+def states_of(base, rows):
     states = {}
     for project in sorted({row["project"] for row in rows}):
         states.update({row["id"]: row["state"] for row in rows_in(base, project)})
-    wrong = {finding_id: states.get(finding_id) for finding_id in ids if states.get(finding_id) != PLANTED_STATE}
+    return states
+
+
+def plant(base, rows):
+    wanted = [row.get(PLANT_STATE_KEY) or PLANTED_STATE for row in rows]
+    bare = [{key: value for key, value in row.items() if key != PLANT_STATE_KEY} for row in rows]
+    registered = call(base, "POST", "/v1/findings", {"findings": bare})["results"]
+    ids = [result["id"] for result in registered]
+    plan = dict(zip(ids, wanted))
+    queued = [finding_id for finding_id, state in plan.items() if state == QUEUED_STATE]
+    states = states_of(base, rows)
+    stale = [finding_id for finding_id in queued if states.get(finding_id) != QUEUED_STATE]
+    for finding_id in stale:
+        path = "/v1/findings/" + urllib.parse.quote(finding_id, safe="")
+        call(base, "PATCH", path, {"state": PLANTED_STATE})
+        call(base, "POST", path + "/verified", {"outcome": REOPEN_OUTCOME, "observed": REOPEN_NOTE})
+    if stale:
+        call(base, "POST", "/v1/findings", {"findings": [row for row, finding_id in zip(bare, ids) if finding_id in stale]})
+    for finding_id, state in plan.items():
+        if state == PLANTED_STATE:
+            call(base, "PATCH", "/v1/findings/" + urllib.parse.quote(finding_id, safe=""), {"state": PLANTED_STATE})
+    states = states_of(base, rows)
+    wrong = {finding_id: states.get(finding_id) for finding_id, state in plan.items() if states.get(finding_id) != state}
     if wrong:
-        sys.exit("planted rows are not %s after the plant: %s" % (PLANTED_STATE, json.dumps(wrong, sort_keys=True)))
-    for finding_id in ids:
-        print("planted %s (%s)" % (finding_id, PLANTED_STATE))
+        sys.exit("planted rows are not in their planted state after the plant: %s" % json.dumps(wrong, sort_keys=True))
+    for finding_id, state in plan.items():
+        print("planted %s (%s)" % (finding_id, state))
 
 
 def teardown(base, rows):

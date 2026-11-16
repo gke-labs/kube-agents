@@ -215,7 +215,7 @@ resource "null_resource" "stall" {
       # the record takes the event path, which is the red this case exists to
       # show, and a stack that refused to run there could not show it.
       kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}" || true)"
-      if ! printf '%s\n' "$kinds" | grep -qxF 'controller-stall'; then
+      if ! grep -qxF 'controller-stall' <<<"$kinds"; then
         echo "WARNING: the Session KV daemon does not advertise the 'controller-stall' inject kind (it advertises: $kinds); the record will take the event path." >&2
       fi
 

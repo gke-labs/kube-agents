@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -48,9 +50,9 @@ import (
 // PlatformAgent reconciler's (agentprofile_platformagent.go), because it lives
 // in the one identity map that reconciler already owns.
 //
-// Everything is dark unless the PlatformAgent in the profile's namespace runs
-// `spec.mode: next`. On today, the reconciler removes what it rendered and
-// renders nothing.
+// Everything is dark unless a PlatformAgent is bound in the profile's
+// namespace: without one the reconciler removes what it rendered and renders
+// nothing.
 //
 // Deletion is finalizer-ordered: the tombstone is published before the
 // finalizer comes off, so a profile never disappears from the cluster while its
@@ -69,6 +71,23 @@ const (
 	// agentProfileNameLabel names the profile on what it renders.
 	agentProfileNameLabel = "kubeagents.x-k8s.io/agentprofile"
 
+	// agentProfileTierLabel is the tier an operator-created ServiceAccount in
+	// the profile namespace is for.
+	agentProfileTierLabel = "kubeagents.x-k8s.io/agentprofile-tier"
+
+	// agentProfileTierModeLabel is the mode of the tier an operator-created
+	// ServiceAccount is for, as the operator rendered it. A tier whose Tier
+	// was deleted drains at this mode (agentprofile_tier_drain.go): the
+	// ServiceAccount is the profile's own (agentProfileOwnsServiceAccount),
+	// so the mode isn't read back from anything a user writes.
+	agentProfileTierModeLabel = "kubeagents.x-k8s.io/agentprofile-tier-mode"
+
+	// agentProfileUIDAnnotation marks an operator-created ServiceAccount in
+	// the profile namespace with its profile's UID, the ownership test that
+	// stands in for an owner reference across namespaces
+	// (agentProfileOwnsServiceAccount).
+	agentProfileUIDAnnotation = "kubeagents.x-k8s.io/agentprofile-uid"
+
 	// agentProfileResync re-reads the directory for live profiles.
 	agentProfileResync = 5 * time.Minute
 
@@ -79,30 +98,48 @@ const (
 // Condition reasons.
 const (
 	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNotNext         = "ModeNotNext"
 	reasonAgentProfileNoAgent         = "NoPlatformAgent"
 	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
 	reasonAgentProfileRefused         = "ServiceAccountRefused"
 	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileModeUnknown     = "ModeNotRecognized"
 	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
 	reasonAgentProfilePublished       = "Published"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
+	reasonAgentProfileNamespaceAbsent = "ProfileNamespaceAbsent"
+	// reasonAgentProfileDispatcherCeiling: the profile is newer than the ones
+	// the dispatcher's identity can carry (refuseOverDispatcherCeiling).
+	reasonAgentProfileDispatcherCeiling = "DispatcherCeiling"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.
 type AgentProfileReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader reads Namespaces uncached: a cached read would start a
+	// cluster-wide Namespace informer. Nil falls back to the client (tests).
+	APIReader client.Reader
 	// Cards is the directory. Nil means the default NATS publisher.
 	Cards cardPublisher
+	// TiersUnreadable is set when the role can't read Tiers: the tier
+	// catalog is then the built-ins alone (agentprofile_tiers.go).
+	TiersUnreadable bool
 }
 
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/finalizers,verbs=update
+// Every verb has a caller (tests/test_operator_secrets_grant.py names them): the reads are the
+// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch,
+// the one write to the profile itself (an Update would drop spec fields a newer CRD added,
+// which is why there is no `update` here); the status is written with Status().Update. There
+// is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
+// reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
+// owner-references admission never asks for it, and the finalizer itself is a field of the
+// main resource, written by the merge patch above. The one `get` on the
+// bus StatefulSet's ControllerRevisions reads which profiles every server has
+// loaded (a2aClusterLoadedProfiles).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
+// +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -125,26 +162,9 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if agent == nil || !a2aStackRendering(agent) {
-		if agent != nil {
-			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
-			if _, modeErr := resolveMode(agent); modeErr != nil {
-				// Version skew freezes the bus rather than tearing it
-				// down; freeze the profile's objects with it. A deletion
-				// still runs: the frozen bus is running, so the tombstone
-				// can be tried, and holding the finalizer would hang the
-				// delete until the operator is rolled forward.
-				if !profile.DeletionTimestamp.IsZero() {
-					return r.finalize(ctx, &profile, agent)
-				}
-				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileModeUnknown, modeErr.Error(), reasonAgentProfileModeUnknown, modeErr.Error(), false)
-			}
-		}
+	if agent == nil {
 		// No bus to talk to: drop any connection held for this namespace's
-		// agent rather than let it reconnect to a dead Service forever. Not
-		// under version skew above, where the bus is frozen and still
-		// running, and a deletion still needs the connection for its
-		// tombstone.
+		// agent rather than let it reconnect to a dead Service forever.
 		r.forgetBus(profile.Namespace)
 		return ctrl.Result{}, r.renderNothing(ctx, &profile, agent, reason, msg)
 	}
@@ -152,71 +172,145 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !profile.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, &profile, agent)
 	}
-	if controllerutil.AddFinalizer(&profile, agentProfileFinalizer) {
-		if err := r.Update(ctx, &profile); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+	if added, err := r.patchFinalizers(ctx, &profile, func(o client.Object) bool {
+		return controllerutil.AddFinalizer(o, agentProfileFinalizer)
+	}); err != nil || added {
+		return ctrl.Result{Requeue: added}, err
 	}
 
 	var all agentv1alpha1.AgentProfileList
 	if err := r.List(ctx, &all, client.InNamespace(profile.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
-	resolution := resolveAgentProfileIdentities(agent, all.Items)[profile.Name]
+	// The single ServiceAccount #2469 created in the agent's namespace,
+	// before per-tier identities moved to the profile namespace.
+	if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go),
+	// then resolved over the same set the PlatformAgent renders from, so the
+	// two controllers cut at the same profile. This profile, if foreign,
+	// isn't in it and gets its refusal just below.
+	renderable, verdicts, err := renderableAgentProfiles(ctx, r.Client, agent, all.Items, r.TiersUnreadable)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	verdict := verdicts[profile.Name]
+	bound, err := withoutForeignServiceAccounts(ctx, r.Client, renderable)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resolution := resolveAgentProfileIdentities(agent, bound)[profile.Name]
+	if len(verdict.renderable) == 0 {
+		resolution = agentProfileResolution{refused: errors.New(verdict.message()), reason: verdict.reason()}
+	}
+	profilesNS := profileNamespaceOf(&profile)
 	if resolution.refused == nil {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
+		// Checked on the tiers that render: a refused or unknown tier gets
+		// no ServiceAccount, so a hand-made one under its name collides
+		// with nothing until the tier renders, when the next pass checks it.
+		checked := narrowedCopy(&profile, verdict)
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, checked)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if foreign {
-			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s already exists and is not this profile's; the operator does not adopt it", agentProfileServiceAccountPrefix+profile.Name), reason: reasonAgentProfileRefused}
+		if foreign != "" {
+			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s/%s already exists and is not this profile's; the operator does not adopt it", profilesNS, foreign), reason: reasonAgentProfileRefused}
 		}
 	}
 
 	if resolution.refused != nil {
-		if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, nil); err != nil {
 			return ctrl.Result{}, err
 		}
 		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
-		if err := r.writeStatus(ctx, &profile, agent, "", resolution.reason, resolution.refused.Error(), cardReason, cardMsg, false); err != nil {
+		if err := r.writeStatus(ctx, &profile, agent, &verdict, "", resolution.reason, resolution.refused.Error(), cardReason, cardMsg, false); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.busResult(busErr)
 	}
 
-	idReason, idMsg := reasonAgentProfileRendered, "ServiceAccount "+resolution.serviceAccount+" and its bus identity are rendered"
+	// The profile namespace is the chart's (agentprofile_namespace.go). Until
+	// it exists, carrying the chart's markers, there is nowhere to render the
+	// ServiceAccounts, so the profile has no identity and no card.
+	ready, err := profileNamespaceReady(ctx, r.apiReader(), agent)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
+		msg := "the profile namespace " + profilesNS + " does not exist or lacks the chart's markers; the chart creates it on every install"
+		if err := r.writeStatus(ctx, &profile, agent, &verdict, "", reasonAgentProfileNamespaceAbsent, msg, cardReason, cardMsg, false); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.busResult(busErr)
+	}
+
+	idReason, idMsg := reasonAgentProfileRendered, "ServiceAccounts "+resolution.serviceAccountList()+" in "+profilesNS+" and their bus identities are rendered"
 	if profile.Spec.Identity.ServiceAccountName == "" {
-		err := r.ensureServiceAccount(ctx, &profile, resolution.serviceAccount)
-		if errors.Is(err, errForeignServiceAccount) {
-			cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
-			if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
+		keep := map[string]bool{}
+		for _, id := range resolution.identities {
+			keep[id.serviceAccount] = true
+			err := r.ensureServiceAccount(ctx, &profile, profilesNS, id, verdict.modes[id.tier])
+			if errors.Is(err, errForeignServiceAccount) {
+				cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
+				if err := r.writeStatus(ctx, &profile, agent, &verdict, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
+					return ctrl.Result{}, err
+				}
+				return r.busResult(busErr)
+			}
+			if err != nil {
 				return ctrl.Result{}, err
 			}
-			return r.busResult(busErr)
 		}
-		if err != nil {
+		// A tier the profile no longer renders or drains loses its
+		// ServiceAccount: a dropped tier once its drain ends.
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, keep); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
-		if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, nil); err != nil {
 			return ctrl.Result{}, err
 		}
 		var sa corev1.ServiceAccount
-		err := r.Get(ctx, types.NamespacedName{Namespace: profile.Namespace, Name: resolution.serviceAccount}, &sa)
+		named := profile.Spec.Identity.ServiceAccountName
+		err := r.Get(ctx, types.NamespacedName{Namespace: profilesNS, Name: named}, &sa)
 		switch {
 		case apierrors.IsNotFound(err):
-			idReason, idMsg = reasonAgentProfileSANotFound, "spec.identity.serviceAccountName "+resolution.serviceAccount+" does not exist; the bus identity is rendered and no pod can present a token for it until it does"
+			idReason, idMsg = reasonAgentProfileSANotFound, "spec.identity.serviceAccountName "+named+" does not exist in "+profilesNS+"; the bus identity is rendered and no pod can present a token for it until it does"
 		case err != nil:
 			return ctrl.Result{}, err
 		}
 	}
 
-	cardReason, cardMsg, busErr := r.publishCard(ctx, agent, &profile)
+	// A newly bound profile's card waits until every bus server has loaded
+	// its config entry, as the dispatcher's config does
+	// (platformagent_a2a_profile_hold.go): the gateway routes by the card.
+	held, err := r.agentProfileCardHeld(ctx, agent, &profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		msg := "the A2A bus is loading this profile's config on every server; the card is published once it has"
+		if err := r.writeStatus(ctx, &profile, agent, &verdict, resolution.serviceAccountList(), idReason, idMsg, reasonAgentProfileBusConfigPending, msg, idReason == reasonAgentProfileRendered); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: a2aBusReloadRecheck}, nil
+	}
+
+	// The card and the durables follow the narrowed copy, never the raw
+	// spec: a tier that renders nothing must not be advertised or queued.
+	narrowed := &profile
+	for i := range renderable {
+		if renderable[i].Name == profile.Name {
+			narrowed = &renderable[i]
+		}
+	}
+	cardReason, cardMsg, busErr := r.publishCard(ctx, agent, narrowed)
 	if busErr != nil {
 		log.Info("could not reconcile the agent card", "profile", profile.Name, "error", busErr.Error())
 	}
-	if err := r.writeStatus(ctx, &profile, agent, resolution.serviceAccount, idReason, idMsg, cardReason, cardMsg, idReason == reasonAgentProfileRendered); err != nil {
+	if err := r.writeStatus(ctx, &profile, agent, &verdict, resolution.serviceAccountList(), idReason, idMsg, cardReason, cardMsg, idReason == reasonAgentProfileRendered); err != nil {
 		return ctrl.Result{}, err
 	}
 	if busErr != nil {
@@ -251,20 +345,25 @@ func (r *AgentProfileReconciler) boundAgent(ctx context.Context, namespace strin
 	}
 }
 
-// renderNothing is the today path: remove what this reconciler rendered and
-// release the finalizer. There is no bus to tombstone on, and on a flip to
-// today the PlatformAgent reconciler tears down the directory with the bus.
+// renderNothing is the path with no bound PlatformAgent: remove what this
+// reconciler rendered and release the finalizer. There is no bus to tombstone
+// on.
 func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, reason, msg string) error {
 	if err := r.deleteOwnServiceAccount(ctx, p); err != nil {
 		return err
 	}
-	if !p.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(p, agentProfileFinalizer) {
-			return r.Update(ctx, p)
-		}
-		return nil
+	// With or without a bound agent: a profile deleted after its agent still
+	// has ServiceAccounts in the profile namespace, which outlives the agent.
+	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
+		return err
 	}
-	return r.writeStatus(ctx, p, agent, "", reason, msg, reason, msg, false)
+	if !p.DeletionTimestamp.IsZero() {
+		_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+			return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+		})
+		return err
+	}
+	return r.writeStatus(ctx, p, agent, nil, "", reason, msg, reason, msg, false)
 }
 
 // finalize publishes the tombstone, then releases the finalizer. A bus that
@@ -282,13 +381,34 @@ func (r *AgentProfileReconciler) finalize(ctx context.Context, p *agentv1alpha1.
 			return ctrl.Result{RequeueAfter: agentProfileBusRetry}, nil
 		}
 	}
-	controllerutil.RemoveFinalizer(p, agentProfileFinalizer)
-	return ctrl.Result{}, r.Update(ctx, p)
+	// The ServiceAccounts in the profile namespace carry no owner reference,
+	// so the garbage collector won't remove them with the profile.
+	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
+		return ctrl.Result{}, err
+	}
+	_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+		return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+	})
+	return ctrl.Result{}, err
+}
+
+// patchFinalizers applies change to p's finalizers and, when it changed them,
+// writes them alone as a merge patch. An Update would send back the whole
+// object as this operator's Go type knows it, and so drop any spec field a
+// newer CRD added: an older operator adding its finalizer to a profile created
+// in the same upgrade stripped yieldToPinned that way (#5435). The optimistic
+// lock keeps Update's conflict on a stale read.
+func (r *AgentProfileReconciler) patchFinalizers(ctx context.Context, p *agentv1alpha1.AgentProfile, change func(client.Object) bool) (bool, error) {
+	before := p.DeepCopy()
+	if !change(p) {
+		return false, nil
+	}
+	return true, r.Patch(ctx, p, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *AgentProfileReconciler) cards() cardPublisher {
 	if r.Cards == nil {
-		r.Cards = newNATSCardPublisher()
+		r.Cards = newNATSCardPublisher(r.Client)
 	}
 	return r.Cards
 }
@@ -307,11 +427,27 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 	if err != nil {
 		return reasonAgentProfileBusError, err.Error(), err
 	}
-	if entry.current(want) {
-		return reasonAgentProfilePublished, "the agent card is on " + agentCardSubject(p.Name), nil
+	if !entry.current(want) {
+		if err := r.cards().Publish(ctx, agent, p.Name, &want); err != nil {
+			return reasonAgentProfileBusError, err.Error(), err
+		}
 	}
-	if err := r.cards().Publish(ctx, agent, p.Name, &want); err != nil {
-		return reasonAgentProfileBusError, err.Error(), err
+	// The profile's durables, once the dispatcher that reads them exists:
+	// one per (rendered or draining tier, kind), and a dropped tier's
+	// deleted once its drain ends.
+	if a2aDispatcherEnabled() {
+		probe, err := r.durableProbeTiers(ctx, agent, p)
+		if err != nil {
+			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
+		}
+		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p), probe); err != nil {
+			// Drop the connection: callout grants are fixed when it opens,
+			// and one opened before the callout served the map that grants
+			// the operator its durables would be refused forever. The retry
+			// reconnects under the map the callout serves now.
+			r.forgetBus(agent.Namespace)
+			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
+		}
 	}
 	return reasonAgentProfilePublished, "the agent card is on " + agentCardSubject(p.Name), nil
 }
@@ -337,7 +473,60 @@ func (r *AgentProfileReconciler) withdrawCard(ctx context.Context, agent *agentv
 			return reasonAgentProfileBusError, err.Error(), err
 		}
 	}
+	// A profile with no identity has no queue: its durables go with its
+	// card, held submissions and all. Only the ones this operator made.
+	if a2aDispatcherEnabled() {
+		probe, err := r.durableProbeTiers(ctx, agent, p)
+		if err != nil {
+			return reasonAgentProfileBusError, "the card is withdrawn, but the durables are not deleted: " + err.Error(), err
+		}
+		if err := r.cards().SyncDurables(ctx, agent, p.Name, nil, probe); err != nil {
+			r.forgetBus(agent.Namespace) // as in publishCard
+			return reasonAgentProfileBusError, "the card is withdrawn, but the durables are not deleted: " + err.Error(), err
+		}
+	}
 	return reasonAgentProfileIdentityMissing, "no card is published while the profile's identity is not rendered", nil
+}
+
+// durableProbeTiers is every tier p could still have a durable at, so a
+// dropped tier's durables are found by name (profileDurableNamesFor): the
+// built-ins, what p lists, what it was last rendered for (status), the tiers
+// it still has its own ServiceAccounts for, every Tier in the catalog, and
+// every tier the applied dispatch config lists for it, live or draining,
+// ended or not, so a tier whose drain has just ended, Tier deleted and
+// ServiceAccount gone with it, still has its durables found.
+// A tier that is in none of these (its Tier deleted and the profile's status
+// lost) leaves an inert durable behind: nothing routes to a tier no card
+// advertises.
+func (r *AgentProfileReconciler) durableProbeTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile) ([]string, error) {
+	cat, err := loadTierCatalog(ctx, r.Client, agent.Namespace, r.TiersUnreadable)
+	if err != nil {
+		return nil, err
+	}
+	owned, err := ownedTierServiceAccounts(ctx, r.Client, p)
+	if err != nil {
+		return nil, err
+	}
+	tiers := append(append([]string(nil), p.AllowedTierList()...), p.Spec.AllowedTiers...)
+	tiers = append(tiers, p.Status.RenderedTiers...)
+	for tier := range owned {
+		tiers = append(tiers, tier)
+	}
+	for tier := range cat {
+		tiers = append(tiers, tier)
+	}
+	applied, err := appliedDispatchProfiles(ctx, r.Client, agent)
+	if err != nil {
+		return nil, err
+	}
+	if prev, ok := applied[p.Name]; ok {
+		tiers = append(tiers, prev.Tiers...)
+		for _, d := range prev.DrainingTiers {
+			tiers = append(tiers, d.Tier)
+		}
+	}
+	slices.Sort(tiers)
+	return slices.Compact(tiers), nil
 }
 
 // errForeignServiceAccount is ensureServiceAccount's refusal: a ServiceAccount
@@ -354,50 +543,116 @@ var errForeignServiceAccount = errors.New("a ServiceAccount under the operator-c
 // foreignness check and the write. Create refuses that case outright with
 // AlreadyExists, and an existing ServiceAccount is only ever updated when the
 // profile already controls it.
-func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, name string) error {
+func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, id agentProfileTierIdentity, mode string) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: p.Namespace,
+			Name:      id.serviceAccount,
+			Namespace: ns,
 			Labels: map[string]string{
 				labelPartOf:           a2aPartOf,
 				a2aComponentLabel:     agentProfileComponent,
 				agentProfileNameLabel: p.Name,
+				agentProfileTierLabel: id.tier,
 			},
+			Annotations: map[string]string{agentProfileUIDAnnotation: string(p.UID)},
 		},
 		AutomountServiceAccountToken: ptr.To(false),
 	}
-	if err := ctrl.SetControllerReference(p, sa, r.Scheme); err != nil {
-		return err
+	if mode != "" {
+		sa.Labels[agentProfileTierModeLabel] = mode
 	}
 	var existing corev1.ServiceAccount
-	err := r.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: name}, &existing)
+	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: id.serviceAccount}, &existing)
 	if apierrors.IsNotFound(err) {
 		err = r.Create(ctx, sa)
 		if apierrors.IsAlreadyExists(err) {
-			return errForeignServiceAccount
+			// A cached NotFound can trail this reconciler's own create (the
+			// status write requeues at once), so ask the API server whose
+			// it is before calling it foreign.
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: id.serviceAccount}, &existing); err != nil {
+				return err
+			}
+			if !agentProfileOwnsServiceAccount(&existing, p) {
+				return errForeignServiceAccount
+			}
+			return nil
 		}
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	if !metav1.IsControlledBy(&existing, p) {
+	if !agentProfileOwnsServiceAccount(&existing, p) {
 		return errForeignServiceAccount
 	}
-	// Ours: keep it as rendered. Forced, because the profile controls it:
-	// a hand edit (kubectl patch, edit, label --overwrite) hands a field to
-	// another manager, and an unforced apply would then conflict on every
-	// reconcile instead of putting the field back.
-	//
-	// Accepted risk (decided on gke-labs#2469): the apply goes by name after
-	// a cached ownership check, so a ServiceAccount deleted and re-created
-	// under this name inside the informer lag could be adopted. Doing that
-	// swap already takes ServiceAccount create in the namespace. The delete
-	// below is held to the UID it checked, so the destructive direction is
-	// closed.
+	// Ours: keep it as rendered, forced, so a hand edit is put back rather
+	// than conflicting on every reconcile. The same accepted risk as before
+	// (decided on gke-labs#2469): the apply goes by name after a cached
+	// ownership check, so a ServiceAccount deleted and re-created under this
+	// name inside the informer lag could be adopted; doing that already takes
+	// ServiceAccount create in the namespace.
 	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent), client.ForceOwnership)
+}
+
+// deleteProfileServiceAccounts removes this profile's ServiceAccounts in the
+// profile namespace except the ones keep names, and only ones it owns
+// (agentProfileOwnsServiceAccount): a ServiceAccount spec.identity names, or
+// one someone else created, is left alone. Each delete is held to the UID it
+// checked, so one re-created inside the informer lag is not removed.
+func (r *AgentProfileReconciler) deleteProfileServiceAccounts(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, keep map[string]bool) error {
+	var list corev1.ServiceAccountList
+	if err := r.List(ctx, &list, client.InNamespace(ns), client.MatchingLabels{agentProfileNameLabel: p.Name}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		sa := &list.Items[i]
+		if keep[sa.Name] || !agentProfileOwnsServiceAccount(sa, p) {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, sa, client.Preconditions{UID: &sa.UID})); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// profileServiceAccountRequests is what a ServiceAccount event in a profile
+// namespace re-reconciles. One named like a profile's (the per-tier prefix)
+// may be one a profile would land on and doesn't own, whatever its labels say
+// (agentProfileServiceAccountIsForeign checks the name label and the UID
+// annotation), and that refuses the profile and so moves the dispatcher
+// ceiling's cut for every newer one: it re-reconciles every profile in the
+// agent's namespace, as the PlatformAgent's watch re-reconciles its agent.
+// Any other name maps to its labelled profile, if any.
+func profileServiceAccountRequests(ctx context.Context, c client.Reader, obj client.Object) []reconcile.Request {
+	if strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix) {
+		if agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace()); ok {
+			return agentProfileRequestsIn(ctx, c, agentNS)
+		}
+		return nil
+	}
+	return profileServiceAccountRequest(obj)
+}
+
+// profileServiceAccountRequest maps a ServiceAccount in a profile namespace,
+// labelled with a profile's name, to that profile in the agent's namespace.
+// Anything else maps to nothing. A label someone copied only costs a
+// reconcile, which checks ownership by UID.
+func profileServiceAccountRequest(obj client.Object) []reconcile.Request {
+	name := obj.GetLabels()[agentProfileNameLabel]
+	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+	if name == "" || !ok {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: agentNS, Name: name}}}
+}
+
+func (r *AgentProfileReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // forgetBus drops the bus connection held for an agent in namespace, if the
@@ -408,8 +663,9 @@ func (r *AgentProfileReconciler) forgetBus(namespace string) {
 	}
 }
 
-// deleteOwnServiceAccount removes the ServiceAccount the operator created for
-// this profile, and only that: a ServiceAccount not controlled by the profile is
+// deleteOwnServiceAccount removes the ServiceAccount #2469 created for this
+// profile in the agent's namespace, before per-tier identities in the profile
+// namespace replaced it, and only that: a ServiceAccount not controlled by the profile is
 // someone else's, including one spec.identity names.
 func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile) error {
 	var sa corev1.ServiceAccount
@@ -431,9 +687,28 @@ func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p 
 	return client.IgnoreNotFound(r.Delete(ctx, &sa, client.Preconditions{UID: &sa.UID}))
 }
 
-// writeStatus records both conditions.
-func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, sa, idReason, idMsg, cardReason, cardMsg string, identityReady bool) error {
+// writeStatus records the three conditions: IdentityReady, CardPublished and
+// JobResourcesFit.
+func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, verdict *tierVerdict, sa, idReason, idMsg, cardReason, cardMsg string, identityReady bool) error {
 	before := p.Status.DeepCopy()
+	// The tiers: what the last pass that rendered rendered, and why any
+	// listed tier wasn't. A pass whose identities aren't ready (a transient
+	// refusal) leaves renderedTiers as it was, so the incumbent unattended
+	// tier survives it: renderedTiers only picks among listed, known tiers
+	// (decideTiers). A pass that never decided the tiers (an early return)
+	// leaves both as they were.
+	if verdict != nil {
+		if identityReady {
+			p.Status.RenderedTiers = append([]string(nil), verdict.renderable...)
+		}
+		meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+			Type:               agentv1alpha1.AgentProfileConditionTiersRendered,
+			Status:             conditionStatus(len(verdict.unknown) == 0 && len(verdict.conflict) == 0),
+			Reason:             verdict.reason(),
+			Message:            verdict.message(),
+			ObservedGeneration: p.Generation,
+		})
+	}
 	p.Status.ObservedGeneration = p.Generation
 	p.Status.ServiceAccountName = sa
 	p.Status.AgentRef = ""
@@ -454,6 +729,29 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		Message:            cardMsg,
 		ObservedGeneration: p.Generation,
 	})
+	fitReason, fitMsg := reasonAgentProfileJobResourcesFit, "the profile's resource requests meet GKE Autopilot's cpu-to-memory ratio, or it runs no Jobs"
+	// Judged on the tiers that render, with their modes, so a Tier resource
+	// of unattended mode counts as running Jobs.
+	fitOn := p
+	if verdict != nil {
+		fitOn = narrowedCopy(p, *verdict)
+	} else if len(p.Annotations) > 0 {
+		// The modes and draining annotations are narrowedCopy's; one on
+		// the stored object is the user's and says nothing.
+		fitOn = p.DeepCopy()
+		delete(fitOn.Annotations, renderedTierModesAnnotation)
+		delete(fitOn.Annotations, drainingTiersAnnotation)
+	}
+	if problem := autopilotRatioProblem(fitOn); problem != "" {
+		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem
+	}
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+		Type:               agentv1alpha1.AgentProfileConditionJobResourcesFit,
+		Status:             conditionStatus(fitReason == reasonAgentProfileJobResourcesFit),
+		Reason:             fitReason,
+		Message:            fitMsg,
+		ObservedGeneration: p.Generation,
+	})
 	if equalAgentProfileStatus(before, &p.Status) {
 		return nil
 	}
@@ -470,7 +768,8 @@ func conditionStatus(ok bool) metav1.ConditionStatus {
 // equalAgentProfileStatus compares two statuses ignoring condition transition
 // times, which SetStatusCondition preserves when nothing else changed.
 func equalAgentProfileStatus(a, b *agentv1alpha1.AgentProfileStatus) bool {
-	if a.ObservedGeneration != b.ObservedGeneration || a.AgentRef != b.AgentRef || a.ServiceAccountName != b.ServiceAccountName || len(a.Conditions) != len(b.Conditions) {
+	if a.ObservedGeneration != b.ObservedGeneration || a.AgentRef != b.AgentRef || a.ServiceAccountName != b.ServiceAccountName ||
+		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, c := range b.Conditions {
@@ -509,9 +808,21 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	enqueueProfilesIn := func(ctx context.Context, namespace string) []reconcile.Request {
 		return agentProfileRequestsIn(ctx, mgr.GetClient(), namespace)
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	bld := ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentProfile{}).
+		// The legacy agent-namespace ServiceAccount (deleteOwnServiceAccount).
 		Owns(&corev1.ServiceAccount{}).
+		// The per-tier ServiceAccounts carry no owner reference, so they map
+		// back to their profile by namespace; one named like a profile's may be
+		// a foreign one that refuses a profile and moves the dispatcher
+		// ceiling's cut, so it re-reconciles every profile in the namespace
+		// (profileServiceAccountRequests).
+		Watches(
+			&corev1.ServiceAccount{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return profileServiceAccountRequests(ctx, mgr.GetClient(), obj)
+			}),
+		).
 		Watches(
 			&agentv1alpha1.PlatformAgent{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -525,7 +836,23 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return enqueueProfilesIn(ctx, obj.GetNamespace())
 			}),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
-		).
-		Named("agentprofile").
-		Complete(r)
+		)
+	// A Tier created, edited or deleted changes which listed tiers render
+	// (decideTiers), so it re-reconciles the profiles in its namespace, as
+	// the PlatformAgent controller re-renders the map for it. Registered
+	// under the same conditions as that watch: the role can read Tiers and
+	// the CRD is served.
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	if !r.TiersUnreadable && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.Tier{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueProfilesIn(ctx, obj.GetNamespace())
+				}),
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+		}
+	}
+	return bld.Named("agentprofile").Complete(r)
 }

@@ -48,7 +48,20 @@ spec:
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
+            {{- /* `| default dict`: a `helm upgrade --reuse-values` from a release
+                   that predates operator.metrics reaches this line with it nil,
+                   as the agentSandbox guard below explains; such a release keeps
+                   the listener off until the value is set. */}}
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            # Plain HTTP on the pod network: the scrape is GKE Managed
+            # Prometheus from gke-gmp-system, which does not carry a bearer
+            # token the manager's authn/authz filter would accept; the
+            # operator's NetworkPolicy (operator-netpol.yaml) bounds who reads it.
+            - --metrics-bind-address=:{{ include "kube-agents.operatorMetricsPort" . }}
+            - --metrics-secure=false
+            {{- else }}
             - --metrics-bind-address=0
+            {{- end }}
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.operator.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           env:
@@ -75,16 +88,42 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; a
+            # GOMEMLIMIT set through operator.extraEnv wins). Read from the
+            # container itself so it follows operator.resources.limits.memory,
+            # and on Autopilot the limit the cluster admitted rather than the
+            # one written here. With no limit set the Downward API reports the
+            # node's allocatable memory, and the soft limit is a share of that.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+            {{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}
+            # The chart rendered the A2A gateway's pod admission policy
+            # (templates/a2a-gateway-pod-admission-policy.yaml), from the same helper:
+            # a signal for operator features that must run only where that policy is
+            # installed. Absent, as on the kustomize path or Kubernetes 1.29, such a
+            # feature stays off. It says the policy was rendered, not that it still holds.
+            - name: A2A_GATEWAY_POD_POLICY
+              value: "true"
+            {{- end }}
+            {{- if include "kube-agents.a2aDispatcherJobPolicyEnabled" . }}
+            # The chart rendered the A2A dispatcher's Job admission policy, from the
+            # same helper. The operator runs the dispatcher's Job mode only under it.
+            - name: A2A_DISPATCHER_JOB_POLICY
+              value: "true"
+            {{- end }}
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders
-            # beside every agent pod, and the logging sidecar it injects into
-            # that pod. Without these a mirrored install still reaches ghcr.io
-            # and Docker Hub at reconcile time, long after `helm install`
-            # reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
+            # beside every agent pod, the logging sidecar it injects into
+            # that pod, and the NATS bus's four images. Without these a
+            # mirrored install still reaches ghcr.io and Docker Hub at
+            # reconcile time, long after `helm install` reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
             # the operator derives the broker image from the agent image by
             # swapping the trailing name, so it follows the value below. The
-            # sandbox does not: it is a separate repository, so it is named.
+            # sandbox is not derived from the agent image, so it is named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
             {{- /* The operator's own image, the same expression as the
@@ -112,6 +151,49 @@ spec:
               value: "{{ include "kube-agents.imageRepository" (dict "repository" ($sandboxImage.repository | default "ghcr.io/gke-labs/kube-agents/agent-sandbox") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $sandboxImage.tag | default .Chart.AppVersion }}"
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
+            {{- /* The A2A NATS bus's four third-party images, which the
+                   operator renders for every install and which, like
+                   FLUENT_BIT_IMAGE, follow global.thirdPartyImageRegistry.
+                   Rendered through kube-agents.thirdPartyImage rather than
+                   imageRepository because two of the four are pinned by digest
+                   as well as tag: unmirrored, the operator pulls the full pin;
+                   mirrored, it pulls <prefix>/<name>:<tag>, the copy `make
+                   mirror-images` writes. Always set, so the operator never falls
+                   back to its compiled Docker Hub defaults on a mirrored
+                   install, and so A2A_NATS_IMAGE and A2A_NATS_EXPORTER_IMAGE are
+                   set together (the operator omits the exporter sidecar when
+                   only the first is: a2aNATSExporterOmitted, mirrored by
+                   kube-agents.a2aNATSExporterRendered). The one exception is
+                   operator.extraEnv that sets A2A_NATS_IMAGE alone, the mirrored
+                   install from before the exporter existed: the chart's exporter
+                   pin stays out (kube-agents.a2aBusExporterFromChart), so that
+                   install keeps running without the sidecar.
+
+                   `| default dict` because a2aBus is a key this chart gained,
+                   the same guard agentSandbox carries above: a render against an
+                   older release's values (`helm upgrade --reuse-values`) has no
+                   a2aBus, and skipping the four there leaves the operator on its
+                   compiled defaults, the same pins, as that release already
+                   ran. */}}
+            {{- $bus := (.Values.a2aBus | default dict).images | default dict }}
+            {{- with $bus.nats }}
+            - name: A2A_NATS_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- with $bus.natsBox }}
+            - name: A2A_PROVISION_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- with $bus.configReloader }}
+            - name: A2A_NATS_RELOADER_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- if include "kube-agents.a2aBusExporterFromChart" $ }}
+            {{- with $bus.prometheusExporter }}
+            - name: A2A_NATS_EXPORTER_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- end }}
             {{- /* The pull identity for those same pods. Redundant for the CR
                    this release renders, which carries the secrets itself, and
                    load-bearing for any OTHER PlatformAgent written against this
@@ -120,6 +202,11 @@ spec:
             {{- with (include "kube-agents.imagePullSecretNames" .) }}
             - name: IMAGE_PULL_SECRETS
               value: {{ . | quote }}
+            {{- end }}
+            {{- /* Operator flags turned on by first-class values (operator.mcpServer.enabled
+                   sets A2A_MCP_DOOR). */}}
+            {{- with (include "kube-agents.operatorFlagEnv" .) }}
+            {{- . | nindent 12 }}
             {{- end }}
             {{- /* Last occurrence of a name wins in a container's env, so an
                    operator.extraEnv entry still overrides anything above. */}}
@@ -130,6 +217,11 @@ spec:
             - containerPort: 8081
               name: health
               protocol: TCP
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            - containerPort: {{ include "kube-agents.operatorMetricsPort" . }}
+              name: metrics
+              protocol: TCP
+            {{- end }}
             {{- if .Values.operator.webhooks.enabled }}
             # 10250, not controller-runtime's default 9443: it is the only non-443 port
             # GKE's automatic control-plane-to-node firewall rule permits, so a private
@@ -158,6 +250,12 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- /* Fails the render on a memory limit under
+                 kube-agents.operatorMemoryFloorBytes: a `helm upgrade
+                 --reuse-values` from a release up to 0.16.0 otherwise keeps
+                 that release's 128Mi, and the manager is OOM-killed as its
+                 cache fills. */}}
+          {{- include "kube-agents.operatorResourcesCheck" . }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:

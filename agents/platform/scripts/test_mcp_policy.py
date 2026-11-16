@@ -171,5 +171,49 @@ class FilterToolsListTest(unittest.TestCase):
                 self.assertIsNone(mcp_policy.filter_tools_list("gke", body))
 
 
+
+
+class ProfileNarrowingTest(unittest.TestCase):
+    """mcp_policy.evaluate_for_profile and the profile tool-list filter (#3658)."""
+
+    def _call(self, name):
+        return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+
+    def test_the_profile_set_is_two_document_reads(self):
+        self.assertEqual(
+            {"developer_knowledge": frozenset({"get_documents", "search_documents"})},
+            mcp_policy.PROFILE_SERVER_TOOLS,
+        )
+
+    def test_each_profile_tool_is_one_the_table_allows(self):
+        for name, tools in mcp_policy.PROFILE_SERVER_TOOLS.items():
+            self.assertLessEqual(tools, mcp_policy.server(name).tools)
+
+    def test_decisions(self):
+        cases = [
+            ("developer_knowledge", self._call("search_documents"), True, "tools/call"),
+            ("developer_knowledge", self._call("get_documents"), True, "tools/call"),
+            ("developer_knowledge", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, True, "tools/list"),
+            ("developer_knowledge", self._call("answer_query"), False, mcp_policy.RULE_PROFILE_TOOL),
+            ("gke", self._call("get_cluster"), False, mcp_policy.RULE_PROFILE_SERVER),
+            ("gke", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, False, mcp_policy.RULE_PROFILE_SERVER),
+            # The table's own refusals come first and read the same as anyone's.
+            ("developer_knowledge", self._call("delete_everything"), False, mcp_policy.RULE_READ_ONLY),
+            ("nope", self._call("x"), False, mcp_policy.RULE_SERVER),
+            ("developer_knowledge", None, False, mcp_policy.RULE_UNREADABLE),
+        ]
+        for server, message, allowed, rule in cases:
+            with self.subTest(server=server, message=message):
+                decision = mcp_policy.evaluate_for_profile(server, message)
+                self.assertEqual((allowed, rule), (decision.allowed, decision.rule_id))
+
+    def test_the_tool_list_filter_narrows_to_the_profile_set(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+            {"name": "answer_query"}, {"name": "get_documents"}, {"name": "search_documents"}]}}).encode()
+        out = mcp_policy.filter_tools_list("developer_knowledge", body, mcp_policy.PROFILE_SERVER_TOOLS["developer_knowledge"])
+        self.assertEqual(sorted(t["name"] for t in json.loads(out)["result"]["tools"]), ["get_documents", "search_documents"])
+        out = mcp_policy.filter_tools_list("developer_knowledge", body)
+        self.assertEqual(len(json.loads(out)["result"]["tools"]), 3)
+
 if __name__ == "__main__":
     unittest.main()

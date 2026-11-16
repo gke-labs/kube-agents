@@ -1,0 +1,189 @@
+# A target patch the channel has withdrawn, or a running patch the channel has moved past (catalogue entry 25).
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (the channel default the report targets is valid by construction, and which
+# patches a channel lists is the provider's), so this case does not grade a
+# withdrawn target: it grades the rule's own entry for every seeded cluster,
+# copied into a declared line; the rule's unit tests
+# (scripts/test_readiness_rules.py) carry the positive detection on recorded
+# inputs. The fleet does carry the rule's other finding: the version-laggard
+# (slot b) is pinned at a control-plane patch the REGULAR channel has moved
+# past, so the rule files its risk for that cluster, naming the next active
+# version, and the note for the three others.
+#
+# Why the slot is the rule's text and not its values. The first form of this
+# case asked for the values (`channel <channel>; target <version>
+# <valid|withdrawn>; control plane <version> <listed|not listed>`), and on
+# 2026-10-21 `main` 1093b74c5, which has no target-patch-valid rule, passed
+# every objective: the agent composed each line from `gcloud container
+# get-server-config` (`channel REGULAR; target 1.36.4-gke.1391002 valid;
+# control plane 1.35.8-gke.1439001 listed`), so the case proved nothing about
+# the rule. The slot is now the rule's entry copied as printed: for the
+# held-back cluster its risk from the readiness table's risks column (behind
+# `target-patch-valid: `) or `readiness.risks[].text` in the JSON, `control
+# plane <version> is not among the REGULAR channel's validVersions at <zone>
+# (the channel has moved past it, whatever another channel still lists); ...;
+# the next active version is <version>` (CONTROL_PLANE_FINDING_FORMAT and
+# ACTION_NEXT_FORMAT in scripts/readiness_rules/target_patch_valid.py); for a
+# cluster whose control plane is listed its note from the note column or
+# `readiness.notes`, `channel REGULAR; target <version> valid; control plane
+# <version> listed in validVersions at <zone>; the target's move:
+# control-plane move` (NOTE_FORMAT). That wording is the rule's alone: no
+# gcloud output carries it, the skill's text paraphrases it, and a report whose
+# rule is missing prints no such entry, so the slot reads `none` or a composed
+# line and fails. The prompt asks for one declared line per seeded cluster in
+# that form; the deterministic objectives read those lines and nothing else,
+# the prose is the judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-readiness-target-patch-valid
+name: Upgrade readiness re-reads the target patch against the channel's valid versions on every cluster
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and include, per cluster, its release
+  channel, whether the target version is among the channel's valid versions at
+  the cluster's location and whether the running control-plane version is
+  still listed there, as the target-patch-valid rule states them: the rule's
+  entry for the cluster in the readiness table's risks column (the text behind
+  `target-patch-valid: `, or `readiness.risks[].text` in the report's JSON)
+  when the rule filed a risk for it, else its entry in the note column (or
+  `readiness.notes`). Read only; change and upgrade nothing. A member may be
+  blocked or carry risks from other rules on the same report; the slot is
+  about this rule only. End your answer with one line per seeded cluster in
+  exactly this form, no other words on the line: "<cluster>:
+  target-patch-valid: <the rule's risk for that cluster if it filed one, else
+  its note, copied as printed|none>". Copy the text from the report's risks or
+  note column or the JSON, not a paraphrase and not values you composed from
+  gcloud; a cluster the rule prints nothing for reads none.
+
+expected_output: >-
+  The version table and the readiness table read during this run, with every
+  seeded cluster on the REGULAR channel, its target (the channel default) valid
+  at its location, and its running control-plane version either listed in the
+  channel's validVersions or, for the held-back cluster, not among them: the
+  channel has moved past it, which the rule files as a risk naming the next
+  active version. The answer says what a withdrawn target would mean (a node
+  pool upgrade to it fails on an image the provider no longer serves; target
+  the newest active patch) and that no target is withdrawn. It ends with the
+  declared lines: for a cluster whose control plane is listed, the rule's note
+  copied from the report, "target-patch-valid: channel REGULAR; target
+  <version> valid; control plane <version> listed in validVersions at <zone>;
+  the target's move: control-plane move"; for the held-back cluster, the
+  rule's risk, "target-patch-valid: control plane <version> is not among the
+  REGULAR channel's validVersions at <zone> (the channel has moved past it,
+  whatever another channel still lists); no active patch of <minor> at or
+  above it on the REGULAR channel; the next active version is <version>". It
+  cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have. The version-laggard's pin (bench/tf/fleet) is what puts
+# slot b's control plane below the REGULAR channel's oldest valid version.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy: the rule id and a cell.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: target-patch-valid: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: target-patch-valid: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: target-patch-valid: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: target-patch-valid: [^\n]+$)'
+  # The held-back cluster's line is the rule's risk in the rule's words: its
+  # control plane is not among the REGULAR channel's validVersions at its zone,
+  # the channel has moved past it, and the action names an active version (the
+  # next one on the channel today; the newest patch of the minor, or none, are
+  # the rule's other two action forms). No gcloud output prints that sentence,
+  # and the note form (`control plane <version> not listed in validVersions`)
+  # is not the risk, so a line that carries the note for this cluster, a
+  # composed line or `none` fails. The table's `target-patch-valid: ` prefix is
+  # optional (report.json carries the bare text); one opener before the text
+  # is admitted, since the cell's `;` keeps the value-wrap fold from removing
+  # it; the whole line is lower-cased.
+  - name: the-held-back-clusters-line-quotes-the-rules-risk
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?control plane \d[^ ;\n]* is not among the regular channel''s validversions at [a-z0-9-]+ \(the channel has moved past it, whatever another channel still lists\); (?:no active patch of \d+\.\d+ at or above it on the regular channel; the next active version is \d[^ ;\n]*|target the newest active patch of the minor on the regular channel: \d[^ ;\n]*|no active version at or above it on the regular channel)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: target-patch-valid: (?!["''“‘<]?(?:target-patch-valid: )?control plane \d[^ ;\n]* is not among the regular channel''s validversions at [a-z0-9-]+ \(the channel has moved past it, whatever another channel still lists\); (?:no active patch of \d+\.\d+ at or above it on the regular channel; the next active version is \d[^ ;\n]*|target the newest active patch of the minor on the regular channel: \d[^ ;\n]*|no active version at or above it on the regular channel)$)[^\n]*$'
+  # The three other clusters' lines are the rule's note in the rule's words:
+  # on REGULAR, the target valid, the control plane listed in validVersions at
+  # the zone, and the move the target asks for. `listed in validVersions at
+  # <zone>; the target's move: ...` is what the composed line `main` produced
+  # on 2026-10-21 (`channel REGULAR; target <version> valid; control plane
+  # <version> listed`) lacks, so that line fails the first forbidden pattern,
+  # which every seeded cluster's cell must pass as either this note or the
+  # risk above. A withdrawn target or another channel is a wrong read, not a
+  # finding, and fails here too.
+  - name: the-other-clusters-lines-quote-the-rules-note
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?channel regular; target \d[^ ;\n]* valid; control plane \d[^ ;\n]* listed in validversions at [a-z0-9-]+; the target''s move: (?:control-plane move|pool move|none)$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?channel regular; target \d[^ ;\n]* valid; control plane \d[^ ;\n]* listed in validversions at [a-z0-9-]+; the target''s move: (?:control-plane move|pool move|none)$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?channel regular; target \d[^ ;\n]* valid; control plane \d[^ ;\n]* listed in validversions at [a-z0-9-]+; the target''s move: (?:control-plane move|pool move|none)$)'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: target-patch-valid: (?!["''“‘<]?(?:target-patch-valid: )?channel regular; target \d[^ ;\n]* valid; control plane \d[^ ;\n]* listed in validversions at [a-z0-9-]+; the target''s move: (?:control-plane move|pool move|none)$)(?!["''“‘<]?(?:target-patch-valid: )?control plane \d[^ ;\n]* is not among the regular channel''s validversions at [a-z0-9-]+ \(the channel has moved past it, whatever another channel still lists\); (?:no active patch of \d+\.\d+ at or above it on the regular channel; the next active version is \d[^ ;\n]*|target the newest active patch of the minor on the regular channel: \d[^ ;\n]*|no active version at or above it on the regular channel)$)[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?channel [^;\n]+; target [^;\n]+ withdrawn;[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: target-patch-valid: ["''“‘<]?(?:target-patch-valid: )?channel (?!regular;)[^;\n]+; target [^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

@@ -34,9 +34,10 @@ var errSessionWatchClosed = errors.New("session-state watch closed before its in
 // The busy notice, singular and plural: a state of the turn's status line,
 // rendered the way statusLine renders the relay's states (icon, bold label,
 // a dash, the detail). It replaces the "⏳ submitted…" placeholder rather than
-// following it as a post of its own, so the relay's next edit (working, or
-// the terminal) replaces it in turn and it is never left under a "completed"
-// header, where it read as the output of some earlier command. On a backend
+// following it as a post of its own, so the relay's next edit (working, the
+// terminal, or on Google Chat the acknowledgement) replaces it in turn and it is never
+// left under a "completed" header, where it read as the output of some
+// earlier command. On a backend
 // that keeps no line (StatusShower: Slack with Agent Sessions) there is none
 // to replace, and showBusy posts it as a message of its own. Plain words,
 // no task id: it is for the person who just asked, and what they need is
@@ -82,7 +83,7 @@ func busyNotice(ahead int) string {
 // render this replaces.
 func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID {
+	if active == nil || active.TaskID != taskID || active.LineClosed {
 		return
 	}
 	line := withLineNote(busyNotice(ahead), active.LineNote)
@@ -98,7 +99,11 @@ func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 			"conversation", rec.Key, "taskId", taskID)
 		return
 	}
-	if g.editLine(rec.Key, active.StatusMsgID, line) {
+	stop := taskID
+	if active.Detached {
+		stop = ""
+	}
+	if g.editLine(rec.Key, active.StatusMsgID, line, stop) {
 		rs.lastLine = line
 		rs.busyShown = true
 		g.log.Info("busy notice shown on the status line",

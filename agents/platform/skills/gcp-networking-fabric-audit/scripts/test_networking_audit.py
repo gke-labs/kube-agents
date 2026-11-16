@@ -131,9 +131,19 @@ def project_answers(**overrides):
     return answers
 
 
+class Warned:
+    """A `project_answers` answer for a read that exits 0 and writes `stderr`,
+    as a gcloud list does when some regions or zones did not respond."""
+
+    def __init__(self, answer, stderr):
+        self.answer = answer
+        self.stderr = stderr
+
+
 def fake_run_cmd(per_project, calls=None):
     """A `run_cmd` answering each project's reads from `project_answers`. An
-    answer that is a `(rc, stderr)` tuple is a failed read."""
+    answer that is a `(rc, stderr)` tuple is a failed read; a `Warned` answer
+    is a read that passed and wrote its `stderr` too."""
 
     def run(cmd, *args, **kwargs):
         if calls is not None:
@@ -142,6 +152,8 @@ def fake_run_cmd(per_project, calls=None):
         answers = per_project.get(networking_audit.project_flag_value(cmd) or "", {})
         for phrase, answer in answers.items():
             if phrase in joined:
+                if isinstance(answer, Warned):
+                    return (0, json.dumps(answer.answer), answer.stderr)
                 if isinstance(answer, tuple):
                     return (answer[0], "", answer[1])
                 return (0, json.dumps(answer), "")
@@ -789,10 +801,10 @@ def project_entry(project):
         "location": "global",
         "project": project,
         "checks_run": [
-            {"check": "cloud-nat-exhaustion", "command": f"gcloud compute routers list --project={project} --format=json"},
+            {"check": "cloud-nat-exhaustion", "command": f"gcloud compute routers list --project={project} '{na.ROUTERS_FORMAT}'"},
             {"check": "psc-routing-deadlock", "command": f"gcloud compute forwarding-rules list --project {project} --format=json"},
-            {"check": "mtu-packet-fragmentation", "command": f"gcloud compute networks list --project={project} --format=json"},
-            {"check": "cloud-armor-false-positive", "command": f"gcloud compute security-policies list --project={project} --format=json"},
+            {"check": "mtu-packet-fragmentation", "command": f"gcloud compute networks list --project={project} '{na.NETWORKS_FORMAT}'"},
+            {"check": "cloud-armor-false-positive", "command": f"gcloud compute security-policies list --project={project} '{na.SECURITY_POLICIES_FORMAT}'"},
         ],
         "checks_not_applicable": [{
             "check": "subnet-ip-exhaustion",
@@ -2249,6 +2261,25 @@ class FirewallReadNarrowingTest(unittest.TestCase):
         argv = networking_audit.project_commands("p1")["instances"]
         self.assertEqual(argv[-1], "--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)")
 
+    def test_the_project_list_reads_are_projected_to_the_fields_their_checks_read(self):
+        """Four of the project reads are projected so a large project's list
+        stays under the credential proxy's output cap; forwarding and firewall
+        rules stay whole because the open-ingress check walks most of their
+        fields. A read put back on `--format=json` ships unobserved otherwise:
+        the suite's fakes answer by substring whatever the format argument."""
+        commands = networking_audit.project_commands("p1")
+        self.assertEqual(
+            {
+                "routers": "--format=json(name,region,nats)",
+                "networks": "--format=json(name,selfLink,mtu,peerings)",
+                "security_policies": "--format=json(name,rules)",
+                "backend_services": "--format=json(name,securityPolicy)",
+                "forwarding_rules": "--format=json",
+                "firewall_rules": "--format=json",
+            },
+            {role: argv[-1] for role, argv in commands.items() if role != "instances"},
+        )
+
 
 class SlugReadsTest(unittest.TestCase):
     def test_the_digest_is_the_concatenations_and_no_body_is_kept(self):
@@ -2392,6 +2423,85 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                          PROJECT_SLUGS)
 
 
+
+class IncompleteListingTest(unittest.TestCase):
+    """A gcloud list that exits 0 but warns that it may be incomplete is a
+    partial read for the subnet sweep.
+
+    gcloud exits 0 when some regions or zones do not respond and names them on
+    stderr. A subnet that the listing did not return, or a VM, address or
+    forwarding rule in a measured subnet, can be in the part it did not read.
+    """
+
+    AUDIT = "gcp-networking-fabric-audit"
+    INCOMPLETE = "WARNING: The following regions did not respond: us-east1. List results may be incomplete."
+    USAGE_READS = ("instances list", "addresses list", "forwarding-rules list")
+
+    def setUp(self):
+        sys.path.insert(0, FLEET_AUDIT_SCRIPTS)
+        self.addCleanup(sys.path.remove, FLEET_AUDIT_SCRIPTS)
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+
+    def fleet(self, per_project):
+        with patch.object(networking_audit, "get_target_projects", return_value=list(per_project)), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        return manifest, {e["name"]: e for e in manifest["clusters"]}
+
+    def gaps(self, manifest):
+        import audit_report
+
+        doc = audit_report.draft_findings(manifest, self.AUDIT)
+        audit_report.validate_findings(doc, self.AUDIT)
+        audit_report.cross_check_manifest(doc, manifest)
+        return audit_report.coverage_gaps(doc)
+
+    def test_a_partial_subnet_list_names_the_warning_on_the_subnets_it_listed(self):
+        answers = project_answers(**{"subnets list": Warned([subnet("small", "10.0.0.0/24")], self.INCOMPLETE)})
+        manifest, by_name = self.fleet({"p1": answers})
+        limitations = by_name["p1/us-central1/small"]["limitations"]
+        self.assertIn("subnets partially read: `gcloud compute networks subnets list --project=p1", limitations)
+        self.assertIn("did not respond: us-east1", limitations)
+        self.assertTrue(any("did not respond: us-east1" in gap for gap in self.gaps(manifest)))
+
+    def test_a_partial_subnet_list_with_no_countable_subnet_is_skipped(self):
+        # Another project has a measured subnet, so the run has subnet
+        # targets and only the skipped row says that p1 was not read in full.
+        manifest, by_name = self.fleet({
+            "p1": project_answers(**{"subnets list": Warned([], self.INCOMPLETE)}),
+            "p2": project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24", project="p2")]}),
+        })
+        row = by_name["p1/UNENUMERATED_SUBNETS"]
+        self.assertEqual(row["outcome"], networking_audit.OUTCOME_GATE_FAILED)
+        self.assertIn("did not respond: us-east1", row["error"])
+        gaps = self.gaps(manifest)
+        self.assertTrue(any("p1/UNENUMERATED_SUBNETS" in gap for gap in gaps), gaps)
+
+    def test_a_partial_usage_read_names_the_warning_on_the_projects_subnets(self):
+        for phrase in self.USAGE_READS:
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24")],
+                                             phrase: Warned([], self.INCOMPLETE)})
+                manifest, by_name = self.fleet({"p1": answers})
+                limitations = by_name["p1/us-central1/small"]["limitations"]
+                self.assertIn("partially read", limitations)
+                self.assertIn("primary-range use can be undercounted", limitations)
+                gaps = self.gaps(manifest)
+                self.assertTrue(any("did not respond: us-east1" in gap for gap in gaps), gaps)
+
+    def test_a_read_with_an_unrelated_warning_is_a_full_read(self):
+        for phrase in ("subnets list", *self.USAGE_READS):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                listing = [subnet("small", "10.0.0.0/24")]
+                answers = project_answers(**{"subnets list": listing})
+                answers[phrase] = Warned(listing if phrase == "subnets list" else [], "WARNING: some unrelated notice")
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertNotIn("limitations", by_name["p1/us-central1/small"])
+                self.assertEqual(self.gaps(manifest), [])
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

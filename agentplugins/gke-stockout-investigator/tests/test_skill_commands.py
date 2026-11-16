@@ -6,7 +6,7 @@ A worker runs as `hermes chat -q`, where the command scanner refuses a command
 whose program is a shell variable (`$G add`) and the refusal is final. The
 platform image's skill check does not read this skill, which ships in the
 plugin's own image, and its `git` steps sit in inline code, which that check
-skips.
+skips. tests/test_skill_inline_commands.py also reads this skill's inline code.
 """
 
 import re
@@ -113,6 +113,15 @@ class SkillCommandsTest(unittest.TestCase):
         ):
             with self.subTest(command):
                 self.assertFalse(any(pattern.search(command) for pattern in PATTERNS))
+
+    def test_remediation_pr_terminology_and_audit_gates_preserved(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn(
+            'Use `"capacity constraint"` or `"scale-up failure"` in the Pull Request title, description, YAML comments, and chat notifications — do NOT call the diagnosis a `"stockout"`.',
+            text,
+        )
+        self.assertIn("- **Checks Performed**:", text)
+        self.assertIn("platform-agent/remediate-stockout-<workload_name>", text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,85 @@
+# Phase 3 of docs/designs/agent-harness-bottlenecks.md: every window 30 minutes, with the late
+# onboarding work moved into a window of its own so a 30-minute window still holds the peak.
+#
+# After a reset, the OOBE job (agents/chat/scripts/oobe.py) runs the reconcile and the scan
+# (a card per Cluster Agent), then its first-run audits one after another, each reading every
+# cluster through the broker. The audits peak the credential proxy and the shell from about 40
+# minutes up to two hours after the reset, past a 30-minute window. Here the onboarding window
+# holds the reset, the reconcile and the scan, and a second window marks the first-run audits due
+# at its start, all at once, as OOBE marks them one by one: a worse case than OOBE's order,
+# bounded for the broker by its 8 command slots. A job the build's roster lacks is noted.
+#
+# Set the target as for phase1.yaml. The cluster levels run from the largest down and the base
+# runs last, so the fleet only shrinks. The 22-cluster fleet was deleted before Phase 3 measured it
+# (a plan that lacked a setting, which the runner now refuses at load); the 22-cluster point is
+# Phase 2's 2-hour window.
+phase: phase3
+base_last: true
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+
+factors:
+  # 6 and 4 were meant to stay below the credential proxy's CPU limit (it reaches 1 core at about
+  # 6 clusters in onboarding), so their CPU would show the need; the audit window reached the limit
+  # at every size, so phase3-proxy-raised.yaml measures the need with the limit raised.
+  clusters: [2, 16, 8, 6, 4]
+
+settings:
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  # Every cluster's default pool holds the fixture Pods, so no level needs a fixture pool: 2 nodes
+  # per cluster at every point.
+  default_pool_pods: 150
+  test_cluster_machine_type: n2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  watcher_wait_seconds: 600
+
+operations:
+  onboarding_30m:
+    kind: reset_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+  audits_30m:
+    kind: trigger_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+    # The OOBE first-run audits (FIRST_RUN_AUDITS in agents/chat/scripts/oobe.py), on the
+    # Platform Agent's roster.
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - fleet-wide-cost-analysis
+      - compliance-audit
+      - obtainability-audit
+      - stockout-prevention
+      - upgrade-retrospective
+  fan_out:
+    kind: prompt
+    factors: [clusters]
+    runs: 3
+    timeout_seconds: 2400
+    prompt: Which of my clusters, if any, are stressed right now? Check every cluster.
+    follow_up: Which clusters do you monitor?

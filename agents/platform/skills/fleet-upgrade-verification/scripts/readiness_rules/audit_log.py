@@ -561,13 +561,14 @@ def _read_pages(context: dict, which: str, result: dict) -> None:
         # stderr, like any failed read.
         rc, stdout, stderr = run(cmd, timeout) if timeout else run(cmd)
         result["pages"] += 1
-        if rc != 0:
-            result["error"] = READ_FAILED_REASON.format(read=which, page=result["pages"], rc=rc, stderr=_one_line(stderr))
-            break
-        # The proxy cuts a page past its output cap and prints the marker with rc 0; the
-        # marker, not the parse failure, names the cause, and the pages before it are kept.
+        # The proxy cuts a page past its output cap and prints the marker (the shim exits 74
+        # on it; an older shim returned rc 0); the marker, not the exit code or the parse
+        # failure, names the cause, and the pages before it are kept.
         if PROXY_TRUNCATION_MARKER in str(stderr or ""):
             result["error"] = OUTPUT_CUT_REASON.format(read=which, page=result["pages"])
+            break
+        if rc != 0:
+            result["error"] = READ_FAILED_REASON.format(read=which, page=result["pages"], rc=rc, stderr=_one_line(stderr))
             break
         page = _parse_page(stdout)
         if page is None:

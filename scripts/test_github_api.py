@@ -150,6 +150,25 @@ class GitHubAPITest(unittest.TestCase):
         self.assertIsNone(delete_res)
         self.assertEqual(calls[1].get_method(), "DELETE")
 
+    def test_object_pages_are_read_to_the_total_and_an_empty_page_ends_them(self):
+        api, calls = self._api(
+            [
+                {"total_count": 3, "workflows": [{"id": 1}, {"id": 2}]},
+                {"total_count": 3, "workflows": [{"id": 3}]},
+            ]
+        )
+        with mock.patch.object(github_api, "PER_PAGE", 2):
+            self.assertEqual([1, 2, 3], [entry["id"] for entry in api.workflows()])
+        self.assertEqual(2, len(calls))
+        self.assertIn("per_page=2&page=1", calls[0].full_url)
+
+        api, calls = self._api([{"total_count": 9, "check_runs": [{"id": 1}]}, {"total_count": 9, "check_runs": []}])
+        with mock.patch.object(github_api, "PER_PAGE", 1):
+            found = api.get_object_pages("/repos/gke-labs/kube-agents/commits/abc/check-runs", "check_runs", {"filter": "all"})
+        self.assertEqual([1], [entry["id"] for entry in found])
+        self.assertEqual(2, len(calls))
+        self.assertIn("filter=all&per_page=1&page=1", calls[0].full_url)
+
     def test_graphql_returns_data(self):
         api, calls = self._api([{"data": {"viewer": {"login": "x"}}}])
         self.assertEqual(api.graphql("query { viewer { login } }", {"a": 1}), {"viewer": {"login": "x"}})
@@ -168,6 +187,38 @@ class GitHubAPITest(unittest.TestCase):
         res = api.get("/test")
         self.assertEqual(res, {"status": "ok"})
         self.assertEqual(len(calls), 2)
+
+
+class HasMarkerCommentTest(unittest.TestCase):
+    """The check both sweeps use for a comment they already posted."""
+
+    MARKER = "<!-- a-sweep -->"
+    _api = GitHubAPITest._api
+
+    def test_only_a_body_that_starts_with_the_marker_counts(self):
+        api, _ = self._api([[{"body": "lgtm"}, {"body": None}, {"body": f"see {self.MARKER}"}]])
+        self.assertFalse(github_api.has_marker_comment(api, 7, self.MARKER))
+        api, _ = self._api([[{"body": "lgtm"}, {"body": f"{self.MARKER}\nposted earlier"}]])
+        self.assertTrue(github_api.has_marker_comment(api, 7, self.MARKER))
+
+    def test_since_reads_only_the_comments_from_then_on(self):
+        api, calls = self._api([[]])
+        github_api.has_marker_comment(api, 7, self.MARKER, since="2026-10-13T11:00:00Z")
+        self.assertTrue(
+            calls[0].full_url.endswith(
+                "/repos/gke-labs/kube-agents/issues/7/comments?since=2026-10-13T11:00:00Z&per_page=100&page=1"
+            ),
+            calls[0].full_url,
+        )
+        api, calls = self._api([[]])
+        github_api.has_marker_comment(api, 7, self.MARKER)
+        self.assertTrue(calls[0].full_url.endswith("/repos/gke-labs/kube-agents/issues/7/comments?per_page=100&page=1"))
+
+    def test_a_failed_read_is_raised_not_taken_for_none(self):
+        refused = urllib.error.HTTPError("https://api.github.com/x", 404, "Not Found", {}, None)  # type: ignore[arg-type]
+        api, _ = self._api([refused])
+        with self.assertRaises(urllib.error.HTTPError):
+            github_api.has_marker_comment(api, 7, self.MARKER)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,11 @@ package hermesbridge
 // Under -Q hermes writes nothing to stdout until the final response, so the
 // bridge cannot learn about tool calls from the pipe it already holds. What
 // hermes does offer is its outbound webhooks (agent/outbound_webhooks.py): a
-// `hooks.outbound` config entry POSTs every pre_tool_call and post_tool_call
-// to a URL, fire-and-forget through a bounded queue, signed with HMAC-SHA256
-// when the variable named by `secret_env` is set. The bridge listens on a
+// `hooks.outbound` config entry POSTs every pre_tool_call, post_tool_call and
+// post_api_request to a URL, fire-and-forget through a bounded queue, signed
+// with HMAC-SHA256 when the variable named by `secret_env` is set. The tool
+// calls become the activity trace and its plan steps; a model request marks
+// where one request ends, and may be the synthesis step (activity_steps.go). The bridge listens on a
 // loopback address (the sidecar shares the pod's network namespace), and
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
@@ -52,7 +54,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 const (
@@ -79,7 +81,7 @@ const (
 	// (the `secret_env` of the hooks.outbound entry); the bridge sets it per
 	// child. In a single-profile CLI process hermes's secret scope falls
 	// through to the process environment, which is what makes this work.
-	ActivitySecretEnv = "A2A_ACTIVITY_SECRET"
+	ActivitySecretEnv = "A2A_ACTIVITY_SECRET" // #nosec G101 -- an env var name, not a credential
 	// ActivityURLEnv tells the child where its deliveries go. hermes reads
 	// the URL from the managed config the bridge writes; the variable is for
 	// the record and for test stubs standing in for hermes.
@@ -190,6 +192,7 @@ const (
 
 	hookPreToolCall     = "pre_tool_call"
 	hookPostToolCall    = "post_tool_call"
+	hookPostAPIRequest  = "post_api_request"
 	hookSignatureHeader = "X-Hermes-Signature-256"
 	hookSignaturePrefix = "sha256="
 	hookStatusOK        = "ok"
@@ -204,17 +207,26 @@ const (
 	redactedValue = "[redacted]"
 )
 
-// What of an input reaches the bus is decided twice, because this stream
-// is retained for days and copied into eval records. redactedKeyPattern
-// and its siblings name input keys whose values never go on the bus, so
-// the trace still says a secret-looking key was there. Then every string
-// value becomes its shape (shapeValue): the graders on the inject lane
-// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
-// and nothing of the arguments, and no grammar tells a resource name from
-// a credential under the same key, so no string value leaves the pod
-// whatever its key, and no value scrub is attempted. A credential a model
-// pastes into a terminal command is one string under "command", and ships
-// as a length.
+// What of an input reaches the bus does not depend on the executor mode,
+// because this stream is retained for days and copied into eval records.
+// First, redactedKeyPattern and its siblings name input keys whose values
+// never go on the bus, so the trace still says a secret-looking key was
+// there. Then every remaining string value becomes its shape (shapeValue):
+// the graders on the inject lane read tool names (an entry's tool, a
+// tool_call wrapper's calls[].name) and nothing of the arguments, so no
+// string value leaves the pod whatever its key. Results are not published
+// either, and neither is a failed call's error text: the entry carries the
+// call's status and hermes's own errorType word. The api executor (a
+// sessionID bound) adds attribution on top of the same entry: the step
+// title the call was planned under, the session, the worker or card it ran
+// for, and, on a kanban_create that made a card, the card's id. A title is
+// the one place a value taken from the arguments is published, and it is a
+// short identifier the renderer needs (a cluster, a file's tail, a search
+// query, a card's title), passed through scrubInlineSecrets as a net. The
+// model's reasoning is read for the step boundary it marks and is not
+// published: a model that has read a secret may restate it, and a scrubber
+// is not a contract.
+//
 // activityEntryBudget bounds the parts one task publishes on its trace and
 // its heartbeat together. Both ride the task's own events subject, which
 // the TASKS stream caps at 4096 messages per subject with discard-old, so a
@@ -350,8 +362,9 @@ func shapeOf(s string) string {
 
 // ActivityEntry is one data part of the activity artifact: one tool
 // invocation. tool and input are the worker adapter's shape; the rest is
-// what hermes's hook adds. Results are deliberately absent - no check reads
-// them and they are the riskiest payload in the pod.
+// what hermes's hook adds. Under the cli executor, results are omitted;
+// under the api executor, one-line scrubbed result/error previews and
+// worker/card attribution are populated for interactive step rendering.
 type ActivityEntry struct {
 	Tool   string          `json:"tool"`
 	Input  json.RawMessage `json:"input,omitempty"`
@@ -361,9 +374,15 @@ type ActivityEntry struct {
 	// status word (blocked, cancelled, timeout, error) or error_type
 	// (tool_error), so a guardrail refusal stays distinguishable from a
 	// tool failure in the trace.
-	ErrorType  string `json:"errorType,omitempty"`
-	DurationMs int64  `json:"durationMs,omitempty"`
-	At         string `json:"at,omitempty"`
+	ErrorType     string `json:"errorType,omitempty"`
+	ErrorMessage  string `json:"errorMessage,omitempty"`
+	ResultPreview string `json:"resultPreview,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	Worker        string `json:"worker,omitempty"`
+	Title         string `json:"title,omitempty"`
+	CardID        string `json:"cardId,omitempty"`
+	DurationMs    int64  `json:"durationMs,omitempty"`
+	At            string `json:"at,omitempty"`
 	// Dropped is set only on the activityTruncatedTool entry: how many
 	// calls are missing from the trace, past the budget, failed to publish,
 	// or left unreported by the drain's deadline.
@@ -381,11 +400,19 @@ type hookDelivery struct {
 	// SessionID is the hermes session the call ran in, top-level in the
 	// payload; the door attributes an API-executor delivery by it.
 	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd"`
+	Profile   string `json:"profile"`
 	Extra     struct {
-		ToolCallID string      `json:"tool_call_id"`
-		DurationMs json.Number `json:"duration_ms"`
-		Status     string      `json:"status"`
-		ErrorType  string      `json:"error_type"`
+		ToolCallID       string          `json:"tool_call_id"`
+		DurationMs       json.Number     `json:"duration_ms"`
+		Status           string          `json:"status"`
+		ErrorType        string          `json:"error_type"`
+		ErrorMessage     string          `json:"error_message"`
+		Result           json.RawMessage `json:"result"`
+		FinishReason     string          `json:"finish_reason"`
+		APICallCount     json.Number     `json:"api_call_count"`
+		AssistantMessage json.RawMessage `json:"assistant_message"`
+		Response         json.RawMessage `json:"response"`
 	} `json:"extra"`
 }
 
@@ -406,6 +433,8 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Timestamp = lenientString(top["timestamp"])
 	d.DeliveryID = lenientString(top["delivery_id"])
 	d.SessionID = lenientString(top["session_id"])
+	d.Cwd = lenientString(top["cwd"])
+	d.Profile = lenientString(top["profile"])
 	var extra map[string]json.RawMessage
 	if raw, ok := top["extra"]; ok {
 		_ = json.Unmarshal(raw, &extra)
@@ -414,6 +443,12 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.ErrorMessage = lenientString(extra["error_message"])
+	d.Extra.Result = extra["result"]
+	d.Extra.FinishReason = lenientString(extra["finish_reason"])
+	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
+	d.Extra.AssistantMessage = extra["assistant_message"]
+	d.Extra.Response = extra["response"]
 	return nil
 }
 
@@ -465,18 +500,25 @@ type activityState struct {
 	// cardsFiled says a kanban_create call of this task's ended without an
 	// error: the turn handed work to cards, so its terminal keeps the ask
 	// marked (cardsMark in bridge.go).
-	cardsFiled atomic.Bool
+	cardsFiled  atomic.Bool
+	waitingCard atomic.Bool
+	waitInTurn  atomic.Bool
 
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
 	// to check a session's delivery against.
 	traced bool
 
-	mu         sync.Mutex
-	open       map[string]ActivityEntry // calls started and not yet ended
-	openOrder  []string                 // their ids, in start order
-	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
-	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
+	mu        sync.Mutex
+	open      map[string]ActivityEntry // calls started and not yet ended
+	openOrder []string                 // their ids, in start order
+	// openRaw is the raw tool input of each open call, kept in memory for
+	// the api executor's attribution when the call's end carries none (the
+	// nested tool name in hermes's wrapper, the worker-to-card mapping);
+	// it is never published.
+	openRaw    map[string]json.RawMessage
+	seen       map[string]struct{} // delivery ids, so a hermes retry is one call
+	seenRing   []string            // the ids in arrival order, the oldest forgotten past activitySeenCap
 	seenNext   int
 	calls      int
 	published  int // trace parts sent, against the budget less the reserve
@@ -485,6 +527,28 @@ type activityState struct {
 	lastTool   string
 	startedAt  time.Time
 	appended   map[string]bool // artifact name -> a first part went out
+	trace      sessionTrace
+
+	// openStep is the plan step the current run of one tool's calls is
+	// building, published when it closes (activity_steps.go); turnSession
+	// is the turn's own hermes session, which a synthesis step must come
+	// from; steps counts the steps published, against activityStepBudget.
+	openStep    *stepmsg.Step
+	turnSession string
+	steps       int
+	// turnCalls is calls for the current turn only, which the synthesis
+	// rule reads: the API route keeps one activityState across a task's
+	// turns, and a follow-up that answers outright did no work however
+	// many calls an earlier turn made (beginTurn). calls stays task-wide.
+	turnCalls int
+	// stepRefused says a step record was refused at encoding and the log
+	// has said so; one line per task (publishSteps).
+	stepRefused atomic.Bool
+
+	// secrets is the secret values this task's tool results carried
+	// (answer_scrub.go), redacted out of its answer and cleared when it
+	// finalizes.
+	secrets seenSecrets
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -497,12 +561,14 @@ type activityState struct {
 func newActivityState(withKey bool) *activityState {
 	a := &activityState{
 		open:      make(map[string]ActivityEntry),
+		openRaw:   make(map[string]json.RawMessage),
 		seen:      make(map[string]struct{}),
 		startedAt: time.Now(),
 		appended:  make(map[string]bool),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	a.waitInTurn.Store(true)
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
 		// crypto/rand.Read does not fail (it crashes the program if the
@@ -548,6 +614,7 @@ func (b *Bridge) apiTraced() bool {
 func newSessionActivityState(sessionID string, traced bool) *activityState {
 	a := newActivityState(false)
 	a.sessionID = sessionID
+	a.turnSession = sessionID
 	a.traced = traced
 	return a
 }
@@ -591,19 +658,26 @@ func hookSigned(key, sig string, body []byte) bool {
 // observe records one delivery. A start opens a call; an end closes it and
 // yields the entry to publish. Ends are the entries (one per invocation, the
 // spec's rule); starts exist so an interrupted call can still be reported.
-func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
+// The steps are the step records the delivery closed or planned
+// (activity_steps.go, activity_thinking.go).
+func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
 	id := d.Extra.ToolCallID
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
 		// end well enough for the interrupted flush, which is all the id
-		// is for.
-		id = "tool:" + d.ToolName
+		// is for. Include SessionID on API session tasks so concurrent
+		// specialist workers do not collide on a.open["tool:<name>"].
+		if a.sessionID != "" && d.SessionID != "" {
+			id = "tool:" + d.SessionID + ":" + d.ToolName
+		} else {
+			id = "tool:" + d.ToolName
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
-			return ActivityEntry{}, false
+			return ActivityEntry{}, false, nil
 		}
 		// The most recent activitySeenCap ids: a retry follows its first
 		// delivery closely, so the oldest id is the one safe to forget.
@@ -616,28 +690,38 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
+	steps := a.observeExecutorStepsLocked(d)
 	switch d.Event {
 	case hookPreToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
-		a.open[id] = ActivityEntry{
+		// The input goes on the bus as its shape under both executors
+		// (the note above redactInput); the api executor keeps the raw
+		// arguments of an open call in memory for its attribution only.
+		entry := ActivityEntry{
 			Tool:   capRunes(d.ToolName, activityToolNameCap),
 			Input:  redactInput(d.ToolName, d.ToolInput),
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
-		return ActivityEntry{}, false
-	case hookPostToolCall:
-		if _, seen := a.open[id]; seen {
-			delete(a.open, id)
-			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
+		a.enrichPreToolCallLocked(d, &entry)
+		a.open[id] = entry
+		if a.sessionID != "" && len(d.ToolInput) > 0 {
+			a.openRaw[id] = d.ToolInput
 		}
+		return ActivityEntry{}, false, steps
+	case hookPostToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
+		openEntry, openRaw := a.popOpenCallLocked(id, d)
 		a.calls++
 		status := activityStatus(d)
-		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
-			a.cardsFiled.Store(true)
+		if a.sessionID == "" || d.SessionID == "" || d.SessionID == a.sessionID {
+			a.turnCalls++
+			if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+				a.cardsFiled.Store(true)
+			}
 		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
@@ -649,10 +733,12 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
+			e.ErrorMessage = debugErrorText(d)
 		}
-		return e, true
+		a.enrichPostToolCallLocked(d, openEntry, openRaw, status, &e)
+		return e, true, steps
 	}
-	return ActivityEntry{}, false
+	return ActivityEntry{}, false, steps
 }
 
 // interrupted returns the calls still open, in start order, as entries, and
@@ -663,10 +749,14 @@ func (a *activityState) interrupted() []ActivityEntry {
 	out := make([]ActivityEntry, 0, len(a.openOrder))
 	for _, id := range a.openOrder {
 		e := a.open[id]
+		if a.sessionID != "" && e.SessionID != "" && e.SessionID != a.sessionID {
+			continue
+		}
 		e.Status = ActivityStatusInterrupted
 		out = append(out, e)
 	}
 	a.open = make(map[string]ActivityEntry)
+	a.openRaw = make(map[string]json.RawMessage)
 	a.openOrder = nil
 	return out
 }
@@ -744,6 +834,43 @@ func (a *activityState) signalStop() {
 	a.stopOnce.Do(func() { close(a.stop) })
 }
 
+// debugErrorTextEnv turns on a failed call's error text in its activity
+// entry, for debugging. Off by default: error text is free text a tool wrote,
+// which can carry a value the tool was handed, and the entries go to TASKS.
+// It is the bridge container's own variable, set by hand while debugging:
+// the operator's rendered bridge drops any inherited copy and sets it false
+// itself, so it is never on in a customer's install by configuration.
+const debugErrorTextEnv = "BRIDGE_DEBUG_ERROR_TEXT"
+
+// debugErrorTextCap bounds the debug error text: its first line, scrubbed.
+const debugErrorTextCap = 320
+
+// debugErrorText is a failed call's error text for its activity entry: ""
+// unless BRIDGE_DEBUG_ERROR_TEXT is true, else the first line of hermes's
+// error_message (or of the result, when hermes gave none), run through
+// scrubInlineSecrets and capped.
+func debugErrorText(d hookDelivery) string {
+	if !debugErrorTextOn() {
+		return ""
+	}
+	text := d.Extra.ErrorMessage
+	if text == "" {
+		var s string
+		if json.Unmarshal(d.Extra.Result, &s) == nil {
+			text = s
+		} else {
+			text = string(d.Extra.Result)
+		}
+	}
+	return oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap)
+}
+
+// debugErrorTextOn reports whether the BRIDGE_DEBUG_ERROR_TEXT switch is on.
+func debugErrorTextOn() bool {
+	on, _ := strconv.ParseBool(os.Getenv(debugErrorTextEnv))
+	return on
+}
+
 // activityErrorType is hermes's own verdict for a failed call: its status
 // word when that is not the generic "error", else its error_type.
 func activityErrorType(d hookDelivery) string {
@@ -818,7 +945,7 @@ func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 		return out
 	}
 	if tool == hermesToolCallWrapper {
-		if capped, ok := capWrapperCalls(red); ok {
+		if capped, ok := capWrapperCalls(red, activityInputCap); ok {
 			return capped
 		}
 	}
@@ -842,7 +969,7 @@ func truncatedStandIn(out []byte, headLen int) map[string]any {
 // small calls still keeps its names. False when the wrapper still does not
 // fit, or when the input is not the wrapper's shape, and the caller falls
 // back to the whole stand-in.
-func capWrapperCalls(red any) (json.RawMessage, bool) {
+func capWrapperCalls(red any, maxBytes int) (json.RawMessage, bool) {
 	m, ok := red.(map[string]any)
 	if !ok {
 		return nil, false
@@ -881,7 +1008,7 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		if err != nil {
 			return nil, false
 		}
-		if len(out) <= activityInputCap {
+		if len(out) <= maxBytes {
 			return out, true
 		}
 	}
@@ -1003,7 +1130,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	var env []byte
 	src := b.cfg.ManagedScopeDir
 	if src != "" {
-		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
+		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile)) // #nosec G304 -- the operator-set managed scope directory, not task data
 		switch {
 		case rerr == nil:
 			// UseNumber: the copy has to carry the operator's pins as written,
@@ -1018,7 +1145,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		case !errors.Is(rerr, os.ErrNotExist):
 			return "", fmt.Errorf("managed config %s: %w", src, rerr)
 		}
-		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile))
+		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile)) // #nosec G304 -- same directory as above
 		switch {
 		case rerr == nil:
 			env = raw
@@ -1057,7 +1184,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
 		"url":        b.ActivityURL(),
-		"events":     []any{hookPreToolCall, hookPostToolCall},
+		"events":     []any{hookPreToolCall, hookPostToolCall, hookPostAPIRequest},
 		"secret_env": ActivitySecretEnv,
 		"timeout":    hookTimeoutSeconds,
 	})
@@ -1237,13 +1364,19 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	run := b.runForSignature(r.Header.Get(hookSignatureHeader), body)
+	sig := r.Header.Get(hookSignatureHeader)
+	run, decoded, runs := b.routeDelivery(sig, body)
 	if run == nil {
+		if decoded != nil {
+			b.collectCardWorkerSecrets(runs, decoded)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil {
+	if decoded != nil {
+		d = *decoded
+	} else if err := json.Unmarshal(body, &d); err != nil {
 		// Signed for this task and unreadable, and which event it was
 		// cannot be known: an unreadable pre costs the trace nothing (the
 		// post carries the record whole), an unreadable post leaves its
@@ -1259,8 +1392,17 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// and the entry would then be dropped as post-terminal - present in the
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
+	// The result's secret values, for the answer's scrub, read before
+	// run.mu: the read is CPU only and bounded, and holding run.mu over it
+	// would hold the heartbeat and a finalize behind it. A value that lands
+	// after the answer was published scrubs nothing; the answer is out.
+	if d.Event == hookPostToolCall {
+		act.secrets.collectToolResult(d.Extra.Result)
+	}
 	run.mu.Lock()
-	if entry, ok := act.observe(d); ok {
+	entry, ok, steps := act.observe(d)
+	b.publishSteps(run, act, steps)
+	if ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {
@@ -1281,8 +1423,17 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 // session id is read only after the signature verifies, so an unsigned body
 // cannot pick a task.
 func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
+	run, _, _ := b.routeDelivery(sig, body)
+	return run
+}
+
+// routeDelivery is runForSignature, also handing back what it read on the
+// way, so the door neither verifies nor decodes a body twice: the delivery,
+// when the pod's shared secret signed it and it decoded (nil otherwise),
+// and the snapshot of tasks it matched against.
+func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
-		return nil
+		return nil, nil, nil
 	}
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -1292,22 +1443,42 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	b.mu.Unlock()
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
-			return r
+			return r, nil, runs
 		}
 	}
 	if !hookSigned(b.cfg.ActivitySecret, sig, body) {
-		return nil
+		return nil, nil, runs
 	}
-	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil || d.SessionID == "" {
-		return nil
+	d := new(hookDelivery)
+	if err := json.Unmarshal(body, d); err != nil {
+		return nil, nil, runs
+	}
+	if d.SessionID == "" {
+		return nil, d, runs
 	}
 	for _, r := range runs {
-		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && a.inTurn.Load() {
-			return r
+		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
+			return r, d, runs
 		}
 	}
-	return nil
+	return matchWorkerDeliveryRun(runs, *d), d, runs
+}
+
+// collectCardWorkerSecrets reads the Secret values of a post_tool_call
+// that matched no task's trace because its card's worker ran before the
+// task started waiting on its cards (a card runs as soon as it is filed,
+// while the coordinator's turn goes on), into the set of the task that
+// filed or tracks the card (cardWorkerRun), whose answer folds the card's
+// report in. Nothing else of the delivery is used: it stays out of the
+// trace, as before. d is the delivery routeDelivery verified and decoded,
+// and runs the tasks it matched against.
+func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
+	if d.Event != hookPostToolCall || d.SessionID == "" {
+		return
+	}
+	if run := cardWorkerRun(runs, *d); run != nil {
+		run.act.Load().secrets.collectToolResult(d.Extra.Result)
+	}
 }
 
 // --- the heartbeat ---
@@ -1348,6 +1519,9 @@ func (b *Bridge) drainActivity(run *taskRun) {
 		return
 	}
 	a.signalStop()
+	// The step the last calls were building closes with the turn, ahead of
+	// the interrupted calls it may hold.
+	b.publishSteps(run, a, a.closeStep())
 	deadline := time.Now().Add(activityDrainBudget)
 	open := a.interrupted()
 	for i, e := range open {
@@ -1416,6 +1590,15 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) b
 // publishArtifactParts is publishArtifactPart for one chunk of several parts:
 // a heartbeat's text and the chat message beside it.
 func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Part) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
+	defer cancel()
+	return b.publishArtifactPartsCtx(ctx, run, name, parts...)
+}
+
+// publishArtifactPartsCtx is publishArtifactParts on the caller's context,
+// for a publish that has to share a budget (publishHandoff, inside
+// finalizeResult's result+terminal budget).
+func (b *Bridge) publishArtifactPartsCtx(ctx context.Context, run *taskRun, name string, parts ...lib.Part) bool {
 	a := run.act.Load()
 	payload, err := json.Marshal(lib.ArtifactUpdate{
 		TaskID:    run.origin.TaskID,
@@ -1441,8 +1624,6 @@ func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Pa
 	// the next part a non-append that replaces the artifact in every fold.
 	// A lost first part costs one entry; a reset costs the whole trace.
 	a.appended[name] = true
-	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
-	defer cancel()
 	if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
 		b.cfg.Logger.Warn("artifact publish failed", "task", run.origin.TaskID, "name", name, "err", err)
 		return false

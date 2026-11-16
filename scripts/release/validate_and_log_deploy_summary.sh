@@ -66,7 +66,10 @@ echo "Memory Provider:            ${MEMORY_PROVIDER:-<NOT SET>}"
 echo "User Profile Enabled:       ${USER_PROFILE_ENABLED:-<NOT SET>}"
 echo "Pub/Sub Platform Plugin:    ${ENABLE_PUBSUB_PLATFORM:-<DEFAULT (false)>}"
 echo "Stockout Investigator:      ${ENABLE_STOCKOUT_INVESTIGATOR:-<DEFAULT (false)>}"
-# The one line here whose unset case provisions rather than skips: the default
-# is true, and it is a Log Router sink over every cluster in the project.
+# The two lines here whose unset case provisions rather than skips: both
+# defaults are true. The first is a Log Router sink over every cluster in the
+# project; the second, on a vertex_ai install, enables the Vertex AI API and
+# grants the gateway's role on the serving project.
 echo "GitOps Drift Detector:      ${ENABLE_DRIFT_DETECTOR:-<DEFAULT (true)>}"
+echo "Manage Vertex Serving Proj: ${VERTEX_MANAGE_SERVING_PROJECT:-<DEFAULT (true)>}"
 echo "======================================================================"

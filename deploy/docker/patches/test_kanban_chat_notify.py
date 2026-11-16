@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +68,199 @@ from gateway.config import Platform  # noqa: E402
 
 ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 UNROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: ""}
+
+
+class SharedHomeFileContractTest(unittest.TestCase):
+    """The patch imports nothing of ours, so it carries its own copy of the
+    projected file's mount path and key; the two copies must stay one file.
+    Outside the fixture above, which patches the directory per test."""
+
+    def test_the_stand_in_reads_the_same_file_as_chat_notify(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+
+
+class RoutedPlatformFromTheFileTest(unittest.TestCase):
+    """A learned Slack home channel reaches the stand-in through the operator's
+    projected file, not the env: routed when the gateway holds Slack and the
+    file names a channel, beside any platform the env lists."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_file_routes_slack(self):
+        # No file and an empty one leave the armed route, for the digest.
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+        self._write("C0FILE\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+        self.assertTrue(kanban_chat_notify.routes("slack"))
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_a_file_that_is_not_text_leaves_the_armed_route(self):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+
+    def test_the_file_adds_slack_to_the_env_and_another_platform_ignores_it(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
+
+    def test_an_absent_directory_leaves_the_armed_route(self):
+        with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), [])
+
+
+class HomePostPlatformsTest(unittest.TestCase):
+    """The stand-in computes the home-post list as chat_notify does: the CR
+    list, plus Slack when the projected file names a channel; with no CR list,
+    Slack's file channel alone or else every armed route. The home-channel
+    variables count for nothing."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_chat_home_alone_takes_the_home_posts(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat"
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
+        # Conversation reports still reach Slack.
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_a_learned_slack_channel_joins_a_chat_home(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat"
+        self._write("C1\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_with_no_cr_home_a_slack_file_channel_takes_the_home_posts(self):
+        self._write("C1\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+
+    def test_with_no_home_anywhere_every_armed_route_keeps_its_posts(self):
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_a_home_less_chat_only_install_stays_routed(self):
+        os.environ[kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
+
+    def test_slack_is_not_added_twice(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self._write("C1\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+
+    def test_both_cr_homes_are_the_list(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+        self._write("C1\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_no_armed_route_routes_nothing(self):
+        os.environ[kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV] = ""
+        self._write("C1\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), [])
+
+    def test_the_home_channel_variables_count_for_nothing(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = ""
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+
+class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
+    """The patch cannot import chat_notify, so it carries its own
+    routed_platforms; over every env and projected-file combination the two
+    copies give the same list."""
+
+    PLATFORM_VALUES = (None, "google_chat", "slack", "google_chat,slack")
+    CONVERSATIONS_VALUES = (None, "google_chat", "slack", "google_chat,slack")
+    FILE_VALUES = (None, "", "C0BUCG2F43E")
+
+    def setUp(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.chat_notify = chat_notify
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        for module in (kanban_chat_notify, chat_notify):
+            directory = mock.patch.object(module, "HOME_FILE_DIR", self.dir)
+            directory.start()
+            self.addCleanup(directory.stop)
+
+    def _set_file(self, value):
+        path = os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY)
+        if value is None:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(value)
+
+    def test_the_two_copies_agree_on_every_cell(self):
+        for platform in self.PLATFORM_VALUES:
+            for conversations in self.CONVERSATIONS_VALUES:
+                for file_value in self.FILE_VALUES:
+                    env = {
+                        kanban_chat_notify.NOTIFY_PLATFORM_ENV: platform,
+                        kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: conversations,
+                    }
+                    with self.subTest(platform=platform, conversations=conversations, file=file_value):
+                        self._set_file(file_value)
+                        with mock.patch.dict(os.environ, {}):
+                            for name, value in env.items():
+                                os.environ.pop(name, None)
+                                if value is not None:
+                                    os.environ[name] = value
+                            self.assertEqual(kanban_chat_notify.routed_platforms(),
+                                             self.chat_notify.routed_platforms())
 
 
 class _Runner:
@@ -191,18 +385,98 @@ class ResolveTest(unittest.TestCase):
         with mock.patch.dict(os.environ, conv_only):
             got = kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, sub)
             self.assertIsInstance(got, kanban_chat_notify.ConversationNotifyAdapter)
-            # A home-thread subscription is not served by the conversation switch.
-            self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, {"thread_id": "spaces/H/threads/T"}))
-            self.assertEqual(kanban_chat_notify.active_platforms(set()), {"google_chat"})
+            # A home-thread subscription is served by the home stand-in: with
+            # no CR home anywhere, every armed route keeps its home posts.
+            self.assertIsInstance(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, {"thread_id": "spaces/H/threads/T"}),
+                                  kanban_chat_notify.ChatNotifyAdapter)
+            self.assertEqual(kanban_chat_notify.active_platforms(set()), {"google_chat", "console"})
         with mock.patch.dict(os.environ, ROUTED):
             # A2A_NOTIFY_PLATFORM alone does not route conversations.
             self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, sub))
 
     def test_active_platforms(self):
+        # The console's route is served whenever the console runs, with no
+        # variable naming it.
         with mock.patch.dict(os.environ, ROUTED):
-            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "google_chat"})
+            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "google_chat", "console"})
         with mock.patch.dict(os.environ, UNROUTED):
-            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server"})
+            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "console"})
+
+    def test_a_console_subscription_gets_the_conversation_stand_in_whatever_the_env_names(self):
+        console = types.SimpleNamespace(value="console")
+        sub = {"thread_id": "console:mcp0123456789abcdef01234567#task-1", "chat_id": "a2a-ctx-1"}
+        with mock.patch.dict(os.environ, UNROUTED):
+            got = kanban_chat_notify.resolve(_Runner(), console, None, sub)
+            self.assertIsInstance(got, kanban_chat_notify.ConversationNotifyAdapter)
+            # Another platform's conversation is still gated by the variable.
+            self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None,
+                                                         {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}))
+
+    def test_a_list_routes_every_named_platform(self):
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack"}, clear=False):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+            self.assertTrue(kanban_chat_notify.routes("slack"))
+            self.assertEqual(kanban_chat_notify.served_platforms(), {"google_chat", "slack", kanban_chat_notify.CONSOLE_PLATFORM})
+
+    def test_home_stand_ins_are_kept_one_per_platform(self):
+        # Both routed, the two platforms' home stand-ins are cached apart: a
+        # Slack resolve between two Google Chat ones does not rebuild Google
+        # Chat's (and re-probe its route).
+        runner = _Runner()
+        both = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}
+        with mock.patch.dict(os.environ, both):
+            chat = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            slack = kanban_chat_notify.resolve(runner, Platform.SLACK, None)
+            self.assertIsInstance(chat, kanban_chat_notify.ChatNotifyAdapter)
+            self.assertIsInstance(slack, kanban_chat_notify.ChatNotifyAdapter)
+            self.assertIsNot(chat, slack)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), chat)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.SLACK, None), slack)
+
+    def test_a_chat_and_a_console_conversation_each_keep_their_stand_in(self):
+        # Served side by side, the two platforms' stand-ins are cached apart:
+        # alternating between them reuses each, rather than rebuilding (and
+        # re-probing the route) on every switch.
+        runner = _Runner()
+        console = types.SimpleNamespace(value="console")
+        chat_sub = {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}
+        console_sub = {"thread_id": "console:tab-1#task-7", "chat_id": "a2a-ctx-2"}
+        conv_only = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}
+        with mock.patch.dict(os.environ, conv_only):
+            chat = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None, chat_sub)
+            cons = kanban_chat_notify.resolve(runner, console, None, console_sub)
+            self.assertIsInstance(chat, kanban_chat_notify.ConversationNotifyAdapter)
+            self.assertIsInstance(cons, kanban_chat_notify.ConversationNotifyAdapter)
+            self.assertIsNot(chat, cons)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None, chat_sub), chat)
+            self.assertIs(kanban_chat_notify.resolve(runner, console, None, console_sub), cons)
+
+    def test_a_console_report_names_the_turn_it_answers(self):
+        adapter = kanban_chat_notify.ConversationNotifyAdapter(types.SimpleNamespace(value="console"), _Runner())
+        with mock.patch.object(kanban_chat_notify, "conversation_context", return_value="ctx-1"):
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "console:tab-1#task-7"),
+                             ["--conversation", "console:tab-1", "--context", "ctx-1", "--reply-to", "task-7"])
+            # A console card filed before the route carried the task has no suffix.
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "console:tab-1"),
+                             ["--conversation", "console:tab-1", "--context", "ctx-1"])
+            # Only a console conversation passes a task on.
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "gchat:spaces/A/threads/B"),
+                             ["--conversation", "gchat:spaces/A/threads/B", "--context", "ctx-1"])
+
+    def test_the_console_platform_is_registered_with_hermes(self):
+        registered = {}
+        registry = types.SimpleNamespace(
+            is_registered=lambda name: name in registered,
+            register=lambda entry: registered.__setitem__(entry.name, entry),
+        )
+        module = types.SimpleNamespace(PlatformEntry=lambda **kw: types.SimpleNamespace(**kw), platform_registry=registry)
+        with mock.patch.dict(sys.modules, {"gateway.platform_registry": module}):
+            kanban_chat_notify._register_console_platform()
+        entry = registered.get("console")
+        self.assertIsNotNone(entry, "console was not registered")
+        self.assertEqual(entry.source, "builtin", "a plugin-scoped entry is invisible to other profiles")
+        self.assertIsNone(entry.adapter_factory(None))
 
 
 class _Proc:
@@ -225,6 +499,12 @@ class SendTest(unittest.TestCase):
         with mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
             result = asyncio.run(adapter.send("spaces/H", text, metadata=metadata))
         return result, calls
+
+    def test_the_posted_text_carries_no_step_line(self):
+        # In the image slack_moments sits beside the gateway; here the scripts directory stands in.
+        with mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"), *sys.path]):
+            _result, calls = self._send(0, b"{}", text="- done\n\n[next: check seeded-a]")
+        self.assertEqual(list(calls[0][0])[-2:], ["--", "- done"])
 
     def test_a_threaded_send_ends_the_flags_before_the_text(self):
         result, calls = self._send(0, b'{"message_id":"m1","thread_id":"t1"}', metadata={"thread_id": "spaces/H/threads/T"})
@@ -263,6 +543,39 @@ class SendTest(unittest.TestCase):
                                           "--", "- 3 nodes"])
         self.assertFalse(missing.success, "a session with no recorded route is a failed send, not a guess")
         self.assertEqual(len(calls), 1)
+
+    def test_the_answer_flag_rides_only_a_conversation_post(self):
+        # The report that settles an ask's plan is flagged --answer-to for the
+        # gateway's rating controls; a home post never carries it (the CLI
+        # would refuse the whole post) and neither does a keyed edit.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        db = os.path.join(home.name, "session_kv.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL)")
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("a2a-ctx-1", json.dumps(
+                {"conversation_route": {"platform": "slack", "conversation": "slack:C1/1.2",
+                                        "context_id": "ctx-1"}})))
+        conversation = kanban_chat_notify.ConversationNotifyAdapter(Platform.SLACK, _Runner())
+        home_route = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
+        calls = []
+
+        async def fake_exec(*argv, **kwargs):
+            calls.append(list(argv))
+            return _Proc(0, b'{"message_id":"m"}')
+
+        flagged = {"thread_id": "slack:C1/1.2", kanban_chat_notify.ANSWER_METADATA_KEY: "plan-t_1-1"}
+        with mock.patch.dict(os.environ, {kanban_chat_notify.SESSION_KV_DB_ENV: db}), \
+                mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            asyncio.run(conversation.send("a2a-ctx-1", "the answer", metadata=flagged))
+            asyncio.run(conversation.send("a2a-ctx-1", "a step", metadata={"thread_id": "slack:C1/1.2"}))
+            asyncio.run(conversation.send("a2a-ctx-1", "plan", metadata={
+                **flagged, kanban_chat_notify.UPDATE_METADATA_KEY: "plan"}))
+            asyncio.run(home_route.send("C1", "home", metadata={"thread_id": "1.2",
+                                                               kanban_chat_notify.ANSWER_METADATA_KEY: "plan-t_1-1"}))
+        self.assertEqual(calls[0][-4:], ["--answer-to", "plan-t_1-1", "--", "the answer"])
+        for argv in calls[1:]:
+            self.assertNotIn("--answer-to", argv)
 
     def test_a_conversation_cards_wake_self_posts_into_the_bridge_session(self):
         # Push-capable, so the notifier still sends the report; but a wake is
@@ -390,6 +703,10 @@ class SendTest(unittest.TestCase):
 
     def test_outcome_unknown_is_not_a_failure(self):
         result, _ = self._send(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN)
+        self.assertTrue(result.success)
+
+    def test_kept_by_the_gateway_is_not_a_failure(self):
+        result, _ = self._send(kanban_chat_notify.NOTIFY_KEPT, err=b"kept for the digest")
         self.assertTrue(result.success)
 
     def test_route_unavailable_fails_and_marks_the_route_down(self):
@@ -532,10 +849,20 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.A2A_CLI, chat_notify.A2A_CLI)
         self.assertEqual(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN, chat_notify.NOTIFY_OUTCOME_UNKNOWN)
         self.assertEqual(kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, chat_notify.NOTIFY_ROUTE_UNAVAILABLE)
+        self.assertEqual(kanban_chat_notify.NOTIFY_KEPT, chat_notify.NOTIFY_KEPT)
         self.assertEqual(kanban_chat_notify.NOTIFY_WAIT_SECONDS, chat_notify.NOTIFY_WAIT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_CONNECT_SECONDS, chat_notify.NOTIFY_CONNECT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_MARGIN_SECONDS, chat_notify.NOTIFY_MARGIN_SECONDS)
         self.assertEqual(kanban_chat_notify.SEND_TIMEOUT_SECONDS, chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
+        self.assertEqual(kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV)
+        self.assertEqual(kanban_chat_notify.PLATFORM_LIST_SEPARATOR, chat_notify.PLATFORM_LIST_SEPARATOR)
+        self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), ["a", "b"])
+        self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), chat_notify.platform_list("a, b,,a"))
+        import kanban_event_routing
+        listed = "google_chat, slack,,slack"
+        with mock.patch.dict(os.environ, {kanban_event_routing.NOTIFY_CONVERSATIONS_ENV: listed}):
+            self.assertEqual(kanban_event_routing._served_conversation_platforms(), ["google_chat", "slack"])
+        self.assertEqual(chat_notify.platform_list(listed), ["google_chat", "slack"])
 
     def test_the_conversation_route_is_spelled_alike_where_it_is_written_and_read(self):
         # session_kv_server writes it, kanban_event_routing addresses the card
@@ -548,6 +875,8 @@ class ContractTest(unittest.TestCase):
                   for t in node.targets if isinstance(t, ast.Name)}
         self.assertEqual(ast.literal_eval(consts["CONVERSATION_ROUTE_KEY"]), kanban_chat_notify.CONVERSATION_ROUTE_KEY)
         self.assertEqual(kanban_event_routing.CONVERSATION_ROUTE_KEY, kanban_chat_notify.CONVERSATION_ROUTE_KEY)
+        self.assertEqual(kanban_event_routing.PLATFORM_LIST_SEPARATOR, kanban_chat_notify.PLATFORM_LIST_SEPARATOR)
+        self.assertEqual(kanban_notifier.GATEWAY_PLATFORM_SEPARATOR, kanban_chat_notify.PLATFORM_LIST_SEPARATOR)
         self.assertEqual(sorted(ast.literal_eval(consts["CONVERSATION_KEY_PREFIXES"]).values()),
                          sorted(kanban_chat_notify.CONVERSATION_KEY_PREFIXES))
         self.assertEqual(ast.literal_eval(consts["SESSION_KV_DB_PATH"].args[1]) if isinstance(consts["SESSION_KV_DB_PATH"], ast.Call)
@@ -643,6 +972,18 @@ class FoldsIntoRowTest(unittest.TestCase):
         with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
             self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
 
+    def test_a_child_beneath_an_open_fan_out_on_google_chat_folds_under_next(self):
+        # The gateway draws the plan on Google Chat under next (kanban_notifier.chat_ux_on),
+        # so a child's answer folds into its row there as on Slack; under today it does not.
+        gsub = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T", "task_id": "t_c1"}
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'google_chat', ?, ?)", (gsub["chat_id"], gsub["thread_id"]))
+        fake = SimpleNamespace(enabled=lambda: True)
+        modules = {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, gsub))
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, gsub))
+
 
 class FoldFanoutTest(unittest.TestCase):
     """A fanned-out child's answer folds into its parent's on the routed path.
@@ -735,8 +1076,13 @@ class FoldFanoutTest(unittest.TestCase):
             self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
 
     def test_no_plan_fold_without_the_slack_flag(self):
-        # This class's thread is Google Chat, which has no plan: the hold stands.
+        # This class's thread is Google Chat; with the flag off, or under today where
+        # the gateway serves nothing, it has no plan: the hold stands.
         self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
+        fake = SimpleNamespace(enabled=lambda: True)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}), \
+                mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
 
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))

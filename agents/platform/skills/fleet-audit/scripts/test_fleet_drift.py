@@ -6,6 +6,7 @@ import copy
 import io
 import inspect
 import json
+from pathlib import Path
 import os
 import shutil
 import subprocess
@@ -24,6 +25,11 @@ import fleet_drift as fd  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -1778,6 +1784,22 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertNotIn("checks_not_applicable", entry)
         self.assertLessEqual(set(self.NA), {c["check"] for c in entry["commands"]})
 
+    def test_every_entry_carries_the_cluster_status(self):
+        """The Config Connector read after the sweep reads only a running
+        cluster, and this collector marks every cluster `collected`."""
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)]
+        clusters[0]["status"] = "STOPPING"
+        statuses = {entry["name"].rpartition("/")[2]: entry["cluster_status"] for entry in self.manifest(clusters)["clusters"]}
+        self.assertEqual(statuses["c0"], "STOPPING")
+        self.assertEqual(statuses["c1"], "RUNNING")
+
+    def test_a_cluster_with_the_config_connector_add_on_is_marked(self):
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)]
+        clusters[0]["addonsConfig"] = {"configConnectorConfig": {"enabled": True}}
+        marked = {entry["name"].rpartition("/")[2]: entry.get("config_connector_addon") for entry in self.manifest(clusters)["clusters"]}
+        self.assertEqual(marked["c0"], True)
+        self.assertIsNone(marked["c1"])
+
     def test_an_undersized_autopilot_cohort_still_declares_them(self):
         """The live fleet's shape: two Autopilot clusters in one cohort against
         a floor of three, so no facet compared and every facet slug is missing
@@ -2640,6 +2662,79 @@ class CandidateSummaryTest(unittest.TestCase):
         self.assertIn("1 cluster(s) collected; 1 candidate(s) to report", err.getvalue())
         self.assertIn("shielded-nodes: 1 (a)", err.getvalue())
 
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main(["--config-connector"])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{fd.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                fd, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(fd.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    fd.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A drift fix can edit a `ContainerCluster` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fd.kcc_health.CONTAINER_KINDS)
+            found["clusters"][0]["kcc_unready"] = list(mapper(lambda entry: {"seen": entry["name"]}, found["clusters"]))
+
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main(["--config-connector"])
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["clusters"][0]["kcc_unready"], [{"seen": "acme/us-central1/hub"}])
+
     def test_main_says_nothing_about_candidates_when_the_run_failed(self):
         manifest = {"clusters": [], "error": "project discovery failed"}
         out, err = io.StringIO(), io.StringIO()
@@ -2731,6 +2826,57 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunTimeoutTest(unittest.TestCase):
+    """`TimeoutExpired` carries the child's output as bytes even under `text=True`;
+    every reader of `Run` matches markers against a str, so the timeout arm
+    must hand back text, as the other collectors' `default_run` copies do."""
+
+    TIMED_OUT = subprocess.TimeoutExpired(["gcloud"], 1, output=b"partial", stderr=b"WARNING: zone did not respond")
+
+    def test_a_timeout_that_wrote_output_returns_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual(result.rc, fd.TIMEOUT_RC)
+        self.assertEqual((result.stdout, result.stderr), ("partial", "WARNING: zone did not respond"))
+
+    def test_a_timeout_that_wrote_nothing_returns_empty_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=subprocess.TimeoutExpired(["gcloud"], 1)):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (fd.TIMEOUT_RC, "", ""))
+
+    def test_a_completed_run_passes_its_text_through(self):
+        done = subprocess.CompletedProcess(["gcloud"], 0, stdout="[]", stderr="")
+        with mock.patch.object(fd.subprocess, "run", return_value=done):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (0, "[]", ""))
+
+    def test_a_timed_out_clusters_list_reads_as_a_gate_failure_in_gclouds_words(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            clusters, record, error = fd.enumerate_project_clusters("proj-a", run=lambda argv, **kw: timed_out)
+        self.assertEqual((clusters, record), ([], None))
+        self.assertEqual(error, f"clusters list rc={fd.TIMEOUT_RC}: WARNING: zone did not respond")
+
+    def test_a_timed_out_projects_list_is_quoted_as_text_not_as_a_bytes_repr(self):
+        """`discover_fleet` formats the listing's stderr into the manifest's
+        partial note with an f-string, which renders bytes as `b'...'` without
+        raising; the note must carry gcloud's words."""
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+
+        def run(argv, **_):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return fd.Run(argv, 0, "acme\n", "", 0.0)
+            return timed_out
+
+        fd.declared_scope.set(None, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["acme"])
+        self.assertIn(f"`gcloud projects list` rc={fd.TIMEOUT_RC}: WARNING: zone did not respond. The scope", discovery.partial)
+
 
 if __name__ == "__main__":
     unittest.main()

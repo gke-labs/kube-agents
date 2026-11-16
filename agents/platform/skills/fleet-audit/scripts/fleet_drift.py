@@ -8,13 +8,16 @@ emits and governance/fleet_consistency_drift_sop.md for the checks.
 This stream's own collector: every one of its twenty checks -- nineteen
 comparative facets and §4.14's cohort-independent `no-environment-label` --
 reads GKE control-plane and node-pool metadata through `gcloud container`, no
-`kubectl` and no kubeconfig, so it needs no per-cluster credential fetch —
+`kubectl` and no kubeconfig, so the checks need no per-cluster credential fetch —
 `clusters list` alone, once per project, returns every field every facet
 compares, the same shape `clusters describe` would (the SOP's own §1.3
 frames `describe` as each finding's `evidence.command`; this collector
 issues the cheaper per-project `list` instead and records that as the
 command it actually ran: the manifest publishes what happened, not what
-the SOP originally described).
+the SOP originally described). After the sweep, with `--config-connector`, `main` fetches credentials
+for each collected cluster and makes one Config Connector read there
+(`kcc_health.py`), inside the collector's time budget; that read needs list
+access on the Config Connector objects, else the entry gets `kcc_unread`.
 
 **What is procedural here and what stays judgment.** Normalizing a raw
 field to one comparable token per facet (§4), computing the majority and
@@ -28,11 +31,12 @@ agent to do once the manifest hands it the outliers.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from collections import Counter
@@ -57,12 +61,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
@@ -112,6 +113,12 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
+# The Config Connector read that `main` adds to the manifest: this stream's
+# `manifest` fixes can edit Config Connector declarations, and `finish` says so
+# on a fix whose object Config Connector does not apply.
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -229,36 +236,14 @@ def log(msg: str) -> None:
     print(f"[fleet_drift] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -277,26 +262,6 @@ def _record(argv_str: str, result: Run) -> dict:
 # --------------------------------------------------------------------------- #
 # §1: fleet enumeration
 # --------------------------------------------------------------------------- #
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all -- neither the active
-    # project nor `projects list` answered. An empty fleet is then a failure
-    # to look, not a fleet with nothing in it, and the manifest says so.
-    error: str | None
-    # Set when discovery resolved part of the fleet and lost the rest: the
-    # active project answered and `projects list` did not, so the scope is one
-    # project out of an unknown number. A warning on stderr was all this used
-    # to be, and stderr is not in the manifest -- so the run read one project,
-    # marked every entry `collected`, and the document that followed carried no
-    # coverage gap. `finish` then has no reason to hold a previous ledger
-    # finding on a cluster in any other project: it is absent from the
-    # document, absent from the manifest, and therefore announced resolved and
-    # its remediation pull request stale-closed. `collect_fleet` turns this
-    # into a `gate-failed` target so the loss is a row the document must
-    # account for, the way a project whose `clusters list` failed already is.
-    partial: str | None = None
-
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     """§1.1's project scope. `--project` scopes the run to one project; else
@@ -1805,9 +1770,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     checks_run: dict[tuple, list[str]] = {ckey(c): [] for c in clusters}
     candidates: dict[tuple, list[dict]] = {ckey(c): [] for c in clusters}
     outlier_facet_count: dict[tuple, int] = {ckey(c): 0 for c in clusters}
-    # §3.6's guard rewrites a cluster's candidates from its `ckey` alone, so it
-    # needs the same name the per-facet emits used.
-    targets: dict[tuple, str] = {ckey(c): target_name(c) for c in clusters}
 
     layout = cohort_layout(clusters, now=now)
     env_of, strategy = layout.env_of, layout.strategy
@@ -1873,7 +1835,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                         continue
                     if _shape_mismatch(facet, c, baseline_clusters):
                         continue
-                    name = target_name(c)
                     inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
                     base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
                     sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
@@ -1908,7 +1869,8 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[di
     return enumerate_project_clusters(project, run=run)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     discovery = discover_fleet(project, run=run)
@@ -2005,6 +1967,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             "project": project_name,
             "location": c.get("location") or c.get("zone") or "",
             "autopilot": cluster_mode(c) == "autopilot",
+            # GKE's status, carried for the Config Connector read after the
+            # sweep (`kcc_health.annotate_manifest`), which reads only a
+            # running cluster: this entry is `collected` in every status.
+            kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
             # Still `collected` when a cohort floored out. Nothing was
             # compared, but nothing the model can run by hand would compare it
             # either -- the peers do not exist -- and `gate-failed` asks for
@@ -2017,6 +1983,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         note = limitations.get(cluster_key)
         if note:
             entry["limitations"] = note
+        if kcc_health.addon_enabled(c):
+            # Read first by the Config Connector read after the sweep.
+            entry[kcc_health.ADDON_FIELD] = True
         skipped = not_applicable.get(cluster_key)
         if skipped:
             entry["checks_not_applicable"] = skipped
@@ -2146,9 +2115,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
+    kcc_health.add_flag(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
+    # With `--config-connector` (`kcc_health.FLAG`), which the SOP command
+    # passes, or while an audit run of this stream is in flight, so the read
+    # does not depend on the model copying the flag; a chat fleet question
+    # with no run in flight does not read. The manifest says which
+    # (`kcc_health.READ_STAMP_FIELD`).
+    reason = kcc_health.read_reason(args.config_connector, AUDIT_ID)
+    manifest[kcc_health.READ_STAMP_FIELD] = reason
+    if reason:
+        # After the sweep, in a new pool of the sweep's size: a credential fetch
+        # and one Config Connector read per collected cluster (discovery, then paged
+        # list requests per container kind, `kcc_health.CONTAINER_KINDS`,
+        # `kcc_health.read_objects`), as `kcc_unready` or
+        # `kcc_unread` on its entry. The reads end inside the collector's time
+        # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
+        with ThreadPoolExecutor(max_workers=broker_admission.sweep_width()) as pool:
+            kcc_health.annotate_manifest(
+                manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kinds=kcc_health.CONTAINER_KINDS
+            )
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         # The manifest is still written -- the shell has already redirected

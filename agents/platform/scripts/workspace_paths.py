@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""The workspace protocol's path validator, for both ends of it.
+"""The path validator for repository paths, for both ends of the broker protocol.
 
-`content_workspace` states the rule this enforces: reject any path under
-`.git`, in both directions, with one validator rather than two that could
-disagree about what `manifests/../.git/config` means. That argument does not
-stop at the broker. A name the broker validated travels over the protocol and
-becomes a write on the reader's filesystem, and the check that matters is the
-one next to the effect -- so the reader validates it again, and it has to be
-the same check. Two implementations of "is this under `.git`" is the parser
-differential the rule was written to avoid, just spread over two containers
-instead of two functions.
+The rule: reject any path under `.git`, in both directions, with one validator
+rather than two that could disagree about what `manifests/../.git/config`
+means. A name the broker validated travels over the protocol and becomes a
+write on the reader's filesystem, and the check that matters is the one next to
+the effect -- so the reader validates it again, and it has to be the same
+check. Two implementations of "is this under `.git`" is the parser differential
+the rule was written to avoid, just spread over two containers instead of two
+functions.
 
-It lives in its own module because the two ends do not ship the same code. The
-broker's `content_workspace` drives git in a tree on its own volume and has no
-business in the sandbox image; this file is stdlib-only, has no idea a git
-exists, and is on the sandbox's shared-scripts allowlist. `content_workspace`
-delegates to it, translating `WorkspaceError` into the `PathRefused` its own
-callers are written against, so `content_workspace.repo_relative` keeps working
-for everything that already called it.
+It lives in its own module because the two ends do not ship the same code: this
+file is stdlib-only, has no idea a git exists, and is on the sandbox's
+shared-scripts allowlist. `vcs_broker` and the provider layer use it on the
+broker side.
 """
 
 from __future__ import annotations
@@ -150,7 +146,7 @@ def validate_path(raw: Any) -> str:
             raise WorkspaceError(
                 f"path {raw!r} names a git directory. Nothing the agent authors "
                 "belongs there: `.git/config` is where a filter driver, an alias "
-                "or a hook path would be defined, and content-passing exists so "
+                "or a hook path would be defined, and the broker routes exist so "
                 "that the agent cannot define one."
             )
     return str(PurePosixPath(*parts))

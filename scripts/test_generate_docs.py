@@ -1,4 +1,4 @@
-"""The cron-job example region, and a region spliced into more than one page.
+"""The cron-job example region, a region spliced into more than one page, and the CRD field pages.
 
 ``generate_docs.py`` renders one Platform Agent roster entry as the fenced JSON
 three site pages show as the job schema's worked example. The three used to be
@@ -14,8 +14,11 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -195,7 +198,7 @@ class CapabilitiesTest(unittest.TestCase):
         jobs = [
             job
             for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
-            if job.get("enabled") and generate_docs.AUDIT_SKILL in job.get("skills", [])
+            if job.get("enabled") and generate_docs.is_audit(job)
         ]
         audits = generate_docs.governance_audits()
         self.assertEqual(sorted(a["id"] for a in audits), sorted(j["id"] for j in jobs))
@@ -215,9 +218,53 @@ class CapabilitiesTest(unittest.TestCase):
         names = {
             *generate_docs._read_skills(generate_docs.SKILLS_DIR),
             *generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR),
+            *generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR),
         }
+        self.assertTrue(names)
         for name in names:
             self.assertIn(f"`{name}`", skills)
+
+    def test_the_catalog_lists_the_support_agent_skills_under_their_own_group(self):
+        tse_skills = generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR)
+        self.assertTrue(tse_skills, "agents/tse/skills holds no SKILL.md")
+        body = generate_docs.gen_skill_catalog()
+        group = body.split(f"### {generate_docs.TSE_SKILL_GROUP}\n")[1]
+        for name in tse_skills:
+            self.assertIn(
+                f"[`{name}`]({generate_docs.GITHUB_BLOB}/agents/tse/skills/{name}/SKILL.md)",
+                group,
+            )
+        self.assertTrue(body.rstrip().endswith(group.rstrip()))
+
+    def test_a_name_shared_across_personas_keeps_each_directory_s_description(self):
+        shared = next(iter(generate_docs.SKILL_GROUPS.values()))[0]
+        by_dir = {
+            generate_docs.SKILLS_DIR: {shared: "platform description"},
+            generate_docs.CLUSTER_SKILLS_DIR: {shared: "cluster description"},
+            generate_docs.TSE_SKILLS_DIR: {},
+        }
+        with mock.patch.object(generate_docs, "_read_skills", side_effect=by_dir.__getitem__):
+            body = generate_docs.gen_skill_catalog()
+        platform_rows, cluster_rows = body.split(f"### {generate_docs.CLUSTER_SKILL_GROUP}\n")
+        blob = generate_docs.GITHUB_BLOB
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/platform/skills/{shared}/SKILL.md) | platform description |",
+            platform_rows,
+        )
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/cluster/skills/{shared}/SKILL.md) | cluster description |",
+            cluster_rows,
+        )
+        self.assertNotIn("cluster description", platform_rows)
+
+    def test_a_persona_group_with_no_skills_is_left_out(self):
+        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {})
+        for group, _ in generate_docs.PERSONA_SKILL_GROUPS:
+            self.assertEqual(grouped[group], [])
+        with mock.patch.object(generate_docs, "read_persona_skills", return_value={}):
+            body = generate_docs.gen_skill_catalog()
+        self.assertNotIn(generate_docs.TSE_SKILL_GROUP, body)
+        self.assertNotIn(generate_docs.CLUSTER_SKILL_GROUP, body)
 
     def test_daily_audits_come_first_and_untimed_schedules_last(self):
         roster = [
@@ -284,6 +331,500 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertIn(
             "[`Odd-Name_SOP.md`](agents/platform/governance/Odd-Name_SOP.md)", body
         )
+
+
+def helper_job(job_id: str, expr: str, **overrides) -> dict:
+    job = {
+        "id": job_id,
+        "name": job_id.replace("-", " ").title(),
+        "schedule": {"kind": "cron", "expr": expr, "display": expr},
+        "skills": [],
+        "no_agent": True,
+        "script": f"{job_id.replace('-', '_')}.py",
+        "enabled": True,
+    }
+    job.update(overrides)
+    return job
+
+
+class CronHelperJobsTest(unittest.TestCase):
+    """The watchdogs page's helper-job table is the roster's non-audit entries."""
+
+    def test_the_block_is_registered_for_the_watchdogs_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["cron-helper-jobs"],
+            ((generate_docs.WATCHDOGS_PAGE,), generate_docs.gen_cron_helper_jobs),
+        )
+
+    def test_exactly_the_enabled_non_audit_jobs_are_listed_in_roster_order(self):
+        roster = generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+        expected = [job["id"] for job in roster if job.get("enabled") and not generate_docs.is_audit(job)]
+        self.assertTrue(expected)
+        body = generate_docs.gen_cron_helper_jobs()
+        listed = re.findall(r"^\| `([^`]+)` \|", body, re.M)
+        self.assertEqual(listed, expected)
+        for job in roster:
+            if generate_docs.is_audit(job):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+    def test_helpers_and_audits_partition_the_enabled_roster(self):
+        # The two regions share `is_audit`; this holds them to the roster from
+        # the other side, so neither can gain or lose an entry on its own.
+        enabled = [
+            job["id"]
+            for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+            if job.get("enabled")
+        ]
+        helpers = [job["id"] for job in generate_docs.helper_jobs()]
+        audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertEqual(sorted(helpers + audits), sorted(enabled))
+        self.assertFalse(set(helpers) & set(audits))
+
+    def test_a_null_skills_entry_is_a_helper_in_both_regions(self):
+        # `jobs.json` readers elsewhere in the tree accept `"skills": null`;
+        # the helper filter used to raise `TypeError` on it while the audit
+        # filter read it as no skills.
+        roster = [
+            helper_job("no-skills", "0 6 * * *", skills=None),
+            audit_job("audit", {"expr": "0 6 * * *"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+            audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertIn("| `no-skills` | script, `no_skills.py` |", body)
+        self.assertNotIn("`audit`", body)
+        self.assertEqual(audits, ["audit"])
+
+    def test_disabled_and_audit_entries_are_left_out(self):
+        roster = [
+            helper_job("off", "0 6 * * *", enabled=False),
+            helper_job("audit", "0 6 * * *", no_agent=None, skills=[generate_docs.AUDIT_SKILL]),
+            helper_job("kept", "0 6 * * *"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertNotIn("`off`", body)
+        self.assertNotIn("`audit`", body)
+        self.assertIn("| `kept` | script, `kept.py` |", body)
+
+    def test_the_type_column_tells_a_script_from_a_prompt_job(self):
+        roster = [
+            helper_job("plain-prompt", "0 7 * * 6", no_agent=None, script=None),
+            helper_job("prompt-after", "0 7 * * 6", no_agent=None, script="queue.py"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `plain-prompt` | prompt | Weekly, Saturday 07:00 |", body)
+        self.assertIn("| `prompt-after` | prompt, after `queue.py` |", body)
+
+    def test_an_unglossed_schedule_shows_its_expression_and_a_name_is_escaped(self):
+        roster = [
+            helper_job("odd", "7 3 * * 2", name="A | B <x>"),
+            helper_job("interval", "", schedule={"kind": "interval", "minutes": 5, "display": "every 5m"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `odd` | script, `odd.py` | `7 3 * * 2` | A \\| B &lt;x&gt; |", body)
+        self.assertIn("| `every 5m` |", body)
+
+
+class GovernanceAuditsTest(unittest.TestCase):
+    """The governance page's matrix is the roster's audits, in README order."""
+
+    def test_the_block_is_registered_for_the_governance_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["governance-audits"],
+            ((generate_docs.GOVERNANCE_PAGE,), generate_docs.gen_governance_audits),
+        )
+
+    def test_each_audit_is_a_row_with_its_sop_watchdog_cadence_and_name(self):
+        audits = generate_docs.governance_audits()
+        self.assertTrue(audits)
+        body = generate_docs.gen_governance_audits()
+        rows = [line for line in body.splitlines()[2:]]
+        self.assertEqual(len(rows), len(audits))
+        for audit, row in zip(audits, rows):
+            self.assertEqual(
+                row,
+                "| `{sop}` | `{id}` | {cadence} | {name} |".format(
+                    sop=Path(audit["sop"]).name,
+                    id=audit["id"],
+                    cadence=generate_docs.CRON_CADENCE[audit["expr"]],
+                    name=generate_docs.md_escape(audit["name"]),
+                ),
+            )
+
+    def test_script_jobs_are_not_in_the_matrix(self):
+        body = generate_docs.gen_governance_audits()
+        for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER):
+            if job.get("no_agent"):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+
+class CadenceCellTest(unittest.TestCase):
+    """One helper decides what every generated cadence cell shows."""
+
+    def test_a_glossed_expression_shows_its_gloss(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "20 6 * * *"}), "Daily 06:20")
+
+    def test_an_unglossed_expression_shows_itself_or_the_fallback(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}), "`7 3 * * 2`")
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}, "—"), "—")
+
+    def test_an_interval_schedule_shows_its_display(self):
+        schedule = {"kind": "interval", "minutes": 5, "display": "every 5m"}
+        self.assertEqual(generate_docs.cadence_cell(schedule), "`every 5m`")
+        self.assertEqual(generate_docs.schedule_expr(schedule), ("", "every 5m"))
+
+
+class CRDFieldBlocksTest(unittest.TestCase):
+    """The CRD field pages are registered, rendered as tables, and selectable."""
+
+    def test_each_kind_has_a_block_on_its_own_page(self):
+        for kind, page in generate_docs.CRD_KINDS.items():
+            block_id = f"{generate_docs.CRD_BLOCK_PREFIX}{kind.lower()}"
+            paths, generator = generate_docs.BLOCKS[block_id]
+            self.assertEqual(paths, (page,))
+            self.assertEqual(generator.func, generate_docs.gen_crd_fields)
+            self.assertEqual(generator.args, (kind,))
+            self.assertTrue(page.exists(), page)
+
+    def test_select_blocks_keeps_registry_order_and_rejects_unknown_ids(self):
+        blocks = {"a": 1, "b": 2, "crd-fields-x": 3, "crd-fields-y": 4}
+        self.assertEqual(generate_docs.select_blocks([], [], blocks), blocks)
+        self.assertEqual(list(generate_docs.select_blocks(["crd-fields-x", "a"], [], blocks)), ["a", "crd-fields-x"])
+        # A prefix covers a family, so the operator Makefile names it once.
+        self.assertEqual(
+            list(generate_docs.select_blocks([], ["crd-fields-"], blocks)), ["crd-fields-x", "crd-fields-y"]
+        )
+        self.assertEqual(list(generate_docs.select_blocks(["a"], ["crd-"], blocks)), ["a", "crd-fields-x", "crd-fields-y"])
+        with self.assertRaises(SystemExit) as caught:
+            generate_docs.select_blocks(["a", "nope"], [], blocks)
+        self.assertIn("nope", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            generate_docs.select_blocks([], ["zzz-"], blocks)
+        self.assertIn("zzz-", str(caught.exception))
+
+    def test_without_go_a_write_run_skips_the_crd_pages_and_a_check_fails(self):
+        def crd_generator() -> str:
+            return generate_docs.run_crd_generator(generate_docs.CRD_API_DIR, ("AgentPlugin",))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "plain.md"
+            crd = Path(tmp) / "crd.md"
+            for page, block_id in ((plain, "plain"), (crd, "crd-fields-x")):
+                page.write_text(
+                    f"<!-- BEGIN GENERATED: {block_id} -->\nstale\n<!-- END GENERATED: {block_id} -->\n",
+                    encoding="utf-8",
+                )
+            blocks = {"plain": ((plain,), lambda: "FRESH"), "crd-fields-x": ((crd,), crd_generator)}
+            out = io.StringIO()
+            with mock.patch.object(generate_docs.shutil, "which", return_value=None):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(generate_docs.main([], blocks), 0)
+                    self.assertIn("FRESH", plain.read_text(encoding="utf-8"))
+                    self.assertIn("stale", crd.read_text(encoding="utf-8"))
+                    self.assertIn("skipped  [crd-fields-x]", out.getvalue())
+                    with self.assertRaises(SystemExit):
+                        generate_docs.main(["--check"], blocks)
+                    with self.assertRaises(SystemExit):
+                        generate_docs.main(["crd-fields-x"], blocks)
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_page_body_is_a_spec_and_a_status_table(self):
+        body = generate_docs.gen_crd_fields("AgentPlugin")
+        intro, tables = body.split("\n\n", 1)
+        self.assertTrue(intro.startswith("Every field of the `AgentPlugin` resource's"), intro)
+        self.assertIn("[AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/)", intro)
+        self.assertIn("`kubectl explain agentplugin.spec.<field>`", intro)
+        self.assertIn("(`agentplugin.status.<field>` for a row of the Status table)", intro)
+        # The Constraints column leaves the CEL rules out, and the intro says so
+        # and where they are listed.
+        self.assertIn("`kubectl get crd agentplugins.kubeagents.x-k8s.io -o yaml`", intro)
+        self.assertIn("`x-kubernetes-validations`", intro)
+        self.assertTrue(tables.startswith("## Spec\n\n" + "\n".join(generate_docs.CRD_TABLE_HEADER)))
+        self.assertIn("\n## Status\n", body)
+        self.assertIn("| `agentRef` | `string` | yes |  |  | ", body)
+        self.assertIn("one of `Always`, `Never`, `IfNotPresent`", body)
+        self.assertIn("| `env` | `[]corev1.EnvVar` |", body)
+        self.assertNotIn("| `env[]", body)
+
+    def test_a_row_is_rendered_from_the_model(self):
+        with mock.patch.object(
+            generate_docs,
+            "crd_model",
+            return_value={
+                "AgentPlugin": {
+                    "spec": [
+                        {
+                            "path": "parts[].name",
+                            "name": "name",
+                            "type": "string",
+                            "kind": "scalar",
+                            "external": False,
+                            "required": True,
+                            "default": "a|b",
+                            "constraints": [
+                                {"name": "MaxLength", "value": "63"},
+                                {"name": "items:Pattern", "value": "^(a|b)$"},
+                                {"name": "Enum", "value": "x;y"},
+                                {"name": "MultipleOf", "value": "5"},
+                                {"name": "values:Enum", "value": "p;q"},
+                            ],
+                            "description": "Name of the <part>, see `kind: <k>`.",
+                        }
+                    ],
+                    "status": [],
+                }
+            },
+        ):
+            body = generate_docs.gen_crd_fields("AgentPlugin")
+        self.assertIn(
+            "| `parts[].name` | `string` | yes | `a\\|b` | max length `63`; items pattern `^(a\\|b)$`; "
+            "one of `x`, `y`; multiple of `5`; values one of `p`, `q` | Name of the &lt;part&gt;, see `kind: <k>`. |",
+            body,
+        )
+        self.assertTrue(body.endswith("## Status\n\n" + generate_docs.CRD_EMPTY_TREE))
+
+    def test_escape_cell_leaves_code_spans_alone(self):
+        self.assertEqual(generate_docs.escape_cell("a <b> `<c>` d|e `f|g`"), "a &lt;b&gt; `<c>` d\\|e `f\\|g`")
+
+    def test_an_edited_region_makes_check_exit_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.md"
+            page.write_text(
+                "<!-- BEGIN GENERATED: example -->\n"
+                "edited by hand\n"
+                "<!-- END GENERATED: example -->\n",
+                encoding="utf-8",
+            )
+            blocks = {"example": ((page,), lambda: "FRESH")}
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(generate_docs.main(["--check"], blocks), 1)
+                self.assertIn("edited by hand", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main([], blocks), 0)
+                self.assertIn("FRESH", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main(["--check"], blocks), 0)
+                self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
+
+
+class ConditionsBlockTest(unittest.TestCase):
+    """The PlatformAgent conditions table is rendered from the controller's slice."""
+
+    def test_the_block_is_on_the_crd_guide_and_in_the_go_family(self):
+        paths, generator = generate_docs.BLOCKS[generate_docs.CONDITIONS_BLOCK]
+        self.assertEqual(paths, (generate_docs.CONDITIONS_PAGE,))
+        self.assertIs(generator, generate_docs.gen_platformagent_conditions)
+        # The operator Makefile's `manifests` refreshes the family by prefix.
+        self.assertTrue(generate_docs.CONDITIONS_BLOCK.startswith(generate_docs.CRD_FAMILY_PREFIX))
+        self.assertTrue(generate_docs.needs_go(generate_docs.CONDITIONS_BLOCK))
+        makefile = (generate_docs.REPO / "k8s-operator/Makefile").read_text(encoding="utf-8")
+        self.assertIn(f"CRD_DOC_BLOCK_PREFIX := {generate_docs.CRD_FAMILY_PREFIX}\n", makefile)
+
+    def test_reasons_render_as_a_code_spanned_list(self):
+        self.assertEqual(generate_docs.code_span_list(["A"]), "`A`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B"]), "`A` or `B`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B", "C"]), "`A`, `B` or `C`")
+        row = generate_docs.render_condition_row(
+            {"type": "T", "written": "When <x>", "meaning": "One of {reasons}; a|b", "reasons": ["A", "B"]}
+        )
+        self.assertEqual(row, "| `T` | When &lt;x&gt; | One of `A` or `B`; a\\|b |")
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_table_carries_every_row_with_its_reasons(self):
+        lines = generate_docs.gen_platformagent_conditions().split("\n")
+        self.assertEqual(tuple(lines[:2]), generate_docs.CONDITIONS_TABLE_HEADER)
+        types = [line.split(" | ")[0].removeprefix("| ") for line in lines[2:]]
+        self.assertEqual(types[0], "`Ready`")
+        self.assertIn("`A2AVerifier`", types)
+        self.assertEqual(len(types), len(set(types)))
+        degraded = next(line for line in lines if line.startswith("| `Degraded`"))
+        self.assertIn("`InvalidCredentialProxyExec` or `RBACIncomplete`", degraded)
+        self.assertNotIn(generate_docs.CONDITIONS_REASONS_PLACEHOLDER, "\n".join(lines))
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_hand_edited_row_fails_the_check_with_the_command_that_fixes_it(self):
+        page_text = generate_docs.CONDITIONS_PAGE.read_text(encoding="utf-8")
+        edited = page_text.replace("| `Degraded` | Only while degraded |", "| `Degraded` | Sometimes |", 1)
+        self.assertNotEqual(edited, page_text)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "platformagent-crd.md"
+            blocks = {generate_docs.CONDITIONS_BLOCK: ((page,), generate_docs.gen_platformagent_conditions)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("STALE", out.getvalue())
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_value_syntax_cannot_resolve_is_refused_with_its_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "docs.go").write_text(
+                "package controller\n\n"
+                'const knownType = "Known"\n\n'
+                "var platformAgentConditionDocs = []conditionDoc{\n"
+                '\t{Type: knownType, Written: "w", Meaning: "m"},\n'
+                '\t{Type: strings.ToUpper("x"), Written: "w", Meaning: "m"},\n'
+                "}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as caught:
+                generate_docs.run_go_generator(
+                    generate_docs.CONDITION_DOCS_GENERATOR, ["-dir", tmp], "the conditions table"
+                )
+        self.assertIn("docs.go:7", str(caught.exception))
+        self.assertIn("not a string literal or constant", str(caught.exception))
+
+
+class FootprintBlocksTest(unittest.TestCase):
+    """The install footprint is rendered from the chart, onto the page and into JSON."""
+
+    def test_the_blocks_target_the_page_and_the_json_and_need_helm(self):
+        prefix = generate_docs.FOOTPRINT_BLOCK_PREFIX
+        self.assertEqual(generate_docs.BLOCKS[prefix][0], (generate_docs.FOOTPRINT_PAGE,))
+        self.assertEqual(generate_docs.BLOCKS[f"{prefix}-profiles"][0], (generate_docs.FOOTPRINT_PROFILES_JSON,))
+        for block_id in (prefix, f"{prefix}-profiles"):
+            self.assertTrue(generate_docs.needs_helm(block_id))
+            self.assertFalse(generate_docs.needs_go(block_id))
+
+    def test_a_json_target_is_replaced_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (True, "{}\n"))
+            target.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (False, "{}\n"))
+            self.assertEqual(generate_docs.splice(target, "x", "[]\n"), (True, "[]\n"))
+
+    def test_without_helm_a_write_run_skips_the_footprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            target.write_text("stale\n", encoding="utf-8")
+            blocks = {"install-footprint-x": ((target,), lambda: "FRESH\n")}
+            out = io.StringIO()
+            with mock.patch.object(
+                generate_docs.shutil, "which", side_effect=lambda b: None if b == generate_docs.HELM_BINARY else "/bin/x"
+            ):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(generate_docs.main([], blocks), 0)
+            self.assertIn("skipped  [install-footprint-x]: needs `helm`", out.getvalue())
+            self.assertEqual(target.read_text(encoding="utf-8"), "stale\n")
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_a_hand_edited_figure_fails_the_check(self):
+        page_text = generate_docs.FOOTPRINT_PAGE.read_text(encoding="utf-8")
+        row = next(line for line in page_text.splitlines() if line.startswith("| GKE Standard |"))
+        cells = row.split(" | ")
+        cells[1] = str(int(cells[1]) + 1)
+        edited = page_text.replace(row, " | ".join(cells), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "prerequisites.md"
+            blocks = {"install-footprint": ((page,), generate_docs.install_footprint.render_tables)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_the_figures_come_from_the_chart_and_the_golden(self):
+        footprint = generate_docs.install_footprint
+        model = footprint.profiles_model()["profiles"]
+        self.assertEqual(model["standard"]["sessionQuotaPods"], footprint.golden_session_quota())
+        # Autopilot counts the credential proxy at its Autopilot requests.
+        self.assertGreater(
+            model["autopilot"]["requirements"]["requestsCpu"],
+            model["standard"]["requirements"]["requestsCpu"],
+        )
+        # Hindsight and the minter add chart pods, which the session quota counts.
+        self.assertGreater(model["hindsight-minter"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"])
+        # One NATS server is two fewer standing pods in the quota.
+        self.assertEqual(model["one-server"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"] - 2)
+        self.assertEqual(footprint.cpu(2000), "2")
+        self.assertEqual(footprint.cpu(2756), "2756m")
+        self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
+        self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
+
+    def test_the_session_pod_reads_every_quantity_form_kubernetes_accepts(self):
+        footprint = generate_docs.install_footprint
+        constants = {
+            "workerCPURequest": "1.5",
+            "workerMemoryRequest": "1.5Gi",
+            "workerCPULimit": "2500m",
+            "workerMemoryLimit": "2G",
+            "workerEphemeralStorageRequest": "1Ti",
+        }
+        source = "\n".join(f'\t{name} = "{value}"' for name, value in constants.items())
+        with mock.patch.object(Path, "read_text", return_value=source):
+            pod = footprint._session_pod()
+        self.assertEqual(pod["cpuMillisRequest"], 1500)
+        self.assertEqual(pod["memoryBytesRequest"], 1536 * 1024**2)
+        self.assertEqual(pod["cpuMillisLimit"], 2500)
+        self.assertEqual(pod["memoryBytesLimit"], 2 * 1000**3)
+        self.assertEqual(pod["ephemeralStorageBytesRequest"], 1024**4)
+
+    def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
+        footprint = generate_docs.install_footprint
+        self.assertEqual(footprint._per_pod({"pods": 2, "cpuMillisRequest": 100, "surges": True}), {"cpuMillisRequest": 50})
+        with self.assertRaises(SystemExit) as caught:
+            footprint._per_pod({"pods": 2, "cpuMillisRequest": 101})
+        self.assertIn("cpuMillisRequest", str(caught.exception))
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_an_a2a_workload_the_table_does_not_list_fails_the_render(self):
+        footprint = generate_docs.install_footprint
+        with mock.patch.object(footprint, "A2A_WORKLOADS", footprint.A2A_WORKLOADS[1:]):
+            with self.assertRaises(SystemExit) as caught:
+                footprint.workloads_rows()
+        self.assertIn("a2aNats", str(caught.exception))
+        self.assertIn("A2A_WORKLOADS", str(caught.exception))
+
+
+class ReplayBaselineMetricsTest(unittest.TestCase):
+    """The replay proxy README's metric table is baseline_report.py's METRICS and CASE_METRICS."""
+
+    def test_the_block_is_registered_for_the_replay_proxy_readme(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["replay-baseline-metrics"],
+            ((generate_docs.REPLAY_PROXY_README,), generate_docs.gen_replay_baseline_metrics),
+        )
+
+    def test_every_metric_is_a_row_with_its_unit_and_headline_mark(self):
+        module = generate_docs.load_replay_baseline_module()
+        body = generate_docs.gen_replay_baseline_metrics()
+        for metric in module.METRICS:
+            mark = "yes" if metric.headline else ""
+            self.assertIn(f"| `{metric.name}` | {metric.unit} | {mark} |", body)
+        for metric in module.CASE_METRICS:
+            self.assertIn(f"| `{metric.name}` | {metric.unit} |", body)
+
+
+class SkillCatalogTest(unittest.TestCase):
+    """Platform and Cluster Agent skills that share a name keep their own descriptions."""
+
+    def test_shared_skill_names_render_each_trees_own_description(self):
+        platform_skills = generate_docs._read_skills(generate_docs.SKILLS_DIR)
+        cluster_skills = generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR)
+        shared = sorted(set(platform_skills) & set(cluster_skills))
+        self.assertTrue(shared, "expected at least one shared skill name across trees")
+
+        catalog = generate_docs.gen_skill_catalog()
+        platform_part, cluster_part = catalog.split(
+            f"### {generate_docs.CLUSTER_SKILL_GROUP}\n", 1
+        )
+        for name in shared:
+            platform_link = f"{generate_docs.GITHUB_BLOB}/agents/platform/skills/{name}/SKILL.md"
+            cluster_link = f"{generate_docs.GITHUB_BLOB}/agents/cluster/skills/{name}/SKILL.md"
+            self.assertIn(
+                f"| [`{name}`]({platform_link}) | {generate_docs.md_escape(platform_skills[name])} |",
+                platform_part,
+            )
+            self.assertIn(
+                f"| [`{name}`]({cluster_link}) | {generate_docs.md_escape(cluster_skills[name])} |",
+                cluster_part,
+            )
 
 
 if __name__ == "__main__":

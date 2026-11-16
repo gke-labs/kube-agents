@@ -42,6 +42,11 @@ on:
           - "fail"
           - "ignore"
           - "defer"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -116,6 +121,8 @@ jobs:
       mode: "apply"
       image_tag: ${{ needs.resolve-candidate.outputs.commit_sha }}
       lease_policy: ${{ needs.resolve-candidate.outputs.lease_policy }}
+      # Null on the automatic triggers, which only ever move forward.
+      allow_breaking_downgrade: ${{ inputs.allow_breaking_downgrade == true }}
       # Until the environment exists with a GCP_PROJECT_ID. Drop it once it
       # does, so an environment that loses its configuration reds this run.
       skip_unconfigured: true

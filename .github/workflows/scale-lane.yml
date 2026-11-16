@@ -1,0 +1,209 @@
+name: Scale Lane
+
+# Measures the two stock binaries that read a cluster at scale, the event
+# watcher and the k8s-api-proxy, against a large KWOK cluster:
+# tests/scale/kwok/README.md says what the lane is and what the JSON holds.
+# Measurements only. No measured value fails the run; the job goes red only
+# when a step could not run (the tools did not install, the cluster did not
+# come up, the seeder or a read errored).
+#
+# Two profiles. A pull request that touches the lane runs the `smoke` profile
+# (100 nodes, 3,000 pods, about ten minutes); the schedule runs `large-cluster`
+# (2,000 nodes, 60,000 pods, most of the 150-minute budget); a dispatch runs
+# the profile it names, `smoke` unless told otherwise. The `Resolve the
+# profile` step is the one place that mapping lives.
+#
+# The pull-request trigger filters with `paths:` at the trigger, not in a
+# step: this is not a required check, so a run that never starts blocks
+# nothing, and an unrelated pull request should not spend 4 vCPU for ten
+# minutes seeding a cluster. k8s-operator-test.yml's header says why a
+# required check cannot filter this way.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+    paths:
+      - "tests/scale/kwok/**"
+      - "k8s-operator/cmd/kwok-seed/**"
+      # The seeder reuses this package's object generator, so a change to the
+      # shapes it emits changes what the lane measures.
+      - "k8s-operator/internal/testing/fakeapiserver/**"
+      - ".github/workflows/scale-lane.yml"
+  #checkov:skip=CKV_GHA_7:One input, the profile, a choice between the two profile files; it reaches the steps through env, nothing is built from it and it is not interpolated into a shell
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: The profile under tests/scale/kwok/profiles/ to seed and measure
+        type: choice
+        options: [smoke, large-cluster]
+        default: smoke
+  schedule:
+    # Off the hour, because GitHub queues on-the-hour crons behind everyone
+    # else's, and in the quiet window before the 06:00 drift report and the
+    # 06:17 release scheduler.
+    - cron: "23 3 * * *"
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
+jobs:
+  baseline:
+    name: Seed a KWOK cluster and measure the watcher and the proxy
+    # A fork inherits the schedule. Nothing here needs a secret, but an
+    # unguarded job would spend 90 minutes of the fork owner's runner budget
+    # every night on a measurement nobody reads.
+    if: github.repository == 'gke-labs/kube-agents'
+    # ubuntu-latest, because on a public repository it is the 4 vCPU / 16 GB
+    # standard runner, and the large-cluster profile needs the 16 GB: the
+    # kwok API server alone reaches 5 GB of RSS at 60,000 pods, and the
+    # seeder's worker pool, the controller manager and the two unpaged pod
+    # lists sit beside it. A smaller runner cannot hold that, and a larger one
+    # is a paid class this repository does not use.
+    runs-on: ubuntu-latest
+    # Seeding the large-cluster profile took 18 minutes on an 8 vCPU machine
+    # and its baseline 35 more; the runner has half the cores.
+    timeout-minutes: 150
+    env:
+      # One cluster per run. The name is also the kubeconfig's file name under
+      # kwok-cluster.sh's state directory, and the `down` step at the end
+      # deletes it by this name.
+      CLUSTER_NAME: scale
+      PROFILE_DIR: tests/scale/kwok/profiles
+      # baseline.sh reads this variable for where it writes, so the artifact
+      # step below uploads the directory the script wrote into, whatever the
+      # script's own default is. Gitignored; it holds the JSON and the logs.
+      BASELINE_OUT_DIR: tests/scale/kwok/results
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # schedule -> large-cluster; dispatch -> the input; pull_request ->
+      # smoke. Resolved once, here, so every later step reads the same name
+      # and the artifact carries it.
+      - name: Resolve the profile
+        id: profile
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+          SCHEDULE_PROFILE: large-cluster
+          PULL_REQUEST_PROFILE: smoke
+        run: |
+          case "$EVENT_NAME" in
+            schedule) profile="$SCHEDULE_PROFILE" ;;
+            workflow_dispatch) profile="$INPUT_PROFILE" ;;
+            *) profile="$PULL_REQUEST_PROFILE" ;;
+          esac
+          if [ ! -f "${PROFILE_DIR}/${profile}.json" ]; then
+            echo "::error::No profile file ${PROFILE_DIR}/${profile}.json for event ${EVENT_NAME}."
+            exit 1
+          fi
+          echo "Profile: ${profile}"
+          echo "profile=${profile}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache: true
+          # Two modules build here: the seeder and the event watcher from
+          # k8s-operator, the proxy from k8s-api-proxy (baseline.sh builds the
+          # last two).
+          cache-dependency-path: |
+            k8s-operator/go.sum
+            k8s-api-proxy/go.sum
+
+      # kwokctl downloads the control-plane binaries for `--runtime binary`
+      # (kube-apiserver, kube-controller-manager, etcd) into this directory on
+      # the first `create cluster`, and the two pins in kwok-cluster.sh decide
+      # which. The key is read from the script (`pins` prints both versions),
+      # so a bump there misses the old cache instead of serving the old
+      # binaries, and nothing has to be kept equal by hand. A miss is not a
+      # failure: kwokctl downloads again. Restore everywhere, save from the
+      # schedule only: a save from a pull-request ref is visible to that ref
+      # alone and still counts against the repository's cache budget, which
+      # k8s-operator-test.yml notes is already over its 10 GB.
+      - name: Read the kwok pins for the cache key
+        id: pins
+        run: echo "key=${RUNNER_OS}-$(./tests/scale/kwok/kwok-cluster.sh pins)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the kwokctl download cache
+        id: kwok-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.kwok/cache
+          key: ${{ steps.pins.outputs.key }}
+
+      - name: Install kwokctl and kwok
+        run: ./tests/scale/kwok/kwok-cluster.sh install-tools
+
+      - name: Create the cluster
+        run: ./tests/scale/kwok/kwok-cluster.sh up "$CLUSTER_NAME"
+
+      # The first `up` filled the cache directory; keep it for the next night
+      # and for every pull-request run, which restore from main's entries.
+      - name: Save the kwokctl download cache
+        if: github.event_name == 'schedule' && steps.kwok-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.kwok/cache
+          key: ${{ steps.pins.outputs.key }}
+
+      # From k8s-operator, because the seeder imports that module's
+      # fakeapiserver package, which only the module tree may. The summary
+      # goes to the runner's temp directory and baseline.sh embeds it in its
+      # JSON, so it needs no upload of its own.
+      - name: Seed the cluster
+        env:
+          PROFILE: ${{ steps.profile.outputs.profile }}
+        run: |
+          kubeconfig="$(./tests/scale/kwok/kwok-cluster.sh kubeconfig "$CLUSTER_NAME")"
+          cd k8s-operator
+          go run ./cmd/kwok-seed \
+            --profile "${GITHUB_WORKSPACE}/${PROFILE_DIR}/${PROFILE}.json" \
+            --kubeconfig "$kubeconfig" \
+            --summary-out "${RUNNER_TEMP}/seed.json"
+
+      # Prints a Markdown table and appends it to the job summary itself.
+      - name: Measure the watcher and the proxy
+        env:
+          PROFILE: ${{ steps.profile.outputs.profile }}
+        run: |
+          BASELINE_SEED_SUMMARY="${RUNNER_TEMP}/seed.json" \
+            ./tests/scale/kwok/baseline.sh "$CLUSTER_NAME" "$PROFILE"
+
+      # always(): a baseline that stopped half way still leaves the proxy and
+      # watcher logs, which are what explains the stop. An empty directory is
+      # an error, not a warning: the record is the lane's one product.
+      - name: Upload the baseline
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scale-baseline-${{ steps.profile.outputs.profile || 'unresolved' }}-${{ github.run_id }}
+          path: ${{ env.BASELINE_OUT_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # always(): the control-plane processes outlive a failed step until the
+      # runner is torn down, and a self-hosted runner never is; a cluster left
+      # behind holds its ports and the next `up` reports it as existing.
+      # `down` exits 0 when there is nothing to delete.
+      - name: Delete the cluster
+        if: always()
+        run: ./tests/scale/kwok/kwok-cluster.sh down "$CLUSTER_NAME"

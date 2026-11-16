@@ -47,6 +47,22 @@ locals {
   # arithmetic (seeded_d's block below works it for the fourth).
   cluster_labels = merge(local.fleet_labels, {
     "environment" = "seeded"
+    # The rollout family. The upgrade rollout's family gate reads
+    # `resourceLabels.upgrade-family`: the first member of a family to take
+    # an upgrade is the canary whose post-upgrade diff releases or holds the
+    # rest. Three clusters share the regular family; seeded-b, pinned a minor
+    # behind, is a held family of its own (held_cluster_labels below), so the
+    # regular family's rollout never waits on the lag. The KEY is on every
+    # cluster in this stack because fleet_drift's label-keys facet compares
+    # label keys across the cohort: a key on three clusters and not the
+    # fourth would be a drift finding on the fourth.
+    "upgrade-family" = "seeded-regular"
+  })
+
+  # seeded-b's resource labels: the same keys as cluster_labels, with the
+  # held family's value.
+  held_cluster_labels = merge(local.cluster_labels, {
+    "upgrade-family" = "seeded-held"
   })
 }
 
@@ -104,15 +120,17 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # identity has to create GKE clusters for the eval tasks, so handing it to the
 # verifiers would be handing them cluster-admin on the shared fleet.
 #
-# roles/container.viewer is the whole grant, verified against the live role
-# rather than assumed: get/list only, no create/update/delete/patch on any
+# roles/container.viewer is the whole grant on the clusters, verified against
+# the live role rather than assumed (roles/compute.viewer, below, reads the
+# project-scoped Compute Engine fixtures): get/list only, no
+# create/update/delete/patch on any
 # Kubernetes object (its one *.create is container.tokenReviews.create, the
 # read-shaped token validation API), and no container.secrets.* at all -- so
 # this account cannot read a Secret on platform-agent-host either. It is
 # project-scoped because IAM is where GKE authorization starts; the fleet
 # stack configures a kubernetes provider only for the clusters it plants
-# objects on, and seeded-c has none, so an RBAC-level grant could not cover
-# every cluster.
+# objects on (seeded-a, seeded-c and seeded-d; seeded-b carries none), so an
+# RBAC-level grant could not cover every cluster.
 #
 # hack/fleet-kubeconfigs.sh binds it by minting an access token
 # (FLEET_READONLY_SA), which is why the token-creator grant below exists.
@@ -128,6 +146,22 @@ resource "google_service_account" "fleet_reader" {
 resource "google_project_iam_member" "fleet_reader_container_viewer" {
   project = var.project_id
   role    = "roles/container.viewer"
+  member  = "serviceAccount:${google_service_account.fleet_reader.email}"
+}
+
+# The project-scoped fixtures (the startup-fail VM, the world-open firewall
+# rule and its VM; fixtures.json roles with cluster_slot null) are Compute
+# Engine objects, which container.viewer cannot read. The CI health bot's scan
+# runs every gcloud read as this account, so the presence probe and the state
+# pass list instances and firewall rules as it (#2483, #2682), and the state
+# pass reads the startup-fail VM's serial port output as it.
+# roles/compute.viewer is get and list on Compute Engine resources, with no
+# create, update or delete. It does show instance metadata and serial port
+# output (compute.instances.getSerialPortOutput), so no secret goes in this
+# project's instance metadata or to a fleet VM's serial console.
+resource "google_project_iam_member" "fleet_reader_compute_viewer" {
+  project = var.project_id
+  role    = "roles/compute.viewer"
   member  = "serviceAccount:${google_service_account.fleet_reader.email}"
 }
 
@@ -150,8 +184,9 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # read-only checks against every pool project as the bot itself, so it needs
 # project-level read here: the project and its IAM policy, the service
 # accounts' policies, the service listing, the cluster listing, the
-# repository, the key and its policy, the state bucket's metadata. These
-# roles cover every read those checks make on the project; none writes. The
+# repository, the key and its policy, the state bucket's metadata, the forge
+# pieces' zone, records, addresses and firewall rules. These roles cover
+# every read those checks make on the project; none writes. The
 # warm-cache repository's policy in the Prow project stays unread. They live in this
 # stack, beside the reader's token-creator grant, because this is the one
 # stack every pool project applies: a project provisioned after this landed
@@ -166,6 +201,8 @@ locals {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
@@ -203,22 +240,23 @@ resource "google_project_iam_member" "pool_state_readers" {
 # ForceNew nor ignored, and the provider answers a raised value with
 # clusters.update carrying desiredMasterVersion, upgrading only when the
 # recorded master is lower (resource_container_cluster.go). So the reconcile
-# CARRIES THE MASTER FORWARD: a new REGULAR patch inside the held minor moves
-# the master to it, and the day REGULAR's default rolls a minor the pin
-# recomputes and the next apply walks the master to the new
+# MOVES THE MASTER BETWEEN MINORS: the day REGULAR's default rolls a minor
+# the pin recomputes and the next apply walks the master to the new
 # default-minus-one, one minor per apply (GKE's control-plane rule), so a
-# master further behind reaches the target over the applies that follow.
-# Both are manual upgrades in GKE's sense, which the
-# exclusion does not gate; the channel rule above does. So when the running
-# patch is one REGULAR does not carry, the script HOLDS the pin instead of
-# asking for the refused bump: the newest REGULAR patch of the running minor
-# above it when there is one (the one upgrade GKE allows), else the running
-# version, and the rest of the project applies; the apply after the step does
-# the minor bump from an on-channel patch. As of 2026-10-14 REGULAR's newest
-# 1.34 is below seeded-b's 1.34.12-gke.1011000, so the hold lasts until
-# REGULAR ships a 1.34 patch above it; if REGULAR drops 1.34 first, no pin
-# can recover and the cluster is upgraded by hand or destroyed and
-# re-created (the recovery below).
+# master further behind reaches the lag minor over the applies that follow.
+# Inside the lag minor the pin is the running version, so the patch does not
+# move: a pin at REGULAR's newest patch put seeded-b back on the channel's
+# list every morning, and the upgrades cases that read seeded-b for a patch
+# REGULAR has moved past never saw one. A provider upgrade is a
+# manual upgrade in GKE's sense, which the exclusion does not gate; the
+# channel rule above does. So when a cluster below the lag minor runs a
+# patch REGULAR does not carry, the script steps it first instead of asking
+# for the refused bump: the newest REGULAR patch of the running minor above
+# it when there is one (the one upgrade GKE allows), else the running
+# version, and the rest of the project applies; the apply after the step
+# does the minor bump from an on-channel patch. If REGULAR drops the minor
+# first, no pin can recover and the cluster is upgraded by hand or destroyed
+# and re-created (the recovery below).
 #
 # The provider only ever upgrades (cur < des) and a control plane cannot be
 # downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
@@ -272,6 +310,10 @@ resource "google_container_cluster" "seeded_a" {
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
   # it, and the label plus README are the guard against accidental sweeps.
+  # This cluster is the exception: the scaled-zero gateway fixture's
+  # kubernetes_manifest resources (defects-a.tf) cannot plan while its endpoint
+  # is unknown, so creating or replacing seeded-a is the README's two-apply
+  # hand recovery, not a reconcile.
   deletion_protection = false
 
   logging_config {
@@ -285,6 +327,29 @@ resource "google_container_cluster" "seeded_a" {
   # fixtures nothing.
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # GKE installs and manages the standard Gateway API CRDs. A scaled-to-zero
+  # gateway fixture (#3198) plants Gateway API objects on this cluster, and the
+  # kubernetes provider reads a CRD at plan time, so the CRDs must exist on
+  # every project before that fixture's objects are added. Not a drift facet
+  # (fleet_consistency_drift_sop.md section 4), so enabling it on one cluster
+  # changes no consistency finding. An in-place update.
+  gateway_api_config {
+    channel = "CHANNEL_STANDARD"
+  }
+
+  # The GKE Config Connector add-on (#4218). The Config Connector eval cases
+  # need a cluster in the audited fleet that runs Config Connector, and only
+  # this cluster gets it. GKE installs the CRDs and the operator. The
+  # ConfigConnector object that turns on namespaced mode is in
+  # config-connector.tf. Not a drift facet (fleet_consistency_drift_sop.md
+  # section 4), so it changes no consistency finding. An in-place update.
+  # Workload Identity, which the add-on needs, is on above.
+  addons_config {
+    config_connector_config {
+      enabled = true
+    }
   }
 
   # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
@@ -325,26 +390,32 @@ resource "google_container_cluster" "seeded_a" {
 }
 
 resource "google_container_node_pool" "seeded_a_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_a.name
-  node_count = 2
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_a.name
+  # Three since the Config Connector add-on (#4218), two before. Measured on
+  # a dev cluster that runs the add-on, its pods request about 1,020m CPU at
+  # all times (cnrm-webhook-manager 2 x 250m, cnrm-deletiondefender 250m,
+  # cnrm-unmanaged-detector 250m, cnrm-resource-stats-recorder 20m), 100m
+  # more for each namespaced controller while a ConfigConnectorContext
+  # exists, and the configconnector-operator pod: more than the core each
+  # node had spare, and default-pool-headroom requires 100m spare on every
+  # node. A node_count change is an in-place resize, not a
+  # replace: no reconcile-allow.json entry, and the machine type stays.
+  node_count = 3
 
   node_config {
-    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
-    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
-    # and the binding constraint is CPU *requests*, not memory: one
-    # e2-medium's 940m allocatable is fully claimed by system pods alone
-    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
-    # The fixtures only ever ran because they scheduled before the system
-    # set filled in; the weekend auto-upgrade rebuilt the node, system-
-    # critical pods scheduled first, and every fixture went Pending on all
-    # 30 pool projects. A second node holds the fixtures plus the Pending
-    # system deployments with ~600m to spare, and survives the next node
-    # rebuild (surge upgrades rotate one node at a time). Matches the live
-    # `gcloud container clusters resize` applied during the incident, so
-    # the next apply is a no-op, not a pool replacement.
-    machine_type    = "e2-medium"
+    # e2-standard-2 (2026-10-20, #3607; two e2-mediums since
+    # #1278, one before). The binding constraint is CPU *requests*: GKE's
+    # system pods (kube-dns at 270m a replica, kube-proxy, metadata-server,
+    # fluentbit, konnectivity, ...) take 700-860m of an e2-medium's 940m
+    # allocatable, the fixtures are 10m each, and the busier node was within
+    # 2-47m of full on every pool project, so each new fixture strands a pod
+    # somewhere. A dedicated-core size allocates 1930m, about a core spare
+    # per node. The provider updates machine_type in place (plan: one
+    # update, no replace), so GKE recreates the two nodes one at a time
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
@@ -461,6 +532,57 @@ resource "google_container_node_pool" "pinned_inference_pool" {
   }
 }
 
+# Posture (capacity): a single-zone autoscaling pool that is zone-locked and
+# nothing else -- no NAP on the cluster, tainted so no multi-zone pool counts
+# as its fallback, and held at zero nodes so it never nears its ceiling (the
+# stockout SOP's 3.9 flags a pool at 90% of its ceiling as a second arm, and
+# a declaration covers the zone-locked arm alone). The pool project's GitOps
+# repository declares it on purpose in knowledge/notification-relay-no-pdb.md,
+# so the capacity audit lists it under Declared intent, not as a finding;
+# pinned-inference-pool above cannot play this part because its Pending
+# backlog and its 1/1 ceiling are the defect stockout-pinned-pool grades.
+# Zero nodes cost nothing; the taint keeps the autoscaler from ever adding
+# one for a stray pod. Catalogue role: declared-single-zone-pool.
+resource "google_container_node_pool" "declared_zonal_pool" {
+  name       = "declared-zonal-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 2
+  }
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "declared-zonal"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "declared-zonal"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -497,11 +619,12 @@ resource "google_container_cluster" "seeded_b" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.cluster_labels
+  resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
-  # REGULAR's own newest previous-minor patch, or the hold when the running
-  # patch is one REGULAR does not carry: the comment above the data source.
+  # REGULAR's own newest previous-minor patch on a create; the running
+  # version once the cluster is in that minor, listed by REGULAR or not;
+  # the comment above the data source has the rest.
   min_master_version = local.lagging_version
   release_channel {
     channel = "REGULAR"
@@ -541,7 +664,7 @@ resource "google_container_cluster" "seeded_b" {
 
   # The other peer of the consistency majority: B matches A (authorized
   # networks ON, open block -- see seeded_a for why this is safe), so C is
-  # the single outlier on a single facet.
+  # the single outlier on the authorized-networks facet.
   master_authorized_networks_config {
     cidr_blocks {
       cidr_block   = "0.0.0.0/0"
@@ -558,22 +681,49 @@ resource "google_container_cluster" "seeded_b" {
 }
 
 resource "google_container_node_pool" "seeded_b_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_b.name
-  node_count = 1
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_b.name
+  # Two nodes, so GKE's own kube-system pods have room. seeded-b has a second
+  # node (no-surge-pool, defects-b.tf) that only pinned-batch-runner
+  # tolerates, so kube-dns's autoscaler asks for two replicas and a system
+  # Deployment's rolling update needs surge room; one e2-small at about 92%
+  # requested left kube-dns's second replica and event-exporter Pending,
+  # which workload_triage.py reports as `system unhealthy` and the fleet
+  # health triage case cannot call a healthy cluster. A node_count change is
+  # an in-place resize. No planted fixture reads this pool's node count: the
+  # surge and drain fixtures live on no-surge-pool, and the LB drain fixture
+  # reads the pool's instance group, which keeps its URL.
+  node_count = 2
   version    = local.lagging_version
 
+  # Each node's step waits out the LB drain fixture's 720 seconds
+  # (defects-b.tf), about 18 minutes. GKE's default surge of 1 would roll
+  # the two nodes one after the other, about 36 minutes, which beside a
+  # master update in the same apply can pass the reconcile's one-hour
+  # ceiling. Surging both at once keeps the roll one step. This is not a
+  # node-first pool, so the readiness surge-capacity rule names only
+  # no-surge-pool.
+  upgrade_settings {
+    max_surge       = 2
+    max_unavailable = 0
+  }
+
+  # Headroom over the one-step roll for the provider's 30-minute default.
+  timeouts {
+    update = "45m"
+  }
+
   # The pool takes the SAME derived pin as the master, and is deliberately
-  # not ignore_changes'd: min_master_version carries the control plane
-  # forward on every reconcile (see the block above), so a frozen pool
-  # would skew against it. Freezing it costs a finding in both directions:
+  # not ignore_changes'd: min_master_version moves the control plane at a
+  # minor roll (see the block above), so a frozen pool would skew against
+  # it. Freezing it costs a finding in both directions:
   # at the next REGULAR minor roll the master moves and the pool does not,
   # which is upgrade SOP 3.2 `pool-skew` -- exactly one minor behind with
   # autoUpgrade true, severity minor -- and even without a minor roll the
-  # same asymmetry leaks at patch level, because GKE auto-upgrades the pool
-  # to the channel's default patch while the pin pushes the master to the
-  # freshest patch of the minor, which 3.2 flags as patch-only drift.
+  # same asymmetry leaks at patch level, because GKE's own patch
+  # auto-upgrade may move the master in its window while a frozen pool
+  # waits for node auto-upgrade, which 3.2 flags as patch-only drift.
   # Either would be an undeclared finding on a fleet whose whole premise is
   # that a correct audit's findings are known in advance. Driving both from
   # local.lagging_version keeps them equal at steady state; the pool
@@ -613,9 +763,12 @@ resource "google_container_node_pool" "seeded_b_default" {
 # normalizes to OFF -- absence on one cluster against an ON majority is the
 # finding (SOP 4.5, base critical, the severity that survives a
 # three-cluster cohort's two ladder steps). Two agree, one differs: the
-# reason this fleet is at least three clusters and not two. Everything else on C
-# deliberately matches its peers, so C is an outlier on exactly one facet
-# and the split-cluster guard never mistakes it for an uncohorted cluster.
+# reason this fleet is at least three clusters and not two. Everything else
+# on C's control plane deliberately matches its peers; its default pool
+# differs on boot-disk size and kubelet config (seeded_c_default below),
+# which no facet reads today and two will. One facet today, three once
+# those land, either count under the six at which the split-cluster guard
+# (SOP 3.6) stops calling C drift and calls it a different kind of cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -630,7 +783,8 @@ resource "google_container_cluster" "seeded_c" {
   }
 
   # Upgrade-SOP background closure, as on seeded-a: REGULAR channel and a
-  # window. The consistency defect above is authorized networks alone.
+  # window. The consistency defects are authorized networks on the control
+  # plane (above) and the default pool's disk and kubelet config (below).
   release_channel {
     channel = "REGULAR"
   }
@@ -649,20 +803,92 @@ resource "google_container_cluster" "seeded_c" {
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
+
+  # Defect (networking): NodeLocal DNSCache off. GKE turns the add-on on by
+  # default on Standard from 1.34.1, and Autopilot cannot turn it off, so this
+  # is the one cluster in a pool project without it; every pod DNS lookup
+  # here crosses a kube-dns conntrack entry. Inert for the fixtures (pods
+  # resolve through kube-dns as before) and not a drift facet. An in-place
+  # cluster update that re-creates the pool's node: GKE documents the roll as
+  # one that honours the maintenance window above; on the dev fleet it ran
+  # during the apply (that apply also moved the pool's disk size, which rolls
+  # nodes too). The slot-c roles read absent for those minutes either way.
+  # Addressed by the no-nodelocal-dnscache role.
+  addons_config {
+    dns_cache_config {
+      enabled = false
+    }
+  }
 }
 
+# Defect (consistency, pool-level): the same cluster's default pool is the
+# outlier on two node facets the drift SOP does not read yet, `boot-disk`
+# and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
+# disk of the default type with no kubelet block; this one runs 50 GB (type
+# unchanged: size alone differed in the incident behind the facets) and
+# sets one kubelet key, cpu_cfs_quota, to false. False rather than the
+# default true, so the facet reads a difference whether it treats an absent
+# key as unset or as the default; CFS quota off on a node that runs only
+# system pods changes nothing anyone measures. Both fields update in place
+# on the pinned provider (8.4.0): GKE recreates the pool's one node, the
+# pool keeps its identity, and the cluster's createTime does not move, so
+# the drift SOP's 24-hour cohort gate is untouched and no reconcile-allow
+# entry is needed. The fixture role is drift-pool-outlier (fixtures.json);
+# the facets and the case that reads it are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
   cluster    = google_container_cluster.seeded_c.name
   node_count = 1
 
+  # Autoscaling held at one node (the pinned-inference-pool shape on slot a):
+  # a ComputeClass `nodepools` rule names only pools with autoscaling on, and
+  # without it GKE marks the class CrdMisconfigured ("Nodepool default-pool
+  # specified by name has autoscaling disabled", read 11-10 on a dev fleet),
+  # which stockout 3.12(b) would file on every project. One to one, so the
+  # autoscaler can neither add a node nor remove the one. Drift's
+  # pool-autoscaling facet flags only a cluster with LESS autoscaling than its
+  # peers (`_flag_less_only`), so the extra vote changes no drift finding.
+  # The stockout audit's 3.9 `single-zone-nodepool` does read a zonal
+  # autoscaled pool with no fallback, as it reads pinned-inference-pool on
+  # slot a; README.md's accepted-background table declares it.
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 1
+  }
+
   node_config {
-    machine_type    = "e2-small"
-    disk_size_gb    = 20
+    # e2-medium since the ComputeClass fixtures (defects-c.tf): GKE's system
+    # pods request about 99 percent of an e2-small's allocatable memory
+    # (1,420 of 1,424 MiB, read 11-10 on a dev fleet at 1.36), so three of the
+    # five fixture pods sat Pending on it at 8Mi each. Memory, not CPU, is the
+    # binding constraint here, the same wall seeded-a hit (#1278, #3607). The
+    # provider updates machine_type in place and GKE re-creates the one node
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-medium"
+    disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # Defect (stockout): the pool is bound to ComputeClass general-ccc
+    # (defects-c.tf) by this label and carries no matching
+    # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
+    # scheduler places untargeted pods on it until it is full and the
+    # autoscaler's pre-filter then drops them. With this the cluster has no
+    # untainted pool without a class label, which is what lets the
+    # obtainability audit's 3.24 file the untargeted workloads in
+    # defects-c.tf. A label change is an in-place pool update on provider 8.x
+    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # settings around it stay the drift-pool-outlier fixture.
+    # Addressed by the untainted-compute-class-pool role.
+    labels = {
+      "cloud.google.com/compute-class" = "general-ccc"
+    }
+
+    kubelet_config {
+      cpu_cfs_quota = false
+    }
 
     workload_metadata_config {
       mode = "GKE_METADATA"
@@ -778,8 +1004,12 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on
 # current images is `Script "startup-script" failed with error: exit status 1`.
-# The script exits 1 on every boot, so the line is on the console from the
-# first boot onward, with no age gate. The audit reads the project, not a
+# The script exits 1 on every boot, and the guest prints the line once per
+# boot. The serial buffer keeps about 1 MiB, and this VM's guest agent logs
+# two errors an hour (it has no service account), so the line rotates out
+# about three weeks after a boot. hack/fleet_reconcile.py resets the VM after
+# each reconcile to print it again, and the fixture-state scan reads the
+# console for it (fixtures.json, startup-fail-vm). The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
 # account: the VM does nothing but fail. The name leads with `startup-fail-`
 # so the case can grade `/startup-fail-`, which only the finding's object path
@@ -841,7 +1071,8 @@ resource "google_container_cluster" "seeded_d" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # local.cluster_labels, the same as a, b and c. The runner has no other way to
+  # local.cluster_labels, the same as a and c (seeded-b carries
+  # held_cluster_labels: the same keys). The runner has no other way to
   # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
   # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
   # cluster without the environment label is never listed, never resolves to a

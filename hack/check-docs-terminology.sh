@@ -92,6 +92,15 @@ forbid 'kubeagents-platform-agent-gsa' \
 forbid 'platform-agent-ksa' \
   "Wrong Kubernetes service account name. common.sh sets PLATFORM_AGENT_KSA_NAME=kubeagents-platform-agent (no -ksa suffix)."
 
+# --- Eval results tied to a third-party model ------------------------------
+# The evidence store keys each case's record by the agent model (<model>-kubeagents-mcp).
+# A third-party model's key in a document is a pass count or timing attributed to that
+# model in public; the records cite the date of the model change instead
+# (docs/eval-gate-roster.md). Product docs that list a model as a BYOM option name the
+# bare model, never the key, so this matches results only.
+forbid 'claude-[a-z0-9.-]*-kubeagents(-mcp)?' \
+  "An eval evidence-store key names a third-party model in public documentation. Cite the date of the model change instead (docs/eval-gate-roster.md does)."
+
 # --- Namespace ------------------------------------------------------------
 forbid 'platform-agent-system' \
   "Stale namespace. install.defaults.env sets DEFAULT_NAMESPACE=kubeagents-system."
@@ -221,11 +230,12 @@ if [ -n "$WRONG_GO" ]; then
 fi
 
 # --- cert-manager version -------------------------------------------------
-# Ground truth: images.json, which the mirror tooling also reads to build the release
-# URL it applies. Three pages quote the version back — two of them inside a
-# copy-pasteable `kubectl apply` URL — and there is nothing else to catch them,
-# because the pin has no other consumer to disagree with. Left unguarded, the
-# next cert-manager bump would hand readers a manifest the install does not use.
+# Ground truth: images.json. Markdown pages quote the version back, one of them
+# inside a copy-pasteable `kubectl apply` URL, and nothing else catches them. The
+# regex below sees only lines that name cert-manager; the non-Markdown copies
+# (the variables.tf default, the tfvars example, the mirror_images.sh comment)
+# are not checked here. Left unguarded, the next cert-manager bump would hand
+# readers a manifest the install does not use.
 CERT_MANAGER_VERSION=$(jq -r '.images[] | select(.name == "cert-manager-controller") | .tag' images.json)
 if [ -z "$CERT_MANAGER_VERSION" ] || [ "$CERT_MANAGER_VERSION" = "null" ]; then
   echo "ERROR: no cert-manager-controller pin in images.json; the version guard cannot run." >&2
@@ -247,7 +257,8 @@ fi
 
 # --- fleet-audit finding id pattern ---------------------------------------
 # Ground truth: FINDING_ID_RE in the fleet-audit harness. Two documents quote
-# this pattern back to the model — SKILL.md and the ledger design doc — and an
+# this pattern back to the model — the skill's findings-document reference and
+# the ledger design doc — and an
 # id that does not match is rejected before anything is published. When the
 # pattern was last relaxed, every copy silently went stale, so the docs told
 # the model to generate ids the validator refused.
@@ -293,7 +304,7 @@ fi
 
 # --- fleet-audit rendering caps -------------------------------------------
 # Ground truth: the module constants in the fleet-audit harness. Every one is
-# hand-copied into SKILL.md, the governance SOPs, the design doc, and the site
+# hand-copied into the skill's reference files, the governance SOPs, the design doc, and the site
 # so the model knows what the renderer will do to its output, and until now
 # nothing checked a single copy. A stale cap is not cosmetic: it teaches the
 # model to pad an excerpt the clipper then truncates mid-object, or to withhold

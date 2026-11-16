@@ -52,7 +52,7 @@ ADAPTER_CLASS = "SlackAdapter"
 BRACKETED_SEND = (
     "try:\n"
     "    result = await delivery_adapter._send_with_retry(chat_id=event.source.chat_id, "
-    "content=text_content, reply_to=reply_to, metadata=metadata)\n"
+    "content=_kage_slack_failure.visible(event, text_content), reply_to=reply_to, metadata=metadata)\n"
     "finally:\n"
     "    _kage_slack_failure.end(_kage_failure_token)"
 )

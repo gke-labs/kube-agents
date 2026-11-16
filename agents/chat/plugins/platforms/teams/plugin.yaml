@@ -1,0 +1,8 @@
+name: teams-platform
+label: Microsoft Teams
+kind: platform
+version: 1.0.0
+description: >
+  Microsoft Teams Bot Framework relay platform backed by the credential-proxy
+  sidecar.
+author: kube-agents

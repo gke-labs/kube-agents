@@ -10,14 +10,19 @@ import datetime
 import json
 import pathlib
 import re
+import shlex
 import shutil
 import stat
-import shlex
 import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import (
+    NOTES_PROBE_TEMPLATE,
+    chart_with_notes_probe,
+    create_minimal_tools_bin,
+    get_isolated_test_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -47,6 +52,22 @@ _SKIP_UNLESS_TRAP_FIRES = (
     "handles, so the guard cannot be seen missing here; "
     "ToleratedProbesClearErrTrapTest pins it by shape"
 )
+
+# The front doors (install.sh's source_provisioning_helpers and Day-2 menu,
+# upgrade.sh's and uninstall.sh's main) source installer_common.sh from inside
+# a function. SourcedFromAFunctionTest runs that shape under every bash a
+# developer here may run the front doors with: the one on PATH, and macOS's
+# /bin/bash 3.2 when it is a different binary.
+_MACOS_SYSTEM_BASH = pathlib.Path("/bin/bash")
+
+
+def _bashes_here():
+    bashes = ["bash"]
+    on_path = shutil.which("bash")
+    if _MACOS_SYSTEM_BASH.exists() and (on_path is None or not _MACOS_SYSTEM_BASH.samefile(on_path)):
+        bashes.append(str(_MACOS_SYSTEM_BASH))
+    return bashes
+
 
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
@@ -130,13 +151,15 @@ def _autopilot_describe_stub(version="1.31.5-gke.1023000"):
     """A `clusters describe` stub for an Autopilot cluster.
 
     The generator asks twice on this path — autopilot.enabled first, then
-    currentMasterVersion for the gVisor floor — so the stub answers on the
-    --format it is given. An empty `version` stands for a version that
-    could not be read.
+    currentMasterVersion for the gVisor floor (plus the NetworkPolicy probe
+    when WEB_CONSOLE_ENABLED and ACCEPT_NO_NETWORK_POLICY are both set) — so
+    the stub answers on the --format it is given. An empty `version` stands
+    for a version that could not be read.
     """
     return (
         'case "$*" in\n'
         f"  *currentMasterVersion*) printf '{version}\\n' ;;\n"
+        '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
         "  *) printf 'True\\n' ;;\n"
         "esac\n"
         "exit 0"
@@ -240,6 +263,10 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    "WEB_CONSOLE_ENABLED": "",
+                    "ACCEPT_NO_NETWORK_POLICY": "",
+                    # And the data volume size, refused when malformed.
+                    "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -524,6 +551,131 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
 
+    def test_tfvars_names_the_minter_key_to_adopt_and_to_share(self):
+        """MINTER_ADOPT_KEY (an explicitly named unlabelled key) and MINTER_SHARED_KEY reach lifecycle.sh (#3504)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "7",
+                     "KMS_KEYRING": "ring", "KMS_KEY": "key", "MINTER_ADOPT_KEY": "ring/key",
+                     "MINTER_SHARED_KEY": "other-ring/other-key"},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('github_minter_adopt_unlabelled_kms_key = "ring/key"', content)
+            self.assertIn('github_minter_shared_kms_key = "other-ring/other-key"', content)
+
+    # ── the web console switch ───────────────────────────────────────────────
+
+    def test_tfvars_carries_the_web_console_switch(self):
+        # Off unless asked for, and on when install.env or the flag says so;
+        # main.tf maps web_console_enabled to the chart's webConsole.enabled.
+        for exported, want in ((None, "false"), ("true", "true"), ("false", "false")):
+            with self.subTest(WEB_CONSOLE_ENABLED=exported), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                env = {"API_SERVER_KEY": "k"}
+                if exported is not None:
+                    env["WEB_CONSOLE_ENABLED"] = exported
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env=env,
+                    describe_stub=_autopilot_describe_stub(),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f"web_console_enabled      = {want}", dest.read_text())
+
+    def test_tfvars_refuses_web_console_when_accept_no_network_policy_is_set(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_reports_unreadable_cluster_when_probing_web_console_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) exit 1 ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "Could not query NetworkPolicy configuration for existing cluster",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_allows_web_console_when_adopted_standard_cluster_now_enforces_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("web_console_enabled      = true", dest.read_text())
+
+    def test_tfvars_allows_web_console_with_stale_accept_on_autopilot_or_created_cluster(self):
+        for label, describe_stub in (
+            ("adopted_autopilot", _autopilot_describe_stub()),
+            ("created_cluster", 'echo "NOT_FOUND" >&2; exit 1'),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={
+                        "API_SERVER_KEY": "k",
+                        "WEB_CONSOLE_ENABLED": "true",
+                        "ACCEPT_NO_NETWORK_POLICY": "true",
+                    },
+                    describe_stub=describe_stub,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn("web_console_enabled      = true", dest.read_text())
+
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
     def test_tfvars_keeps_cert_manager_when_the_state_manages_the_release(self):
@@ -651,6 +803,19 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("kubeagents-platform-gsa", proc.stderr)
         self.assertIn("PLATFORM_AGENT_GSA_NAME", proc.stderr)
+
+    def test_a_foreign_minter_gsa_is_named_by_its_owner(self):
+        """The minter GSA's description names the install that owns it (#3504)."""
+        stub = ('if [[ "$*" == *"value(description)"* ]]; then '
+                'echo "kube-agents GitHub token minter for install cluster-a/kubeagents-system"; fi; exit 0')
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1,
+            sa_describe_stub=stub,
+            env={"TFVARS_ENABLE_GITHUB_MINTER": "true"},
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Its description names its owner: kube-agents GitHub token minter for install cluster-a/kubeagents-system", proc.stderr)
 
     def test_service_account_ownership_stands_down_when_state_is_unreadable(self):
         # A transient GCS failure is not "no state": refusing on it would tell a
@@ -1154,6 +1319,65 @@ class InstallerCommonTest(unittest.TestCase):
                         self.assertIn("install.env", proc.stderr + proc.stdout)
                         self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
+    # LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD are in SEEDED_INSTALLER_ENV_KEYS,
+    # so a developer's own exported value never reaches these runs.
+    def test_tfvars_carry_litellm_budget_only_while_it_is_on(self):
+        # Off (unset, empty, 0 or 0.0) writes no litellm_budget line at all, so
+        # an install without a ceiling keeps the file it had, whatever a
+        # leftover period says; on, the amount is a bare HCL number and the
+        # period a string, the default 1d when empty.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, None),
+                ({"LITELLM_BUDGET_USD": "0"}, None),
+                ({"LITELLM_BUDGET_USD": "0.0", "LITELLM_BUDGET_PERIOD": "not-a-duration"}, None),
+                ({"LITELLM_BUDGET_USD": "25"}, 'litellm_budget = { usd = 25, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "0.01"}, 'litellm_budget = { usd = 0.01, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "2.50", "LITELLM_BUDGET_PERIOD": "7d"}, 'litellm_budget = { usd = 2.50, period = "7d" }\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    text = dest.read_text()
+                    if expected is None:
+                        self.assertNotIn("litellm_budget", text)
+                    else:
+                        self.assertIn(expected, text)
+
+    def test_tfvars_refuse_litellm_budget_values_terraform_or_the_chart_would(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it. The period
+        # is checked only beside an amount above zero, as the chart reads it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, key in (
+                ({"LITELLM_BUDGET_USD": "-1"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "$25"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "25."}, "LITELLM_BUDGET_USD"),
+                # Under the floor the chart's per-replica share rounds to nothing
+                # and its render would refuse at the apply; refused here first.
+                ({"LITELLM_BUDGET_USD": "0.005"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.0099"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.00009"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "1x"}, "LITELLM_BUDGET_PERIOD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "0d"}, "LITELLM_BUDGET_PERIOD"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(key, proc.stderr + proc.stdout)
+                    self.assertIn("install.env", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
     # Empty reads as unset, so a developer's own exported value cannot stand in.
     _REDACTION_UNSET = {
         "LITELLM_REDACTION_ENABLED": "",
@@ -1227,6 +1451,31 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn(expected, content)
                     if absent:
                         self.assertNotIn(absent, content)
+
+    def test_tfvars_refuse_a_misspelt_vertex_manage_serving_project(self):
+        # Read as off, a typo would revoke the gateway's grant on the serving
+        # project, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "flase", "managed"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"VERTEX_MANAGE_SERVING_PROJECT='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+            for value, expected in (("False", "false"), ("yes", "true")):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(f"vertex_manage_serving_project = {expected}", dest.read_text())
 
     def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
         # upgrade.sh regenerates from install.env without install.sh's checks,
@@ -1415,6 +1664,89 @@ class InstallerCommonTest(unittest.TestCase):
                     proc = self._run(
                         f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
                         env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    # ── PLATFORM_AGENT_STORAGE_SIZE: the PlatformAgent's spec.storage.size ──
+
+    def test_tfvars_carry_the_platform_agent_storage_size(self):
+        # Written on every run, the default included; the composition renders
+        # nothing into the chart for the default.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": ""}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}, 'platform_agent_storage_size = "80Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "1Ti"}, 'platform_agent_storage_size = "1Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "64Ti"}, 'platform_agent_storage_size = "64Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "67108864Mi"}, 'platform_agent_storage_size = "67108864Mi"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_malformed_platform_agent_storage_size(self):
+        # The generator is the installer's only check on the value: it names
+        # the key and writes nothing, rather than leave the variable's
+        # validation to refuse it at plan.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("0Gi", "80", "80G", "1.5Ti", "-10Gi", "080Gi", "80Gi ", "65Ti", "65537Gi", "99999999999Ti"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(
+                        f"PLATFORM_AGENT_STORAGE_SIZE='{value}' is not a whole number of Mi, Gi or Ti above zero",
+                        proc.stderr,
+                    )
+                    self.assertIn("Fix it in install.env, or on a first install, in the value this shell exports.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_storage_size_from_the_file_alone(self):
+        # An inherited size would grow the claims for one run, and the next run
+        # from a clean shell would drop the field again; the file's own key
+        # still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            for file, expected in ((silent, "SIZE=[]"), (recorded, "SIZE=[80Gi]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "SIZE=[${{PLATFORM_AGENT_STORAGE_SIZE:-}}]"',
+                        env={"PLATFORM_AGENT_STORAGE_SIZE": "120Gi"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_storage_size_is_carried_into_the_regenerated_tfvars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_storage_size = "80Gi"\n'),
+                (recorded, "120Gi", 'platform_agent_storage_size = "80Gi"\n'),
+                (silent, "120Gi", 'platform_agent_storage_size = "50Gi"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": exported},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -1675,25 +2007,22 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
-            # Installed next through the installer; the key now asks for today,
-            # which renders nothing and so removes the recorded field.
-            ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
-                                 "retires the A2A stack", "set PLATFORM_AGENT_MODE=next in install.env")),
-            # A render that drops a recorded today removes the field from a CR
-            # patched to next since.
-            ("today next today", ("WARN: This apply switches the install from spec.mode next to today",)),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat and Slack, either or both")),
+            # The key asks for today: the CRD defaults spec.mode to next and the
+            # webhook rewrites today, so this is a note, not a switch.
+            ("next next today", ("install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next",)),
+            ("today next today", ("install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next",)),
         ):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 for line in expect:
                     self.assertIn(line, proc.stdout)
-                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+                self.assertIn("https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode", proc.stdout)
 
     def test_an_ungated_switch_does_not_offer_run_again(self):
         # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
         # no confirmation after the notice: "run again" is not a way out there.
-        for args in ("next next today", "unset unset next"):
+        for args in ("unset unset next",):
             with self.subTest(args=args):
                 gated = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 self.assertIn("in install.env and run again.", gated.stdout)
@@ -1714,36 +2043,72 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("This run applies it without asking first", proc.stdout, proc.stderr)
 
     def test_a_re_apply_and_an_unread_install_are_silent(self):
-        for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):
+        for args in ("next next next", "unset next next", '"" unset next', 'unset "" next'):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 self.assertEqual(proc.stdout, "")
 
-    def test_a_mode_set_by_hand_is_named_rather_than_announced_as_a_switch(self):
-        # The release renders the key already, so Helm sends no change and a
-        # mode set on the CR by hand stays: a CR patched to next under a
-        # record with no mode, and one patched back to today under a record
-        # of next (a rollback round trip's state).
-        for args, running, key in (("unset next today", "next", "today"), ("next today next", "today", "next"), ("next unset next", "today", "next")):
+    def test_the_apply_leaves_next_whatever_the_record_or_the_cr_says(self):
+        # The CRD defaults spec.mode to next: a CR that reads today moves (a
+        # switch, announced), and a CR that reads next stays with a note when
+        # the key asks for today.
+        for args, expect in (
+            ("unset next today", "install.env resolves PLATFORM_AGENT_MODE to today, but spec.mode stays next"),
+            ("next today next", "WARN: This apply switches the install from spec.mode today to next"),
+            ("next unset next", "WARN: This apply switches the install from spec.mode today to next"),
+        ):
             with self.subTest(args=args):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertNotIn("This apply switches", proc.stdout)
-                self.assertIn(
-                    f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
-                    proc.stdout,
-                )
+                self.assertIn(expect, proc.stdout)
+                self.assertNotIn("switches the install from spec.mode next to today", proc.stdout)
 
-    def test_a_retag_says_what_a_full_upgrade_would_do(self):
-        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
-        self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
-        self.assertIn("leaves it at spec.mode today", proc.stdout)
-        self.assertIn("A full upgrade applies the switch to next", proc.stdout)
-        # Quiet where a full upgrade would not move the CR either: the same
-        # mode, a hand-set mode the key cannot reach, or nothing read.
-        for args in ("next next next harness", "unset unset today operator", "unset next today harness", "next today next harness", '"" unset next operator', 'unset "" next operator'):
+    def test_the_mode_after_the_apply_is_next_for_the_chat_checklists(self):
+        # The chat checklists follow the mode the CR is left on, which the
+        # CRD default makes next whatever the key, the record or the CR says;
+        # a first install's included.
+        echo = '; echo "AFTER=$PLATFORM_AGENT_MODE_AFTER_APPLY"'
+        for listing, latest, key, after in (
+            (self._cr_list("next"), "{}", "today", "next"),
+            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "next"),
+            (self._cr_list(), "{}", "next", "next"),
+            (self._cr_list("next"), '{"platformAgent":{"mode":"next"}}', "next", "next"),
+            (self._cr_list(), "norelease", "next", "next"),
+        ):
+            with self.subTest(listing=listing, latest=latest, key=key):
+                proc = self._announce(self._cr_kubectl(listing), self._helm(self._HEALTHY, {}, latest=latest),
+                                      call=f"announce_platform_agent_mode_for_apply kubeagents-system {key}{echo}")
+                self.assertIn(f"AFTER={after}\n", proc.stdout, proc.stderr)
+        first = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE_AFTER_APPLY=stale; TFVARS_CLUSTER_EXISTS=false "
+                          f"announce_platform_agent_mode_for_apply kubeagents-system today{echo}", kubectl_script=None)
+        self.assertIn("AFTER=next\n", first.stdout, first.stderr)
+
+    def test_a_retag_says_the_operators_crd_leaves_next(self):
+        # A CR that still reads today (its CRD predates the default) moves to
+        # next with the operator this run installs, whatever the key says.
+        for args in ("unset unset next harness", "unset unset today operator", "next today next harness"):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
+                self.assertIn("installs an operator whose CRD defaults spec.mode to next", proc.stdout)
+                self.assertNotIn("switch to today", proc.stdout)
+        # Quiet where the CR already reads next, or nothing was read.
+        for args in ("next next next harness", "unset next today harness", '"" unset next operator', 'unset "" next operator'):
             with self.subTest(args=args):
                 quiet = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
                 self.assertEqual(quiet.stdout, "")
+
+    def test_a_today_recorded_install_is_refused_for_an_email_in_slack_allowed_users(self):
+        # The guard reads the mode the apply leaves (next), not the key, so an
+        # install that still records today meets the gateway's rule now.
+        proc = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE=today SLACK_ENABLED=true GOOGLE_CHAT_ENABLED=false "
+                         'SLACK_ALLOWED_USERS=alice@example.com SLACK_BOT_TOKEN=xoxb-1; refuse_next_slack_gateway_settings_from_env; echo "rc=$?"')
+        self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails", proc.stdout + proc.stderr)
+        self.assertIn("rc=1", proc.stdout)
+
+    def test_a_today_chat_install_with_no_home_channel_key_is_warned(self):
+        proc = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE=today GOOGLE_CHAT_ENABLED=true SLACK_ENABLED=false GOOGLE_CHAT_HOME_CHANNEL=; "
+                         'warn_next_home_channel_unset_from_env; echo "KEY=$NEXT_HOME_CHANNEL_UNSET_KEY"')
+        self.assertIn("WARN:", proc.stdout)
+        self.assertIn("KEY=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout)
 
     def test_the_retag_note_reads_the_record_from_the_retag_values(self):
         # The values the retag re-applies are the record a later full upgrade
@@ -1757,7 +2122,7 @@ class InstallerCommonTest(unittest.TestCase):
             (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "next", None),
             # The record decides here: a recorded next that the key drops is a
             # switch a full upgrade makes; with no recorded mode it would make none.
-            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", "A full upgrade applies the switch to today"),
+            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", None),
             (self._cr_kubectl(self._cr_list("next")), "{}", "today", None),
             (self._cr_kubectl(self._cr_list(present=False)), "{}", "next", None),
             (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE), "{}", "next",
@@ -2426,6 +2791,160 @@ class InstallerCommonTest(unittest.TestCase):
             # The TF_VAR_* channel carries them instead.
             self.assertIn("tfvar=k1", proc.stdout)
 
+    # ── openai_compatible ────────────────────────────────────────────────────
+
+    _OPENAI_COMPATIBLE_ENV = {
+        "API_SERVER_KEY": "k",
+        "MODEL_PROVIDER": "openai_compatible",
+        "MODEL_DEFAULT_NAME": "some-org/some-model",
+        "OPENAI_COMPATIBLE_API_BASE": "http://10.8.0.12:8000/v1",
+        "OPENAI_COMPATIBLE_TARGET_PORT": "",
+        "OPENAI_COMPATIBLE_EGRESS_CIDRS": "10.8.0.0/24, 10.9.0.0/24",
+        "OPENAI_COMPATIBLE_CA_SECRET_NAME": "llm-ca",
+        "OPENAI_COMPATIBLE_API_KEY": "oc-key",
+    }
+
+    def test_tfvars_carries_the_openai_compatible_lines_for_that_provider(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=self._OPENAI_COMPATIBLE_ENV,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('model_provider     = "openai_compatible"', content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            # Empty is the variable's "unset", 0, not a bare word HCL refuses.
+            self.assertIn("openai_compatible_target_port    = 0\n", content)
+            self.assertIn('openai_compatible_egress_cidrs   = ["10.8.0.0/24", "10.9.0.0/24"]', content)
+            self.assertIn('openai_compatible_ca_secret_name = "llm-ca"', content)
+            self.assertIn('openai_compatible_api_key = "oc-key"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    # ── the gateway's env Secret, and provider slugs ─────────────────────────
+
+    def test_tfvars_names_the_litellm_env_secret_only_when_set(self):
+        for env, expected in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap", "LITELLM_ENV_SECRET_NAME": "sap-aicore"}, True),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap"}, False),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": ""}, False),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                content = dest.read_text()
+                self.assertEqual('litellm_env_secret_name = "sap-aicore"' in content, expected, content)
+                self.assertIn(f'model_provider     = "{env["MODEL_PROVIDER"]}"', content)
+
+    def test_a_provider_slug_is_accepted_and_needs_a_model(self):
+        proc = self._run(
+            'for p in sap azure bedrock databricks2 a_b; do is_valid_model_provider "$p" && echo "ok $p"; done; '
+            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock" chatgpt; do is_valid_model_provider "$p" || echo "no $p"; done; '
+            'is_table_model_provider sap && echo table-sap; is_table_model_provider azure || echo slug-azure; '
+            'validate_model_provider_inputs azure "" ; echo "slug-no-model=$?"; '
+            'validate_model_provider_inputs azure gpt-5.4; echo "slug-model=$?"; '
+            'validate_model_provider_inputs sap ""; echo "sap-no-model=$?"; '
+            'echo "sap-default=$(default_model_for_provider sap) azure-default=[$(default_model_for_provider azure)]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for line in ("ok sap", "ok azure", "ok bedrock", "ok databricks2", "ok a_b",
+                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock", "no chatgpt",
+                     "table-sap", "slug-azure", "slug-no-model=1", "slug-model=0", "sap-no-model=0",
+                     "sap-default=anthropic--claude-4.5-sonnet azure-default=[]"):
+            self.assertIn(line, proc.stdout)
+        self.assertIn("MODEL_PROVIDER='azure' is a LiteLLM provider slug", proc.stderr + proc.stdout)
+
+    def test_the_generator_refuses_a_slug_without_a_model_and_a_bad_secret_name(self):
+        for env, message in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "azure", "LITELLM_ENV_SECRET_NAME": "azure-openai"},
+             "set --model-default-name"),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": "Not_A_Secret"},
+             "is not a valid Kubernetes Secret name"),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "the file must be left untouched")
+
+    def test_tfvars_writes_a_service_target_port_as_a_number(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV,
+                   OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
+                   OPENAI_COMPATIBLE_TARGET_PORT="8000", OPENAI_COMPATIBLE_EGRESS_CIDRS="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("openai_compatible_target_port    = 8000\n", content)
+            self.assertIn("openai_compatible_egress_cidrs   = []", content)
+
+    def test_tfvars_leaves_the_openai_compatible_lines_out_for_any_other_provider(self):
+        # Every other install's file stays byte for byte what it was (the
+        # gitlab_forge goldens hold that), even with the keys in the environment.
+        env = dict(self._OPENAI_COMPATIBLE_ENV, MODEL_PROVIDER="gemini", MODEL_DEFAULT_NAME="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("openai_compatible", dest.read_text())
+
+    def test_tfvars_keeps_the_openai_compatible_key_off_disk_when_persist_secrets_off(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV, PERSIST_SECRETS_ON_DISK="false")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=env,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertNotIn("oc-key", content)
+            self.assertNotIn("openai_compatible_api_key", content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    def test_tfvars_generation_refuses_an_openai_compatible_install_the_chart_cannot_render(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator holds the same line.
+        for overrides, message in (
+            ({"MODEL_DEFAULT_NAME": ""}, "has no default model"),
+            ({"OPENAI_COMPATIBLE_API_BASE": ""}, "needs the server's base URL"),
+            ({"OPENAI_COMPATIBLE_EGRESS_CIDRS": ""}, "set --openai-compatible-egress-cidrs"),
+            ({"OPENAI_COMPATIBLE_TARGET_PORT": "http"}, "is not a port"),
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=dict(self._OPENAI_COMPATIBLE_ENV, **overrides),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
+    def test_tfvars_generation_recovers_the_openai_compatible_key_from_live_secret(self):
+        # PERSIST_SECRETS_ON_DISK=false on an earlier run left install.env
+        # without the key; an adoption re-install must not drop it.
+        recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="  # base64("recovered-key")
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.OPENAI_COMPATIBLE_API_KEY}}"*) printf "%s" "{recovered_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        env = dict(self._OPENAI_COMPATIBLE_ENV, OPENAI_COMPATIBLE_API_KEY="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('openai_compatible_api_key = "recovered-key"', dest.read_text())
+
     def test_google_chat_home_channel_written_to_tfvars(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
@@ -2594,6 +3113,112 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("sub= rc=0", proc.stdout)
 
+    # The minter's per-install names (#3504).
+    _MINTER_STATE = [
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_kms_key_ring",
+         "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-keyring"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_kms_crypto_key",
+         "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-key"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account",
+         "name": "minter", "instances": [{"attributes": {"account_id": "kubeagents-github-minter-gsa"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account_iam_member",
+         "name": "workload_identity", "instances": [{"attributes": {
+             "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/kubeagents-github-minter]"}}]},
+    ]
+    _EXISTING = ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa",
+                 "kubeagents-github-minter"]
+
+    def test_minter_derived_names_follow_the_cluster(self):
+        proc = self._run('minter_derived_names ka-today-1')
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter",
+                          "ka-today-1-github-minter"])
+
+    def test_the_longest_cluster_name_still_gives_a_valid_ksa_name(self):
+        """A GKE cluster name is at most 40 characters; the KSA must stay a DNS-1123 label."""
+        ksa = self._run(f"minter_derived_names {'a' * 40}").stdout.strip().split("|")[3]
+        self.assertRegex(ksa, r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+
+    def test_a_long_cluster_name_still_gives_a_valid_distinct_gsa_id(self):
+        """A GSA id is 6-30 characters; two long names sharing a prefix stay apart."""
+        ids = []
+        for cluster in ("production-europe-west4-primary", "production-europe-west4-standby"):
+            gsa = self._run(f"minter_derived_names {cluster}").stdout.strip().split("|")[2]
+            self.assertRegex(gsa, r"^[a-z][-a-z0-9]{4,28}[a-z0-9]$")
+            ids.append(gsa)
+        self.assertNotEqual(ids[0], ids[1])
+
+    def test_tf_state_minter_names_reads_the_four_names(self):
+        """The KSA is the one the Workload Identity member names."""
+        proc = self._run('tf_state_minter_names; echo "rc=$?"', gcloud_stdout=_state_doc(self._MINTER_STATE))
+        self.assertIn("|".join(self._EXISTING), proc.stdout)
+        self.assertIn("rc=0", proc.stdout)
+
+    def test_an_install_with_a_minter_in_state_keeps_its_names(self):
+        """The existing install: the names its state holds, whatever the cluster is called."""
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(self._MINTER_STATE))
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
+
+    def test_an_install_keeps_the_ksa_its_binding_names(self):
+        """A KSA set on an earlier run is read back from the binding, not re-derived."""
+        state = self._MINTER_STATE[:3] + [dict(self._MINTER_STATE[3], instances=[{"attributes": {
+            "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/c1-github-minter]"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[3], "c1-github-minter")
+
+    def test_a_state_holding_only_some_minter_names_keeps_each_in_its_place(self):
+        """An interrupted destroy leaves only the GSA: the empty ring and key fields stay empty."""
+        proc = self._run("minter_name_defaults test-project ka-today-1",
+                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:3]))
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
+        custom_gsa = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "my-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(custom_gsa))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter",
+                          "kubeagents-github-minter"])
+
+    def test_a_new_minter_stopped_before_its_binding_keeps_the_derived_ksa(self):
+        """The GSA is this cluster's derived one and no binding exists yet: the KSA is derived too."""
+        state = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "ka-today-1-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[2:], ["ka-today-1-minter", "ka-today-1-github-minter"])
+
+    def test_an_install_without_a_minter_in_state_derives_its_names(self):
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
+        self.assertEqual(proc.stdout.strip().split("|")[0], "ka-today-1-minter-keyring")
+
+    def test_a_first_install_with_no_state_derives_its_names(self):
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_exit=1)
+        self.assertEqual(proc.stdout.strip().split("|")[1], "ka-today-1-minter-key")
+
+    def test_unreadable_state_keeps_the_project_wide_names_and_says_so(self):
+        """Not knowing whether this install has a minter, it must not rename one."""
+        proc = self._run('print_warning() { echo "WARN: $*"; }; minter_name_defaults test-project ka-today-1',
+                         gcloud_exit=1, gcloud_stderr="ERROR: 503 Service Unavailable")
+        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"), self._EXISTING)
+        self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
+
+    def _key_owner(self, describe_rc=0, labels="", labels_rc=0):
+        stub = (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then '
+            f'echo "{labels}"; exit {labels_rc}; fi; '
+            f'if [[ "$*" == *"kms keys describe"* ]]; then exit {describe_rc}; fi'
+        )
+        return self._run('owner="$(minter_key_owner ring key us-central1 p)"; echo "owner=$owner rc=$?"',
+                         gcloud_extra_cases=f'  *"kms keys describe"*) {stub} ;;\n')
+
+    def test_minter_key_owner_reads_the_owner_labels(self):
+        proc = self._key_owner(labels="kube-agents-cluster=cluster-a;kube-agents-namespace=team-one")
+        self.assertIn("owner=cluster-a/team-one rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_is_empty_for_an_unlabelled_key(self):
+        proc = self._key_owner(labels="")
+        self.assertIn("owner= rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_returns_1_for_a_key_it_cannot_describe(self):
+        proc = self._key_owner(describe_rc=1)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
     def test_minter_deferred_without_an_enabled_key_version(self):
         # A minter whose KMS key holds no ENABLED version never passes
         # readiness, and the apply waits on it — the generator defers.
@@ -2614,6 +3239,51 @@ class InstallerCommonTest(unittest.TestCase):
             proc = self._run(f'write_tfvars_from_state "{dest}"', env=env, kms_versions="1")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("enable_github_minter = true", dest.read_text())
+
+    def test_minter_deferred_names_the_restore_for_scheduled_versions(self):
+        # A key whose versions a destroy scheduled: the generator still defers,
+        # but names the restore instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DESTROY_SCHEDULED\"*) printf '2'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are scheduled for destruction", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
+
+    def test_minter_deferred_names_the_enable_for_disabled_versions(self):
+        # A key a restore left DISABLED: the generator still defers, but names
+        # the enable instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DISABLED\"*) printf '1'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are disabled", out)
+            self.assertIn("gcloud kms keys versions enable <version>", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
 
     def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
         # A stale context pointing at some other install must not donate that
@@ -2679,6 +3349,83 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn("enable_pubsub_platform       = true", content)
             self.assertIn("enable_stockout_investigator = true", content)
+
+    def test_tfvars_generation_includes_helm_upgrade_install(self):
+        """HELM_UPGRADE_INSTALL reaches the composition's helm_upgrade_install.
+
+        Off unless install.env (or the environment) says otherwise, because
+        upgrade_install also adopts a release this install's state does not
+        own (#4108). The key has no flag and no interview question, so the
+        generator's own fallback is the only default it has.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+            for spelling in ("true", "True", "yes", "1"):
+                with self.subTest(spelling=spelling):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": spelling},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("helm_upgrade_install = true\n", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+    def test_tfvars_refuse_a_helm_upgrade_install_spelling_that_is_neither_true_nor_false(self):
+        # Read as off, a typo leaves upgrade_install off on the environment it
+        # was set to rescue, and the apply fails as before naming nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "enabled", "t", " "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"HELM_UPGRADE_INSTALL='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+
+    def test_helm_upgrade_install_reaches_the_kube_agents_release(self):
+        """The tfvars key is inert unless main.tf hands it to the release."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        release = main_tf.split('resource "helm_release" "kube_agents" {', 1)[1]
+        release = release.split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$", release),
+            "helm_release.kube_agents does not set upgrade_install = var.helm_upgrade_install",
+        )
+        # With upgrade_install on and version unset, the provider's plan reads the
+        # installed release's version from the cluster: a from-nothing install
+        # cannot plan, and a chart version change fails the apply (#4108).
+        self.assertIsNotNone(
+            re.search(
+                r'(?m)^  version\s*=\s*yamldecode\(file\("\$\{path\.module\}/\.\./\.\./\.\./charts/kube-agents/Chart\.yaml"\)\)\.version\s*$',
+                release,
+            ),
+            "helm_release.kube_agents does not pin version to the chart's Chart.yaml version",
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+            "helm_upgrade_install must default to false",
+        )
 
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
@@ -2838,24 +3585,36 @@ class InstallDefaultsFileTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "autopilot")
 
     def test_the_chart_carries_the_same_per_provider_models(self):
-        """charts/kube-agents/templates/litellm.yaml keeps its own copy of the
-        per-provider default models for a hand-driven Helm install, because a
-        chart cannot source this file. The copy is allowed only while it is
+        """charts/kube-agents/templates/_helpers.tpl (kube-agents.litellmModel)
+        keeps its own copy of the per-provider default models for a
+        hand-driven Helm install, because a chart cannot source this file. The copy is allowed only while it is
         equal, and this is what makes that true."""
         proc = subprocess.run(
             ["bash", "-c",
              f'set -u; source "{self._INSTALLER_COMMON}"; '
-             'for p in gemini openai anthropic vertex_ai; do '
+             'for p in gemini openai anthropic vertex_ai sap; do '
              'echo "$p=$(default_model_for_provider "$p")"; done'],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         defaults = dict(line.split("=", 1) for line in proc.stdout.split())
-        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "litellm.yaml").read_text()
+        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "_helpers.tpl").read_text()
         table = re.search(r'\$defaultModels := dict (.*?) \}\}', chart)
-        self.assertIsNotNone(table, "litellm.yaml no longer declares $defaultModels")
+        self.assertIsNotNone(table, "_helpers.tpl no longer declares $defaultModels")
         chart_models = dict(re.findall(r'"(\w+)" "([^"]+)"', table.group(1)))
         self.assertEqual(chart_models, defaults)
+        # Two more copies of the Gemini default: the operator's providers file,
+        # which the admin console shows, and the web console's fallback.
+        providers = json.loads(
+            (_REPO_ROOT / "k8s-operator" / "config" / "integrations" / "litellm" / "providers.json").read_text()
+        )["providers"]
+        for provider in providers:
+            if provider["id"] in ("gemini", "vertex_ai"):
+                self.assertEqual(provider["defaultModel"], defaults[provider["id"]], provider["id"])
+        console = (_REPO_ROOT / "a2a" / "cmd" / "web-console" / "models.go").read_text()
+        fallback = re.search(r'defaultGeminiModel = "([^"]+)"', console)
+        self.assertIsNotNone(fallback, "models.go no longer declares defaultGeminiModel")
+        self.assertEqual(fallback.group(1), defaults["gemini"])
 
     def test_the_state_location_derives_from_the_defaults(self):
         """installer_common.sh and lifecycle.sh both derive the bucket and the
@@ -2973,7 +3732,14 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
                     target = bin_dir / name
                     target.write_text(content)
                     target.chmod(target.stat().st_mode | stat.S_IEXEC)
-            full_env = get_isolated_test_env(overrides=env_overrides or {}, bin_dir=str(bin_dir))
+            # An empty kubeconfig of the test's own: ensure_clean_helm_release
+            # asks kubectl for a pending release's Secret, and a developer's
+            # default context must never answer a unit test.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
+            full_env = get_isolated_test_env(
+                overrides={"KUBECONFIG": str(kubeconfig), **(env_overrides or {})}, bin_dir=str(bin_dir)
+            )
             body = (
                 f'set -u\n'
                 f'{_PRINT_STUBS}\n'
@@ -3550,6 +4316,9 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; printf ', 1),
         (_INSTALLER_COMMON, 'PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values ', 1),
         (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
+        (_INSTALLER_COMMON, 'constraint="$(trap - ERR; _scope_policy_denying_asset_api ', 1),
+        (_INSTALLER_COMMON, 'reason="$(trap - ERR; _scope_container_can_set_iam ', 6),
+        (_INSTALLER_COMMON, 'token="$(trap - ERR; _scope_terraform_access_token)"', 2),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
@@ -5050,7 +5819,7 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
 
 class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
-    Slack on and Google Chat off, the A2A gateway takes Slack
+    Slack on, the A2A gateway takes Slack whether Google Chat is on or off
     (a2aSlackArmed in k8s-operator), and three settings that the today path
     accepts break it:
 
@@ -5059,10 +5828,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     - a SLACK_HOME_CHANNEL that is not a channel id leaves the notify route
       unarmed;
     - a comma-separated SLACK_BOT_TOKEN list makes the Slack backend fail
-      at connect.
-
-    With Chat on too, Chat holds the gateway and Slack stays on the today
-    path, so nothing is refused."""
+      at connect."""
 
     _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
     _TOKEN = "xoxb-1-secretpart"
@@ -5154,6 +5920,14 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 )
                 self.assertIn(f"[C0lower] [] LC_ALL={locale}", proc.stdout, proc.stderr)
 
+    def test_a_channel_id_padded_with_unicode_space_is_not_refused(self):
+        # The operator trims with strings.TrimSpace before it checks the id.
+        for home in ("\u00a0C0HOME", "C0HOME\u202f"):
+            with self.subTest(home=home):
+                proc = self._run(home=home)
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", proc.stdout + proc.stderr)
+
     def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
         for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C0lower", "Gcore", "C", "C0HOME/1.2"):
             with self.subTest(home=home):
@@ -5192,11 +5966,23 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                     out,
                 )
                 self.assertIn(
-                    "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
-                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    "INFO: The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's "
+                    "bot token (xoxb-...) in install.env and run again, or turn Slack off (SLACK_ENABLED=false).",
                     out,
                 )
                 self.assertNotIn("secretpart", out)
+
+    def test_a_list_of_bot_tokens_through_flags_names_the_token_flag(self):
+        # There is no mode to switch to: the remedy is one token or Slack off.
+        proc = self._run(token="xoxb-1-secretpart,xoxb-2-secretpart", flags=True)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(
+            "INFO: The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's "
+            "bot token (xoxb-...) in install.env or --slack-bot-token and run again, or turn Slack off (SLACK_ENABLED=false).",
+            out,
+        )
+        self.assertNotIn("PLATFORM_AGENT_MODE=today", out)
 
     def test_one_bot_token_or_none_passes(self):
         for token in (self._TOKEN, f" {self._TOKEN} ", ""):
@@ -5249,12 +6035,20 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
             dict(slack="false"),
             dict(slack=""),
             dict(slack="no"),
-            # Chat holds the gateway; Slack stays on the today path.
-            dict(chat="true"),
-            dict(chat="True"),
         ):
             with self.subTest(**gate):
                 self._passes(**{**bad, **gate})
+
+    def test_google_chat_beside_slack_does_not_lift_the_refusal(self):
+        # Both platforms share the gateway, so Slack's settings still reach it.
+        bad = dict(allowlist="alice@example.com", home="D0DM", token="xoxb-a,xoxb-b")
+        for chat in ("true", "True"):
+            with self.subTest(chat=chat):
+                proc = self._run(**bad, chat=chat)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                for said in ("SLACK_ALLOWED_USERS holds entries that look like emails",
+                             "SLACK_HOME_CHANNEL is 'D0DM'", "SLACK_BOT_TOKEN holds 2 tokens"):
+                    self.assertIn(said, proc.stdout)
 
 
 class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
@@ -5285,10 +6079,728 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
         gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
         operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+                              "slackChannelID", "home", "a2aSlackMinChannelIDLen")
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
+
+
+class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
+    """The Google Chat checklist names a GOOGLE_CHAT_HOME_CHANNEL the A2A
+    gateway would not arm its notify route on. The installer's check copies
+    the gateway's gchatIsSpaceName and the operator's a2aGchatHomeSpace; this
+    keeps the copy from drifting (docs/README.md lists the rule's three
+    homes)."""
+
+    def test_the_rule_is_the_gateways_and_the_operators(self):
+        gateway = (_REPO_ROOT / "a2a/gateway/gchat.go").read_text()
+        self.assertRegex(gateway, r'\n\tgchatSpacesToken\s*=\s*"spaces/"\n')
+        self.assertIn("func gchatIsSpaceName(s string) bool {\n"
+                      "\tid, found := strings.CutPrefix(s, gchatSpacesToken)\n"
+                      "\treturn found && id != \"\" && !strings.Contains(id, \"/\")\n}\n", gateway)
+        operator = (_REPO_ROOT / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
+        self.assertRegex(operator, r'\n\ta2aGchatSpacePrefix\s*=\s*"spaces/"\n')
+        self.assertIn("\thome := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)\n"
+                      "\tid, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)\n"
+                      "\tif !ok || id == \"\" || strings.Contains(id, \"/\") {\n", operator)
+        shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
+        self.assertRegex(shell, r'(?m)^readonly GCHAT_SPACE_PREFIX="spaces/"$')
+        cases = {"spaces/AAA": "", "  spaces/AAA ": "", "": "", "AAA": "AAA", "spaces/": "spaces/",
+                 "spaces/AAA/threads/B": "spaces/AAA/threads/B", " Spaces/AAA": "Spaces/AAA",
+                 # strings.TrimSpace strips Unicode spaces too, so the operator
+                 # and the gateway take these as spaces/AAA.
+                 "\u00a0spaces/AAA\u3000": "", "\u0085spaces/AAA\u2009\t": "",
+                 "spaces/A\u00a0A": ""}
+        script = "".join(f'printf "[%s]\\n" "$(gchat_home_channel_not_a_space_name {shlex.quote(v)})"\n'
+                         for v in cases)
+        proc = subprocess.run(["bash", "-c", f'source "{_INSTALLER_COMMON}"\n{script}'],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), [f"[{v}]" for v in cases.values()])
+
+
+class NextHomeChannelUnsetWarningTest(unittest.TestCase):
+    """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
+    gateway makes the proactive posts and arms them only on a home channel,
+    so a chat backend the gateway holds with none refuses and keeps every
+    alert for a digest while conversations keep working. The front doors warn, never refuse, and the
+    closing summary says it again. The backends follow the operator's
+    a2aChatArmed / a2aSlackArmed: with both on, each needs its own home."""
+
+    def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; warn_next_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$NEXT_HOME_CHANNEL_UNSET_KEY"\n'
+            + (f'print_next_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_next_slack_without_a_home_channel_warns_and_names_the_key(self):
+        proc = self._run()
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
+        self.assertIn("keeps them for one digest", proc.stdout)
+        self.assertIn("HomeChannelUnset", proc.stdout)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
+        self.assertIn("slack-app/#home-channel", proc.stdout)
+
+    def test_next_chat_without_a_home_channel_names_the_chat_key(self):
+        proc = self._run(slack="false", chat="true")
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+
+    def test_both_platforms_share_the_gateway(self):
+        # Each backend needs its own home; with both unset both keys are named, Chat first.
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\n", self._run(chat="true", slack_home="C0123ABCD").stdout)
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL\n", self._run(chat="true", chat_home="spaces/AAA").stdout)
+        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA", slack_home="C0123ABCD").stdout, "rc=0 key=\n")
+        proc = self._run(chat="true", flags=True, summary=True)
+        out = proc.stdout
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\nSLACK_HOME_CHANNEL\n", out, proc.stderr)
+        self.assertLess(out.index("WARN: GOOGLE_CHAT_HOME_CHANNEL is empty"), out.index("WARN: SLACK_HOME_CHANNEL is empty"))
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", out)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", out)
+        # The summary repeats both, in the same order, and ends on Slack's remedy.
+        lines = [l for l in out.splitlines() if l]
+        self.assertEqual(sum(l.startswith("WARN: No home channel:") for l in lines), 2, out)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), out)
+
+    def test_with_one_home_the_other_platforms_posts_go_there(self):
+        # Home posts go to every platform with a home channel, so with one set
+        # the other's posts are not kept; the summary says the same.
+        for kw, there in (({"chat": "true", "slack_home": "C0123ABCD"}, "Slack's home channel"),
+                          ({"chat": "true", "chat_home": "spaces/AAA"}, "Google Chat's home channel")):
+            with self.subTest(**kw):
+                out = self._run(summary=True, **kw).stdout
+                self.assertEqual(out.count(f"go to {there} meanwhile"), 2, out)
+                self.assertNotIn("keeps them for one digest", out)
+        both_unset = self._run(chat="true").stdout
+        self.assertEqual(both_unset.count("keeps them for one digest"), 2, both_unset)
+        self.assertNotIn("meanwhile", both_unset)
+
+    def test_a_chat_home_that_is_not_a_space_name_is_no_home(self):
+        # The gateway arms no Chat route for it, so Slack's posts are kept,
+        # as the operator's HomeChannelUnset condition says.
+        for chat_home in ("AAAA", "spaces/AAA/threads/T"):
+            with self.subTest(chat_home=chat_home):
+                out = self._run(chat="true", chat_home=chat_home).stdout
+                self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", out)
+                self.assertIn("keeps them for one digest", out)
+                self.assertNotIn("meanwhile", out)
+
+    def test_a_slack_home_that_is_not_a_channel_id_is_no_home(self):
+        # The operator's slackChannelID arms no Slack route for it, so Google
+        # Chat's posts are kept for the digest, not sent to Slack.
+        for slack_home in ("#general", "D0123ABCD", "c0123abcd"):
+            with self.subTest(slack_home=slack_home):
+                out = self._run(chat="true", slack_home=slack_home, summary=True).stdout
+                self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\n", out)
+                self.assertEqual(out.count("keeps them for one digest"), 2, out)
+                self.assertNotIn("meanwhile", out)
+
+    def test_the_message_names_no_hermes_fallback(self):
+        for kw in ({}, {"slack": "false", "chat": "true"}, {"chat": "true"}):
+            with self.subTest(**kw):
+                out = self._run(**kw).stdout
+                self.assertIn("keeps them for one digest", out)
+                self.assertNotIn("Hermes", out)
+
+    def test_flags_name_the_flag(self):
+        self.assertIn("install.env or --slack-home-channel", self._run(flags=True).stdout)
+        self.assertIn("install.env or --google-chat-home-channel", self._run(slack="false", chat="true", flags=True).stdout)
+
+    def test_silent_when_nothing_is_dropped(self):
+        for kw in ({"slack_home": "C0123ABCD"}, {"slack_home": "  ", "mode": "today"}, {"mode": "today"},
+                   {"slack": "false"}, {"slack": "false", "chat": "true", "chat_home": "spaces/AAA"}):
+            with self.subTest(**kw):
+                self.assertEqual(self._run(**kw).stdout, "rc=0 key=\n")
+
+    def test_a_blank_home_channel_counts_as_unset(self):
+        self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
+
+    def test_a_home_channel_of_unicode_space_counts_as_unset(self):
+        # The operator trims with strings.TrimSpace, which strips these too,
+        # and sets HomeChannelUnset; the checklist trims the same way. In the
+        # C locale [[:space:]] matches none of them, and glibc's UTF-8 locales
+        # leave U+00A0 out, so the result must not depend on the locale.
+        for locale in ("C", "en_US.UTF-8"):
+            for args, key in (('next false true "" "\u00a0"', "GOOGLE_CHAT_HOME_CHANNEL"),
+                              ('next true false "\u3000\u202f" ""', "SLACK_HOME_CHANNEL")):
+                with self.subTest(locale=locale, key=key):
+                    proc = subprocess.run(
+                        ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
+                         f'echo "key=$(next_home_channel_unset_key {args})"'],
+                        capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                    )
+                    self.assertIn(f"key={key}", proc.stdout, proc.stderr)
+
+    def test_the_summary_repeats_it_last(self):
+        proc = self._run(summary=True)
+        lines = [l for l in proc.stdout.splitlines() if l]
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are not delivered there yet."), proc.stdout)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
+        self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
+
+
+class SourcedFromAFunctionTest(unittest.TestCase):
+    """The library is sourced from inside a function by every front door, so
+    its top level runs in that function's scope. On bash 3.2 (macOS's
+    /bin/bash) a `readonly -a` there is local to the function, as a `declare`
+    is on every bash, and the array is gone by the time trim_go_space reads
+    it: install.sh stopped on `GO_TRIMSPACE_CHARS[@]: unbound variable`
+    (#3837). bash 4.4 and 5.x keep a `readonly -a` global there, so the
+    behavioural test sees the defect only on a bash 3.2 host; the shape test
+    is the guard on every bash."""
+
+    _SOURCED_FILES = sorted((_REPO_ROOT / "scripts" / "installer").glob("*.sh"))
+    # A top-level `declare`/`typeset`, or a `readonly` with an array flag, in a
+    # file sourced from a function. `local` is never legal at top level, and
+    # the function bodies are indented, so the anchor at column 0 is the
+    # top level.
+    _FUNCTION_SCOPED_DECLARATION = re.compile(
+        r"^(?:(?:declare|typeset)\b.*|readonly\s+(?:-\w+\s+)*-\w*[aA]\w*\b.*)$", re.MULTILINE)
+
+    def test_no_sourced_file_declares_at_top_level(self):
+        self.assertIn(_INSTALLER_COMMON, self._SOURCED_FILES)
+        for path in self._SOURCED_FILES:
+            with self.subTest(file=path.name):
+                hits = self._FUNCTION_SCOPED_DECLARATION.findall(path.read_text())
+                self.assertEqual(hits, [], f"{path.name}: assign the value, then `readonly NAME` on its own line")
+
+    def test_trim_go_space_runs_after_a_function_sourced_the_library(self):
+        body = (
+            _PRINT_STUBS
+            + f'load() {{ source "{_INSTALLER_COMMON}"; }}\nload\nset -u\n'
+            + 'printf "n=%s [%s] [%s]\\n" "${#GO_TRIMSPACE_CHARS[@]}" "$(trim_go_space $\'\\xc2\\xa0C0HOME \')" '
+            '"$(slack_home_channel_not_an_id $\' D0DM\\xe3\\x80\\x80\')"\n'
+        )
+        for bash in _bashes_here():
+            with self.subTest(bash=bash):
+                proc = subprocess.run([bash, "-c", body], capture_output=True, text=True,
+                                      env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
+
+
+class SlackHomeChannelPolicyTest(unittest.TestCase):
+    """SLACK_HOME_CHANNEL_POLICY renders spec.integration.slack.homeChannelPolicy,
+    whose CRD enum is exact (auto, manual; absent reads as auto). The generator
+    refuses any other spelling before a file is written, so every route to
+    Terraform (install.sh's run, --dry-run, the Day-2 menu, upgrade.sh --plan and
+    apply) stops with the key named rather than inside `terraform plan`."""
+
+    _run = InstallerCommonTest._run
+
+    def _check(self, value, flags=""):
+        return self._run(f'require_slack_home_channel_policy {shlex.quote(value)} {flags}; echo "rc=$?"')
+
+    def test_the_three_accepted_values_pass_silently(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL_POLICY", proc.stdout + proc.stderr)
+
+    def test_any_other_spelling_is_refused_as_the_crd_would(self):
+        # Exact, as the API server is: no trim, no case folding.
+        for value in ("Auto", " auto", "manual ", "MANUAL", "sometimes"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(f"SLACK_HOME_CHANNEL_POLICY is '{value}', which is not auto or manual (empty means auto)", out)
+                self.assertIn("spec.integration.slack.homeChannelPolicy", out)
+                self.assertIn("Set it in install.env and run again", out)
+                self.assertNotIn("--slack-home-channel-policy", out)
+
+    def test_the_remedy_names_the_flag_when_install_sh_can_set_it(self):
+        proc = self._check("sometimes", "flags")
+        self.assertIn("Set it in install.env or --slack-home-channel-policy and run again", proc.stdout + proc.stderr)
+
+    def _tfvars(self, env):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", **env},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            return proc, (dest.read_text() if dest.exists() else None)
+
+    def test_the_generator_renders_the_policy_beside_the_other_slack_keys(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": value})
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f'slack_home_channel_name = ""\nslack_home_channel_policy = "{value}"\n', content)
+
+    def test_the_generator_refuses_a_policy_outside_the_enum_with_no_file_written(self):
+        proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": "sometimes"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
+        self.assertIsNone(content, "the file must be left untouched")
+
+# ── print_footprint_summary: the step 11 footprint and modeled-cost block ───
+
+_FOOTPRINT_TFVARS = """# generated
+platform_agent_storage_size = "200Gi"
+enable_github_minter = true
+hermes_dashboard_enabled = false
+web_console_enabled      = true   # trailing comment
+memory_provider          = "kube_agents_memory"
+platform_agent_mode = "next"
+cluster_mode = "autopilot"
+namespace    = "agents-ns"
+"""
+_MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+_FOOTPRINT_PROFILES = _REPO_ROOT / "tests" / "data" / "footprint_profiles.json"
+
+# The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
+# maps them onto the chart.
+_FOOTPRINT_EXPECTED_SETS = [
+    "--set platformAgent.storage.size=200Gi",
+    "--set platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set webConsole.enabled=true",
+    "--set githubMinter.enabled=true",
+    "--set platformAgent.mode=next",
+]
+
+# The chart keys kube-agents.quotaRequirements (and the summary's own mode read) take
+# their figures from and the composition can set from a tfvar: a `var.` the composition
+# puts under one of these, or under a `resources` subtree of a summed workload, has to
+# be a line in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's figure drifts from the
+# notes' while every test stays green.
+_FOOTPRINT_READ_KEYS = {
+    "operator.enabled", "operator.replicaCount",
+    "litellm.enabled", "litellm.replicaCount",
+    "hindsight.enabled", "hindsight.postgresql.storage",
+    "githubMinter.enabled", "githubMinter.replicaCount",
+    "webConsole.enabled",
+    "platformAgent.enabled", "platformAgent.mode", "platformAgent.cleanupHook.enabled",
+    "platformAgent.storage.size",
+    "platformAgent.harness.memory.provider",
+    "platformAgent.harness.hermes.dashboardEnabled",
+    "platformAgent.deployment.availability.replicas",
+}
+_FOOTPRINT_READ_SUBTREES = (
+    "operator.resources", "litellm.resources", "githubMinter.resources", "webConsole.resources",
+    "hindsight.api.resources", "hindsight.postgresql.resources",
+    "platformAgent.deployment.credentialProxy.resources",
+    "platformAgent.deployment.kubeProxy.resources",
+    "platformAgent.deployment.agentAPIAuth.resources",
+    "platformAgent.harness.experimental.shellSandbox.resources",
+)
+_HCL_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_HCL_TOKEN = re.compile(
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b(' + _HCL_IDENT + r')\s*=(?![=>])'
+    r"|\bmerge\(|\bvar\.(" + _HCL_IDENT + r")"
+    r"|\b((?:local|module|data|each)\." + _HCL_IDENT + r"(?:\." + _HCL_IDENT + r")*)|[{}()\[\]]"
+)
+# A `{` that opens a `for` comprehension is an expression, not an object literal.
+_HCL_FOR_AHEAD = re.compile(r"\s*for\b")
+# A `${` that is not the `$${` escape: the string is a template, not a literal.
+_HCL_INTERPOLATION = re.compile(r"(?<!\$)\$\{")
+
+
+def _hcl_chart_vars(src, pos=0):
+    """Every (chart key, reference) pair the HCL object opening at src[pos] assigns.
+
+    The reference is the bare tfvar name for `var.x`; for anything else the walker cannot
+    follow to a tfvar it is the text itself, so a caller can tell the two apart with
+    `_HCL_IDENT`: a `local.x`, `module.x.y`, `data.x.y` or `each.x` chain, or a string
+    carrying an interpolation (`"${var.x}"`, `"${local.p}-suffix"`; the `$${` escape is a
+    literal). The map test fails on one under a footprint key rather than resolving it,
+    because a local or a template can be anything.
+
+    Walks the object with a stack of enclosing keys: `key = {` and `key = merge(` push the
+    key, `(`, `[` and a `{ for` comprehension push an anonymous frame, and a reference
+    anywhere in the right-hand side of `leaf =` records the path: right after the `=`, or
+    inside anonymous frames under it (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`,
+    `leaf = { for k in var.x : k => ... }`), never past a named one.
+    A closer ends the leaves inside and at the frame it closes, and the next `key =` at a
+    depth ends the leaf there, so a `var.x` that follows a block (the condition in
+    `}, var.x ? {} : {`) has no leaf and is skipped: it decides whether a block renders,
+    and the block's own assignments record what it sets.
+    """
+    stack, closers, pairs, leaf_at = [], [], set(), {}
+    while True:
+        m = _HCL_TOKEN.search(src, pos)
+        assert m is not None, "unterminated values block"
+        tok, pos = m.group(0), m.end()
+        if tok.startswith("#") or (tok.startswith('"') and not _HCL_INTERPOLATION.search(tok)):
+            continue
+        depth = len(stack)
+        if m.group(1):
+            leaf_at[depth] = m.group(1)
+            continue
+        if tok in ("merge(", "{", "(", "["):
+            named = tok == "merge(" or (tok == "{" and not _HCL_FOR_AHEAD.match(src, pos))
+            stack.append(leaf_at.get(depth) if named else None)
+            closers.append("}" if tok == "{" else ")" if tok.endswith("(") else "]")
+            continue
+        if tok in "})]":
+            closers.pop()
+            stack.pop()
+            if not closers:
+                return pairs
+            leaf_at = {d: k for d, k in leaf_at.items() if d < len(stack)}
+            continue
+        ref = m.group(2) or m.group(3) or tok
+        while depth not in leaf_at and depth > 0 and stack[depth - 1] is None:
+            depth -= 1
+        if depth in leaf_at:
+            pairs.add((".".join([*(k for k in stack[:depth] if k), leaf_at[depth]]), ref))
+
+
+def _composition_chart_vars():
+    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns."""
+    src = _MAIN_TF.read_text()
+    release = src.index('resource "helm_release" "kube_agents"')
+    return _hcl_chart_vars(src, src.index("values = [yamlencode(", release) + len("values = [yamlencode("))
+
+
+def _footprint_value_map():
+    """FOOTPRINT_TFVARS_VALUE_MAP as installer_common.sh declares it: {tfvar: chart key}."""
+    text = _INSTALLER_COMMON.read_text()
+    match = re.search(r'readonly FOOTPRINT_TFVARS_VALUE_MAP="([^"]*)"', text)
+    assert match, "FOOTPRINT_TFVARS_VALUE_MAP not declared"
+    return dict(line.split("=", 1) for line in match.group(1).splitlines() if line)
+
+# A helm that answers `template` with the probe ConfigMap's shape, the arguments it
+# was given as the summary's one line, so the test reads the --set mapping and the
+# block-scalar extraction off the helper's stdout.
+_ECHO_HELM = (
+    "#!/usr/bin/env bash\n"
+    "printf 'apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: footprint-summary\\n'\n"
+    "printf 'data:\\n  summary: |\\n    args: %s\\n    second line\\n' \"$*\"\n"
+)
+
+_FOOTPRINT_LABEL = "(modeled from us-central1 list prices, excluding LLM tokens)"
+# The resource kube-agents.gkeAutopilot probes; the installer tells its render the cluster
+# serves it unless the tfvars say standard, and the notes' parity render here does the same.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
+_NOTES_SETS = [
+    "--set", "platformAgent.harness.clusterName=ci-cluster",
+    "--set", "platformAgent.harness.location=us-central1",
+    "--set", "platformAgent.harness.projectId=ci-project",
+    "--set", "platformAgent.storage.size=200Gi",
+    "--set", "platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set", "platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set", "githubMinter.enabled=true",
+    "--set", "githubMinter.org=foo",
+    "--set", "githubMinter.repo=bar",
+    "--set", "platformAgent.integration.github.gitRepo=foo/bar",
+    "--set", "platformAgent.integration.github.org=foo",
+    "--set", "webConsole.enabled=true",
+    "--set", "platformAgent.mode=next",
+]
+
+
+class CompositionChartVarsWalkerTest(unittest.TestCase):
+    """The HCL walker the map-completeness test rests on, over the shapes main.tf uses."""
+
+    def test_a_var_inside_a_function_or_a_for_expression_is_credited_to_its_leaf(self):
+        src = """{
+          a = try(var.x, false)
+          b = coalesce(var.y, "50Gi")
+          c = [for r in var.z.rules : { for k, v in r : k => v if v != null }]
+          d = [{ e = local.n }, var.w]
+          e = { for k in var.v : k => k }
+          f = {
+            for k, v in var.u : k => v
+          }
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w"), ("e", "local.n"), ("e", "v"), ("f", "u")},
+        )
+
+    def test_a_local_a_module_output_or_a_template_string_is_recorded_as_itself(self):
+        # The shapes the walker cannot follow to a tfvar: recorded verbatim, so the map
+        # test fails on one under a footprint key instead of staying green.
+        src = """{
+          a = local.n
+          b = { size = "${var.x}" }
+          c = "${local.p}-suffix"
+          d = module.m.out
+          e = "$${literal}"
+          f = each.value.g
+          g = var.y
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {
+                ("a", "local.n"), ("b.size", '"${var.x}"'), ("c", '"${local.p}-suffix"'),
+                ("d", "module.m.out"), ("f", "each.value.g"), ("g", "y"),
+            },
+        )
+        self.assertEqual([ref for _, ref in _hcl_chart_vars(src) if re.fullmatch(_HCL_IDENT, ref)], ["y"])
+
+    def test_a_var_in_a_condition_after_a_block_is_not_credited_to_the_previous_leaf(self):
+        # main.tf's shape: a leaf set from a local, then a merge() argument gated on a var.
+        src = """{
+          root = merge({
+            integration = local.integration
+          }, var.size == local.default_size ? {} : {
+            storage = { size = var.size }
+          }, var.mode == "today" ? {} : {
+            mode = var.mode
+          })
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {("root.integration", "local.integration"), ("root.storage.size", "size"), ("root.mode", "mode")},
+        )
+
+    def test_nested_blocks_and_bare_vars_record_the_full_path(self):
+        src = """{
+          a = {
+            b = { c = var.x }
+            d = var.y ? { e = 1 } : {}
+            f = local.g
+          }
+          h = var.z
+        }"""
+        self.assertEqual(_hcl_chart_vars(src), {("a.b.c", "x"), ("a.d", "y"), ("a.f", "local.g"), ("h", "z")})
+
+
+class FootprintSummaryTest(unittest.TestCase):
+    def _run(self, script, helm_script=None, tfvars=_FOOTPRINT_TFVARS, without_helm=False):
+        """Source installer_common.sh and run `script` with a tfvars file at $TFVARS.
+
+        `helm_script` puts a stub helm first on PATH; `without_helm` runs on a PATH
+        of the essential tools only, where no helm exists. Otherwise the real helm
+        answers.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars_path = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars_path.write_text(tfvars)
+            if without_helm:
+                bin_dir = create_minimal_tools_bin(tmp)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)})
+                env["PATH"] = str(bin_dir)
+            else:
+                bin_dir = pathlib.Path(tmp) / "bin"
+                bin_dir.mkdir()
+                if helm_script:
+                    helm = bin_dir / "helm"
+                    helm.write_text(helm_script)
+                    helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)}, bin_dir=str(bin_dir))
+            body = (
+                f'set -u\n{_PRINT_STUBS}\nprint_warning() {{ echo "WARN: $*"; }}\n'
+                f'print_info() {{ echo "INFO: $*"; }}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            )
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT))
+
+    def test_tfvars_scalar_reads_the_generator_shapes(self):
+        proc = self._run(
+            'for k in platform_agent_storage_size enable_github_minter hermes_dashboard_enabled '
+            'web_console_enabled memory_provider absent_key; do '
+            'printf "%s=[%s]\\n" "$k" "$(tfvars_scalar "$TFVARS" "$k")"; done'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("platform_agent_storage_size=[200Gi]", proc.stdout)
+        self.assertIn("enable_github_minter=[true]", proc.stdout)
+        self.assertIn("hermes_dashboard_enabled=[false]", proc.stdout)
+        self.assertIn("web_console_enabled=[true]", proc.stdout)
+        self.assertIn("memory_provider=[kube_agents_memory]", proc.stdout)
+        self.assertIn("absent_key=[]", proc.stdout)
+
+    def test_render_passes_each_tfvars_setting_under_its_chart_key(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        args_line = next((line for line in proc.stdout.splitlines() if line.startswith("args: ")), None)
+        self.assertIsNotNone(args_line, proc.stdout)
+        self.assertTrue(args_line.startswith("args: template footprint-summary "), args_line)
+        for item in _FOOTPRINT_EXPECTED_SETS:
+            self.assertIn(item, args_line)
+        # The tfvars say autopilot: the render is told the cluster serves the resource the
+        # chart probes, so the credential proxy is counted at its Autopilot requests.
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", args_line)
+        # The block scalar's indent is stripped and nothing but its lines come out.
+        self.assertIn("\nsecond line\n", proc.stdout)
+        self.assertNotIn("kind: ConfigMap", proc.stdout)
+
+    def test_render_passes_nothing_for_a_key_the_tfvars_lacks(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script=_ECHO_HELM,
+            tfvars='platform_agent_storage_size = "80Gi"\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("--set platformAgent.storage.size=80Gi", proc.stdout)
+        for item in _FOOTPRINT_EXPECTED_SETS[1:]:
+            self.assertNotIn(item.split("=")[0], proc.stdout)
+
+    def test_the_map_carries_every_footprint_key_the_composition_sets_from_a_tfvar(self):
+        # Checked against main.tf, the mapping's owner, rather than against a copy of
+        # the map: a composition variable that reaches a key the summary reads and is
+        # not forwarded makes the installer's figure differ from the notes'.
+        pairs = _composition_chart_vars()
+        self.assertGreater(len(pairs), 20, pairs)
+        value_map = _footprint_value_map()
+        footprint_pairs = {
+            (key, ref) for key, ref in pairs
+            if key in _FOOTPRINT_READ_KEYS or key.startswith(tuple(f"{s}." for s in _FOOTPRINT_READ_SUBTREES))
+        }
+        self.assertTrue(footprint_pairs)
+        # A footprint key set from a local, a module output or a template string is one
+        # the walker cannot follow to a tfvar; it fails here rather than passing unseen.
+        unfollowed = sorted((key, ref) for key, ref in footprint_pairs if not re.fullmatch(_HCL_IDENT, ref))
+        self.assertFalse(
+            unfollowed,
+            f"main.tf sets footprint keys from something this test cannot follow to a tfvar: {unfollowed}. "
+            "Set them from var.<name> and carry the pair in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's "
+            "figure drifts from the notes'.",
+        )
+        for key, var in sorted(footprint_pairs):
+            self.assertEqual(value_map.get(var), key, f"main.tf sets {key} from var.{var}; FOOTPRINT_TFVARS_VALUE_MAP must carry {var}={key}")
+        for var, key in value_map.items():
+            self.assertIn((key, var), pairs, f"the map forwards {var} to {key}, which main.tf does not set from var.{var}")
+
+    def test_a_standard_cluster_is_told_the_rates_price_pods_not_nodes(self):
+        standard = _FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"')
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM, tfvars=standard)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("This is a GKE Standard cluster", proc.stdout)
+        # The install creates a gVisor pool only when asked; the sentence claims no pool.
+        self.assertNotIn("gVisor", proc.stdout)
+        # And its render is not told the cluster is Autopilot.
+        self.assertNotIn("--api-versions", proc.stdout)
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertNotIn("GKE Standard cluster", proc.stdout)
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", proc.stdout)
+
+    def test_extra_helm_values_are_named_as_outside_the_figure(self):
+        script = f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"'
+        caveat = "Chart values set through the composition's extra_helm_values are not in this figure"
+        proc = self._run(script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        proc = self._run("export TF_VAR_extra_helm_values='{litellm={replicaCount=4}}'\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn(caveat, proc.stdout)
+        # The apply goes through Terraform, which shows no notes: the hint names the
+        # command that prints them, for the namespace the tfvars carry.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints it", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
+        # Every variables file Terraform auto-loads beside the generated terraform.tfvars.
+        for name in ("extra.auto.tfvars", "extra.auto.tfvars.json", "terraform.tfvars.json"):
+            proc = self._run(f'touch "$(dirname "$TFVARS")/{name}"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run('touch "$(dirname "$TFVARS")/notes.json"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        # Terraform's extra command-line arguments: a -var-file from anywhere on disk in
+        # any of the three, or the variable itself; -auto-approve alone, the route
+        # lifecycle.sh reads, carries no values and prints no caveat.
+        for name in ("TF_CLI_ARGS", "TF_CLI_ARGS_plan", "TF_CLI_ARGS_apply"):
+            proc = self._run(f'export {name}="-var-file=$HOME/kube-agents.tfvars"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run("export TF_CLI_ARGS_apply=\"-input=false -var 'extra_helm_values={litellm={replicaCount=4}}'\"\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-var=extra_helm_values={}"\n' + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-auto-approve -input=false"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+
+    def test_render_fails_naming_the_cause_when_helm_refuses(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script="#!/usr/bin/env bash\necho 'Error: values don'\"'\"'t meet the specifications' >&2\nexit 1\n",
+        )
+        self.assertIn("rc=1", proc.stdout)
+        self.assertIn("values don't meet the specifications", proc.stderr)
+        self.assertNotIn("Release footprint", proc.stdout)
+
+    def test_print_warns_and_goes_on_without_helm(self):
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: helm is not on PATH", proc.stdout)
+        self.assertNotIn("Release footprint", proc.stdout)
+        # The fallback is the one command that shows the notes after a Terraform apply,
+        # not the notes the apply never prints nor a dry run the operator cannot value.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints them", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
+        self.assertNotIn("helm install", proc.stdout)
+        # Without a namespace in the tfvars the hint carries the placeholder.
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            tfvars=_FOOTPRINT_TFVARS.replace('namespace    = "agents-ns"\n', ""), without_helm=True,
+        )
+        self.assertIn("'helm get notes kube-agents -n <namespace>' prints them", proc.stdout)
+
+    def test_print_warns_and_goes_on_when_the_chart_is_not_in_the_checkout(self):
+        proc = self._run('print_footprint_summary /nonexistent "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: the chart at /nonexistent/", proc.stdout)
+
+    @unittest.skipIf(shutil.which("helm") is None, "helm is required to render the chart")
+    def test_real_render_prints_the_notes_block_for_the_tfvars(self):
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
+        # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
+        # which `make docs-generate` renders from the same chart template with these
+        # tfvars' --set values (held equal to _FOOTPRINT_EXPECTED_SETS below), and docs-check
+        # keeps current. So this checks that the tfvars reach the render under the right
+        # keys and that the installer prints what the notes print, not the arithmetic,
+        # which tests/test_quota_preflight.py pins from hand-kept constants. The tfvars say
+        # autopilot, so the credential proxy is counted at the operator's Autopilot
+        # requests; on standard the same tfvars sum footprint.yaml's.
+        profiles = json.loads(_FOOTPRINT_PROFILES.read_text())["profiles"]
+        for key, output in (("installer-autopilot", proc), ("installer-standard", None)):
+            profile = profiles[key]
+            self.assertEqual(
+                [f"--set {item}" for item in profile["sets"]], _FOOTPRINT_EXPECTED_SETS,
+                f"{key} in {_FOOTPRINT_PROFILES.name} renders other values than the installer passes",
+            )
+            if output is None:
+                output = self._run(
+                    f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+                    tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+                )
+                self.assertIn("rc=0", output.stdout, output.stderr)
+            r = profile["requirements"]
+            gib = 1024**3
+            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            self.assertIn(
+                f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
+                output.stdout, key,
+            )
+        # Autopilot counts the credential proxy higher, so the two profiles differ.
+        self.assertGreater(
+            profiles["installer-autopilot"]["requirements"]["requestsCpu"],
+            profiles["installer-standard"]["requirements"]["requestsCpu"],
+        )
+        # The tfvars say next, so the installer prints the caveat the notes print.
+        self.assertIn("Not counted: the session pods", proc.stdout)
+        # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
+        # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = chart_with_notes_probe(_REPO_ROOT / "charts" / "kube-agents", pathlib.Path(tmp) / "kube-agents")
+            rendered = subprocess.run(
+                ["helm", "template", "test-release", str(chart), "--show-only",
+                 NOTES_PROBE_TEMPLATE, "--api-versions", _AUTOPILOT_API, *_NOTES_SETS],
+                capture_output=True, text=True, check=True,
+            )
+            notes_text = json.loads(rendered.stdout.split("notes: ", 1)[1].strip())
+        summary_lines = [line[6:] for line in proc.stdout.splitlines() if line.startswith("      ")]
+        self.assertTrue(summary_lines, proc.stdout)
+        self.assertIn("\n".join(summary_lines), notes_text)
+
 
 if __name__ == "__main__":
     unittest.main()

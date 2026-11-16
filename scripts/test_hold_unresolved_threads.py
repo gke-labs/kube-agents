@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for hold_unresolved_threads.py -- the label that keeps an unmergeable PR out of Tide's pool.
+"""Tests for hold_unresolved_threads.py -- the label that keeps an unmergeable PR out of the merge queue.
 
 Run: cd scripts && python3 -m unittest test_hold_unresolved_threads
 
 Both wrong answers are quiet. A pull request that should have been labelled
-sits in the pool and Tide retries it every 85 seconds ahead of everyone else;
-a label that should have been left alone -- a person's, or one on a pull
-request whose threads are still open -- disappears and the merge Tide then
-attempts is the one the label existed to prevent. So each side of `decide`
+stays in the pool with its threads open, and its author gets no comment that
+says why it does not merge; a label that should have been left alone -- a person's, or
+one on a pull request whose threads are still open -- disappears and the
+pull request goes in the queue the label existed to keep it out of. So each side of `decide`
 gets a case, and the ownership check is driven with the timeline shapes the
 API actually returns.
 """
@@ -156,6 +156,21 @@ class SweepTest(unittest.TestCase):
         self.assertIn(f"/repos/{REPO}/issues/7/labels", paths)
         self.assertNotIn(f"/repos/{REPO}/issues/7/comments", paths)
         self.assertIn("comment is already there", lines[0])
+
+    def test_a_failed_comment_read_counts_as_that_pull_request_s_failure(self):
+        api = FakeAPI(pulls=[pull(7)], threads={7: [[False]]})
+        real = api.get_all
+
+        def refusing(path):
+            if path.endswith("/comments"):
+                raise RuntimeError("HTTP 502")
+            return real(path)
+
+        api.get_all = refusing
+        lines, failures = hold.sweep(api)
+        self.assertEqual(failures, 1)
+        self.assertIn("#7: failed: HTTP 502", lines)
+        self.assertNotIn(f"/repos/{REPO}/issues/7/comments", [path for path, _ in api.posts])
 
     def test_the_label_is_created_before_it_is_applied(self):
         api = FakeAPI(pulls=[pull(7)], threads={7: [[False]]})

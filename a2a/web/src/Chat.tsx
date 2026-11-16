@@ -22,6 +22,17 @@ const EMPTY_READ_ONLY = "watching the bus - ask the agent something in chat";
 const EMPTY_CONSOLE = "watching the bus - type below to ask the agent something, or /help";
 const INPUT_ROWS = 2;
 /**
+ * The one turn the footer sends on a click: the gateway answers it with the
+ * install's usage and feedback block (a2a/gateway/feedback_summary.go), the
+ * third surface of #3428 after the script and the chat command. It goes
+ * through onSend like a typed line, so the link rules and the settled
+ * classification (console.ts) apply to it unchanged.
+ */
+const USAGE_SUMMARY_COMMAND = "/feedback summary";
+const USAGE_SUMMARY_LABEL = "usage summary";
+const USAGE_SUMMARY_TITLE =
+  "send /feedback summary: the gateway posts the install's usage and feedback block, with a copy button";
+/**
  * Some WebKit versions report `isComposing: false` on the Enter that commits
  * an IME composition, but still carry the legacy `keyCode` for it - this is
  * the fallback check for those.
@@ -126,6 +137,16 @@ export default function Chat({
         <button type="button" className="probe-button" onClick={onProbe} disabled={probePending}>
           {probePending ? "verifying…" : "verify"}
         </button>
+        {canSend && (
+          <button
+            type="button"
+            className="probe-button usage-summary-button"
+            title={USAGE_SUMMARY_TITLE}
+            onClick={() => onSend?.(USAGE_SUMMARY_COMMAND)}
+          >
+            {USAGE_SUMMARY_LABEL}
+          </button>
+        )}
         {probe && <span className={`probe-result probe-${probe.outcome}`}>{probeText(probe)}</span>}
       </div>
     </div>

@@ -87,8 +87,21 @@ func TestNotifyFailsWhenTheGatewayPostedNothing(t *testing.T) {
 	notifyEnv(t, s.ClientURL())
 	answerNotify(t, s.ClientURL(), lib.NotifyReply{Error: "thread is not a thread of the home channel"})
 	err := run([]string{"notify", "--platform", "google_chat", "x"})
-	if err == nil || !strings.Contains(err.Error(), "posted nothing") {
+	if err == nil || !strings.Contains(err.Error(), "posted nothing") || errors.Is(err, errNotifyRouteUnavailable) {
 		t.Errorf("err = %v, want the gateway's refusal", err)
+	}
+}
+
+// A refusal the gateway marks Retry (stopping, a record it couldn't read) is
+// route-unavailable, which a sender waits out instead of counting against
+// the destination; a plain refusal is not.
+func TestNotifyARetryRefusalIsRouteUnavailable(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	answerNotify(t, s.ClientURL(), lib.NotifyReply{Error: "the gateway is stopping; not posted", Retry: true})
+	err := run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyRouteUnavailable) {
+		t.Errorf("err = %v, want route-unavailable", err)
 	}
 }
 
@@ -139,6 +152,28 @@ func TestNotifyWithNoAnswerIsOutcomeUnknown(t *testing.T) {
 	err = run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
 	if !errors.Is(err, errNotifyOutcomeUnknown) {
 		t.Errorf("err = %v, want outcome-unknown", err)
+	}
+}
+
+// A home post the gateway refused and kept answers with kept set, and main
+// exits notifyExitKept so a sender that re-sends on failure stops.
+func TestNotifyAKeptRefusalExitsKept(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if _, err := nc.Subscribe(lib.NotifySubjectGchat, func(m *nats.Msg) {
+		_ = m.Respond([]byte(`{"error":"no home channel is configured","kept":true}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.Flush()
+	err = run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyKept) {
+		t.Errorf("err = %v, want kept", err)
 	}
 }
 
@@ -366,6 +401,57 @@ func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
 		argv := append([]string{"notify", "--platform", "google_chat", "--timeout", "200ms"}, append(args, "--", "x")...)
 		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
 			t.Errorf("%s: err = %v, want a usage refusal", name, err)
+		}
+	}
+	// --answer-to rides a conversation post only, and is held to an update key's shape.
+	for name, args := range map[string][]string{
+		"answer without conversation": {"--answer-to", "plan-1"},
+		"spaced answer key":           {"--answer-to", " plan-1", "--conversation", "slack:C1/1.0", "--context", "x"},
+		"long answer key":             {"--answer-to", strings.Repeat("k", notifyUpdateMax+1), "--conversation", "slack:C1/1.0", "--context", "x"},
+	} {
+		argv := append([]string{"notify", "--platform", "slack", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || !strings.Contains(err.Error(), "--answer-to") {
+			t.Errorf("%s: err = %v, want a refusal naming --answer-to", name, err)
+		}
+	}
+}
+
+// --reply-to rides a conversation request to the console's subject; it is
+// refused without --conversation, or when it is no task id.
+func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	got := make(chan lib.NotifyRequest, 1)
+	if _, err := nc.Subscribe(lib.NotifySubjectConsole, func(m *nats.Msg) {
+		var req lib.NotifyRequest
+		_ = json.Unmarshal(m.Data, &req)
+		got <- req
+		body, _ := json.Marshal(lib.NotifyReply{MessageID: "n-1", ThreadID: req.Conversation})
+		_ = m.Respond(body)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1",
+		"--reply-to", "task-7", "the report"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if req := <-got; req.ReplyTo != "task-7" || req.Conversation != "console:tab-1" {
+		t.Errorf("request = %+v, want reply_to task-7 into console:tab-1", req)
+	}
+	for _, args := range [][]string{
+		{"notify", "--platform", "console", "--reply-to", "task-7", "x"},
+		{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1", "--reply-to", "task 7", "x"},
+	} {
+		if err := run(args); err == nil || !strings.Contains(err.Error(), "--reply-to") {
+			t.Errorf("%v: err = %v, want a --reply-to refusal", args, err)
 		}
 	}
 }

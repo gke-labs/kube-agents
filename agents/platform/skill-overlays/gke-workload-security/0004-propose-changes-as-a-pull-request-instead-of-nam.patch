@@ -1,0 +1,142 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -24,6 +24,8 @@ This skill provides workflows and best practices for securing GKE workloads. It
+ covers security auditing, Network Security (Network Policies), and Node Security.
+ For Workload Identity setup, use the `gke-workload-identity` skill.
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
+ ## Workflows
+ 
+ ### 1. Security Audit
+@@ -62,37 +64,33 @@ principals (the GKE documentation lists those limitations).
+ 
+ **Steps:**
+ 
+-1.  **Create Namespace and KSA:**
+-
+-    ```bash
+-    kubectl create namespace workload-identity-test-ns
+-    kubectl create serviceaccount <ksa-name> \
+-        --namespace workload-identity-test-ns
+-    ```
+-
+-2.  **Bind KSA to GSA:**
+-
+-    ```bash
+-    gcloud iam service-accounts add-iam-policy-binding <gsa-name>@<project-id>.iam.gserviceaccount.com \
+-        --role roles/iam.workloadIdentityUser \
+-        --member "serviceAccount:<project-id>.svc.id.goog[workload-identity-test-ns/<ksa-name>]"
++1.  **Create Namespace and annotated KSA**, proposed as a pull request through
++    `submit-suggestion`:
++
++    ```yaml
++    apiVersion: v1
++    kind: Namespace
++    metadata:
++      name: workload-identity-test-ns
++    ---
++    apiVersion: v1
++    kind: ServiceAccount
++    metadata:
++      name: <ksa-name>
++      namespace: workload-identity-test-ns
++      annotations:
++        iam.gke.io/gcp-service-account: <gsa-name>@<project-id>.iam.gserviceaccount.com
+     ```
+ 
+-3.  **Annotate KSA:**
++2.  **Bind KSA to GSA:** grant
++    `serviceAccount:<project-id>.svc.id.goog[workload-identity-test-ns/<ksa-name>]`
++    `roles/iam.workloadIdentityUser` on
++    `<gsa-name>@<project-id>.iam.gserviceaccount.com`, as an IAM binding in Config
++    Connector YAML through `gcp-config-connector`.
+ 
+-    ```bash
+-    kubectl annotate serviceaccount <ksa-name> \
+-        --namespace workload-identity-test-ns \
+-        iam.gke.io/gcp-service-account=<gsa-name>@<project-id>.iam.gserviceaccount.com
+-    ```
+-
+-4.  **Verify Example Pod:** Use existing asset
++3.  **Verify Example Pod:** Use existing asset
+     `assets/workload-identity-pod.yaml` to test the configuration. Update the
+-    `<ksa-name>` in the file first.
+-
+-    ```bash
+-    kubectl apply -f assets/workload-identity-pod.yaml -n workload-identity-test-ns
+-    ```
++    `<ksa-name>` in the file first, and propose it as a pull request.
+ 
+ ### 3. Implement Network Policies
+ 
+@@ -120,31 +118,22 @@ gcloud container clusters describe <cluster-name> \
+ **Enable Network Policy Enforcement (non-DPv2 clusters):**
+ 
+ Enabling network policy enforcement on clusters without Dataplane V2 requires
+-two sequential commands in this order: first enable the Calico addon on the
++two sequential changes in this order: first enable the Calico addon on the
+ control plane, then enable network policy enforcement on the nodes. GKE rejects
+-`--enable-network-policy` with HTTP 400 until the addon is enabled, and `gcloud`
+-rejects both flags in a single invocation.
++enforcement with HTTP 400 until the addon is enabled. Propose them as two pull
++requests on the cluster's `ContainerCluster` through `gcp-config-connector`, the
++second only after the first has applied:
+ 
+-```bash
+-# Step 1: Enable the NetworkPolicy addon on the control plane
+-gcloud container clusters update <cluster-name> \
+-    --update-addons=NetworkPolicy=ENABLED \
+-    --region <region>
+-
+-# Step 2: Enable NetworkPolicy enforcement on the nodes (node pools may be recreated; this can take several minutes)
+-gcloud container clusters update <cluster-name> \
+-    --enable-network-policy \
+-    --region <region>
+-```
++1. Enable the NetworkPolicy addon on the control plane:
++   `spec.addonsConfig.networkPolicyConfig.disabled: false`.
++2. Enable NetworkPolicy enforcement on the nodes: `spec.networkPolicy.enabled: true`
++   (node pools may be recreated; this can take several minutes).
+ 
+ **Apply Default Deny Policy:** Isolate namespaces by denying all ingress and
+ egress traffic by default.
+ 
+-**Replace `<target-namespace>` with the namespace you want to isolate.**
+-
+-```bash
+-kubectl apply -f assets/default-deny-netpol.yaml -n <target-namespace>
+-```
++**Propose `assets/default-deny-netpol.yaml` in `<target-namespace>`, the namespace
++you want to isolate, as a pull request through `submit-suggestion`.**
+ 
+ ### 4. GKE Sandbox (gVisor) Pod Isolation
+ 
+@@ -171,12 +160,14 @@ spec:
+ 
+ Enforce security policies on namespaces using labels.
+ 
+-**Enforce Restricted Profile:**
++**Enforce Restricted Profile:** set these labels on the namespace's manifest,
++proposed as a pull request through `submit-suggestion`:
+ 
+-```bash
+-kubectl label --overwrite ns <namespace> \
+-    pod-security.kubernetes.io/enforce=restricted \
+-    pod-security.kubernetes.io/enforce-version=latest
++```yaml
++metadata:
++  labels:
++    pod-security.kubernetes.io/enforce: restricted
++    pod-security.kubernetes.io/enforce-version: latest
+ ```
+ 
+ > [!NOTE] Using `latest` ensures you use the policies corresponding to the

@@ -13,6 +13,8 @@ metadata:
 
 Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 ## When to Use
 
 -   **Cost optimization:** Spot VMs with on-demand fallback.
@@ -23,7 +25,7 @@ Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
 --------------------------------------------------------------------------------
 
 ## CRITICAL RULES
-- **CODE-FIRST VERIFICATION (OPEN-SOURCE CODEBASE):** GKE Cluster Autoscaler and ComputeClasses are open-sourced at `https://github.com/GoogleCloudPlatform/cluster-autoscaler`. When user questions challenge or explore undocumented/subtle behaviors, or when guidance is not explicitly established in this skill, **READ THE CODE WITH THE `inspect-repository` SKILL**: this install's terminal has no `git` and cannot clone or fetch from GitHub itself, but `inspect-repository` clones broker-side and lets you `grep` and `fetch` files at the cloned `sha`. Start from the package or symbol in the code index and cite the commit you read. It returns files without history, so `git log -S` and `git blame` are the user's to run: name the symbol for them, and do not state a version or date range you have not read. See `references/compute-class-code-index.md` for exact package and symbol mappings.
+- **CODE-FIRST VERIFICATION (OPEN-SOURCE CODEBASE):** GKE Cluster Autoscaler and ComputeClasses are open-sourced at `https://github.com/GoogleCloudPlatform/cluster-autoscaler`. When user questions challenge or explore undocumented/subtle behaviors, or when guidance is not explicitly established in this skill, **READ THE CODE WITH THE `inspect-repository` SKILL**: this install's terminal has no `git` and cannot clone or fetch from GitHub itself, but `inspect-repository` copies the files of one revision, or of one directory with `--prefix`, and names the `sha` it read. Start from the package or symbol in the code index and cite the commit you read. It returns files without history, so `git log -S` and `git blame` are the user's to run: name the symbol for them, and do not state a version or date range you have not read. See `references/compute-class-code-index.md` for exact package and symbol mappings.
 
 ## Engagement Rules: Generalized First, Refine Later
 

@@ -43,23 +43,32 @@ def _error(code: str, message: str, *, retryable: bool = False) -> dict:
     return {"error": {"code": code, "message": message, "retryable": retryable}}
 
 
+def _shared_runtime_factory(
+    resolve_target: Callable[[], DeploymentTarget],
+) -> RuntimeProviderFactory:
+    """Keep one provider per target, rebuilt only when the target changes."""
+    return agent_runtime.held_per_target(
+        resolve_target, agent_runtime.AgentRuntimeProvider
+    )
+
+
 def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:
-    def build() -> agent_runtime.AgentRuntimeProvider:
+    def resolve_target() -> DeploymentTarget:
         connection = load_connection(account)
         if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."
             )
-        return agent_runtime.AgentRuntimeProvider(connection.target)
+        return connection.target
 
-    return build
+    return _shared_runtime_factory(resolve_target)
 
 
 def target_runtime_factory(target: DeploymentTarget) -> RuntimeProviderFactory:
-    """Build providers lazily so UI tests and callers can substitute adapters."""
+    """Build the provider lazily so UI tests and callers can substitute adapters."""
 
-    return lambda: agent_runtime.AgentRuntimeProvider(target)
+    return _shared_runtime_factory(lambda: target)
 
 
 def create_app(

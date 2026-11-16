@@ -1,0 +1,92 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -12,6 +12,8 @@ metadata:
+ 
+ Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
+ ## When to Use
+ 
+ -   **Cost optimization:** Spot VMs with on-demand fallback.
+diff --git a/assets/system-pool-compute-class.yaml b/assets/system-pool-compute-class.yaml
+--- a/assets/system-pool-compute-class.yaml
++++ b/assets/system-pool-compute-class.yaml
+@@ -11,15 +11,15 @@
+ # Fix: route non-DaemonSet system pods to a dedicated, cheap class. Expensive
+ # nodes only host actual workloads, and consolidation can drain them freely.
+ #
+-# After kubectl apply, label the namespace (the -non-daemonset variant leaves
++# In the same pull request, label the namespace (the -non-daemonset variant leaves
+ # DaemonSets alone — they need to run everywhere anyway, and CA already
+ # ignores DaemonSet-only nodes for scale-down):
+ #
+-#   kubectl label namespace kube-system \
+-#     cloud.google.com/default-compute-class-non-daemonset=system-pool
++#   cloud.google.com/default-compute-class-non-daemonset: system-pool
++#   on the kube-system Namespace
+ #
+ # Existing system pods don't reschedule on their own — wait for natural
+-# restarts or `kubectl rollout restart deployment -n kube-system <name>`.
++# restarts.
+ #
+ # whenUnsatisfiable: ScaleUpAnyway is intentional — never let priority
+ # exhaustion block a kube-system pod (would cascade into a wider outage).
+diff --git a/references/compute-class-autopilot-mode.md b/references/compute-class-autopilot-mode.md
+--- a/references/compute-class-autopilot-mode.md
++++ b/references/compute-class-autopilot-mode.md
+@@ -19,8 +19,9 @@ converting the cluster. Selection is by ComputeClass.
+ 
+ -   **Per-Pod:** `nodeSelector: { cloud.google.com/compute-class: autopilot }`
+     (or a node-affinity rule on that label).
+--   **Namespace default:** `kubectl label ns $NS
+-    cloud.google.com/default-compute-class=autopilot` — all Pods in the
++-   **Namespace default:** the label
++    `cloud.google.com/default-compute-class: autopilot` on the namespace's
++    manifest, proposed as a pull request — all Pods in the
+     namespace run Autopilot mode unless they select another class.
+ -   **Existing Pods:** Pods already running on Standard nodes switch to
+     Autopilot mode **only when recreated** (rollout/restart), not in place.
+diff --git a/references/compute-class-governance.md b/references/compute-class-governance.md
+--- a/references/compute-class-governance.md
++++ b/references/compute-class-governance.md
+@@ -62,7 +62,8 @@ leaving `statefulsets`/`daemonsets`/`replicasets` (apps), `jobs`/`cronjobs`
+ -   `failurePolicy: Fail` — fail closed.
+ -   Scope with `namespaceSelector.matchLabels` (e.g.
+     `kubernetes.io/metadata.name: <NS>`).
+--   Apply: `kubectl apply -f restrict-computeclass-usage-vap.yaml`.
++-   Propose `restrict-computeclass-usage-vap.yaml` as a pull request through
++    `submit-suggestion`.
+ 
+ Denial surfaces as: `admission webhook ... denied the request: This namespace
+ cannot request ComputeClass <NAME> ...`.
+diff --git a/references/compute-class-provisioning-methods.md b/references/compute-class-provisioning-methods.md
+--- a/references/compute-class-provisioning-methods.md
++++ b/references/compute-class-provisioning-methods.md
+@@ -64,13 +64,11 @@ node boot disk).
+ ## Binding Manual Pools to ComputeClass
+ 
+ Manual pools must be labeled/tainted to be eligible for a ComputeClass (unless
+-it's the cluster default).
+-
+-```bash
+-gcloud container node-pools update <POOL> \
+-    --node-labels="cloud.google.com/compute-class=<CLASS-NAME>" \
+-    --node-taints="cloud.google.com/compute-class=<CLASS-NAME>:NoSchedule"
+-```
++it's the cluster default). `nodeConfig.labels` is immutable on an existing pool, so propose a new
++`ContainerNodePool` carrying the label `cloud.google.com/compute-class: <CLASS-NAME>`
++in `spec.nodeConfig.labels` and a `spec.nodeConfig.taint` entry with that key and
++value and the no-schedule effect, as Config Connector YAML through
++`gcp-config-connector`.
+ 
+ When using node pool auto-creation, ComputeClasses auto-tolerate these taints;
+ workloads do **not** need matching tolerations.

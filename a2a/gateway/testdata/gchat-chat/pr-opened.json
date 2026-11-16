@@ -1,0 +1,32 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*I opened PR #412 in fleet-config. It's yours to review.* Opened PR #412 raising the limit",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "openLink": {
+                  "url": "https://github.com/acme/fleet-config/pull/412"
+                }
+              },
+              "text": "Open PR ↗",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "openLink": {
+                  "url": "https://github.com/acme/fleet-config/pull/412/files"
+                }
+              },
+              "text": "Files changed ↗"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

@@ -10,32 +10,38 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger and, with `KUBEAGENTS_POST_MERGE_CHECK` not `off`, the post-merge records; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route, and `post_merge_check.py notice` updates `post_merge_records` the same way. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
 1. **Deduplication:** Maps repeat events to the same troubleshooting session, preventing alert flooding and saving LLM token costs.
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
-4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
-5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
+4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context. An `apply` among them is also recorded for the recurrence hold ([below](#holding-a-recurrence-while-its-fix-waits-for-review)).
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap. Events an alert-exclude rule held back in the watcher arrive on `POST /v1/excluded-events` with no session, as rows marked `excluded = 1` (one per object and reason per hour, with later records added to its `occurrences`), and the recap counts them on a line of their own that names the five noisiest workloads. `GET /v1/intercepted-events` lists them with the status `excluded`. They count toward `LEDGER_MAX_ROWS` like every other row.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
-7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (on Slack, a fleet-audit report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
+7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
 
 ### Triage Routing
 
 The session lands on the front door and cannot land anywhere else. Hermes selects a profile by URL prefix (`POST /p/<profile>/api/sessions`), only when `gateway.multiplex_profiles` is enabled — it is off by default and this install does not set it — and only against that profile's own `API_SERVER_KEY`. A `profile` key in the request body is accepted with a `201` and dropped, so it looks like routing and is not. Routing is therefore a prompt, not a parameter.
 
-`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report.
+`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report. When `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` (a `spec.deployment.env` entry, passed through by the operator like `INCIDENT_WORKLOAD_DEDUP_SECONDS`), `_build_agent_query_with_pull_request` asks the front door for a second `kanban_create` call assigned to `platform` with `parents: ["<triage_card_id>"]` and a verbatim body from `_triage_pr_task_body`; the dispatcher holds that second card in `todo` until the diagnosis card settles (`done` or `archived` — while the diagnosis card is `blocked`, the second card stays held in `todo` and is surfaced by `kanban_board_health`, and if the blocked parent is archived without a report, step 2 of `_triage_pr_task_body` sees `status != 'done'` and completes without opening a pull request), and when the diagnosis completes the Platform Agent opens the GitOps Pull Request for the recommended fix without waiting for a chat reply. That card's branch (`_incident_branch`) is keyed on the workload the way the incident fold keys it (`_fold_key`, [below](#folding-a-workloads-repeat-events)), so every replica of a Deployment lands on one branch, and an event folded into an open incident starts no turn and files no pull-request card.
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
-Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel.
+Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the `State at HH:MM UTC:` opener from the agent's own read, the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel, by title and how long it has waited, when it first gets stuck and then weekly while any stays stuck.
 
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
 The session id is therefore the thread key, and `session_metadata` records the `platform` alongside the `thread_id`: a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright.
+
+#### Limiting the open triage pull requests
+
+With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge from the managed repository itself (a fork's, whose `sourceRepo` names another repository, does not count) (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The forge is read before the lock, and the reservations are read and written under it, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts `TRIAGE_PR_CAP_NOTE` is posted where `_triage_not_started` posts its notice: in the alert's thread, or under the alert's quoted first line when it has no thread. With no chat platform the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
+
+There is one reservation per triage and branch. It is released when its branch shows an open proposal (it then counts as open), when that triage's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived` and opened no pull request after the forge was read (a later one is not in that read, so the reservation still counts it), when the triage does not start (`_triage_not_started`), and after `TRIAGE_PR_RESERVATION_MAX_S` (24 h). The last covers a card never filed, and a card that is `blocked` or held in `todo` behind a blocked triage card: such a card can still open its pull request, so it keeps counting until it settles or the 24 hours pass. Under the watcher's `--mode=shared`, where every incident shares one session, the first settled card, or one triage that does not start, releases every reservation. A daemon start also releases each reservation whose triage never reached `started` (a process that died between the claim and the start), beside the fold anchors. The count goes by the branch prefix alone: a pull request opened by a reply's `apply` counts when the branch `submit-suggestion` names for it (`platform-agent/<change_type>-<target_id>`) takes the prefix, and not otherwise.
 
 ### Daily Alert Ceiling
 
@@ -45,7 +51,19 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound.
+#### Folding a workload's repeat events
+
+The watcher deduplicates on the involved object's UID and the reason, so one broken Deployment reaches `inject_message` once per replica, once per replacement pod, and once per reason in a cascade (`Unhealthy`, then `BackOff`). With `INCIDENT_WORKLOAD_DEDUP_SECONDS` above `0` (default `3600`, which the operator renders into the container and the chart exposes as `platformAgent.deployment.incidentWorkloadDedupSeconds`; `0` turns it off; capped at `86400`; a negative value reads as `0` and an unparseable one as the default), a Warning-or-worse event for a `(cluster, namespace, object kind, fold_key)` that already has an admitted row younger than the window is written with `duplicate_of` set to that row (a Critical only when that row is Critical too, below). It claims no allowance, posts nothing and starts no turn, and the route answers `folded`. The watcher keeps its dedup entry unflagged and counts the event in `k8s_event_watcher_events_folded_total`, not as injected or as a triage session; `filtered` would let the next Warning sighting reopen the entry. A watcher that predates the status reads it as delivered, which keeps the entry the same way and miscounts it. The window runs from the anchor, so once it passes, the next new pod or reason from a workload that is still failing is announced again, unless the workload's fix is waiting for review ([below](#holding-a-recurrence-while-its-fix-waits-for-review)). The anchor lookup (`_workload_incident_anchor`) runs on the inject route under `_WORKLOAD_FOLD_LOCK`, so every event waits on it; it reads the ledger through the partial index `idx_intercepted_events_fold_anchor` on `(cluster, namespace, object_kind, fold_key, id DESC) WHERE fold_key != '' AND (notified != 0 OR delivery_error != '')`, and the start-up clear of `fold_key` walks the same index. The admission term is in the index because every forwarded event writes a row with its `fold_key` set whatever became of it, and a workload its severity's ceiling refuses for the rest of a day writes one row per sighting, none of which anchors: with the index on the key alone each later sighting walked all of them before concluding there was no anchor (1,600,122 SQLite steps on a 200,000-row storm, against 270 with the term), under the lock every other inject waits on. SQLite matches a partial index's `WHERE` against the query's text, so the queries spell the terms beside their bound parameters (`FOLD_ANCHOR_INDEX_TERM`); a reworded query that loses one goes back to scanning the table, which `test_session_kv_server.py` reads out of `EXPLAIN QUERY PLAN`, and the start-up replaces an index of the same name whose SQL lacks the term.
+
+`fold_key` is what makes two events one workload. For a Pod event the watcher fills `context.controller_ref` with the Pod's owning workload, `<Kind>/<name>`, read from the Pod's controller ownerReference with a metadata-only GET once the event is admitted (`k8s-operator/cmd/k8s-event-watcher/owner.go`). A Pod with one folds on it: the pods of one Job, StatefulSet or DaemonSet are one incident, as a Deployment's replicas are, and its incidents of one reason share one pull-request branch. Only those controllers fold (`FOLDABLE_CONTROLLER_KINDS`): a static Pod's controller is its Node, and a Node is not a workload, and a ReplicaSet no Deployment owns (no matching `pod-template-hash`: a bare one, or an Argo Rollout's) is read as no owner. A fix pull request opened before the watcher sent the field, for a StatefulSet, DaemonSet or Job pod, is keyed to the pod's name, so a recurrence after the upgrade is not held by it and opens a pull request of its own; Deployment pods keep their key, except those whose hash is shorter than 8 characters (below). A Deployment's pods fold on the bare Deployment name and every other kind on `<Kind>/<name>`, so a StatefulSet and a Deployment of the same name stay apart. A value of any other shape is ignored. The field is empty when the Pod has no controller of those kinds, when the Pod is gone (a 404), or when the lookup failed (for example, an identity that may not read Pods on that cluster), and then the key is read from the pod's name, as below. A Deployment's pod (its ReplicaSet's pod-template hash, then its own suffix: `checkout-6cfdb6b98b-zwv24`) folds on the workload `clean_workload_name` gives it. The hash is `SafeEncodeString` of a decimal number, so its characters are only `4`–`9`, `b`, `c`, `d` and `f`, and the fold key is set only for a segment of 8–10 of those. That keeps out a CronJob run's pod (`report-29812345-abcde`) and a date-stamped Job's (`db-migrate-20261021-abcde`), which the display cleaner shows under the same prefix: folded, a Job's failure would sit under a same-named Deployment's incident. The hash is shorter than 8 characters for about 0.2% of pod templates, and without a `controller_ref` those Deployments do not fold: a lower bound would also match short name segments and fold different owners together. A non-Pod object folds on its own name. Without a `controller_ref`, any other Pod name has no key, so it neither folds nor anchors: a StatefulSet's `web-0` and `web-1` keep their ordinals, and a DaemonSet's or a Job's pods end in a five-character segment the cleaner also strips from a bare pod, where it is not a replica suffix (`api-cache` and `api-proxy` both display as `api`). Folding those would let one workload's alert silence another's, so they each still alert. A Critical event folds only into a Critical anchor: a workload that gets worse after its Warning went out is announced again.
+
+An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage start was given up: the triage pool retries a start that provably did not begin ([When a triage cannot start](#when-a-triage-cannot-start); a 2xx, a 5xx other than 503 or an error while waiting for the `/chat` answer counts as started, since the turn may have run), and when it gives up it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. While the start is queued or retrying the row still anchors: a start is on its way, and a sibling admitted then would open a second triage on the same incident. The same release happens when the background task dies on an exception before the start is queued, and every start of the server clears the fold key of every admitted row (a refused or folded row keeps its key and never anchors, since anchoring needs admission too), because a row whose task never ran (the process died between the insert and the task) or whose queued start the restart lost has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a start the pool gave up on, they are the ones that arrived while it was queued or retrying, up to the queue limit plus the retry budget, and the give-up notice in the anchor's thread is the record that no triage ran for the workload; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
+
+#### Holding a recurrence while its fix waits for review
+
+Past the fold window, a workload can break again while the fix for its last incident is still a pull request waiting for review. With `INCIDENT_WORKLOAD_DEDUP_SECONDS` above `0`, `inject_message` then looks for that fix before admitting the event (`_open_fix_pull_request`): among the workload's five most recent admitted incidents that have a session (same cluster, namespace, kind and `workload_key`, with the event's reason the incident's own or one folded into it, since another reason is another fault the fix may not touch; a Critical event only among Critical ones), a pull request a card opened for the incident, which the forge still reports open. A card opened one when the board holds a `pr_opened` event on it (`agents/platform/plugins/pr_opened`), and the card belongs to the incident when it was filed in the incident's own session (`tasks.session_id`, which Hermes stamps on the card the front door files with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST`). A human's `apply` (typed, or an option button's text) is filed by the front door in its own session, so the card that opens that fix counts by another route: `incident_context` records each `apply` in the incident's thread (`POST /v1/incidents/apply`, table `incident_applies`), and the first card assigned to `INCIDENT_PR_ASSIGNEE` that carries the thread's subscription (`kanban_notify_subs`) and was created within `INCIDENT_APPLY_CARD_WINDOW_S` (30 min) after one of the thread's five most recent `apply`s (`INCIDENT_APPLIES_SCANNED`) is that incident's fix card. Only a reply found by its own thread is recorded: the first reply in a Google Chat direct message, recovered from its raw payload, is answered at top level, so its card carries no subscription to match. Any other card that only carries the thread's subscription does not count: anything asked for in the thread files one, so its pull request need not be the fix. The `spec.mode: next` A2A gateway does not run `incident_context`, so an `apply` on the platform it holds is not recorded and its fix does not hold. When one is open, the event is written with `duplicate_of` set to that incident and `pull_request` set to its URL, claims no allowance, starts no turn, and is answered `folded`; on an install with a chat platform, the incident's thread is told once per window that the workload is still failing and the fix is waiting (`_remind_fix_pull_request`, rate-limited through `fix_pr_reminded_at` in the incident's `session_metadata`). A merged pull request whose workload breaks again, a closed one, or none, admits the event as a new incident. The lookup is made outside `_WORKLOAD_FOLD_LOCK` and only when no fold applies, and it fails open: an unreadable board or a forge that does not answer within `FIX_PR_LOOKUP_TIMEOUT_S` (8 s for the whole search) announces the event as before. The ledger read uses the partial index `idx_intercepted_events_workload_incident` on `workload_key`, which holds only the rows that can answer (`workload_key != '' AND duplicate_of IS NULL AND session_id != '' AND (notified != 0 OR delivery_error != '')`, `WORKLOAD_INCIDENT_INDEX_TERM`; the admission term is there for the same reason as in the anchor index, since a refused sighting is written with the inject's session and would otherwise sit in this index too), and the folded-reason test is a correlated `EXISTS` on `idx_intercepted_events_duplicate_reason` (`(duplicate_of, reason) WHERE duplicate_of > 0`), so a hit stops at the first index row and a miss walks none of the refused or folded rows the workload wrote. The forge calls go through `_FixPullRequestLookupPool`: `FIX_PR_LOOKUP_WORKERS` (4) daemon threads on a queue of at most `FIX_PR_LOOKUP_QUEUE_MAX` waiting lookups, with each pull request's state reused for `FIX_PR_STATE_CACHE_TTL_S` (60 s) and callers that arrive while a read is in flight waiting on that read. A caller waits only its own share of the search budget, and the worker's forge call is bounded by the same `FIX_PR_LOOKUP_TIMEOUT_S` (passed to `forge.call`, which shortens the sandbox hop and skips the retry once the budget is spent), so a forge that hangs holds a worker for 8 s rather than for the hop's 90 s; a read that outlives its caller still lands in the cache. Only a state the forge gave is cached, and a full queue answers "unknown", so a forge outage announces events rather than holding them. `workload_key` is what `_incident_branch_workload` reads, and unlike `fold_key` nothing clears it, so the search reaches back past a restart.
+
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -58,7 +76,8 @@ Three of the four are severities and the fourth is not; `GitOpsDrift` is what dr
 whatever they display as.
 
 The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
-each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+each object, because the detector does not combine live records (late ones are digested and bill
+nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
 detector by default, so this value applies to the installs that these scripts manage. Only changes by
 people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
 object still sends a card with less detail, unless its cluster is outside the install's scope. That
@@ -115,6 +134,19 @@ What the drift branch does differently:
   `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
   the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **Late records skip this route.** A record the detector marks as backlog (it queued while no detector was
+  pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
+  route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
+  starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
+  on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
+  reads it, and it stays in view until a person acts). A
+  principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
+  claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
+  `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
+  carded from its own columns (summary and cluster). The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
+  marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
   `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
@@ -147,7 +179,8 @@ separate variables and refuses an apply that sets `enable_drift_detector` withou
 #### Asking whether the dispatch is there
 
 `GET /healthz` answers `inject_kinds`, the list of kinds the dispatch above understands, and the
-detector probes it at startup and refuses to run if `gitops-drift` is not on it.
+detector probes it at startup and refuses to run if `gitops-drift` is not on it. It also answers
+`features`; the detector uses `POST /v1/drift-backlog` only when `drift-backlog` is on it.
 
 The dispatch is an equality test on `kind`, and a daemon predating it cannot say so: the drift
 payload falls into the event path, where the defaults render it as a `Warning` Pod alert named
@@ -159,13 +192,18 @@ objects is six of them.
 The skew is an ordinary deployment window rather than a hypothetical: this script is copied to the
 shared PVC from the agent image while the Go producers ship in their own, so the two roll
 independently. The event watcher negotiates the same class of problem in the other direction with
-`X-Watcher-Features`.
+`X-Watcher-Features`, and the daemon answers in kind: its `injected` reply to an event lists what it
+does with the session beyond posting the alert (`features`, today `followup`), and `/healthz` lists
+the same under `features`, which the watcher's sweep reads again before each tick's
+follow-ups; together they are how the watcher knows a `k8s-event-followup` will reach the thread
+rather than open a second alert, whichever way the two images have rolled.
 
 It is on the unauthenticated `/healthz` so the probe is a precondition of starting rather than
 something a producer discovers only once it holds credentials, and the key's _absence_ is the
 signal: an old daemon answers `{"status": "ok"}` and nothing else, so a producer that requires its
-kind fails closed against one. A kind goes on the list only when the dispatch actually handles it —
-the watcher's two are there because the event path is a real answer for them rather than a fallback.
+kind fails closed against one. A kind goes on the list only when the dispatch actually handles it:
+`k8s-event` because the event path is a real answer for it rather than a fallback, and
+`k8s-event-followup` because it has a branch of its own (below).
 
 ### The third producer: `controller-stall`
 
@@ -193,6 +231,28 @@ these ways:
 
 The watch files no card itself and finds the one the Planning Agent filed by `tasks.session_id`, so it
 can comment on it when new objects stall and complete it when the stall clears.
+
+### The watcher's second record: `k8s-event-followup`
+
+The event watcher sends `kind: k8s-event-followup` on an alert's own session once the object has
+emitted no new event for the watcher's quiet period (`WATCHER_QUIET_AFTER`, 15m), and only to a
+daemon whose `injected` answer to the alert listed `followup` under `features`. `_inject_followup`
+reads the session's routing, posts one line into the alert's thread ("Quiet since HH:MM UTC …") and
+leaves the same line as a comment on the card the session filed, found by `tasks.session_id` as the
+stall watch finds its card. It writes no ledger row, claims no quota and starts no turn: nothing new
+happened, something stopped happening. The line says what it is, silence and not a confirmed recovery,
+since the watcher reads events and, of the object, only a Pod's owner, never its state. A session with
+a card but no thread, every session on an install
+without a chat surface, gets the line on its card alone, written before the answer; while the card is still to come (triage queued or running), or the board will not answer, the answer is a 503 the watcher retries each sweep, for an hour from the daemon's first attempt (`FOLLOWUP_CARD_WAIT_SECONDS`); past that, and for a session with
+neither, it is answered `unrouted`. It is a reply rather than an edit of the alert: the alert's update key names whatever message last
+took it, the triage report once that landed, so a keyed send here would overwrite it.
+
+An alert whose investigation never starts gets the same thread's line from `_triage_watchdog`,
+armed by `trigger_agent_troubleshooter` as soon as the alert is routed to its thread and before the
+gateway is contacted (`TRIAGE_WATCHDOG_SECONDS`, 3600, read like the ceilings so a bad value falls
+back): if an hour on the session has filed no card and no report has been stored for the thread, it
+says so there, stating those two facts and no cause. A board it cannot read is unknown and keeps it
+quiet. An in-process timer, so a daemon restart inside the hour drops it for the alerts before it.
 
 ---
 
@@ -233,6 +293,9 @@ sequenceDiagram
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Route this triage)
     Gateway->>Front: Wake up the front door
     Front->>Agent: kanban_create(assignee=cluster-proj-x-loc, body=the brief, verbatim)
+    opt INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true
+        Front->>Fixer: kanban_create(assignee=platform, parents=[triage_card_id], body=PR brief, verbatim)
+    end
     Note over Front, Agent: The card is subscribed to the alert's thread, not to the api_server origin
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
@@ -256,6 +319,7 @@ sequenceDiagram
     Chat->>Plugin: User replies: "apply" (recommended) or "apply Option B" (Hook: pre_gateway_dispatch)
     Plugin->>Proxy: GET /v1/incidents/by-thread
     Proxy-->>Plugin: Return triage report content
+    Plugin->>Proxy: POST /v1/incidents/apply (an apply only, for the recurrence hold)
     Note over Plugin: Rewrite message text to prepend triage report context
     Plugin->>Gateway: Dispatch the rewritten message
     Gateway->>Front: Ordinary chat ingress, so it lands on the front door
@@ -283,10 +347,97 @@ Stores the mapping between the troubleshooter session and the platform chat thre
 ```sql
 CREATE TABLE session_metadata(
   session_id TEXT PRIMARY KEY,
-  metadata TEXT NOT NULL,         -- JSON object storing platform, chat_id, thread_id, and timestamps
+  metadata TEXT NOT NULL,         -- JSON object storing platform, chat_id, thread_id, origin, origin_platform, and timestamps
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+`origin` and `origin_platform` record where the session's work started. The first writer wins:
+the hermes-bridge (`PUT /v1/sessions/{id}/origin`, which answers 409 when the session already has
+one), this server for a watcher session on its first inject (`drift` or `event`), or the
+`session_store` plugin, which writes `chat` and the platform for a session on a chat platform. A
+session with no `origin` resolves as `other`. `GET /v1/sessions/{id}/origin` follows compression
+parents, so a rotated session id keeps its parent's origin.
+
+#### Work-origin tables
+
+Three tables hold the origin of work that is not a session. `cleanup_old_records` leaves the first
+two: they are durable, not idle-session state.
+
+```sql
+CREATE TABLE cron_job_origins(      -- PUT/GET /v1/cron/jobs/{id}/origin
+  job_id TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  recorded_at TEXT
+);
+CREATE TABLE proposals_opened(      -- POST /v1/proposals/opened, GET /v1/proposals/opened/counts
+  url TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  opened_at TEXT
+);
+CREATE TABLE kanban_stamp_tickets(  -- POST /v1/board/stamp-tickets, POST /v1/board/stamp-tickets/{ticket}/redeem
+  ticket TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  issued_at REAL,
+  redeemed_at REAL NULL
+);
+```
+
+`cron_job_origins` is the origin a cron job was created or last changed under; the cronjob tool
+upserts it on `create` and `update`. `proposals_opened` is the ledger of pull requests the broker
+confirmed this install opened, one row per url, where the first record stands; the counts route
+answers every origin, an origin with no row as zero. `kanban_stamp_tickets` holds one-time tickets
+that stamp one new card's origin at insert; a ticket is spent once, and `cleanup_old_records`
+removes it once it is older than `STAMP_TICKET_TTL_SECONDS` (300). The card's stamp itself is in
+`kanban.db`, in the side table `kanban_task_origins`.
+
+#### `post_merge_records`
+
+```sql
+CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
+  url TEXT PRIMARY KEY,
+  repo TEXT, number INTEGER, kind TEXT,
+  finding_id TEXT, project TEXT, location TEXT, cluster TEXT, namespace TEXT, object TEXT,
+  environment TEXT,
+  origin TEXT, origin_platform TEXT, opened_at TEXT,
+  task_id TEXT, thread_platform TEXT, thread_chat_id TEXT, thread_id TEXT,
+  merged_at TEXT, merge_commit TEXT, closed_at TEXT, merge_checked_at TEXT,
+  applied_at TEXT, sync_state TEXT, health_baseline TEXT, health_result TEXT, health_detail TEXT,
+  health_at TEXT, health_checked_at TEXT,
+  human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
+  outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
+  followup_detail TEXT
+);
+```
+
+One row per fix pull request the post-merge check follows, the first record of a url standing. The
+`pr_opened` plugin writes it when it claims a proposal whose record names the finding it fixes (the
+fleet audit sets it for a one-workload `no-pdb` fix) and the install's `KUBEAGENTS_POST_MERGE_CHECK`
+switch is not `off`; with the switch off nothing is written. The server derives `kind` from the
+finding id's first segment (`POST_MERGE_KINDS` in `session_kv_server.py`, mirrored in the plugin)
+and ignores any kind the caller sends; `project` and `location` come from the Cluster Agent profile
+whose `cluster_identity` names that cluster (all three parts must match for the audit's qualified
+`<project>/<location>/<name>`), empty when none names it or the profiles that do disagree. The finding itself is
+still the opener's word, so the check verifies the fix rather than trusting the row. `repo` is read
+off the pull request url, and the thread is the one the opening card reports to: empty outside a
+kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it
+(the plugin does not). The merge step is `post_merge_check.py notice`,
+one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
+read first, and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
+`merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
+`closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
+that it ends with no outcome. Every read stamps `merge_checked_at`. The edit, revert
+and outcome columns are left for the later steps. `cleanup_old_records` leaves the table: each row
+is a durable record of a fix pull request, not idle-session state.
+
+`GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
+fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
+thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table
+that does not exist yet answers an empty list; a table missing a column the count needs, or a database
+that cannot be read, answers `503`.
 
 #### `incidents`
 
@@ -310,7 +461,7 @@ number instead of losing them; the watcher's own dedup snapshot cannot substitut
 rolling window of _active_ incidents keyed by `(uid, reason)`, carries no namespace or workload
 name, and resets each entry's `count` when its window rolls over.
 
-`notified = 0` covers three unrelated outcomes and the recap must not conflate them. The [severity
+`notified = 0` covers four unrelated outcomes and the recap must not conflate them. The [severity
 gate](#severity-gate) holds back events Kubernetes itself graded informational, and those are the
 recap's subject — reported as a count. An alert the [daily ceiling](#daily-alert-ceiling) dropped
 carries the same flag but was graded `Critical` or `Warning` and was on its way to chat, so the
@@ -324,7 +475,7 @@ written. The row goes in before the chat post is attempted: the send runs in a b
 row written afterwards would be lost outright if the process died mid-flight. A send that then fails
 comes back and clears the flag, recording why in `delivery_error` — without that correction the row
 reads as delivered, and the recap prints its ✅ all-clear over a day an alert never reached anyone.
-It is a separate column rather than a fourth `severity` reading because a ceiling drop and a failed
+It is a separate column rather than another `severity` reading because a ceiling drop and a failed
 send prescribe opposite remedies: raise the ceiling, or fix the chat credentials. The recap keeps
 that distinction in its counts and drops it from its listing: it names neither class, and prints a
 separate ⚠️ total for each above the body. No metric counts the delivery-failure class at all, so
@@ -334,10 +485,12 @@ what to query for the detail. Like `cluster`, it postdates the first draft of th
 when `PRAGMA table_info` says it is there — see "Which columns are migrated, and which are not" below for
 why that tolerance is in the reader and not in `init_db`, and why `cluster` does not get it.
 
+The fourth is a row folded into its workload's open incident ([Folding a workload's repeat events](#folding-a-workloads-repeat-events)): graded `Critical` or `Warning`, and not posted because an incident for the same workload was already admitted (posted, dispatched headless, or posted and refused by chat). It carries `duplicate_of`, which is how the recap tells it from a ceiling drop. It counts it in neither tally, and keys its group as an alert that went out, so it joins its anchor's group when the reason, severity and delivery match and forms a group of its own when they do not.
+
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
-marks the delivery failure and then continues into `_create_gateway_session` and `_start_agent_turn`,
-so a triage session **does** run for every undelivered alert — it only skips
+marks the delivery failure and then still queues the triage start (see "When a triage cannot start"),
+so a triage start is queued for every undelivered alert — it only skips
 `_register_session_routing` on that branch, leaving the turn with no thread to reply into even
 though `_build_agent_query` instructs the model to thread its findings. The turn still writes its
 `incidents` row; it just reaches nobody through chat. Nothing announces that session, so the session
@@ -379,11 +532,60 @@ CREATE TABLE intercepted_events(
   notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back; 1 when posted to chat; 2 when dispatched on a headless install with no chat platform enabled
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
-  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  dispatched_at TEXT,                      -- when the dispatcher created the turn's gateway session (sub-second); a drift-backlog row is stamped at carding; NULL = admitted and not yet dispatched
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
+  principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
+  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  triage_state TEXT NOT NULL DEFAULT '',   -- pending when the triage start is queued, then started or aborted; '' when no start was queued (filtered, suppressed, or written before this column)
+  duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
+  fold_key    TEXT NOT NULL DEFAULT '',    -- what the row folds on: a pod's owning workload (context.controller_ref; a Deployment's as its bare name, others as <Kind>/<name>) or, without one, the workload of a pod named like a Deployment's; a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
+  workload_key TEXT NOT NULL DEFAULT '',   -- the workload an incident's fix belongs to (_incident_branch_workload); never cleared
+  pull_request TEXT NOT NULL DEFAULT '',   -- the open fix pull request a recurrence was held for; '' otherwise
+  excluded    INTEGER NOT NULL DEFAULT 0   -- 1 on a row an alert-exclude rule held back in the watcher (POST /v1/excluded-events); 0 otherwise
 );
+CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
+  ON intercepted_events (session_id);
 ```
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
+##### When a triage cannot start
+
+`trigger_agent_troubleshooter` posts the alert, writes `triage_state = pending` on the row, and hands
+the session create and the `/chat` turn to a pool of 4 threads (`TRIAGE_START_WORKERS`),
+then returns. The pool is the cap: every turn holds a worker of the gateway's default executor, which
+has `min(32, vCPUs + 4)` workers (8 on a 4-vCPU node), and session creates and the
+readiness probe wait on the same executor. A burst of 20 starts at once on a warm gateway lost half of
+them to create timeouts; 4 at once lost none. The 4 depends on that executor's size, so measure it again
+(a burst of 20 failing pods against a warm gateway, counting `TRIAGE_STARTED` lines and probe timeouts) on
+a Hermes upgrade that changes the executor, or on nodes with fewer than 4 vCPUs.
+
+A start is retried only when it provably did not start: a refused connection, a 429 or 503 (after its
+`Retry-After`), a create that timed out or lost its connection (the create waits 25 s, above Hermes'
+20 s lock wait, and the retry's 409 counts as created) or got a 5xx, and a `/chat` 404, which creates
+the session again once, and a `/chat` request that failed while connecting or sending (a `URLError`;
+an error while waiting for the answer is not one). A `/chat` call that was sent and got no answer, or a 5xx other than 503, is
+never sent again, because the turn may be running; the row records it as `started`, so `started`
+means the turn was sent, not that it ran. The budget is 6 answered attempts and 300 s of time spent on
+answered attempts and the waits after them. Refused connections spend neither. A start dequeued more than
+20 minutes after it was queued still gets one attempt, and no retry: a long queue behind slow turns is not
+a gateway fault, and on `main` the start was at least attempted.
+
+A start that gives up logs `TRIAGE_NOT_STARTED session=<id> source=<event|drift|stall> reason=<...>`,
+sets `triage_state = aborted` (the feed reports it as `triage_aborted`, or `undelivered` when the
+alert's own delivery failed or is unconfirmed), releases the row's fold anchor
+([Folding a workload's repeat events](#folding-a-workloads-repeat-events)), and posts one notice in the
+alert's thread: triage did not start, whether the alert comes back, and what to do now. An alert
+delivered without a thread gets the notice as a new message that quotes the alert's first line; an
+undelivered alert and a headless install get no notice, so the session log and `triage_state` are
+their record. `TRIAGE_QUEUED`, `TRIAGE_DEQUEUED` and
+`TRIAGE_STARTED` log lines mark the other steps. A restart loses the queued starts, and their rows
+stay `pending`.
+
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` and the shared supplement rules in `agents/platform/scripts/worker_transcript.py` (the same module the bench's trajectory read loads in the pod) before returning it. A `tool_result` whose call read a secret is withheld rather than scrubbed, and the detector fails closed: it reads each simple command of the line on its own and each quoted script (`sh -c '…'`) as a line of its own, serves a `kubectl get` whose resources are other kinds by name, serves one of secrets only when the command is provably the bare list (names, types and ages; no output flag in any spelling, no variable, no substitution), withholds one whose resource it cannot tell (from a file, stdin or a variable), and serves a secret store's command only when its subcommand is one of the store's named lists, so an output form nobody enumerated withholds the result. When `GET /v1/sessions/{session_id}/tasks` is called for a dispatched `intercepted_events` triage session before the front door has filed a kanban card, it returns a sibling `routing` object (`profile = "default"`) beside `tasks: []` (`in_progress` while the front-door turn is active, from the ledger row alone with `live_steps: []` until the gateway session appears in `state.db`, or terminal `completed` / `failed` once `sessions.ended_at` is set for this turn (an `ended_at`, reply or step older than the dispatch belongs to the previous turn of a reused session and is ignored) or the turn — or a ledger row whose gateway session never started in `state.db` — ages past `PRE_KANBAN_STALE_AFTER_SECONDS`, 900 s, measured from the dispatch (`dispatched_at`, stamped by the dispatcher as it creates the gateway session on every path, and by the carding of a drift-backlog row; a row still unstamped when the server starts, from before the column or from a restart between the inject and the stamp, is stamped to `created_at` at startup, so a row unstamped in the running process is queued: `in_progress` from the ledger alone, never aged into `failed`) and the session's start, whichever is later, and the object's `created_at`/`started_at` are that clock; if `<agent_home>/state.db` exists and raises `sqlite3.Error`, `routing` falls back to the ledger-backed object with `live_steps: []` and `routing_error` naming the read error).
+
+Two routes write to `kanban.db`, and the drift backlog writes one more table there directly: when it files a card, it stamps the card's origin as `drift` in `kanban_task_origins` (`_stamp_board_task_origin`), and the first stamp wins. The first route also signals processes: `POST /v1/sessions/{session_id}/cards/stop`. The hermes-bridge calls it when a gateway conversation's `stop` reaches its cards, with the conversation's context id. The route refuses any session but the `a2a-*` one that context id names; that is a consistency check on what the bridge sends, not an authorization. It archives every open card in the conversation through Hermes' own `archive_task`: the cards filed under the session or its compression continuations (not its branches or delegates), every card those cards fanned out, to any depth and whatever session the child carries, and a session-less card subscribed to that session and thread. It kills each running card's worker, and the processes in the worker's group that carry its `HERMES_KANBAN_TASK`, and no others; a command an ssh client already sent to the shell sandbox runs on. Stop doesn't touch cards from other conversations, crons or alerts that depend on this thread's cards: a `task_links` child filed under another session is left alone even though Hermes copies our thread's subscription onto it, and it is promoted once our card is archived, as it would have been when our card finished. The answer names what was stopped, and what it could not finish in time, within 24 seconds (`CARD_STOP_WORST_CASE_S`: a 20-second deadline plus one 3-second busy wait plus a second of slack); an archive still running at the deadline is reported `pending` and finishes on its own. Every holder of `SESSION_KV_API_KEY` can call it for any `a2a-*` session, so anything in the pod that can record a conversation's route can also stop that conversation's cards; the agent itself could already archive cards.
+
+The second is `POST /v1/board/actions`, the board-health card's Retry and Drop ([`agents/platform/cron/README.md`](../cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)). Its body is `action` (`retry` or `drop`), `tasks` (1-50 card ids of at most 64 characters) and `by` (who pressed, for the log line). It acts only on a card still `blocked`: Retry is Hermes' `unblock_task`, Drop the card stop's archive above. It answers each card's outcome, `done`, `moved` (no longer blocked), `gone` or `failed`, and a card its deadline (the card stop's) leaves unstarted answers `failed`. Its callers are the Slack adapter's click handler under today and the hermes-bridge under `spec.mode: next`, each having decided who may press first. Like the card stop, any holder of `SESSION_KV_API_KEY` can call it, and the agent could already unblock and archive cards.
 
 ##### Two bounds, not one
 
@@ -403,17 +605,17 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### Which columns are migrated, and which are not
 
-`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
-for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
-startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `excluded` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request`, `excluded` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
 introduced the table (#426), and a migration maintained for a pre-release shape no released
 install has is machinery that outlives its reason.
 
-**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id`, `backlog`, `principal` and `payload` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
 NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 
@@ -421,8 +623,9 @@ which column is missing:
   column in its INSERT, so every write raises `no such column: cluster` into the blanket
   `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
   as long as the shape lasts.
-- **No `object_uid`** — the same, and for the same reason: it is in the INSERT, so nothing is
-  recorded.
+- **No `object_uid`** — the session server does not start. `init_db` creates the partial index
+  `idx_intercepted_events_drift_uid` on `object_uid` at import, which raises
+  `no such column: object_uid`, and the process exits.
 - **No `delivery_error`** — events are still recorded correctly and only the correction fails.
   `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
   swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as
@@ -463,7 +666,22 @@ The column is named `severity` and three of its four values are one, but the key
 `_claim_alert_quota` was handed: `GitOpsDrift` is a billing bucket for records that display as
 `Warning`. `GET /v1/alert-quota` reports the row as it finds it, so a reader sees four buckets.
 
-Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata` and `incidents`, so roughly two weeks of history is available to answer "what did we drop last week".
+Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata`, `incidents` and `incident_applies`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+#### `triage_pr_reservations`
+
+The branches triages were routed to open a pull request on, which count against `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` ([above](#limiting-the-open-triage-pull-requests)):
+
+```sql
+CREATE TABLE triage_pr_reservations(
+  branch TEXT NOT NULL,           -- platform-agent/incident-<incident>
+  session_id TEXT NOT NULL,       -- the triage that reserved it
+  reserved_at REAL NOT NULL,      -- epoch seconds
+  PRIMARY KEY (branch, session_id)
+);
+```
+
+Not swept by the TTL: each claim releases the rows that no longer count.
 
 The same database also holds `findings` and `queue_publications`, the findings queue's tables. They are exempt from the TTL sweep — a backlog item disappears when its state says it is finished, not when it gets old. [`docs/designs/inventory-findings-queue.md`](../../../docs/designs/inventory-findings-queue.md) §3.1 is the canonical description of both.
 

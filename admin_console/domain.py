@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
 
 
 class TriggerKind(StrEnum):
@@ -48,9 +47,3 @@ class ActivityEvent:
     attribution: AttributionLevel = AttributionLevel.EXPLICIT
     trace_id: str = ""
     details: dict[str, str] = field(default_factory=dict)
-
-
-class TelemetryProvider(Protocol):
-    """Read-only normalized telemetry interface."""
-
-    def list_activity(self) -> list[ActivityEvent]: ...

@@ -19,8 +19,9 @@ converting the cluster. Selection is by ComputeClass.
 
 -   **Per-Pod:** `nodeSelector: { cloud.google.com/compute-class: autopilot }`
     (or a node-affinity rule on that label).
--   **Namespace default:** `kubectl label ns $NS
-    cloud.google.com/default-compute-class=autopilot` — all Pods in the
+-   **Namespace default:** the label
+    `cloud.google.com/default-compute-class: autopilot` on the namespace's
+    manifest, proposed as a pull request — all Pods in the
     namespace run Autopilot mode unless they select another class.
 -   **Existing Pods:** Pods already running on Standard nodes switch to
     Autopilot mode **only when recreated** (rollout/restart), not in place.

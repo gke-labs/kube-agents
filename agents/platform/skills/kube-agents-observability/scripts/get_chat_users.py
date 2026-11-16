@@ -55,9 +55,11 @@ GCLOUD_TIMEOUT_SECONDS = 420
 BROKER_DEADLINE_EXIT_CODE = 124
 BROKER_DEFAULT_DEADLINE_SECONDS = 300
 # The broker caps a relayed command's stdout; past the cap the shim writes the
-# cut body, prints this line on stderr and exits as the command did. The cut
-# body is not the read, so the line is a failure here whatever the exit code.
-# Same words as credential_proxy_client.py prints; the test holds them equal.
+# cut body, prints this line on stderr with the counts and exits 74
+# (EX_IOERR; an older shim exited as the command did). The cut body is not
+# the read, so the line is read before the exit code and is a failure here
+# whatever that code is. Same words as credential_proxy_client.py prints; the
+# test holds them equal.
 SHIM_TRUNCATION_NOTE = "credential proxy output truncated"
 EXIT_READ_FAILED = 1
 JSON_INDENT = 2
@@ -116,6 +118,15 @@ def read_entries(project_id: str, hours: int, limit: int = LOG_LIMIT) -> list:
             f"wait, so at the defaults the broker went quiet, while a broker configured with a "
             f"longer deadline may still have been working"
         ) from exc
+    # The marker before the exit code: the shim exits 74 on a cut reply, and
+    # the remedy is the limit, not the code.
+    if SHIM_TRUNCATION_NOTE in completed.stderr:
+        raise RuntimeError(
+            f"gcloud logging read returned more than the credential broker relays for one "
+            f"command ({SHIM_TRUNCATION_NOTE}); the {limit} newest entries do not fit, so "
+            f"lower --limit (the body is the newest entries whatever the window, so --hours "
+            f"shrinks it only once the narrower window holds fewer than {limit})"
+        )
     if completed.returncode == BROKER_DEADLINE_EXIT_CODE:
         raise RuntimeError(
             f"gcloud logging read exited {BROKER_DEADLINE_EXIT_CODE}: the credential broker "
@@ -128,13 +139,6 @@ def read_entries(project_id: str, hours: int, limit: int = LOG_LIMIT) -> list:
     if completed.returncode != 0:
         raise RuntimeError(
             f"gcloud logging read exited {completed.returncode}: {completed.stderr.strip()}"
-        )
-    if SHIM_TRUNCATION_NOTE in completed.stderr:
-        raise RuntimeError(
-            f"gcloud logging read returned more than the credential broker relays for one "
-            f"command ({SHIM_TRUNCATION_NOTE}); the {limit} newest entries do not fit, so "
-            f"lower --limit (the body is the newest entries whatever the window, so --hours "
-            f"shrinks it only once the narrower window holds fewer than {limit})"
         )
     # `--format=json` answers an empty window with the literal `[]`, so an
     # empty body is one that went missing between gcloud and here, and it

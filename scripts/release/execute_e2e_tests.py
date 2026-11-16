@@ -16,7 +16,6 @@ different one. The old spellings are still read; see the module constants.
 """
 
 import argparse
-import json
 import os
 import pathlib
 import subprocess

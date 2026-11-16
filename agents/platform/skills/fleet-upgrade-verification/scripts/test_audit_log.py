@@ -281,6 +281,9 @@ class AuditLogReadTest(unittest.TestCase):
         cut_first = audit_log.read_removed(context_with(FakeRunner(rc=0, stdout='[{"timestamp": "2026-', stderr="credential proxy output truncated")))
         self.assertIn("(removed read, page 1) output was cut at the credential proxy's output cap", cut_first["error"])
         self.assertEqual((cut_first["entries"], cut_first["callers"]), (0, []))
+        # The shim exits 74 on a cut reply now; the cap is still what is named.
+        cut_74 = audit_log.read_removed(context_with(FakeRunner(rc=74, stdout='[{"timestamp": "2026-', stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")))
+        self.assertIn("(removed read, page 1) output was cut at the credential proxy's output cap", cut_74["error"])
 
     def test_each_read_runs_once_per_context_and_is_cached(self):
         context = sample_context()

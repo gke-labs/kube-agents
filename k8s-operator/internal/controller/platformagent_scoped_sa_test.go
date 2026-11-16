@@ -545,7 +545,7 @@ func TestTheReservedListNamesThePoolVariablesInItsOwnRight(t *testing.T) {
 }
 
 // The A2A gateway's broker-side variables are reserved whether or not the
-// operator renders them (it does, under next with Chat), so a CR cannot decide
+// operator renders them (it does, with Chat on), so a CR cannot decide
 // who holds the a2a-chat role or arm a second Chat consumer through
 // spec.deployment.env. Called with an empty managed list for the same reason
 // as the test above: on an install where the render does not set them, the
@@ -554,7 +554,7 @@ func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
 		{Name: "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", Value: "kubeagents-credential-proxy"},
 		{Name: "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "projects/p/subscriptions/theirs"},
-		// The legacy name too: under next with Chat the render no longer
+		// The legacy name too: with Chat on the gateway the render no longer
 		// sets it, so the managed-names loop stops protecting it, and a CR
 		// that set it would arm a second relay instance on whatever the
 		// broker's credential can pull, or refuse the broker's start.
@@ -605,4 +605,40 @@ func TestTheMappingReachesTheRenderedBrokerPod(t *testing.T) {
 		}
 	}
 	t.Errorf("the mount names volume %q and the Pod declares no such volume", mount.Name)
+}
+
+func TestTheMappingReachesTheRenderedKubeProxyPod(t *testing.T) {
+	agent := scopedAgent(true, account("proj", "ka-proj-1a2b3c4d@host-proj.iam.gserviceaccount.com"))
+
+	dep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
+	if got := dep.Spec.Template.Annotations["kubeagents.x-k8s.io/proxy-policy-hash"]; got == "" {
+		t.Errorf("kube-proxy pod template proxy-policy-hash is empty")
+	}
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	if value, count := envValueCount(container.Env, "CREDENTIAL_PROXY_SCOPED_SA_POOL"); value != "1" || count != 1 {
+		t.Errorf("CREDENTIAL_PROXY_SCOPED_SA_POOL = %q (x%d), want \"1\"", value, count)
+	}
+	if path, count := envValueCount(container.Env, "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE"); path != scopedSAPoolMountPath || count != 1 {
+		t.Errorf("CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE = %q (x%d), want %q", path, count, scopedSAPoolMountPath)
+	}
+
+	var mount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].SubPath == scopedSAPoolKey {
+			mount = &container.VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("kube-proxy is armed with no mapping mounted")
+	}
+	if !mount.ReadOnly || mount.MountPath != scopedSAPoolMountPath {
+		t.Errorf("unexpected kube-proxy pool mount: %+v", *mount)
+	}
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if volume.Name == mount.Name {
+			return
+		}
+	}
+	t.Errorf("kube-proxy mount names volume %q and the Pod declares no such volume", mount.Name)
 }

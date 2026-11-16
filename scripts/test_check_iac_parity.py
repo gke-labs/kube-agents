@@ -16,25 +16,17 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.check_iac_parity import (
-    EXCLUDED_NETPOL_MANIFESTS,
-    LINK_LOCAL_CIDR,
     REPO_ROOT,
     REQUIRED_DNS_LITERAL,
-    REQUIRED_DNS_PROTOCOLS,
-    REQUIRED_EXCEPT_MINIMUM,
     REQUIRED_LINK_LOCAL_CLOUDDNS,
     REQUIRED_LINK_LOCAL_DNSCACHE,
-    REQUIRED_LINK_LOCAL_LITERALS,
     REQUIRED_WILDCARD_CIDR,
     STATIC_NETWORK_POLICIES,
     check_all,
-    check_dns_egress_rule,
     check_network_policy_file,
     discover_dns_network_policies,
     governs_egress,
-    load_network_policies,
     main,
-    sanitize_helm_template,
     validate_exclusions,
 )
 

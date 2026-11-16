@@ -1,0 +1,2051 @@
+{
+  "schema": 1,
+  "records": [
+    {
+      "key": "00000000|next|base|0|fleet_audit|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "base",
+      "level": 0,
+      "operation": "fleet_audit",
+      "run": 1,
+      "started": "2000-01-01T00:00:00Z",
+      "ended": "2000-01-01T00:30:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 4,
+        "pods": 94,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 120,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2040528896
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 461373440
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 545259520
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 41943040
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 0.9
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.12
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.35
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.02
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1288490189
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 0.5
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 2.5
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 240.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 180000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 639631360
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.22
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.6
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 150
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 52000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 6100
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 21000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|base|0|fan_out|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "base",
+      "level": 0,
+      "operation": "fan_out",
+      "run": 1,
+      "started": "2000-01-01T00:45:00Z",
+      "ended": "2000-01-01T01:00:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 4,
+        "pods": 94,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 120,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2147483648
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 450887680
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 419430400
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 40894464
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.1
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.11
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.3
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.01
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1288490189
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 0.4
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 3.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 25.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 60000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 618659840
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.25
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.8
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 60
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 18000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 2300
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 7000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|base|0|watcher_soak|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "base",
+      "level": 0,
+      "operation": "watcher_soak",
+      "run": 1,
+      "started": "2000-01-01T01:15:00Z",
+      "ended": "2000-01-01T02:15:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 4,
+        "pods": 94,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 120,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 1825570816
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 450887680
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 314572800
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 40894464
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 0.4
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.1
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.1
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.01
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1288490189
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 0.2
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 1.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 587202560
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.08
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.7
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 400
+        },
+        {
+          "name": "watcher_events_seen_per_minute",
+          "value": 6.7
+        },
+        {
+          "name": "watcher_session_creates",
+          "value": 4
+        },
+        {
+          "name": "watcher_events_injected",
+          "value": 0
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|clusters|8|fleet_audit|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "clusters",
+      "level": 8,
+      "operation": "fleet_audit",
+      "run": 1,
+      "started": "2000-01-01T03:00:00Z",
+      "ended": "2000-01-01T03:40:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 8,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 120,
+        "nodes": 16,
+        "pods": 376,
+        "deployments": 120,
+        "services": 184,
+        "hpas": 120,
+        "configmaps": 504,
+        "events": 480,
+        "pvcs": 0,
+        "clusters": 8
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2469396480
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 639631360
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 796917760
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 42991616
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.4
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.2
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.7
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.02
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 2040109466
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 1.5
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 9.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 720.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 620000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 754974720
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.4
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 9
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.5
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 600
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 190000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 21000
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 80000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|clusters|8|fan_out|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "clusters",
+      "level": 8,
+      "operation": "fan_out",
+      "run": 1,
+      "started": "2000-01-01T04:00:00Z",
+      "ended": "2000-01-01T04:20:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 8,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 120,
+        "nodes": 16,
+        "pods": 376,
+        "deployments": 120,
+        "services": 184,
+        "hpas": 120,
+        "configmaps": 504,
+        "events": 480,
+        "pvcs": 0,
+        "clusters": 8
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2684354560
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 629145600
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 734003200
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 42991616
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.6
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.18
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.75
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.02
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 2040109466
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 2.5
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 12.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 48.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 210000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 734003200
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.45
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 9
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.9
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 240
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 61000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 7400
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 25000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|clusters|8|fan_out|2",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "clusters",
+      "level": 8,
+      "operation": "fan_out",
+      "run": 2,
+      "started": "2000-01-01T04:30:00Z",
+      "ended": "2000-01-01T04:55:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 8,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 120,
+        "nodes": 16,
+        "pods": 376,
+        "deployments": 120,
+        "services": 184,
+        "hpas": 120,
+        "configmaps": 504,
+        "events": 480,
+        "pvcs": 0,
+        "clusters": 8
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2630877184
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 639631360
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 744488960
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 42991616
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.55
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.19
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.74
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.02
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 2093796557
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 2.5
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 13.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 140.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 230000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 739246080
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.47
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 9
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.6
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 300
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 66000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 7900
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 27000
+        }
+      ],
+      "provider_429s": 4,
+      "excluded_from": ["response_seconds"],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|objects|4000|fleet_audit|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "objects",
+      "level": 4000,
+      "operation": "fleet_audit",
+      "run": 1,
+      "started": "2000-01-01T06:00:00Z",
+      "ended": "2000-01-01T06:45:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 4000,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 220,
+        "nodes": 28,
+        "pods": 2506,
+        "deployments": 1200,
+        "services": 1216,
+        "hpas": 1200,
+        "configmaps": 1886,
+        "events": 900,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 2791309312
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 1180696576
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 1395654656
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 46137344
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.2
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.3
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.9
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.03
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1503238554
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 2.0
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 14.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "response_seconds",
+          "value": 610.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 900000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 817889280
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.5
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.4
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 420
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 300000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 26000
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 120000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|nodes|100|watcher_soak|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "nodes",
+      "level": 100,
+      "operation": "watcher_soak",
+      "run": 1,
+      "started": "2000-01-01T08:00:00Z",
+      "ended": "2000-01-01T09:00:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 100,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 200,
+        "pods": 682,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 2400,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 1932525568
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 943718400
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 335544320
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 47185920
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 0.5
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.35
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.1
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.02
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1342177280
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 0.3
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 2.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 1
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 602931200
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.09
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.7
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 9000
+        },
+        {
+          "name": "watcher_events_seen_per_minute",
+          "value": 150.0
+        },
+        {
+          "name": "watcher_session_creates",
+          "value": 31
+        },
+        {
+          "name": "watcher_events_injected",
+          "value": 1
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|failing_pods|100|watcher_soak|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "failing_pods",
+      "level": 100,
+      "operation": "watcher_soak",
+      "run": 1,
+      "started": "2000-01-01T10:00:00Z",
+      "ended": "2000-01-01T11:00:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 100,
+        "concurrent": 1,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 4,
+        "pods": 193,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 3100,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 1887436800
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 629145600
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 314572800
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 40894464
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 0.45
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.3
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.1
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.01
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1288490189
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 0.2
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 1.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 2
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 0
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 608174080
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.1
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.8
+        },
+        {
+          "name": "failed_prompts",
+          "value": 0
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 6400
+        },
+        {
+          "name": "watcher_events_seen_per_minute",
+          "value": 106.7
+        },
+        {
+          "name": "watcher_session_creates",
+          "value": 210
+        },
+        {
+          "name": "watcher_events_injected",
+          "value": 4
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 38
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": []
+    },
+    {
+      "key": "00000000|next|concurrent|15|fan_out|1",
+      "commit": "0000000000000000000000000000000000000000",
+      "mode": "next",
+      "phase": "sample",
+      "factor": "concurrent",
+      "level": 15,
+      "operation": "fan_out",
+      "run": 1,
+      "started": "2000-01-01T12:00:00Z",
+      "ended": "2000-01-01T12:40:00Z",
+      "image": "ghcr.io/gke-labs/kube-agents/platform-agent:0000000000000000000000000000000000000000",
+      "values": {
+        "clusters": 2,
+        "nodes": 2,
+        "objects": 100,
+        "churn_per_minute": 10,
+        "failing_pods": 1,
+        "concurrent": 15,
+        "listing_pods": 100
+      },
+      "totals": {
+        "namespaces": 30,
+        "nodes": 4,
+        "pods": 94,
+        "deployments": 30,
+        "services": 46,
+        "hpas": 30,
+        "configmaps": 126,
+        "events": 120,
+        "pvcs": 0,
+        "clusters": 2
+      },
+      "limits": {
+        "platform-agent": {
+          "memory_bytes": 8589934592,
+          "cpu_cores": 2.0
+        },
+        "agent-api-auth": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "envoy-credential-proxy": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        },
+        "manager": {
+          "memory_bytes": 536870912,
+          "cpu_cores": 0.5
+        },
+        "litellm-container": {
+          "memory_bytes": 2147483648,
+          "cpu_cores": 1.0
+        }
+      },
+      "replicas": {
+        "platform-agent": 1,
+        "agent-api-auth": 1,
+        "envoy-credential-proxy": 1,
+        "manager": 1,
+        "litellm-container": 2
+      },
+      "metrics": [
+        {
+          "name": "memory_peak_bytes",
+          "container": "platform-agent",
+          "value": 3221225472
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "agent-api-auth",
+          "value": 503316480
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "envoy-credential-proxy",
+          "value": 943718400
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "manager",
+          "value": 40894464
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "platform-agent",
+          "value": 1.9
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "agent-api-auth",
+          "value": 0.2
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "envoy-credential-proxy",
+          "value": 0.95
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "manager",
+          "value": 0.01
+        },
+        {
+          "name": "oomkills",
+          "container": "platform-agent",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "agent-api-auth",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "envoy-credential-proxy",
+          "value": 0
+        },
+        {
+          "name": "oomkills",
+          "container": "manager",
+          "value": 0
+        },
+        {
+          "name": "pvc_capacity_bytes",
+          "value": 53687091200
+        },
+        {
+          "name": "pvc_used_bytes",
+          "value": 1288490189
+        },
+        {
+          "name": "proxy_wait_p50_seconds",
+          "value": 5.0
+        },
+        {
+          "name": "proxy_wait_max_seconds",
+          "value": 25.0
+        },
+        {
+          "name": "triage_lost",
+          "value": 0
+        },
+        {
+          "name": "run_slot_refusals",
+          "value": 5
+        },
+        {
+          "name": "response_seconds",
+          "value": 410.0
+        },
+        {
+          "name": "tokens_input",
+          "value": 400000
+        },
+        {
+          "name": "memory_peak_bytes",
+          "container": "litellm-container",
+          "value": 943718400
+        },
+        {
+          "name": "cpu_peak_cores",
+          "container": "litellm-container",
+          "value": 0.85
+        },
+        {
+          "name": "oomkills",
+          "container": "litellm-container",
+          "value": 0
+        },
+        {
+          "name": "profiles",
+          "value": 3
+        },
+        {
+          "name": "churn_achieved_per_minute",
+          "value": 9.5
+        },
+        {
+          "name": "failed_prompts",
+          "value": 1
+        },
+        {
+          "name": "watcher_events_seen",
+          "value": 90
+        },
+        {
+          "name": "watcher_quota_suppressed",
+          "value": 0
+        },
+        {
+          "name": "run_tokens_input",
+          "value": 240000
+        },
+        {
+          "name": "run_tokens_output",
+          "value": 30000
+        },
+        {
+          "name": "run_tokens_cached",
+          "value": 98000
+        }
+      ],
+      "provider_429s": 0,
+      "excluded_from": [],
+      "errors": ["prompt failed: no answer within 2400s"]
+    }
+  ]
+}

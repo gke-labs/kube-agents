@@ -42,6 +42,18 @@ func TestFilterDecide(t *testing.T) {
 			wantGate: gateReason,
 		},
 		{
+			// A Config Connector resource that cannot apply records only this
+			// event; the default list carries it so the event path hears it.
+			name:     "default config accepts a Config Connector reconcile failure",
+			event:    TriageEvent{Key: EventKey{Reason: "UpdateFailed"}, Namespace: "config-control", Count: 1},
+			wantGate: gateAccepted,
+		},
+		{
+			name:     "default config does not accept a Config Connector normal state",
+			event:    TriageEvent{Key: EventKey{Reason: "UpToDate"}, Namespace: "config-control"},
+			wantGate: gateReason,
+		},
+		{
 			name:       "filters out excluded namespace",
 			excludedNS: []string{"kube-system"},
 			event:      TriageEvent{Key: EventKey{Reason: "CrashLoopBackOff"}, Namespace: "kube-system"},
@@ -262,12 +274,16 @@ func TestFilterDecide(t *testing.T) {
 // and the staleness check age against known values.
 func TestFilterDecideFailedScheduling(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+	// Stamped as the informer stamps every event, with a span that already
+	// meets the minimum, so a case reaches the span check only when it sets
+	// one of its own (lasting).
 	fs := func(count int, mark scaleUpMark) TriageEvent {
 		return TriageEvent{
 			Key:       EventKey{UID: "pod-1", Reason: "FailedScheduling"},
 			Namespace: "default",
 			Name:      "api",
 			Message:   "0/3 nodes are available: 3 Insufficient cpu.",
+			FirstSeen: now.Add(-defaultFailedSchedulingMinSpan),
 			LastSeen:  now,
 			Count:     count,
 			ScaleUp:   mark,
@@ -283,11 +299,15 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 	stale.LastSeen = now.Add(-failedSchedulingStaleAfter - time.Second)
 	untimed := fs(2, scaleUpMark{})
 	untimed.LastSeen = time.Time{}
+	unstamped := fs(5, scaleUpMark{})
+	unstamped.FirstSeen, unstamped.LastSeen = time.Time{}, time.Time{}
 	staleButDeclined := fs(9, declined(time.Minute))
 	staleButDeclined.LastSeen = now.Add(-failedSchedulingStaleAfter - time.Second)
 	untimedDeclined := fs(1, declined(time.Minute))
 	untimedDeclined.LastSeen = time.Time{}
+	// Moves the sighting and keeps its span.
 	sightedAt := func(ev TriageEvent, at time.Time) TriageEvent {
+		ev.FirstSeen = at.Add(-ev.LastSeen.Sub(ev.FirstSeen))
 		ev.LastSeen = at
 		return ev
 	}
@@ -319,10 +339,22 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		ev.Message = message
 		return ev
 	}
+	lasting := func(ev TriageEvent, span time.Duration) TriageEvent {
+		ev.FirstSeen = ev.LastSeen.Add(-span)
+		return ev
+	}
+	// A pod evicted by a node scale-down, as seen live: the drain records no
+	// autoscaler verdict, and the scheduler's retries on each cluster change
+	// took the event to count five three seconds after its first attempt.
+	scaleDown := func(count int, span time.Duration) TriageEvent {
+		ev := saying(fs(count, scaleUpMark{}), "0/3 nodes are available: 1 Insufficient memory, 1 node(s) had untolerated taint(s), 1 node(s) were unschedulable.")
+		return lasting(ev, span)
+	}
 
 	tests := []struct {
 		name        string
 		minCount    int
+		minSpan     time.Duration
 		hold        time.Duration
 		disableHold bool
 		event       TriageEvent
@@ -335,8 +367,23 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "count 4 is held", event: fs(4, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
 		{name: "count 5 fires", event: fs(5, scaleUpMark{}), wantGate: gateAccepted},
 		{name: "count 0 fails open", event: fs(0, scaleUpMark{}), wantGate: gateAccepted},
-		{name: "threshold 1 restores firing on the first event", minCount: 1, event: fs(1, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "threshold 1 with the span off fires on the first event", minCount: 1, minSpan: -1, event: lasting(fs(1, scaleUpMark{}), 0), wantGate: gateAccepted},
+		{name: "threshold 1 alone holds the first event on its span", minCount: 1, event: lasting(fs(1, scaleUpMark{}), 0), wantGate: gateFailedSchedulingMinSpan},
 		{name: "an explicit threshold is honoured", minCount: 8, event: fs(7, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+
+		// Past the count, the sightings must span --failedscheduling-min-span.
+		{name: "a scale-down burst past the count is held on its span", event: scaleDown(5, 3*time.Second), wantGate: gateFailedSchedulingMinSpan},
+		{name: "a span just short of the minimum is held", event: scaleDown(50, defaultFailedSchedulingMinSpan-time.Second), wantGate: gateFailedSchedulingMinSpan},
+		{name: "a span at the minimum fires", event: scaleDown(5, defaultFailedSchedulingMinSpan), wantGate: gateAccepted},
+		{name: "a pod still pending at the next flush fires", event: scaleDown(6, 5*time.Minute), wantGate: gateAccepted},
+		{name: "the count is checked before the span", event: scaleDown(4, 10*time.Minute), wantGate: gateFailedSchedulingMinCount},
+		{name: "an explicit span is honoured", minSpan: 5 * time.Minute, event: scaleDown(5, 4*time.Minute), wantGate: gateFailedSchedulingMinSpan},
+		{name: "the span off restores the count alone", minSpan: -1, event: scaleDown(5, 3*time.Second), wantGate: gateAccepted},
+		{name: "missing stamps fail open", event: unstamped, wantGate: gateAccepted},
+		{name: "a decline passes a short span", event: lasting(fs(1, declined(time.Second)), 3*time.Second), wantGate: gateAccepted},
+		{name: "a live scale-up holds a short span on its own terms", event: lasting(fs(5, triggered(time.Minute)), 3*time.Second), wantGate: gateScaleUpHold},
+		{name: "an expired scale-up sends a short span to the span check", event: lasting(fs(5, triggered(defaultScaleUpHold+time.Second)), 3*time.Second), wantGate: gateFailedSchedulingMinSpan},
+		{name: "a stale short span is held as stale", event: lasting(sightedAt(fs(5, scaleUpMark{}), now.Add(-failedSchedulingStaleAfter-time.Second)), 3*time.Second), wantGate: gateFailedSchedulingStale},
 
 		// A live TriggeredScaleUp holds regardless of count; an expired one does not.
 		{name: "triggered mark holds count 5", event: fs(5, triggered(time.Minute)), wantGate: gateScaleUpHold},
@@ -395,6 +442,7 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "autopilot scale-to-zero is held at the count backstop", event: autopilot(5, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
 		{name: "autopilot scale-to-zero is held below the count backstop", event: autopilot(1, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
 		{name: "autopilot scale-to-zero is held on an uncounted event", event: autopilot(0, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held before the span check", event: lasting(autopilot(50, scaleUpMark{}), 3*time.Second), wantGate: gateAutopilotScaleToZero},
 		{name: "surrounding whitespace does not defeat the message match", event: saying(autopilot(50, scaleUpMark{}), " "+noNodesAvailableMessage+"\n"), wantGate: gateAutopilotScaleToZero},
 
 		// All three conditions are required. Zero nodes on Standard is a fault
@@ -438,6 +486,7 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 			// below would be exercising the disabled path by accident.
 			f := newFilter(newFilterConfig(scaleUpReasons, nil, nil, filterThresholds{
 				failedSchedulingMinCount:        tc.minCount,
+				failedSchedulingMinSpan:         tc.minSpan,
 				scaleUpHold:                     tc.hold,
 				disableAutopilotScaleToZeroHold: tc.disableHold,
 			}))
@@ -544,5 +593,22 @@ func TestFilterDecideScaleUpMarks(t *testing.T) {
 				t.Errorf("Decide(%+v) = %q; want %q", tc.event, gate, tc.wantGate)
 			}
 		})
+	}
+}
+
+// TestDefaultReasonsCarryEveryConfigConnectorFailure: the shipped default
+// list carries each reconcile-failure reason Config Connector's monitoring
+// guide lists, and none of its normal states.
+func TestDefaultReasonsCarryEveryConfigConnectorFailure(t *testing.T) {
+	defaults := stringSet(defaultReasons)
+	for _, reason := range []string{"UpdateFailed", "DeleteFailed", "DependencyNotReady", "DependencyNotFound", "DependencyInvalid", "ManagementConflict", "Unmanaged", "PreActuationTransformFailed", "PostActuationTransformFailed"} {
+		if _, ok := defaults[reason]; !ok {
+			t.Errorf("defaultReasons lacks Config Connector's %s", reason)
+		}
+	}
+	for _, reason := range []string{"Updating", "UpToDate", "Deleting", "Deleted"} {
+		if _, ok := defaults[reason]; ok {
+			t.Errorf("defaultReasons carries Config Connector's normal state %s", reason)
+		}
 	}
 }

@@ -1,0 +1,21 @@
+# The proxy on port 443 at an internal address of the VPC. A private DNS
+# record gives this address the name ${GHES_PUBLIC_HOST} (see README.md).
+# On GKE the annotation makes an internal passthrough Network Load Balancer;
+# the proxy terminates TLS itself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghes-proxy
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: ghes-proxy
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: ghes-proxy
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

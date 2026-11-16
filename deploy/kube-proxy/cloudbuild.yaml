@@ -1,0 +1,31 @@
+# Cloud Build for the k8s-api-proxy (kube-proxy) image.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - "docker pull $_IMAGE_URI_LATEST || true"
+  - name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_IMAGE_URI"
+      - "-t"
+      - "$_IMAGE_URI_LATEST"
+      - "--cache-from"
+      - "$_IMAGE_URI_LATEST"
+      - "-f"
+      - "deploy/kube-proxy/Dockerfile"
+      - "--build-arg"
+      - "BUILDKIT_INLINE_CACHE=1"
+      - "."
+images:
+  - "$_IMAGE_URI"
+  - "$_IMAGE_URI_LATEST"
+substitutions:
+  _IMAGE_URI: ""
+  _IMAGE_URI_LATEST: ""

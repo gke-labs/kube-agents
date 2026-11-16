@@ -1,0 +1,63 @@
+# Token cost against fleet size, on the real-install test's install at the L container size: the
+# Step 1 fleet shape at 80, then 20 clusters (42 is measured by real-install.yaml's soak_12h). Each
+# level measures a 3-hour steady window, then the seven daily audits started together, so a day's
+# tokens are 24 steady hours plus one round of audits. Run with --only-factor clusters.
+phase: real-install-scaling
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-f
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 40
+  nodes: 2
+  objects: 1200
+  churn_per_minute: 3
+  failing_pods: 5
+  concurrent: 1
+  listing_pods: 100
+
+factors:
+  clusters: [80, 20]
+
+settings:
+  # Long enough for the triage burst a gateway restart starts to pass before the steady window.
+  settle_seconds: 1800
+  trigger_drain_seconds: 3600
+  pods_per_node: 60
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  default_pool_pods: 150
+  test_cluster_machine_type: e2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 10
+  watcher_wait_seconds: 600
+
+operations:
+  scaling_steady:
+    kind: soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 10800
+  scaling_audits:
+    kind: trigger_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 5400
+    # The daily audits on the Platform Agent's roster (agents/platform/cron/jobs.json).
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - compliance-audit
+      - obtainability-audit
+      - ai-security-audit
+      - stockout-prevention
+      - gcp-networking-fabric-audit
+      - gce-compute-fleet-audit
+      - upgrade-readiness-watch

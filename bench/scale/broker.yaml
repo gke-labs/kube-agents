@@ -1,0 +1,135 @@
+# The credential broker's load for its exec-tier design (#4082): the first-run audits at each fleet
+# size, the command path with kubectl and with gcloud, and interactive questions at once at 8
+# clusters. Run it on a build whose fleet audits run (the #3933 fix), so the sweep load is measured.
+# Every run records the broker's slot cap, its CPU throttling, and its commands and seconds by tool.
+# Its slots-in-use peak is recorded only where the cluster runs Managed Prometheus collection for the
+# broker's gauge; elsewhere the record says so in `errors` (the 2026-10-28 records have no peak).
+#
+# `run`, `apply` and `teardown` hold the experiment install's live-test lease, and `run --dry-run`
+# prints the cluster creates and deletes and the runs first (the runner's, from Phase 4). The plan
+# measures the broker at its default 1-CPU limit, so it refuses to run while the broker carries
+# another (`expect_proxy_limits`). The 2026-10-28 run took about 10 hours, so the lease lasts 14.
+# That run created its test clusters in us-central1-f (SCALE_ZONE=us-central1-f): us-central1-c had
+# no e2-standard-2 capacity that day.
+#
+# The target names no project: set SCALE_PROJECT_ID as for phase1.yaml. 16 and 32 clusters are a
+# later run of this file with those levels added to `clusters`: above about 30 clusters the
+# project's default network has no room left for Pod ranges (see phase2.yaml).
+phase: broker
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+  proxy_concurrency: 1
+
+# Levels run in this order: the 2-cluster points, then 8 clusters, then the combined points, which
+# keep 8 clusters, so no level after the clusters one changes the fleet.
+factors:
+  proxy_concurrency: [1, 4, 8, 16]
+  clusters: [2, 8]
+  # Level N is the Nth point under combined.
+  combined: [1, 2, 3, 4]
+
+# Interactive questions at once at 8 clusters: below, at and above the broker's 8 slots and the
+# agent's 10 run slots.
+combined:
+  - clusters: 8
+    concurrent: 8
+  - clusters: 8
+    concurrent: 10
+  - clusters: 8
+    concurrent: 12
+  - clusters: 8
+    concurrent: 15
+
+settings:
+  expect_proxy_limits:
+    cpu: "1"
+  lease_ttl_minutes: 840
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  # Every cluster's default pool holds the fixture Pods, so no level needs a fixture pool.
+  default_pool_pods: 150
+  test_cluster_machine_type: n2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  watcher_wait_seconds: 600
+
+operations:
+  # The sweep load: the OOBE first-run audits started together, as phase3.yaml runs them.
+  audits_30m:
+    kind: trigger_soak
+    factors: [clusters]
+    runs: 3
+    window_seconds: 1800
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - fleet-wide-cost-analysis
+      - compliance-audit
+      - obtainability-audit
+      - stockout-prevention
+      - upgrade-retrospective
+  fan_out:
+    kind: prompt
+    factors: [combined]
+    runs: 3
+    timeout_seconds: 2400
+    prompt: Which of my clusters, if any, are stressed right now? Check every cluster.
+    follow_up: Which clusters do you monitor?
+  # The command path with no model call, once per tool, so the tool split has both sides.
+  # kubectl at the base only: #4107 already measured the kubectl load at 1 to 32 at once.
+  proxy_load_kubectl:
+    kind: proxy_load
+    factors: []
+    runs: 3
+    window_seconds: 180
+    command:
+      - kubectl
+      - --kubeconfig
+      - "{kubeconfig}"
+      - get
+      - pods
+      - --all-namespaces
+      - --no-headers
+  proxy_load_gcloud:
+    kind: proxy_load
+    factors: []
+    runs: 3
+    window_seconds: 180
+    command:
+      - gcloud
+      - container
+      - clusters
+      - list
+      - --format=value(name)
+  # The gcloud load at more commands at once, one run per level (the 2026-10-28 run's time budget).
+  proxy_load_gcloud_levels:
+    kind: proxy_load
+    factors: [proxy_concurrency]
+    runs: 1
+    window_seconds: 180
+    command:
+      - gcloud
+      - container
+      - clusters
+      - list
+      - --format=value(name)

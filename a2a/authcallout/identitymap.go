@@ -25,14 +25,20 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// AccountControl and AccountApp are the two NATS accounts the callout will
+// issue a user into: control-plane writers in TRUSTED and runtime workloads in
+// APP. Session and profile workers' narrowed identities are minted only into
+// AccountApp, and the dispatcher's (NarrowingDispatcher) only into
+// AccountControl.
+const (
+	AccountControl = "TRUSTED"
+	AccountApp     = "APP"
+)
+
 // mintableAccounts is every NATS account the callout will issue a user into.
 //
-// The deployment renders exactly one application account, and the callout's own
-// account holds nothing but the callout. Anything else - $SYS above all - is
-// either a mistake or an attempt, and both are worth refusing at the point the
-// map is parsed rather than at the point a connection lands somewhere it should
-// not be.
-var mintableAccounts = []string{"APP"}
+// Anything outside this list - $SYS above all - is refused at parse time.
+var mintableAccounts = []string{AccountControl, AccountApp}
 
 const (
 	// ServiceAccountPrefix is how the Kubernetes TokenReview API spells a
@@ -89,7 +95,10 @@ type Identity struct {
 	// NarrowingProfile. Such an entry MUST carry no
 	// grants, and the map is refused if it does — see session.go for why an
 	// entry that could hold real grants AND be narrowed is one skipped code
-	// path away from handing every session everything.
+	// path away from handing every session everything. NarrowingDispatcher
+	// is the exception: its grants are its control connection's and are
+	// required on both sides, and only its bucket connections' per-profile
+	// grants are derived (dispatcher_narrowing.go).
 	Narrowing string `json:"narrowing,omitempty"`
 
 	// Profile is the AgentProfile a NarrowingProfile entry executes for: the
@@ -101,14 +110,38 @@ type Identity struct {
 	// profile's own spelling; the callout composes the subjects (see
 	// profile_narrowing.go). Set only with that narrowing.
 	Topics *TopicGrants `json:"topics,omitempty"`
+
+	// Tier is the tier a NarrowingProfile entry's pods run at (#3655): the
+	// operator renders one ServiceAccount and one entry per (profile, tier),
+	// so a pod's tier is its identity's. Set only with that narrowing.
+	// Optional while an operator from before per-tier identities can still
+	// render the map; when set it must be a known tier.
+	Tier string `json:"tier,omitempty"`
+
+	// Draining names the profiles a NarrowingDispatcher entry still holds
+	// grants for after they left the map: removed or refused profiles whose
+	// tasks are still being drained. They have no profile entry to derive
+	// from, so the operator lists them here, by name only. A draining
+	// profile has no durables left, so a tier would select nothing. Set only
+	// with that narrowing.
+	Draining []string `json:"draining,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
 // the operator's content hash of the entries; the callout reports the version
 // it is serving so "the map says X" is checkable against the running system
 // rather than against the rendered object.
+//
+// The operator cuts a map into numbered ConfigMaps when it would not fit one
+// (the API server refuses an object past 1 MiB), so a parsed document is one
+// shard: Shard of Shards, carrying the version of the whole map. The callout
+// is told the count and watches each name, and AssembleIdentityMap joins the
+// shards of one version back into the map it serves. A map that fits is shard
+// 0 of 1.
 type IdentityMap struct {
 	Version    string     `json:"version"`
+	Shard      int        `json:"shard"`
+	Shards     int        `json:"shards"`
 	Identities []Identity `json:"identities"`
 
 	// users is the set of names Users returns, built by ParseIdentityMap.
@@ -134,10 +167,7 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
-	m.users = make(map[string]struct{}, len(m.Identities))
-	for _, u := range m.Users() {
-		m.users[u] = struct{}{}
-	}
+	m.users = servedUsers(&m)
 	return &m, nil
 }
 
@@ -145,18 +175,34 @@ func (m *IdentityMap) validate() error {
 	if m.Version == "" {
 		return fmt.Errorf("identity map has no version")
 	}
+	// The stamps. A document from before sharding carries none, which
+	// decodes as 0 of 0 and is accepted here as a whole map; whether the
+	// store takes it depends on how many shards it was told to expect
+	// (Store.UpdateShard). A stamped document names its place in a count.
+	if m.Shard < 0 || m.Shards < 0 || (m.Shards == 0 && m.Shard != 0) || (m.Shards > 0 && m.Shard >= m.Shards) {
+		return fmt.Errorf("identity map is stamped shard %d of %d, which is not a place in a count", m.Shard, m.Shards)
+	}
 	// An empty map is never intentional. The operator always renders at
 	// least the provisioner and the session principal, so zero entries
 	// means the render
 	// produced nothing — and serving it would refuse every
 	// connection on a callout that reports itself perfectly healthy. Refuse
 	// it here so the previous map keeps serving and the reason is logged.
+	// A shard is never empty either: the operator cuts by size and puts at
+	// least one identity in each.
 	if len(m.Identities) == 0 {
 		return fmt.Errorf("identity map serves no identities; every connection would be refused")
 	}
-	seenSA := make(map[string]bool, len(m.Identities))
-	seenUser := make(map[string]bool, len(m.Identities))
-	for i, id := range m.Identities {
+	return validateIdentities(m.Identities)
+}
+
+// validateIdentities checks every entry and the set: once per shard at parse,
+// and once more over the joined shards at assembly, since two shards can each
+// be sound and still name one ServiceAccount between them.
+func validateIdentities(identities []Identity) error {
+	seenSA := make(map[string]bool, len(identities))
+	seenUser := make(map[string]bool, len(identities))
+	for i, id := range identities {
 		if err := id.validate(); err != nil {
 			return fmt.Errorf("identity %d: %w", i, err)
 		}
@@ -173,6 +219,40 @@ func (m *IdentityMap) validate() error {
 		}
 		seenSA[id.ServiceAccount] = true
 		seenUser[id.User] = true
+	}
+	// A dispatcher's bucket connections take the users <user>-b<n>, each with
+	// its own inbox. No entry may hold one of those names, and nor may a
+	// profile, whose addressee a bucket user would then share. One
+	// dispatcher entry per map: two would split one profile's grants
+	// between two principals.
+	dispatchers := 0
+	for i, id := range identities {
+		if id.Narrowing != NarrowingDispatcher {
+			continue
+		}
+		if dispatchers++; dispatchers > 1 {
+			return fmt.Errorf("identity %d: a second entry narrows on %q", i, NarrowingDispatcher)
+		}
+		for _, u := range dispatcherBucketUsers(id.User) {
+			if seenUser[u] {
+				return fmt.Errorf("identity %d: user %q is one of dispatcher %q's bucket users", i, u, id.User)
+			}
+		}
+	}
+	if dispatchers == 1 {
+		buckets := map[string]bool{}
+		for _, id := range identities {
+			if id.Narrowing == NarrowingDispatcher {
+				for _, u := range dispatcherBucketUsers(id.User) {
+					buckets[u] = true
+				}
+			}
+		}
+		for i, id := range identities {
+			if id.Narrowing == NarrowingProfile && buckets[id.Profile] {
+				return fmt.Errorf("identity %d: profile %q is the name of a dispatcher bucket user", i, id.Profile)
+			}
+		}
 	}
 	return nil
 }
@@ -206,11 +286,25 @@ func (id Identity) validate() error {
 		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
 			id.User, id.Account, mintableAccounts)
 	}
+	// Narrowed entries land in APP, except the dispatcher's, which is a
+	// control-plane principal and lands in TRUSTED, exactly (#5381).
+	if id.Narrowing == NarrowingDispatcher {
+		if id.Account != AccountControl {
+			return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
+				id.User, id.Narrowing, AccountControl, id.Account)
+		}
+	} else if id.Narrowing != "" && id.Account != AccountApp {
+		return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
+			id.User, id.Narrowing, AccountApp, id.Account)
+	}
+	if id.Narrowing != NarrowingDispatcher && len(id.Draining) > 0 {
+		return fmt.Errorf("user %q lists draining profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
+	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 	// The profile fields mean something only under NarrowingProfile. On any
 	// other entry they would be read by nothing, and a field the callout
 	// silently ignores is a grant someone believes exists.
-	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil) {
+	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil || id.Tier != "") {
 		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
 	}
 	switch id.Narrowing {
@@ -255,10 +349,58 @@ func (id Identity) validate() error {
 		if err := validateProfileEntry(id); err != nil {
 			return err
 		}
+	case NarrowingDispatcher:
+		// The entry's grants are the control connection's, and are served
+		// as written, so they get the un-narrowed entry's both-sides check.
+		// No per-profile subject is in the map: a bucket connection's grants
+		// come from the profile entries and the draining names. The
+		// draining names are checked here for shape. The callout checks
+		// them against its reserved names at the mint, since the map can't
+		// see those.
+		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
+				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+		if err := validateDispatcherEntry(id); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("user %q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 	}
 	return nil
+}
+
+// AssembleIdentityMap joins the shards of one render into the map the callout
+// serves: every shard present, in index order, each stamped with its index and
+// the count, all carrying one version. The joined entries are validated as a
+// set, because a duplicate across two shards is invisible to either shard's
+// parse. The result is stamped as the whole, 0 of 1, since that is what it is.
+func AssembleIdentityMap(shards []*IdentityMap) (*IdentityMap, error) {
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("no identity map shards to assemble")
+	}
+	version := ""
+	var identities []Identity
+	for i, shard := range shards {
+		if shard == nil {
+			return nil, fmt.Errorf("identity map shard %d of %d has not arrived", i, len(shards))
+		}
+		if shard.Shards != len(shards) || shard.Shard != i {
+			return nil, fmt.Errorf("identity map shard %d of %d is stamped shard %d of %d", i, len(shards), shard.Shard, shard.Shards)
+		}
+		if version == "" {
+			version = shard.Version
+		} else if shard.Version != version {
+			return nil, fmt.Errorf("identity map shard %d carries version %s where shard 0 carries %s", i, shard.Version, version)
+		}
+		identities = append(identities, shard.Identities...)
+	}
+	if err := validateIdentities(identities); err != nil {
+		return nil, fmt.Errorf("the assembled identity map: %w", err)
+	}
+	m := &IdentityMap{Version: version, Shard: 0, Shards: 1, Identities: identities}
+	m.users = servedUsers(m)
+	return m, nil
 }
 
 // Lookup returns the identity mapped to a TokenReview username. The bool
@@ -298,20 +440,34 @@ func (m *IdentityMap) Users() []string {
 	return users
 }
 
-// servesUser reports whether name is a user of one of this map's entries.
+// servedUsers is the set servesUser answers from: every entry's user, and a
+// dispatcher entry's bucket users, whose inboxes no narrowed pod may take.
+func servedUsers(m *IdentityMap) map[string]struct{} {
+	users := make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		users[u] = struct{}{}
+	}
+	for _, id := range m.Identities {
+		if id.Narrowing == NarrowingDispatcher {
+			for _, u := range dispatcherBucketUsers(id.User) {
+				users[u] = struct{}{}
+			}
+		}
+	}
+	return users
+}
+
+// servesUser reports whether name is a user of one of this map's entries, or
+// one of a dispatcher entry's bucket users.
 // ParseIdentityMap builds the set, and Store.Update installs nothing else, but
 // a map built any other way (a test writing the store directly) has no set; it
 // falls back to scanning the entries rather than reporting no users, so the
 // refusal fails closed.
 func (m *IdentityMap) servesUser(name string) bool {
-	if m.users == nil {
-		for _, id := range m.Identities {
-			if id.User == name {
-				return true
-			}
-		}
-		return false
+	users := m.users
+	if users == nil {
+		users = servedUsers(m)
 	}
-	_, ok := m.users[name]
+	_, ok := users[name]
 	return ok
 }

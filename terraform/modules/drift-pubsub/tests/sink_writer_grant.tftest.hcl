@@ -372,6 +372,11 @@ run "a_source_project_gets_its_own_sink_grant_and_identity_into_the_host_topic" 
   }
 
   assert {
+    condition     = strcontains(google_logging_project_sink.drift_audit.filter, "principalEmail=~\"\\.gserviceaccount\\.com$\"") && !strcontains(google_logging_project_sink.drift_audit.filter, "iam\\.gserviceaccount") && strcontains(google_logging_project_sink.source_drift_audit["drift-project-2"].filter, "principalEmail=~\"\\.gserviceaccount\\.com$\"")
+    error_message = "the lease carve-out matches the whole *.gserviceaccount.com domain on every sink, Google-managed accounts such as the Compute Engine default included: ${google_logging_project_sink.drift_audit.filter}"
+  }
+
+  assert {
     condition     = startswith(google_logging_project_sink.drift_audit.filter, "logName=\"projects/drift-project-1/logs/cloudaudit.googleapis.com%2Factivity\"") && strcontains(google_logging_project_sink.drift_audit.filter, "cluster_name")
     error_message = "the host sink keeps its own project's log name and its cluster_names clause: ${google_logging_project_sink.drift_audit.filter}"
   }

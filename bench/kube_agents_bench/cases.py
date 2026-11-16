@@ -33,13 +33,23 @@ from drifting apart.
 
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+from devops_bench.tasks.schema import Task as DevopsBenchTask
+
+from kube_agents_bench import pushed_report, scope_exclude, stop_hook, worker_trajectory
+from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
+from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
+from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
+from kube_agents_bench.lane import requested_pull_requests as _lane_requested_pull_requests
 
 __all__ = [
+    "CASE_KEYS",
+    "HARNESS_WRITTEN_ENTRIES",
     "TRACE_GRADABLE_CHECK_TYPES",
     "TRANSPORT_BLIND_CHECK_TYPES",
     "WORKER_BLIND_CHECK_TYPES",
@@ -47,6 +57,45 @@ __all__ = [
     "CaseSpecError",
     "load_case",
 ]
+
+# Every top-level key a task.yaml may carry, which is this grader's schema for
+# the top level: neither loader rejects a key it does not know -- devops-bench
+# and load_case read the keys they want and drop the rest -- so
+# hack/ci-eval-pr.sh reds a pull request's case carrying a key outside main's
+# copy of this set ("land the grader change first"), and tests/test_cases.py
+# holds every task in the tree to it. Two halves:
+#
+# - devops-bench's: its task model's fields, read off the installed model so a
+#   bump that adds one is allowed without an edit here (``folder`` is set by
+#   the loader from the directory, never written), plus the three aliases its
+#   loader maps onto them (``Task.from_dict``: ``task_id`` for ``id``,
+#   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
+# - this repository's: what this package and the case tooling read --
+#   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
+#   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
+#   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
+#   (read by ``lane.py`` and by ``load_case``), ``suite``
+#   (``certification``: the case runs on the certification lane only; the
+#   lane and scripts/validate_bench_cases.py read the bare line from the task
+#   file), ``certification_part`` (which section of that lane, default 1)
+#   -- and ``task_version``, a
+#   case's own revision note that nothing reads. A new one is added here, in a
+#   pull request before any case a pull-request job grades uses it (the
+#   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
+_DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
+_DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
+DEVOPS_BENCH_CASE_KEYS = (
+    frozenset(DevopsBenchTask.model_fields) - _DEVOPS_BENCH_LOADER_FIELDS
+) | _DEVOPS_BENCH_ALIASES
+REPOSITORY_CASE_KEYS = frozenset(
+    {
+        "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
+        "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
+        "certification_part",
+        _REQUESTED_KEY,
+    }
+)
+CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out
@@ -56,32 +105,72 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs (or, with
-# ``after_result_pattern``, the workers' trajectory entries), ``worker_agents`` the
-# ``agent`` tags the harness puts on the workers' trajectory entries. On the
+# ``worker_commands`` the delegated cards' worker logs (and, with
+# ``after_result_pattern``, the workers' trajectory entries as typed), ``worker_agents`` the
+# ``agent`` tags the harness puts on the workers' trajectory entries,
+# ``worker_budget`` the cards' run rows the same read collects. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
 # ``tool_called`` in its default ``router`` scope reads the delegating
 # turn's own calls, which the door's trace carries once the executor
 # publishes it (the transport then writes an ``a2a.activity`` marker), so
-# it is set aside only on a record without the marker. ``worker_commands``
+# it is set aside only on a record without the marker -- unless it sets a
+# ``result`` pattern, which the trace cannot serve. ``worker_commands``
 # and ``worker_agents``, and ``tool_called`` in the ``workers`` or ``all``
 # scope, read the delegated cards' logs and the workers' tagged entries,
 # which the trace does not carry -- it holds calls without their results,
 # so no card id can be read from it. The delegation wait reads them from
-# the pod instead, when the turn ran under the bridge's api executor, but
-# the scorer still sets these checks aside on every inject record, marker
-# or not, until it grades them on a record that carries the workers. A
-# check is reported as not applicable there rather than failed or errored.
+# the pod instead, when the turn ran under the bridge's api executor, and
+# puts them on the trajectory tagged with the worker's profile. The scorer
+# grades these checks on an inject record that carries tagged worker
+# entries and no ``worker_trajectory.GAP_ENTRY`` (a capture with gaps), grades
+# the ``workers``-scope ``tool_called`` ones on a record carrying
+# ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` and no worker entry, and sets them
+# aside on any other inject record. Two kinds stay set aside on a
+# record with the workers too: a check that also reads the router's own
+# calls, on a record whose door did not vouch for them, and a check that
+# reads what the trace never carries (a router call's result or argument
+# values, or ``report_times_in_window``). A check set aside is reported as
+# not applicable rather than failed or errored.
 # Recorded per entry NAME, because the report devops-bench writes carries
 # the entry's name and not its check type.
 TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
-WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents"})
+# ``report_times_in_window`` reads the report, but also every tool output in
+# the trajectory, the workers' included, to tell a time the agent read from
+# one it guessed; the inject trace carries the router's calls without their
+# tool outputs, so it stays blind on a record that carries the workers'.
+WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
+# Entries the harness writes on the trajectory itself (``stop_hook.py``,
+# ``pushed_report.py``, ``worker_trajectory.py``), not calls read off the door's trace, so a lossy
+# trace says nothing about them: a ``tool_called`` leaf naming only these is
+# graded on every record.
+HARNESS_WRITTEN_ENTRIES = frozenset(
+    {
+        stop_hook.STOP_ENTRY,
+        stop_hook.CARDS_STOPPED_ENTRY,
+        pushed_report.PLANT_ENTRY,
+        worker_trajectory.GAP_ENTRY,
+        worker_trajectory.NO_WORKER_CALLS_ENTRY,
+    }
+)
+_TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
 _TOOL_CALLED_ROUTER_SCOPE = "router"
+# The scope that reads the delegated workers' calls alone.
+_TOOL_CALLED_WORKERS_SCOPE = "workers"
+# The scope that reads the router's calls and the workers' together.
+_TOOL_CALLED_ALL_SCOPE = "all"
+# The worker-blind type that reads every tool output, the router's included.
+_REPORT_TIMES_CHECK_TYPE = "report_times_in_window"
+# ``tool_called``'s result-pattern key. The door's trace records no results,
+# so a leaf that sets it cannot be graded from the trace in any scope.
+_TOOL_CALLED_RESULT_KEY = "result"
+# ``tool_called``'s argument-pattern key. The door's trace sends each of the
+# router's arguments as its shape (``<string, 51 chars>``), not its value.
+_TOOL_CALLED_ARGUMENTS_KEY = "arguments"
 # The compound type that negates its children ("none of these tools was
 # called"), which is how a safeguard against a forbidden call is written.
 _NEGATED_COMPOUND_TYPE = "none"
@@ -112,9 +201,9 @@ class CaseSpec:
     """Human label for the verdict summary. Falls back to the case id."""
 
     domain: str | None
-    """``domain:``, for per-domain reporting. None is a real answer: a task
-    that claims no domain covers no journey, which ``gpu-stress-test-diagnosis``
-    documents at length in its own comments."""
+    """``domain:``, for per-domain reporting. scripts/validate_bench_cases.py
+    rejects a task without one, so None appears only for a file read outside
+    that lint."""
 
     deployer: str
     """``infrastructure.deployer``, defaulting to ``noop``."""
@@ -145,9 +234,9 @@ class CaseSpec:
 
     trace_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` whose every leaf is a
-    ``tool_called`` in the ``router`` scope: blind only on an inject record
-    whose door showed no tool-call trace (no ``a2a.activity`` marker), and
-    graded in full on one that did."""
+    ``tool_called`` in the ``router`` scope with no ``result`` pattern:
+    blind only on an inject record whose door showed no tool-call trace (no
+    ``a2a.activity`` marker), and graded in full on one that did."""
 
     negated_trace_blind_checks: frozenset[str] = frozenset()
     """The entries in ``trace_blind_checks`` whose every leaf sits under an
@@ -161,15 +250,45 @@ class CaseSpec:
 
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
-    delegated workers -- ``worker_commands``, ``worker_agents``, or a
-    ``tool_called`` in the ``workers`` or ``all`` scope. Blind on every
-    inject record, trace or none: the trace carries no results, so no card
-    id can be read from it. The delegation wait reads the workers from the
-    pod when the turn ran under the bridge's api executor; the set-aside
-    stays until the scorer grades them on a record that carries them. A
-    compound mixing such a leaf with a router-scope ``tool_called`` lands
-    here, not in ``trace_blind_checks``: its worker leaf would still error
-    with the trace shown, and grading the compound would block on it."""
+    delegated workers -- ``worker_commands``, ``worker_agents``,
+    ``worker_budget``, or a ``tool_called`` in the ``workers`` or ``all`` scope -- or any
+    ``tool_called`` with a ``result`` pattern. The trace carries no
+    results, so no card id can be read from it and no result pattern can
+    match. The delegation wait reads the workers from the pod when the turn
+    ran under the bridge's api executor and tags their entries, so the
+    scorer grades these entries on an inject record that carries tagged
+    worker entries and no capture gap, and sets them aside on any other
+    inject record (``scoring._inject_lane_view``), bar
+    ``worker_calls_checks`` on a record carrying
+    ``worker_trajectory.NO_WORKER_CALLS_ENTRY``. A compound mixing such a
+    leaf with a router-scope ``tool_called`` lands here, not in
+    ``trace_blind_checks``: its worker leaf would still error with the
+    trace shown, and grading the compound would block on it. The two sets
+    below are the entries that need more than the workers."""
+
+    worker_router_checks: frozenset[str] = frozenset()
+    """The entries in ``worker_blind_checks`` with a leaf that also reads the
+    router's own calls: a ``tool_called`` in the ``router`` or ``all`` scope
+    with no ``result`` pattern. On a record that carries the workers they
+    grade only when the door's trace vouches for the router's calls, as
+    ``trace_blind_checks`` do."""
+
+    worker_untraced_checks: frozenset[str] = frozenset()
+    """The entries in ``worker_blind_checks`` with a leaf that reads what the
+    inject trace never carries: a ``tool_called`` in the ``router`` or
+    ``all`` scope with a ``result`` or ``arguments`` pattern (the trace
+    holds the router's calls with no results and with each argument's shape
+    in place of its value), or ``report_times_in_window`` (it reads every
+    tool output, the router's included). Set aside on every inject record,
+    workers or none."""
+
+    worker_calls_checks: frozenset[str] = frozenset()
+    """The entries in ``worker_blind_checks`` whose every leaf is a
+    ``tool_called`` in the ``workers`` scope with no ``result`` pattern. On a
+    record carrying ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` (the cards
+    closed, a clean capture, no worker entry) these alone grade, on zero
+    worker calls; the other worker-reading entries stay set aside, since their
+    verifiers read a capture that holds nothing (``scoring._inject_lane_view``)."""
 
     tool_calls_optional: bool = False
     """``tool_calls_optional:``, for a case a correct agent can answer without
@@ -178,6 +297,19 @@ class CaseSpec:
     case that sets it, a non-empty reply stands in for the trajectory as the
     run evidence, beside the billed tokens and latency every case needs.
     Absent means False."""
+
+    requested_pull_requests: int = 0
+    """How many pull requests the case requests: the larger of what its own
+    requesting checks ask for (leaves of a type in
+    ``lane.REQUESTING_CHECK_TYPES``) and the count it declares at its top
+    level under ``requested_pull_requests``, for a case that opens more pull
+    requests by design than its checks grade or a placeholder for a case the
+    persona answers with a pull request before its own check lands. The
+    write-safeguard carve-outs in ``scoring.classify_rep`` fire only when this
+    is non-zero, and hold the charged writes to it: on a case that requested
+    none a write is a genuine forbidden action and still blocks. Both counts
+    are in the task file, which is why they live there: the scorer is pinned
+    to the ``bench/`` tree and cannot read the lane file under ``hack/``."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -193,15 +325,58 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
     return [{}]
 
 
+def _harness_written(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` over harness-written entries
+    only, which no transport blinds."""
+    names = leaf.get(_TOOL_CALLED_NAMES_KEY) or []
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+        and bool(names)
+        and set(names) <= HARNESS_WRITTEN_ENTRIES
+    )
+
+
 def _reads_the_workers(leaf: dict[str, Any]) -> bool:
-    """Whether a transport-blind leaf reads the delegated workers rather than
-    the delegating turn's own calls: a worker type, or a ``tool_called``
-    outside the ``router`` scope."""
+    """Whether a transport-blind leaf is blind on every inject record: a
+    worker type, a ``tool_called`` outside the ``router`` scope, or a
+    ``tool_called`` with a ``result`` pattern, which the trace cannot serve."""
     kind = str(leaf.get("type") or "")
     if kind in WORKER_BLIND_CHECK_TYPES:
         return True
-    scope = leaf.get(_TOOL_CALLED_SCOPE_KEY)
-    return kind in TRACE_GRADABLE_CHECK_TYPES and scope not in (None, _TOOL_CALLED_ROUTER_SCOPE)
+    if kind not in TRACE_GRADABLE_CHECK_TYPES:
+        return False
+    if leaf.get(_TOOL_CALLED_RESULT_KEY) is not None:
+        return True
+    return leaf.get(_TOOL_CALLED_SCOPE_KEY) not in (None, _TOOL_CALLED_ROUTER_SCOPE)
+
+
+def _reads_the_router(leaf: dict[str, Any]) -> bool:
+    """Whether a worker-reading leaf also reads the router's own calls: a
+    ``tool_called`` in the ``router`` or ``all`` scope with no ``result``
+    pattern."""
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+        and leaf.get(_TOOL_CALLED_SCOPE_KEY) in (None, _TOOL_CALLED_ROUTER_SCOPE, _TOOL_CALLED_ALL_SCOPE)
+    )
+
+
+def _reads_untraced_output(leaf: dict[str, Any]) -> bool:
+    """Whether a worker-reading leaf reads something the inject trace never
+    carries: ``report_times_in_window``, or a ``tool_called`` in the
+    ``router`` or ``all`` scope with a ``result`` or ``arguments`` pattern."""
+    kind = str(leaf.get("type") or "")
+    if kind == _REPORT_TIMES_CHECK_TYPE:
+        return True
+    return (
+        kind in TRACE_GRADABLE_CHECK_TYPES
+        and (
+            leaf.get(_TOOL_CALLED_RESULT_KEY) is not None
+            or leaf.get(_TOOL_CALLED_ARGUMENTS_KEY) is not None
+        )
+        and leaf.get(_TOOL_CALLED_SCOPE_KEY) in (None, _TOOL_CALLED_ROUTER_SCOPE, _TOOL_CALLED_ALL_SCOPE)
+    )
 
 
 def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
@@ -226,12 +401,37 @@ def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
     return False
 
 
+def _calls_the_workers_only(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` in the ``workers`` scope with no ``result`` pattern."""
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_SCOPE_KEY) == _TOOL_CALLED_WORKERS_SCOPE
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+    )
+
+
+def _worker_calls_checks(spec: Any, workers: frozenset[str]) -> frozenset[str]:
+    """The names in ``workers`` whose every leaf passes :func:`_calls_the_workers_only`."""
+    if not isinstance(spec, list):
+        return frozenset()
+    return frozenset(
+        str(entry["name"])
+        for entry in spec
+        if isinstance(entry, dict)
+        and str(entry.get("name")) in workers
+        and (leaves := _leaves(entry.get("check")))
+        and all(_calls_the_workers_only(leaf) for leaf in leaves)
+    )
+
+
 def _transport_blind_checks(
     spec: Any,
-) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
     """The names of the spec's entries whose every leaf is transport-blind,
     split into the trace-gradable ones, the ``none``-compound subset of
-    those, and the worker-reading ones.
+    those, the worker-reading ones, and the two subsets of the
+    worker-reading ones that also read the router's calls or an output the
+    inject trace never carries.
 
     An entry without a ``name`` cannot be matched to its report line and is
     left out: the scorer then grades it as it always has, which fails closed
@@ -240,25 +440,38 @@ def _transport_blind_checks(
     trace: set[str] = set()
     negated: set[str] = set()
     workers: set[str] = set()
+    router: set[str] = set()
+    untraced: set[str] = set()
     if not isinstance(spec, list):
-        return frozenset(), frozenset(), frozenset()
+        return frozenset(), frozenset(), frozenset(), frozenset(), frozenset()
     for entry in spec:
         if not isinstance(entry, dict) or entry.get("name") is None:
             continue
         check = entry.get("check")
         leaves = _leaves(check)
         if not leaves or not all(
-            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves
+            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES and not _harness_written(leaf)
+            for leaf in leaves
         ):
             continue
         name = str(entry["name"])
         if any(_reads_the_workers(leaf) for leaf in leaves):
             workers.add(name)
+            if any(_reads_the_router(leaf) for leaf in leaves):
+                router.add(name)
+            if any(_reads_untraced_output(leaf) for leaf in leaves):
+                untraced.add(name)
             continue
         trace.add(name)
         if _negates_every_leaf(check):
             negated.add(name)
-    return frozenset(trace), frozenset(negated), frozenset(workers)
+    return (
+        frozenset(trace),
+        frozenset(negated),
+        frozenset(workers),
+        frozenset(router),
+        frozenset(untraced),
+    )
 
 
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
@@ -286,6 +499,9 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     directory. Raises :class:`CaseSpecError` on anything the scorer cannot
     grade honestly — a missing file, a document that is not a mapping, or a
     declared id that disagrees with the directory.
+
+    The case's ``requested_pull_requests`` is the larger of the count of its
+    own requesting checks and the top-level ``requested_pull_requests`` key.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -341,6 +557,11 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     declares_spec = isinstance(spec, list) and len(spec) > 0
 
     expected_fail_raw = doc.get("expected_fail", False)
+    try:
+        declared = _lane_declared_pull_requests(doc, where=str(path))
+    except _LaneSafeguardsError as exc:
+        raise CaseSpecError(str(exc)) from exc
+
     expected_fail = _coerce_bool(expected_fail_raw, field="expected_fail", path=path)
     tool_calls_optional = _coerce_bool(
         doc.get("tool_calls_optional", False), field="tool_calls_optional", path=path
@@ -352,8 +573,9 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name_raw = doc.get("name")
     name = str(name_raw).strip() if name_raw is not None else case_id
 
-    trace_blind, negated_trace_blind, worker_blind = _transport_blind_checks(spec)
-
+    trace_blind, negated_trace_blind, worker_blind, worker_router, worker_untraced = (
+        _transport_blind_checks(spec)
+    )
     return CaseSpec(
         case_id=case_id,
         name=name,
@@ -366,5 +588,9 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         trace_blind_checks=trace_blind,
         negated_trace_blind_checks=negated_trace_blind,
         worker_blind_checks=worker_blind,
+        worker_router_checks=worker_router,
+        worker_untraced_checks=worker_untraced,
+        worker_calls_checks=_worker_calls_checks(spec, worker_blind),
         tool_calls_optional=tool_calls_optional,
+        requested_pull_requests=max(_lane_requested_pull_requests(spec), declared),
     )

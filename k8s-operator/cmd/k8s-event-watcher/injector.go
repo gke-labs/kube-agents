@@ -21,9 +21,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+)
+
+// The session-create cooldown breaker (sessionBreaker). session_kv_server is
+// one loopback process shared by every cluster's dispatcher, so a 429 or a
+// 5xx from POST /sessions says the daemon is busy or broken, not that one
+// workload's request was. Before the breaker, every sighting of every
+// workload on every cluster re-POSTed into that failure, because the failed
+// dispatch forgets its dedup entry and the next sighting retries.
+const (
+	// sessionBreakerThreshold is how many consecutive 429 or 5xx answers to
+	// POST /sessions open the breaker. A 201 resets the count; any other
+	// status (a 401, a 404) leaves it alone, since it says nothing about load.
+	sessionBreakerThreshold = 3
+	// sessionBreakerCooldown is how long an open breaker holds session
+	// creates when the opening response carries no Retry-After, or one
+	// shorter than this.
+	sessionBreakerCooldown = 60 * time.Second
+	// sessionBreakerMaxCooldown caps a Retry-After the daemon sends, so a
+	// misconfigured or hostile header cannot silence triage for hours.
+	sessionBreakerMaxCooldown = 300 * time.Second
+	// retryAfterHeader is the header the opening failure's cooldown is read
+	// from, either delta-seconds or an HTTP-date (RFC 9110 §10.2.3).
+	retryAfterHeader = "Retry-After"
 )
 
 // injectorConfig holds the REST endpoint configuration for the agent gateway.
@@ -45,6 +72,125 @@ type injectorConfig struct {
 type injector struct {
 	cfg    injectorConfig
 	client *http.Client
+	// breaker is one per injector, and the injector is one per process
+	// (main builds it once and every cluster's dispatcher shares it), so an
+	// open breaker holds every cluster's session creates at once.
+	breaker *sessionBreaker
+}
+
+// sessionBreaker counts consecutive 429 and 5xx answers to POST /sessions
+// and, past sessionBreakerThreshold, holds session creates for a cooldown.
+// Only POST /sessions feeds it: the inject and follow-up POSTs have a session
+// already and are not what piles up on a struggling daemon.
+//
+// Mutex-guarded because every cluster's dispatcher reaches it from its own
+// goroutine. The clock is a field so tests drive the cooldown without
+// sleeping.
+type sessionBreaker struct {
+	mu sync.Mutex
+	// failures is the consecutive 429 or 5xx count since the last 201.
+	failures int
+	// openUntil is when the hold ends; zero while the breaker is closed.
+	openUntil time.Time
+	// openedBy is the status that tripped the breaker, for the log line.
+	openedBy int
+	// held counts the creates SuppressedUntil turned away during the
+	// current hold, for the line logged when it closes.
+	held int
+	now  func() time.Time
+}
+
+func newSessionBreaker() *sessionBreaker {
+	return &sessionBreaker{now: time.Now}
+}
+
+// record takes one POST /sessions outcome. A 201 closes the count; a 429 or
+// a 5xx increments it and, at the threshold, opens the breaker for
+// sessionBreakerCooldown or the response's Retry-After when that is longer,
+// capped at sessionBreakerMaxCooldown. Any other status is left alone. An
+// answer that lands while the breaker is open (a POST that was in flight
+// when it opened) changes nothing: the deadline the open line logged stands.
+func (b *sessionBreaker) record(status int, retryAfter string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.openUntil.IsZero() && b.now().Before(b.openUntil) {
+		return
+	}
+	if status == http.StatusCreated {
+		b.failures = 0
+		return
+	}
+	if status != http.StatusTooManyRequests && status < http.StatusInternalServerError {
+		return
+	}
+	b.failures++
+	if b.failures < sessionBreakerThreshold {
+		return
+	}
+	now := b.now()
+	cooldown := sessionBreakerCooldown
+	if asked, ok := parseRetryAfter(retryAfter, now); ok && asked > cooldown {
+		cooldown = asked
+	}
+	if cooldown > sessionBreakerMaxCooldown {
+		cooldown = sessionBreakerMaxCooldown
+	}
+	b.openUntil = now.Add(cooldown)
+	b.openedBy = status
+	log.Printf("injector: session creates held until %s: %d consecutive POST /sessions failures, last status %d",
+		b.openUntil.UTC().Format(time.RFC3339), b.failures, status)
+}
+
+// SuppressedUntil reports whether session creates are held, and until when.
+// A call that is told "held" is a create turned away, and is counted for
+// the close line. The first call past the deadline closes the breaker,
+// resets the count and logs once, with how many creates the hold turned
+// away; the caller then proceeds to POST. There is no timer: on a quiet
+// fleet the line waits for the next event.
+func (b *sessionBreaker) SuppressedUntil() (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.openUntil.IsZero() {
+		return time.Time{}, false
+	}
+	if b.now().Before(b.openUntil) {
+		b.held++
+		return b.openUntil, true
+	}
+	log.Printf("injector: session creates resume: cooldown opened by status %d ended at %s; %d creates held",
+		b.openedBy, b.openUntil.UTC().Format(time.RFC3339), b.held)
+	b.openUntil = time.Time{}
+	b.openedBy = 0
+	b.failures = 0
+	b.held = 0
+	return time.Time{}, false
+}
+
+// parseRetryAfter reads a Retry-After value as a duration from now: either
+// delta-seconds or an HTTP-date. A missing, malformed or past value is not
+// a duration, and the caller falls back to the fixed cooldown.
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(value); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	at, err := http.ParseTime(value)
+	if err != nil || !at.After(now) {
+		return 0, false
+	}
+	return at.Sub(now), true
+}
+
+// SessionCreatesSuppressedUntil is the dispatcher's question before a
+// per-incident POST /sessions: held, and until when. See sessionBreaker.
+func (i *injector) SessionCreatesSuppressedUntil() (time.Time, bool) {
+	return i.breaker.SuppressedUntil()
 }
 
 // newInjector creates a new injector and validates target endpoint configurations.
@@ -65,7 +211,7 @@ func newInjector(cfg injectorConfig) (*injector, error) {
 			Timeout: 10 * time.Second,
 		}
 	}
-	return &injector{cfg: cfg, client: client}, nil
+	return &injector{cfg: cfg, client: client, breaker: newSessionBreaker()}, nil
 }
 
 // createSessionResponse maps the JSON response from session creation.
@@ -88,9 +234,13 @@ func (i *injector) CreateSession(ctx context.Context) (string, error) {
 	}
 	resp, err := i.client.Do(req)
 	if err != nil {
+		// A transport error is not the daemon answering, so it does not
+		// feed the breaker: a daemon that is not listening yet costs one
+		// refused connection per sighting, not a queue on its socket.
 		return "", fmt.Errorf("injector: POST /sessions: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	i.breaker.record(resp.StatusCode, resp.Header.Get(retryAfterHeader))
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("injector: POST /sessions: status %d: %s", resp.StatusCode, string(body))
@@ -110,11 +260,29 @@ type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
-// injectResponse is the daemon's reply to an accepted inject. Only the status
-// is read; the daemon sends more on the suppressed path and may send more
-// later.
+// injectResponse is the daemon's reply to an accepted inject: the status, and
+// the features the daemon lists for the session; the daemon sends more on the
+// suppressed path and may send more later.
 type injectResponse struct {
 	Status string `json:"status"`
+	// Features is what the daemon says it does with this session beyond
+	// posting the alert. The one read today is injectFeatureFollowup: a daemon
+	// that lists it posts a k8s-event-followup into the alert's thread; one
+	// that does not takes that kind down the event path and would post a
+	// second alert, so the dispatcher sends none to it (dedupEntry.
+	// FollowupSupported). The same feature is read again off /healthz before
+	// each tick's follow-ups (Features), for the daemon of that moment.
+	Features []string `json:"features,omitempty"`
+}
+
+// injectFeatureFollowup is the daemon's word for "I post a
+// k8s-event-followup into the alert's thread"; session_kv_server spells it
+// in INJECT_RESPONSE_FEATURES.
+const injectFeatureFollowup = "followup"
+
+// Supports reports whether the daemon listed feature on this response.
+func (r injectResponse) Supports(feature string) bool {
+	return hasFeature(r.Features, feature)
 }
 
 // injectStatusSuppressed is the daemon's word for "accepted, and then dropped
@@ -155,6 +323,112 @@ const injectStatusSuppressed = "suppressed"
 // install and a pod is not all-old or all-new.
 const injectStatusFiltered = "filtered"
 
+// injectStatusFolded is the daemon's word for "accepted, and recorded as one
+// more sighting of an incident already open for the same workload" — an
+// earlier event for it (another replica's, or this pod's under another reason)
+// was admitted within the daemon's INCIDENT_WORKLOAD_DEDUP_SECONDS window. The
+// entry stays, unflagged, and is held for this watcher's own window like any
+// delivered incident: rolling it back would re-offer this pod at its repeat
+// cadence, and flagging it policy-filtered would let the next Warning sighting
+// reopen it. No feature negotiation: a watcher predating this status reads it
+// as delivered, which keeps the entry the same way and only miscounts it as an
+// injected event and a triage session.
+const injectStatusFolded = "folded"
+
+// sessionIDPattern is the shape of a session id the daemon issues
+// (`k8s-evt-<hex>`, and the operator's own id in shared mode): letters,
+// digits, dot, underscore and hyphen. A session id reaches the inject URL
+// from the daemon's own answer or from the dedup snapshot on disk, and the
+// check keeps a hand-edited snapshot from steering the POST anywhere else.
+var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// injectStatusUnrouted is the daemon's answer to a k8s-event-followup for a
+// session with neither a chat thread nor a card: accepted, nothing posted,
+// nothing to retry (session_kv_server, _inject_followup). A session with a
+// card but no thread, every session on an install without a chat surface,
+// gets the line on its card and is answered like a routed one.
+const injectStatusUnrouted = "unrouted"
+
+// healthzPath is the daemon's unauthenticated health route, which lists the
+// inject kinds it dispatches and, under injectFeaturesKey, the features it
+// serves (the drift detector reads the same list for its own feature);
+// healthzBodyMax bounds the read.
+const (
+	healthzPath       = "/healthz"
+	injectFeaturesKey = "features"
+	healthzBodyMax    = 64 * 1024
+)
+
+// Features asks the daemon, now, which inject features it serves. The
+// per-session answer recorded at alert time says what the daemon of that
+// moment promised; this is what the daemon of this moment does, and the
+// sweep asks before each tick's follow-ups so an agent image rolled back to
+// a build without the follow-up branch is never sent one (it would take the
+// kind down the event path and post a second alert).
+func (i *injector) Features(ctx context.Context) ([]string, error) {
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, not a request's input
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.cfg.daemonURL+healthzPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("injector: build GET healthz: %w", err)
+	}
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
+	if err != nil {
+		return nil, fmt.Errorf("injector: GET healthz: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, healthzBodyMax))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("injector: GET healthz: status %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Features []string `json:"features"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("injector: healthz body: %w", err)
+	}
+	return parsed.Features, nil
+}
+
+// excludedEventsPath is the daemon's route for the events alert-exclude rules
+// hold back (session_kv_server post_excluded_event).
+const excludedEventsPath = "/v1/excluded-events"
+
+// PostExcluded sends one excluded-event record. No session: the daemon writes
+// a ledger row for the daily recap and nothing else.
+func (i *injector) PostExcluded(ctx context.Context, rec excludedRecord) error {
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("injector: marshal excluded record: %w", err)
+	}
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, not a request's input
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.cfg.daemonURL+excludedEventsPath, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("injector: build POST excluded: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
+	if err != nil {
+		return fmt.Errorf("injector: POST excluded: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, healthzBodyMax))
+		return fmt.Errorf("injector: POST excluded: status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// hasFeature reports whether feature is in the list.
+func hasFeature(features []string, feature string) bool {
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
 //
@@ -175,29 +449,34 @@ const injectFeaturesHeader = "X-Watcher-Features"
 // injectStatusFiltered. Matched against by the daemon's `_watcher_features`.
 const injectFeaturePolicyFiltered = "policy-filtered"
 
-// Inject posts the triage event details to the specified session's queue.
-//
-// Returns the daemon's status string alongside the error, because a 2xx does
-// not by itself mean anyone was told — see injectStatusSuppressed and
+// InjectDetailed POSTs the payload to the session's inject route and returns
+// the daemon's whole answer: the status Dispatch reads and the features the
+// sweep's handshake reads. The status rides beside the error because a 2xx
+// does not by itself mean anyone was told — see injectStatusSuppressed and
 // injectStatusFiltered. An empty or unparseable body reads as delivered: a
-// daemon predating this field is one that always delivers, and guessing
+// daemon predating the field is one that always delivers, and guessing
 // "dropped" would reopen every incident on every sighting.
-func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
+func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload InjectPayload) (injectResponse, error) {
+	var none injectResponse
 	if sessionID == "" {
-		return "", errors.New("injector: Inject: sessionID is required")
+		return none, errors.New("injector: Inject: sessionID is required")
+	}
+	if !sessionIDPattern.MatchString(sessionID) {
+		return none, fmt.Errorf("injector: Inject: session id %q is not one the daemon issues", sessionID)
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("injector: marshal payload: %w", err)
+		return none, fmt.Errorf("injector: marshal payload: %w", err)
 	}
 	wrapped, err := json.Marshal(injectMessageRequest{Message: string(body)})
 	if err != nil {
-		return "", fmt.Errorf("injector: wrap inject envelope: %w", err)
+		return none, fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
 	url := i.cfg.daemonURL + "/sessions/" + sessionID + "/inject"
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, and the session id matched sessionIDPattern above
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wrapped))
 	if err != nil {
-		return "", fmt.Errorf("injector: build POST inject: %w", err)
+		return none, fmt.Errorf("injector: build POST inject: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -205,16 +484,16 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	if i.cfg.assertedCaller != "" {
 		req.Header.Set("X-Asserted-Caller", i.cfg.assertedCaller)
 	}
-	resp, err := i.client.Do(req)
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
 	if err != nil {
-		return "", fmt.Errorf("injector: POST inject: %w", err)
+		return none, fmt.Errorf("injector: POST inject: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
+		return none, fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
 	}
 	var parsed injectResponse
 	_ = json.Unmarshal(respBody, &parsed)
-	return parsed.Status, nil
+	return parsed, nil
 }

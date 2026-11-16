@@ -1026,6 +1026,18 @@ class WrapperCaseSelectionTest(_StubbedScriptTest):
                 self.assertEqual(self.state()["applied"]["spec"]["harness"]["driftDetector"],
                                  {"enabled": enabled, "subscription": "drift-sub"})
 
+    def test_reset_keeps_the_event_watcher_alert_exclude_rules(self):
+        # The reset sets the watcher's switch and nothing else under
+        # eventWatcher: the install's alert-exclude rules survive it.
+        rules = [{"namespace": "payments"}]
+        cr = _platform_agent(alias=True)
+        cr["spec"].setdefault("harness", {})["eventWatcher"] = {"enabled": True, "alertExclude": rules}
+        self.given_cr(cr)
+        proc = self.run_wrapper(CASE="b-0022b-gitops-pinned-base", AGENT_STATE_RESET="true")
+        self.assertEqual(proc.returncode, _KUBECTL_STOP, proc.stderr)
+        self.assertEqual(self.state()["applied"]["spec"]["harness"]["eventWatcher"],
+                         {"enabled": False, "alertExclude": rules})
+
     def test_reset_on_a_crd_without_the_drift_detector_writes_none(self):
         # The stub's apply refuses a harness field the CRD does not declare, as
         # strict field validation does, after the delete.

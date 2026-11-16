@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "number": 3,
+    "body": "Investigating."
+  },
+  "responses": [
+    {
+      "id": 16,
+      "html_url": "https://gitea.example.test/acme/infra/issues/3#issuecomment-16",
+      "pull_request_url": "",
+      "issue_url": "https://gitea.example.test/acme/infra/issues/3",
+      "user": {
+        "id": 1,
+        "login": "kube-agents",
+        "full_name": "",
+        "email": "kube-agents@noreply.gitea.example.test",
+        "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+        "html_url": "https://gitea.example.test/kube-agents",
+        "is_admin": false
+      },
+      "original_author": "",
+      "original_author_id": 0,
+      "body": "Investigating.",
+      "created_at": "2026-10-04T14:20:43Z",
+      "updated_at": "2026-10-04T14:20:43Z"
+    }
+  ]
+}

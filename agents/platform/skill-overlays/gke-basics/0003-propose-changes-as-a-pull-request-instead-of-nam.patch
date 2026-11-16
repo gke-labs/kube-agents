@@ -1,0 +1,349 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -32,14 +32,8 @@ Managed Kubernetes platform on Google Cloud. Defaults to Autopilot mode unless S
+ 1. **Private Autopilot Clusters:**
+    * Use `--enable-private-nodes` for private node IP addresses.
+    * Use `--enable-private-endpoint` to disable public IP access to the control plane.
+-   * Restrict control plane access with `--enable-master-authorized-networks` and `--master-authorized-networks=CIDR_BLOCK`:
+-     ```bash
+-     gcloud container clusters create-auto CLUSTER_NAME --region=REGION \
+-       --enable-private-nodes \
+-       --enable-private-endpoint \
+-       --enable-master-authorized-networks \
+-       --master-authorized-networks=CIDR_BLOCK
+-     ```
++   * Restrict control plane access with `--enable-master-authorized-networks` and `--master-authorized-networks=CIDR_BLOCK`.
++   * These are cluster settings, proposed as a pull request in Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-connector` (`spec.privateClusterConfig.enablePrivateNodes`, `spec.privateClusterConfig.enablePrivateEndpoint`, `spec.masterAuthorizedNetworksConfig.cidrBlocks`). The broker refuses `gcloud` writes.
+ 
+ 2. **Workload Identity (IAM Binding):**
+    * Never mount raw GCP Service Account JSON keys in Pods; open `gke-workload-identity/SKILL.md` for KSA/GSA setup.
+diff --git a/references/cli-reference.md b/references/cli-reference.md
+--- a/references/cli-reference.md
++++ b/references/cli-reference.md
+@@ -1,5 +1,7 @@
+ # CLI & Tool Reference for GKE
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
+ ## Tool Preference
+ 
+ Tool usage follows two distinct, domain-specific preference hierarchies:
+@@ -32,29 +34,23 @@ Default preference order:
+ 
+ | Interface         | When to Use                | Examples                    |
+ | ----------------- | -------------------------- | --------------------------- |
+-| **GKE MCP Tools** | Default for all cluster    | `create_cluster`,           |
+-:                   : and K8s operations when    : `get_cluster`,              :
+-:                   : MCP server is available.   : `get_k8s_resource`,         :
+-:                   : Structured I/O, supports   : `apply_k8s_manifest`,       :
+-:                   : dry-run, no                : `get_k8s_logs`              :
++| **GKE MCP Tools** | Default for all cluster    | `get_cluster`,              |
++:                   : and K8s reads when MCP     : `get_k8s_resource`,         :
++:                   : server is available.       : `get_k8s_logs`              :
++:                   : Structured I/O, no         :                             :
+ :                   : shell/kubeconfig needed.   :                             :
+ | **`gcloud` CLI**  | No MCP equivalent, or user | `gcloud container ai        |
+ :                   : explicitly requested CLI.  : profiles`, `gcloud          :
+ :                   : Required for\: GIQ model   : container                   :
+ :                   : discovery, available K8s   : get-server-config`, `gcloud :
+-:                   : versions, maintenance      : iam service-accounts`       :
+-:                   : windows, monitoring        :                             :
+-:                   : components, IAM/SA setup,  :                             :
+-:                   : Cloud Logging queries.     :                             :
++:                   : versions, Cloud Logging    : logging read`               :
++:                   : queries.                   :                             :
+ | **`kubectl`**     | Neither MCP nor `gcloud`   | `kubectl top pods`,         |
+-:                   : covers the operation, or   : `kubectl scale deployment`, :
+-:                   : user explicitly prefers    : `helm install`              :
++:                   : covers the operation, or   : `kubectl top nodes`         :
++:                   : user explicitly prefers    :                             :
+ :                   : kubectl. Required for\:    :                             :
+-:                   : `kubectl top`, `kubectl    :                             :
+-:                   : scale`, `kubectl exec`,    :                             :
+-:                   : `kubectl port-forward`,    :                             :
+-:                   : Helm, custom CRDs not in   :                             :
+-:                   : MCP.                       :                             :
++:                   : `kubectl top`, custom CRDs :                             :
++:                   : not in MCP.                :                             :
+ 
+ ### User preference override
+ 
+@@ -67,7 +63,7 @@ If the user states a preference, respect it for the session:
+ -   **"Use MCP"** / no preference → Default. Use MCP for everything it supports.
+ 
+ Even with an override, fall back through the chain for unsupported operations
+-(e.g., cluster creation always requires `gcloud` or MCP).
++(e.g., available Kubernetes versions always require `gcloud`).
+ 
+ --------------------------------------------------------------------------------
+ 
+@@ -82,18 +78,11 @@ Even with an override, fall back through the chain for unsupported operations
+ :                     :                  : clusters list`     :             :
+ | Get cluster details | `get_cluster`    | `gcloud container  | READ        |
+ :                     :                  : clusters describe` :             :
+-| Create cluster      | `create_cluster` | `gcloud container  | MUTATE      |
+-:                     :                  : clusters           :             :
+-:                     :                  : create-auto`       :             :
+-| Update cluster      | `update_cluster` | `gcloud container  | DESTRUCTIVE |
+-:                     :                  : clusters update`   :             :
+ | Get K8s versions    | —                | `gcloud container  | READ        |
+ :                     :                  : get-server-config` :             :
+ | Get credentials     | —                | `gcloud container  | READ        |
+ :                     :                  : clusters           :             :
+ :                     :                  : get-credentials`   :             :
+-| Delete cluster      | —                | `gcloud container  | DESTRUCTIVE |
+-:                     :                  : clusters delete`   :             :
+ 
+ ```
+ # List clusters in a project (all regions)
+@@ -101,26 +90,12 @@ list_clusters(parent="projects/<PROJECT_ID>/locations/-")
+ 
+ # Get cluster details (all fields)
+ get_cluster(name="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>", readMask="*")
+-
+-# Create golden path Autopilot cluster
+-create_cluster(
+-  parent="projects/<PROJECT_ID>/locations/<REGION>",
+-  cluster='{"name":"<CLUSTER_NAME>","autopilot":{"enabled":true},"privateClusterConfig":{"enablePrivateNodes":true},...}'
+-)
+ ```
+ 
+ ```bash
+ # Get available Kubernetes versions (CLI-only)
+ gcloud container get-server-config --region <REGION> --format="yaml(channels)" --quiet
+ 
+-# Create golden path Autopilot cluster (see gke-cluster-creation.md for full templates)
+-gcloud container clusters create-auto <CLUSTER_NAME> \
+-  --region <REGION> --project <PROJECT_ID> \
+-  --enable-private-nodes --enable-master-authorized-networks \
+-  --enable-dns-access --release-channel regular \
+-  --enable-secret-manager --scoped-rbs-bindings \
+-  --quiet
+-
+ # Get credentials (CLI-only)
+ gcloud container clusters get-credentials <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID> --quiet
+ ```
+@@ -133,47 +108,18 @@ gcloud container clusters get-credentials <CLUSTER_NAME> --region <REGION> --pro
+ :                  :                    : node-pools list`     :             :
+ | Get node pool    | `get_node_pool`    | `gcloud container    | READ        |
+ :                  :                    : node-pools describe` :             :
+-| Create node pool | `create_node_pool` | `gcloud container    | MUTATE      |
+-:                  :                    : node-pools create`   :             :
+-| Update node pool | `update_node_pool` | `gcloud container    | DESTRUCTIVE |
+-:                  :                    : node-pools update`   :             :
+ 
+ ```
+ list_node_pools(parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>")
+-
+-create_node_pool(
+-  parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
+-  nodePool='{"name":"<POOL_NAME>","config":{"machineType":"e2-standard-4"},"initialNodeCount":3,...}'
+-)
+ ```
+ 
+ ## Cluster Updates
+ 
+-| Operation         | MCP Tool         | CLI Fallback            | Mode        |
+-| ----------------- | ---------------- | ----------------------- | ----------- |
+-| Update cluster    | `update_cluster` | `gcloud container       | DESTRUCTIVE |
+-: settings          :                  : clusters update`        :             :
+-| Update monitoring | —                | `gcloud container       | DESTRUCTIVE |
+-:                   :                  : clusters update         :             :
+-:                   :                  : --monitoring=...`       :             :
+-| Set maintenance   | —                | `gcloud container       | DESTRUCTIVE |
+-: window            :                  : clusters update         :             :
+-:                   :                  : --maintenance-window-*` :             :
+-
+-```
+-# Enable VPA via MCP
+-update_cluster(
+-  name="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
+-  update='{"desiredVerticalPodAutoscaling":{"enabled":true}}'
+-)
+-```
+-
+-```bash
+-# Update monitoring components (CLI-only)
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER,STORAGE,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA \
+-  --quiet
+-```
++Cluster settings such as Vertical Pod Autoscaling (`spec.verticalPodAutoscaling.enabled`),
++monitoring components (`spec.monitoringConfig.enableComponents`) and maintenance windows
++(`spec.maintenancePolicy`) are changed as Config Connector YAML on the cluster's
++`ContainerCluster` through `gcp-config-connector`; node pools likewise as a
++`ContainerNodePool`.
+ 
+ ## Kubernetes Resource Operations
+ 
+@@ -183,9 +129,6 @@ gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+ : resources       :                          :                  :             :
+ | Describe        | `describe_k8s_resource`  | `kubectl         | READ        |
+ : resource        :                          : describe`        :             :
+-| Apply manifest  | `apply_k8s_manifest`     | `kubectl apply`  | DESTRUCTIVE |
+-| Patch resource  | `patch_k8s_resource`     | `kubectl patch`  | DESTRUCTIVE |
+-| Delete resource | `delete_k8s_resource`    | `kubectl delete` | DESTRUCTIVE |
+ | List API        | `list_k8s_api_resources` | `kubectl         | READ        |
+ : resources       :                          : api-resources`   :             :
+ | Check auth      | `check_k8s_auth`         | `kubectl auth    | READ        |
+@@ -198,16 +141,6 @@ get_k8s_resource(
+   resourceType="deployment", namespace="<NAMESPACE>"
+ )
+ 
+-# Apply a manifest (with dry-run)
+-apply_k8s_manifest(parent="...", yamlManifest="...", dryRun=true)
+-
+-# Patch deployment resources for rightsizing
+-patch_k8s_resource(
+-  parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
+-  resourceType="deployment", name="<DEPLOYMENT>", namespace="<NAMESPACE>",
+-  patch='{"spec":{"template":{"spec":{"containers":[{"name":"app","resources":{"requests":{"cpu":"200m","memory":"256Mi"}}}]}}}}'
+-)
+-
+ # Check RBAC permissions
+ check_k8s_auth(parent="...", verb="create", resourceType="deployments", namespace="<NAMESPACE>")
+ ```
+@@ -243,8 +176,6 @@ get_k8s_rollout_status(parent="...", resourceType="deployment", name="<DEPLOY>",
+ :                  :                    : operations list`     :             :
+ | Get operation    | `get_operation`    | `gcloud container    | READ        |
+ :                  :                    : operations describe` :             :
+-| Cancel operation | `cancel_operation` | `gcloud container    | DESTRUCTIVE |
+-:                  :                    : operations cancel`   :             :
+ 
+ ```
+ list_operations(parent="projects/<PROJECT_ID>/locations/<REGION>")
+@@ -260,11 +191,10 @@ gcloud container ai profiles manifests create \
+   --model=<MODEL_NAME> --model-server=<SERVER> \
+   --accelerator-type=<ACCELERATOR> \
+   --target-ntpot-milliseconds=<NTPOT> --quiet > inference.yaml
+-
+-# Deploy generated manifest via MCP
+-apply_k8s_manifest(parent="...", yamlManifest="<contents of inference.yaml>")
+ ```
+ 
++The generated `inference.yaml` is proposed as a pull request through `submit-suggestion`.
++
+ ## kubectl-Only Operations
+ 
+ No MCP or `gcloud` equivalent:
+@@ -272,16 +202,14 @@ No MCP or `gcloud` equivalent:
+ ```bash
+ kubectl top pods --all-namespaces --sort-by=cpu
+ kubectl top nodes
+-kubectl scale deployment <DEPLOYMENT> --replicas=<N> -n <NAMESPACE>
+-kubectl exec -it <POD_NAME> -n <NAMESPACE> -- /bin/sh
+-kubectl port-forward svc/<SERVICE> <LOCAL_PORT>:<REMOTE_PORT> -n <NAMESPACE>
+-kubectl cp <NAMESPACE>/<POD>:<PATH> <LOCAL_PATH>
+-kubectl run debug --rm -it --image=busybox -- /bin/sh
+-kubectl drain <NODE_NAME> --ignore-daemonsets --delete-emptydir-data
+-helm install <RELEASE> <CHART> -n <NAMESPACE>
+-helm upgrade <RELEASE> <CHART> -n <NAMESPACE>
+ ```
+ 
++`kubectl exec`, `kubectl port-forward` and `kubectl cp` reach into a running pod, and the
++broker refuses them; when a task needs one, give the user the command to run.
++
++Scaling a Deployment (its `replicas`) or installing a Helm chart is a manifest change,
++proposed as a pull request through `submit-suggestion`.
++
+ ## `parent` / `name` Format Quick Reference
+ 
+ ```
+diff --git a/references/iac-usage.md b/references/iac-usage.md
+--- a/references/iac-usage.md
++++ b/references/iac-usage.md
+@@ -72,6 +72,6 @@ resource "kubernetes_deployment_v1" "default" {
+ ## YAML Samples
+ 
+ GKE cluster configurations and Kubernetes manifests can also be defined using
+-YAML for use with `kubectl apply` or Deployment Manager.
++YAML, proposed as a pull request through `submit-suggestion`.
+ 
+ -   [GKE YAML Samples](https://docs.cloud.google.com/docs/samples?product=googlekubernetesengine)
+diff --git a/references/mcp-usage.md b/references/mcp-usage.md
+--- a/references/mcp-usage.md
++++ b/references/mcp-usage.md
+@@ -1,8 +1,10 @@
+ # GKE MCP Server Usage
+ 
+-The GKE MCP server provides 23 structured tools for cluster management,
+-Kubernetes resource operations, and diagnostics — without requiring shell access
+-or kubeconfig setup.
++The GKE MCP server provides structured read tools for clusters, node pools,
++Kubernetes resources, and diagnostics — without requiring shell access or
++kubeconfig setup.
++
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Connecting to the GKE MCP Server
+ 
+@@ -25,32 +27,25 @@ Use `locations/-` to match all regions when listing.
+ 
+ ### Cluster Management
+ 
+-| Tool             | Mode        | Purpose                                                 |
+-| ---------------- | ----------- | ------------------------------------------------------- |
+-| `list_clusters`  | READ        | Discover clusters in a project/region                   |
+-| `get_cluster`    | READ        | Inspect cluster config. Use `readMask` to select fields |
+-| `create_cluster` | MUTATE      | Create a cluster from JSON config                       |
+-| `update_cluster` | DESTRUCTIVE | Change Day-1 cluster settings                           |
++| Tool            | Mode | Purpose                                                 |
++| --------------- | ---- | ------------------------------------------------------- |
++| `list_clusters` | READ | Discover clusters in a project/region                   |
++| `get_cluster`   | READ | Inspect cluster config. Use `readMask` to select fields |
+ 
+ ### Node Pool Management
+ 
+-| Tool               | Mode        | Purpose                        |
+-| ------------------ | ----------- | ------------------------------ |
+-| `list_node_pools`  | READ        | List pools in a cluster        |
+-| `get_node_pool`    | READ        | Get pool details               |
+-| `create_node_pool` | MUTATE      | Add a pool (Standard clusters) |
+-| `update_node_pool` | DESTRUCTIVE | Modify a pool                  |
++| Tool              | Mode | Purpose                 |
++| ----------------- | ---- | ----------------------- |
++| `list_node_pools` | READ | List pools in a cluster |
++| `get_node_pool`   | READ | Get pool details        |
+ 
+ ### Kubernetes Resources
+ 
+-| Tool                     | Mode        | Purpose                                                    |
+-| ------------------------ | ----------- | ---------------------------------------------------------- |
+-| `get_k8s_resource`       | READ        | List/get any K8s resource (supports label/field selectors) |
+-| `describe_k8s_resource`  | READ        | Detailed info with events and conditions                   |
+-| `apply_k8s_manifest`     | DESTRUCTIVE | Apply YAML manifests (supports `dryRun`)                   |
+-| `patch_k8s_resource`     | DESTRUCTIVE | JSON patch resource fields                                 |
+-| `delete_k8s_resource`    | DESTRUCTIVE | Remove resources (supports `cascade`, `dryRun`)            |
+-| `list_k8s_api_resources` | READ        | Discover available resource types                          |
++| Tool                     | Mode | Purpose                                                    |
++| ------------------------ | ---- | ---------------------------------------------------------- |
++| `get_k8s_resource`       | READ | List/get any K8s resource (supports label/field selectors) |
++| `describe_k8s_resource`  | READ | Detailed info with events and conditions                   |
++| `list_k8s_api_resources` | READ | Discover available resource types                          |
+ 
+ ### Diagnostics & Observability
+ 
+@@ -65,11 +60,10 @@ Use `locations/-` to match all regions when listing.
+ 
+ ### Operations
+ 
+-| Tool               | Mode        | Purpose                            |
+-| ------------------ | ----------- | ---------------------------------- |
+-| `list_operations`  | READ        | Pending/running cluster operations |
+-| `get_operation`    | READ        | Track create/upgrade progress      |
+-| `cancel_operation` | DESTRUCTIVE | Abort stuck operations             |
++| Tool              | Mode | Purpose                            |
++| ----------------- | ---- | ---------------------------------- |
++| `list_operations` | READ | Pending/running cluster operations |
++| `get_operation`   | READ | Track create/upgrade progress      |
+ 
+ ## Developer Knowledge MCP Server
+ 

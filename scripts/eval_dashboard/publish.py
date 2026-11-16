@@ -6,7 +6,7 @@ Usage::
     python3 scripts/eval_dashboard/publish.py --out-dir out/ --target gs://bucket/dash
     python3 scripts/eval_dashboard/publish.py --out-dir out/ --target /some/local/dir
 
-A ``gs://`` target shells out to gsutil; anything else is a local directory
+A ``gs://`` target shells out to ``gcloud storage cp``; anything else is a local directory
 copy (which is also what the tests exercise -- nothing in the test suite
 touches a bucket).
 
@@ -24,7 +24,10 @@ import shutil
 import subprocess
 import sys
 
-CACHE_CONTROL = "Cache-Control: no-cache"
+# `gcloud storage cp` sets the object's Cache-Control from this flag.
+CACHE_CONTROL_FLAG = "--cache-control=no-cache"
+GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 
 
 def out_dir_files(out_dir: pathlib.Path) -> list[pathlib.Path]:
@@ -36,14 +39,14 @@ def out_dir_files(out_dir: pathlib.Path) -> list[pathlib.Path]:
     return files
 
 
-def gsutil_command(files: list[pathlib.Path], target: str) -> list[str]:
+def gcloud_storage_command(files: list[pathlib.Path], target: str) -> list[str]:
     """The exact argv a bucket publish runs -- kept separate so tests can
-    assert on it without ever executing gsutil."""
+    assert on it without ever executing gcloud."""
     return [
-        "gsutil",
-        "-h",
-        CACHE_CONTROL,
+        GCLOUD,
+        STORAGE_GROUP,
         "cp",
+        CACHE_CONTROL_FLAG,
         *[str(f) for f in files],
         target.rstrip("/") + "/",
     ]
@@ -52,7 +55,7 @@ def gsutil_command(files: list[pathlib.Path], target: str) -> list[str]:
 def publish(out_dir: str, target: str, runner=subprocess.run) -> None:
     files = out_dir_files(pathlib.Path(out_dir))
     if target.startswith("gs://"):
-        runner(gsutil_command(files, target), check=True)
+        runner(gcloud_storage_command(files, target), check=True)
         return
     dest = pathlib.Path(target)
     dest.mkdir(parents=True, exist_ok=True)

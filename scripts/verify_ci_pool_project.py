@@ -43,6 +43,15 @@ _AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scri
 # The name the audit module is registered under when loaded by path; unregistered
 # in sys.modules, so it cannot shadow or be shadowed by an installed package.
 _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# The audit's collector, whose `workload_declarations` is the index that keys a
+# repository's workload manifests; the workload-declaration check hands it the
+# seeded file rather than copying its rule.
+_COLLECT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "collect.py"
+_COLLECT_MODULE_NAME = "kube_agents_fleet_collect"
+_GITLAB_FORGE = _ROOT / "hack" / "ci_gitlab_forge.py"
+_GITLAB_FORGE_MODULE_NAME = "kube_agents_ci_gitlab_forge"
+_GITLAB_SWEEP = _ROOT / "hack" / "ci_sweep_agent_pulls.py"
+_GITLAB_SWEEP_MODULE_NAME = "kube_agents_ci_sweep_agent_pulls"
 # Every name the declared-intent check reads off the loaded module. Read once
 # at load, so a rename upstream is a loader failure (the check unverified with
 # the AttributeError named) and never a verdict on a repository's note.
@@ -108,6 +117,8 @@ CHECK_ARTIFACT_REGISTRY = "artifact_registry"
 CHECK_WARM_CACHE = "warm_cache"
 CHECK_GKE_AND_STATE = "gke_and_state"
 CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
+# The once-per-project pieces a self-managed forge VM needs (docs/ci-pool-projects.md 5.8).
+CHECK_FORGE_PIECES = "forge_pieces"
 CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
 # The GitOps repository's default branch alone: one metadata read, apart from
 # the repo-and-App check because that one needs an org member's `gh` and this
@@ -115,7 +126,12 @@ CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
 # hourly pool-state scan run it (docs/ci-health.md, "The pool-state scan").
 CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
 CHECK_GITOPS_DECLARATION = "gitops_declaration"
+CHECK_GITOPS_WORKLOAD_MANIFEST = "gitops_workload_manifest"
+CHECK_GITLAB_WORKLOAD_MANIFEST = "gitlab_workload_manifest"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
+# The eval nightlies' Gemini Developer API key, its secret and the secret's
+# grants (scripts/provision_ci_pool_gemini_key.sh), read as metadata and IAM.
+CHECK_GEMINI_KEY = "gemini_api_key"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
 # the minter GSA's signing right and its Workload Identity binding, read with
@@ -131,10 +147,14 @@ CHECK_IDS = (
     CHECK_WARM_CACHE,
     CHECK_GKE_AND_STATE,
     CHECK_SEEDED_FLEET,
+    CHECK_FORGE_PIECES,
     CHECK_GITHUB_REPO_AND_APP,
     CHECK_GITOPS_DEFAULT_BRANCH,
     CHECK_GITOPS_DECLARATION,
+    CHECK_GITOPS_WORKLOAD_MANIFEST,
+    CHECK_GITLAB_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
+    CHECK_GEMINI_KEY,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
 )
@@ -142,7 +162,11 @@ CHECK_IDS = (
 # minter check, which CHECK_TOKEN_MINTER covers. The one definition, read by
 # run_checks and verify_project alike, so a --report's key set does not depend
 # on which of them decided.
-DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
+# The GitLab read is opt-in (`--checks gitlab_workload_manifest`): its project
+# is onboarded after provisioning (docs/ci-pool-projects.md 5.6, 8), so a
+# default run during provisioning would fail or go unverified over a project
+# nobody has created yet.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST))
 # The console name each check reports under, for a result written on its
 # behalf before it ran (a deadline that passed, a blocked toolchain).
 CHECK_DISPLAY_NAMES = {
@@ -153,10 +177,14 @@ CHECK_DISPLAY_NAMES = {
     CHECK_WARM_CACHE: "Warm Cache Readers",
     CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
     CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
+    CHECK_FORGE_PIECES: "Self-managed Forge Pieces",
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
     CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
     CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
+    CHECK_GITOPS_WORKLOAD_MANIFEST: "GitOps Workload Declaration",
+    CHECK_GITLAB_WORKLOAD_MANIFEST: "GitLab Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
+    CHECK_GEMINI_KEY: "Gemini Developer API Key",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
 }
@@ -164,7 +192,12 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
+# The GitLab lane's twin of the workload check reads gitlab.com over HTTPS
+# with a token (GITLAB_VERIFY_TOKEN, else the pool's ledger token from Secret
+# Manager), no `gh` and no project-level `gcloud` read, so it sits in neither
+# set: without a token it reports itself unread.
+GITLAB_CHECKS = frozenset({CHECK_GITLAB_WORKLOAD_MANIFEST})
 # The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
 # purpose: the pool-state scan selects it, and a toolchain blocker would turn
 # a job without a GitHub credential into "not checked" on all of the scan's
@@ -173,19 +206,20 @@ GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
 # every check but the mapping, which reads the checkout and the remote ref,
 # the default-branch read, and the GitHub checks in GITHUB_CHECKS, whose reads
 # are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
-# (an org member's `gh` for github_repo_and_app and gitops_declaration, the
-# ledger App's key for ledger_read_credential), not the minter's signing half
+# (an org member's `gh` for github_repo_and_app, gitops_declaration and
+# gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
-# read is in another project the bot holds nothing on. The GitOps
-# default-branch read is in: one metadata call the job makes with whatever
-# GitHub credential it carries (GITOPS_READ_TOKEN_ENV), and records as not
-# checked when it carries none.
-POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_TOKEN_MINTER_KMS)
+# read is in another project the bot holds nothing on. The Gemini key check
+# is in: securityReviewer carries its reads (GCLOUD_SURFACE_READ_ROLES). The
+# GitOps default-branch read is in: one metadata call the job makes with whatever GitHub credential it
+# carries (GITOPS_READ_TOKEN_ENV), and records as not checked when it carries
+# none.
+POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_FORGE_PIECES, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_GEMINI_KEY, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
 REPORT_STATUS_PASS = "pass"
@@ -304,6 +338,9 @@ REQUIRED_APIS = {
     # not only transitively through GKE.
     "compute.googleapis.com",
     "container.googleapis.com",
+    # The private zone eval.internal that resolves the self-managed forges'
+    # hosts for the host cluster (section 5.8).
+    "dns.googleapis.com",
     "cloudbuild.googleapis.com",
     "artifactregistry.googleapis.com",
     "aiplatform.googleapis.com",
@@ -312,8 +349,17 @@ REQUIRED_APIS = {
     # The observability nightly case reads the install's traces through the
     # broker's relay; the composition enables this for the same reason.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences through the GKE Hub API; the composition
+    # enables it for the same reason.
+    "gkehub.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
+    # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
+    # key, the secret that holds its string, and the API the key calls.
+    "apikeys.googleapis.com",
+    "secretmanager.googleapis.com",
+    "generativelanguage.googleapis.com",
 }
 
 HOST_CLUSTER = "platform-agent-host"
@@ -352,6 +398,9 @@ REPAIR_HOST_OTEL_SCOPE = (
     f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
 )
 FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
+# A missing Compute plant sweeper grant fails the hourly sweep, not a leased
+# run: the sweeper holds nothing an eval run uses.
+FINDING_COMPUTE_SWEEPER_MISSING = "iam/compute-sweeper/missing"
 # Findings a leased run passes with. Every other finding reds the run that
 # leases the project -- a missing grant, API, key or cluster is a 403 or a
 # missing resource in the agent's transcript -- and the health bot's pool-drift
@@ -360,7 +409,119 @@ FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
 # this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
 # health.py's rule 3e) before wording the advice, so a 403 on a project whose
 # findings are all here is reported as the change's to read, not the pool's.
-LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
+# One exception, in the nightly alone: observability-trace-latency-brokered
+# (hack/eval/nightly-cases.txt) reads the install's own traces and fails its
+# report check on a host cluster without the scope. The advice is worded for
+# a pull request, whose presubmit run still passes such a lease; it is made
+# from the pool-state scan (health.py rule 3e), not from runs, so a nightly
+# red of that case on a project with only this finding is the case's record
+# and not a reason to reclassify.
+# A missing Compute plant sweeper grant is here too: it fails only the sweep.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE, FINDING_COMPUTE_SWEEPER_MISSING})
+
+# ─── The self-managed forges' once-per-project pieces (docs 5.8) ─────────────
+# hack/ci-forge.sh creates a forge VM per run and reads these; it never writes
+# them. The verifier reads them back and prints the provisioning commands as
+# the repair. Kept equal to scripts/provision_ci_pool_project.sh by the tests.
+FORGE_DNS_ZONE = "eval-internal"
+FORGE_DNS_NAME = "eval.internal."
+FORGE_NETWORK = "default"
+# Row -> host: the defaults of forge_profile() in hack/ci-deploy.sh, pinned
+# equal by scripts/test_verify_ci_pool_project.py.
+FORGE_ROW_HOSTS = {"ghes": "ghes.eval.internal", "gitlab-ce": "gitlab.eval.internal"}
+FORGE_ADDRESS_TEMPLATE = "forge-{row}"
+FORGE_FIREWALL_RULE = "allow-forge-443"
+FORGE_FIREWALL_SOURCE_RANGES = "10.0.0.0/8"
+FORGE_FIREWALL_ALLOWED = "tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): everything else from anywhere, the default network's stock
+# allow-ssh included, stops before it reaches a forge VM's external address.
+FORGE_DENY_RULE = "deny-forge-ingress"
+FORGE_DENY_PRIORITY = 1100
+FORGE_DENY_SOURCE_RANGES = "0.0.0.0/0"
+FORGE_DENY_RULES = "all"
+FORGE_NETWORK_TAG = "forge"
+FORGE_VM_SA_ID = "forge-vm"
+FORGE_VM_SA_ROLES = frozenset({"roles/artifactregistry.reader"})
+FORGE_RECORD_TTL = 60
+FINDING_FORGE_ZONE_MISSING = "forge/zone/missing"
+# A zone of the right name but another dnsName, visibility or network: the
+# records the lane needs cannot live in it, and a create by name skips it.
+FINDING_FORGE_ZONE_MISMATCH = "forge/zone/mismatch"
+FINDING_FORGE_FIREWALL_MISSING = "forge/firewall/missing"
+FINDING_FORGE_FIREWALL_MISMATCH = "forge/firewall/mismatch"
+FINDING_FORGE_DENY_MISSING = "forge/firewall-deny/missing"
+FINDING_FORGE_DENY_MISMATCH = "forge/firewall-deny/mismatch"
+# Roles beyond the registry read: the VM runs with the cloud-platform scope,
+# so every role the identity holds is usable from it (docs 5.8, "nothing else").
+FINDING_FORGE_VM_SA_ROLE_EXTRA = "forge/vm-sa/extra"
+FINDING_FORGE_VM_SA_MISSING = "forge/vm-sa/missing"
+FINDING_FORGE_ADDRESS_MISSING = "forge/address/missing/{row}"
+FINDING_FORGE_RECORD_MISSING = "forge/record/missing/{host}"
+FINDING_FORGE_RECORD_MISMATCH = "forge/record/mismatch/{host}"
+FINDING_FORGE_VM_SA_ROLE_MISSING = "forge/vm-sa/missing/{role}"
+# Every forge finding a project can carry: the two public lanes use none of
+# these pieces, so a leased run passes with any of them; only the self-managed
+# lanes (#3683, #3684) refuse the lease, at second zero and by name.
+FORGE_FINDINGS = frozenset(
+    {
+        FINDING_FORGE_ZONE_MISSING, FINDING_FORGE_ZONE_MISMATCH, FINDING_FORGE_FIREWALL_MISSING, FINDING_FORGE_FIREWALL_MISMATCH,
+        FINDING_FORGE_DENY_MISSING, FINDING_FORGE_DENY_MISMATCH, FINDING_FORGE_VM_SA_MISSING, FINDING_FORGE_VM_SA_ROLE_EXTRA,
+    }
+    | {FINDING_FORGE_ADDRESS_MISSING.format(row=row) for row in FORGE_ROW_HOSTS}
+    | {FINDING_FORGE_RECORD_MISSING.format(host=host) for host in FORGE_ROW_HOSTS.values()}
+    | {FINDING_FORGE_RECORD_MISMATCH.format(host=host) for host in FORGE_ROW_HOSTS.values()}
+    | {FINDING_FORGE_VM_SA_ROLE_MISSING.format(role=role) for role in FORGE_VM_SA_ROLES}
+)
+# The DNS API serves the private zone alone, so its finding is in the same
+# position as the pieces: nothing on the public lanes resolves eval.internal.
+FINDING_DNS_API = "apis/dns.googleapis.com"
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
+
+# ─── The eval nightlies' Gemini Developer API key ────────────────────────────
+# scripts/provision_ci_pool_gemini_key.sh mints the key and keeps its string as
+# the latest version of a secret in the same project; the nightly reads that
+# secret as a runner. The verifier reads the key's restriction, the secret's
+# latest version state and the secret's policy -- never the key string or the
+# secret's value. Kept equal to the script's constants by the tests.
+GEMINI_KEY_SCRIPT = "scripts/provision_ci_pool_gemini_key.sh"
+GEMINI_KEY_DISPLAY_NAME = "kube-agents-eval-gemini"
+GEMINI_KEY_SECRET_NAME = "kube-agents-eval-gemini-api-key"
+GEMINI_KEY_API_TARGET = "generativelanguage.googleapis.com"
+GEMINI_KEY_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
+# How much of a failed gcloud read's stderr a warning quotes.
+GEMINI_KEY_ERR_EXCERPT = 200
+# The state of a secret version the nightly's `versions access latest` reads.
+GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# Client restrictions on an API key: a key that carries any of them accepts
+# calls only from that browser, server address or app, so the agent pod's
+# calls are refused.
+GEMINI_KEY_CLIENT_RESTRICTIONS = (
+    "browserKeyRestrictions",
+    "serverKeyRestrictions",
+    "androidKeyRestrictions",
+    "iosKeyRestrictions",
+)
+# REQUIRED_APIS holds the API Keys and Secret Manager APIs, and the key script
+# enables them, but on a project neither ran against both reads answer
+# PERMISSION_DENIED with reason SERVICE_DISABLED. The general classifier keeps
+# that a refusal; check_gemini_api_key alone reads it as the key absent, and
+# only when the refusal names the target project (GEMINI_KEY_DISABLED_IN).
+GEMINI_KEY_SERVICE_DISABLED = re.compile(
+    r"\bSERVICE_DISABLED\b|API has not been used in project \S+ before or it is disabled"
+)
+# The project a SERVICE_DISABLED refusal names, by number or id: gcloud's
+# message line and the ErrorInfo's consumer. A refusal that names another
+# project (the caller's quota project, such as kube-agents-prow before its
+# API Keys API was enabled on 2026-11-06) or none says nothing about the
+# target, so it stays unread.
+GEMINI_KEY_DISABLED_IN = re.compile(
+    r"API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
+)
+FINDING_GEMINI_KEY_MISSING = "apikeys/gemini/missing"
+FINDING_GEMINI_KEY_RESTRICTION = "apikeys/gemini/restriction"
+FINDING_GEMINI_KEY_SECRET_MISSING = "secrets/gemini-api-key/missing"
+FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX = "secrets/gemini-api-key/accessor/"
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -379,14 +540,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -403,6 +564,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -412,9 +576,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings."""
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -430,6 +595,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
+    "stockout-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -437,6 +603,82 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+    ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
+)
+# checkout-gateway's declaration, which provisioning seeds beside the note
+# (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
+# remediation cases propose a PodDisruptionBudget beside it; in a repository
+# without it the agent finds nothing to fix and refuses the pull request. The
+# path is the one the fleet audit's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), the tie #2228's cases wait for. The script's
+# content, byte for byte, pinned by a test as the note is.
+GITOPS_WORKLOAD_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+GITOPS_WORKLOAD_MANIFEST_MESSAGE = "Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+GITOPS_WORKLOAD_MANIFEST_CONTENT = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi"""
+# The key the audit's index (collect.py workload_declarations) must hold for
+# the seeded file: cluster off the path's second segment, then kind, namespace
+# and name. Presence alone is not the check: a file at the path that declares
+# another object leaves the finding manual and the cases red with a presence
+# check green, so the body is handed to that index and the key looked up.
+GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
+# The index refuses an object two files declare (`declaration_for` returns
+# None on more than one path), so every YAML under the seeded cluster's tree is
+# handed to it with the seeded file, read from the repository's tree listing.
+# A pool repository holds a handful of files; the cap keeps a repository nobody
+# sized from turning the check into a crawl, and is reported when it bites.
+GITOPS_WORKLOAD_MANIFEST_TREE = "/".join(GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[:2])
+GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP = 25
+GITOPS_YAML_SUFFIXES = (".yaml", ".yml")
+# How _workload_manifest_problem names a duplicate declaration; the check
+# reads it to print the remedy for the siblings rather than for the seed.
+DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
+# How it names an index raise that a sibling causes, the seed alone indexing
+# cleanly: the remedy is the sibling, not a replace of the seed.
+SIBLING_RAISE_PREFIX = "a file beside it under the tree makes the index raise ("
+# The cases that fail on a project whose repository lacks the declaration:
+# pdb-remediation-pr (back on the roster since 2026-10-26 on this seed,
+# #3120) and the #2228 case parked on this fixture. (The other
+# #2228 case, obtainability-refusal-direct-mutation, is nightly and only
+# loses its pull-request arm: its inline-proposal arm passes without the file.)
+GITOPS_WORKLOAD_MANIFEST_CASES = (
+    "pdb-remediation-pr",
+    "obtainability-major-pdb-auto-pr",
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
@@ -464,13 +706,18 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
-# What this script's probe mint asks for: the same three reads the eval's
+# What this script's probe mint asks for: the same four reads the eval's
 # grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
 # holds the two equal). An omitted body would mint the installation's whole
 # grant, which includes issues: write (2026-09-22, the ledger reset) and
 # pull_requests and contents write (2026-10-01, the repository reset) on every
 # pool repository; a read probe has no business holding that.
-LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
+LEDGER_READ_PERMISSIONS = {
+    "issues": "read",
+    "pull_requests": "read",
+    "contents": "read",
+    "metadata": "read",
+}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -575,14 +822,80 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The two runners read the eval nightlies' Gemini key secret, so each holds
+# GEMINI_KEY_ACCESSOR_ROLE on it.
+GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
+# Every finding check_gemini_api_key emits. None is lease-silent: the health
+# bot classes a run that leased a project with one as the pool's. The runs whose
+# eval-model pair names provider gemini read the key (docs/ci-pool-projects.md
+# 5.10); a lane whose pair names vertex_ai does not. A missing secret or accessor grant
+# stops hack/ci-deploy.sh at its FATAL line before Helm; a restriction finding,
+# or a key deleted while its secret remains, fails at the first agent call.
+GEMINI_KEY_FINDINGS = frozenset(
+    {FINDING_GEMINI_KEY_MISSING, FINDING_GEMINI_KEY_RESTRICTION, FINDING_GEMINI_KEY_SECRET_MISSING}
+    | {FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member for member in GEMINI_KEY_SECRET_ACCESSORS}
+)
+
 # The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
 # ci-kube-agents-pull-sweep on main) signs the agent's App through each
 # project's copy of the key, so it needs signer on that key and nothing on the
-# project. A project without the grant fails every ten-minute sweep from the
+# project. A project without the grant fails every sweep from the
 # first, so the check names the one command that adds it -- the provisioning
 # script must not be re-run on a registered project (docs/ci-pool-projects.md
 # section 8).
 PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+
+# The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
+# ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
+# subnets, addresses and alert policies that a killed run left in a free
+# project. It holds one project-level custom role with exactly
+# COMPUTE_SWEEP_PERMISSIONS, and nothing else on the project.
+# roles/compute.networkAdmin also covers the sweep, but it holds almost a
+# thousand permissions. A project without the grant fails every
+# sweep there, so the check names the commands that add it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# sections 5.7 and 8). Kept equal to scripts/provision_ci_pool_project.sh and
+# the repair block in docs/ci-pool-projects.md by
+# scripts/test_verify_ci_pool_project.py.
+COMPUTE_SWEEP_MEMBER = "serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+COMPUTE_SWEEP_ROLE_ID = "kubeAgentsComputePlantSweeper"
+COMPUTE_SWEEP_ROLE_TITLE = "kube-agents Compute plant sweeper"
+COMPUTE_SWEEP_ROLE_STAGE = "GA"
+COMPUTE_SWEEP_ROLE_TEMPLATE = "projects/{project_id}/roles/" + COMPUTE_SWEEP_ROLE_ID
+# One permission for each gcloud call the sweep makes, plus the operation
+# reads gcloud makes while it waits for each delete to finish.
+COMPUTE_SWEEP_PERMISSIONS = frozenset({
+    # `gcloud compute networks list`, and `networks delete` (a global operation).
+    "compute.networks.list",
+    "compute.networks.delete",
+    # `gcloud compute networks subnets list` (an aggregated list), and
+    # `subnets delete --region` (a regional operation).
+    "compute.subnetworks.list",
+    "compute.subnetworks.delete",
+    # `gcloud compute addresses list` (an aggregated list), and
+    # `addresses delete --region` (a regional operation). The plant's addresses
+    # are INTERNAL, and GCP checks deleteInternal to delete one; delete covers
+    # an external address. deleteInternal is at the TESTING support level for
+    # custom roles: a role may hold it, and gcloud warns when it does.
+    "compute.addresses.list",
+    "compute.addresses.delete",
+    "compute.addresses.deleteInternal",
+    # A plant address with no region is deleted with `--global`, and the
+    # aggregated address list can include global addresses.
+    "compute.globalAddresses.list",
+    "compute.globalAddresses.delete",
+    "compute.globalAddresses.deleteInternal",
+    # gcloud waits on each delete operation until it is done.
+    "compute.globalOperations.get",
+    "compute.regionOperations.get",
+    # `gcloud monitoring policies list`, and `policies delete` for a policy the
+    # alert-policy stack labelled managed-by=kube-agents-bench (#3797). A
+    # project whose role predates these fails the sweep at the policy list,
+    # after its Compute sweep: `gcloud iam roles update` with the current
+    # list repairs it (docs/ci-pool-projects.md section 5.7).
+    "monitoring.alertPolicies.list",
+    "monitoring.alertPolicies.delete",
+})
 
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
@@ -618,6 +931,38 @@ POOL_STATE_READER_ROLES = {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    # CHECK_FORGE_PIECES reads the forge addresses and firewall rules
+    # (networkViewer) and the private zone and its records (dns.reader);
+    # without them those scan as unchecked (the VM identity still reads).
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
+}
+
+# Each gcloud surface the checks read, and the roles above that read it. The
+# test holds the keys equal to the `"gcloud", "<surface>"` prefixes in this
+# file, so a check on a new API names its role here and in the list above
+# before the pool scan runs it: read without the role, a piece scans as "not
+# checked" at best, and as drift when the API's refusal text is one the
+# denial patterns below have not seen. `auth` reads the local credential
+# store, not the project. `projects describe` needs projects.get, which
+# securityReviewer lacks and clusterViewer carries. The `kms` surface also
+# covers the KMS sign in check_ledger_read_credential, which the scan does not run.
+# securityReviewer also carries the three reads check_gemini_api_key makes
+# (apikeys.keys.list, secretmanager.versions.list,
+# secretmanager.secrets.getIamPolicy). roles/serviceusage.apiKeysViewer is not
+# used: it carries apikeys.keys.getKeyString, which reads the key string.
+GCLOUD_SURFACE_READ_ROLES = {
+    "artifacts": ("roles/artifactregistry.reader",),
+    "auth": (),
+    "compute": ("roles/compute.networkViewer",),
+    "container": ("roles/container.clusterViewer",),
+    "dns": ("roles/dns.reader",),
+    "iam": ("roles/iam.securityReviewer",),
+    "kms": ("roles/cloudkms.viewer",),
+    "projects": ("roles/iam.securityReviewer", "roles/container.clusterViewer"),
+    "secrets": ("roles/iam.securityReviewer",),
+    "services": ("roles/iam.securityReviewer",),
+    "storage": ("roles/storage.bucketViewer",),
 }
 
 # What a runner loses without the token-creator grant; the bot's loss is
@@ -652,12 +997,16 @@ FLEET_READER_TOKEN_CREATORS = tuple(
 PROW_RUNNER_ROLES = {
     "roles/cloudbuild.builds.editor",
     "roles/cloudbuild.builds.viewer",
+    # The self-managed forge VM hack/ci-forge.sh creates and deletes per run
+    # (section 5.8); getSerialPortOutput for its readiness is in it too.
+    "roles/compute.instanceAdmin.v1",
     "roles/container.admin",
     "roles/container.developer",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
     "roles/logging.viewer",
+    "roles/monitoring.alertPolicyEditor",
     "roles/resourcemanager.projectIamAdmin",
     "roles/serviceusage.serviceUsageConsumer",
     "roles/storage.admin",
@@ -680,7 +1029,13 @@ FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-pr
 FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    # The reconcile's reset of that VM needs compute.instances.reset, which
+    # this role also grants.
     "roles/compute.instanceAdmin.v1",
+    # loadBalancerAdmin: the stack plants a backend service and a health check on the
+    # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs
+    # compute.backendServices.*, compute.healthChecks.* and compute.instanceGroups.use.
+    "roles/compute.loadBalancerAdmin",
     # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
     # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
     "roles/compute.securityAdmin",
@@ -734,6 +1089,7 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -806,6 +1162,16 @@ def _account_binding(project_id: str, account: str, member: str, role: str) -> s
     return f'gcloud iam service-accounts add-iam-policy-binding {account} --project={project_id} --member="{member}" --role={role}'
 
 
+def _compute_sweep_repair(project_id: str) -> str:
+    """The two commands that give the Compute plant sweeper its role on one project."""
+    create = (
+        f"gcloud iam roles create {COMPUTE_SWEEP_ROLE_ID} --project={project_id} "
+        f'--title="{COMPUTE_SWEEP_ROLE_TITLE}" --permissions={",".join(sorted(COMPUTE_SWEEP_PERMISSIONS))} --stage={COMPUTE_SWEEP_ROLE_STAGE}'
+    )
+    role = COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+    return f"{create}\n{_project_binding(project_id, COMPUTE_SWEEP_MEMBER, role)}"
+
+
 def run_cmd(
     cmd: List[str],
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
@@ -845,6 +1211,10 @@ _DENIAL_PATTERNS = (
     re.compile(r"denied on resource", re.I),
     re.compile(r"does not have (?:permission|\S+ access)", re.I),
     re.compile(r"permission\(s\) for", re.I),
+    # The Compute API's form through gcloud, with no status code: `Required
+    # 'compute.addresses.get' permission for 'projects/p/regions/r/addresses/a'`;
+    # without it a refused read of a forge address or firewall rule reads as missing.
+    re.compile(r"required ['\"][\w.]+['\"] permission for", re.I),
     re.compile(r"is required to perform this operation", re.I),
     re.compile(r"(?:httperror|error|code[=: ])\s*403\b", re.I),
     re.compile(r"403 forbidden", re.I),
@@ -1346,7 +1716,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the runners', the reconciler's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
+    """Verify Workload Identity, the runners', the reconciler's, the Compute plant sweeper's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
     details = []
     warnings: List[str] = []
     findings: List[Finding] = []
@@ -1404,7 +1774,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
     # hack/ci-deploy.sh's per-lease helm upgrade annotates the
     # kubeagents-litellm KSA with this GSA, so a project missing the pair
-    # reds every presubmit it leases at the deploy's model-call gate (#1097).
+    # reds every run on Vertex AI that leases it (the lanes whose eval-model pair
+    # names vertex_ai, docs/ci-pool-projects.md 5.10) at the deploy's model-call gate (#1097).
     litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -1455,8 +1826,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
-            "the seeded-fleet reconciler's roles, "
+            f"Could not read the project IAM policy on {project_id}, so both runners' fourteen roles, "
+            "the seeded-fleet reconciler's roles, the Compute plant sweeper's role, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -1470,6 +1841,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             runner_held = {member: set() for _, _, member in RUNNERS}
             reconciler_held = set()
+            compute_sweep_held = set()
             platform_held = set()
             litellm_held = set()
             bot_held = set()
@@ -1501,6 +1873,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     bot_held.add(b.get("role"))
                 if FLEET_RECONCILER_MEMBER in members:
                     reconciler_held.add(b.get("role"))
+                if COMPUTE_SWEEP_MEMBER in members:
+                    compute_sweep_held.add(b.get("role"))
 
             for label, job, member in RUNNERS:
                 missing = PROW_RUNNER_ROLES - runner_held[member]
@@ -1537,6 +1911,22 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         f"The seeded-fleet reconciler is missing {role} on {project_id}",
                         _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
                     ))
+
+            # The binding only: the role's permissions are not read here. A
+            # role that lacks one shows in the sweep's own report as a
+            # refused list or delete.
+            compute_sweep_role = COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+            if compute_sweep_role not in compute_sweep_held:
+                passed = False
+                _drift(
+                    details, findings, FINDING_COMPUTE_SWEEPER_MISSING,
+                    f"The Compute plant sweeper ({COMPUTE_SWEEP_MEMBER.split(':', 1)[1]}) lacks "
+                    f"{compute_sweep_role} on {project_id}, so the periodic Compute plant sweep fails "
+                    "here and leftover plant networks and alert policies stay. Grant it without re-running the provisioning "
+                    "script (docs/ci-pool-projects.md section 5.7); if the role exists, run "
+                    "`gcloud iam roles update` with the same flags in place of `create`",
+                    _compute_sweep_repair(project_id),
+                )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
@@ -1707,7 +2097,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         message = partial
     else:
         message = (
-            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, Compute plant sweeper's, "
+            "health bot's and platform GSA project roles, "
             "and the fleet reader's token-creator binding verified"
         )
 
@@ -2508,6 +2899,16 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
+def gitops_manifest_seed_command(repo_slug: str, sha: str = "") -> str:
+    """The `gh api` call that writes checkout-gateway's declaration, replacing it when `sha` names the copy there."""
+    replace = f"-f sha={sha} " if sha else ""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"-f message=\"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" {replace}"
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
 def _gitops_repo_slug(project_id: str) -> str:
     """The GitOps repository a pool project owns, `gke-agentic/<project>-infra`, as hack/ci-deploy.sh maps it."""
     return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
@@ -2804,6 +3205,596 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     )
 
 
+def check_gitops_workload_manifest(project_id: str) -> CheckResult:
+    """Verify the GitOps repository declares checkout-gateway where the remediation cases expect it.
+
+    The same reader and the same verdicts as check_gitops_declaration: a
+    refusal or a transient leaves the check unverified, a 404 fails it with
+    the seed command (naming both of its readings), and a body at the path
+    that does not declare the Deployment fails it with the replace command.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_WORKLOAD_MANIFEST]
+    repo_slug = _gitops_repo_slug(project_id)
+    path = GITOPS_WORKLOAD_MANIFEST_PATH
+    cases = " and ".join(GITOPS_WORKLOAD_MANIFEST_CASES)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what} in {repo_slug} could not be read: {reason}")], read=False)
+
+    def failed(what: str, err: str) -> CheckResult:
+        return CheckResult(name, False, f"Could not read {what} in {repo_slug}: {err}")
+
+    def absent() -> CheckResult:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {path}, or this token cannot read the repository "
+            f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
+            f"readable, {cases} find no manifest to propose a budget beside and fail on this project until it "
+            f"is seeded: {gitops_manifest_seed_command(repo_slug)}",
+        )
+
+    state, out = _gitops_path_state(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(path, out)
+    if state == GITHUB_PATH_ABSENT:
+        return absent()
+    if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+        return failed(path, out)
+    try:
+        payload = _load_json(out)
+        sha = str(payload.get("sha") or "")
+        if payload.get("encoding") == GITHUB_CONTENT_ENCODING_NONE:
+            state, body = _gitops_path_state(repo_slug, path, raw=True)
+            if state == GITHUB_PATH_UNREAD:
+                return unread(f"{path} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_ABSENT:
+                return absent()
+            if state == GITHUB_PATH_UNDECODABLE:
+                # The index reads it with replacement characters and keys
+                # what parses; this reader cannot, so the file is unjudged,
+                # as a sibling with the same byte is.
+                return unread(f"{path} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_FAILED:
+                return failed(f"{path} (over the contents API's inline limit, read raw)", body)
+        else:
+            # Decoded as the index reads the file (`errors="replace"`), so a
+            # stray byte is the index's verdict below, not a failure here.
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8", errors="replace")
+    except Exception as exc:
+        return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
+    # The index, not a copy of its rule: the file goes into a scratch tree at
+    # its own path, beside every other YAML the repository holds under the
+    # seeded cluster's tree, and collect.py's workload_declarations says
+    # whether it keys the Deployment there once (dict documents, the Config
+    # Connector skip, and the one-file-per-object rule declaration_for
+    # enforces). A collector that cannot load here is a machine fault, unread
+    # as the note check's parser is; a raise on the file is the file's.
+    try:
+        collect = _load_collect()
+    except Exception as exc:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not load the audit's collector to index {path}: {type(exc).__name__}: {exc}")],
+            read=False,
+        )
+    state, siblings = _gitops_cluster_tree_yaml(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    if state != GITHUB_PATH_PRESENT:
+        return failed(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    try:
+        problem = _workload_manifest_problem(body, collect, siblings)
+    except OSError as exc:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {path} (no writable temporary directory to hand it to the audit's index): {type(exc).__name__}: {exc}")], read=False)
+    if problem.startswith(DUPLICATE_DECLARATION_PREFIX):
+        # The seeded file is right; another file under the tree declares the
+        # same object, and the index resolves neither. Replacing the seed
+        # changes nothing: the other file has to go.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} declares Deployment/checkout-gateway in seeded-reliability more than once under "
+            f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this "
+            f"project. Remove every declaration but {path}.",
+        )
+    if problem.startswith(SIBLING_RAISE_PREFIX):
+        # The seed is right; another YAML under the tree makes the index
+        # raise, and the audit's clone would hit the same file. Replacing
+        # the seed changes nothing: that file has to be found and fixed.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {path}, which the audit's index keys on its own, but {problem}, so the audit's "
+            f"index fails over this cluster's tree and {cases} fail on this project. Find the YAML under "
+            f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ that PyYAML's safe loader rejects and fix or remove it; the seed stands.",
+        )
+    if problem:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {path} but the audit's index does not key Deployment/checkout-gateway in seeded-reliability from it "
+            f"({problem}), so {cases} fail on this project. "
+            f"Replace it: {gitops_manifest_seed_command(repo_slug, sha)}",
+        )
+    return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}, where the audit's index keys it")
+
+
+GITLAB_VERIFY_TOKEN_ENV = "GITLAB_VERIFY_TOKEN"
+_GITLAB_TOKEN_CACHE: dict = {}
+
+
+def _load_gitlab_forge():
+    """hack/ci_gitlab_forge.py as a module: the GitLab reads and the seed, host and retries included.
+
+    It imports its sibling ci_reset_audit_ledgers by name, so hack/ joins
+    sys.path for the load, the way the sweep runs it.
+    """
+    import importlib.util
+
+    hack = str(_GITLAB_FORGE.parent)
+    if hack not in sys.path:
+        sys.path.append(hack)
+    spec = importlib.util.spec_from_file_location(_GITLAB_FORGE_MODULE_NAME, _GITLAB_FORGE)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_GITLAB_FORGE}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    getattr(module, "repository_file")
+    return module
+
+
+def _load_gitlab_sweep():
+    """hack/ci_sweep_agent_pulls.py as a module, for its Secret Manager read of the pool's GitLab tokens."""
+    import importlib.util
+
+    hack = str(_GITLAB_SWEEP.parent)
+    if hack not in sys.path:
+        sys.path.append(hack)
+    spec = importlib.util.spec_from_file_location(_GITLAB_SWEEP_MODULE_NAME, _GITLAB_SWEEP)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_GITLAB_SWEEP}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    getattr(module, "gitlab_secret")
+    return module
+
+
+def _gitlab_read_token() -> tuple[str, str]:
+    """(token, where it came from) for the GitLab reads, or ("", why there is none).
+
+    GITLAB_VERIFY_TOKEN first (a developer's own), else the pool's ledger
+    token read as the sweep reads it (`gitlab_secret`: one printable line
+    from Secret Manager, anything else refused); a machine that can read
+    neither leaves the check unread. Nothing here raises: a missing gcloud
+    or a refused read is the reason returned, not a traceback.
+    """
+    if "token" in _GITLAB_TOKEN_CACHE:
+        return _GITLAB_TOKEN_CACHE["token"]
+    token = os.environ.get(GITLAB_VERIFY_TOKEN_ENV, "").strip()
+    if token and any(ch.isspace() or not ch.isprintable() for ch in token):
+        # The same bar as `gitlab_secret`: a value with a line break inside
+        # would be refused by http.client with the value in the error text,
+        # and that text would reach the console and --report. Not echoed.
+        found = ("", f"{GITLAB_VERIFY_TOKEN_ENV} is not one token on one line (a header file with a second line, cut as the recipe cuts it, reads like this); export the bare token")
+    elif token:
+        found = (token, GITLAB_VERIFY_TOKEN_ENV)
+    else:
+        try:
+            sweep = _load_gitlab_sweep()
+            secret = f"{sweep.GITLAB_SECRETS_PROJECT}/{sweep.GITLAB_LEDGER_SECRET}"
+            found = (sweep.gitlab_secret(sweep.GITLAB_LEDGER_SECRET), secret)
+        except Exception as exc:
+            found = ("", f"no token in {GITLAB_VERIFY_TOKEN_ENV}, and the pool's ledger token could not be read from Secret Manager: {type(exc).__name__}: {str(exc)[:200]}")
+    _GITLAB_TOKEN_CACHE["token"] = found
+    return found
+
+
+def gitlab_manifest_seed_command(project_id: str, host: str = "gitlab.com") -> str:
+    """The `seed-file` call that writes checkout-gateway's declaration to a pool project's GitLab project, with the group Owner's token."""
+    return (
+        f"printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | GITLAB_SEED_TOKEN=<the gke-agentic Owner's token> "
+        f"python3 hack/ci_gitlab_forge.py seed-file --project-id {project_id} --path {GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"--message \"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" --content-file - --host {host}"
+    )
+
+
+def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
+    """Verify the pool project's GitLab project declares checkout-gateway where the remediation cases expect it.
+
+    The GitLab lane runs the same cases against `gke-agentic/<project>-infra`
+    on gitlab.com (docs/ci-pool-projects.md 5.6), so the same file has to be
+    there; the verdicts are check_gitops_workload_manifest's, read through
+    hack/ci_gitlab_forge.py instead of `gh`. A project the token cannot see
+    fails as the GitHub check's 404 does, naming both readings.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITLAB_WORKLOAD_MANIFEST]
+    path = GITOPS_WORKLOAD_MANIFEST_PATH
+    cases = " and ".join(GITOPS_WORKLOAD_MANIFEST_CASES)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what}: {reason}")], read=False)
+
+    token, source = _gitlab_read_token()
+    if not token:
+        return unread("the GitLab project", source)
+    try:
+        gitlab = _load_gitlab_forge()
+        collect = _load_collect()
+    except Exception as exc:
+        return unread("the GitLab project (a module this check runs did not load)", f"{type(exc).__name__}: {exc}")
+    project_path = f"{gitlab.GROUP}/{project_id}{gitlab.PROJECT_SUFFIX}"
+    host = gitlab.DEFAULT_HOST
+    import urllib.error as _urlerr
+
+    # The run's deadline, honoured as every other command honours it: the
+    # helper's calls are not run_cmd or _net_timeout, so its per-call
+    # timeout is cut to the time left here (the module is this check's own
+    # load), and a run already out of time starts no read.
+    if _RUN_DEADLINE is not None:
+        left = _RUN_DEADLINE - time.monotonic()
+        if left <= 0:
+            return unread(f"{host}/{project_path}", "the run's deadline passed before this check read anything")
+        gitlab.REQUEST_TIMEOUT_SECONDS = _net_timeout(gitlab.REQUEST_TIMEOUT_SECONDS)
+
+    try:
+        _, branch = gitlab.project_view(project_path, token, host=host)
+        state, body = gitlab.repository_file(project_path, path, token, host=host, ref=branch)
+        if state == gitlab.FILE_ABSENT:
+            return CheckResult(
+                name,
+                False,
+                f"{host}/{project_path} has no {path} on {branch}, or the token from {source} cannot read the project. "
+                f"If the project is readable, {cases} find no manifest to propose a budget beside and fail on this project "
+                f"on the GitLab lane until it is seeded: {gitlab_manifest_seed_command(project_id, host)}",
+            )
+        prefix = GITOPS_WORKLOAD_MANIFEST_TREE
+        wanted = [
+            p for p in gitlab.repository_blobs(project_path, prefix, token, host=host, ref=branch)
+            if p.endswith(GITOPS_YAML_SUFFIXES) and p != path
+        ]
+        if len(wanted) > GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP:
+            return unread(f"the tree of {host}/{project_path} under {prefix}/", f"{len(wanted)} YAML files, over the {GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP} this check reads")
+        siblings: dict = {}
+        for sibling in wanted:
+            sib_state, text = gitlab.repository_file(project_path, sibling, token, host=host, ref=branch)
+            if sib_state == gitlab.FILE_PRESENT:
+                siblings[sibling] = text
+    except _urlerr.HTTPError as exc:
+        if exc.code == 404:
+            return CheckResult(
+                name,
+                False,
+                f"{host}/{project_path} does not exist, or the token from {source} cannot see it (GitLab answers 404 to both). "
+                f"The GitLab lane leases this project and dies at its reset without it; onboard it as docs/ci-pool-projects.md 5.6 says, "
+                f"seed included: {gitlab_manifest_seed_command(project_id, host)}",
+            )
+        if exc.code == 401:
+            return unread(f"{host}/{project_path}", f"the token from {source} no longer authenticates (HTTP 401)")
+        return unread(f"{host}/{project_path}", f"HTTP {exc.code} from {host}")
+    except Exception as exc:
+        return unread(f"{host}/{project_path}", f"{type(exc).__name__}: {exc}")
+    try:
+        problem = _workload_manifest_problem(body, collect, siblings)
+    except OSError as exc:
+        return unread(path, f"no writable temporary directory to hand it to the audit's index: {type(exc).__name__}: {exc}")
+    if problem.startswith(DUPLICATE_DECLARATION_PREFIX):
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} declares Deployment/checkout-gateway in seeded-reliability more than once under "
+            f"{prefix}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this project on the "
+            f"GitLab lane. Remove every declaration but {path}.",
+        )
+    if problem.startswith(SIBLING_RAISE_PREFIX):
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} carries {path}, which the audit's index keys on its own, but {problem}, so the audit's "
+            f"index fails over this cluster's tree and {cases} fail on this project on the GitLab lane. Find the YAML under "
+            f"{prefix}/ that PyYAML's safe loader rejects and fix or remove it; the seed stands.",
+        )
+    if problem:
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} carries {path} but the audit's index does not key Deployment/checkout-gateway in "
+            f"seeded-reliability from it ({problem}), so {cases} fail on this project on the GitLab lane. Replace it with "
+            f"the seed's content (the files API's PUT, or delete it and run: {gitlab_manifest_seed_command(project_id, host)})",
+        )
+    return CheckResult(name, True, f"{host}/{project_path} declares Deployment/checkout-gateway at {path} on {branch}, where the audit's index keys it")
+
+
+def _load_collect():
+    """The fleet-audit collector as a module, with the index this check queries.
+
+    collect.py appends its own directory to sys.path for `fleet_scope_args`
+    at import, so loading it by path is enough; PyYAML is imported here as
+    the index imports it lazily, so a machine without it fails at one place.
+    """
+    import importlib.util
+
+    import yaml  # noqa: F401  (workload_declarations' dependency, proven present here)
+
+    spec = importlib.util.spec_from_file_location(_COLLECT_MODULE_NAME, _COLLECT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_COLLECT}")
+    module = importlib.util.module_from_spec(spec)
+    with contextlib.redirect_stderr(io.StringIO()):
+        spec.loader.exec_module(module)
+    getattr(module, "workload_declarations")
+    return module
+
+
+def _gitops_cluster_tree_yaml(repo_slug: str, seeded_path: str) -> tuple[str, dict[str, str] | str]:
+    """(GITHUB_PATH_*, {path: body} for every other YAML under the seeded cluster's tree, or the reason).
+
+    One listing of the repository's tree, then one raw read per sibling. A
+    sibling that cannot be read makes the whole answer unread or failed as
+    that read was: the index's one-file rule cannot be judged without it.
+    """
+    rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/git/trees/HEAD?recursive=1"])
+    if rc != 0:
+        reason = _unread_reason(err or "")
+        if reason is not None or _GH_TRANSPORT_LINE.search(err or ""):
+            return GITHUB_PATH_UNREAD, reason or (err or "").strip()
+        return GITHUB_PATH_FAILED, (err or "").strip()
+    try:
+        listing = _load_json(out)
+        entries = listing.get("tree") or []
+    except Exception as exc:
+        return GITHUB_PATH_FAILED, f"could not parse the tree listing: {exc}"
+    if listing.get("truncated"):
+        # The API cut the listing; the entries under the tree may be the
+        # ones missing, so the one-file rule cannot be judged from it.
+        return GITHUB_PATH_UNREAD, "the tree listing is truncated by the API, so the one-file rule cannot be judged"
+    prefix = GITOPS_WORKLOAD_MANIFEST_TREE + "/"
+    wanted = sorted(
+        str(e.get("path"))
+        for e in entries
+        if isinstance(e, dict) and e.get("type") == "blob" and str(e.get("path") or "").startswith(prefix)
+        and str(e.get("path") or "").endswith(GITOPS_YAML_SUFFIXES) and e.get("path") != seeded_path
+    )
+    if len(wanted) > GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP:
+        return GITHUB_PATH_UNREAD, f"{len(wanted)} YAML files under {prefix}, over the {GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP} this check reads"
+    siblings: dict[str, str] = {}
+    for sibling in wanted:
+        state, text = _gitops_path_state(repo_slug, sibling, raw=True)
+        if state == GITHUB_PATH_ABSENT:
+            # Gone between the listing and the read: the index would not see it either.
+            continue
+        if state == GITHUB_PATH_UNDECODABLE:
+            # The index reads it with replacement characters and keys what
+            # parses; this reader cannot, so the rule is unjudged, not failed.
+            return GITHUB_PATH_UNREAD, f"{sibling}: {text}"
+        if state != GITHUB_PATH_PRESENT:
+            return (GITHUB_PATH_UNREAD if state == GITHUB_PATH_UNREAD else GITHUB_PATH_FAILED), f"{sibling}: {text or state}"
+        siblings[sibling] = text
+    return GITHUB_PATH_PRESENT, siblings
+
+
+def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | None = None) -> str:
+    """Why the audit's index would not key GITOPS_WORKLOAD_MANIFEST_KEY from `body` at its path, once, or "" when it does.
+
+    `siblings` are the repository's other YAML files under the seeded
+    cluster's tree, written beside the body so the index's one-file-per-object
+    rule is judged as the audit judges it. Raises OSError when the scratch
+    tree cannot be written. A raise from the index itself (PyYAML's safe
+    constructors raise KeyError, AttributeError or ValueError on a tagged
+    scalar, outside the YAMLError the index catches) is the file's verdict,
+    not a traceback.
+    """
+    def index_of(files: dict[str, str]):
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = Path(scratch)
+            for rel, text in files.items():
+                target = tree / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                return collect.workload_declarations(tree)
+
+    try:
+        index = index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})})
+    except OSError:
+        # The scratch tree, not the index: the callers report it unread.
+        raise
+    except Exception as exc:
+        if siblings:
+            # PyYAML's message names no file. Index the seed alone to say
+            # which side is at fault: a seed that indexes and keys the
+            # Deployment makes the raise a sibling's, and a replace of the
+            # seed would change nothing; then each sibling alone, to name it.
+            try:
+                alone = index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body})
+            except OSError:
+                raise
+            except Exception:
+                alone = None
+            if alone is not None:
+                raiser = ""
+                for rel, text in siblings.items():
+                    try:
+                        index_of({rel: text})
+                    except OSError:
+                        raise
+                    except Exception:
+                        raiser = rel
+                        break
+                named = f" {raiser}" if raiser else ""
+                if alone.get(GITOPS_WORKLOAD_MANIFEST_KEY):
+                    return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}){named}; the seed alone indexes and keys it"
+                # The seed is at fault for not keying the Deployment, and a
+                # sibling is at fault for the raise: the replace is right,
+                # and the sibling is named so the next run does not stop there.
+                return (
+                    "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+                    + f"; beside it{named} makes the index raise ({type(exc).__name__}: {exc}), which the replace does not cure"
+                )
+        return f"the index raises on it ({type(exc).__name__}: {exc})"
+    paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if not paths:
+        return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if len(paths) > 1:
+        return DUPLICATE_DECLARATION_PREFIX + ", ".join(sorted(paths)) + ")"
+    return ""
+
+
+def _forge_repair(project_id: str, location: str) -> str:
+    """The provisioning commands for every forge piece, as docs 5.8 prints them."""
+    lines = [
+        f"gcloud dns managed-zones create {FORGE_DNS_ZONE} --dns-name={FORGE_DNS_NAME} --visibility=private --networks={FORGE_NETWORK} --project={project_id}",
+    ]
+    for row, host in FORGE_ROW_HOSTS.items():
+        address = FORGE_ADDRESS_TEMPLATE.format(row=row)
+        lines.append(f"gcloud compute addresses create {address} --region={location} --subnet={FORGE_NETWORK} --purpose=GCE_ENDPOINT --project={project_id}")
+        lines.append(
+            f"gcloud dns record-sets create {host}. --zone={FORGE_DNS_ZONE} --type=A --ttl={FORGE_RECORD_TTL} --project={project_id} "
+            f"--rrdatas=\"$(gcloud compute addresses describe {address} --region={location} --project={project_id} --format='value(address)')\""
+        )
+    lines.append(
+        f"gcloud compute firewall-rules create {FORGE_FIREWALL_RULE} --network={FORGE_NETWORK} --direction=INGRESS --allow={FORGE_FIREWALL_ALLOWED} "
+        f"--source-ranges={FORGE_FIREWALL_SOURCE_RANGES} --target-tags={FORGE_NETWORK_TAG} --project={project_id}"
+    )
+    lines.append(
+        f"gcloud compute firewall-rules create {FORGE_DENY_RULE} --network={FORGE_NETWORK} --direction=INGRESS --action=DENY --rules={FORGE_DENY_RULES} "
+        f"--priority={FORGE_DENY_PRIORITY} --source-ranges={FORGE_DENY_SOURCE_RANGES} --target-tags={FORGE_NETWORK_TAG} --project={project_id}"
+    )
+    lines.append(f"gcloud iam service-accounts create {FORGE_VM_SA_ID} --display-name='kube-agents forge VM' --project={project_id}")
+    for role in sorted(FORGE_VM_SA_ROLES):
+        lines.append(_project_binding(project_id, f"serviceAccount:{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com", role))
+    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; a zone of another name, visibility or network is deleted first (`gcloud dns managed-zones delete`), a firewall rule of another shape likewise (`gcloud compute firewall-rules delete`); the bindings are idempotent, and a role the VM identity holds beyond the registry read is removed by hand)"
+
+
+def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckResult:
+    """The once-per-project pieces hack/ci-forge.sh reads for a self-managed forge:
+    the private zone, one reserved address and one A record per row, the 443
+    firewall rule, and the VM identity with its registry read. Nothing here is
+    a leased public-lane run's; a missing piece refuses only the self-managed
+    lanes, which say so by name.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_FORGE_PIECES]
+    details: List[str] = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    read_any = False
+    repair = _forge_repair(project_id, location)
+
+    def read(cmd: List[str], what: str) -> Tuple[Optional[str], bool]:
+        """(stdout, read): stdout "" when the resource is absent; read False when the command could not tell."""
+        nonlocal read_any
+        rc, out, err = run_cmd(cmd)
+        if rc == 0:
+            read_any = True
+            return out.strip(), True
+        if _record_unreadable(err, f"{what} absent: {err.strip()}", f"Could not read {what} in {project_id}", details, warnings):
+            return None, False
+        read_any = True
+        return "", True
+
+    def missing(finding_id: str, observed: str) -> None:
+        nonlocal passed
+        passed = False
+        _drift(details, findings, finding_id, observed, repair)
+
+    zone, ok = read(
+        ["gcloud", "dns", "managed-zones", "describe", FORGE_DNS_ZONE, f"--project={project_id}", "--format=value(dnsName,visibility,privateVisibilityConfig.networks[0].networkUrl.basename())"],
+        f"the private zone {FORGE_DNS_ZONE}",
+    )
+    expected_zone = [FORGE_DNS_NAME, "private", FORGE_NETWORK]
+    zone_checked = ok
+    addresses_checked = records_checked = True
+    if ok and not zone:
+        missing(FINDING_FORGE_ZONE_MISSING, f"The private zone {FORGE_DNS_ZONE} ({FORGE_DNS_NAME}) is missing in {project_id}, so no self-managed forge host resolves from the host cluster")
+    elif ok and zone.split("\t") != expected_zone:
+        missing(FINDING_FORGE_ZONE_MISMATCH, f"Zone {FORGE_DNS_ZONE} in {project_id} is {zone!r}, not {FORGE_DNS_NAME} private on {FORGE_NETWORK}; the forge records cannot live in it, and a create by name skips it: delete the zone and run the provisioning commands")
+    elif ok:
+        details.append(f"✓ Private zone {FORGE_DNS_ZONE}: {zone}")
+    for row, host in FORGE_ROW_HOSTS.items():
+        address = FORGE_ADDRESS_TEMPLATE.format(row=row)
+        ip, ok_ip = read(["gcloud", "compute", "addresses", "describe", address, f"--region={location}", f"--project={project_id}", "--format=value(address)"], f"the reserved address {address}")
+        addresses_checked = addresses_checked and ok_ip
+        if ok_ip and not ip:
+            missing(FINDING_FORGE_ADDRESS_MISSING.format(row=row), f"The reserved address {address} is missing in {project_id} ({location}); the {row} forge VM has no address to take")
+        record, ok_rr = read(["gcloud", "dns", "record-sets", "describe", f"{host}.", f"--zone={FORGE_DNS_ZONE}", "--type=A", f"--project={project_id}", "--format=value(rrdatas[0])"], f"the A record {host}.")
+        records_checked = records_checked and ok_rr
+        if ok_rr and not record:
+            missing(FINDING_FORGE_RECORD_MISSING.format(host=host), f"The A record {host}. is missing from zone {FORGE_DNS_ZONE} in {project_id}")
+        elif ok_rr and ok_ip and ip and record != ip:
+            missing(FINDING_FORGE_RECORD_MISMATCH.format(host=host), f"{host}. resolves to {record} in zone {FORGE_DNS_ZONE}, but the reserved address {address} is {ip}; the forge VM takes the address, so the record must point at it")
+        elif ok_rr and ok_ip and ip:
+            details.append(f"✓ {host} -> {ip} ({address})")
+    rule, ok = read(
+        ["gcloud", "compute", "firewall-rules", "describe", FORGE_FIREWALL_RULE, f"--project={project_id}", "--format=value(sourceRanges.list(),targetTags.list(),allowed[].map().firewall_rule().list())"],
+        f"the firewall rule {FORGE_FIREWALL_RULE}",
+    )
+    firewall_checked = ok
+    expected_rule = [FORGE_FIREWALL_SOURCE_RANGES, FORGE_NETWORK_TAG, FORGE_FIREWALL_ALLOWED]
+    if ok and not rule:
+        missing(FINDING_FORGE_FIREWALL_MISSING, f"The firewall rule {FORGE_FIREWALL_RULE} is missing in {project_id}; the host cluster's pods could not reach a forge VM on 443")
+    elif ok and rule.split("\t") != expected_rule:
+        missing(FINDING_FORGE_FIREWALL_MISMATCH, f"Firewall rule {FORGE_FIREWALL_RULE} in {project_id} is {rule!r}, not {FORGE_FIREWALL_ALLOWED} from {FORGE_FIREWALL_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}; delete it and run the provisioning commands")
+    elif ok:
+        details.append(f"✓ Firewall rule {FORGE_FIREWALL_RULE}: {FORGE_FIREWALL_ALLOWED} from {FORGE_FIREWALL_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}")
+    deny, ok = read(
+        ["gcloud", "compute", "firewall-rules", "describe", FORGE_DENY_RULE, f"--project={project_id}", "--format=value(direction,priority,sourceRanges.list(),targetTags.list(),denied[].map().firewall_rule().list())"],
+        f"the deny rule {FORGE_DENY_RULE}",
+    )
+    deny_checked = ok
+    expected_deny = ["INGRESS", str(FORGE_DENY_PRIORITY), FORGE_DENY_SOURCE_RANGES, FORGE_NETWORK_TAG, FORGE_DENY_RULES]
+    if ok and not deny:
+        missing(FINDING_FORGE_DENY_MISSING, f"The deny rule {FORGE_DENY_RULE} is missing in {project_id}; a forge VM's external address would answer the default network's stock rules (ssh from anywhere)")
+    elif ok and deny.split("\t") != expected_deny:
+        missing(FINDING_FORGE_DENY_MISMATCH, f"Deny rule {FORGE_DENY_RULE} in {project_id} is {deny!r}, not INGRESS priority {FORGE_DENY_PRIORITY} denying {FORGE_DENY_RULES} from {FORGE_DENY_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}; delete it and run the provisioning commands")
+    elif ok:
+        details.append(f"✓ Deny rule {FORGE_DENY_RULE}: everything else to tag {FORGE_NETWORK_TAG} at priority {FORGE_DENY_PRIORITY}")
+    sa_email = f"{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com"
+    sa, ok = read(["gcloud", "iam", "service-accounts", "describe", sa_email, f"--project={project_id}", "--format=value(email)"], f"the VM identity {sa_email}")
+    identity_checked = ok
+    if ok and not sa:
+        missing(FINDING_FORGE_VM_SA_MISSING, f"The VM identity {sa_email} is missing; a forge VM could not pull its image from the project's registry")
+    elif ok:
+        roles, ok_roles = read(
+            ["gcloud", "projects", "get-iam-policy", project_id, "--flatten=bindings[].members", f"--filter=bindings.members:serviceAccount:{sa_email}", "--format=value(bindings.role)"],
+            f"the roles of {sa_email}",
+        )
+        identity_checked = ok_roles
+        if ok_roles:
+            held = set(roles.split()) if roles else set()
+            for role in sorted(FORGE_VM_SA_ROLES - held):
+                missing(FINDING_FORGE_VM_SA_ROLE_MISSING.format(role=role), f"The VM identity {sa_email} lacks {role} on {project_id}; the forge VM could not pull its image")
+            extra = sorted(held - FORGE_VM_SA_ROLES)
+            if extra:
+                missing(FINDING_FORGE_VM_SA_ROLE_EXTRA, f"The VM identity {sa_email} also holds {', '.join(extra)} on {project_id}; the forge VM runs with the cloud-platform scope, so every role it holds is usable from it")
+            elif FORGE_VM_SA_ROLES <= held:
+                details.append(f"✓ VM identity {sa_email} holds {', '.join(sorted(FORGE_VM_SA_ROLES))} and nothing else")
+    if not read_any:
+        return CheckResult(name, True, "Not checked", details, warnings, findings, read=False)
+    # The summary must not assert an item a warning above retracts: with the
+    # DNS API disabled the zone and record reads are refused while the compute
+    # and IAM reads go ahead.
+    partial = _partial_summary(
+        [
+            ("the private zone", zone_checked),
+            ("the reserved addresses", addresses_checked),
+            ("the A records", records_checked),
+            ("the firewall rule", firewall_checked),
+            ("the deny rule", deny_checked),
+            ("the VM identity and its role", identity_checked),
+        ]
+    )
+    if not passed:
+        message = f"{len(findings)} forge piece(s) missing or wrong (docs/ci-pool-projects.md 5.8)"
+    elif partial:
+        message = partial
+    else:
+        message = "Zone, addresses, records, firewall and deny rules and VM identity present"
+    return CheckResult(name, passed, message, details, warnings, findings, read=True)
+
+
 def check_github_repo_and_app(
     project_id: str, app_id: int, repo_membership_confirmed: bool = False
 ) -> CheckResult:
@@ -3047,7 +4038,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
     pins, whatever the App is granted.
     """
 
@@ -3262,6 +4253,194 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
         )])
 
     return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+
+
+def check_gemini_api_key(project_id: str) -> CheckResult:
+    """The eval nightlies' Gemini Developer API key in this project: one key
+    named GEMINI_KEY_DISPLAY_NAME restricted to GEMINI_KEY_API_TARGET alone with
+    no client restriction, an enabled latest version of
+    GEMINI_KEY_SECRET_NAME, and the runners' accessor
+    grant on that secret. Metadata and IAM only: no read here returns the key
+    string or the secret's value. Whether GEMINI_KEY_API_TARGET is enabled is
+    CHECK_PROJECT_AND_APIS's read (REQUIRED_APIS), not repeated here.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GEMINI_KEY]
+    details: List[str] = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    read_any = False
+    repair = f"{GEMINI_KEY_SCRIPT} {project_id}"
+    # The target's number and why it is unknown, read once, and only when a
+    # SERVICE_DISABLED refusal names a project other than project_id.
+    number: Optional[Tuple[Optional[str], str]] = None
+
+    def target_number() -> Tuple[Optional[str], str]:
+        """(project number, why it is unknown)."""
+        nonlocal number
+        if number is None:
+            rc, out, err = run_cmd(["gcloud", "projects", "describe", project_id, "--format=value(projectNumber)"])
+            value = out.strip() if rc == 0 else ""
+            why = "" if value else (_unread_reason(err) or (err or "").strip()[:GEMINI_KEY_ERR_EXCERPT] or NO_OUTPUT_REASON)
+            number = (value or None, why)
+        return number
+
+    def disabled_in_target(err: str) -> Tuple[bool, str]:
+        """(the SERVICE_DISABLED refusal names the target alone, why not)."""
+        named = {m for pair in GEMINI_KEY_DISABLED_IN.findall(err) for m in pair if m}
+        if not named:
+            return False, "the refusal names no project"
+        others = named - {project_id}
+        if not others:
+            return True, ""
+        value, why = target_number()
+        if value is None:
+            return False, f"the refusal names project {', '.join(sorted(others))} and {project_id}'s number could not be read ({why})"
+        others -= {value}
+        if others:
+            return False, f"the refusal names project {', '.join(sorted(others))}, not {project_id} ({value})"
+        return True, ""
+
+    def read(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
+        """(parsed JSON, read): None with read True when the resource is absent
+        (its API disabled in project_id included); read False when the command
+        could not tell, a SERVICE_DISABLED that names another project or none
+        included."""
+        nonlocal read_any
+        rc, out, err = run_cmd(cmd)
+        if rc != 0:
+            if GEMINI_KEY_SERVICE_DISABLED.search(err or ""):
+                in_target, why = disabled_in_target(err)
+                if not in_target:
+                    warnings.append(Unread(f"Could not read {what} in {project_id}: SERVICE_DISABLED, but {why}"))
+                    return None, False
+                read_any = True
+                details.append(f"{what} absent: its API is disabled in {project_id}")
+                return None, True
+            if _record_unreadable(err, f"{what} absent: {err.strip()[:GEMINI_KEY_ERR_EXCERPT]}", f"Could not read {what} in {project_id}", details, warnings):
+                return None, False
+            read_any = True
+            return None, True
+        try:
+            parsed = json.loads(out or "null")
+        except ValueError as exc:
+            warnings.append(Unread(f"Could not read {what} in {project_id}: gcloud printed no JSON ({exc})"))
+            return None, False
+        read_any = True
+        return parsed, True
+
+    def drift(finding_id: str, observed: str, fix: str = repair) -> None:
+        nonlocal passed
+        passed = False
+        _drift(details, findings, finding_id, observed, fix)
+
+    # Unfiltered: gcloud's --filter is not an exact match, so the display name
+    # is compared here and a key such as kube-agents-eval-gemini-probe is not taken.
+    keys, keys_checked = read(
+        ["gcloud", "services", "api-keys", "list", f"--project={project_id}", "--format=json"],
+        f"the API key {GEMINI_KEY_DISPLAY_NAME}",
+    )
+    if keys_checked:
+        keys = [key for key in (keys or []) if key.get("displayName") == GEMINI_KEY_DISPLAY_NAME]
+        if not keys:
+            drift(FINDING_GEMINI_KEY_MISSING, f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
+        if len(keys) > 1:
+            warnings.append(
+                f"{len(keys)} API keys are named {GEMINI_KEY_DISPLAY_NAME} in {project_id}: "
+                f"{', '.join(k.get('name', '?') for k in keys)}. {GEMINI_KEY_SCRIPT} refuses to run until one is left"
+            )
+        for key in keys:
+            key_name = key.get("name", "?")
+            restrictions = key.get("restrictions") or {}
+            targets = sorted(t.get("service", "") for t in (restrictions.get("apiTargets") or []))
+            clients = [field for field in GEMINI_KEY_CLIENT_RESTRICTIONS if field in restrictions]
+            set_target = f"gcloud services api-keys update {key_name} --project={project_id} --api-target=service={GEMINI_KEY_API_TARGET}"
+            if clients:
+                # gcloud refuses --clear-restrictions beside --api-target, so
+                # the repair is two commands: clear, then set the API target.
+                drift(
+                    FINDING_GEMINI_KEY_RESTRICTION,
+                    f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} carries client restrictions "
+                    f"({', '.join(clients)}), so the agent pod's calls are refused",
+                    f"gcloud services api-keys update {key_name} --project={project_id} --clear-restrictions && {set_target}",
+                )
+            elif targets != [GEMINI_KEY_API_TARGET]:
+                drift(
+                    FINDING_GEMINI_KEY_RESTRICTION,
+                    f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} is restricted to "
+                    f"{', '.join(targets) or 'no API at all (unrestricted)'}, not {GEMINI_KEY_API_TARGET} alone",
+                    set_target,
+                )
+            else:
+                details.append(f"✓ API key {key_name} restricted to {GEMINI_KEY_API_TARGET}")
+
+    secret = GEMINI_KEY_SECRET_NAME
+    versions, versions_checked = read(
+        ["gcloud", "secrets", "versions", "list", secret, f"--project={project_id}", "--limit=1", "--format=json"],
+        f"the latest version of secret {secret}",
+    )
+    secret_exists = versions_checked and versions is not None
+    if versions_checked:
+        latest = (versions or [{}])[0].get("state", "")
+        if versions is None:
+            drift(FINDING_GEMINI_KEY_SECRET_MISSING, f"Secret {secret} is missing in {project_id}; the eval nightly cannot read its Gemini key")
+        elif latest != GEMINI_KEY_VERSION_ENABLED:
+            drift(
+                FINDING_GEMINI_KEY_SECRET_MISSING,
+                f"Secret {secret} in {project_id} has no enabled latest version ({latest or 'no version at all'}); "
+                "the eval nightly reads `latest` and gets nothing",
+            )
+        else:
+            details.append(f"✓ Secret {secret} has an enabled latest version")
+
+    grants_checked = False
+    if secret_exists or not versions_checked:
+        policy, grants_checked = read(
+            ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
+            f"the IAM policy of secret {secret}",
+        )
+        if grants_checked and policy is None:
+            # A failure that was neither a refusal nor a transient: the
+            # policy was not read, so the accessors are not verified.
+            grants_checked = False
+            warnings.append(Unread(f"Could not read the IAM policy of secret {secret} in {project_id}, so its accessors are unverified"))
+        if grants_checked and policy is not None:
+            held = {
+                member
+                for binding in (policy or {}).get("bindings", [])
+                if binding.get("role") == GEMINI_KEY_ACCESSOR_ROLE
+                for member in binding.get("members", [])
+            }
+            for member in GEMINI_KEY_SECRET_ACCESSORS:
+                if member in held:
+                    details.append(f"✓ {member.split(':', 1)[1]} holds {GEMINI_KEY_ACCESSOR_ROLE} on {secret}")
+                else:
+                    drift(
+                        FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member,
+                        f"{member.split(':', 1)[1]} lacks {GEMINI_KEY_ACCESSOR_ROLE} on secret {secret} in {project_id}; "
+                        "a run as it cannot read the Gemini key",
+                    )
+    else:
+        # The secret is absent: its policy has nothing to say, and the
+        # missing finding's repair grants the accessors with the secret.
+        grants_checked = True
+
+    if not read_any:
+        return CheckResult(name, True, "Not checked", details, warnings, findings, read=False)
+    partial = _partial_summary(
+        [
+            ("the API key", keys_checked),
+            ("the secret's latest version", versions_checked),
+            ("the secret's accessors", grants_checked),
+        ]
+    )
+    if not passed:
+        message = f"{len(findings)} Gemini key piece(s) missing or wrong (run {repair})"
+    elif partial:
+        message = partial
+    else:
+        message = "Key restricted, secret has an enabled version, runners granted"
+    return CheckResult(name, passed, message, details, warnings, findings, read=True)
 
 
 def _probe_github_app_identity(
@@ -3837,10 +5016,14 @@ def run_checks(
 
     run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
     run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
+    run(CHECK_FORGE_PIECES, lambda: check_forge_pieces(project_id, location))
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
     run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
     run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
+    run(CHECK_GITOPS_WORKLOAD_MANIFEST, lambda: check_gitops_workload_manifest(project_id))
+    run(CHECK_GITLAB_WORKLOAD_MANIFEST, lambda: check_gitlab_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
+    run(CHECK_GEMINI_KEY, lambda: check_gemini_api_key(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:

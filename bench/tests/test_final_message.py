@@ -140,16 +140,162 @@ def test_a_phrase_only_in_a_poll_recital_does_not_satisfy_final_scope():
 # ------------------------------------------------------ _append_final
 
 
-def test_append_final_deduplicates_against_the_existing_message():
+def test_a_quoted_artifact_is_neither_appended_nor_marked():
     base = _base("The answer already quotes: the report body.")
     _append_final(base, ["Artifact report.md produced by delegated task t1:\nthe report body."])
-    assert base.metadata["final_message"].count("the report body") == 1
+    assert base.metadata["final_message"] == "The answer already quotes: the report body."
 
 
 def test_append_final_with_no_sections_is_a_no_op():
     base = _base("unchanged")
     _append_final(base, [])
     assert base.metadata["final_message"] == "unchanged"
+
+
+# -------------------------------------- a card result relayed verbatim
+
+# The kanban smoke's specialist check: the card's own result, read through the
+# header the harness writes, names the planted fleet.
+_KANBAN_SMOKE_CASE = "agent-kanban-smoke"
+_SPECIALIST_CHECK = "the-specialists-answer-names-the-planted-fleet"
+_RELAYED_RESULT = (
+    "**Five GKE clusters are running in project `evals-5`.**\n\n"
+    "| Cluster | Status |\n| --- | --- |\n"
+    "| `seeded-a` | `RUNNING` |\n| `seeded-b` | `RUNNING` |\n| `seeded-c` | `RUNNING` |"
+)
+_SECTION_T1 = f"Result of delegated task t1:\n{_RELAYED_RESULT}"
+
+
+def _kanban_smoke_specialist_patterns() -> list[str]:
+    from pathlib import Path
+
+    import yaml
+
+    doc = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "tasks" / _KANBAN_SMOKE_CASE / "task.yaml").read_text()
+    )
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == _SPECIALIST_CHECK]
+    return check["check"]["required_patterns"]
+
+
+def test_a_card_result_the_router_relayed_verbatim_keeps_its_header():
+    base = _base(_RELAYED_RESULT)
+    _append_delivered(base, _observed_with_card_result("t1", _RELAYED_RESULT), ["t1"])
+    assert (base.output, base.metadata["final_message"]) == (_SECTION_T1, _SECTION_T1)
+
+
+def test_a_relay_inside_the_routers_prose_is_lifted_out_behind_the_prose():
+    base = _base(f"Here is what the specialist found:\n\n{_RELAYED_RESULT}\n\nAnything else?")
+    _append_delivered(base, _observed_with_card_result("t1", _RELAYED_RESULT), ["t1"])
+    assert base.metadata["final_message"] == f"Here is what the specialist found:\n\nAnything else?\n\n{_SECTION_T1}"
+
+
+def test_the_last_occurrence_of_a_short_result_is_the_relay():
+    body = "All pods are Running."
+    base = _base(f"I asked card t1 whether:\n{body}\nThe specialist said:\n{body}")
+    _append_delivered(base, _observed_with_card_result("t1", body), ["t1"])
+    assert base.metadata["final_message"] == (
+        f"I asked card t1 whether:\n{body}\nThe specialist said:\n\nResult of delegated task t1:\n{body}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("prose", "body"),
+    [
+        ("The deploy was abandoned yesterday.", "done"),
+        ("The fleet has 3 clusters.", "3"),
+        ("Clusters: fleet-a, fleet-b, fleet-c.", "fleet-a, fleet-b"),
+        (f"Here is what the specialist found: {_RELAYED_RESULT}", _RELAYED_RESULT),
+    ],
+)
+def test_a_result_woven_into_the_routers_sentence_is_not_cut_out_of_it(prose, body):
+    base = _base(prose)
+    _append_final(base, [f"Result of delegated task t1:\n{body}"])
+    assert base.metadata["final_message"] == f"{prose}\n\nResult of delegated task t1:\n{body}"
+
+
+def test_a_body_already_under_its_header_is_not_lifted_from_the_prose_too():
+    base = _base(f"{_RELAYED_RESULT}\n\n{_SECTION_T1}")
+    _append_final(base, [_SECTION_T1])
+    assert base.metadata["final_message"] == f"{_RELAYED_RESULT}\n\n{_SECTION_T1}"
+
+
+def test_folding_the_same_result_twice_adds_nothing():
+    base = _base(_RELAYED_RESULT)
+    observed = _observed_with_card_result("t1", _RELAYED_RESULT)
+    _append_delivered(base, observed, ["t1"])
+    once = (base.output, base.metadata["final_message"])
+    _append_delivered(base, observed, ["t1"])
+    assert (base.output, base.metadata["final_message"]) == once
+
+
+def test_a_body_already_under_its_header_with_a_blank_line_is_left_alone():
+    already = f"Result of delegated task t1:\n\n{_RELAYED_RESULT}"
+    base = _base(already)
+    _append_final(base, [_SECTION_T1])
+    assert base.metadata["final_message"] == already
+
+
+def test_two_cards_with_the_same_result_each_keep_a_full_section():
+    base = _base("Delegated to t1 and t2.")
+    _append_final(base, [_SECTION_T1, f"Result of delegated task t2:\n{_RELAYED_RESULT}"])
+    final = base.metadata["final_message"]
+    assert final == f"Delegated to t1 and t2.\n\n{_SECTION_T1}\n\nResult of delegated task t2:\n{_RELAYED_RESULT}"
+
+
+def test_a_later_card_whose_answer_repeats_part_of_an_earlier_ones_cuts_nothing():
+    first = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base("Delegated to t1 and t2.")
+    _append_final(base, [f"Result of delegated task t1:\n{first}", f"Result of delegated task t2:\n{_RELAYED_RESULT}"])
+    assert base.metadata["final_message"] == (
+        f"Delegated to t1 and t2.\n\nResult of delegated task t1:\n{first}\n\nResult of delegated task t2:\n{_RELAYED_RESULT}"
+    )
+
+
+def test_a_relay_is_lifted_only_out_of_the_prose_ahead_of_the_sections():
+    base = _base(f"{_RELAYED_RESULT}\n\nArtifact a.md produced by delegated task t1:\n{_RELAYED_RESULT}")
+    _append_final(base, [_SECTION_T1])
+    assert base.metadata["final_message"] == (
+        f"Artifact a.md produced by delegated task t1:\n{_RELAYED_RESULT}\n\n{_SECTION_T1}"
+    )
+
+
+def test_a_shorter_card_folded_first_does_not_cut_a_longer_cards_relay():
+    longer = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base(longer)
+    _append_final(base, [_SECTION_T1, f"Result of delegated task t2:\n{longer}"])
+    assert base.metadata["final_message"] == f"{_SECTION_T1}\n\nResult of delegated task t2:\n{longer}"
+
+
+def test_two_relays_one_inside_the_other_are_each_lifted_whole():
+    longer = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base(f"Both said the same.\n\n{_RELAYED_RESULT}\n\n{longer}")
+    _append_final(base, [_SECTION_T1, f"Result of delegated task t2:\n{longer}"])
+    assert base.metadata["final_message"] == (
+        f"Both said the same.\n\n{_SECTION_T1}\n\nResult of delegated task t2:\n{longer}"
+    )
+
+
+def test_a_relayed_result_keeps_its_indented_first_line():
+    body = "  tree:\n    leaf: 1"
+    base = _base(f"The specialist's tree:\n\n{body}")
+    _append_final(base, [f"Result of delegated task t1:\n{body}"])
+    assert base.metadata["final_message"] == f"The specialist's tree:\n\nResult of delegated task t1:\n{body}"
+
+
+def test_an_artifact_keeps_its_indented_first_line():
+    section = "Artifact a.yaml produced by delegated task t1:\n  key: v\n  k2: v2"
+    base = _base("Read the file.")
+    _append_final(base, [section])
+    assert base.metadata["final_message"] == f"Read the file.\n\n{section}"
+
+
+def test_the_kanban_smokes_specialist_check_reads_a_verbatim_relay():
+    base = _base(_RELAYED_RESULT)
+    _append_delivered(base, _observed_with_card_result("t1", _RELAYED_RESULT), ["t1"])
+    transcript.set(base.output, base.trajectory, final_message=base.metadata["final_message"])
+    check = ReportContainsVerifier(type="report_contains", required_patterns=_kanban_smoke_specialist_patterns())
+    assert check.verify(5.0).status == "pass"
 
 
 # ------------------------------------------------- the ledger pointer

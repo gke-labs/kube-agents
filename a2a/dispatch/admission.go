@@ -1,0 +1,300 @@
+package dispatch
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
+)
+
+// Verifier is the one verifier call the dispatcher makes: may the grant at
+// ref run profile at tier for target, started by trigger (nil for
+// none). It is capability.Client's
+// CheckProfileRun (#3734); a nil error means permitted, an error wrapping
+// ErrVerifierUnreachable means no verifier answered, and anything else is a
+// refusal.
+type Verifier interface {
+	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope, trigger *capability.Trigger) error
+}
+
+// The task parameters that make a cluster target, and the target shapes the
+// verifier is asked about (contract section 6).
+const (
+	paramProject      = "project"
+	paramLocation     = "location"
+	paramCluster      = "cluster"
+	clusterTargetForm = "project/%s/location/%s/cluster/%s"
+	namespaceTarget   = "namespace/"
+)
+
+// errStopping marks an admission that could not finish because the
+// dispatcher is shutting down: not a verdict, so the submission is given
+// back rather than refused.
+var errStopping = errors.New("dispatcher stopping")
+
+// ErrVerifierUnreachable is a Verifier's error when no verifier answered
+// (the bus or the verifiers away, the dispatcher's own connection being
+// replaced): not a verdict, so the submission stays queued and is asked
+// about again, until a verdict or its queue timeout ends it.
+var ErrVerifierUnreachable = errors.New("the verifier could not be reached")
+
+// refusal is an admission verdict against a submission.
+type refusal struct {
+	reason string
+	detail string
+}
+
+// errStopped marks a submission with a stop record (stop.go): ended
+// canceled, never run.
+var errStopped = errors.New("stopped before it started")
+
+// errHeldBack marks an admission that is neither a verdict nor a stop: the
+// submission stays queued, as over a cap, and comes back (an open breaker,
+// or a half-open one trying the oldest held task first).
+var errHeldBack = errors.New("held back at admission")
+
+// noRunner reports whether a task of prof's at tier has nothing to run on,
+// so admission refuses it at once rather than leave it queued until its
+// queue timeout: an unattended tier without Job mode for the profile (no
+// JobRunner, or no Job template, which the operator renders only where the
+// chart installed the Job admission policy) and with no pod in the tier's
+// pool, which the operator builds for the read tier only. A pool that hasn't
+// listed its pods yet says nothing, so a dispatcher just started refuses
+// nothing on it.
+func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
+	if !d.cfg.unattendedFor(prof, tier) || (d.jobs != nil && prof.HasJobTemplate()) {
+		return false
+	}
+	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
+		return false
+	}
+	return len(d.pool.Pods(prof.Name, tier)) == 0
+}
+
+// admit runs the admission checks in order, cheapest first: the tier, a runner
+// for it, the queue age, the parameters, then the verifier. A nil refusal
+// admits, and then cluster is the cluster the verifier permitted the task on
+// (nil when the task names none and was checked against the namespace): the
+// target a task credential for the credential proxy confines it to (#3889). An
+// error is no verdict (errStopping, or a verifier that could not be reached,
+// ErrVerifierUnreachable), and the submission is not refused for it. The
+// verifier's permit is reused for verifiedFor across the same submission's
+// retries over a cap, so a queue waiting on a cap doesn't call the verifier
+// once per retry delay, but only while the retry asks for the same ref and
+// target the permit was given for; the cheap checks run every time.
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (_ admitted, _ *refusal, _ error) {
+	env := del.Envelope()
+	tier := hk.tier
+	if prof.DrainsTier(tier) {
+		return admitted{}, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
+	}
+	if !allowsTier(prof, tier) {
+		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+	}
+	if d.noRunner(prof, tier) {
+		return admitted{}, &refusal{ReasonNoWorker, fmt.Sprintf("no runner for %s on this install: Job mode is off for profile %s, and no %s worker pool serves it", tier, prof.Name, tier)}, nil
+	}
+	if rec := del.Received(); !rec.IsZero() {
+		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
+			return admitted{}, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+		}
+	}
+	if d.stopRequested(ctx, d.log, prof.Name, hk.taskID) {
+		return admitted{}, nil, errStopped
+	}
+	// After the age check: a submission a breaker holds still ends at its
+	// queue timeout.
+	queued := del.Received()
+	if queued.IsZero() {
+		queued = now
+	}
+	// A child of the current half-open probe is part of the probe's own
+	// attempt, not a fresh one: holding it would hold the probe until its
+	// deadline. Every other child waits as a top task does.
+	if !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
+		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
+			func() bool { return d.olderWaiting(hk, queued) }); wait {
+			return admitted{}, nil, errHeldBack
+		}
+	}
+	target, cluster, bad := taskTarget(env, prof, snap.Namespace)
+	if bad != "" {
+		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
+	}
+	if ref := profileParentRefusal(env, snap, prof, hk.kind, target); ref != nil {
+		return admitted{}, ref, nil
+	}
+	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil {
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+	}
+	// The trigger the submission claims is asked about, not trusted: the
+	// verifier permits only when it is the grant's own (#4685).
+	trigger, err := capability.TriggerFromAuthority(env.Authority)
+	switch {
+	case err != nil:
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block's trigger is not well-formed"}, nil
+	case !present:
+		return admitted{}, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
+	case d.verifier == nil:
+		return admitted{}, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
+	}
+	// The permit is for what the verifier was asked: this ref, this target.
+	// The stream keeps one submission per subject and a newer one replaces
+	// it, so a retry can carry another capability or another cluster under
+	// the same key: that is a cache miss, checked afresh, never the old
+	// permit stretched over an unchecked target.
+	asked := permit{ref: ref, target: target, cluster: cluster, trigger: trigger}
+	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger)}
+	d.mu.Lock()
+	p, cached := d.verified[hk]
+	d.mu.Unlock()
+	if cached && now.Sub(p.at) <= verifiedFor && p.covers(asked) {
+		return adm, nil, nil
+	}
+	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target, trigger); err != nil {
+		if ctx.Err() != nil {
+			return admitted{}, nil, errStopping
+		}
+		if errors.Is(err, ErrVerifierUnreachable) {
+			return admitted{}, nil, err
+		}
+		return admitted{}, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
+	}
+	asked.at = now
+	d.mu.Lock()
+	d.verified[hk] = asked
+	d.mu.Unlock()
+	return adm, nil, nil
+}
+
+// admitted is what an admitted submission hands on to its holding: the
+// cluster and the trigger its credential-proxy token carries, each nil when
+// the submission names none.
+type admitted struct {
+	cluster *taskcred.Target
+	trigger *taskcred.Trigger
+}
+
+// credentialTrigger is the verifier-checked trigger in the credential's
+// shape, nil for none.
+func credentialTrigger(t *capability.Trigger) *taskcred.Trigger {
+	if t == nil {
+		return nil
+	}
+	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream}
+}
+
+// permit is a verifier permit admission reuses: when it was given, and the
+// ref, target, cluster and trigger it was given for.
+type permit struct {
+	at      time.Time
+	ref     capability.Ref
+	target  capability.Scope
+	cluster *taskcred.Target
+	trigger *capability.Trigger
+}
+
+// covers says p was given for exactly what q asks: the same ref, the same
+// verifier target, the same cluster fields and the same trigger.
+func (p permit) covers(q permit) bool {
+	if p.ref != q.ref || p.target != q.target || (p.cluster == nil) != (q.cluster == nil) {
+		return false
+	}
+	if (p.trigger == nil) != (q.trigger == nil) || (p.trigger != nil && *p.trigger != *q.trigger) {
+		return false
+	}
+	return p.cluster == nil || *p.cluster == *q.cluster
+}
+
+// taskTarget reads the submission's task parameters, checks them against
+// the profile's declared ones, and builds the verifier's target: the cluster
+// path when the task names a cluster, the install's namespace otherwise.
+// cluster is the same cluster as fields, nil for a namespace target. A
+// non-empty bad is the parameters-invalid detail.
+func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, cluster *taskcred.Target, bad string) {
+	var msg lib.Message
+	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		return "", nil, "the submission's message does not parse"
+	}
+	tp, _, err := lib.TaskParametersOf(msg.Parts)
+	if err != nil {
+		return "", nil, err.Error()
+	}
+	params := tp.Parameters
+	var missing []string
+	for _, p := range prof.Parameters {
+		if _, ok := params[p.Name]; p.Required && !ok {
+			missing = append(missing, p.Name)
+		}
+	}
+	if len(missing) > 0 {
+		return "", nil, "missing required parameters: " + strings.Join(missing, ", ")
+	}
+	project, hasProject := params[paramProject]
+	location, hasLocation := params[paramLocation]
+	clusterName, hasCluster := params[paramCluster]
+	switch {
+	case hasProject && hasLocation && hasCluster:
+		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, clusterName)),
+			&taskcred.Target{Project: project, Location: location, Cluster: clusterName}, ""
+	case hasProject || hasLocation || hasCluster:
+		return "", nil, "a cluster target needs all of project, location and cluster"
+	case namespace == "":
+		return "", nil, "the task names no cluster and the dispatcher has no namespace to scope it to"
+	}
+	return capability.Scope(namespaceTarget + namespace), nil, ""
+}
+
+// parentChainSeparator joins a parent's chain in a parent-cycle refusal.
+const parentChainSeparator = " → "
+
+// profileParentRefusal re-checks a child whose parent is an AgentProfile task
+// (#5686): the gateway holds it to these rules at mint, and this holds the
+// child to them even when the gateway that sent it is an older one that
+// never checked, during a roll or after a rollback. The parent is a profile
+// task when the child's `via.session` names a profile this install
+// dispatches; a session's child names its session pod instead. Such a child
+// must carry the parent's scope (the gateway writes it with the parent's
+// chain), its profile must not be on the parent's chain unless the parent
+// heads it and starts its own profile once, and its target must lie inside
+// the parent's scope, where the install's namespace scope holds any target
+// the install admits. nil admits.
+func profileParentRefusal(env *lib.Envelope, snap lib.DispatchConfig, prof lib.DispatchProfile, kind string, target capability.Scope) *refusal {
+	if kind != lib.SubmitKindChild {
+		return nil
+	}
+	via, err := capability.ViaFromAuthority(env.Authority)
+	if err != nil || via == nil || !dispatchesProfile(snap, via.Session) {
+		return nil
+	}
+	if via.Scope == "" {
+		return &refusal{ReasonParentUnchecked, fmt.Sprintf("a child of profile %s's task carries no parent scope, so its chain and scope were never checked", via.Session)}
+	}
+	chain := append(slices.Clone(via.ProfileChain), via.Session)
+	headSelfNest := len(via.ProfileChain) == 0 && prof.Name == via.Session
+	if slices.Contains(chain, prof.Name) && !headSelfNest {
+		return &refusal{ReasonParentCycle, fmt.Sprintf("profile %s is already on its parent's chain (%s)", prof.Name, strings.Join(chain, parentChainSeparator))}
+	}
+	if via.Scope != capability.NamespaceScope(snap.Namespace) && !via.Scope.Contains(target) {
+		return &refusal{ReasonOutsideParentScope, fmt.Sprintf("target %s is outside its parent's scope %s", target, via.Scope)}
+	}
+	return nil
+}
+
+// dispatchesProfile reports whether name is a profile in snap.
+func dispatchesProfile(snap lib.DispatchConfig, name string) bool {
+	for _, p := range snap.Profiles {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}

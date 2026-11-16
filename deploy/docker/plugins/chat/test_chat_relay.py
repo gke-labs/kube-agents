@@ -938,6 +938,43 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
         )
 
 
+class TestSchedulerFailureFlag(unittest.TestCase):
+    """The scheduler's failure line is flagged so the relay posts it as written."""
+
+    TITLE = "Security & RBAC Posture Audit"
+
+    def send(self, body):
+        with RecordingRelay() as relay:
+            with patch.dict(os.environ, {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url}):
+                asyncio.run(mod.standalone_send(None, "cron-reports", wrapped(self.TITLE, "compliance-audit", body)))
+        return relay.requests[0]["body"]
+
+    def test_a_failure_line_for_this_job_is_flagged(self):
+        body = self.send(
+            "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
+            "Fallback chain exhausted. Full details saved in cron output."
+        )
+        self.assertIs(body["scheduler_failure"], True)
+
+    def test_a_blocked_config_line_is_flagged(self):
+        body = self.send(
+            "⛔ Cron 'Security & RBAC Posture Audit' blocked by configuration validation "
+            "(no LLM call was made): bad model. This alert is sent once."
+        )
+        self.assertIs(body["scheduler_failure"], True)
+
+    def test_a_report_is_not_flagged(self):
+        self.assertNotIn("scheduler_failure", self.send("Security & RBAC Posture Audit: 1 new, 0 resolved."))
+
+    def test_a_failure_line_naming_another_job_is_not_flagged(self):
+        body = self.send("⚠️ Cron 'Stockout Prevention' failed: provider rate limit.")
+        self.assertNotIn("scheduler_failure", body)
+
+    def test_a_long_message_that_starts_like_a_failure_is_not_flagged(self):
+        body = self.send("⚠️ Cron 'Security & RBAC Posture Audit' failed: " + "notes " * 500)
+        self.assertNotIn("scheduler_failure", body)
+
+
 class TestRegistration(unittest.TestCase):
     """What the scheduler reads off the ``PlatformEntry``."""
 

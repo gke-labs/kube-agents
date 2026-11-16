@@ -5,17 +5,55 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import json
 import logging
 import os
+import sys
+import urllib.error
 import urllib.request
 from typing import Any, NamedTuple
 
 import sandbox_artifact_patch
 from credential_proxy_client import authorization_headers
+from slack_relay_patch import is_silent_text
 
 
 LOGGER = logging.getLogger("google-chat-relay-patch")
+
+# Below: what ``hermes send`` needs to reach Chat from a process with no
+# credential of its own.
+#
+# ``hermes send`` runs out of process, so Hermes delivers through the plugin's
+# standalone sender rather than the adapter ``create_adapter`` patches. That
+# sender mints its own token, and in the sandboxed agent there is none to mint:
+# with no service-account JSON it falls back to Application Default
+# Credentials, the metadata server is unreachable from the agent container by
+# design, and every send ends at "token refresh timed out" after ten seconds.
+# On ``spec.mode: today`` that is every incident alert session_kv_server posts.
+
+#: The registry name the plugin registers the platform under.
+PLATFORM_NAME = "google_chat"
+
+#: The module holding Hermes' platform registry singleton, read for an entry
+#: registered before this patch installed (sitecustomize's TRIGGER_MODULE).
+REGISTRY_MODULE = "gateway.platform_registry"
+
+#: Prefix of every error the relayed sender returns. Upstream's own, so a
+#: failure reads the same in the session server's log whichever sender ran.
+STANDALONE_ERROR_PREFIX = "Google Chat standalone send"
+
+#: Where Hermes keeps ``send_error``, the standalone senders' error envelope,
+#: which runs the text through its secret redactor before it reaches the model
+#: transcript. Imported lazily: the module pulls in Hermes' ``agent`` package.
+SEND_ERROR_MODULE = "gateway.platforms._shared"
+
+#: ``messages.create``'s option for a post into an existing thread. Without it
+#: the API ignores ``thread.name`` and starts a new thread; FALLBACK rather than
+#: OR_FAIL still delivers when the thread is gone. Upstream's ``_create_kwargs``
+#: passes it on the SDK path, and the image's build-time edit to
+#: ``_standalone_send`` adds it to the REST one (deploy/docker/Dockerfile).
+THREAD_REPLY_OPTION = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
 
 # Below: what makes a deliverable inlineable when it cannot be attached.
 #
@@ -208,6 +246,44 @@ def _inline_chunks(text: str, *, fenced: bool) -> list[str]:
             head, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
         chunks.append(f"```\n{head}\n```" if fenced else head)
     return chunks
+
+
+def standalone_error(text: str) -> dict[str, Any]:
+    """An error result for the relayed standalone sender, redacted as upstream's are.
+
+    Upstream's senders return ``send_error(...)``; so does this one, wherever
+    Hermes is importable. Without it (these modules' unit tests) the text goes
+    back as given, which carries nothing secret: the relay's own status line, a
+    URLError, a JSON error.
+    """
+    try:
+        send_error = importlib.import_module(SEND_ERROR_MODULE).send_error
+    except Exception:
+        return {"error": text}
+    return send_error(text)
+
+
+def relay_failure_detail(exc: urllib.error.HTTPError) -> str:
+    """What a refused ``/v1/chat/api`` call says about itself, for an error result.
+
+    The credential proxy answers ``502`` with a ``chat`` object carrying the
+    status line when Google Chat itself rejected the call, and a bare ``error``
+    for anything it refused on its own (a malformed request, the relay being
+    disabled). Keeping the two apart is the difference between "that space does
+    not exist" and "the relay is broken".
+    """
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return f"relay error {exc.code}"
+    fields = body.get("chat")
+    if isinstance(fields, dict) and fields.get("status"):
+        reason = fields.get("reason")
+        return f"API returned {fields['status']}" + (f" ({reason})" if reason else "")
+    error = body.get("error")
+    return f"relay error {exc.code}" + (f": {error}" if error else "")
 
 
 def install() -> None:
@@ -506,6 +582,73 @@ def install() -> None:
             )
         adapter_class._credential_proxy_relay_patched = True
 
+    async def relay_standalone_send(
+        pconfig: Any,
+        chat_id: Any,
+        message: Any,
+        *,
+        thread_id: Any = None,
+        media_files: Any = None,
+        force_document: bool = False,
+    ) -> dict[str, Any]:
+        """Post one out-of-process Chat message through the credential proxy.
+
+        Stands in for upstream's ``_standalone_send`` with the same signature
+        and the same result: ``{"success": True, "message_id": <message
+        name>}``, from which session_kv_server derives the alert's thread
+        (``chat_notify.thread_from_response``), or ``{"error": ...}``. Never
+        raises: ``send_message_tool`` folds an exception into a vaguer error,
+        and the scheduler and the session server both read the dict.
+
+        Relays unconditionally rather than deferring to a local credential the
+        way the Slack sender does: the in-process adapter above already ignores
+        any service-account JSON once the relay is configured, and the two
+        paths posting under different identities would be worse than either.
+
+        Does not chunk: ``send_message_tool`` splits against the registry
+        entry's ``max_message_length`` and calls this once per chunk.
+        """
+        # Signature parity, exactly as upstream: its REST path posts text only.
+        del pconfig, media_files, force_document
+        # A silent cron tick, bare or with the marker dressed (``**[SILENT]**``),
+        # is dropped as the Slack relayed sender and the chat plugin drop it:
+        # the three senders are handed the same ``_deliver_result`` text, so
+        # one that posts what its siblings suppress puts the marker in the
+        # channel. ``is_silent_text`` is the Slack sender's predicate, shared
+        # rather than restated.
+        if is_silent_text(message):
+            LOGGER.info(
+                "google chat relay: dropped a %d-character message as a silent tick",
+                len(str(message or "")),
+            )
+            return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_text"}
+        if not chat_id:
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX}: chat_id (space resource) is required")
+        body: dict[str, Any] = {"text": message}
+        arguments: dict[str, Any] = {"parent": str(chat_id), "body": body}
+        if thread_id:
+            body["thread"] = {"name": str(thread_id)}
+            arguments["messageReplyOption"] = THREAD_REPLY_OPTION
+        try:
+            # The same remote facade the in-process adapter posts through, so
+            # both paths put one request shape on the wire. ``execute`` is a
+            # blocking urlopen; cron delivery runs under asyncio.run, so it
+            # goes to a thread rather than stalling the loop.
+            operation = RemoteResource().spaces().messages().create(**arguments)
+            response = await asyncio.to_thread(operation.execute)
+        except urllib.error.HTTPError as exc:
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX}: {relay_failure_detail(exc)}")
+        except Exception as exc:
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX} failed: {exc}")
+        name = response.get("name") if isinstance(response, dict) else None
+        return {"success": True, "message_id": name}
+
+    relay_standalone_send._credential_proxy_relay_patched = True
+
+    def patch_google_chat_entry(entry: Any) -> None:
+        """Give a registered Google Chat entry the relay-backed sender."""
+        entry.standalone_sender_fn = relay_standalone_send
+
     from gateway.platform_registry import PlatformRegistry
 
     original_registry_create = PlatformRegistry.create_adapter
@@ -523,3 +666,57 @@ def install() -> None:
 
         PlatformRegistry.create_adapter = create_adapter
         PlatformRegistry._credential_proxy_relay_patched = True
+
+    # ``create_adapter`` fires only where a live adapter is built. ``hermes
+    # send`` and a cron tick build none: they look the entry up in the registry
+    # and call its ``standalone_sender_fn``, so that is what has to be swapped,
+    # as the plugin registers it. The import that brings the registry in is
+    # what fires sitecustomize's hook in those processes too.
+    original_registry_register = getattr(PlatformRegistry, "register", None)
+    if original_registry_register is not None and not getattr(
+        PlatformRegistry, "_google_chat_standalone_relay_patched", False
+    ):
+
+        # Forwarded blind past ``entry``, for the reason slack_relay_patch's
+        # wrapper of the same method gives at length: every platform registers
+        # through the class, so a restated signature that goes stale takes all
+        # of them down. The frame-depth caveat it describes for an omitted
+        # ``scope`` holds with this wrapper stacked on that one, for the same
+        # reasons: neither module is a plugin namespace.
+        def register(self: Any, entry: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(entry, "name", None) == PLATFORM_NAME:
+                try:
+                    patch_google_chat_entry(entry)
+                except Exception:
+                    # Raised from the trigger import, this would disable the
+                    # relay for the life of the process and say nothing.
+                    LOGGER.warning(
+                        "Google Chat relay entry patch failed", exc_info=True
+                    )
+            return original_registry_register(self, entry, *args, **kwargs)
+
+        PlatformRegistry.register = register
+        PlatformRegistry._google_chat_standalone_relay_patched = True
+
+        # An entry registered before this ran is reached by no future
+        # register(). Defensive only: sitecustomize installs this as the
+        # registry module finishes executing, before anything registers. Both
+        # maps, since a scoped registration lands in ``_scoped_entries``.
+        try:
+            registry_module = sys.modules.get(REGISTRY_MODULE)
+            singleton = getattr(registry_module, "platform_registry", None)
+            entries = getattr(singleton, "_entries", None)
+            scoped = getattr(singleton, "_scoped_entries", None)
+            readable = [entries] if isinstance(entries, dict) else []
+            if isinstance(scoped, dict):
+                readable.extend(
+                    scope_entries
+                    for scope_entries in scoped.values()
+                    if isinstance(scope_entries, dict)
+                )
+            for scope_entries in readable:
+                chat_entry = scope_entries.get(PLATFORM_NAME)
+                if chat_entry is not None:
+                    patch_google_chat_entry(chat_entry)
+        except Exception:
+            LOGGER.debug("No pre-registered Google Chat entry to patch", exc_info=True)

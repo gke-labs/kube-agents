@@ -90,12 +90,12 @@ func TestLiveKVCreateAndInject(t *testing.T) {
 		t.Errorf("sessionID %q does not carry the daemon's k8s-evt- prefix", sessionID)
 	}
 
-	status, err := inj.Inject(ctx, sessionID, testPayload("CrashLoopBackOff"))
+	answer, err := inj.InjectDetailed(ctx, sessionID, testPayload("CrashLoopBackOff"))
 	if err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
-	if status != "injected" {
-		t.Errorf("expected status injected, got %q", status)
+	if answer.Status != "injected" {
+		t.Errorf("expected status injected, got %q", answer.Status)
 	}
 }
 
@@ -114,24 +114,24 @@ func TestLiveKVQuotaSuppression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	status, err := inj.Inject(ctx, first, testPayload("CrashLoopBackOff"))
+	answer, err := inj.InjectDetailed(ctx, first, testPayload("CrashLoopBackOff"))
 	if err != nil {
 		t.Fatalf("first Inject: %v", err)
 	}
-	if status != "injected" {
-		t.Fatalf("first inject expected injected, got %q", status)
+	if answer.Status != "injected" {
+		t.Fatalf("first inject expected injected, got %q", answer.Status)
 	}
 
 	second, err := inj.CreateSession(ctx)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	status, err = inj.Inject(ctx, second, testPayload("CrashLoopBackOff"))
+	answer, err = inj.InjectDetailed(ctx, second, testPayload("CrashLoopBackOff"))
 	if err != nil {
 		t.Fatalf("second Inject: %v", err)
 	}
-	if status != injectStatusSuppressed {
-		t.Errorf("expected %q on the spent quota, got %q", injectStatusSuppressed, status)
+	if answer.Status != injectStatusSuppressed {
+		t.Errorf("expected %q on the spent quota, got %q", injectStatusSuppressed, answer.Status)
 	}
 }
 
@@ -147,7 +147,7 @@ func TestLiveKVBadBearer(t *testing.T) {
 		t.Errorf("expected a 401 in the error, got: %v", err)
 	}
 
-	if _, err := inj.Inject(ctx, "k8s-evt-nonexistent", testPayload("Evicted")); err == nil {
+	if _, err := inj.InjectDetailed(ctx, "k8s-evt-nonexistent", testPayload("Evicted")); err == nil {
 		t.Error("Inject with a bad bearer must fail")
 	} else if !strings.Contains(err.Error(), "401") {
 		t.Errorf("expected a 401 in the error, got: %v", err)

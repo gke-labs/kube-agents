@@ -25,9 +25,12 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // calloutFixturePath is the rendered map the a2a module's callout parses in its
@@ -46,12 +49,25 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 	}
 }
 
+// singleA2AAuthMapShard renders the map and returns its one shard and the
+// version. The maps these tests render fit in one shard by a wide margin, and
+// a test that reads shard 0 of several would be reading part of the map, so a
+// render that cuts more than one is a failure here, not a thing to pick from.
+func singleA2AAuthMapShard(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string) {
+	t.Helper()
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
+	if err != nil {
+		t.Fatalf("buildA2AAuthMapConfigMaps: %v", err)
+	}
+	if len(cms) != 1 {
+		t.Fatalf("the map rendered as %d shards; this test reads one", len(cms))
+	}
+	return cms[0], version
+}
+
 func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T) {
 	agent := authMapTestAgent()
-	cm, version, err := buildA2AAuthMapConfigMap(agent, nil)
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, version := singleA2AAuthMapShard(t, agent, nil)
 
 	var doc a2aAuthMapDocument
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
@@ -81,6 +97,17 @@ func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T)
 	}
 	if cm.Annotations[a2aAuthMapVersionAnnotation] != version {
 		t.Errorf("version annotation = %q, want %q", cm.Annotations[a2aAuthMapVersionAnnotation], version)
+	}
+	// A map that fits is shard 0 of 1, stamped as such inside and out, under
+	// the numbered name: the callout watches no other.
+	if doc.Shard != 0 || doc.Shards != 1 {
+		t.Errorf("a one-shard map is stamped shard %d of %d, want 0 of 1", doc.Shard, doc.Shards)
+	}
+	if cm.Name != agent.Name+"-a2a-authmap-0" {
+		t.Errorf("the one shard is named %q, want %q", cm.Name, agent.Name+"-a2a-authmap-0")
+	}
+	if cm.Annotations[a2aAuthMapShardAnnotation] != "0" || cm.Annotations[a2aAuthMapShardsAnnotation] != "1" {
+		t.Errorf("shard annotations = %q of %q, want 0 of 1", cm.Annotations[a2aAuthMapShardAnnotation], cm.Annotations[a2aAuthMapShardsAnnotation])
 	}
 }
 
@@ -153,10 +180,7 @@ func TestTheMapKeysOnTheServiceAccountTheProvisionJobRunsAs(t *testing.T) {
 // silently undoes it. Every subject list here is full of > wildcards and the
 // escaped form is what an operator would be reading at 3 AM.
 func TestTheRenderedMapIsReadable(t *testing.T) {
-	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent(), nil)
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, authMapTestAgent(), nil)
 	body := cm.Data[a2aAuthMapKey]
 
 	// The escape Go's default encoder would emit for the NATS wildcard,
@@ -176,10 +200,7 @@ func TestTheRenderedMapIsReadable(t *testing.T) {
 // its own test suite, with unknown fields refused, so a field renamed here
 // without being renamed there fails on the other side of the repo.
 func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
-	cm, _, err := buildA2AAuthMapConfigMap(authMapTestAgent(), nil)
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, authMapTestAgent(), nil)
 	rendered := cm.Data[a2aAuthMapKey]
 
 	path := filepath.Clean(calloutFixturePath)
@@ -221,7 +242,23 @@ func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
 const natsConfFixturePath = "../../../a2a/authcallout/testdata/rendered-nats.conf"
 
 func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	// A single-server render: the callout suite starts one server from this
+	// file, and a cluster block would have it wait for peers that do not
+	// exist. TestTheRenderedClusterFormsOverVerifiedRoutes runs the cluster.
+	agent := authMapTestAgent()
+	if agent.Spec.Harness == nil {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	}
+	if agent.Spec.Harness.Tuning == nil {
+		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+
+	// The two values the pod supplies and a test process cannot: the server
+	// name, from the pod's env, and a pid file on the pod's data volume.
+	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-nats-0", 1)
+	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: ""`, 1)
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these
@@ -294,7 +331,7 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 			{
 				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
 				User:           "gateway",
-				Account:        a2aAccountApp,
+				Account:        a2aAccountControl,
 				Grants: a2aAuthMapGrants{
 					Publish:   []string{"a2a.tasks.>"},
 					Subscribe: []string{"_INBOX.gateway.>"},
@@ -320,6 +357,14 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 		},
 		"a narrowed entry carrying only a subscribe": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
 			ids[1].Grants.Subscribe = []string{"a2a.tasks.>"}
+			return ids
+		},
+		"a narrowed entry in the control account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].Account = a2aAccountControl
+			return ids
+		},
+		"an entry in the console account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Account = a2aAccountConsole
 			return ids
 		},
 		"a narrowing the callout does not implement": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
@@ -385,6 +430,9 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"1": {"account", "grants", "identities", "publish", "serviceAccount", "subscribe", "user", "version"},
 	"2": {"account", "grants", "identities", "narrowing", "publish", "serviceAccount", "subscribe", "user", "version"},
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
+	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
+	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -413,16 +461,23 @@ func a2aJSONKeys(v any, into map[string]bool) {
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
 
-	// With a profile that has topics, so every key the renderer can emit is
+	// With a profile that has topics, and the dispatcher's bucketed entry
+	// with a draining profile, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema
 	// and roll nothing.
-	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	auditor := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
 		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
-	})})
-	if err != nil {
-		t.Fatalf("rendering the auth map: %v", err)
+	})
+	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
+		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
+	cms, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{auditor}, draining)
+	if err != nil || len(cms) != 1 {
+		t.Fatalf("rendering the auth map: %d shards, %v", len(cms), err)
 	}
+	cm := cms[0]
 	var doc any
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
 		t.Fatalf("decoding the rendered auth map: %v", err)
@@ -448,7 +503,7 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 
 	// The constant is only worth anything if it reaches the pod template,
 	// which is the thing that actually rolls.
-	dep := buildA2ACalloutDeployment(agent)
+	dep := buildA2ACalloutDeployment(agent, "", 1)
 	if got := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; got != a2aIdentityMapSchema {
 		t.Errorf("the callout pod template's %s annotation is %q, want %q; without it on the TEMPLATE a schema bump changes no pod spec and the old callout is never rolled",
 			a2aIdentityMapSchemaAnnotation, got, a2aIdentityMapSchema)
@@ -459,7 +514,7 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 // the template is part of the pod spec the Deployment controller diffs, so an
 // annotation one level up would look like a fix and roll nothing.
 func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
-	dep := buildA2ACalloutDeployment(a2aTestAgent())
+	dep := buildA2ACalloutDeployment(a2aTestAgent(), "", 1)
 	if _, onDeployment := dep.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; onDeployment {
 		if _, onTemplate := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; !onTemplate {
 			t.Error("the schema annotation is on the Deployment but not its pod template; changing it would roll nothing")

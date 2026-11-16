@@ -1,0 +1,145 @@
+{
+  "type": "CARD_CLICKED",
+  "eventTime": "2026-10-30T01:46:08.760777Z",
+  "message": {
+    "name": "spaces/rj0PRyAAAAE/messages/SiNPVaUGVPc.SiNPVaUGVPc",
+    "sender": {
+      "name": "users/115322364361294764187",
+      "displayName": "Kage (bhoekstra)",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED=k-no",
+      "type": "BOT",
+      "domainId": "REDACTED"
+    },
+    "createTime": "2026-10-30T01:42:04.764143Z",
+    "text": "*Live test: which cluster should I look at first?* 2 candidates\n\nBoth run *checkout-gateway*; only one is in `us-central1`.\n\n- `major` `kube-agents-cluster` restarts every 10 minutes\n  OOMKilled, exit 137\n- `platform-agent-host` is healthy\n\n*why*\nEach cluster's last restart, as `kubectl` reported it.\n```\ncluster             | restarts | last\n--------------------+----------+--------\nkube-agents-cluster | 6        | 10m ago\nplatform-agent-host | 0        | never\n```",
+    "thread": {
+      "name": "spaces/rj0PRyAAAAE/threads/SiNPVaUGVPc",
+      "retentionSettings": {
+        "state": "PERMANENT"
+      }
+    },
+    "space": {
+      "name": "spaces/rj0PRyAAAAE",
+      "type": "DM",
+      "singleUserBotDm": true,
+      "spaceThreadingState": "THREADED_MESSAGES",
+      "spaceType": "DIRECT_MESSAGE",
+      "spaceHistoryState": "HISTORY_ON",
+      "lastActiveTime": "2026-10-30T01:43:51.038783Z",
+      "membershipCount": {
+        "joinedDirectHumanUserCount": 1
+      },
+      "spaceUri": "https://chat.google.com/dm/rj0PRyAAAAE?cls=11"
+    },
+    "argumentText": "*Live test: which cluster should I look at first?* 2 candidates\n\nBoth run *checkout-gateway*; only one is in `us-central1`.\n\n- `major` `kube-agents-cluster` restarts every 10 minutes\n  OOMKilled, exit 137\n- `platform-agent-host` is healthy\n\n*why*\nEach cluster's last restart, as `kubectl` reported it.\n```\ncluster             | restarts | last\n--------------------+----------+--------\nkube-agents-cluster | 6        | 10m ago\nplatform-agent-host | 0        | never\n```",
+    "retentionSettings": {
+      "state": "PERMANENT"
+    },
+    "messageHistoryState": "HISTORY_ON",
+    "formattedText": "*Live test: which cluster should I look at first?* 2 candidates\n\nBoth run *checkout-gateway*; only one is in `us-central1`.\n\n- `major` `kube-agents-cluster` restarts every 10 minutes\n  OOMKilled, exit 137\n- `platform-agent-host` is healthy\n\n*why*\nEach cluster's last restart, as `kubectl` reported it.\n```\ncluster             | restarts | last\n--------------------+----------+--------\nkube-agents-cluster | 6        | 10m ago\nplatform-agent-host | 0        | never\n```",
+    "accessoryWidgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "text": "kube-agents-cluster",
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "kube-agents-cluster: is it the host cluster of this install? Answer in one line."
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "type": "FILLED"
+            },
+            {
+              "text": "platform-agent-host",
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "platform-agent-host: which GCP project is it in? Answer in one line."
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "text": "Cloud Console",
+              "onClick": {
+                "openLink": {
+                  "url": "https://console.cloud.google.com/kubernetes/list?project=bhoekstra-gkedemos"
+                }
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "markupSyntax": "MARKUP_SYNTAX_CHAT"
+  },
+  "user": {
+    "name": "users/100000000000000000042",
+    "displayName": "Test Sender",
+    "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED=k-no",
+    "email": "sender@example.com",
+    "type": "HUMAN",
+    "domainId": "REDACTED"
+  },
+  "space": {
+    "name": "spaces/rj0PRyAAAAE",
+    "type": "DM",
+    "singleUserBotDm": true,
+    "spaceThreadingState": "THREADED_MESSAGES",
+    "spaceType": "DIRECT_MESSAGE",
+    "spaceHistoryState": "HISTORY_ON",
+    "lastActiveTime": "2026-10-30T01:43:51.038783Z",
+    "membershipCount": {
+      "joinedDirectHumanUserCount": 1
+    },
+    "spaceUri": "https://chat.google.com/dm/rj0PRyAAAAE?cls=11"
+  },
+  "action": {
+    "actionMethodName": "kage.choice",
+    "parameters": [
+      {
+        "key": "reply",
+        "value": "platform-agent-host: which GCP project is it in? Answer in one line."
+      },
+      {
+        "key": "choice",
+        "value": "1"
+      }
+    ]
+  },
+  "common": {
+    "userLocale": "en",
+    "hostApp": "CHAT",
+    "timeZone": {
+      "id": "America/Toronto",
+      "offset": -14400000
+    },
+    "parameters": {
+      "reply": "platform-agent-host: which GCP project is it in? Answer in one line.",
+      "choice": "1"
+    },
+    "invokedFunction": "kage.choice"
+  },
+  "thread": {
+    "name": "spaces/rj0PRyAAAAE/threads/SiNPVaUGVPc"
+  }
+}

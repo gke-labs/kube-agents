@@ -1,0 +1,52 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*First look at your fleet: two things to fix first*\n\n1 cluster scanned in full · 9 configuration checks\n\n- `critical` invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key · Anyone who reads the Secret holds editor on the project. Move it to Workload Identity.\n- `critical` log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists · No node ships its logs. Point log-shipper at a published tag.\n\n5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.\n\n*What the scan checked*\nstartup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Fix the first one: invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "Fix the first one",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "See all 7 items"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "See all 7 items"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

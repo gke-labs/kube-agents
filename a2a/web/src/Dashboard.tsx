@@ -6,13 +6,21 @@
 import { useEffect, useRef } from "react";
 import {
   KV_TBD_REASON,
-  SPEND_TBD_REASON,
+  SPEND_EMPTY_REASON,
+  SPEND_TASK_NONE_REASON,
   capacities,
   conversationsByBackend,
   currentTaskOf,
   fmtAgo,
+  fmtCost,
+  fmtDuration,
+  fmtTokenCounts,
+  fmtUsage,
   livenessOf,
   recentTasks,
+  spendCoverage,
+  spendOf,
+  taskSpend,
   taskTimes,
 } from "./derive.ts";
 import { corrColor, type UiState } from "./model.ts";
@@ -63,6 +71,7 @@ export default function Dashboard({
   const tasks = recentTasks(state, RECENT_TASKS);
   const groups = conversationsByBackend(state);
   const topics = [...state.topics.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const spend = spendOf(state);
 
   return (
     <div className="dashboard" ref={root}>
@@ -137,7 +146,7 @@ export default function Dashboard({
                   <td>{t.addressee}</td>
                   <td>{t.state}</td>
                   <td>{taskTimes(t)}</td>
-                  <td title={SPEND_TBD_REASON}>tbd</td>
+                  <td title={t.usage ? fmtUsage(t.usage) : SPEND_TASK_NONE_REASON}>{taskSpend(t)}</td>
                   <td>{t.reason ?? ""}</td>
                 </tr>
               ))}
@@ -210,13 +219,32 @@ export default function Dashboard({
       </Panel>
 
       <Panel id="spend" title="spend" focused={is("spend")}>
-        {["tokens", "cost", "model", "harness duration"].map((f) => (
-          <div key={f} className="anomaly-row">
-            <span>{f}</span>
-            <span>tbd</span>
-          </div>
-        ))}
-        <p className="panel-empty">{SPEND_TBD_REASON}</p>
+        {spend.total === undefined ? (
+          <Empty text={SPEND_EMPTY_REASON} />
+        ) : (
+          [
+            ["tasks reporting", `${spend.reported}`],
+            [
+              "tokens",
+              spend.total.inputTokens === undefined && spend.total.outputTokens === undefined
+                ? "not reported"
+                : `${fmtTokenCounts(spend.total)}${spendCoverage(spend.counted, spend.reported)}`,
+            ],
+            [
+              "cost",
+              spend.total.costUsd === undefined
+                ? "not reported"
+                : `${fmtCost(spend.total.costUsd)}${spendCoverage(spend.priced, spend.reported)}`,
+            ],
+            ["model", spend.models.length === 0 ? "not reported" : spend.models.join(", ")],
+            ["turn time", spend.total.durationMs === undefined ? "not reported" : fmtDuration(spend.total.durationMs)],
+          ].map(([f, v]) => (
+            <div key={f} className="anomaly-row">
+              <span>{f}</span>
+              <span>{v}</span>
+            </div>
+          ))
+        )}
       </Panel>
     </div>
   );

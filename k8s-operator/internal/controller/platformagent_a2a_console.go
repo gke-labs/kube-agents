@@ -82,29 +82,52 @@ const (
 	a2aConsoleLocalHost    = "localhost"
 	a2aConsoleLoopbackHost = "127.0.0.1"
 	a2aConsoleHostSep      = ","
-	// The scheme for both the console server's own origin (as the browser
-	// asserts it) and the bus URL the proxy dials. Both are plain http: the
-	// browser origin because the port-forward is unencrypted, and the bus
-	// dial because the proxy upgrades the connection itself.
+	// The console server's own origin as the browser asserts it: plain http,
+	// because the browser's end of the port-forward is.
 	a2aConsoleOriginScheme = "http://"
-	a2aConsoleOriginSep    = ", "
+	// The bus URL the proxy dials: https, because the websocket listener
+	// serves TLS (renderA2ANATSConf), and not wss, because the proxy is an
+	// HTTP reverse proxy that upgrades the connection itself.
+	a2aConsoleBusScheme = "https://"
+	a2aConsoleOriginSep = ", "
 
 	// The binary's environment (a2a/cmd/console).
 	a2aConsoleEnvBusURL       = "CONSOLE_BUS_URL"
 	a2aConsoleEnvUser         = "CONSOLE_USER"
 	a2aConsoleEnvPasswordFile = "CONSOLE_PASSWORD_FILE"
 	a2aConsoleEnvAllowedHosts = "CONSOLE_ALLOWED_HOSTS"
+	// a2aConsoleMemoryLimitEnvVar carries the container's memory limit in
+	// bytes, written by the Downward API from its own limits.memory
+	// (a2aConsoleMemoryLimitResource), which the console turns into the Go
+	// runtime's soft memory limit (nine tenths of it; an explicit GOMEMLIMIT
+	// wins). The same name the chart's web console reads, so the two console
+	// binaries share one contract. Read from the container itself so that
+	// on Autopilot it is the limit the cluster admitted, a clamp to the
+	// request included, rather than a2aConsoleMemoryLimit.
+	a2aConsoleMemoryLimitEnvVar   = "WEB_CONSOLE_MEMORY_LIMIT_BYTES"
+	a2aConsoleMemoryLimitResource = "limits.memory"
 
 	a2aConsoleReadinessPeriod  = 5
 	a2aConsoleReadinessFailure = 3
 	a2aConsoleLivenessPeriod   = 10
 	a2aConsoleLivenessFailure  = 6
-	// GKE Autopilot raises any CPU request under 50m on admission, so a
-	// smaller one is rewritten on every apply and the stored Deployment
-	// never matches the render. Sized like the gateway and the verifier.
-	a2aConsoleCPURequest    = "50m"
-	a2aConsoleMemoryRequest = "64Mi"
-	a2aConsoleMemoryLimit   = "128Mi"
+	// Sized for GKE Autopilot without Pod bursting, which sets each limit
+	// to its request: the request is what the console then runs under, so
+	// it is the figure that has to hold a page served with the bus proxy
+	// behind it, and the limit is the room it gets where bursting is on.
+	// The requests pair sits in the 1 to 6.5 GiB per vCPU band Autopilot
+	// admits unchanged (and above the 50m it raises smaller CPU requests
+	// to), so the stored Deployment matches the render on every apply.
+	a2aConsoleCPURequest    = "100m"
+	a2aConsoleMemoryRequest = "128Mi"
+	a2aConsoleMemoryLimit   = "256Mi"
+	// A namespace ResourceQuota on limits.cpu refuses a pod with a container
+	// that declares no CPU limit, so the console needs one (#3847). Measured
+	// over seven days on the dev installs (2026-10-30, 1-minute rates, five
+	// next-mode installs): p99 0.4m, peak 10m. A limit only throttles, and a
+	// 1-minute rate hides sub-minute bursts, so it takes the band the callout
+	// and verifier use rather than a multiple of that near-zero peak.
+	a2aConsoleCPULimit = "500m"
 )
 
 func a2aConsoleImage() string {
@@ -142,10 +165,10 @@ func a2aConsoleOriginList() string {
 }
 
 // a2aNATSWebSocketURL is the bus's websocket listener as the proxy dials it.
-// http, not ws: the proxy is an HTTP reverse proxy and upgrades on the way
-// through.
+// The host is one of the serving certificate's SANs (a2aNATSDNSNames), which
+// the proxy verifies against the CA bundle.
 func a2aNATSWebSocketURL(agent *agentv1alpha1.PlatformAgent) string {
-	return fmt.Sprintf("%s%s.%s.svc:%d", a2aConsoleOriginScheme, a2aNATSName(agent), agent.Namespace, a2aNATSWebSocketPort)
+	return fmt.Sprintf("%s%s.%s.svc:%d", a2aConsoleBusScheme, a2aNATSName(agent), agent.Namespace, a2aNATSWebSocketPort)
 }
 
 // buildA2AConsoleDeployment renders the console server.
@@ -198,7 +221,13 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							}},
 							Optional: ptr.To(true),
 						}},
-					}},
+					},
+						// The bus CA the proxy verifies the websocket
+						// listener against. Not optional: without it the
+						// server refuses to start rather than dial the bus
+						// unverified.
+						a2aNATSCABundleVolume(agent),
+					},
 					Containers: []corev1.Container{{
 						Name:  a2aConsoleContainer,
 						Image: a2aConsoleImage(),
@@ -213,13 +242,17 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: a2aConsoleEnvUser, Value: a2aConsoleConfUser},
 							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleMountDir, a2aConsolePasswordKey)},
 							{Name: a2aConsoleEnvAllowedHosts, Value: strings.Join(a2aConsoleHosts(), a2aConsoleHostSep)},
+							a2aNATSCAFileEnvVar(),
+							{Name: a2aConsoleMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+								Resource: a2aConsoleMemoryLimitResource,
+							}}},
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aConsolePortName, ContainerPort: a2aConsolePort}},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      a2aConsoleKeyVolume,
 							MountPath: a2aConsoleMountDir,
 							ReadOnly:  true,
-						}},
+						}, a2aNATSCABundleMount()},
 						// /healthz is the one path the server answers for any
 						// Host. The kubelet sends the pod IP, which the Host
 						// check would refuse everywhere else.
@@ -243,6 +276,7 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								corev1.ResourceMemory: resource.MustParse(a2aConsoleMemoryRequest),
 							},
 							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(a2aConsoleCPULimit),
 								corev1.ResourceMemory: resource.MustParse(a2aConsoleMemoryLimit),
 							},
 						},

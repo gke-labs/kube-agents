@@ -93,9 +93,10 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	now := metav1.Now()
 	full := agentv1alpha1.AgentUsageStatus{
 		SessionsTotal: 3, EventsIngestedTotal: 4, ToolExecutionsTotal: 5,
-		RemediationsProposedTotal: 6, RemediationsAppliedTotal: 7, RemediationsMergedTotal: 10, ChatMessagesInboundTotal: 11,
+		RemediationsProposedTotal: 6, RemediationsMergedTotal: ptr.To(int64(10)), ChatMessagesInboundTotal: 11, ToolExecutionsBlockedTotal: 12, BrokerFailuresTotal: 13, ChatTurnsErroredTotal: 14, BackgroundTasksGaveUpTotal: 15, NegativeFeedbackTotal: 16, PositiveFeedbackTotal: 21, InputTokensTotal: 22, OutputTokensTotal: 23, SpendMicrosUSDTotal: 24, RemediationsClosedUnmergedTotal: ptr.To(int64(17)),
+		RemediationsOpen: ptr.To(int64(18)), ProposalsAuthored: ptr.To(int64(19)), ProposalHumanTouches: ptr.To(int64(20)), ProposalsMergedUntouched: ptr.To(int64(0)),
 		ClustersRegistered: ptr.To(int64(8)), ClustersMonitored: ptr.To(int64(9)),
-		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now,
+		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now, LastHumanActiveTime: &now,
 	}
 	got, err = json.Marshal(full)
 	if err != nil {
@@ -107,15 +108,15 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	}
 	for _, key := range []string{
 		"sessionsTotal", "eventsIngestedTotal", "toolExecutionsTotal",
-		"remediationsProposedTotal", "remediationsAppliedTotal", "remediationsMergedTotal", "chatMessagesInboundTotal",
-		"clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime",
+		"remediationsProposedTotal", "remediationsMergedTotal", "chatMessagesInboundTotal",
+		"toolExecutionsBlockedTotal", "brokerFailuresTotal", "chatTurnsErroredTotal", "backgroundTasksGaveUpTotal", "negativeFeedbackTotal", "positiveFeedbackTotal", "inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal", "remediationsClosedUnmergedTotal", "remediationsOpen", "proposalsAuthored", "proposalHumanTouches", "proposalsMergedUntouched", "clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime", "lastHumanActiveTime",
 	} {
 		if _, ok := decoded[key]; !ok {
 			t.Errorf("serialised form lacks %q: %s", key, got)
 		}
 	}
-	if len(decoded) != 11 {
-		t.Errorf("serialised form has %d keys, want 11: %s", len(decoded), got)
+	if len(decoded) != 25 {
+		t.Errorf("serialised form has %d keys, want 25: %s", len(decoded), got)
 	}
 }
 
@@ -314,7 +315,7 @@ func TestAPrunedUsageStatusIsLoggedOncePerRecord(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	settle := func() {
 		t.Helper()
-		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+		if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 			t.Fatalf("updateStatusReady: %v", err)
 		}
 	}
@@ -364,12 +365,15 @@ func TestReconcileRequeuesAtTheIntervalWhileAUsageRecordIsHeld(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
-	// The finalizer, then the workload and the status, then a settled pass.
+	// The finalizer, then the workload and the status, then the A2A stack
+	// settled (its pending requeue would mask the interval under test), then
+	// a settled pass.
 	for pass := 1; pass <= 2; pass++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile %d: %v", pass, err)
 		}
 	}
+	settleA2AStack(t, ctx, cl, r, req, agent)
 	settled, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("settled Reconcile: %v", err)

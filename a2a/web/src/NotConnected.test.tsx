@@ -43,6 +43,13 @@ describe("NotConnected", () => {
   it("shows the read-only recipe for a named user with no password, and no inputs", () => {
     render(<NotConnected error={null} namedUser="web" onRetry={() => {}} />);
     expect(screen.getByText(/user=web&pass=/)).toBeTruthy();
+    // Through the console server's proxy: the bus's own 9222 serves TLS a
+    // browser cannot verify.
+    expect(screen.getByText(/\?ws=ws:\/\/localhost:8080\/bus&user=web/)).toBeTruthy();
+    expect(
+      screen.getByText("kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080"),
+    ).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/a2a-nats|9222/);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(document.querySelector("input")).toBeNull();
   });

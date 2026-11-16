@@ -52,6 +52,8 @@ CONFIG = {
         "**": ["repository-owners", "repository-reviewers"],
         "hack/eval/presubmit-cases.txt": ["eval-crew"],
         "hack/eval/blocking-roster.txt": ["eval-crew"],
+        "hack/eval/inject-lane-exclusions.txt": ["eval-crew"],
+        "hack/eval/inject-lane-safeguards.yaml": ["eval-crew"],
     },
     "options": {
         "ignore_draft": True,
@@ -63,6 +65,18 @@ CONFIG = {
     },
 }
 
+# hack/ci-eval-pr.sh, which grades every pull request with main's grader, and
+# the files that run inside it: they fall through to the root approvers and the
+# default reviewers like any other change.
+GRADER_PIN_FILES = (
+    "hack/ci-eval-pr.sh",
+    "hack/ci-env.sh",
+    "hack/fleet-kubeconfigs.sh",
+    "hack/ci-deploy.sh",
+    "hack/ci-revalidate.sh",
+    "hack/fleet-fixture-state.py",
+    "scripts/installer/gke_dns_endpoint.sh",
+)
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
 REVIEWERS = CONFIG["reviewers"]["groups"]["repository-reviewers"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
@@ -90,6 +104,9 @@ OWNERS_TREE = {
     "hack/OWNERS": (
         "filters:\n"
         "  'eval/(presubmit-cases|blocking-roster)\\.txt$':\n"
+        "    approvers:\n"
+        "    - eval-crew\n"
+        "  '^replay-proxy/':\n"
         "    approvers:\n"
         "    - eval-crew\n"
         "options:\n"
@@ -374,25 +391,29 @@ class SelectionTest(unittest.TestCase):
         # blocking-roster.txt (hack/OWNERS, no_parent_owners), so a random root
         # owner would review a pull request they cannot clear, and nothing
         # would tell eval-crew it exists.
-        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+        for path in (
+            "hack/eval/presubmit-cases.txt",
+            "hack/eval/blocking-roster.txt",
+            "hack/eval/inject-lane-exclusions.txt",
+            "hack/eval/inject-lane-safeguards.yaml",
+        ):
             with self.subTest(path=path):
                 self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), EVAL_CREW)
                 self.assertIn(self.select([path])[0], EVAL_CREW)
 
-    def test_the_nightly_file_a_case_and_the_script_stay_with_root(self):
+    def test_the_nightly_file_a_case_and_the_deploy_script_stay_with_root(self):
         # Decision A (#1546, 2026-09-15): the nightly file, a new case directory
-        # and ci-eval-pr.sh itself fall through to the root OWNERS, so they
-        # route to the default reviewers like any other change.
-        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/ci-eval-pr.sh", "hack/ci-deploy.sh"):
+        # and hack/'s subprocess helpers fall through to the root OWNERS, so they
+        # route to the default reviewers like any other change. ci-eval-pr.sh
+        # and the files that run inside it are among them.
+        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/boskos_heartbeat.sh", *GRADER_PIN_FILES):
             with self.subTest(path=path):
                 self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), POOL)
 
     def test_a_mixed_change_still_goes_to_eval_crew(self):
         # Last match wins, and eval-crew is listed last: the reviewer who can
-        # clear the roster half is asked. Not every member is a root owner, so
-        # the README half may still wait on a root approver's /approve; the
-        # alternative, a random root owner who cannot clear the roster at all,
-        # is the gap this entry closes.
+        # clear the roster half is asked. Not every member is a root owner;
+        # `draw_covering` then draws a root approver for the README half.
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "hack/eval/presubmit-cases.txt"], "author")
         self.assertEqual(matched, EVAL_CREW)
 
@@ -443,10 +464,10 @@ class SelectionTest(unittest.TestCase):
         # the /approve, so only the OWNERS approvers for the change are drawn.
         config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
         approvers = {name.lower() for name in OWNERS}
-        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to=approvers)
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), approvers_by_file={"README.md": approvers})
         self.assertEqual(picked, OWNERS)
         for seed in range(20):
-            picked = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), restrict_to=approvers)
+            picked = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), approvers_by_file={"README.md": approvers})
             self.assertIn(picked[0], OWNERS, seed)
 
     def test_no_restriction_draws_from_the_whole_pool(self):
@@ -460,18 +481,80 @@ class SelectionTest(unittest.TestCase):
         # OWNERS logins come out of the walk lower-cased; the config spells
         # them as GitHub shows them.
         config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
-        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to={"fuxiao-gao"})
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), approvers_by_file={"README.md": {"fuxiao-gao"}})
         self.assertEqual(picked, ["Fuxiao-Gao"])
 
     def test_a_restriction_that_empties_the_pool_falls_back_to_the_whole_of_it(self):
-        # Nobody in the matched pool can /approve: a config shape, not a
-        # pull-request one. Asking someone who can lgtm beats asking nobody,
-        # and the run log says the pool was not narrowed.
+        # Nobody in the matched pool or the defaults can /approve. Asking
+        # someone who can lgtm beats asking nobody, and the run log says the
+        # pool was not narrowed.
         config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to={"nobody"})
+            picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), approvers_by_file={"README.md": {"nobody"}})
         self.assertEqual(picked, POOL)
         self.assertIn("none of them", stderr.getvalue())
+
+    def test_a_mixed_change_draws_an_approver_for_every_file(self):
+        # Prow's `approved` is per file. A draw from the union of the
+        # approvers could hand a replay-proxy change that also touched a doc
+        # to a root approver alone, who cannot clear the replay-proxy half.
+        by_file = {
+            "examples/inference-replay/eval-design.md": {name.lower() for name in OWNERS},
+            "hack/replay-proxy/normalizer.py": set(EVAL_CREW),
+        }
+        for seed in range(40):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(CONFIG, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file)
+            with self.subTest(seed=seed):
+                self.assertIn(picked[0], EVAL_CREW)
+                for path, approvers in by_file.items():
+                    self.assertTrue({name.lower() for name in picked} & approvers, path)
+                # jayantid approves both halves, so is asked alone.
+                if picked[0] == "jayantid":
+                    self.assertEqual(picked, ["jayantid"])
+
+    def test_covering_skips_files_the_author_approves(self):
+        # lapis2002's own replay-proxy half opens approved; only the doc half
+        # still needs someone, so one root approver is drawn.
+        by_file = {"README.md": {"bradhoekstra", "jayantid"}, "hack/replay-proxy/a.py": {"jayantid", "lapis2002"}}
+        for seed in range(20):
+            picked = rr.draw_covering(["bradhoekstra", "jayantid"], by_file, "Lapis2002", rng=random.Random(seed))
+            self.assertEqual(len(picked), 1, seed)
+            self.assertIn(picked[0], ["bradhoekstra", "jayantid"])
+
+    def test_covering_leaves_out_a_file_nobody_in_the_pool_approves(self):
+        by_file = {"README.md": {"bradhoekstra"}, "x/a.go": {"nobody"}}
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            picked = rr.draw_covering(["bradhoekstra"], by_file, "author", rng=random.Random(0))
+        self.assertEqual(picked, ["bradhoekstra"])
+        self.assertIn("Nobody in the pool or the defaults approves", stderr.getvalue())
+
+    def test_a_roster_change_with_a_root_file_gets_a_root_approver_whoever_eval_crew_is(self):
+        # The roster glob routes the whole change to eval-crew. With no root
+        # approver in the group, the README half is drawn for from the
+        # defaults rather than left with nobody asked.
+        config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["lapis2002"]})))
+        by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": {"lapis2002"}}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(config, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file)
+            self.assertEqual(picked[0], "lapis2002", seed)
+            self.assertEqual(len(picked), 2, seed)
+            self.assertIn(picked[1], OWNERS, seed)
+
+    def test_a_pool_that_approves_nothing_still_owed_tries_the_defaults(self):
+        # lapis2002 has approved the roster half; the README half is owed, and
+        # the roster glob's pool (eval-crew, lapis2002 alone here) cannot
+        # approve it. A root approver is drawn, not lapis2002 again.
+        config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["lapis2002"]})))
+        files = ["README.md", "hack/eval/presubmit-cases.txt"]
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(
+                    config, files, "author", rng=random.Random(seed), approvers_by_file={"README.md": {name.lower() for name in OWNERS}}
+                )
+            self.assertEqual(len(picked), 1, seed)
+            self.assertIn(picked[0], OWNERS, seed)
 
     def test_teams_are_split_from_users(self):
         users, teams = rr.split_teams(["bradhoekstra", "team:sre"])
@@ -499,8 +582,8 @@ class OwnersTest(unittest.TestCase):
         self.assertEqual(self.approvers("k8s-operator/internal/controller/pa.go"), ROOT_APPROVERS)
 
     def test_a_filtered_path_under_no_parent_owners_gets_only_the_filter(self):
-        # hack/OWNERS: only eval-crew can /approve the presubmit rosters, and a
-        # root approver does not count (#1546).
+        # hack/OWNERS: only eval-crew can /approve the presubmit rosters (#1546),
+        # and a root approver does not count.
         for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
             with self.subTest(path=path):
                 self.assertEqual(self.approvers(path), {"jayantid", "lapis2002"})
@@ -508,7 +591,7 @@ class OwnersTest(unittest.TestCase):
     def test_an_unfiltered_path_under_no_parent_owners_falls_through_to_the_root(self):
         # The same file's comment: everything else under hack/ matches no
         # filter and falls through, so no_parent_owners only bites on a match.
-        for path in ("hack/eval/nightly-cases.txt", "hack/ci-eval-pr.sh"):
+        for path in ("hack/eval/nightly-cases.txt", "hack/boskos_heartbeat.sh", "hack/eval/ci-eval-pr.sh", *GRADER_PIN_FILES):
             with self.subTest(path=path):
                 self.assertEqual(self.approvers(path), ROOT_APPROVERS)
 
@@ -529,7 +612,7 @@ class OwnersTest(unittest.TestCase):
             {"hack/OWNERS": OWNERS_TREE["hack/OWNERS"].replace("    - eval-crew\n", "    - eval-crew\n    reviewers:\n    - roster-reader\n")},
         )
         self.assertEqual(rr.applicable_reviewers(["hack/eval/presubmit-cases.txt"], self.root.name), {"roster-reader"})
-        self.assertEqual(rr.applicable_reviewers(["hack/ci-eval-pr.sh"], self.root.name), ROOT_REVIEWERS)
+        self.assertEqual(rr.applicable_reviewers(["hack/boskos_heartbeat.sh"], self.root.name), ROOT_REVIEWERS)
 
     def test_an_author_self_approves_only_when_every_file_is_theirs(self):
         # Prow's `approved` is per file: a root approver's own pull request
@@ -567,7 +650,7 @@ class OwnersTest(unittest.TestCase):
         write_tree(self.root.name, {"hack/eval/OWNERS": "approvers:\n- sub\n"})
         self.assertEqual(self.approvers("hack/eval/nightly-cases.txt"), {"sub"})
         self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"sub", "jayantid", "lapis2002"})
-        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+        self.assertEqual(self.approvers("hack/boskos_heartbeat.sh"), ROOT_APPROVERS)
 
     def test_top_level_approvers_beside_filters_are_ignored_as_prow_does(self):
         # Prow reads a file with `filters:` as a filtered file and drops a
@@ -577,7 +660,7 @@ class OwnersTest(unittest.TestCase):
             {"hack/OWNERS": "approvers:\n- stray\n" + OWNERS_TREE["hack/OWNERS"]},
         )
         self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"jayantid", "lapis2002"})
-        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+        self.assertEqual(self.approvers("hack/boskos_heartbeat.sh"), ROOT_APPROVERS)
 
     def test_no_changed_files_means_no_approvers(self):
         self.assertEqual(self.approvers(), set())
@@ -595,6 +678,11 @@ class OwnersTest(unittest.TestCase):
         root_approvers = rr.applicable_approvers(["README.md"], REPO_ROOT)
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
+        # The script that pins a pull request's grader, and every file that
+        # runs inside it: the root approvers, as for any other change.
+        for path in GRADER_PIN_FILES:
+            self.assertEqual(rr.applicable_approvers([path], REPO_ROOT), root_approvers, path)
+        self.assertEqual(rr.applicable_approvers(["scripts/installer/install.sh"], REPO_ROOT), root_approvers)
         self.assertNotIn(NON_APPROVER, root_approvers)
         # OWNERS repeats every root approver under `reviewers`: Prow's reviewer
         # walk falls through hack/OWNERS (no_parent_owners, no reviewers of its
@@ -691,6 +779,24 @@ class AlreadyReviewedTest(unittest.TestCase):
         self.assertIsNone(rr.already_reviewed_reason(pull_request(), [review("KYBER775", "APPROVED")], APPROVERS, robots))
         # Not listed, the same review counts, as it does from any other person.
         self.assertIn("kyber775", rr.already_reviewed_reason(pull_request(), stale, APPROVERS))
+
+    def test_with_files_given_an_approval_counts_only_once_every_file_is_approved(self):
+        # Prow's `approved` is per file: a root approver's approval on a
+        # change that also touches hack/replay-proxy/ leaves eval-crew's owed.
+        by_file = {"README.md": {"bradhoekstra", "jayantid"}, "hack/replay-proxy/a.py": {"jayantid", "lapis2002"}}
+        approvers = set().union(*by_file.values())
+
+        def reason(*reviews):
+            return rr.already_reviewed_reason(pull_request(), list(reviews), approvers, approvers_by_file=by_file)
+
+        self.assertIsNone(reason(review("bradhoekstra", "APPROVED")))
+        self.assertIn("jayantid", reason(review("jayantid", "APPROVED")))
+        self.assertIsNotNone(reason(review("bradhoekstra", "APPROVED"), review("lapis2002", "APPROVED")))
+        # The author's own approval covers their files.
+        lapis = pull_request(user={"login": "lapis2002", "type": "User"})
+        self.assertIsNotNone(rr.already_reviewed_reason(lapis, [review("bradhoekstra", "APPROVED")], approvers, approvers_by_file=by_file))
+        # A CHANGES_REQUESTED still counts on its own.
+        self.assertIn("bradhoekstra", reason(review("bradhoekstra", "CHANGES_REQUESTED")))
 
     def test_approver_logins_match_case_insensitively(self):
         self.assertIsNotNone(self.reason([review("JayantiD", "APPROVED")]))
@@ -854,6 +960,49 @@ class MainTest(_MainHarness):
             self.assertEqual(self.code, 0)
             self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
         self.assertIn("author's own approval does not cover", self.stderr.getvalue())
+
+    def test_a_replay_proxy_change_with_a_root_file_asks_eval_crew(self):
+        # hack/OWNERS gives hack/replay-proxy/ to eval-crew alone and the
+        # catch-all glob matches it, so the pool holds root approvers too.
+        # Whoever is asked, someone who can clear each half is among them.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        for seed in range(20):
+            self.run_main(pull_request(), [], "--seed", str(seed), files=files)
+            self.assertEqual(self.code, 0)
+            requested = {login.lower() for login in self.requested()}
+            self.assertTrue(requested & {"jayantid", "lapis2002"}, seed)
+            self.assertTrue(requested & ROOT_APPROVERS, seed)
+
+    def test_a_root_approval_on_a_replay_proxy_change_still_asks_eval_crew(self):
+        # A root approver approved before the check went green: the doc half
+        # is cleared, so only the replay-proxy half is drawn for.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        for seed in range(20):
+            self.run_main(pull_request(), [review("bradhoekstra", "APPROVED")], "--seed", str(seed), files=files)
+            self.assertEqual(self.code, 0)
+            self.assertEqual(len(self.requested()), 1, seed)
+            self.assertIn(self.requested()[0], ("jayantid", "lapis2002"), seed)
+
+    def test_the_override_skips_files_an_approval_already_clears(self):
+        # lapis2002 approved the replay-proxy half; `/request-review` asks for
+        # the doc half alone, never lapis2002 again.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        for seed in range(20):
+            self.run_main(pull_request(), [review("lapis2002", "APPROVED")], "--react-to", str(self.COMMENT_ID), "--seed", str(seed), files=files)
+            self.assertEqual(self.code, 0)
+            self.assertEqual(len(self.requested()), 1, seed)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
+
+    def test_the_override_counts_the_authors_own_files_as_covered(self):
+        # bradhoekstra approves the doc half of his own change and lapis2002
+        # approved the replay-proxy half: nothing is still owed, so the
+        # override draws as it would with no approvals, not for his files.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        author = pull_request(user={"login": "bradhoekstra", "type": "User"})
+        self.run_main(author, [review("lapis2002", "APPROVED")], "--react-to", str(self.COMMENT_ID), files=files)
+        self.assertEqual(self.code, 0)
+        self.assertNotIn("drawing only for the files they cannot approve", self.stderr.getvalue())
+        self.assertIn(self.requested()[0], ("jayantid", "lapis2002"))
 
     def test_the_override_narrows_the_pool_too(self):
         # `/request-review` skips the verdict check, not the narrowing: the

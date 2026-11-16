@@ -2,6 +2,9 @@ package capability
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -56,9 +59,9 @@ const (
 	// Living under `a2a.` rather than `_INBOX` has a consequence that an
 	// earlier revision of this comment got wrong, and the way it was wrong
 	// is worth keeping. `a2a.>` is a real subscribe grant on this bus — the
-	// read-only `web` user, the one credential published to a browser,
-	// holds it — and that grant covers both subjects above. The comment
-	// used to reason about what a browser could OBSERVE there (caller, key,
+	// read-only `web` user and the `console` user, the two credentials
+	// published to a browser, hold it — and that grant covers both
+	// subjects above. The comment used to reason about what a browser could OBSERVE there (caller, key,
 	// revision, verb, verdict; never a capability, since neither message
 	// carries one) and accept it as a subset of what `web` already reads
 	// off `a2a.tasks.>`.
@@ -67,12 +70,15 @@ const (
 	// permitted to subscribe to a subject join any QUEUE GROUP on it, so
 	// `web` could join `cap-verifier` and take a share of the verify
 	// requests — not to answer them, which it cannot (no publish under
-	// `a2a.cap.reply.>`), but to swallow them. Check reads the resulting
-	// timeout as a denial, by design, so a browser credential would have
-	// rejected a proportion of every task on the bus. A subscriber on a
+	// `a2a.cap.reply.>`), but to swallow them. Check asks again after a
+	// swallowed ask, inside its reach window, so each one costs a task a
+	// timeout of delay, and a task whose asks are all swallowed for the
+	// window is refused: a browser credential would have slowed every
+	// task on the bus and rejected some of them. A subscriber on a
 	// request subject intercepts; it does not merely watch.
 	//
-	// So `web` is denied `a2a.cap.>` outright (webIdentity, in
+	// So `web` and `console` are denied `a2a.cap.>` outright (webIdentity
+	// and consoleIdentity, in
 	// k8s-operator/internal/controller/platformagent_a2a_identities.go).
 	// The general rule this leaves behind: any future grant wide enough to
 	// cover VerifySubscribe has to be checked against queue-group theft,
@@ -119,12 +125,86 @@ func callerFromSubject(subject string) (string, error) {
 	return rest, nil
 }
 
-// Request is what a broker asks. It carries no identity: the subject carries
+// Request is what a broker asks, or the dispatcher asking profile.run. It carries no identity: the subject carries
 // that, and a payload field would be one the caller writes.
 type Request struct {
 	Ref      Ref   `json:"ref"`
 	Verb     Verb  `json:"verb"`
 	Resource Scope `json:"resource"`
+
+	// Profile and Tier are profile.run's, and only profile.run's: what the
+	// dispatcher means to run and at which tier. Any other verb carrying
+	// either is refused, so a field one verb reads can never be quietly
+	// ignored by another.
+	Profile string `json:"profile,omitempty"`
+	Tier    Tier   `json:"tier,omitempty"`
+
+	// Trigger is profile.run's too: the trigger the submission claims,
+	// which must equal the grant's (nil only against a grant with none).
+	// Refused on any other verb, like Profile and Tier.
+	Trigger *Trigger `json:"trigger,omitempty"`
+	// RequestID binds a capability decision to the request that asked for
+	// it (#5647): the client draws a fresh one per check (requestIDBytes of
+	// crypto/rand, hex), the verifier echoes it in its Response, and the
+	// client acts only on the answer to its own question. Defence in depth for
+	// the dispatcher's admission, which mints a task's credentials on the
+	// verifier's answer; each check already has its own reply inbox. Omitted
+	// by a client from before it existed, which a verifier still answers; one
+	// that is present but not well-formed makes the request not well-formed.
+	RequestID string `json:"requestId,omitempty"`
+}
+
+// requestIDBytes is the entropy in one request id: 128 bits.
+const requestIDBytes = 16
+
+// acceptUnechoedReply is whether a client acts on a reply that carries no
+// request id, which is what a verifier from before #5647 sends. True for one
+// release, so a new client keeps working against an old verifier during a roll
+// and after a one-step rollback; a reply carrying a different id is never
+// acted on. The follow-up turns this false once a GA release with the echo is
+// published and isn't the newest (the N→N-1 window,
+// docs/site/src/content/docs/deploy/rollback.md), and an un-echoed reply then
+// fails the check closed at its timeout.
+const acceptUnechoedReply = true
+
+// newRequestID draws a fresh request id.
+func newRequestID() (string, error) {
+	var b [requestIDBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// validRequestID reports whether id is exactly what newRequestID produces:
+// requestIDBytes of lowercase hex.
+func validRequestID(id string) bool {
+	if len(id) != 2*requestIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isAnswerTo reports whether resp is the answer to the request that carried
+// id: it echoes id, or it carries no id at all and acceptUnechoed holds (an
+// older verifier's reply). A reply carrying a different id never is.
+func isAnswerTo(resp Response, id string, acceptUnechoed bool) bool {
+	if resp.RequestID == "" {
+		return acceptUnechoed
+	}
+	return sameRequestID(resp.RequestID, id)
+}
+
+// sameRequestID compares the id a reply echoes against the one that was sent.
+// An empty echo never matches.
+func sameRequestID(got, want string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // Response is a verdict and the rule behind it. It deliberately does NOT carry
@@ -134,6 +214,10 @@ type Request struct {
 type Response struct {
 	Allowed bool   `json:"allowed"`
 	Reason  string `json:"reason,omitempty"`
+	// RequestID echoes the request's id (#5647), so the caller can tell this
+	// answer is the answer to its own question. Empty when the request carried
+	// none, as a client from before #5647 sends.
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // Service answers verification requests. It holds the only Store in the
@@ -151,9 +235,17 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		return Response{Reason: Reason(err)}
 	}
 	var req Request
-	if err := json.Unmarshal(data, &req); err != nil {
+	if err := json.Unmarshal(data, &req); err != nil || (req.RequestID != "" && !validRequestID(req.RequestID)) {
 		return Response{Reason: "the request is not well-formed"}
 	}
+	resp := s.decide(ctx, caller, req)
+	resp.RequestID = req.RequestID
+	return resp
+}
+
+// decide is Answer's verdict on a request that parsed. Answer stamps the
+// request id on whatever it returns, so no branch here can forget it.
+func (s *Service) decide(ctx context.Context, caller string, req Request) Response {
 	// The walk and the verb check are answered differently on purpose, and
 	// the split is the whole anti-oracle argument.
 	//
@@ -189,6 +281,15 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		}
 		return Response{Reason: WalkRefused}
 	}
+	if req.Verb == VerbProfileRun {
+		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource, req.Trigger); err != nil {
+			return Response{Reason: Reason(err)}
+		}
+		return Response{Allowed: true}
+	}
+	if req.Profile != "" || req.Tier != "" || req.Trigger != nil {
+		return Response{Reason: "profile, tier and trigger are only read for profile.run"}
+	}
 	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
 		return Response{Reason: Reason(err)}
 	}
@@ -213,9 +314,9 @@ func clip(s string) string {
 // Subscribe starts answering and returns as soon as the subscription is
 // established on the server. It exists in this shape so a caller can know the
 // verifier is listening before it lets anything ask: a request that races the
-// subscription is answered by the client's timeout, and the client reads a
-// timeout as a denial. Pair it with DrainAndCancel at shutdown; the context
-// handed here is the one that ordering is about.
+// subscription gets no answer, and a client that gets none for its whole
+// reach window reads that as a denial. Pair it with DrainAndCancel at
+// shutdown; the context handed here is the one that ordering is about.
 func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscription, error) {
 	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
 		s.handle(ctx, m)
@@ -297,10 +398,52 @@ func (s *Service) handle(ctx context.Context, m *nats.Msg) {
 	}
 }
 
-// DefaultTimeout bounds a broker's wait. The verifier is on the request path,
-// so a broker that waits forever turns a verifier outage into a wedged task
-// rather than a refused one.
+// DefaultTimeout bounds one ask. The verifier is on the request path, so a
+// broker that waits forever turns a verifier outage into a wedged task rather
+// than a refused one.
 const DefaultTimeout = 5 * time.Second
+
+const (
+	// DefaultReachWindow is how long Check keeps asking a verifier it could
+	// not reach before it refuses. It is the bus coming back, not the
+	// verifier being down: when NATS restarts, every client reconnects on
+	// its own clock, and an executor that is back first refuses whatever
+	// lands before the verifiers are. gke-labs/kube-agents#3270 saw that
+	// gap at 3.75s (the executor back at 22:02:03.46, the surviving
+	// verifier at 22:02:07.21), and a task arriving at 22:02:06.31 was
+	// refused 2ms after it was accepted.
+	//
+	// Ten seconds covers the slower of the two ways a verifier comes back.
+	// A verifier that kept its pod reconnects within nats.go's default
+	// reconnect wait plus the verifier's jitter (2s + 0.5s, or 4s under
+	// TLS). A verifier whose bucket bind was in flight when the bus went
+	// away answers only after that bind attempt times out and the next one
+	// runs: jetstream's 5s API timeout plus cmd/verifier's 2s
+	// bindRetryInterval, so up to 7s after the bus is back. Ten is that plus
+	// a reconnect wait, and it stays far inside every grace the gateway
+	// gives a task: the first-event grace and the task deadline are
+	// floored at a minute, and the executor has already published
+	// `submitted` before it asks.
+	//
+	// It is not a longer outage tolerance. A verifier that stays away is
+	// refused with the same reason as before, ten seconds later.
+	DefaultReachWindow = 10 * time.Second
+
+	// reachBackoffInitial and reachBackoffMax pace the asks inside the
+	// window. No-responders comes back from the server in about a
+	// millisecond, so without a pause the loop would spin; the cap keeps a
+	// verifier that subscribes mid-window from waiting more than a second
+	// to be asked again.
+	reachBackoffInitial = 100 * time.Millisecond
+	reachBackoffMax     = time.Second
+
+	// unreachableRule is the refusal when no verifier answered. Callers
+	// and operators read it; it is unchanged by the retry.
+	unreachableRule = "the verifier could not be reached"
+	// malformedAnswerRule is the refusal when a verifier answered with
+	// something that does not parse.
+	malformedAnswerRule = "the verifier's answer was not well-formed"
+)
 
 // Client is the broker side. It knows its own name because the operator told
 // the pod, and it cannot lie about it: it can only publish on its own subject.
@@ -308,7 +451,14 @@ type Client struct {
 	nc      *nats.Conn
 	self    string
 	subject string
+	// Timeout bounds one ask; zero means DefaultTimeout.
 	Timeout time.Duration
+	// ReachWindow bounds how long Check keeps asking when no verifier
+	// answers: zero means DefaultReachWindow, negative means ask once.
+	ReachWindow time.Duration
+	// Log, when set, gets one line when a check reaches the verifier only
+	// after a retry, so a reconnect gap the window rode out is visible.
+	Log *slog.Logger
 }
 
 // NewClient builds the broker's verifier client. self is the principal's own
@@ -322,12 +472,49 @@ func NewClient(nc *nats.Conn, self string) (*Client, error) {
 	return &Client{nc: nc, self: self, subject: subj}, nil
 }
 
+// errUnreachable marks an ask that got no answer at all: no responders, a
+// timeout, or a publish or subscribe the connection refused. It is the only
+// outcome Check retries.
+var errUnreachable = refuse(unreachableRule)
+
+// IsUnreachable reports whether err is Check's refusal for an ask no
+// verifier answered within the window, rather than a verdict. A caller that
+// can hold its request (the profile dispatcher holds a submission) asks
+// again; every other caller treats it as the refusal it is.
+func IsUnreachable(err error) bool { return errors.Is(err, errUnreachable) }
+
 // Check asks whether the capability at ref permits verb v on resource r.
 // A nil error means permitted. Everything else — refused, unreachable,
 // malformed — is a denial, because the alternative is a broker that proceeds
 // when it could not find out.
+//
+// An ask nobody answers is asked again, with backoff, for up to ReachWindow
+// (or Timeout, if that is longer). Any answer ends it at once: a verdict is a
+// verdict whether it came first time or fifth, and a deny is never retried.
+// ctx ends the wait too, with the unreachable refusal, so a caller that is
+// shutting down or was canceled tells the two apart by ctx.Err() as before.
 func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
-	b, err := json.Marshal(Request{Ref: ref, Verb: v, Resource: r})
+	return c.check(ctx, Request{Ref: ref, Verb: v, Resource: r})
+}
+
+// CheckProfileRun asks profile.run: may the grant at ref run profile at tier
+// for target, started by trigger. target is the task's target scope, or the
+// install's namespace scope for a task with none; it is never empty. trigger
+// is the one the submission claims (TriggerFromAuthority), nil when it claims
+// none; the verifier permits only when it equals the grant's.
+func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope, trigger *Trigger) error {
+	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier, Trigger: trigger})
+}
+
+func (c *Client) check(ctx context.Context, req Request) error {
+	// One id per check. Every ask of the check is the same question, so the
+	// answer to any of them, late or not, is the answer to this one.
+	id, err := newRequestID()
+	if err != nil {
+		return err
+	}
+	req.RequestID = id
+	b, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
@@ -335,36 +522,114 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	window := c.ReachWindow
+	if window == 0 {
+		window = DefaultReachWindow
+	}
+	// The whole check, every retry included, ends at the later of one
+	// ask's timeout and the window, and never after the caller's own ctx.
+	budget := max(timeout, window)
+	reach, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+
 	// The reply subject is spelled here rather than taken from the
 	// connection's inbox prefix. Answers ride their own namespace, not
 	// _INBOX (see ReplyPrefix), so nats.Request would ask from a subject
 	// the verifier drops — and the client would read the drop as the
 	// verifier being down, a fail-closed bug that would take a deployment
 	// out silently.
+	//
+	// One reply subject and one subscription serve every ask of this
+	// check, so an answer that arrives after its own ask timed out still
+	// counts: a slow verifier's late verdict is used, not dropped and asked
+	// for again.
 	reply, err := ReplySubject(c.self)
 	if err != nil {
 		return err
 	}
-	sub, err := c.nc.SubscribeSync(reply)
-	if err != nil {
-		return refuse("the verifier could not be reached")
+	var sub *nats.Subscription
+	defer func() {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}()
+
+	start := time.Now()
+	backoff := reachBackoffInitial
+	for attempt := 1; ; attempt++ {
+		if sub == nil {
+			// Subscribed here rather than once above so a subscribe the
+			// connection refuses is retried like any other unreachable ask.
+			if s, err := c.nc.SubscribeSync(reply); err == nil {
+				sub = s
+			}
+		}
+		err := errUnreachable
+		if sub != nil {
+			err = c.ask(reach, timeout, reply, sub, b, id)
+		}
+		if !errors.Is(err, errUnreachable) {
+			if attempt > 1 && c.Log != nil {
+				c.Log.Info("capability check reached the verifier after a retry",
+					"caller", c.self, "attempts", attempt,
+					"waited", time.Since(start).Round(time.Millisecond),
+					"allowed", err == nil)
+			}
+			return err
+		}
+		// A closed connection will not come back, and a caller whose ctx
+		// ended has stopped asking.
+		if window < 0 || c.nc.IsClosed() || reach.Err() != nil {
+			return err
+		}
+		select {
+		case <-reach.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, reachBackoffMax)
 	}
-	defer func() { _ = sub.Unsubscribe() }()
-	if err := c.nc.PublishRequest(c.subject, reply, b); err != nil {
-		return refuse("the verifier could not be reached")
+}
+
+// ask is one request and its answer, on the check's reply subscription.
+// errUnreachable means nothing answered; any other error is the verifier's
+// verdict or an answer that did not parse.
+// Only a reply that echoes id is this check's answer (#5647). A reply that
+// parses but carries a different id is not an answer at all: it is dropped,
+// and the wait goes on, so a correct answer later in the window is still acted
+// on, and with none the ask ends as every unanswered ask does, in
+// errUnreachable and, once the window is spent, a refusal. A reply with no id
+// is an older verifier's, acted on while acceptUnechoedReply holds.
+func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := c.nc.PublishRequest(c.subject, reply, body); err != nil {
+		return errUnreachable
 	}
-	msg, err := sub.NextMsgWithContext(ctx)
-	if err != nil {
-		return refuse("the verifier could not be reached")
+	for {
+		// No responders arrives here as nats.ErrNoResponders, within a
+		// millisecond: the server answers a request on a subject nobody is
+		// subscribed to with a 503 status. That is the shape of the gap after
+		// a bus restart, and the reason it was refused at once before the
+		// retry.
+		msg, err := sub.NextMsgWithContext(ctx)
+		if err != nil {
+			return errUnreachable
+		}
+		var resp Response
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			return refuse(malformedAnswerRule)
+		}
+		if !isAnswerTo(resp, id, acceptUnechoedReply) {
+			if c.Log != nil {
+				c.Log.Warn("capability check dropped a reply that is not the answer to its request",
+					"caller", c.self, "carriedID", resp.RequestID != "")
+			}
+			continue
+		}
+		if !resp.Allowed {
+			return &Refusal{Rule: resp.Reason}
+		}
+		return nil
 	}
-	var resp Response
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return refuse("the verifier's answer was not well-formed")
-	}
-	if !resp.Allowed {
-		return &Refusal{Rule: resp.Reason}
-	}
-	return nil
 }

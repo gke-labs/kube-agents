@@ -1,0 +1,59 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+variable "host_cluster_name" {
+  type        = string
+  description = "Name of the cluster the scenario is planted on; arrives as TF_VAR_host_cluster_name from the runner."
+}
+
+variable "host_cluster_location" {
+  type        = string
+  description = "Region or zone of host_cluster_name."
+}
+
+variable "project_id" {
+  type        = string
+  description = "GCP project holding host_cluster_name; empty means the gcloud default project."
+  default     = ""
+}
+
+variable "namespace" {
+  type        = string
+  description = "Namespace the scenario's workload is planted in. The case's checks name the same namespace. Its own, so another case's namespace left Terminating on the same host cluster cannot stop this plant."
+  default     = "seeded-streaming"
+}
+
+variable "target_resource_name" {
+  type        = string
+  description = "Name of the Deployment the case's checks name."
+  default     = "streamed-image-service"
+}
+
+variable "image" {
+  type        = string
+  description = "The Artifact Registry image the Deployment pulls with no pull secret. Its project id is longer than the 30 characters GCP allows, so no project of that name can exist and the node identity's pull is refused on every host. The case's image safeguard names the same value."
+  default     = "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+}
+
+variable "prow_build_id" {
+  type        = string
+  description = "Prow BUILD_ID of the run creating this infra"
+  default     = ""
+}
+
+variable "prow_pull_number" {
+  type        = string
+  description = "Pull request number the run belongs to"
+  default     = ""
+}

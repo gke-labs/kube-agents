@@ -264,10 +264,13 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Fatalf("failed to delete agent: %v", err)
 	}
 
-	// Reconcile after deletion timestamp is set
-	_, err = r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile on delete failed: %v", err)
+	// Reconcile after deletion timestamp is set. Two passes: the first marks
+	// the A2A bus StatefulSet for deletion and requeues so its claims are
+	// reaped only once it is gone; the second releases the finalizer.
+	for i := range 2 {
+		if _, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d on delete failed: %v", i+1, err)
+		}
 	}
 
 	// Verify agent is deleted completely (because finalizer was removed)
@@ -347,6 +350,37 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	surviving := &networkingv1.NetworkPolicy{}
 	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(guardrail), surviving); err != nil {
 		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive a reconcile, got %v", err)
+	}
+}
+
+// TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames (#3871): the legacy
+// cleanup runs on every reconcile, and a Deployment or
+// ServiceAccount named <agent>-sandbox that this PlatformAgent does not
+// control is somebody else's. It is left as found and the cleanup completes;
+// refusing it stopped everything after this step, the status write included.
+func TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: "agent-uid"}}
+	planted := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, planted...)...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, agent); err != nil {
+		t.Fatalf("an unowned object under a legacy name stopped the cleanup: %v", err)
+	}
+	for _, obj := range planted {
+		got := obj.DeepCopyObject().(client.Object)
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), got); err != nil {
+			t.Errorf("the unowned %T is gone: %v", obj, err)
+			continue
+		}
+		if refs := got.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %T was adopted: owner references %+v", obj, refs)
+		}
 	}
 }
 
@@ -532,6 +566,100 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 	}
 }
 
+func TestReconcileRBAC_DisallowSecretsReadAndExistingInstallPreservation(t *testing.T) {
+	scheme := setupScheme()
+	roleName := "kubeagents:minimal:test-ns:test-agent"
+
+	t.Run("new install with unset DisallowSecretsRead grants secrets", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected new install ClusterRole to grant secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets keeps existing RBAC when DisallowSecretsRead is unset", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected existing ClusterRole without secrets to omit secrets when DisallowSecretsRead is unset, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets adds secrets when DisallowSecretsRead is false", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(false),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=false to grant secrets on existing ClusterRole, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("DisallowSecretsRead=true omits secrets on new and existing installs", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(true),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, true)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=true to omit secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+}
+
 func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
@@ -664,13 +792,14 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
-	// client either, so telemetry falls through to the managed default and asks to be
-	// re-probed later. The Secret re-read asks sooner, and the pass returns the sooner
-	// of the two — so the telemetry deadline is still met, by a requeue that also
-	// picks up a rotated key.
-	if res.RequeueAfter != secretEnvReprobeInterval {
-		t.Errorf("expected RequeueAfter %v, got %v", secretEnvReprobeInterval, res.RequeueAfter)
+	// There is no collector Service in the fake client, so telemetry falls
+	// through to the managed default and asks to be re-probed later. The A2A
+	// stack is still converging (no controller runs the fake's workloads), and
+	// its pending requeue is the soonest ask, so the pass returns it -- which
+	// still meets the telemetry deadline, by a requeue that also picks up a
+	// rotated key.
+	if res.RequeueAfter != a2aPendingRequeue {
+		t.Errorf("expected RequeueAfter %v, got %v", a2aPendingRequeue, res.RequeueAfter)
 	}
 	if res.RequeueAfter > otelRediscoverAfter {
 		t.Errorf("RequeueAfter %v misses the telemetry re-probe deadline %v", res.RequeueAfter, otelRediscoverAfter)
@@ -730,6 +859,9 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 				"app": "test-agent-unschedulable-gateway",
 			},
 		},
+		// As the agent pod renders it: the CR's RuntimeClass on the pod,
+		// which is what lets the scan blame the RuntimeClass.
+		Spec: corev1.PodSpec{RuntimeClassName: ptr.To("gvisor")},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
 			Conditions: []corev1.PodCondition{
@@ -938,29 +1070,12 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	// With every workload ready, Ready is True and the phase Ready while
 	// Degraded still carries the refusal. The workloads' status is written
 	// after the reconciles, and the status writer is driven directly.
-	for _, key := range []client.ObjectKey{
-		{Name: agent.Name + "-gateway", Namespace: agent.Namespace},
-		{Name: credentialBrokerName(agent), Namespace: agent.Namespace},
-	} {
-		d := &appsv1.Deployment{}
-		if err := cl.Get(ctx, key, d); err != nil {
-			t.Fatalf("get %s: %v", key.Name, err)
-		}
-		d.Status.ReadyReplicas = 1
-		if err := cl.Status().Update(ctx, d); err != nil {
-			t.Fatalf("mark %s ready: %v", key.Name, err)
-		}
-	}
-	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: shellSandboxName(agent), Namespace: agent.Namespace}, sts); err != nil {
-		t.Fatalf("get shell sandbox: %v", err)
-	}
-	sts.Status.ReadyReplicas = 1
-	if err := cl.Status().Update(ctx, sts); err != nil {
-		t.Fatalf("mark shell sandbox ready: %v", err)
+	markEveryWorkloadReady(t, ctx, cl, r, req, agent)
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
 	}
 	r.APIReader = cl
-	phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+	phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -990,17 +1105,9 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if want := resolveCredentialProxyImage(agent.Spec.Deployment); proxy.Image != want || proxy.Image == staleImage {
 		t.Errorf("the proxy container's image = %q, want %q; a refused override must not stop the Deployment being applied", proxy.Image, want)
 	}
-	wantResources := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("2Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-		},
-	}
+	// The operator's defaults, read from the merge with no override, so a
+	// change to them does not need a second copy here.
+	wantResources := resolveCredentialProxyResources(nil, sizingTierSmall)
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
 		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
 	}
@@ -1016,6 +1123,83 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		t.Errorf("no Warning %s event naming %s", conditionReasonInvalidCredentialProxyResources, wantField)
 	}
 	return degraded.Message
+}
+
+// markEveryWorkloadReady puts the whole render into the state Ready reads as
+// up: the callout serving so the gateway gate lets the A2A gateway through
+// (two passes), the provision Job complete, and every Deployment and
+// StatefulSet in the namespace reporting its replicas ready. The fake client
+// runs no controllers, so a test that wants the phase to reach Ready drives
+// this itself before reading the status writer.
+func markEveryWorkloadReady(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, req ctrl.Request, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	deps := &appsv1.DeploymentList{}
+	if err := cl.List(ctx, deps, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	for i := range deps.Items {
+		d := &deps.Items[i]
+		want := int32(1)
+		if d.Spec.Replicas != nil {
+			want = *d.Spec.Replicas
+		}
+		d.Status.Replicas = want
+		d.Status.ReadyReplicas = want
+		if err := cl.Status().Update(ctx, d); err != nil {
+			t.Fatalf("mark %s ready: %v", d.Name, err)
+		}
+	}
+	stses := &appsv1.StatefulSetList{}
+	if err := cl.List(ctx, stses, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatalf("list statefulsets: %v", err)
+	}
+	for i := range stses.Items {
+		st := &stses.Items[i]
+		want := int32(1)
+		if st.Spec.Replicas != nil {
+			want = *st.Spec.Replicas
+		}
+		st.Status.Replicas = want
+		st.Status.ReadyReplicas = want
+		if err := cl.Status().Update(ctx, st); err != nil {
+			t.Fatalf("mark %s ready: %v", st.Name, err)
+		}
+	}
+}
+
+// settleA2AStack drives a fake-client install to the state where the A2A
+// stack asks for no sooner pass of its own (a2aProvisionState.wantsRequeue
+// and a2aNATSShort both false): the callout serving so the gateway and the
+// provision Job are created, the Job complete, every bus server and the
+// gateway ready, and one Ready callout pod whose /status reports the rendered
+// identity map taken. The gateway's leader election is off: with it on, a
+// gateway asking for more than one replica rechecks the Lease every minute
+// until a pod this fake never runs has taken it. Nothing runs these
+// controllers in the fake, so a test that reads the steady-state requeue off
+// Reconcile's tail does this first.
+func settleA2AStack(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, req ctrl.Request, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
+	markEveryWorkloadReady(t, ctx, cl, r, req, agent)
+	version := r.renderedAuthMapVersion(ctx, agent)
+	if version == "" {
+		t.Fatal("settleA2AStack: no identity map shard rendered, so no callout answer can match it")
+	}
+	pod := statusCalloutPod(agent, a2aCalloutName(agent)+"-settled", "10.0.0.1", true)
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("settleA2AStack: create the callout pod: %v", err)
+	}
+	if err := cl.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("settleA2AStack: report the callout pod ready: %v", err)
+	}
+	r.calloutStatus = fakeCalloutStatus{pod.Status.PodIP: {Version: version}}
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("settleA2AStack: Reconcile %d: %v", i+1, err)
+		}
+	}
 }
 
 // A memory limit under the floor: rendered, the broker would turn its budget
@@ -1069,7 +1253,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedOncePerGe
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -1129,7 +1314,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedAfterAnEa
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -1629,8 +1815,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		scrape.From[0].PodSelector != nil {
 		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
 	}
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules (DNS, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker, A2A bus), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -1663,19 +1849,15 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
 			"cannot resolve and every named destination below becomes unreachable")
 	}
-	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
-	})
-	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80)")
-	}
-	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
-	// address as well as the link-local one even when the cluster has no nodes.
-	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.252/32"
-	})
-	if ruleMeta988 == nil || len(ruleMeta988.To) != 2 {
-		t.Errorf("expected 2 peers in GCP Workload Identity egress rule (port 988)")
+	// The gateway pod holds no Google identity, so the metadata server's token
+	// paths are closed: nothing admits 169.254.169.254 on 80 (pre-NAT) or the WI
+	// daemon on 988 (post-NAT). Only the DNS rule above may name the address.
+	for _, port := range []int32{80, 988} {
+		if rule := findEgressRule(port, func(p networkingv1.NetworkPolicyPeer) bool {
+			return p.IPBlock != nil && (p.IPBlock.CIDR == "169.254.169.254/32" || p.IPBlock.CIDR == "169.254.169.252/32")
+		}); rule != nil {
+			t.Errorf("the gateway policy admits the metadata server on port %d, a Workload Identity token path", port)
+		}
 	}
 	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
@@ -1756,20 +1938,20 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
-	// Expected 11 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// Expected 9 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is
+	// omitted, and the gateway policy carries no metadata-server rule):
 	// 1. Cluster DNS (53)
-	// 2. GCP WI / Metadata server (80)
-	// 3. GKE WI Host Network Daemon (988)
-	// 4. LiteLLM Gateway (80, 4000, 8080)
-	// 5. vLLM Gemma Server (80, 8000)
-	// 6. Kubernetes API Server (443, 6443, 8443)
-	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
-	// 8. GitHub Token Minter (8080)
-	// 9. Hindsight memory API (8888)
-	// 10. The shell sandbox's sshd (2222)
-	// 11. The credential broker, which hosts the chat relay (8765)
-	if len(netpol.Spec.Egress) != 11 {
-		t.Errorf("expected 11 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 2. LiteLLM Gateway (80, 4000, 8080)
+	// 3. vLLM Gemma Server (80, 8000)
+	// 4. Kubernetes API Server (443, 6443, 8443)
+	// 5. GKE Managed OpenTelemetry Collector (4317, 4318)
+	// 6. GitHub Token Minter (8080)
+	// 7. Hindsight memory API (8888)
+	// 8. The shell sandbox's sshd (2222)
+	// 9. The credential broker, which hosts the chat relay (8765)
+	// 10. The A2A bus (4222)
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -2090,39 +2272,17 @@ func TestBuildNetworkPolicy_ProfileDrivenRules(t *testing.T) {
 		}
 	})
 
-	t.Run("EmptyMetadataDaemonIPSuppressesRule3", func(t *testing.T) {
-		profile := defaultTestNetpolProfile()
-		profile.MetadataDaemonIP = ""
-		profile.MetadataDaemonSource = netpolSourceSuppressed
+	t.Run("TheMetadataDaemonSettingOpensNothing", func(t *testing.T) {
+		// The gateway policy carries no metadata-server rule, so the daemon
+		// address the profile discovers or suppresses changes nothing in it.
+		suppressed := defaultTestNetpolProfile()
+		suppressed.MetadataDaemonIP = ""
+		suppressed.MetadataDaemonSource = netpolSourceSuppressed
 
-		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 988 {
-					t.Fatalf("rule 3 (port 988) survived metadataDaemon.endpoint suppression")
-				}
-			}
-		}
-
-		// The pre-DNAT rule 2 is a separate rule and must NOT go with it.
-		withDaemon := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-		if len(netpol.Spec.Egress) != len(withDaemon.Spec.Egress)-1 {
-			t.Errorf("suppression removed %d rules, want exactly 1", len(withDaemon.Spec.Egress)-len(netpol.Spec.Egress))
-		}
-		found80 := false
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 80 {
-					for _, peer := range rule.To {
-						if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
-							found80 = true
-						}
-					}
-				}
-			}
-		}
-		if !found80 {
-			t.Errorf("rule 2 (link-local metadata on port 80) was removed along with rule 3")
+		without := buildNetworkPolicy(agent, nil, suppressed, false, "", false)
+		with := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+		if !reflect.DeepEqual(without.Spec.Egress, with.Spec.Egress) {
+			t.Errorf("the metadata daemon setting changed the gateway policy; it should open nothing")
 		}
 	})
 }
@@ -2137,37 +2297,22 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
-	// The pre-NAT target belongs on port 80.
-	got80 := egressCIDRsForPort(netpol, 80)
-	want80 := []string{"169.254.169.254/32"}
-	if !reflect.DeepEqual(got80, want80) {
-		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
+	// The gateway pod holds no Google identity, so neither token path is open: not
+	// the pre-NAT link-local address on 80, not the WI daemon on 988.
+	for _, port := range []int32{80, 988} {
+		for _, cidr := range egressCIDRsForPort(netpol, port) {
+			if cidr == "169.254.169.254/32" || cidr == "169.254.169.252/32" {
+				t.Errorf("the gateway policy admits the metadata server at %s on port %d", cidr, port)
+			}
+		}
 	}
 
-	// Port 988 is the post-DNAT destination on Dataplane V1, carrying the metadata
-	// daemon's link-local address (169.254.169.252) and the link-local alias.
-	got988 := egressCIDRsForPort(netpol, 988)
-	want988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
-	}
-	if !reflect.DeepEqual(got988, want988) {
-		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
-	}
-
-	// Every port the metadata server is reachable on, across all egress rules. 8080 —
-	// the pre-NAT ALTS handshaker port — must not be among them: Dataplane V2 evaluates
-	// policy pre-NAT at the socket layer, so pairing 8080 with the link-local address
-	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
-	// to the platform goldens, which are snapshots that `go test -update` re-blesses
-	// from whatever the code emits.
-	//
-	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
-	// answers DNS at this address, and the DNS rule names it for that and nothing else.
-	// This assertion is the guard on that — a change that widened the DNS rule to carry
-	// 80, or the port-80 rule to carry 53, fails here rather than in review.
+	// Every port the metadata address is reachable on, across all egress rules: 53
+	// only. Under Cloud DNS for GKE the node answers DNS at this address, and the DNS
+	// rule names it for that and nothing else; a change that adds any other port
+	// here reopens a token path and fails rather than passing review.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 988}
+	wantPorts := []int32{53}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -2184,20 +2329,12 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	profile.MetadataDaemonPort = 1988
 
 	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-
-	got1988 := egressCIDRsForPort(netpol, 1988)
-	want1988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
+	if got := egressCIDRsForPort(netpol, 1988); len(got) != 0 {
+		t.Errorf("a custom metadata daemon port opened %v in the gateway policy", got)
 	}
-	if !reflect.DeepEqual(got1988, want1988) {
-		t.Errorf("expected custom metadata daemon peers %v, got %v", want1988, got1988)
-	}
-
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 1988}
-	if !reflect.DeepEqual(gotPorts, wantPorts) {
-		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	if !reflect.DeepEqual(gotPorts, []int32{53}) {
+		t.Errorf("expected the metadata server reachable on port 53 only, got %v", gotPorts)
 	}
 }
 
@@ -2252,6 +2389,11 @@ func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32
 		for _, p := range netpol.Spec.Egress[i].Ports {
 			if p.Port != nil {
 				seen[p.Port.IntVal] = true
+			}
+			// A range's upper end too: {Port: 53, EndPort: 988} opens the
+			// post-NAT token port while Port still reads 53 (see ruleIsDNSOnly).
+			if p.EndPort != nil {
+				seen[*p.EndPort] = true
 			}
 		}
 	}
@@ -2551,6 +2693,39 @@ func TestIsImageVolumeSupported(t *testing.T) {
 	}
 	if !isImageVolumeSupported(nil, agentWithAnnotation) {
 		t.Errorf("expected annotation override 'true' to return true")
+	}
+}
+
+func TestUpdatePluginStatuses_NamesAPubsubRouteTheOperatorCannotQualify(t *testing.T) {
+	// The adapter's fatal line points the reader at this status; the wiring
+	// that puts the route there has to hold at the level the other status
+	// tests check.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "stockout", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent", Image: "gcr.io/plugin:v1",
+			Config: "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n        gke_stockout_alerts:\n          subscription: gke-stockout-alerts-sub\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(plugin).WithStatusSubresource(plugin).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updated agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected a Ready=True condition, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "spec.harness.projectId is empty") {
+		t.Errorf("the refused route is not on the plugin's status: %q", cond.Message)
 	}
 }
 
@@ -4570,8 +4745,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -4633,8 +4808,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -5150,9 +5325,11 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
 	}
 
+	// And the A2A stack, which Ready waits on as well.
+	objects := append(a2aStackUp(agent), agent, dep, shell, broker, a2aGatewayWorkload(agent, 1))
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, dep, shell, broker).
+		WithObjects(objects...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -5164,7 +5341,7 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -5254,7 +5431,7 @@ func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 
@@ -5463,14 +5640,15 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml and repo-2.yaml were created and scoped to all managed repos in org
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
-	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml and repo-2.yaml were created, each scoped to its own repository
+	// alone: listing every managed repository in every key made the ConfigMap quadratic.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected repo-1.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
 	}
 	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
-		t.Errorf("expected repo-2.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-2.yaml"])
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify unmanaged-static.yaml was NOT pruned
@@ -5734,10 +5912,15 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml was adopted and updated to include both repos
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml was adopted and kept at its own repository, and repo-2.yaml rendered
+	// beside it listing repo-2 alone.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected pre-rendered repo-1.yaml to be updated with all repos, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected pre-rendered repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify managed keys annotation includes both repo-1.yaml and repo-2.yaml
@@ -5747,11 +5930,11 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 	}
 }
 
-// The base template as the chart renders it since the read scope was added: a
-// write scope and a read scope, both listing the primary repository. Written
-// with sigs.k8s.io/yaml in mind -- the read-only rendering re-marshals it with
-// sorted keys, so the expectations below are built from a parse rather than
-// from a string.
+// The base template as the chart renders it since the sweep scope was added: a
+// write scope, a read scope and a sweep scope, all listing the primary
+// repository. Written with sigs.k8s.io/yaml in mind -- the read-only rendering
+// re-marshals it with sorted keys, so the expectations below are built from a
+// parse rather than from a string.
 const minterTemplateWithReadScope = `version: 'minty.abcxyz.dev/v2'
 rule:
   if: "assertion.iss == 'https://accounts.google.com'"
@@ -5772,6 +5955,15 @@ scope:
       - 'default-repo'
     permissions:
       contents: 'read'
+  platform-agent-sweep-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'read'
+      pull_requests: 'read'
+      issues: 'read'
 `
 
 // parsedMinterPolicy unmarshals a rendered policy so a test can assert on its
@@ -5807,8 +5999,13 @@ func TestRenderReadOnlyPolicy(t *testing.T) {
 		t.Errorf("expected the top-level rule to be carried over, got %v", doc["rule"])
 	}
 	scopes := minterPolicyScopes(t, rendered)
+	// One scope, though the template carries three: the sweep scope reads pull
+	// requests and issues, and a context repository's policy grants contents alone.
 	if len(scopes) != 1 {
 		t.Fatalf("expected exactly the read scope, got %v", scopes)
+	}
+	if _, hasSweep := scopes[minterSweepScope]; hasSweep {
+		t.Errorf("a read-only policy must not carry the sweep scope, got %v", scopes)
 	}
 	readScope, ok := scopes["platform-agent-read-scope"].(map[string]interface{})
 	if !ok {
@@ -5897,6 +6094,16 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	if got := fmt.Sprint(managedScopes["platform-agent-scope"].(map[string]interface{})["repositories"]); got != "[gitops]" {
 		t.Errorf("expected the managed policy to list managed repositories only, got %s", got)
 	}
+	sweepScope, hasSweep := managedScopes[minterSweepScope].(map[string]interface{})
+	if !hasSweep {
+		t.Fatalf("expected gitops.yaml to carry the sweep scope, got %v", managedScopes)
+	}
+	if got := fmt.Sprint(sweepScope["repositories"]); got != "[gitops]" {
+		t.Errorf("expected the sweep scope to list managed repositories only, got %s", got)
+	}
+	if _, hasSweep := contextScopes[minterSweepScope]; hasSweep {
+		t.Errorf("expected tf-live.yaml to carry no sweep scope, got %v", contextScopes)
+	}
 	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml,tf-live.yaml" {
 		t.Errorf("expected both keys tracked, got %q", ann)
 	}
@@ -5955,10 +6162,10 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	if err := cl.Get(ctx, key, updatedCM); err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	for _, name := range []string{"tf-live.yaml", "tf-modules.yaml"} {
-		readScope = minterPolicyScopes(t, updatedCM.Data[name])["platform-agent-read-scope"].(map[string]interface{})
-		if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
-			t.Errorf("%s: expected every same-org context repository, got %s", name, got)
+	for _, name := range []string{"tf-live", "tf-modules"} {
+		readScope = minterPolicyScopes(t, updatedCM.Data[name+".yaml"])["platform-agent-read-scope"].(map[string]interface{})
+		if got := fmt.Sprint(readScope["repositories"]); got != "["+name+"]" {
+			t.Errorf("%s.yaml: expected the context repository alone, got %s", name, got)
 		}
 	}
 	if _, exists := updatedCM.Data["gitops.yaml"]; exists {
@@ -6119,10 +6326,6 @@ func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
 	}
 }
 
-// An unrecognized spec.mode can only reach the reconciler through version skew
-// (enum validation rejects it at admission — the fake client, like a newer CRD
-// with an older binary, does not). The contract from the mode spec: Degraded
-// with reason ModeNotRecognized, today's stack still rendered, and a requeue.
 func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t *testing.T) {
 	// A hand-edited list that is not JSON must skip the sync, as it did before
 	// context_repos was read: an error that read as "no repositories" would
@@ -6659,81 +6862,6 @@ func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *
 	}
 }
 
-func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
-	scheme := setupScheme()
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, shellSandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
-	ctx := context.Background()
-
-	// 1st reconcile adds the finalizer, 2nd does the work.
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 1 failed: %v", err)
-	}
-	result, err := r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile 2 failed: %v", err)
-	}
-	if result.RequeueAfter != 30*time.Second {
-		t.Errorf("expected 30s requeue while mode is unrecognized, got %v", result.RequeueAfter)
-	}
-
-	updated := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	if updated.Status.Phase != "Degraded" {
-		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
-	}
-	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
-	if cond == nil {
-		t.Fatal("expected a Ready condition")
-	}
-	if cond.Reason != "ModeNotRecognized" {
-		t.Errorf("expected reason ModeNotRecognized, got %q", cond.Reason)
-	}
-	if !strings.Contains(cond.Message, "quantum") {
-		t.Errorf("condition message must name the unrecognized value, got %q", cond.Message)
-	}
-
-	// Fail-closed means the dark stack stays dark AND today's stack still renders:
-	// the cluster keeps running what it ran, with the skew visible in status.
-	dep := &appsv1.Deployment{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
-		t.Errorf("today's Deployment should still be rendered under an unrecognized mode: %v", err)
-	}
-
-	// Correcting the mode clears the Degraded phase on the next reconcile.
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to refetch agent: %v", err)
-	}
-	updated.Spec.Mode = nil
-	if err := cl.Update(ctx, updated); err != nil {
-		t.Fatalf("failed to update agent: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 3 failed: %v", err)
-	}
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	if updated.Status.Phase == "Degraded" {
-		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
-	}
-}
-
 type mockAutopilotDiscovery struct {
 	discovery.DiscoveryInterface
 	serverVersionErr  error
@@ -7174,7 +7302,7 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To(string(ModeNext))},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("next")},
 	}
 
 	pod := &corev1.Pod{
@@ -7208,45 +7336,6 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	}
 	if !strings.Contains(message, "test-agent-a2a-gateway-7d9f-abc") {
 		t.Errorf("message does not name the faulting pod: %q", message)
-	}
-}
-
-// TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall keeps the
-// dark stack dark, and matches the gate readSplitWorkloads uses. A today install
-// renders no A2A gateway; a pod left behind by a mode flip, or one frozen by
-// version skew, must not turn that CR Degraded for a workload this install does
-// not claim to run.
-func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testing.T) {
-	scheme := setupScheme()
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
-	}
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent-a2a-gateway-7d9f-abc",
-			Namespace: "test-ns",
-			Labels:    map[string]string{"app": "test-agent-a2a-gateway"},
-		},
-		Status: corev1.PodStatus{
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "gateway",
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-					Reason:  "ImagePullBackOff",
-					Message: "Back-off pulling image",
-				}},
-			}},
-			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-
-	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
-
-	if phase == "Degraded" {
-		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)
 	}
 }
 
@@ -7411,8 +7500,10 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
 	}
 
-	// A storage switch renders the other workload kind while the old one still
-	// runs: the old one is what holds the value.
+	// A switch renders the other workload kind while the old one still runs:
+	// the old one is what holds the value. The switch that remains is the
+	// replica cap: a StatefulSet a pre-cap release rendered for replicas > 1
+	// over RWO storage, under a spec that now renders the Deployment.
 	switched := agentWith("https://github.com:gke-labs/infra")
 	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
@@ -7422,11 +7513,16 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		}},
 	}
-	if !useStatefulSet(switched) {
-		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	if useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent still selects a StatefulSet past the replica cap")
 	}
-	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
-		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	liveSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec:       appsv1.StatefulSetSpec{Template: live.Spec.Template},
+	}
+	stsOnly := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveSts).Build(), Scheme: scheme}
+	if held, err := stsOnly.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a workload-kind switch, expected the live gke-labs", held, err)
 	}
 
 	// A read that fails is returned, never taken for "nothing live": the render
@@ -7438,5 +7534,422 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 	})}
 	if held, err := failing.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); err == nil {
 		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepo covers the gitops_repo key: the fleet
+// audit reads it to choose the repository for its ledger issue when several
+// repositories are managed. Each forge gets the key, in the form of its
+// managed_repos entry, and the key goes away when no repository has role
+// gitops.
+func TestReconcileGitopsStateGitOpsRepo(t *testing.T) {
+	gitlabToken := &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}
+	cases := []struct {
+		name   string
+		forges []agentv1alpha1.ForgeSpec
+		want   string
+	}{
+		{
+			name:   "github.com",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name:   "GitLab",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme", CredentialsRef: gitlabToken}},
+			want:   `{"type":"gitlab","url":"https://gitlab.example.com/acme/infra"}`,
+		},
+		{
+			name:   "GitHub Enterprise Server",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Host: "ghe.example.com", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://ghe.example.com/acme/infra"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+			ctx := context.Background()
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"}}
+			declare := func(gitopsRole string) {
+				agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: tc.forges,
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "vcs", Repository: "infra", Role: gitopsRole},
+						{Forge: "vcs", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				}}
+			}
+			read := func() (string, bool) {
+				var cm corev1.ConfigMap
+				if err := cl.Get(ctx, client.ObjectKey{Name: "repo-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+					t.Fatalf("get: %v", err)
+				}
+				value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+				return value, ok
+			}
+
+			// Created with the key.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on create = %q, expected %q", got, tc.want)
+			}
+
+			// Removed when the role goes away.
+			declare(agentv1alpha1.RepositoryRoleManaged)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := read(); ok {
+				t.Errorf("gitops_repo = %q stayed after no repository has role gitops", got)
+			}
+
+			// Written again on an update, and not only on create.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on update = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildGitopsStateConfigMapGitOpsRepo(t *testing.T) {
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	cases := []struct {
+		name string
+		list []agentv1alpha1.RepositorySpec
+		want string
+	}{
+		{
+			name: "one gitops repository among managed and context ones",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "docs", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+			want: `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name: "no gitops repository",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+		{
+			// The CRD refuses this; past it, neither one is the GitOps repository.
+			name: "two gitops repositories",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: tc.list},
+				}},
+			}
+			got, ok := buildGitopsStateConfigMap(agent).Data[gitopsStateGitOpsRepoKey]
+			if tc.want == "" && ok {
+				t.Errorf("gitops_repo = %q, expected no key", got)
+			}
+			if tc.want != "" && got != tc.want {
+				t.Errorf("gitops_repo = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepoHeldOrRemoved covers the gitops_repo key
+// on an existing ConfigMap: a declaration that does not resolve, or a gitops
+// repository that validation refuses, keeps the key as it is; two gitops
+// repositories remove it.
+func TestReconcileGitopsStateGitOpsRepoHeldOrRemoved(t *testing.T) {
+	const want = `{"type":"github","url":"https://github.com/acme/infra"}`
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "held-agent", Namespace: "test-ns"}}
+	declare := func(spec agentv1alpha1.IntegrationSpec) {
+		agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: spec}
+	}
+	read := func() (string, bool) {
+		var cm corev1.ConfigMap
+		if err := cl.Get(ctx, client.ObjectKey{Name: "held-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+		return value, ok
+	}
+	reconcile := func(step string) {
+		if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+	}
+
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("create")
+	if got, _ := read(); got != want {
+		t.Fatalf("gitops_repo = %q, expected %q", got, want)
+	}
+
+	// Both spellings at once: the declaration does not resolve.
+	declare(agentv1alpha1.IntegrationSpec{
+		Forges:       gh,
+		Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+		GitHub:       &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "other"},
+	})
+	reconcile("unresolved")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a declaration that does not resolve, expected it kept at %q", got, want)
+	}
+
+	// A gitops repository that validation refuses.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "acme/in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("refused")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a refused gitops repository, expected it kept at %q", got, want)
+	}
+
+	// Two gitops repositories: neither one is the GitOps repository.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleGitOps},
+	}})
+	reconcile("two gitops")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q with two gitops repositories, expected no key", got)
+	}
+	reconcile("two gitops again")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q on the second reconcile with two gitops repositories, expected no key", got)
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias covers a
+// github.com install that install.sh renders through the deprecated github
+// alias: its gitRepo is the gitops repository.
+func TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias(t *testing.T) {
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "alias-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			IntegrationSpec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "infra"}},
+		}},
+	}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := cl.Get(ctx, client.ObjectKey{Name: "alias-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cm.Data[gitopsStateGitOpsRepoKey], `{"type":"github","url":"https://github.com/acme/infra"}`; got != want {
+		t.Errorf("gitops_repo = %q, expected %q", got, want)
+	}
+}
+
+// TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode: Reconcile
+// passes the discovered cluster mode to the proxy builder, so an Autopilot
+// cluster gets the Autopilot requests and a Standard one keeps the defaults.
+func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.T) {
+	autopilot := &mockAutopilotDiscovery{
+		serverGroupsList: &metav1.APIGroupList{Groups: []metav1.APIGroup{{
+			Name:     "auto.gke.io",
+			Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+		}}},
+		resourcesList: map[string]*metav1.APIResourceList{"auto.gke.io/v1": {
+			GroupVersion: "auto.gke.io/v1", APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+		}},
+	}
+	tests := []struct {
+		name     string
+		dc       discovery.DiscoveryInterface
+		wantCPU  string
+		wantMem  string
+		wantType string
+	}{
+		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, shellSandboxKeysSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: tt.dc}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			assertQuantity(t, proxy.Resources.Limits, corev1.ResourceCPU, "2")
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+			if _, onPod := dep.Spec.Template.Annotations[credentialProxyClusterTypeAnnotation]; onPod {
+				t.Errorf("%s is on the pod template, where a change restarts the proxy", credentialProxyClusterTypeAnnotation)
+			}
+		})
+	}
+}
+
+// TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails: when
+// discovery cannot say whether the cluster is Autopilot, Reconcile renders the
+// proxy at the cluster type the running proxy was rendered for: the one its
+// cluster-type annotation records, or, on a Deployment without one, the one
+// whose requests it carries. So a failed check after an operator restart does
+// not restart the proxy. With no proxy yet it renders the Standard requests.
+func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) {
+	lowerMemory := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")}}
+	cpuOnly := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}
+	cpuHalf := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")}}
+	memory2Gi := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
+	bothRequests := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}}
+	tests := []struct {
+		name      string
+		resources *corev1.ResourceRequirements
+		running   *bool
+		// editedMeanwhile renders the running proxy without the CR's override,
+		// as before a CR edit made while discovery fails; runningResources, when
+		// set, is the override the running proxy was rendered from instead.
+		editedMeanwhile  bool
+		runningResources *corev1.ResourceRequirements
+		unannotated      bool
+		wantCPU          string
+		wantMem          string
+		// wantType is the cluster-type annotation after the reconcile; "" is
+		// none. A guess from the requests is never recorded.
+		wantType string
+	}{
+		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
+		// The annotation holds across a CR edit that moves the requests, which
+		// the request comparison cannot follow.
+		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi", wantType: credentialProxyClusterTypeAutopilot},
+		// A Standard proxy at 500m / 2Gi (requests.memory 2Gi), whose CR now
+		// sets only requests.cpu 500m: the new CR's Autopilot render is also
+		// 500m / 2Gi, so only the annotation keeps it Standard.
+		{
+			name: "Standard, the CR edited meanwhile", resources: cpuHalf, running: ptr.To(false), editedMeanwhile: true,
+			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard,
+		},
+		// A Deployment an older operator wrote has no annotation, so its
+		// requests decide.
+		{name: "unannotated, at the Autopilot requests", running: ptr.To(true), unannotated: true, wantCPU: "2", wantMem: "2Gi"},
+		{name: "unannotated, at the Standard requests", running: ptr.To(false), unannotated: true, wantCPU: "500m", wantMem: "1Gi"},
+		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
+		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
+		{name: "unannotated, only the CPU matches the Autopilot render", resources: cpuOnly, running: ptr.To(false), unannotated: true, wantCPU: "2", wantMem: "1Gi"},
+		// A CR that sets both requests renders the same on either type, so the
+		// comparison matches Autopilot on a Standard proxy; that guess must not
+		// be written down, or a later CR edit would render the Autopilot
+		// defaults while discovery still fails.
+		{name: "unannotated, the requests match both renders", resources: bothRequests, running: ptr.To(false), unannotated: true, wantCPU: "1", wantMem: "1Gi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			if tt.resources != nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.resources}}
+			}
+			objs := []client.Object{agent, shellSandboxKeysSecret(agent)}
+			if tt.running != nil {
+				source := agent.DeepCopy()
+				if tt.editedMeanwhile {
+					source.Spec.Deployment = nil
+					if tt.runningResources != nil {
+						source.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.runningResources}}
+					}
+				}
+				live := buildCredentialProxyDeploymentForPlugins(source, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running)
+				if tt.unannotated {
+					delete(live.Annotations, credentialProxyClusterTypeAnnotation)
+				}
+				objs = append(objs, live)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			failing := &mockAutopilotDiscovery{serverGroupsErr: fmt.Errorf("503 Service Unavailable")}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: failing}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			if r.autopilotResolved {
+				t.Fatal("an undetermined discovery answer was cached")
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+		})
 	}
 }

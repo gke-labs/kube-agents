@@ -2,7 +2,6 @@
 
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -774,13 +773,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         }
         self.assertIsNotNone(collect.check_untargeted_compute_class_workload(wl, ctx_win))
 
-    def _create_dump_file(self, fake_dump):
-        tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp_dir.cleanup)
-        dump_path = Path(tmp_dir.name) / "test_dump.json"
-        dump_path.write_text(json.dumps(fake_dump), encoding="utf-8")
-        return dump_path
-
+    # `dump_state` returns the parsed dump itself: the collector pages the kinds through
+    # `kubectl get --raw` and reads them straight back, and no scratch file is written.
     def test_collect_obtainability_crd_absent_sets_not_applicable(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
@@ -793,9 +787,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.return_value = (
@@ -824,9 +817,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.return_value = (
@@ -855,12 +847,11 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        tmp_dump = self._create_dump_file(fake_dump)
         cc_stdout = json.dumps({"items": [self.cc]})
         test_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "standard-cc"})
         np_stdout = json.dumps([test_pool])
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.side_effect = [
@@ -894,9 +885,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {"items": [deployment("api"), self.ns]}
-        tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 cc_context = collect._collect_obtainability(
@@ -920,10 +910,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {"items": [deployment("api"), self.ns]}
-        tmp_dump = self._create_dump_file(fake_dump)
         cc_stdout = json.dumps({"items": [self.cc]})
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.side_effect = [
@@ -950,10 +939,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {"items": [deployment("api"), self.ns]}
-        tmp_dump = self._create_dump_file(fake_dump)
         cc_stdout = json.dumps({"items": [self.cc]})
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 # 1. Output is a dict instead of a list (rc=0)
@@ -1187,14 +1175,13 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), node("arm-node", labels={"cloud.google.com/gke-nodepool": "arm-pool"}), self.ns]
         }
-        tmp_dump = self._create_dump_file(fake_dump)
         arm_pool = pool(
             "arm-pool",
             labels={"cloud.google.com/compute-class": "axion"},
             taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
         )
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.side_effect = [
                     ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout="{}")),
@@ -1220,9 +1207,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             None,
             "impact description",
         )
-        tmp_dump = self._create_dump_file({"items": []})
+        fake_dump = {"items": []}
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.return_value = ([], MagicMock(rc=0, duration_s=0.05, stdout="[]", stderr=""))
                 cc_context = collect._collect_obtainability(
@@ -1247,9 +1234,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             None,
             "impact description",
         )
-        tmp_dump = self._create_dump_file({"items": []})
+        fake_dump = {"items": []}
         with patch.object(collect, "dump_state") as mock_dump:
-            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            mock_dump.return_value = (fake_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.side_effect = [
                     ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout="{}")),

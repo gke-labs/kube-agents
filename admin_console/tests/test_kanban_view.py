@@ -43,6 +43,7 @@ class DisplayStatusTest(unittest.TestCase):
             (card("blocked", block_kind="needs_input"), "blocked · needs input"),
             (card("blocked", block_kind="capability"), "blocked · missing capability"),
             (card("blocked", block_kind="transient"), "blocked · temporary failure"),
+            (card("blocked", block_kind="capacity"), "blocked · no capacity"),
             (card("blocked"), "blocked"),
             (card("blocked", block_kind="future_kind"), "blocked"),
             (card("triage"), "triage"),

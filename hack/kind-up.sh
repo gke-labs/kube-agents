@@ -86,7 +86,7 @@ docker tag "${SANDBOX_IMAGE}" "kind.local/agent-sandbox:${SANDBOX_TAG}"
 docker tag "${OPERATOR_IMAGE}" "kind.local/k8s-operator:${OPERATOR_TAG}"
 
 # ─── Cluster ─────────────────────────────────────────────────────────────────
-if ! kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
+if ! grep -qx "${CLUSTER_NAME}" <<<"$(kind get clusters 2>/dev/null)"; then
   log "creating kind cluster ${CLUSTER_NAME}"
   kind create cluster --name "${CLUSTER_NAME}" --wait 120s
 fi
@@ -109,8 +109,8 @@ fi
 # ─── Chart ───────────────────────────────────────────────────────────────────
 # harness.location=kind tells the operator there is no GKE cluster: the
 # credential proxy uses the cluster it runs in. No gVisor; no PodMonitoring
-# (LiteLLM's is switched off, the gateway's follows the cluster and kind serves
-# no such API); one small LiteLLM replica.
+# (every PodMonitoring knob follows the cluster and kind serves no such API);
+# one small LiteLLM replica.
 log "installing the chart"
 helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/charts/kube-agents" \
   --namespace "${NAMESPACE}" --create-namespace \
@@ -121,6 +121,7 @@ helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/cha
   --set-string "platformAgent.harness.projectId=kind" --set-string "platformAgent.harness.location=kind" --set-string "platformAgent.harness.clusterName=kind" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
   --set "platformAgent.harness.hermes.dashboardEnabled=false" \
+  --set "platformAgent.harness.tuning.busReplicas=1" \
   --set "platformAgent.credentials.create=true" \
   --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
   --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
@@ -128,7 +129,7 @@ helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/cha
   --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${KEY_DIR}/id_sandbox.pub" \
   --set-string "litellm.modelProvider=gemini" --set-string "litellm.modelDefaultName=gemini-3.7-flash" --set "litellm.replicaCount=1" \
   --set-string "litellm.resources.requests.memory=256Mi" --set-string "litellm.resources.limits.memory=1Gi" \
-  --set "litellm.podMonitoring=false" --set "litellm.podDisruptionBudget.enabled=false" --set "litellm.topologySpread.enabled=false" \
+  --set "litellm.podDisruptionBudget.enabled=false" --set "litellm.topologySpread.enabled=false" \
   --set "operator.podDisruptionBudget.enabled=false" --set "operator.topologySpread.enabled=false" \
   --wait --timeout 15m
 

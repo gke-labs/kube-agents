@@ -1,0 +1,55 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "seeded-c is one minor version behind.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "It runs 1.32.9 and stable is 1.33.4; seeded-a and seeded-b are current.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "text": {
+              "emoji": true,
+              "text": "upgrade plan for seeded-c",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "upgrade plan for seeded-c"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

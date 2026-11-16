@@ -1,0 +1,4 @@
+id: case-xfail-cap
+domain: capacity
+owner: alice
+expected_fail: True

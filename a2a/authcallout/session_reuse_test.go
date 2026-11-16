@@ -30,7 +30,10 @@ const (
 	// for one that completes. Under a three-second grant every party in the
 	// fixture (the verifier and the gateway too) reconnects every few
 	// seconds, so a turn whose capability check lands in one of those
-	// reconnects is rejected as "the verifier could not be reached". That is
+	// reconnects could be rejected as "the verifier could not be reached".
+	// The capability client now asks again for its reach window
+	// (capability.DefaultReachWindow), which rides out one such reconnect;
+	// the attempts and the gap below predate it and stay as margin. That is
 	// the fixture's churn, not the pod's: what the test needs from every
 	// turn is that the pod took it. So it does not show that a turn landing
 	// inside the pod's own reconnect is never rejected; that is for the live
@@ -140,7 +143,10 @@ func TestAReusedSessionPodTakesItsNextTaskUnderItsOwnGrants(t *testing.T) {
 // still take the next turn, and run one through.
 func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 	var reviews atomic.Int64
-	h := startHarness(t, sessionMap, sessionTokens(), withGrantTTL(reuseGrantTTL),
+	// The re-authentications are counted as the TokenReviews they cause,
+	// and the validator would otherwise answer a second presentation of
+	// the pod's token inside 30s from memory, uncounted.
+	h := startHarness(t, sessionMap, sessionTokens(), withGrantTTL(reuseGrantTTL), withoutReviewCache(),
 		watchingTokenReviews(func(token string) func() {
 			if token == tokenPodA {
 				reviews.Add(1)

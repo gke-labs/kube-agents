@@ -4,16 +4,27 @@ The transport half of this patch is covered by
 ``tests/integration/test_seam_chat_ingress.py``, which drives the real closures
 against the real credential proxy. This file covers the half that has no
 network in it: what the adapter does with a deliverable on an install where
-``media.upload`` is unreachable.
+``media.upload`` is unreachable; and the standalone sender ``hermes send``
+reaches Chat through, with the relay transport faked at ``urlopen``.
 """
 
 import asyncio
+import io
+import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import urllib.error
+from email.message import Message
 from pathlib import Path
+from unittest import mock
+
+import chat_notify
+
+RELAY_URL = "http://127.0.0.1:1"
 
 
 def _install_gateway_stub() -> dict:
@@ -529,6 +540,330 @@ class InlineFallbackTest(unittest.TestCase):
 
         self.assertEqual(len(adapter.sent), 1, "no report follows a refused caption")
         self.assertEqual(len(adapter.fallback_calls), 1)
+
+
+def relay_error(status, body):
+    """The error response the credential proxy answers a refused call with."""
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+    return urllib.error.HTTPError(
+        RELAY_URL + "/v1/chat/api", status, "error", Message(), io.BytesIO(raw)
+    )
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload):
+        self._data = json.dumps(payload).encode("utf-8")
+
+    def read(self, *_args):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class StandaloneRelaySendTest(unittest.TestCase):
+    """``hermes send --to google_chat``: the registry entry's standalone sender.
+
+    ``hermes send`` builds no adapter, so ``create_adapter`` never fires there.
+    It looks the plugin's entry up and calls ``standalone_sender_fn``, which
+    upstream implements by minting a token the sandboxed agent cannot mint.
+    """
+
+    def setUp(self):
+        self.saved = _install_gateway_stub()
+        self.addCleanup(self._restore)
+        os.environ["GOOGLE_CHAT_RELAY_URL"] = RELAY_URL
+        self.addCleanup(os.environ.pop, "GOOGLE_CHAT_RELAY_URL", None)
+        sys.modules.pop("google_chat_relay_patch", None)
+        import google_chat_relay_patch
+
+        self.patch = google_chat_relay_patch
+        self.registered = []
+
+        # Upstream's signature, keyword-only ``scope`` included: a fake on an
+        # older signature agrees with a wrapper on an older signature.
+        def register(_self, entry, *, scope=None):
+            self.registered.append((entry, scope))
+
+        self.registry_class = sys.modules["gateway.platform_registry"].PlatformRegistry
+        self.registry_class.register = register
+        self.original_calls = []
+
+        async def original_standalone_send(pconfig, chat_id, message, **kwargs):
+            self.original_calls.append((chat_id, message, kwargs))
+            return {"error": "Google Chat standalone send: token refresh timed out"}
+
+        self.original_standalone_send = original_standalone_send
+
+    def _restore(self):
+        for name, module in self.saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def _register(self, name="google_chat"):
+        entry = types.SimpleNamespace(
+            name=name, standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_class().register(entry, scope="profile-home")
+        return entry
+
+    def _relay(self, responses):
+        """Fake the relay transport, capturing every request it receives."""
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return FakeHTTPResponse({"response": result})
+
+        return captured, mock.patch("urllib.request.urlopen", side_effect=fake_urlopen)
+
+    def _send(self, entry, message="alert", **kwargs):
+        return asyncio.run(
+            entry.standalone_sender_fn(None, "spaces/AAA", message, **kwargs)
+        )
+
+    def test_registering_google_chat_swaps_the_sender(self):
+        self.patch.install()
+        entry = self._register()
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+        # The registration itself still reaches upstream, scope and all.
+        self.assertEqual([(entry, "profile-home")], self.registered)
+
+    def test_another_platform_is_left_alone(self):
+        self.patch.install()
+        entry = self._register("slack")
+        self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
+
+    def test_no_relay_url_keeps_the_original_sender(self):
+        os.environ.pop("GOOGLE_CHAT_RELAY_URL")
+        self.patch.install()
+        entry = self._register()
+        self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
+
+    def test_a_silent_cron_tick_is_dropped_as_its_siblings_drop_it(self):
+        from test_slack_relay_patch import _chat_adapter_modules
+
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([])
+        skipped = {"success": True, "platform": "google_chat", "skipped": "empty_text"}
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            with patched, self.assertLogs("google-chat-relay-patch", "INFO") as logs:
+                for silent in ("`[SILENT]`", "**[SILENT]**", "  **`[silent]`**  ", "  \n "):
+                    with self.subTest(silent=silent):
+                        self.assertEqual(skipped, self._send(entry, message=silent))
+        self.assertEqual([], captured, "a silent tick never reaches the relay")
+        self.assertIn("silent tick", logs.output[0])
+
+    def test_a_report_that_only_mentions_the_marker_still_posts(self):
+        from test_slack_relay_patch import _chat_adapter_modules
+
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            with patched:
+                result = self._send(
+                    entry, message="Compliance Audit: 2 critical [SILENT] was not the answer"
+                )
+        self.assertTrue(result.get("success"))
+        self.assertEqual(1, len(captured))
+
+    def test_a_local_service_account_does_not_keep_the_token_minting_sender(self):
+        # Unlike Slack's: the relayed in-process adapter already ignores a
+        # service-account JSON once the relay is configured, and the two paths
+        # posting under different identities would be worse than either.
+        captured, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        pconfig = types.SimpleNamespace(extra={"service_account_json": '{"type": "service_account"}'})
+        # Set from install through send, so neither the swap nor the send can defer to it.
+        with patched, mock.patch.dict(os.environ, {"GOOGLE_CHAT_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'}):
+            self.patch.install()
+            entry = self._register()
+            self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+            result = asyncio.run(entry.standalone_sender_fn(pconfig, "spaces/AAA", "alert"))
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual([], self.original_calls, "the token-minting sender must not run")
+        self.assertEqual([RELAY_URL + "/v1/chat/api"], [url for url, _ in captured])
+
+    def test_the_alert_is_posted_through_the_relay(self):
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        with patched:
+            result = self._send(entry)
+
+        self.assertEqual(
+            {"success": True, "message_id": "spaces/AAA/messages/abc.abc"}, result
+        )
+        self.assertEqual([], self.original_calls, "the token-minting sender must not run")
+        self.assertEqual(1, len(captured))
+        url, payload = captured[0]
+        self.assertEqual(RELAY_URL + "/v1/chat/api", url)
+        self.assertEqual(
+            {
+                "resource": ["spaces", "messages"],
+                "method": "create",
+                "arguments": {"parent": "spaces/AAA", "body": {"text": "alert"}},
+            },
+            payload,
+        )
+
+    def test_the_result_gives_the_session_server_a_thread(self):
+        """What ``_post_initial_alert`` reads off ``hermes send --json``."""
+        self.patch.install()
+        entry = self._register()
+        _, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        with patched:
+            result = self._send(entry)
+
+        self.assertEqual(
+            "spaces/AAA/threads/abc",
+            chat_notify.thread_from_response("google_chat", result),
+        )
+
+    def test_a_thread_reply_is_threaded(self):
+        """The thread name alone is ignored by the API without the reply option."""
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay(
+            [{"name": "spaces/AAA/messages/abc.def"}]
+        )
+        with patched:
+            self._send(entry, thread_id="spaces/AAA/threads/abc")
+
+        arguments = captured[0][1]["arguments"]
+        self.assertEqual({"name": "spaces/AAA/threads/abc"}, arguments["body"]["thread"])
+        self.assertEqual(
+            "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD", arguments["messageReplyOption"]
+        )
+
+    def test_the_blocking_relay_call_runs_off_the_event_loop(self):
+        """Cron delivery runs under asyncio.run; a blocking urlopen stalls it."""
+        self.patch.install()
+        entry = self._register()
+        callers = []
+
+        def fake_urlopen(req, timeout=None):
+            callers.append(threading.current_thread())
+            return FakeHTTPResponse({"response": {"name": "spaces/AAA/messages/m"}})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self._send(entry)
+
+        self.assertEqual(1, len(callers))
+        self.assertIsNot(threading.main_thread(), callers[0])
+
+    def test_a_chat_rejection_is_an_error_result(self):
+        self.patch.install()
+        entry = self._register()
+        _, patched = self._relay(
+            [
+                relay_error(
+                    502,
+                    {
+                        "error": "Google Chat operation failed",
+                        "chat": {"status": 404, "reason": "Not Found"},
+                    },
+                )
+            ]
+        )
+        with patched:
+            result = self._send(entry)
+
+        self.assertEqual(
+            {"error": "Google Chat standalone send: API returned 404 (Not Found)"},
+            result,
+        )
+
+    def test_a_refusal_by_the_relay_names_the_relay(self):
+        self.patch.install()
+        entry = self._register()
+        _, patched = self._relay([relay_error(503, {"error": "chat relay disabled"})])
+        with patched:
+            result = self._send(entry)
+
+        self.assertEqual(
+            {"error": "Google Chat standalone send: relay error 503: chat relay disabled"},
+            result,
+        )
+
+    def test_an_unreachable_relay_is_an_error_result(self):
+        self.patch.install()
+        entry = self._register()
+        _, patched = self._relay([urllib.error.URLError("connection refused")])
+        with patched:
+            result = self._send(entry)
+
+        self.assertIn("error", result)
+        self.assertTrue(
+            result["error"].startswith("Google Chat standalone send failed:"), result
+        )
+
+    def test_an_error_goes_through_hermes_redactor_when_it_is_there(self):
+        # Upstream's senders return send_error(...), which redacts secrets
+        # before the text reaches the model transcript; so must this one.
+        self.patch.install()
+        entry = self._register()
+        shared = types.ModuleType("gateway.platforms._shared")
+        shared.send_error = lambda text: {"error": text.replace("hunter2", "***")}
+        stubs = {"gateway.platforms": types.ModuleType("gateway.platforms"), "gateway.platforms._shared": shared}
+        _, patched = self._relay([urllib.error.URLError("refused, token=hunter2")])
+        with patched, mock.patch.dict(sys.modules, stubs):
+            result = self._send(entry)
+        self.assertEqual({"error": "Google Chat standalone send failed: <urlopen error refused, token=***>"}, result)
+
+    def test_a_missing_space_is_refused_before_the_relay(self):
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([])
+        with patched:
+            result = asyncio.run(entry.standalone_sender_fn(None, "", "alert"))
+
+        self.assertIn("error", result)
+        self.assertEqual([], captured)
+
+    def test_an_entry_registered_before_install_is_still_patched(self):
+        entry = types.SimpleNamespace(
+            name="google_chat", standalone_sender_fn=self.original_standalone_send
+        )
+        registry_module = sys.modules["gateway.platform_registry"]
+        registry_module.platform_registry = types.SimpleNamespace(
+            _entries={}, _scoped_entries={"profile-home": {"google_chat": entry}}
+        )
+        self.patch.install()
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+
+
+class RelayFailureDetailTest(unittest.TestCase):
+    def setUp(self):
+        self.saved = _install_gateway_stub()
+        self.addCleanup(self._restore)
+        import google_chat_relay_patch
+
+        self.patch = google_chat_relay_patch
+
+    def _restore(self):
+        for name, module in self.saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_a_chat_status_without_a_reason(self):
+        detail = self.patch.relay_failure_detail(relay_error(502, {"chat": {"status": 403}}))
+        self.assertEqual("API returned 403", detail)
+
+    def test_an_unreadable_body_is_a_relay_error(self):
+        detail = self.patch.relay_failure_detail(relay_error(401, b"<html>"))
+        self.assertEqual("relay error 401", detail)
 
 
 if __name__ == "__main__":

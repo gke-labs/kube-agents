@@ -10,17 +10,27 @@
 #   hack/rollback-roundtrip.sh [namespace] [platformagent-name]
 #
 # Defaults: kubeagents-system and platform-agent. ROLLBACK_KUBE_CONTEXT pins
-# every kubectl call to one context. hack/ci-eval-pr.sh runs it after the
-# next lane's matrix and reports the result beside the eval verdict, not in it.
+# every kubectl call to one context. hack/ci-eval-pr.sh runs it after a
+# next-mode matrix on main and reports the result beside the eval verdict, not
+# in it.
+#
+# ROLLBACK_END_MODE=today adds a third leg, next -> today again, with leg 1's
+# assertions, so the install is left rolled back: what the today lane
+# (EVAL_ROLLBACK_LANE=1 in hack/ci-eval-pr.sh) runs before it grades today's
+# matrix on that install. It refuses a CR that declares sidecars of its own,
+# before anything changes, since the third flip would have to leave them unset.
 #
 # The two kept objects, as the operator renders them for a CR named <cr>
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go, cleanupA2A
 # and the a2aPreBusTeardown and a2aBusTeardown lists it walks, neither of
 # which names either object):
-#   - the JetStream PVC data-<cr>-a2a-nats-0. The NATS StatefulSet's
+#   - the JetStream PVC data-<cr>-a2a-nats-0 (a three-server bus keeps -1 and
+#     -2 the same way; this run checks -0, which every bus has). The NATS StatefulSet's
 #     volumeClaimTemplate (a2aNATSDataClaim, "data") stamps it out, so it has
-#     no owner reference, and the StatefulSet sets no PVC retention policy,
-#     whose default keeps the claim when the StatefulSet goes. The flip
+#     no owner reference, and the StatefulSet's PVC retention policy keeps
+#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain), and
+#     in this release on a scale-down too (WhenScaled: Retain; #4225 changes
+#     that with the migration). The flip
 #     forward renders the same template under the same StatefulSet name, and
 #     the StatefulSet controller binds the claim of that name that is already
 #     there.
@@ -69,6 +79,10 @@ readonly NATS_ORDINAL_SUFFIX="-0"
 readonly CALLOUT_NAME_SUFFIX="-a2a-callout"
 readonly CALLOUT_KEYS_SUFFIX="-keys"
 readonly A2A_GATEWAY_SUFFIX="-a2a-gateway"
+# A Service's selector as a label selector, with a trailing comma to trim.
+# shellcheck disable=SC2016 # a go-template, not a shell expansion
+readonly SELECTOR_TEMPLATE='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}'
+
 readonly A2A_VERIFIER_SUFFIX="-a2a-verifier"
 readonly INJECT_NAME_SUFFIX="-a2a-inject"
 readonly AGENT_DEPLOYMENT_SUFFIX="-gateway"
@@ -123,6 +137,22 @@ readonly AGENT_API_MODEL="model-default"
 readonly AGENT_API_PROMPT="ping"
 readonly AGENT_API_ACCEPT_MARKERS="output assistant pong"
 readonly AGENT_LOCAL_PORT_DEFAULT=28541
+
+# ─── The web console ─────────────────────────────────────────────────────────
+# The deploy's console gate (hack/ci-deploy.sh, 6a), run again after pre and
+# after every leg through the probe both share (hack/web-console-probe.sh,
+# sourced below SCRIPT_DIR): the console's Deployment is rolled out, its page
+# and read routes answer, one turn through its chat route gets a reply, and
+# the session's messages show the user's row and the assistant's. The console
+# is the chart's, named off the Helm release rather than the CR
+# (<release>-web-console, charts/kube-agents/templates/web-console.yaml);
+# ROLLBACK_WEB_CONSOLE_NAME overrides the lane's release name. An install with
+# no such Service gets a SKIP: the lane installs the console, a dev install
+# may not. tests/test_rollback_roundtrip.py holds the default to the lane's
+# release.
+readonly WEB_CONSOLE_NAME_DEFAULT="kube-agents-web-console"
+readonly WEB_CONSOLE_PORT=8080
+readonly WEB_CONSOLE_LOCAL_PORT_DEFAULT=28080
 
 # ─── The bus task ────────────────────────────────────────────────────────────
 # One task through the inject door (a2aInjectPort; token under a2aInjectTokenKey
@@ -183,6 +213,16 @@ readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
 readonly DEFAULT_TURN_ATTEMPTS=5
+# One console read route's request, and one console turn's: the latter
+# outlasts the console's own turn timeout (turnTimeout, 300 s), after which
+# the console answers 504 and the next attempt sends another turn. Two
+# tunnels, not the today turn's five: the run makes up to four console
+# checks inside the one-hour bound hack/ci-eval-pr.sh gives it, and each
+# turn is already retried inside Hermes, so the second attempt is for a
+# dropped tunnel or a turn the console cut off, not a third try at the model.
+readonly DEFAULT_CONSOLE_ROUTE_TIMEOUT=60
+readonly DEFAULT_CONSOLE_TURN_TIMEOUT=330
+readonly DEFAULT_CONSOLE_TURN_ATTEMPTS=2
 # One bus task, submission to terminal; and how many fresh tunnels a door
 # that could not be reached gets.
 readonly DEFAULT_BUS_TASK_TIMEOUT=900
@@ -202,6 +242,9 @@ readonly CLIENT_ERR_TAIL_LINES=5
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly BENCH_DIR="${SCRIPT_DIR}/../bench"
+# The web console probe assert_web_console runs, shared with the deploy's gate.
+# shellcheck source=hack/web-console-probe.sh
+source "${SCRIPT_DIR}/web-console-probe.sh"
 
 NAMESPACE="${1:-${ROLLBACK_NAMESPACE:-${DEFAULT_NAMESPACE}}}"
 CR_NAME="${2:-${ROLLBACK_CR_NAME:-${DEFAULT_CR_NAME}}}"
@@ -219,6 +262,11 @@ SETTLE_TIMEOUT="${ROLLBACK_SETTLE_TIMEOUT:-${DEFAULT_SETTLE_TIMEOUT}}"
 UNSCHEDULABLE_TIMEOUT="${ROLLBACK_UNSCHEDULABLE_TIMEOUT:-${DEFAULT_UNSCHEDULABLE_TIMEOUT}}"
 TURN_TIMEOUT="${ROLLBACK_TURN_TIMEOUT:-${DEFAULT_TURN_TIMEOUT}}"
 TURN_ATTEMPTS="${ROLLBACK_TURN_ATTEMPTS:-${DEFAULT_TURN_ATTEMPTS}}"
+CONSOLE_ROUTE_TIMEOUT="${ROLLBACK_CONSOLE_ROUTE_TIMEOUT:-${DEFAULT_CONSOLE_ROUTE_TIMEOUT}}"
+CONSOLE_TURN_TIMEOUT="${ROLLBACK_CONSOLE_TURN_TIMEOUT:-${DEFAULT_CONSOLE_TURN_TIMEOUT}}"
+CONSOLE_TURN_ATTEMPTS="${ROLLBACK_CONSOLE_TURN_ATTEMPTS:-${DEFAULT_CONSOLE_TURN_ATTEMPTS}}"
+WEB_CONSOLE_NAME="${ROLLBACK_WEB_CONSOLE_NAME:-${WEB_CONSOLE_NAME_DEFAULT}}"
+WEB_CONSOLE_LOCAL_PORT="${ROLLBACK_WEB_CONSOLE_LOCAL_PORT:-${WEB_CONSOLE_LOCAL_PORT_DEFAULT}}"
 BUS_TASK_TIMEOUT="${ROLLBACK_BUS_TASK_TIMEOUT:-${DEFAULT_BUS_TASK_TIMEOUT}}"
 BUS_TASK_ATTEMPTS="${ROLLBACK_BUS_TASK_ATTEMPTS:-${DEFAULT_BUS_TASK_ATTEMPTS}}"
 PORT_FORWARD_WAIT="${ROLLBACK_PORT_FORWARD_WAIT:-${DEFAULT_PORT_FORWARD_WAIT}}"
@@ -229,8 +277,12 @@ INJECT_LOCAL_PORT="${ROLLBACK_INJECT_LOCAL_PORT:-${INJECT_LOCAL_PORT_DEFAULT}}"
 # AGENT_INJECT_URL works: for an install already reachable from here.
 AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
+WEB_CONSOLE_URL="${ROLLBACK_WEB_CONSOLE_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
+# Where the run leaves the install: next (the round trip) or today (a third
+# leg rolls it back again; header).
+END_MODE="${ROLLBACK_END_MODE:-${MODE_NEXT}}"
 
 readonly NATS_NAME="${CR_NAME}${NATS_NAME_SUFFIX}"
 readonly NATS_PVC="${NATS_DATA_CLAIM}-${NATS_NAME}${NATS_ORDINAL_SUFFIX}"
@@ -795,14 +847,14 @@ print(json.dumps({"spec": {"deployment": {"sidecars": ((cr.get("spec") or {}).ge
 # a wrapper and leaves the tunnel bound, and every later attempt's probe is
 # answered by the first, possibly dead, tunnel.
 start_port_forward() {
-  local service="$1" local_port="$2" remote_port="$3" waited=0
+  local target="$1" local_port="$2" remote_port="$3" waited=0
   local -a pf=(kubectl)
   stop_port_forward
   [ -n "${PF_LOG}" ] || PF_LOG="$(mktemp)"
   if [ -n "${ROLLBACK_KUBE_CONTEXT:-}" ]; then
     pf+=(--context "${ROLLBACK_KUBE_CONTEXT}")
   fi
-  pf+=(-n "${NAMESPACE}" port-forward "svc/${service}" "${local_port}:${remote_port}")
+  pf+=(-n "${NAMESPACE}" port-forward "${target}" "${local_port}:${remote_port}")
   "${pf[@]}" >>"${PF_LOG}" 2>&1 &
   PF_PID=$!
   while [ "${waited}" -lt "${PORT_FORWARD_WAIT}" ]; do
@@ -812,8 +864,59 @@ start_port_forward() {
     sleep 1
     waited=$((waited + 1))
   done
-  note "port-forward to svc/${service} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
+  note "port-forward to ${target} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
   return 1
+}
+
+# The inject door's port-forward target: the pod holding the gateway's Lease,
+# which is the one replica serving the door once the gateway runs more than
+# one (a standby answers 503), or the door's Service when no Lease names one.
+# Read again on every attempt, so a retry after a handover finds the new
+# holder.
+#
+# The holder is taken only if it is one of the pods the inject Service
+# selects: the tunnel carries the door's token, and a Lease's holder is a
+# string anyone who can write the Lease sets. A Lease read that fails for a
+# reason other than a missing Lease is said, since the Service it falls back
+# to can land on the standby. Everything said goes to stderr: stdout is the
+# target this function returns.
+inject_target() {
+  local holder selector err rc=0
+  err="$(mktemp)"
+  holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>"${err}")" || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    if ! grep -q NotFound "${err}"; then
+      note "reading lease ${A2A_GATEWAY_NAME} failed; forwarding to svc/${INJECT_NAME}: $(tr '\n' ' ' <"${err}")" >&2
+    fi
+    holder=""
+  fi
+  rm -f "${err}"
+  if [ -n "${holder}" ]; then
+    local pods
+    # A pod's name and nothing else: the holder is a free string, and one
+    # with a newline would pass grep -F below as two patterns.
+    case "${holder}" in
+      *[!a-z0-9.-]*)
+        note "lease ${A2A_GATEWAY_NAME} names a holder that isn't a pod name; forwarding to svc/${INJECT_NAME}" >&2
+        echo "svc/${INJECT_NAME}"
+        return 0
+        ;;
+    esac
+    if ! selector="$(k_read get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}")"; then
+      note "reading svc/${INJECT_NAME}'s selector failed; forwarding to the service" >&2
+    elif [ -z "${selector}" ]; then
+      # An empty selector would list every pod in the namespace.
+      note "svc/${INJECT_NAME} has no selector; forwarding to the service" >&2
+    elif ! pods="$(k_read get pods -l "${selector%,}" -o name)"; then
+      note "listing the pods svc/${INJECT_NAME} selects failed; forwarding to the service" >&2
+    elif grep -qxF "pod/${holder}" <<<"${pods}"; then
+      echo "pod/${holder}"
+      return 0
+    else
+      note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
+    fi
+  fi
+  echo "svc/${INJECT_NAME}"
 }
 
 stop_port_forward() {
@@ -832,7 +935,7 @@ assert_today_turn() {
   for ((attempt = 1; attempt <= TURN_ATTEMPTS; attempt++)); do
     url="${AGENT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
+      if ! start_port_forward "svc/${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
         detail="the port-forward to svc/${CR_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
@@ -852,6 +955,47 @@ assert_today_turn() {
     note "${name}: attempt ${attempt}/${TURN_ATTEMPTS} got no answer: ${detail:0:200}"
   done
   fail "${name}" "no answer from ${AGENT_API_PATH} in ${TURN_ATTEMPTS} attempts; last: ${detail:0:300}"
+}
+
+# ─── The web console ─────────────────────────────────────────────────────────
+# The probe is hack/web-console-probe.sh's: WEB_CONSOLE_PROBE_RETRY for an
+# answer another tunnel or turn may change, 1 for one it would not, and
+# WEB_CONSOLE_DETAIL naming the route either way.
+assert_web_console() {
+  local name="$1" present state attempt url rc
+  present="$(k_read get svc "${WEB_CONSOLE_NAME}" --ignore-not-found -o name)" || fail "${name}" "svc/${WEB_CONSOLE_NAME} could not be read"
+  if [ -z "${present}" ]; then
+    skip "${name}" "no svc/${WEB_CONSOLE_NAME}: the install has no web console (webConsole.enabled), so nothing is checked"
+    return 0
+  fi
+  state="$(rollout_state deployment "${WEB_CONSOLE_NAME}")"
+  [ "${state}" = "ok" ] || fail "${name}" "deployment/${WEB_CONSOLE_NAME} is not rolled out: ${state}"
+  WEB_CONSOLE_BODY_FILE="$(mktemp)"
+  WEB_CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  for ((attempt = 1; attempt <= CONSOLE_TURN_ATTEMPTS; attempt++)); do
+    url="${WEB_CONSOLE_URL}"
+    if [ -z "${url}" ]; then
+      if ! start_port_forward "svc/${WEB_CONSOLE_NAME}" "${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_PORT}"; then
+        WEB_CONSOLE_DETAIL="the port-forward to svc/${WEB_CONSOLE_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+        rc="${WEB_CONSOLE_PROBE_RETRY}"
+        continue
+      fi
+      url="http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}"
+    fi
+    rc=0
+    web_console_probe "${url}" "${CONSOLE_ROUTE_TIMEOUT}" "${CONSOLE_TURN_TIMEOUT}" || rc=$?
+    stop_port_forward
+    if [ "${rc}" -eq 0 ]; then
+      rm -f "${WEB_CONSOLE_BODY_FILE}"
+      pass "${name}" "deployment/${WEB_CONSOLE_NAME} rolled out; ${WEB_CONSOLE_DETAIL} (attempt ${attempt}/${CONSOLE_TURN_ATTEMPTS})"
+      return 0
+    fi
+    [ "${rc}" -eq "${WEB_CONSOLE_PROBE_RETRY}" ] || break
+    note "${name}: attempt ${attempt}/${CONSOLE_TURN_ATTEMPTS}: ${WEB_CONSOLE_DETAIL}"
+  done
+  rm -f "${WEB_CONSOLE_BODY_FILE}"
+  fail "${name}" "${WEB_CONSOLE_DETAIL}"
 }
 
 # ─── The bus task ────────────────────────────────────────────────────────────
@@ -902,7 +1046,7 @@ done = exchange.outcome in (it.OUTCOME_TERMINAL, it.OUTCOME_STREAM_TERMINAL) and
 sys.exit(0 if done else 1)
 '
 assert_bus_task() {
-  local name="$1" token attempt url line rc conversation err
+  local name="$1" token attempt url line rc conversation err target
   token="$(secret_value "${INJECT_NAME}" "${INJECT_TOKEN_FIELD}")" || fail "${name}" "secret/${INJECT_NAME} could not be read"
   [ -n "${token}" ] || fail "${name}" "secret/${INJECT_NAME} has no ${INJECT_TOKEN_FIELD}: the install has no inject door (A2A_INJECT_BACKEND=true on the operator)"
   conversation="${BUS_TASK_CONVERSATION_PREFIX}/${name}/$(date -u +%s)"
@@ -910,8 +1054,9 @@ assert_bus_task() {
   for ((attempt = 1; attempt <= BUS_TASK_ATTEMPTS; attempt++)); do
     url="${INJECT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${INJECT_NAME}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
-        line="the port-forward to svc/${INJECT_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+      target="$(inject_target)"
+      if ! start_port_forward "${target}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
+        line="the port-forward to ${target} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
       url="http://127.0.0.1:${INJECT_LOCAL_PORT}"
@@ -943,7 +1088,7 @@ wait_bridges_consuming() {
   while :; do
     missing=""
     for sidecar in ${BUS_SIDECARS}; do
-      if ! k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null | grep -qF "${BRIDGE_CONSUMING_LOG_MSG}"; then
+      if ! grep -qF "${BRIDGE_CONSUMING_LOG_MSG}" <<<"$(k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null)"; then
         missing="${missing} ${sidecar}"
       fi
     done
@@ -967,7 +1112,7 @@ patch_and_reconcile() {
   local leg="$1" what="$2" patch="$3" before
   before="$(agent_generation)" || fail "${leg}.${what}.patched" "deployment/${AGENT_DEPLOYMENT} could not be read"
   k patch platformagent "${CR_NAME}" --type merge -p "${patch}" >/dev/null || fail "${leg}.${what}.patched" "kubectl patch was refused"
-  if [ "${leg}.${what}" = "leg1.mode-today" ]; then
+  if [ "${what}" = "mode-today" ]; then
     BUS_DOWN=1
   fi
   pass "${leg}.${what}.patched" "merge patch applied"
@@ -991,6 +1136,23 @@ bringup_left() {
   echo $((left > 0 ? left : 0))
 }
 
+# The flip to today and what it must leave: leg 1's, and leg 3's under
+# ROLLBACK_END_MODE=today. The teardown ran to its end: the StatefulSet is
+# the last thing cleanupA2A deletes, and the callout keys Secret is one it
+# deletes rather than keeps, so a kept PVC and creds Secret are kept through
+# a teardown that happened, not through one that never started.
+flip_to_today() {
+  local leg="$1"
+  patch_and_settle "${leg}" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
+  wait_absent "${leg}.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
+  assert_same_uid "${leg}.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
+  assert_same_uid "${leg}.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
+  wait_settled "${leg}.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
+  assert_not_degraded "${leg}.not-degraded"
+  assert_today_turn "${leg}.today-turn"
+  assert_web_console "${leg}.web-console"
+}
+
 # ─── The run ─────────────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || {
   echo "FAIL preflight.tools: python3 is required"
@@ -1002,9 +1164,22 @@ note "kept across the flip: pvc/${NATS_PVC}, secret/${CREDS_SECRET}"
 
 # Leg 0: a healthy next install, and the two objects as they are now.
 CURRENT_LEG="pre"
+case "${END_MODE}" in
+  "${MODE_NEXT}" | "${MODE_TODAY}") ;;
+  *) fail "pre.end-mode" "ROLLBACK_END_MODE is '${END_MODE}'; it is ${MODE_NEXT} (the round trip) or ${MODE_TODAY} (a third leg rolls the install back again)" ;;
+esac
 read_cr_state || fail "pre.cr-readable" "platformagent/${CR_NAME} could not be read in ${NAMESPACE}"
 [ "${CR_MODE}" = "${MODE_NEXT}" ] || fail "pre.mode-next" "spec.mode is ${CR_MODE}; the round trip starts from a next install"
 pass "pre.mode-next" "spec.mode is next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Read before anything changes: leg 3 would have to unset a declared
+  # sidecar and leave it unset under today, which is a change to the CR this
+  # run does not own. The lane's install declares none.
+  CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "pre.end-mode-today" "platformagent/${CR_NAME} could not be read"
+  DECLARED_SIDECARS="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}" | sed -n 1p)"
+  [ -z "${DECLARED_SIDECARS}" ] || fail "pre.end-mode-today" "the CR declares spec.deployment.sidecars (${DECLARED_SIDECARS}); ending at ${MODE_TODAY} would leave them unset, so run the round trip without ROLLBACK_END_MODE=${MODE_TODAY}"
+  pass "pre.end-mode-today" "the CR declares no sidecars; the run ends with the install at ${MODE_TODAY}"
+fi
 wait_cr_ready "pre.ready" "${PRE_READY_TIMEOUT}"
 record_degraded_baseline "pre.degraded-baseline"
 wait_rolled "pre.nats-ready" statefulset "${NATS_NAME}" "${PRE_READY_TIMEOUT}"
@@ -1016,6 +1191,7 @@ PVC_UID="${ASSERTED_UID}"
 assert_present "pre.creds-present" secret "${CREDS_SECRET}"
 CREDS_UID="${ASSERTED_UID}"
 assert_bus_task "pre.bus-task"
+assert_web_console "pre.web-console"
 
 # Leg 1: next -> today.
 CURRENT_LEG="leg1"
@@ -1035,17 +1211,7 @@ if [ -n "${UNSET_SIDECARS}" ]; then
 else
   skip "leg1.sidecars-unset" "the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)"
 fi
-patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
-# The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
-# deletes, and the callout keys Secret is one it deletes rather than keeps,
-# so a kept PVC and creds Secret below are kept through a teardown that
-# happened, not through one that never started.
-wait_absent "leg1.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
-assert_same_uid "leg1.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
-assert_same_uid "leg1.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
-wait_settled "leg1.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
-assert_not_degraded "leg1.not-degraded"
-assert_today_turn "leg1.today-turn"
+flip_to_today "leg1"
 
 # Leg 2: today -> next, on the kept objects.
 CURRENT_LEG="leg2"
@@ -1062,11 +1228,13 @@ CURRENT_LEG="leg2"
 # The arithmetic, at the defaults: patch to Ready is at most
 # GENERATION_TIMEOUT + BUS_UP_TIMEOUT = 300 + 1500 = 1800s, whatever the
 # split between the five. That leaves 1800s of the 3600s ci-eval-pr.sh gives
-# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
-# leg 2, which take minutes on a healthy install (each not-degraded check's
-# capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most 300s, 600s for both);
-# a run that needs more is stopped there and reports itself interrupted at
-# the leg it was in. The
+# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1, the rest of
+# leg 2 and, under ROLLBACK_END_MODE=today, leg 3, which take minutes on a
+# healthy install (the round trip has measured about four in CI; each
+# not-degraded check's capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most
+# 300s, 900s for all three); a run that needs more is stopped there and
+# reports itself interrupted at the leg it was in. The today lane runs it
+# before its matrix, where no start-by bound applies. The next-mode run's
 # job-level bound is ci-eval-pr.sh's, beside EVAL_ROLLBACK_START_BY_SECONDS:
 # the run starts by 15600s of job age, deploy included, and with the 3600s
 # bound and its 60s kill grace ends by 19260s, inside the 21600s deadline. The
@@ -1112,7 +1280,17 @@ wait_rolled "leg2.gateway-serving" deployment "${A2A_GATEWAY_NAME}" "${ROLLOUT_T
 assert_bus_task "leg2.bus-task"
 wait_settled "leg2.nothing-stuck" "${MODE_NEXT}" "${SETTLE_TIMEOUT}"
 assert_not_degraded "leg2.not-degraded"
+assert_web_console "leg2.web-console"
+
+ROUTE="next -> today -> next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Leg 3: next -> today again, on the objects leg 2 brought back, and the
+  # install is left there for whatever runs after.
+  CURRENT_LEG="leg3"
+  flip_to_today "leg3"
+  ROUTE="${ROUTE} -> today"
+fi
 
 CURRENT_LEG="done"
-echo "ROLLBACK ROUND TRIP PASSED: next -> today -> next on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
+echo "ROLLBACK ROUND TRIP PASSED: ${ROUTE} on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
 record "PASSED"

@@ -55,6 +55,12 @@ pages = {
             title="LLM Gateway",
             icon=":material/model_training:",
         ),
+        st.Page(
+            VIEWS_DIRECTORY / "harness_limits.py",
+            title="Harness limits",
+            icon=":material/speed:",
+            url_path="harness-limits",
+        ),
     ],
     "Agentic": [
         st.Page(

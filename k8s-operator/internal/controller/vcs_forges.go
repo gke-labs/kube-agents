@@ -143,8 +143,12 @@ func buildVCSForgesVolumeMounts(agent *agentv1alpha1.PlatformAgent) []corev1.Vol
 
 // buildVCSForgesVolumes projects each forge's token out of its Secret.
 //
-// Only the `token` key, so nothing else an administrator keeps in the Secret
-// reaches the pod. 0400, readable through the pod's fsGroup as the other
+// Only the `token` key and the optional `read-token` key, so nothing else an
+// administrator keeps in the Secret reaches the pod. The broker uses the read
+// token only to clone context repositories. Kubelet skips an item whose key
+// is missing from an optional Secret, so a Secret without `read-token` still
+// starts the pod and the broker clones context repositories with no
+// credential, as before. 0400, readable through the pod's fsGroup as the other
 // projections are. Optional, deliberately: a missing Secret must not keep the
 // broker -- and with it GitHub, chat and every brokered command -- from
 // starting. The broker reads the token on every call and answers a missing
@@ -163,6 +167,9 @@ func buildVCSForgesVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 				Items: []corev1.KeyToPath{{
 					Key:  agentv1alpha1.ForgeCredentialsTokenKey,
 					Path: agentv1alpha1.ForgeCredentialsTokenKey,
+				}, {
+					Key:  agentv1alpha1.ForgeCredentialsReadTokenKey,
+					Path: agentv1alpha1.ForgeCredentialsReadTokenKey,
 				}},
 				DefaultMode: ptr.To(int32(0o400)),
 				Optional:    ptr.To(true),

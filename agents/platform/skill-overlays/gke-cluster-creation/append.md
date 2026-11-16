@@ -4,7 +4,7 @@
 
 Creating a cluster is **not complete** until it has a Cluster Agent. A managed cluster and its
 Cluster Agent profile are **created together** — never leave a newly created cluster without a
-profile. Immediately after `create_cluster` succeeds and the cluster is reachable, create its
+profile. Once the merged change has produced the cluster and it is reachable, create its
 dedicated **Cluster Agent** profile (this is what makes the cluster delegable for runtime
 debugging). Use the [cluster-agent-lifecycle](../cluster-agent-lifecycle/SKILL.md) skill:
 

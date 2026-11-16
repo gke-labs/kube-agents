@@ -175,6 +175,20 @@ def _detector_startup_marker() -> str:
     return f"{name.group(1)}: {logged.group(1).strip()}"
 
 
+def _shell_function(text: str, name: str) -> str:
+    """A function of the script, from its `name() {` line to the `}` that
+    closes it in column 0 (the gate's failure path calls report_cr_status,
+    defined above the gate)."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == f"{name}() {{":
+            for end in range(index, len(lines)):
+                if lines[end] == "}":
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{name}() not found in hack/ci-deploy.sh in the shape this test lifts")
+
+
 def _ready_gate(text: str) -> str:
     start = text.find(_READY_GATE_START)
     assert start != -1, f"{_READY_GATE_START!r} not found in hack/ci-deploy.sh"
@@ -363,6 +377,7 @@ exit 0
                     "set -euo pipefail",
                     _head_constants(text),
                     f"NAMESPACE={_GATE_NAMESPACE}",
+                    _shell_function(text, "report_cr_status"),
                     _ready_gate(text),
                     f'echo "{_GATE_RESULT}=${{drift_detector_started}}"',
                 )

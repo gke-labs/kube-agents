@@ -1,0 +1,5 @@
+# Security and conformance tests approved for quarantine: one `<path> <issue>`
+# line per skipped test file and the issue that tracks its fix. A quarantine
+# under tests/conformance/ or a2a/authcallout/ fails scripts/check_quarantine.py
+# without its line here, and hack/OWNERS lets only the security approvers
+# approve a change to this file. Remove the line with the skip.

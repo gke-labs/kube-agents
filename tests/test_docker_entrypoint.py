@@ -971,8 +971,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         command-not-found behind its `|| echo WARN` and the test would stay green.
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += block
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,10 +981,24 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template_dir.mkdir()
             shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
             del scaffolded["context_file_max_chars"]
+            # Scaffolded before the workers' stale bound changed: the migration moves it.
+            scaffolded["providers"]["custom"]["stale_timeout_seconds"] = 600
             (profile / "config.yaml").write_text(
                 yaml.safe_dump(scaffolded, sort_keys=False),
                 encoding="utf-8",
@@ -1023,12 +1037,517 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template["context_file_max_chars"],
             "a cluster profile from before the context-file cap was pinned did not take it",
         )
-        self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertEqual(
+            live["providers"]["custom"]["stale_timeout_seconds"],
+            template["providers"]["custom"]["stale_timeout_seconds"],
+            "a cluster profile scaffolded with the old 600s stale bound kept it",
+        )
+        self.assertIn("stale timeout migrate", proc.stdout)
+        self.assertEqual(
+            persona,
+            "persona\n\n---\n\n## Target Cluster Identity\n\n- project: p\n- cluster: c\n- location: us-central1\n",
+            "the persona copy and identity stamp beside the repair stopped running",
+        )
         self.assertIn("config backfill", proc.stdout)
         # The shipped template's remote servers go through the credential proxy,
         # so the repair syncs their whole argv and says so.
         self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
+
+    def test_the_shipped_cluster_loop_stamps_target_cluster_identity_into_soul_md(self):
+        """When the real cluster SOUL.md template is synced onto a cluster profile,
+        the startup loop stamps the target cluster identity from config.yaml."""
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        script += block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shutil.copy(_REPO / "agents" / "cluster" / "SOUL.md", template_dir / "SOUL.md")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            profile.mkdir(parents=True)
+            scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(scaffolded, sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", persona)
+        self.assertIn(f"- project: {self._IDENTITY['project']}", persona)
+        self.assertIn(f"- cluster: {self._IDENTITY['cluster']}", persona)
+        self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
+        self.assertEqual(persona.count("## Target Cluster Identity"), 1)
+
+    def test_the_cluster_loop_refreshes_the_image_owned_plugin_code(self):
+        """A cluster profile on the volume runs the image's tool_call_audit, not its own.
+
+        The profile copied the shared plugins tree once, when it was scaffolded, and the
+        back-fill in this loop turns tool_call_audit on for it. Without a refresh the
+        profile runs the copy it was scaffolded with, which may predate the writer the
+        sidecar ships from. hermes_otel holds the profile's pinned endpoint and an
+        operator-mounted plugin is a symlink; the loop must leave both as they are.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        # The two definitions sit above the block's opener. The shipped plugin list runs
+        # as it is; the source path is a fixed image path, so the test points it at the
+        # fixture tree the way CLUSTER_TEMPLATE is, and checks the shipped value below.
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        shipped = {
+            line.split("=", 1)[0]: line
+            for line in source.splitlines()
+            if line.startswith(("CLUSTER_SHARED_PLUGINS=", "CLUSTER_IMAGE_PLUGINS="))
+        }
+        self.assertEqual(len(shipped), 2, "the plugin refresh's two definitions moved")
+        script += shipped["CLUSTER_IMAGE_PLUGINS"] + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shared = root / "defaults" / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py"), ("hermes_otel", "config.yaml")):
+                (shared / plugin).mkdir(parents=True)
+                (shared / plugin / module).write_text("image\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            plugins = profile / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py"), ("hermes_otel", "config.yaml")):
+                (plugins / plugin).mkdir(parents=True)
+                (plugins / plugin / module).write_text("scaffolded\n", encoding="utf-8")
+            mounted = root / "agent-plugins" / "tool_call_audit"
+            mounted.mkdir(parents=True)
+            (mounted / "audit.py").write_text("mounted\n", encoding="utf-8")
+            linked = root / "data" / "profiles" / "cluster-p-d-us-central1"
+            (linked / "plugins").mkdir(parents=True)
+            (linked / "plugins" / "tool_call_audit").symlink_to(mounted)
+            (linked / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "CLUSTER_SHARED_PLUGINS": str(shared),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = (plugins / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+            sink = (plugins / "common" / "audit_sink.py").read_text(encoding="utf-8")
+            otel = (plugins / "hermes_otel" / "config.yaml").read_text(encoding="utf-8")
+            is_link = (linked / "plugins" / "tool_call_audit").is_symlink()
+            mounted_text = (mounted / "audit.py").read_text(encoding="utf-8")
+        self.assertEqual(audit, "image\n", "the profile kept the tool_call_audit it was scaffolded with")
+        self.assertEqual(sink, "image\n", "the profile kept the common modules it was scaffolded with")
+        self.assertEqual(otel, "scaffolded\n", "the loop overwrote hermes_otel's per-profile config")
+        self.assertTrue(is_link, "the loop replaced an operator-mounted plugin")
+        self.assertEqual(mounted_text, "mounted\n", "the loop wrote through an operator-mounted plugin")
+        self.assertNotIn("WARN", proc.stderr)
+        # The loop refreshes from the tree cluster profiles are scaffolded from.
+        scaffold = (_REPO / "agents" / "platform" / "scripts" / "cluster_agent_profile.py").read_text(encoding="utf-8")
+        default = re.search(r'"SHARED_PLUGINS_DIR", "([^"]+)"', scaffold).group(1)
+        # A fixed path, not ${VAR:-...}: an AgentPlugin's spec.env reaches this
+        # container, and must not choose where the audit plugin code comes from.
+        self.assertEqual(shipped["CLUSTER_SHARED_PLUGINS"], f'CLUSTER_SHARED_PLUGINS="{default}"')
+
+    def _cluster_loop_fixture(self, root):
+        """A cluster template, the scripts the loop runs, one scaffolded profile, and the loop's script.
+
+        The scaffold scripts land where the loop's fallback looks for them, the boot
+        stamp script included, so the stamp runs as it does in the pod.
+        """
+        template_dir = root / "cluster-template"
+        template_dir.mkdir()
+        shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+        (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+        scripts_dir = root / "data" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script_name in (
+            "cluster_agent_profile.py",
+            "sandbox_exec.py",
+            "gke_endpoint.py",
+            "profile_scaffold.py",
+            "cluster_boot_stamp.py",
+        ):
+            shutil.copy(_REPO / "agents" / "platform" / "scripts" / script_name, scripts_dir / script_name)
+        profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text(
+            yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+            encoding="utf-8",
+        )
+        venv = root / "install" / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        wrapper = venv / "python3"
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        script += _extract_readonly("CLUSTER_BOOT_STAMP_FILE") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        script += _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "CLUSTER_TEMPLATE": str(template_dir),
+            "TARGET_DIR": str(root / "data"),
+            "INSTALL_DIR": str(root / "install"),
+            "SCAFFOLD": str(scripts_dir / "profile_scaffold.py"),
+        }
+        return template_dir, profile, script, env
+
+    def test_the_cluster_loop_skips_a_home_it_stamped_until_the_image_changes(self):
+        """The boot stamp: one full pass per image per home, not one per start.
+
+        The first start runs the whole pass and leaves the stamp. The second start on
+        the same inputs skips the home, which a hand edit to SOUL.md proves: the loop
+        would have overwritten it. A change to any input the loop reads, here the
+        template, makes the home stale again, and the pass repairs the edit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir, profile, script, env = self._cluster_loop_fixture(root)
+            stamp = profile / ".scaffold-stamp"
+
+            def start():
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("WARN", proc.stderr)
+                return proc
+
+            first = start()
+            self.assertIn("1 refreshed from the image, 0 current", first.stdout)
+            self.assertTrue(stamp.is_file(), "a clean pass left no stamp")
+            digest = stamp.read_text(encoding="utf-8").strip()
+            self.assertTrue(digest, "the stamp is empty")
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+            self.assertIn("## Target Cluster Identity", persona)
+            self.assertEqual(sorted(p.name for p in profile.glob(".scaffold-stamp*")), [".scaffold-stamp"],
+                             "the stamp's temporary file was left behind")
+
+            (profile / "SOUL.md").write_text("hand edit\n", encoding="utf-8")
+            second = start()
+            self.assertIn("0 refreshed from the image, 1 current", second.stdout)
+            self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "hand edit\n",
+                             "a current home was refreshed anyway")
+            self.assertEqual(stamp.read_text(encoding="utf-8").strip(), digest)
+
+            (template_dir / "SOUL.md").write_text("persona v2\n", encoding="utf-8")
+            third = start()
+            self.assertIn("1 refreshed from the image, 0 current", third.stdout)
+            self.assertIn("persona v2", (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertNotEqual(stamp.read_text(encoding="utf-8").strip(), digest,
+                                "the stamp did not follow the template")
+
+    def test_a_pass_that_warned_is_not_stamped(self):
+        """A home one step could not finish is refreshed again next start.
+
+        The cron back-fill is made to fail: the scaffold script the loop is pointed at
+        exits non-zero. The rest of the pass still runs, the WARN is still printed, and
+        no stamp is written, so the next start does not read the home as current.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text("[]\n", encoding="utf-8")
+            failing = root / "failing_scaffold.py"
+            failing.write_text("raise SystemExit(1)\n", encoding="utf-8")
+            env["SCAFFOLD"] = str(failing)
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: failed to backfill risk tier", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a pass that warned was stamped")
+            self.assertEqual([p.name for p in profile.glob(".scaffold-stamp*")], [])
+            self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
+                          "the failed step stopped the rest of the pass")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_a_home_the_loop_cannot_write_into_warns_and_is_not_stamped(self):
+        """The persona copy used to fail silently; with the stamp, silence would mean current.
+
+        A read-only SOUL.md in a directory this user cannot write into (`cp -f` can
+        neither truncate it nor replace it) fails the first step of the pass and leaves
+        the identity stamp nothing to write into. Both have to be said and have to keep
+        the home off the stamp, or the home would not be revisited until the image changed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "SOUL.md").write_text("old persona\n", encoding="utf-8")
+            (profile / "SOUL.md").chmod(0o444)
+            profile.chmod(0o555)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                profile.chmod(0o755)
+                (profile / "SOUL.md").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not copy SOUL.md from the image", proc.stderr)
+            self.assertIn("SOUL.md is not writable; its cluster identity was not stamped", proc.stderr)
+            self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "old persona\n")
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home the pass could not refresh was stamped")
+
+    def test_a_cron_store_the_back_fill_cannot_read_is_not_stamped(self):
+        """The shipped back-fill, not a stand-in: a store it cannot parse fails the step.
+
+        `profile_scaffold.py --backfill-cron` used to exit zero whatever it could do;
+        with the stamp that read a malformed `jobs.json` as back-filled. The step now
+        exits non-zero for a store it could not read or rewrite, the loop's WARN names
+        it, and the home is refreshed again next start.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text("{not json", encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not read cron store", proc.stderr)
+            self.assertIn("WARN: failed to backfill risk tier", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a store the back-fill could not read was stamped")
+            self.assertEqual((profile / "cron" / "jobs.json").read_text(encoding="utf-8"), "{not json")
+
+    def test_a_profile_whose_config_has_no_identity_is_not_stamped(self):
+        """The persona copy blanks SOUL.md; a profile the stamp cannot re-identify must not read as current.
+
+        `stamp-soul` used to return quietly when `config.yaml` carried no readable
+        `cluster_identity`, leaving the blank template in place. It exits non-zero now,
+        the loop says so, and the home stays off the stamp until the identity is back.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            config = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+            del config["cluster_identity"]
+            (profile / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("no readable cluster_identity", proc.stderr)
+            self.assertIn("WARN: failed to stamp cluster identity", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertNotIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a profile with no identity was stamped")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_read_only_config_and_cron_files_inside_a_writable_home_are_not_stamped(self):
+        """A repair stepped over is said, not stamped.
+
+        The config repairs and the cron back-fill are each gated on the file being
+        writable and used to skip it in silence; the persona copy beside them still
+        succeeds, so without a word the pass would look clean. Both files are named,
+        the rest of the pass runs, and no stamp is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "job1"}]}), encoding="utf-8")
+            before = (profile / "config.yaml").read_text(encoding="utf-8")
+            (profile / "config.yaml").chmod(0o444)
+            (profile / "cron" / "jobs.json").chmod(0o444)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                (profile / "config.yaml").chmod(0o644)
+                (profile / "cron" / "jobs.json").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("config.yaml is not writable; its config repairs were skipped", proc.stderr)
+            self.assertIn("cron/jobs.json is not writable; its risk tier back-fill was skipped", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
+                          "the skipped repairs stopped the rest of the pass")
+            self.assertEqual((profile / "config.yaml").read_text(encoding="utf-8"), before)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home with a repair skipped was stamped")
+
+    def test_without_the_stamp_script_every_home_is_refreshed_and_none_is_stamped(self):
+        """The fallback is the loop as it always ran: no digest, no skip, no stamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (root / "data" / "scripts" / "cluster_boot_stamp.py").unlink()
+            for _ in range(2):
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("cluster boot stamp unavailable", proc.stdout)
+                self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_a_failed_plugin_refresh_leaves_the_old_file_whole(self):
+        """A copy that cannot finish keeps the profile's old module intact, and says so.
+
+        Each file is copied to a temporary name beside its target and renamed over it,
+        so the failure here, a plugin folder the copy cannot write into, leaves the old
+        audit_sink.py byte for byte, no temporary file behind, and a WARN that names the
+        plugin. The other plugin is still refreshed: one failure does not stop the loop.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        plugin_list = next(line for line in source.splitlines() if line.startswith("CLUSTER_IMAGE_PLUGINS="))
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        script += plugin_list + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shared = root / "defaults" / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py")):
+                (shared / plugin).mkdir(parents=True)
+                (shared / plugin / module).write_text("image\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            plugins = profile / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py")):
+                (plugins / plugin).mkdir(parents=True)
+                (plugins / plugin / module).write_text("scaffolded\n", encoding="utf-8")
+            (plugins / "common").chmod(0o555)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            try:
+                proc = subprocess.run(
+                    ["sh", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "CLUSTER_TEMPLATE": str(template_dir),
+                        "CLUSTER_SHARED_PLUGINS": str(shared),
+                        "TARGET_DIR": str(root / "data"),
+                        "INSTALL_DIR": str(root / "install"),
+                    },
+                )
+                sink = (plugins / "common" / "audit_sink.py").read_text(encoding="utf-8")
+                audit = (plugins / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+                leftovers = sorted(p.name for p in plugins.rglob("*.refresh.*"))
+            finally:
+                (plugins / "common").chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sink, "scaffolded\n", "a failed copy did not leave the old module whole")
+        self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
+        self.assertIn("could not refresh the common plugin", proc.stderr)
+        self.assertEqual(audit, "image\n", "one failed plugin stopped the refresh of the other")
+
+    def test_the_container_environment_cannot_choose_the_cluster_plugin_source(self):
+        """The refresh reads plugin code from a fixed image path, never from the environment.
+
+        An AgentPlugin's spec.env reaches the agent container with no allowlist. If the
+        source path could come from the environment, that plugin could choose the code
+        copied over every Cluster Agent's audit writer. This runs the shipped definitions
+        with a decoy tree in the environment and checks that nothing from it is copied,
+        whatever spelling an override would take.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        preamble = source[source.index("\nCLUSTER_TEMPLATE=") + 1 : source.index('if [ -d "$CLUSTER_TEMPLATE" ]; then')]
+        self.assertIn("CLUSTER_SHARED_PLUGINS", preamble, "the plugin refresh's definitions moved")
+        # CLUSTER_TEMPLATE comes from the fixture through the environment, as in the sibling test.
+        preamble = "\n".join(line for line in preamble.splitlines() if not line.startswith("CLUSTER_TEMPLATE="))
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        script += preamble + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            decoy = root / "decoy"
+            for plugin in ("tool_call_audit", "common"):
+                (decoy / plugin).mkdir(parents=True)
+                (decoy / plugin / "decoy.py").write_text("decoy\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            (profile / "plugins" / "tool_call_audit").mkdir(parents=True)
+            (profile / "plugins" / "tool_call_audit" / "audit.py").write_text("scaffolded\n", encoding="utf-8")
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "CLUSTER_SHARED_PLUGINS": str(decoy),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            copied = sorted(str(p.relative_to(profile)) for p in profile.rglob("decoy.py"))
+            audit = (profile / "plugins" / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+        self.assertEqual(copied, [], "the environment chose the plugin code copied into a cluster profile")
+        self.assertEqual(audit, "scaffolded\n")
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.
@@ -1064,7 +1583,11 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        # Every prompt the image ships, so a new one the entrypoint's list does not name fails here.
+        names = sorted(
+            f"onboarding/{p.name}" for p in (_REPO / "agents" / "chat" / "defaults" / "onboarding").glob("*.md")
+        )
+        self.assertIn("onboarding/report_filed.md", names)
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
             pvc = pathlib.Path(tmp) / "data"
@@ -1084,6 +1607,216 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             )
             for name in names:
                 self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
+
+    def test_every_plugin_the_image_ships_is_refreshed_from_a_newer_stale_pvc_copy(self):
+        # Step 2's cp -ru skips a destination that looks newer, so a rollback, or a roll to
+        # an image built earlier than the volume's files, kept the previous image's plugin
+        # code live beside the new image's scripts. Every plugin directory the image ships
+        # is force-synced; the pinned external plugin and the top-level files are not, and
+        # a plugin's own runtime state on the volume survives the copy.
+        shipped = sorted(
+            p.name
+            for p in (_REPO / "agents" / "chat" / "defaults" / "plugins").iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_"))
+        )
+        self.assertIn("chat_metrics", shipped)
+        # The pinned list is the set of plugins the Dockerfile installs from outside this
+        # repository, read from its `hermes plugins install` lines rather than pinned here.
+        dockerfile = (_REPO / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        installed = re.findall(r"hermes plugins install\s+(?:--\S+\s+\S+\s+)*(\S+)", dockerfile)
+        installed = sorted({name.rsplit("/", 1)[-1] for name in installed})
+        self.assertEqual(installed, ["hermes_otel"], "the Dockerfile's external plugins changed; update PINNED_EXTERNAL_PLUGINS")
+        pinned = re.fullmatch(r'readonly PINNED_EXTERNAL_PLUGINS="([^"]*)"', _extract_readonly("PINNED_EXTERNAL_PLUGINS")).group(1).split()
+        self.assertEqual(sorted(pinned), installed)
+        external = "hermes_otel"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            future = time.time() + 3600
+            for name in shipped + [external]:
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+                (pvc / "plugins" / name / "live.db").write_text("state\n", encoding="utf-8")
+                os.utime(pvc / "plugins" / name / "plugin.py", (future, future))
+            (image / "plugins" / ".install-metadata.json").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / ".install-metadata.json").write_text("volume\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in shipped:
+                self.assertEqual((pvc / "plugins" / name / "plugin.py").read_text(encoding="utf-8"), "image\n", name)
+                self.assertEqual((pvc / "plugins" / name / "live.db").read_text(encoding="utf-8"), "state\n", name)
+            self.assertEqual((pvc / "plugins" / external / "plugin.py").read_text(encoding="utf-8"), "stale\n")
+            self.assertEqual((pvc / "plugins" / ".install-metadata.json").read_text(encoding="utf-8"), "volume\n")
+
+    def test_a_failed_plugin_refresh_in_step_2b_leaves_the_old_file_whole(self):
+        # Replicas share the volume, so a file is copied to a temporary name and renamed over
+        # its target: a plugin folder the copy cannot write into keeps its old module whole,
+        # no temporary file is left behind, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+            if os.geteuid() == 0:
+                self.skipTest("root writes into a read-only directory")
+            (pvc / "plugins" / "agent_roster").chmod(0o555)
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                kept = (pvc / "plugins" / "agent_roster" / "plugin.py").read_text(encoding="utf-8")
+                leftovers = sorted(p.name for p in (pvc / "plugins" / "agent_roster").iterdir() if ".refresh." in p.name)
+                refreshed = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            finally:
+                (pvc / "plugins" / "agent_roster").chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n", "a failed copy did not leave the old module whole")
+        self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
+        self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
+
+    def test_a_failed_rename_in_step_2b_removes_its_temporary_file(self):
+        # The copy lands first and the rename fails: the temporary file is removed, the old
+        # module stays whole, and the start continues with a warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            kept = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            leftovers = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir() if ".refresh." in p.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n")
+        self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
+    def test_a_symlinked_plugin_destination_is_left_alone(self):
+        # A symlink at the destination is not the image's copy to refresh: the loop
+        # skips it, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            elsewhere = pathlib.Path(tmp) / "mounted"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            elsewhere.mkdir()
+            (elsewhere / "plugin.py").write_text("mounted\n", encoding="utf-8")
+            (pvc / "plugins" / "agent_roster").symlink_to(elsewhere)
+            (pvc / "plugins" / "chat_metrics").mkdir()
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((elsewhere / "plugin.py").read_text(encoding="utf-8"), "mounted\n")
+            self.assertTrue((pvc / "plugins" / "agent_roster").is_symlink())
+            self.assertEqual((pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8"), "image\n")
+
+    def test_a_refreshed_plugin_file_keeps_the_images_mtime(self):
+        # The copy preserves the image file's mtime (cp -p), as the cluster loop's does, so a
+        # later start reads the refreshed file as the image's, not as one written on the volume.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            image_time = time.time() - 86400
+            os.utime(image / "plugins" / "chat_metrics" / "plugin.py", (image_time, image_time))
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual(int((pvc / "plugins" / "chat_metrics" / "plugin.py").stat().st_mtime), int(image_time))
+
+    def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
+        # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
+        # an old plugin beside the new script writes no greeting hold.
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            (pvc / name).parent.mkdir(parents=True)
+            (pvc / name).write_text("stale\n", encoding="utf-8")
+            future = time.time() + 3600
+            os.utime(pvc / name, (future, future))
+            block = _plugin_refresh_block(image)
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n")
+
+    def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
+        # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
+        # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            plugins = pvc / "plugins"
+            plugins.mkdir(parents=True)
+            if os.geteuid() == 0:
+                # root writes anywhere; a file in the directory's place fails the mkdir instead.
+                (plugins / "bootstrap_onboarding").write_text("", encoding="utf-8")
+            else:
+                plugins.chmod(0o555)
+            try:
+                block = "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"
+                proc = subprocess.run(
+                    ["bash", "-c", block],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                plugins.chmod(0o755)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("reached-the-next-step", proc.stdout)
+            self.assertIn("WARN: could not refresh", proc.stderr)
+            self.assertFalse((pvc / name).exists())
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
@@ -1151,6 +1884,125 @@ def _extract_shell_function(name):
         if lines[end] == "}":
             return "\n".join(lines[start : end + 1])
     raise AssertionError(f"{name}() has no closing brace")
+
+
+def _extract_readonly(name):
+    """Return the `readonly NAME=...` line that declares one of the entrypoint's constants."""
+    for line in _ENTRYPOINT.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"readonly {name}="):
+            return line
+    raise AssertionError(f"readonly {name} not found in {_ENTRYPOINT}")
+
+
+# Step 2b's plugin refresh: the comment line that opens it, and the two constants it reads.
+_PLUGIN_REFRESH_MARKER = "# 2b, continued: every plugin the image ships is image-owned too"
+
+
+def _plugin_refresh_block(image):
+    """Return step 2b's plugin refresh as a script that reads the image tree at `image`."""
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(_PLUGIN_REFRESH_MARKER))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+    block = "\n".join(
+        [_extract_readonly("DEFAULTS_PLUGINS_DIR"), _extract_readonly("PINNED_EXTERNAL_PLUGINS")] + lines[start : end + 1]
+    )
+    return block.replace("/opt/defaults", str(image))
+
+
+# The helpers step 2.6's cluster loop calls. A test that runs the loop defines every one,
+# because a missing one fails as command-not-found behind its `|| echo WARN`.
+_CLUSTER_LOOP_FUNCTIONS = (
+    "sync_profile_skills",
+    "backfill_config_from_template",
+    "migrate_stale_timeout_from_template",
+    "repair_remote_mcp_user_agent",
+)
+
+
+class StaleTimeoutMigrationTest(unittest.TestCase):
+    """A Cluster Agent profile on the volume moves from the old 600s stale bound to its template's.
+
+    The cluster loop does not force-sync a Cluster Agent's config.yaml, and the back-fill
+    only adds keys the file lacks. Without the migration, a cluster onboarded before the
+    worker bound changed keeps 600s for the life of the volume. Only the old shipped value
+    moves: any other value was set on purpose.
+    """
+
+    _CLUSTER_TEMPLATE = _REPO / "agents" / "cluster" / "config.yaml"
+
+    def _migrate(self, template, live):
+        """Run the shipped function over two files. Return `(proc, reloaded_live, unchanged)`."""
+        script = (
+            _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS")
+            + "\n"
+            + _extract_shell_function("migrate_stale_timeout_from_template")
+            + '\nmigrate_stale_timeout_from_template "$1" "$2"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_path = root / "template.yaml"
+            live_path = root / "live.yaml"
+            template_path.write_text(yaml.safe_dump(template, sort_keys=False), encoding="utf-8")
+            live_path.write_text(yaml.safe_dump(live, sort_keys=False), encoding="utf-8")
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            before = live_path.read_bytes()
+            proc = subprocess.run(
+                ["sh", "-c", script, "sh", str(template_path), str(live_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin", "INSTALL_DIR": str(root / "install")},
+            )
+            after = live_path.read_bytes()
+            return proc, yaml.safe_load(after), before == after
+
+    def _template(self):
+        return yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+
+    def test_a_profile_on_the_old_shipped_bound_takes_the_templates(self):
+        template = self._template()
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 600
+        live["cluster_identity"] = {"project": "p", "cluster": "c", "location": "us-central1"}
+        proc, migrated, unchanged = self._migrate(template, live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(unchanged)
+        self.assertEqual(
+            migrated["providers"]["custom"]["stale_timeout_seconds"],
+            template["providers"]["custom"]["stale_timeout_seconds"],
+        )
+        self.assertEqual(migrated["providers"]["custom"]["request_timeout_seconds"], 900)
+        self.assertEqual(migrated["cluster_identity"], live["cluster_identity"])
+        self.assertIn("stale timeout migrate", proc.stdout)
+
+    def test_a_value_set_on_purpose_stays(self):
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 300
+        proc, migrated, unchanged = self._migrate(self._template(), live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertEqual(migrated["providers"]["custom"]["stale_timeout_seconds"], 300)
+
+    def test_a_template_still_on_the_old_bound_changes_nothing(self):
+        template = self._template()
+        template["providers"]["custom"]["stale_timeout_seconds"] = 600
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 600
+        proc, _, unchanged = self._migrate(template, live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+
+    def test_a_profile_without_the_provider_block_is_left_alone(self):
+        live = self._template()
+        del live["providers"]
+        proc, migrated, unchanged = self._migrate(self._template(), live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertNotIn("providers", migrated)
 
 
 class SyncProfileSkillsTest(unittest.TestCase):
@@ -2240,6 +3092,172 @@ class TerminalEnvPinGateTest(unittest.TestCase):
         self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
+_TIRITH_CLEANUP_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then'
+)
+
+
+def _entrypoint_readonly(name):
+    """The value of a top-of-file `readonly NAME=value` in the shipped entrypoint."""
+    match = re.search(rf"^readonly {name}=(\S+)$", _ENTRYPOINT.read_text(encoding="utf-8"), re.M)
+    if not match:
+        raise AssertionError(f"no `readonly {name}=` in {_ENTRYPOINT}")
+    return match.group(1)
+
+
+class TirithCleanupTest(unittest.TestCase):
+    """Step 4.4 removes the tirith copies Hermes downloaded into each home.
+
+    Gated on the image's copy being what PATH resolves, which no host has, so every other
+    entrypoint test skips it. The block runs extracted, with IMAGE_TIRITH pointed at a stub
+    first on PATH. It must never execute a candidate: the files sit on a volume the agent's
+    workers can write.
+    """
+
+    ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TIRITH_CLEANUP_OPENER)
+        cls._ELF_MAGIC_HEX = _entrypoint_readonly("ELF_MAGIC_HEX")
+
+    def _run(self, seed, primary="1", image_on_path=True):
+        """Seed $TARGET_DIR via `seed(target, tmp)`, run the block, return (proc, target, tmp)."""
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = tmp / "data"
+        image = tmp / "image" / "tirith"
+        image.parent.mkdir(parents=True)
+        image.write_text("#!/bin/sh\necho tirith 0.4.2\n", encoding="utf-8")
+        image.chmod(0o755)
+        seed(target, tmp)
+        path = f"{image.parent}:{os.environ['PATH']}" if image_on_path else os.environ["PATH"]
+        proc = subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "PATH": path,
+                "TARGET_DIR": str(target),
+                "IS_BOOTSTRAP_PRIMARY": primary,
+                "IMAGE_TIRITH": str(image),
+                "ELF_MAGIC_HEX": self._ELF_MAGIC_HEX,
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        return proc, target, tmp
+
+    def _plant(self, path, content, mode=0o755):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        path.chmod(mode)
+        return path
+
+    def _seed_copies(self, target, tmp):
+        self._plant(target / "bin" / "tirith", self.ELF)
+        self._plant(target / "profiles" / "cluster-a" / "bin" / "tirith", self.ELF)
+
+    def test_the_downloaded_copies_are_removed_and_logged(self):
+        proc, target, _ = self._run(self._seed_copies)
+        self.assertFalse((target / "bin" / "tirith").exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
+        self.assertEqual(proc.stdout.count("Reclaimed a per-profile tirith copy:"), 2, proc.stdout)
+
+    def test_a_non_primary_replica_leaves_them(self):
+        _, target, _ = self._run(self._seed_copies, primary="0")
+        self.assertTrue((target / "bin" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
+
+    def test_without_the_image_copy_on_path_they_stay(self):
+        """Hermes would still need them: with nothing on PATH it falls back to the home copy."""
+        _, target, _ = self._run(self._seed_copies, image_on_path=False)
+        self.assertTrue((target / "bin" / "tirith").exists())
+
+    def test_a_file_that_is_not_an_elf_binary_stays_and_is_never_run(self):
+        def seed(target, tmp):
+            marker = tmp / "executed"
+            self._plant(
+                target / "profiles" / "cluster-b" / "bin" / "tirith",
+                f'#!/bin/sh\ntouch "{marker}"\necho tirith 0.3.3\n'.encode(),
+            )
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / "tirith").exists())
+        self.assertFalse((tmp / "executed").exists(), "the cleanup executed a file from the volume")
+
+    def test_a_symlink_and_its_target_stay(self):
+        def seed(target, tmp):
+            real = self._plant(tmp / "elsewhere" / "tirith", self.ELF)
+            link = target / "profiles" / "cluster-c" / "bin" / "tirith"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(real)
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
+        self.assertTrue((tmp / "elsewhere" / "tirith").exists())
+
+
+_NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'
+_PROFILE_SCAFFOLD = _REPO / "agents" / "platform" / "scripts" / "profile_scaffold.py"
+
+
+class NpmCacheShareTest(unittest.TestCase):
+    """Step 4.4b points npm in every home on the volume at one cache (gke-labs#3376).
+
+    The block runs extracted, with SCAFFOLD at the repository's scaffolder and
+    INSTALL_DIR at a stub venv whose python3 is this interpreter.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_NPM_CACHE_SHARE_OPENER)
+
+    def _run(self, primary="1"):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = tmp / "srv" / "agent-home"
+        homes = [target / "home", target / "profiles" / "cluster-a" / "home"]
+        for home in homes:
+            home.mkdir(parents=True)
+        # The cache npm kept in a profile's home before step 4.4b.
+        (homes[1] / ".npm" / "_cacache").mkdir(parents=True)
+        python = tmp / "hermes" / ".venv" / "bin" / "python3"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        proc = subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "TARGET_DIR": str(target),
+                "HERMES_HOME": str(target),
+                "INSTALL_DIR": str(tmp / "hermes"),
+                "SCAFFOLD": str(_PROFILE_SCAFFOLD),
+                "IS_BOOTSTRAP_PRIMARY": primary,
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        return target, homes
+
+    def test_the_primary_links_every_home_and_reclaims_the_old_cache(self):
+        target, homes = self._run()
+        for home in homes:
+            self.assertEqual((home / ".npm").resolve(), (target / ".cache" / "npm").resolve())
+        self.assertFalse((target / ".cache" / "npm" / "_cacache").exists())
+
+    def test_a_non_primary_replica_writes_nothing(self):
+        target, homes = self._run(primary="0")
+        self.assertFalse(homes[0].joinpath(".npm").exists())
+        self.assertTrue(homes[1].joinpath(".npm", "_cacache").is_dir())
+        self.assertFalse((target / ".cache").exists())
+
+
 class A2AModeProbeTest(unittest.TestCase):
     """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
 
@@ -2531,6 +3549,95 @@ class JournalModeConversionStepTest(_JournalModeCase):
         self.assertEqual(text.count('SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"'), 1)
         self.assertIn(_JOURNAL_WAIT_OPENER, text)
         self.assertLess(text.index(_JOURNAL_WAIT_OPENER), text.index(_JOURNAL_STEP_OPENER))
+
+
+_RETENTION_SCRIPT = _REPO / "agents" / "platform" / "scripts" / "session_retention.py"
+_PIN_STEP_OPENER = 'if [ -f "$SESSION_RETENTION_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+
+
+def _session_store(path, rows):
+    """A state.db with the columns of Hermes' schema the pinning reads; rows are (id, parent)."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, pinned INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);"
+    )
+    conn.executemany("INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _pinned(path):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        return {row[0] for row in conn.execute("SELECT id FROM sessions WHERE pinned = 1")}
+    finally:
+        conn.close()
+
+
+class SessionParentPinStepTest(_JournalModeCase):
+    """Step 1.8: session parents are pinned before the gateway's first prune.
+
+    Same staging as the conversion: the shipped block drives the shipped script through
+    a wrapper at the venv path the entrypoint hard-codes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_PIN_STEP_OPENER)
+
+    def _run(self, script=None):
+        env = {**self.env(), "SESSION_RETENTION_SCRIPT": str(script or _RETENTION_SCRIPT)}
+        return subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    def test_a_parent_with_a_child_is_pinned_in_every_store(self):
+        machine = _session_store(self.target / "state.db", [("root", None), ("tip", "root"), ("alone", None)])
+        profile = _session_store(
+            self.target / "profiles" / "platform" / "state.db", [("p-root", None), ("p-tip", "p-root")]
+        )
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertEqual(_pinned(machine), {"root"})
+        self.assertEqual(_pinned(profile), {"p-root"})
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_store_it_cannot_pin_warns_and_start_up_continues(self):
+        broken = self.target / "profiles" / "broken" / "state.db"
+        broken.parent.mkdir(parents=True)
+        broken.write_text("not a database", encoding="utf-8")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN: pinning session parents did not finish", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_missing_script_is_skipped_not_fatal(self):
+        proc = self._run(script=self.tmp / "absent.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_step_follows_the_conversion_and_precedes_the_default_sync(self):
+        """After the WAL conversion, which wants the stores unopened; before anything that opens them."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        conversion = text.index(_JOURNAL_STEP_OPENER)
+        step = text.index(_PIN_STEP_OPENER)
+        sync = text.index("# 2. Sync default agent files")
+        self.assertLess(conversion, step)
+        self.assertLess(step, sync)
+        self.assertEqual(text.count(_PIN_STEP_OPENER), 1)
 
 
 class JournalModeWaitTest(_JournalModeCase):

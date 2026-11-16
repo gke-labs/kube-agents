@@ -27,7 +27,10 @@ import (
 
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -444,5 +447,157 @@ func TestDiscoverThroughBrokerSkips(t *testing.T) {
 				t.Errorf("proxy saw %d requests, want %d: %v", len(requests), tc.wantReqs, requests)
 			}
 		})
+	}
+}
+
+// TestABrokerRefusalReachesTheJoinAsAStatusError pins what the drift detector's
+// join sees when the broker refuses a kind: the credential proxy answers with a
+// metav1.Status (test_a_refusal_is_a_kubernetes_status_naming_the_rule pins the
+// same body on the Python side), and client-go's dynamic client, which the join
+// reads with, turns it into a Forbidden StatusError carrying the rule id. The
+// join forwards the record with that error as its lookup error. The broker's
+// earlier body, which was not a Status, reached the join as a bare Forbidden
+// with the rule id gone; the second case keeps that difference visible.
+func TestABrokerRefusalReachesTheJoinAsAStatusError(t *testing.T) {
+	const rule = "kubernetes.watcher.kind"
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantRule bool
+	}{
+		{
+			name: "status body",
+			body: `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",` +
+				`"message":"SECURITY_POLICY_BLOCKED (` + rule + `): The watcher's Kubernetes route reads only the kinds in its table; the drift record is reported without ownership.",` +
+				`"reason":"Forbidden","details":{"causes":[{"reason":"SECURITY_POLICY_BLOCKED","message":"` + rule + `"}]},"code":403}`,
+			wantRule: true,
+		},
+		{
+			name:     "earlier body",
+			body:     `{"status":"blocked","code":"SECURITY_POLICY_BLOCKED","rule":"` + rule + `","message":"refused"}`,
+			wantRule: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			tokenFile := filepath.Join(t.TempDir(), "token")
+			writeToken(t, tokenFile, "token-1")
+			broker := &Broker{URL: srv.URL, TokenFile: tokenFile}
+			cfg, err := broker.ClientConfig(Identity{Project: "p", Location: "l", Cluster: "c"})
+			if err != nil {
+				t.Fatalf("ClientConfig: %v", err)
+			}
+			client, err := dynamic.NewForConfig(cfg)
+			if err != nil {
+				t.Fatalf("dynamic.NewForConfig: %v", err)
+			}
+			pods := schema.GroupVersionResource{Version: "v1", Resource: "pods"}
+			_, err = client.Resource(pods).Namespace("default").Get(context.Background(), "web-0", metav1.GetOptions{})
+			if !apierrors.IsForbidden(err) {
+				t.Fatalf("Get error = %v, want a Forbidden", err)
+			}
+			if got := strings.Contains(err.Error(), rule); got != tc.wantRule {
+				t.Errorf("rule id in %q = %v, want %v", err.Error(), got, tc.wantRule)
+			}
+		})
+	}
+}
+
+// TestDescribeClusterThroughTheBroker covers the exported describe a caller
+// that already holds a Broker makes: a Discoverer with a Broker and no Describe
+// reaches the broker's GKE route, and the answer's currentNodeCount, which the
+// broker's projection keeps, comes back on the Cluster.
+func TestDescribeClusterThroughTheBroker(t *testing.T) {
+	fb, broker := newFakeBroker(t)
+	fb.answers["c"] = fakeAnswer{status: http.StatusOK, body: `{"name":"c","currentNodeCount":7}`}
+	d := Discoverer{Broker: broker}
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster: %v", err)
+	}
+	if cluster.CurrentNodeCount != 7 {
+		t.Errorf("CurrentNodeCount = %d; want 7", cluster.CurrentNodeCount)
+	}
+	requests, _ := fb.seen()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters/c"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v; want exactly [%s]", requests, want)
+	}
+}
+
+// TestDescribeClusterFillsTheBrokerFromTheEnvironment covers the describe the
+// shipped watcher makes: its fleet-shape probe binds DescribeCluster on a
+// zero-value Discoverer, with neither Describe nor Broker set, so the broker
+// has to be filled from BrokerURLEnv and BrokerTokenFileEnv the way
+// DiscoverAndBuild fills it. The one GKE request lands on the fake the
+// environment names, bearing the token from the file it names; without the
+// fill the describe would fall through to the GKE API, which newFakeBroker
+// leaves no credential for.
+func TestDescribeClusterFillsTheBrokerFromTheEnvironment(t *testing.T) {
+	fb, envBroker := newFakeBroker(t)
+	fb.answers["c"] = fakeAnswer{status: http.StatusOK, body: `{"name":"c","currentNodeCount":5}`}
+	t.Setenv(BrokerURLEnv, envBroker.URL)
+	t.Setenv(BrokerTokenFileEnv, envBroker.TokenFile)
+	var d Discoverer
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster on a zero Discoverer with the broker in the environment: %v", err)
+	}
+	if cluster.CurrentNodeCount != 5 {
+		t.Errorf("CurrentNodeCount = %d; want 5", cluster.CurrentNodeCount)
+	}
+	requests, auths := fb.seen()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters/c"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v; want exactly [%s]", requests, want)
+	}
+	if got := strings.Join(auths, ","); got != "Bearer token-1" {
+		t.Errorf("Authorization headers = %q; want the token from the file the environment names", got)
+	}
+	if d.Broker != nil {
+		t.Error("DescribeCluster wrote the filled broker back onto the caller's value; the fill is per call")
+	}
+}
+
+// TestDescribeClusterRefusesHalfABrokerPair: the fill applies BrokerFromEnv's
+// rule, so one of the two variables without the other is the describe's error
+// rather than a fall back to the GKE API on the pod's own identity.
+func TestDescribeClusterRefusesHalfABrokerPair(t *testing.T) {
+	fb, envBroker := newFakeBroker(t)
+	t.Setenv(BrokerURLEnv, envBroker.URL)
+	t.Setenv(BrokerTokenFileEnv, "")
+	var d Discoverer
+	if _, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"}); err == nil {
+		t.Fatal("DescribeCluster with only the broker URL set succeeded; want BrokerFromEnv's error")
+	} else if !strings.Contains(err.Error(), BrokerTokenFileEnv) {
+		t.Errorf("error = %v; want it to name %s", err, BrokerTokenFileEnv)
+	}
+	if requests, _ := fb.seen(); len(requests) != 0 {
+		t.Errorf("half a pair still reached the broker: %v", requests)
+	}
+}
+
+// TestDescribeClusterPrefersTheStub: a Describe field wins over the broker,
+// as it does inside Discover, so a test that stubs the describe is not
+// reached through by a broker the environment names.
+func TestDescribeClusterPrefersTheStub(t *testing.T) {
+	fb, broker := newFakeBroker(t)
+	d := Discoverer{Broker: broker, Describe: func(_ context.Context, id Identity) (*container.Cluster, error) {
+		return &container.Cluster{Name: id.Cluster, CurrentNodeCount: 3}, nil
+	}}
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster: %v", err)
+	}
+	if cluster.CurrentNodeCount != 3 {
+		t.Errorf("CurrentNodeCount = %d; want the stub's 3", cluster.CurrentNodeCount)
+	}
+	if requests, _ := fb.seen(); len(requests) != 0 {
+		t.Errorf("the stubbed describe reached the broker: %v", requests)
 	}
 }

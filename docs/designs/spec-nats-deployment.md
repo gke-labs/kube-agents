@@ -25,6 +25,71 @@ Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run 
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
 nothing here may depend on a managed control plane.
 
+**Amended 10/29 (#3274):** the production posture is the default for a new bus. The
+operator renders `spec.harness.tuning.busReplicas` servers. When the field is unset, an
+install keeps the server count its bus already runs (an install from before this change
+stays on one server), and a new bus gets three. Every stream and bucket the provision Job
+creates takes `min(3, servers)` replicas. The servers find each other through a headless
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
+a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
+clients off a stopping server rather than dropping them.
+
+**Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
+bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
+server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
+payloads and CI logs are public; debug names connections and the public keys they
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
+
+**Changing the server count empties the bus.** A server that restarts in cluster mode
+finds its standalone streams unassigned in the new metadata layer and deletes them as
+orphans; going back, a standalone server refuses to load an R3 stream. Either way the
+provision Job then recreates every stream and bucket empty. So setting `busReplicas` on
+an install whose bus already runs another count is a conversion, and its cost is the
+bus's contents: task history, the topics journal, and the KV buckets. Converting without
+that loss is #4225 (a copy into a new cluster before the switch).
+
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
+**Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
+The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
+leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
+Standard, the third never joined although every server held its routes. The leader then refused
+every R3 stream with a bare "no suitable peers for placement", and the provision Job retried until
+the run timed out. So before the provision Job is created, the operator reads each server's `/jsz`
+at its pod IP: the bus pods have no per-pod DNS names, and the client Service would answer from one
+server at random. The group counts as formed when a quorum of servers report one leader and that
+leader lists every other server as a current peer. Until then the Job waits, and the
+`A2ABusMetaGroup` condition names the server outside.
+
+A server still outside after 3 minutes is restarted once, under every one of these guards:
+
+- it is the only server outside;
+- the rest are a quorum without it;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
+- the bus StatefulSet doesn't already record it as restarted.
+
+The record is an annotation the operator writes before the delete, with its own patch, so the
+StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
+its one restart stays named in the condition, for a person.
+
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -45,12 +110,14 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| :--------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Stream            | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| :---------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`           | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
+| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. No other principal holds a consumer verb here; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                                                               |
+| `DISPATCH_STOPS`  | `a2a.stop.>`         | 24h, `max_msgs_per_subject: 1`, 64MiB (amended 10/30, #3655)     | The gateway's stop records for AgentProfile tasks, one per task, written only by the gateway (its grant comes with #4127) and read by the dispatcher by subject, per profile it dispatches for. Outside `a2a.dispatch.`, because the dispatcher publishes there. No consumers. The browser credentials are denied it, and the dispatch subjects.                                                                                                                         |
+| `DIRECTORY`       | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL`  | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -64,8 +131,9 @@ the tempting place for a cheaper R1 class, but they are also the replay and audi
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
-limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
-and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+limit (dev defaults: 8GiB `TASKS`, 1GiB each for `TOPICS-JOURNAL`, `TOPICS-STATE`
+and `DIRECTORY`; an existing stream keeps its cap, and the provision Job reports the edit that lowers
+it and whether that is safe yet). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of
@@ -74,7 +142,7 @@ before it is reached.
 
 `TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
 above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
-artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+artifact text - could consume the whole 8GiB budget and, under `discard: old`, evict
 every other session's history on the way out. The per-subject cap makes a runaway pay
 for its own runaway and nobody else's. Be precise about what it is not: a session's
 publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
@@ -93,8 +161,9 @@ the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
 degradation a reader can see rather than a short history it cannot distinguish from a
 real one. On the number, sized against the publisher that means it rather than the
 well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
-per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
-the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - half of
+the 8GiB stream since #4476, so a subject that means it can still evict half the other
+sessions' history; the per-subject cap bounds a runaway, not a determined publisher. The worker adapter's own result chunks are 256KiB, so a task built out of
 those reaches nearer 1GiB at the same count, but that is a property of one publisher and
 not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
 events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The
@@ -191,13 +260,15 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Three KV buckets ride the same JetStream deployment:
+Six KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
 - `session-state` - the gateway's session registry (session key, `contextId`, current
   pod, roster, and the active task's bounded ask echo - user content, deliberately; the
-  gateway design owns the content-vs-identifier rule). The gateway's user is the only
+  gateway design owns the content-vs-identifier rule), and under `refused.<backend>.` the
+  home posts the chat.notify route refused for want of a home channel (agent output, bounded
+  in count and age; the gateway design's "Proactive posts"). The gateway's user is the only
   writer by grant, and since the 8/31 narrowing the only reader too: no other user
   holds `$KV.session-state.>` on either side, and the web user's consumer-create route
   INTO the bucket - a push consumer bound to `KV_session-state` - is closed by the
@@ -223,6 +294,35 @@ Three KV buckets ride the same JetStream deployment:
   it is a denial it has to be enumerated over every principal on the bus rather than
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
+- `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
+  exchange it rated: user content that can hold cluster data. One of the two buckets with a
+  max age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
+  past it a new rating is refused until older ones expire. The gateway's user is
+  the only reader and writer of its records by grant, with the registry's four verbs on
+  `KV_feedback`; provision and seed hold STREAM.INFO on it, which can list its keys (task
+  id and rater),
+  and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
+  same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
+  design owns what a record holds ("Answer feedback").
+- `people` - one hashed key and a last-put time per chat person the gateway has seen. The
+  other bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
+  30 days after their last turn. Capped at 32MiB, about a hundred thousand entries: past it
+  a put is refused and the count under-counts. The gateway's user is the only reader and
+  writer of its records by grant, with the registry's four verbs on `KV_people`; provision
+  and seed hold STREAM.INFO on it, which can list its keys (the hashed key alone), and the
+  session-state deliver-subject residue above applies to `$KV.people.>` the same way. The
+  gateway counts nobody in a bucket without a max age. The
+  [human interaction readings design](human-interaction-readings.md) owns what a record holds
+  ("People").
+- `PROFILE_LEASES` - each AgentProfile task's liveness lease, keyed
+  `<profile>.<tier>.<pod>.<task>` (#3655). The dispatcher is its only writer, by grant.
+  Workers renew by publishing on their own `a2a.dispatch.<profile>.<tier>.<pod>.lease`
+  subject and hold nothing on the bucket, because a put on a KV bucket can carry
+  `Nats-Rollup: all`, which purges every key, so any worker with a put grant could wipe
+  every lease. No max age: the dispatcher reads expiry from each record, so a restarted
+  dispatcher can still read every lease it has to re-adopt or fail. Provision and seed
+  hold CREATE and INFO on it for the info-then-add guard. The dispatcher design owns
+  what a record holds (`lib.LeaseRecord`).
 
 ## Accounts and connection-time authorization
 
@@ -243,7 +343,10 @@ short-lived, kubelet-rotated) and returns the account and the permission set.
 Revocation is the issuer's problem for the credential, and the issuer has solved it: a
 projected token is bound to its pod, so the API server stops authenticating it once the
 pod object is gone - measured at about ten seconds behind the delete, which is the
-TokenReview success cache rather than the token's hour. That governs the NEXT connection
+TokenReview success cache rather than the token's hour. The callout adds a cache of its
+own in front of that, thirty seconds on a successful review and nothing on a failure, so
+a deleted pod's token can open a new connection for up to about forty seconds after the
+delete. That governs the NEXT connection
 and only the next one. An ALREADY-OPEN connection is not revoked by anything above: the
 callout is consulted once, at CONNECT, and the server holds the grants it issued in a
 signed user JWT until that JWT expires - the callout's grant TTL, an hour less jitter.
@@ -259,7 +362,31 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 `worker` retired; amended 9/9, the verifier added): the render now carries the
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
-every spawned session pod, the platform agent container, and the capability verifier. **Statically**, from `nats.conf` and listed in `auth_users`:
+every spawned session pod, the platform agent container, the capability verifier, and
+(amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end). Amended
+11/10: on by default, at the release set's image, and off at `A2A_PROFILE_DISPATCHER=false`
+(the chart's `operator.profileDispatcher.enabled`).
+The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
+profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
+running across the reconnect. Listing them all in its map entry grows the entry about
+1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
+By default (`A2A_DISPATCHER_BUCKETED_GRANTS` on the operator, which only `false` turns off) the
+entry narrows on `dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
+CONNECT password beside the token gets the per-profile grants, draining profiles' included,
+of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
+from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+password picks a slice of what the token already allows; it is not a credential. A bucket the
+callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
+names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
+profiles. The operator renders the same switch onto the dispatcher, which then opens one
+connection per bucket beside its control connection, and is Ready only with all of them up. A
+profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
+the operator's: one from before the bucket connections ignores the switch, binds no durable on
+its control connection, and stays not Ready. With a dispatcher the
+operator principal also creates and deletes those durables, and it is the only principal
+with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -289,7 +416,8 @@ client is handed so it can set its inbox prefix - is `platformagent_a2a_identiti
 before the callout those three lived in a config string, a Secret and a container env
 block with nothing but review connecting them. The one static block not in that file is
 the callout's own, rendered in the AUTH account template in
-`platformagent_a2a_manifests.go`.
+`platformagent_a2a_manifests.go` from `a2aCalloutConfIdentity` in
+`platformagent_a2a_confusers.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -298,7 +426,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest.
+without a credential reaching the digest. On a single server the gateway's per-profile
+deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
+profile change rolls the servers (below).
 
 Layout:
 
@@ -314,28 +444,42 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
-- **One user per agent identity** inside the account. Permissions are exact subject
-  lists, deny by default: publish only to the subjects its role emits on, subscribe only
-  to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
-  shared topics it is granted. That is an upper bound, not the shape every principal has:
-  a pull-only principal may hold no task-subject subscribe at all, which is what the
-  session grants do. The addressee token in the task subjects (payload spec
-  0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping still the parked tightening (9/9): the authority work landed
-  the capability envelope, which scopes the task's AUTHORITY per task without narrowing
-  the subject grants, and narrowing those remains separate and unstarted. **Amended
-  10/1:** "deny by default" holds per side, and only while that side has entries in
-  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
-  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
-  that side's allow or deny list is non-empty, and the two sides are independent), so
-  a rendered entry that lost its publish list would grant the whole subject space on
-  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
-  may therefore be empty: in the callout identity map the operator refuses such a
-  render and the callout refuses it again at the mint, and in the static `nats.conf`
-  users - which have no validator - a side left empty beside a populated one renders
-  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
-  which is how `sys` ships, still gets no permissions block at all. A principal that
-  must not publish cannot be expressed by omission - there is no deny list in the map
+  Amended 11/3: within a scope, the application side is three accounts, joined only by
+  explicit exports and imports, so control-plane writers are isolated from worker
+  credentials. `TRUSTED` holds the control-plane services (the gateway, provision, the
+  verifier, the operator, seed and the dispatcher) and the JetStream store. `CONSOLE` holds
+  the web console and its MCP server (`console-mcp`). `APP` holds agent and session workers
+  and the read-only principals. The static user blocks are rendered per account, still from
+  `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
+  static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
+  Amended 11/9 (#4173): `TRUSTED` exports consumer create to `APP` and `CONSOLE` per stream,
+  naming only the streams a principal in those accounts may create consumers on
+  (`DIRECTORY`, `KV_runtime-state`, `TASKS`, `TOPICS-JOURNAL`, `TOPICS-STATE`), instead of
+  `$JS.API.CONSUMER.CREATE.>`. The list is derived from the identities' grants, so a new
+  grant brings its stream into the export with it.
+- **One user per agent identity** inside the account. Permissions are exact subject lists,
+  deny by default: publish only to the subjects its role emits on, subscribe only to its own
+  addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
+  is granted. That is an upper bound, not the shape every principal has: a pull-only
+  principal may hold no task-subject subscribe at all, which is what the session grants do.
+  The addressee token in the task subjects (payload spec 0.4) is what makes these grants
+  expressible - executor-granularity at connect time, with per-task scoping still the parked
+  tightening (9/9): the authority work landed the capability envelope, which scopes the
+  task's AUTHORITY per task without narrowing the subject grants. Narrowing those is staged
+  under #3889: its first PR adds a profile worker's task connection, granted one task's
+  subjects on a dispatcher-signed task credential, and the worker PR removes the pod
+  connection's profile-wide task reach. **Amended 10/1:** "deny by default" holds per side,
+  and only while that side has entries in it. An empty allow list is nats-server's spelling
+  of _unrestricted_, not of _nothing_ (`buildPermissionsFromJwt` builds a side's permission
+  object only when that side's allow or deny list is non-empty, and the two sides are
+  independent), so a rendered entry that lost its publish list would grant the whole subject
+  space on that side while its subscribes stayed narrow. Neither side of a non-narrowed
+  entry may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf` users -
+  which have no validator - a side left empty beside a populated one renders an explicit
+  `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
+  ships, still gets no permissions block at all. A principal that must not publish cannot be
+  expressed by omission - there is no deny list in the map
   - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
@@ -351,8 +495,12 @@ Layout:
   invites squaring the render against prose. Two consequences of the split the render does
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
-  static render cannot express - so it reaches every profile's supervisor subject too, and
-  a profile task's `…supervisor` must not be modelled as unreachable. Second, the class
+  static render cannot express. The render subtracts each bound or draining profile by name
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny; #5301 moves profile
+  supervisors to the six-token `a2a.tasks.p.<profile>.*.supervisor`, which the gateway
+  subscribes to read only and can never publish), so the gateway cannot
+  publish directly to a profile's supervisor subject. The deny covers direct publishes
+  only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
   credential the Hermes bridge authenticates with: its `a2a.tasks.*.*.events` wildcards the
   addressee token, so it reaches session and profile subjects alike until that credential
@@ -360,7 +508,10 @@ Layout:
   callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
   consumer rule that rests on all of this and enumerates what is not yet decision-grade -
   including a redirection route onto `…supervisor` that no assertion pins. Read that
-  section before treating any class as closed.
+  section before treating any class as closed. A profile task's submission has a subject of its own,
+  `a2a.submit.<profile>.<tier>.<kind>.<task>` on the `PROFILE_SUBMITS` stream, and the gateway is its one writer: the
+  dispatcher reads it through its durables, and no executor's grant reaches it
+  (`test_A3_the_submit_subject_has_exactly_one_writer`).
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
@@ -401,11 +552,12 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
-  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
+  ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
+  encryption") with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -480,7 +632,11 @@ Layout:
   reaches the gateway's relay durable from `bridge` too, measured on the render: one
   permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
   one carrying `inactive_threshold` has the server reap it, ack floor and all, with
-  `CONSUMER.DELETE` refused in the same run; and a consumer's
+  `CONSUMER.DELETE` refused in the same run (amended 11/9, #4173: no longer for the relay or
+  the bridge's intake. The provision Job pre-creates both on `TASKS`, create-only, their
+  readers bind them and never create, and every principal that may create consumers on
+  `TASKS` is denied create, update and delete on those two names. The route still reaches
+  every other consumer on the four streams); and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
   a persisted write under the messages' original subjects - not forgery, since a read by
   subject never sees them, but an eviction lever against the capturing stream. Delivery
@@ -501,7 +657,9 @@ Layout:
   tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
   measured, not assumed. The session principal is the case where it does work, and why:
   its consumer names are derived from the pod the API server attested rather than chosen
-  by the client, so the grant can name them exactly instead of by prefix. The real close is a
+  by the client, so the grant can name them exactly instead of by prefix. The two
+  pre-created `TASKS` durables are the other case: their names are fixed, so a deny can name
+  them exactly too. The real close is a
   separate account with an export/import, which stays open.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
@@ -515,16 +673,25 @@ Layout:
 
   Posture, stated accurately: plain ws puts the credential on the pod network in
   cleartext, and the Service is ClusterIP, so nothing outside the cluster reaches it.
+  **Amended 10/21 (#3651):** no longer plain. The listener serves TLS and the console
+  server dials it verified, so the credential crosses the pod network encrypted; the
+  browser's leg to the console server is still the port-forward's. See "Transport
+  encryption" below.
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, the capability verifier, session pods by the spawner's
+  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher (when
+  rendered), session pods by the spawner's
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
-  which need not be the agent's), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  which need not be the agent's; **amended 10/22 (#3655):** and every pod in the
+  AgentProfile namespace `<agent-ns>-profiles`, matched by its name and the chart's
+  `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
+  fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
-  below)**. The demo's
+  below)**; **amended 11/09:** 8222 admits the operator's pod, the same peer as 4222, which
+  reads `config_load_time` there to confirm a config reload (below). The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and, in-cluster, through the console server alone. The enumeration is today's client
@@ -535,10 +702,16 @@ Layout:
   one peer every new connection depends on - and nothing looks broken when that
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
-  exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series), and the NATS pods themselves on their route port the moment the deployment
-  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
-  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
+  exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
+  new peer on 8222, whose one peer stays the operator's pod (for reload
+  confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
+  loopback and serves on 7777, and a separate rule admits the managed collector's
+  namespace (`gke-gmp-system`) and the operator's own pod to 7777 and nothing else; the
+  operator reads the stream list there to notice a provisioned stream gone missing
+  (amended 11/10, #4290). The NATS pods' own route peer, which this list used to carry as owed, landed
+  with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
+  the bus's servers and nothing else, since a fence without it keeps the cluster from
+  ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
   other legitimate destination, save the credential broker on its one port when the
@@ -578,20 +751,52 @@ Layout:
   sees the proxy's `Host`, not the browser's. The server answers only a `Host` naming that
   forwarded address, so a forward to any other local port gets a refusal naming the right
   one. The `web` user keeps the same posture it had: a 9222 port-forward and a page that
-  brings its own password. The access gate moves with the credential: before this, reading
+  brings its own password. **Amended 10/21 (#3651):** the `web` page now comes through the
+  console server as well, with `?ws=ws://localhost:8080/bus` (see "Transport
+  encryption" below). The access gate moves with the credential: before this, reading
   the `console` password needed `get` on the creds Secret, and now `pods/portforward` to
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
 
+  **Amended 10/21 (#3653):** a second console client, the MCP server (`a2a/cmd/mcp`), under
+  the operator flag `A2A_MCP_DOOR=true` and only then. It runs in its own Deployment
+  (`<agent>-a2a-mcp`, from the console image) holding the `console` password, one key of the
+  creds Secret like the console's, and dials 4222 over TLS as `console`; the NATS fence
+  admits it on 4222 by label and never on 9222. It adds no principal and no grant: what an
+  MCP caller can do on the bus is what the console can. Callers authenticate to the server
+  with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
+  bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
+  and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
+  access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
+  not have: its pod hands the password to whoever forwards to it.
+  **Amended 11/3:** the MCP server no longer shares `console`. It holds its own principal,
+  `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
+  the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
+  console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
-  publish on `chat.notify.gchat` and `chat.notify.slack` (one subject per backend the gateway can
-  hold) and subscribe on `chat.notify.reply.agent.>`; the gateway user gains the matching grants
-  (subscribe on the two request subjects, publish on the reply namespace). No other
+  publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
+  backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
+  the gateway user gains the matching grants (subscribe on the three request subjects, publish on
+  the reply namespace). No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
   replies. Core NATS, like the console subjects: the provision Job is untouched.
+
+- **The board route.** The Slack Home tab's read of the agent pod's board (spec-chatops-gateway.md,
+  "The Home tab"). The gateway user gains publish on `chat.board` and subscribe on
+  `chat.board.reply.gateway.>`; the bridge user gains the matching grants (subscribe on the
+  request, publish on the reply namespace), because the bridge is the bus participant in the
+  agent pod that holds session-kv's bearer. No other principal holds either subject, and the
+  reply namespace is its own for the notify route's reason. The bridge's password is reachable
+  from the agent's terminal like every grant in that pod, so a forged board can reach the Home
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
@@ -632,7 +837,13 @@ operator has one for itself, keyed on the manager's own ServiceAccount: publish 
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
-profiles spec for why a static entry cannot work there).
+profiles spec for why a static entry cannot work there). **Amended 11/2:** the map is cut
+into numbered ConfigMaps, `<agent>-a2a-authmap-0` through `-<n-1>`, each under a byte budget
+that keeps it below the API server's 1 MiB object limit (the single object crossed it near
+640 bound profiles); every shard carries the whole map's version and `shard`/`shards`
+stamps, the callout is told the count and watches each name under a Role naming each, and
+it serves a new version only once every shard of it has arrived. A map that fits is one
+shard.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
@@ -663,7 +874,8 @@ changed value changes the pod template, which rolls the callout. The same check 
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
 `agent`, `verifier`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
-`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+`_INBOX.<user>.>` (the dispatcher's entry, though narrowed, is minted under its `user` too,
+and its bucket users `<user>-b0` to `<user>-b31` are reserved with the rest); the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved
@@ -698,6 +910,10 @@ profiles need the same refusal, from a set that follows them, when the CRD lands
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The
+callout's own thirty-second memory of a successful review (below, "The throughput
+ceiling") sits in front of that, so a new connection on the reaped pod's token is refused
+within about forty seconds of the delete rather than ten; a connection already open is
+bounded by the grant TTL either way. The
 one-hour token lifetime is not the revocation story and must not be read as one.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
@@ -815,6 +1031,29 @@ exposes. Rolling the callout pods on every map change would close the gap and wa
 rejected: the callout is on the connection path, so a rolling restart is a window in
 which new connections fail, which is the thing the informer exists to avoid.
 
+**Amended 11/3:** the bus has an ordering of its own with the callout. When the bus restarts
+on a new config, every client reconnects, and whichever callout replica answers a reconnect
+places it by the map that replica holds. A connection placed by the previous map stays in
+that map's account until it next reconnects. So a running bus moves to a new config only
+once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
+(`a2aBusWaitsForCallout`). Readiness alone does not hold it: a current replica that is not ready places
+nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
+reconciled ahead of both. A fresh install is not held, since there is no running bus. The
+wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
+600s by default) does not hold the bus, because the config can carry a credential repair or a
+key change. The release records a Warning event, and the `A2ACalloutRolloutStalled` condition
+stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
+Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
+terminating one only until its deletion deadline.
+A bus that is down does not wait either: when its pod has not been Ready for two minutes and no
+callout replica is Ready, the bus admits no new connection and the hold can only end at the
+progress deadline, since a callout replica is not Ready without the bus. The release records an
+`A2ABusHoldSkipped` Warning event. Once the bus is back, a pod of an older ReplicaSet can answer a
+reconnect until the callout's rollout finishes, the same window the stall release opens.
+While the bus waits, a reconnect is placed by the current map, which can name an account the
+running config does not have yet. That connection is refused until the bus moves, which
+fails closed.
+
 Three numbers in the render are load-bearing and none of them is a preference.
 
 **`max_control_line: 65536`.** A ServiceAccount token travels inside the client's CONNECT
@@ -830,7 +1069,17 @@ first-ping timer on a connection that has not yet authenticated at roughly two s
 and the Go client aborts the connect on a PING where it required a PONG - reporting
 "expected 'PONG', got 'PING'", which names nothing about authorization and sends whoever
 is debugging it to the network layer. A merely _slow_ callout hits this too, so the real
-budget for a TokenReview round trip is under two seconds whatever this number says.
+budget for a TokenReview round trip is under two seconds whatever this number says. The
+client has ceilings of its own on the same handshake: nats.go gives the TCP dial one budget
+of its `Timeout` option, split across the resolved hosts, and then the TLS handshake and the
+CONNECT round trip a fresh deadline of the same length, on the first connect and on every
+reconnect alike. The library sets that option to ten seconds by default (`lib.DialTimeout`)
+on every connection it opens, and the worker adapter gives the raw `nats.Conn` it opens
+beside its library client the same option, so a session pod's two connections
+re-authenticate under one budget; left at nats.go's two-second default, a loaded host spends
+enough of each budget before the CONNECT that the attempt at a grant expiry fails, and the
+connection's consumers are gone until an attempt succeeds. The other raw connections under
+the callout, the verifier's and the operator's card publisher, keep nats.go's default.
 
 **The token contract.** Audience `a2a-bus`, mounted at `/var/run/secrets/a2a-bus/token`,
 3600s expiry, kubelet-rotated. The audience is the load-bearing part: a TokenReview that
@@ -846,15 +1095,18 @@ ServiceAccount, so any container in that pod presenting a token for this audienc
 authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
 copied into the pod verbatim. The operator therefore refuses and strips user-authored
 volumes by SOURCE as well as by name: a projection of this audience under any name, and a
-`secret` volume or projected `secret` source naming one of the three Secrets the bus
-renders. (Those two source fields only - the ones that mount the Secret into the
-container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
-node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
-which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
-interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
-which signs the bus's own tokens. The Secrets are cheaper than the projection, because
-reading one needs no token at all. All of them are closed together, because closing one
-narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+`secret` volume or projected `secret` source naming one of the six Secrets the bus renders
+with a credential or key in it. (Those two source fields only - the ones that mount the
+Secret into the container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef`
+hand it to a node plugin instead, and are not matched.) The first three are
+`<agent>-a2a-nats-creds`, which holds the static users' passwords;
+`<agent>-a2a-nats-config`, whose `nats.conf` interpolates every one of those passwords in
+clear text; and `<agent>-a2a-callout-keys`, which signs the bus's own tokens. The other
+three are `<agent>-a2a-nats-tls` and `<agent>-a2a-nats-ca`, the bus's serving key and the CA
+key that can mint another, and `<agent>-a2a-task-signing-key`, the dispatcher's task-signing
+seed (#3889). The Secrets are cheaper than the projection, because reading one needs no
+token at all. All of them are closed together, because closing one narrows the expensive
+route, leaves the cheap ones, and names the class while doing it.
 
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
@@ -891,22 +1143,180 @@ continue. The blast radius, named honestly: during a callout outage nothing new
 connects, which means no new tasks and no new workers - the fabric is dark to new work,
 not gracefully degraded. Established sessions and the resilience contract below are
 what make that acceptable at this stage; a hardened HA callout is production posture,
-not part of the dev toggle.
+not part of stage 1.
 
-**The throughput ceiling, so it is known rather than discovered.** A replica answers
-authorization requests one at a time: the subscription is a queue-group subscription with
-an async handler, the client library dispatches one subscription's callbacks from one
-goroutine, and the handler does its TokenReview round trip inline. Two replicas is
-therefore two authorizations in flight for the whole fabric, and a slow API server sets
-the rate directly: two divided by the TokenReview latency, which is about 20 connections a
-second at a 100ms round trip. The queue behind it is bounded by the same under-two-second
-budget as everything else on this path. Measured, not read off the code, by
-`TestTheCalloutAnswersOneAuthorizationAtATime` in `a2a/authcallout`, which makes the
-TokenReview slow and observes that no two overlap. It is adequate for the connection rate
-this stage has - connections are rare compared to messages - and it is the first thing to
-look at if a fleet reconnecting at once is slow to come back. Raising it means handling
-each request in its own goroutine with a bound, which is a change to make against a
-measurement rather than in advance of one.
+**The throughput ceiling, so it is known rather than discovered.** A replica decides
+sixteen authorization requests at once: the subscription is a queue-group subscription
+with an async handler, the client library dispatches one subscription's callbacks from
+one goroutine, and the handler hands each request to a goroutine that decodes it, then
+takes one of sixteen worker slots before it reviews, mints and responds (the decode comes
+first because a refusal has to be addressed to the decoded user nkey). The under-two-second
+budget starts at receipt, so time spent waiting for a slot counts against it, and a
+request whose budget lapses before it gets one is refused rather than decided late. Two
+bounds then set the rate of fresh reviews per replica: sixteen divided by the TokenReview
+latency (160 a second at a 100ms round trip), and the TokenReview client's own limit of
+50 requests a second with a burst of 100, raised from client-go's defaults of 5 and 10,
+which the serial handler never reached and the pool would have hit before the API server
+was asked. So a replica sustains about 50 fresh reviews a second and absorbs a burst of
+100, and two replicas twice that. In front of the API server the callout remembers a
+successful review for thirty seconds, keyed by an HMAC-SHA-256 of the token under a key
+each replica draws at start (the API server's own token cache uses the same construction),
+so the token itself is not held and a cache key says nothing about its token outside that
+process, with concurrent presentations of one token sharing one review; a failure is
+never remembered, and the identity-map lookup is not cached, so a map change reaches the
+next connection as before. A reconnecting fleet therefore costs one review per distinct
+token per thirty seconds, its retries are free, and the log line for an authorized
+connection says whether its review was `fresh` or `cached`. Measured, not read off the
+code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connects sixty-four clients with distinct tokens to the operator's rendered server, holds
+every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
+`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
+handler directly with a 50ms review each and asserts every one is answered inside a
+second, sixteen abreast. Before this the
+handler did its TokenReview inline and a replica answered one request at a time, and
+twelve A2A workers reconnecting per replica were enough to queue past the first-ping
+timer, each failed connect reconnecting and reviewing again; that outage was the
+measurement this paragraph had said to wait for before raising the ceiling.
+
+## Transport encryption
+
+Every connection to the client listener on 4222 is TLS. nats.conf carries a top-level
+`tls { }` block, so the server advertises `tls_required` and refuses a CONNECT sent in the
+clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
+certificate is refused. Every client the operator renders is handed `tls://` on the NATS
+Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
+health and stats, not payloads or tokens. The operator reads it for one thing, `config_load_time` in
+`/varz`.
+
+**Reloading permissions without a restart.** The bus pod runs nats-io's
+`nats-server-config-reloader` beside nats-server, in one PID namespace. When the kubelet
+writes a new `nats.conf` into the pod, the reloader sends nats-server the reload signal,
+and the server applies the new users and permissions to the connections it already holds.
+It also runs the auth callout again for each connection the callout authenticated; on
+2.10.29 those connections dropped at the reload and reconnected within a second.
+The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
+added, removed or done draining changes the config Secret and not the template: the bus is
+reloaded, not rolled. Every other config change still rolls it. The operator records the
+reload it asked for on the Secret, with the `config_load_time` it read just before writing,
+and confirms the reload when that value moves. A config written while a reload is still
+pending can't be confirmed by that move, which may be the earlier write landing, so the move
+restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
+kubelet write, so a restarted wait usually sees no further move, and nothing the server
+reports says whether the newest write was in the one it saw. If the value hasn't moved
+within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
+the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+`BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
+restart is kept even then: confirming by the absence of a move would admit a profile whose
+deny the server might not hold. The kubelet takes up to about a minute to write
+an updated Secret into a running pod, so a newly added profile's deny lands that long after
+the profile does. On the roll path it landed when the new pod came up, tens of seconds
+later, with the bus down for the roll. The websocket listener on 9222, the console's
+door, serves the same certificate from the same files (below).
+
+**A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
+grant and the agent card take a newly bound AgentProfile only once every bus server has
+loaded the config carrying its deny; until then the profile's `CardPublished` condition is
+`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
+servers, the pod template records the profile list, and the operator reads the revision
+each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
+them). On one server the config Secret records the previous list while a reload is pending
+or the pod restarts, and the profile counts as loaded once the server is on the new config.
+Only the way in waits: a profile the dispatch config already lists live, or whose card is
+already published, stays, and a removed profile keeps its deny while it drains, as before.
+
+**Certificate source.** The operator mints the certificates itself, with no dependency on
+cert-manager, which the chart does not install. Three objects, all owned by the
+`PlatformAgent` and removed with the stack on a flip to `today`:
+
+| Object                                             | Holds                                                  |
+| -------------------------------------------------- | ------------------------------------------------------ |
+| Secret `<name>-a2a-nats-ca`                        | an ECDSA P-256 CA, ten years, key included             |
+| Secret `<name>-a2a-nats-tls` (`kubernetes.io/tls`) | the serving pair, one year, with `ca.crt` beside it    |
+| ConfigMap `<name>-a2a-nats-ca-bundle`              | the CA's public certificate alone, which clients mount |
+
+The serving certificate names the NATS Service's in-cluster names and nothing else: no
+localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
+sets the TLS server name to the Service name (`NATS_TLS_SERVER_NAME` for clients built on
+`a2a/lib`). Both Secrets are on the webhook's bus-credential list: a user volume mounting
+either is refused, since the serving key lets a pod impersonate the bus and the CA key
+lets it mint a certificate that does.
+
+**Clients.** `NATS_CA_FILE` names the bundle to every client, and `a2a/lib.TLSOptions`
+reads it on each handshake. The gateway also gets `NATS_CA_CONFIGMAP` and mounts that
+ConfigMap into each session pod it spawns, at the same path. `NATS_CA_FILE` is reserved
+like `NATS_URL`: pointed at a CA of someone else's choosing, a client accepts a server
+that CA signed and hands it the bearer token at CONNECT. The provision Job passes the
+bundle to the `nats` CLI as `--tlsca`. A sidecar the CR declares, a bridge among them,
+gets `NATS_CA_FILE` and the bundle mount from the operator too, overriding its own value.
+
+**Ownership.** A CA or serving Secret under those names that the `PlatformAgent` does not
+control is deleted on its UID and recreated, never rewritten, so a stray or copied Secret
+neither becomes the bus CA nor carries the key out under someone else's metadata. That
+check reads the controller ownerReference, which anyone able to create the Secret can
+write, so it does not stop a caller with Secret write access in the namespace, who can
+already read the callout's issuer seed there. Anchoring the CA to something only the
+operator writes, such as a fingerprint in the status, is not done yet.
+
+**The websocket listener and the console (#3651).** The `websocket { }` block has its own
+`tls { }` on the same serving pair, since nats-server does not apply the top-level block
+to it. Its one in-cluster client is the console server, which dials it as `https` to the
+NATS Service name and verifies it against `NATS_CA_FILE`; it refuses to start with an
+`https` bus URL and no readable CA, and reads the file on each dial, so a bundle the
+kubelet updates in place applies without a restart. A browser cannot verify the bus CA,
+so every page, the read-only `web` view included, reaches the bus through the console
+server's `/bus`, which passes the page's own credential through. What is encrypted, path
+by path:
+
+| Path                             | Transport                                                                                                         |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Browser → console server         | plain http/ws to `localhost:8080`, carried inside the `kubectl port-forward` tunnel; the page's password rides it |
+| Console server → bus `:9222`     | wss, verified against the bus CA under the Service name                                                           |
+| Port-forward straight to `:9222` | TLS only; the client must trust the bus CA and name the Service as its TLS server name                            |
+| Every other client → bus `:4222` | TLS, as above                                                                                                     |
+| Monitoring `:8222`               | plain HTTP, health and stats only                                                                                 |
+
+The browser leg is as private as the port-forward: the tunnel runs over the client's
+connection to the API server, and the console pod accepts nothing else. A TLS front for a
+path that leaves the port-forward model (an Ingress or Gateway in front of the console) is
+not rendered; it would terminate on its own certificate for an external name, not the bus
+CA.
+
+**Rotation.** The reconcile reissues either certificate once fewer than 30 days remain,
+and replaces whichever Secret it cannot use (unparseable, a key that is not the
+certificate's, a serving certificate the CA no longer signs) whole. The CA outlives every
+serving certificate it signs, so a renewal never changes what clients trust. A renewal
+does change what the server presents, and nats-server reads its certificate only at boot
+or on a reload signal, so the serving certificate's fingerprint rides the StatefulSet's
+config hash: a renewal restarts the bus once a year, the same window any config change
+costs. A reloader that sends the reload signal instead would remove that restart; it
+needs another pinned image and a shared process namespace, and is not rendered yet.
+
+A new CA happens only when the CA Secret is gone, unreadable or within 30 days of its
+tenth year. It is a one-step swap, not an overlap: the operator writes the new CA into the
+bundle and reissues the serving certificate under it in the same pass, and the bus
+restarts on the new pair. Clients read the bundle on each handshake, so a client whose
+kubelet has not yet synced the new bundle fails its reconnects until it has, usually
+within a minute. The bundle always holds exactly the CA the operator signs with, so a CA
+added by hand is overwritten on the next reconcile; carrying two CAs across a planned
+rotation is a change this render does not make yet. For the same reason the two Secrets
+are operator-owned today: a serving certificate from another issuer, such as
+cert-manager, is replaced, because it does not verify against the operator's CA.
+
+**The flip on an existing install.** The release that adds the `tls { }` block also moves
+every client the operator renders to `tls://`, in the same reconcile, so the bus restarts
+once and every client rolls on its new env. Two things the operator does not re-render:
+
+- **Session pods the gateway reuses** keep the env they were spawned with. The spawner
+  stamps each pod with its bus transport (a digest of the URL and the CA path it was handed), and a
+  pod whose stamp does not match the gateway's is never handed another task, so the
+  conversation gets a fresh pod. A task in flight in an old pod when the bus restarts
+  fails, as on any bus restart.
+- **Anything outside the operator** that dials the bus by hand needs `tls://` and the
+  bundle afterwards.
+
+Client certificates (`verify: true`) are not required. Every connection already
+authenticates with a TokenReview'd ServiceAccount token or a static password; mTLS as a
+second factor is a separate option.
 
 ## Observability and audit
 

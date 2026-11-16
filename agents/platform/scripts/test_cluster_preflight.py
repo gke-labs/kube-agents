@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -8,6 +9,8 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import credential_proxy_client
 
 SCRIPT = Path(__file__).parent.absolute() / "cluster_preflight.sh"
 # The terminal tool's default call timeout is Hermes' (`TERMINAL_TIMEOUT` in
@@ -26,6 +29,8 @@ BROKER_BOUNDS = (
     ("DEFAULT_KUBECTL_TIMEOUT_SECONDS", "BROKER_KUBECTL_RUN_SECONDS"),
 )
 SCRIPT_CAP_MARGIN = "CAP_MARGIN_SECONDS"
+# The script's name for the shim's retry-deadline variable, held equal to the shim's.
+SCRIPT_SHIM_DEADLINE_ENV_RE = r"^readonly SHIM_RETRY_DEADLINE_ENV=(\S+)$"
 
 PROJECT = "demo-project"
 CLUSTER = "cluster-a"
@@ -58,6 +63,10 @@ KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
 #                            KUBECONFIG, i.e. the credential-proxy sidecar's own
 #                            context leaking in. Unset means KUBECONFIG is honoured.
 #   FAKE_UNREACHABLE       - make `cluster-info` fail like a dead API server.
+#   FAKE_BUSY_THEN_UNREACHABLE - the same, after the shim's own "credential
+#                            proxy busy ... retrying" line: refused once at the
+#                            broker, retried, admitted, and then never reaching
+#                            the API server.
 #   FAKE_CONFIG_FAILS      - make `config current-context` fail the way a
 #                            credential-proxy outage does: non-zero, error on
 #                            stderr, nothing on stdout.
@@ -76,6 +85,9 @@ KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
 #                            admitted.
 #   FAKE_CLUSTER_INFO_TIMES_OUT - the same for `cluster-info`, check 5's call.
 #   FAKE_KUBECTL_LOG       - append every argv the fake receives to this file.
+#   FAKE_DEADLINE_LOG      - append the retry deadline the preflight told the
+#                            shim (CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS, or
+#                            `unset`) to this file, one line per call.
 #
 # The context is read with PyYAML, as the credential-proxy shim reads it, so a
 # quoted or commented value means the same thing to the fake as to the real one.
@@ -89,6 +101,7 @@ FAKE_KUBECTL = textwrap.dedent(
     print(doc.get("current-context") or "")' "$1"
     }
     [ -n "${FAKE_KUBECTL_LOG:-}" ] && printf '%s\\n' "$*" >>"$FAKE_KUBECTL_LOG"
+    [ -n "${FAKE_DEADLINE_LOG:-}" ] && printf '%s\\n' "${CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS:-unset}" >>"$FAKE_DEADLINE_LOG"
 
     KCFG=""
     ARGS=()
@@ -130,6 +143,11 @@ FAKE_KUBECTL = textwrap.dedent(
             fi
             if [ -n "${FAKE_FORBIDDEN:-}" ]; then
                 echo 'Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" cannot get path "/"' >&2
+                exit 1
+            fi
+            if [ -n "${FAKE_BUSY_THEN_UNREACHABLE:-}" ]; then
+                echo "credential proxy busy (HTTP 503): the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retrying in 1.7s (attempt 2)" >&2
+                echo "Unable to connect to the server: dial tcp: i/o timeout" >&2
                 exit 1
             fi
             if [ -n "${FAKE_UNREACHABLE:-}" ]; then
@@ -371,6 +389,16 @@ class ClusterPreflightTest(unittest.TestCase):
         # The verbatim kubectl error is still the evidence.
         self.assertIn("i/o timeout", result["evidence"])
 
+    def test_check_5_refused_busy_once_and_then_unreachable_still_offers_the_remedy(self):
+        # The shim's busy line is followed by the admitted attempt's kubectl,
+        # whose endpoint timeout is the case the remedy exists for.
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_BUSY_THEN_UNREACHABLE="1")
+        self.assertEqual("5", result["check"])
+        self.assertTrue(result["remediation"].startswith("Add 10.92.0.0/14 to this cluster's authorized networks"),
+                        result["remediation"])
+        self.assertIn("i/o timeout", result["evidence"])
+
     def test_check_5_keeps_the_remedy_case_and_spacing(self):
         self.with_endpoint_bullets()
         result = self.run_preflight(FAKE_UNREACHABLE="1")
@@ -498,6 +526,42 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertGreater(script[SCRIPT_CAP_MARGIN], 0)
         self.assertGreater(kubectl_cap_seconds(), sum(broker.values()))
         self.assertLess(QUEUED_PAST_OLD_CAP_SECONDS, kubectl_cap_seconds())
+
+    def test_the_shim_is_told_the_cap_less_the_margin_and_the_run_bound_as_its_retry_deadline(self):
+        # Under the preflight's `timeout` the shim's own retries must end before
+        # it fires, the command a late-admitted retry runs included, which the
+        # shim's rule does not reserve: every brokered call carries the cap
+        # less the margin and the run bound as the deadline, named by the
+        # variable the shim reads.
+        script_name = re.search(SCRIPT_SHIM_DEADLINE_ENV_RE, _script(), re.MULTILINE)
+        self.assertTrue(script_name, "cluster_preflight.sh no longer declares SHIM_RETRY_DEADLINE_ENV")
+        self.assertEqual(credential_proxy_client.RETRY_DEADLINE_ENV, script_name.group(1))
+        log = Path(self._tmp.name) / "deadlines"
+        result = self.run_preflight(FAKE_DEADLINE_LOG=str(log))
+        self.assertEqual("ok", result["status"], result)
+        told = [int(line) for line in log.read_text(encoding="utf-8").split()]
+        self.assertEqual(2, len(told), told)  # checks 4 and 5, the two brokered calls
+        bounds = script_bounds()
+        expected = kubectl_cap_seconds() - bounds[SCRIPT_CAP_MARGIN] - bounds["BROKER_KUBECTL_RUN_SECONDS"]
+        self.assertEqual(bounds["BROKER_ADMISSION_WAIT_SECONDS"], expected)
+        self.assertEqual(expected, told[0])
+        self.assertTrue(0 <= told[1] <= expected, told)
+
+    def test_under_the_preflights_deadline_the_shim_makes_no_retry(self):
+        # The cap holds one admission wait and one command run. The shim's rule
+        # reserves a retry's admission wait and not its run, so under the cap
+        # less the margin and the run bound not even a refusal answered at once
+        # is retried: the shortest retry, the jitter floor on the first backoff
+        # base plus an admission wait, already reaches the deadline, and the
+        # shim gives up at the first refusal with the broker's reason.
+        bounds = script_bounds()
+        deadline = float(kubectl_cap_seconds() - bounds[SCRIPT_CAP_MARGIN] - bounds["BROKER_KUBECTL_RUN_SECONDS"])
+        wait = credential_proxy_client.retry_wait
+        admission = credential_proxy_client.BROKER_ADMISSION_WAIT_SECONDS
+        shortest = admission + credential_proxy_client.RETRY_JITTER_FLOOR * credential_proxy_client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+        self.assertIsNone(wait(1, 0.0, None, random.Random(1), lambda: admission, deadline=deadline))
 
     def test_check_4_queued_past_the_old_cap_and_under_the_cap_passes(self):
         # The #2632 symptom: a correct pin whose check 4 call the broker admits

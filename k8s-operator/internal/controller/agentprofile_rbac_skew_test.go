@@ -25,7 +25,7 @@ func TestAgentProfileAccessDeniedNamesOnlyAgentProfileGrants(t *testing.T) {
 
 	checker := NewRBACChecker((&fakeAuthorizer{deny: func(a *authorizationv1.ResourceAttributes) bool {
 		return a.Resource == "agentprofiles" && a.Verb == "list"
-	}}).reviews())
+	}}).reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestAgentProfileAccessDeniedNamesOnlyAgentProfileGrants(t *testing.T) {
 		t.Errorf("AgentProfileAccessDenied = %v, want the one list denial", got)
 	}
 
-	other := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews())
+	other := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews(), "")
 	if _, err := other.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
@@ -70,10 +70,10 @@ func TestAnUnreadableAgentProfileKindIsNotListed(t *testing.T) {
 
 	// The control: with the flag clear the render does list, and the 403 is
 	// what it hits.
-	if _, err := build(false).reconcileA2A(context.Background(), agent.DeepCopy()); err == nil || !strings.Contains(err.Error(), "failed to list AgentProfiles") {
+	if _, err := build(false).reconcileA2A(context.Background(), agent.DeepCopy(), homeChannelRecord{}); err == nil || !strings.Contains(err.Error(), "failed to list AgentProfiles") {
 		t.Fatalf("with the kind readable, reconcileA2A = %v; want the list's 403, or this test proves nothing", err)
 	}
-	if _, err := build(true).reconcileA2A(context.Background(), agent.DeepCopy()); err != nil && strings.Contains(err.Error(), "AgentProfiles") {
+	if _, err := build(true).reconcileA2A(context.Background(), agent.DeepCopy(), homeChannelRecord{}); err != nil && strings.Contains(err.Error(), "AgentProfiles") {
 		t.Errorf("with the kind unreadable, reconcileA2A still listed it: %v", err)
 	}
 }

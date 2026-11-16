@@ -97,7 +97,30 @@ class HelmPluginsTemplatingTest(unittest.TestCase):
         self.assertIn("name: gkestockoutinvestigator", proc.stdout)
         self.assertIn("targetProfile: \"platform\"", proc.stdout)
         self.assertIn("resource.labels.cluster_name == 'my-gke-cluster'", proc.stdout)
+        self.assertIn(
+            "Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,",
+            proc.stdout,
+        )
         self.assertIn("ghcr.io/gke-labs/kube-agents/gke-stockout-investigator:", proc.stdout)
+
+    def test_stockout_investigator_route_prompt_matches_subchart(self):
+        root_plugins = (_CHART / "templates" / "plugins.yaml").read_text(encoding="utf-8")
+        subchart_plugin = (
+            _REPO_ROOT
+            / "agentplugins"
+            / "gke-stockout-investigator"
+            / "templates"
+            / "agentplugin.yaml"
+        ).read_text(encoding="utf-8")
+        expected_prompt = (
+            "prompt: 'GKE Scale-up Failure Alert.\n\n"
+            "                Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,\n"
+            "                and if it is real, diagnose it and propose a GitOps remediation PR.\n\n"
+            "                Alert Details:\n"
+            "                {__raw__}'"
+        )
+        self.assertIn(expected_prompt, root_plugins)
+        self.assertIn(expected_prompt, subchart_plugin)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
     def test_mirrored_registry_rewrites_plugin_images(self):
@@ -170,6 +193,33 @@ class HelmPluginsTemplatingTest(unittest.TestCase):
         self.assertIn("maxInProgress: 3", proc.stdout)
         self.assertIn("maxTurns: 200", proc.stdout)
         self.assertIn("maxTurns: 150", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_stockout_investigator_tuning_can_be_left_off(self):
+        cmd = [
+            "helm",
+            "template",
+            "test-release",
+            str(_CHART),
+            "--set",
+            "platformAgent.harness.clusterName=ci-cluster",
+            "--set",
+            "platformAgent.harness.location=us-central1",
+            "--set",
+            "platformAgent.harness.projectId=ci-project",
+            "--set",
+            "plugins.pubsubPlatform.enabled=true",
+            "--set",
+            "plugins.stockoutInvestigator.enabled=true",
+            "--set",
+            "plugins.stockoutInvestigator.applyTuning=false",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # The install that only proves the plugin's ingress keeps its own tuning:
+        # the presubmit sets this so eval cases run under the limits they are graded at.
+        self.assertNotIn("maxTurns: 200", proc.stdout)
+        self.assertNotIn("maxTurns: 150", proc.stdout)
+        self.assertNotIn("apiMaxRetries", proc.stdout)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
     def test_plugins_inherit_custom_platform_agent_name(self):

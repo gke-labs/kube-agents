@@ -14,12 +14,15 @@ Workloads without webhook serving or heavy cold starts (`inference-replay`, `git
 define explicit rollout strategies resolving `maxUnavailable >= 1` to replace in place under quota (#975).
 
 Single-replica workloads with admission webhooks or multi-minute model loading cold starts
-(`operator`, `hindsight-api`, `vllm-gemma`) deliberately default to surge-first (`maxUnavailable: 0`
-in Kustomize/examples, configurable in Helm defaulting to 0): at `replicas: 1`, `maxUnavailable: 1`
-sets `minAvailable = 0` and terminates the old Pod before the replacement is Ready, causing
-admission outages or minutes of memory recall / inference downtime during upgrades.
+(`operator`, `hindsight-api`) deliberately default to surge-first (`maxUnavailable: 0` in
+Kustomize, configurable in Helm defaulting to 0): at `replicas: 1`, `maxUnavailable: 1` sets
+`minAvailable = 0` and terminates the old Pod before the replacement is Ready, causing admission
+outages or minutes of memory recall downtime during upgrades.
 
-Consequently, `operator`, `hindsight-api`, and `vllm-gemma` will still stall under a zero-headroom
+The `vllm-gemma` example uses `Recreate` instead: its Pod takes every GPU on its node, so a surge
+Pod never schedules and a surge rollout waits forever.
+
+Consequently, `operator` and `hindsight-api` will still stall under a zero-headroom
 ResourceQuota by default. For the Helm chart workloads, `operator.rollingUpdate.maxUnavailable` and
 `hindsight.api.rollingUpdate.maxUnavailable` provide the override knob to unblock rollouts under quota
 when the transient outage is acceptable.
@@ -246,17 +249,17 @@ class DeploymentsRolloutSurvivesAFullQuota(unittest.TestCase):
             f"{_REPLAY_EXAMPLE.relative_to(_ROOT)} must resolve maxUnavailable >= 1",
         )
 
-    def test_vllm_gemma_example_preserves_surge_first_strategy(self):
+    def test_vllm_gemma_example_uses_recreate_strategy(self):
         docs = list(_extract_deployments(_VLLM_GEMMA_EXAMPLE))
         self.assertEqual(
             len(docs), 1, f"expected 1 Deployment in {_VLLM_GEMMA_EXAMPLE}"
         )
-        max_unavail = _resolve_max_unavailable(docs[0])
+        strategy = docs[0]["spec"].get("strategy") or {}
         self.assertEqual(
-            max_unavail,
-            0,
-            f"{_VLLM_GEMMA_EXAMPLE.relative_to(_ROOT)} must resolve maxUnavailable to 0 "
-            "to prevent multi-minute inference outages while pulling and loading Gemma models",
+            strategy.get("type"),
+            "Recreate",
+            f"{_VLLM_GEMMA_EXAMPLE.relative_to(_ROOT)} must use Recreate: its Pod takes every GPU "
+            "on its node, so a surge Pod never schedules",
         )
 
     def test_github_minter_chart_template_sets_rollout_strategy(self):
@@ -275,8 +278,7 @@ class DeploymentsRolloutSurvivesAFullQuota(unittest.TestCase):
                     # Exclude single-replica workloads that deliberately surge-first:
                     # - operator controller-manager (admission webhook backend)
                     # - hindsight-api (1.4 GB image + 5m model loading cold start)
-                    # - vllm-gemma (multi-minute Gemma weight loading)
-                    if path in (_OPERATOR_KUSTOMIZE, _HINDSIGHT_KUSTOMIZE, _VLLM_GEMMA_EXAMPLE):
+                    if path in (_OPERATOR_KUSTOMIZE, _HINDSIGHT_KUSTOMIZE):
                         continue
                     resolved = _resolve_max_unavailable(doc)
                     if resolved is not None and resolved < 1:

@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,15 +23,21 @@ import (
 // copied from the credential broker's (CREDENTIAL_PROXY_METRICS_PORT in
 // agents/platform/scripts/credential_proxy.py), so that the collector
 // scraping it, and the operator's usage poller, are admitted to a port that
-// serves counters and nothing else.
+// serves counters (MetricsPath) and a readiness line for the kubelet
+// (ReadyzPath) and nothing else.
 // The doors keep their own loopback listeners and never serve these series.
 // The operator renders A2A_METRICS_PORT from the constant that also declares
 // the container port and the collector's ingress rule
 // (a2aGatewayMetricsPort in platformagent_a2a_manifests.go); unset means no
 // listener, which is what an older operator that declares no port gets.
 const (
-	// MetricsPath is the one path the metrics listener serves.
+	// MetricsPath is the counters' path on the metrics listener.
 	MetricsPath = "/metrics"
+
+	// ReadyzPath is the readiness path on the same listener: 200 once the
+	// gateway has bound its event relay, 503 with the reason until then. The
+	// operator's readinessProbe reads it (a2aGatewayReadyzPath).
+	ReadyzPath = "/readyz"
 
 	// metricsNamespace and metricsSubsystem prefix every series, so the
 	// gateway's sit beside the broker's kubeagents_* names and cannot be
@@ -36,6 +45,10 @@ const (
 	metricsNamespace = "kubeagents"
 	metricsSubsystem = "a2a_gateway"
 
+	// taskTerminalsName counts every task terminal by state and source; the
+	// operator's usage poller reads it under failed and rejected as the
+	// next-mode half of status.usage's chatTurnsErroredTotal
+	// (docs/designs/usage-counters-producer.md).
 	taskTerminalsName       = "task_terminals_total"
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"
@@ -46,6 +59,21 @@ const (
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
+	// answerFeedbackName counts the ratings chat users gave answers, by
+	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
+	// series.
+	answerFeedbackName = "answer_feedback_total"
+	// postFeedbackName counts the ratings chat users gave the posts the agent
+	// made on its own (alerts and reports on the chat.notify route), by
+	// platform, rating and kind (feedback.go): apart from answer_feedback_total,
+	// so a 👎 on a noisy alert reads as noise rather than as a bad answer.
+	postFeedbackName = "post_feedback_total"
+	// sessionsName counts the conversations the gateway minted a session
+	// record for, by platform: the next-mode chat half of status.usage's
+	// sessionsTotal, beside the watcher's triage sessions and the
+	// session_store plugin's count for the Hermes-side ingress
+	// (docs/designs/usage-counters-producer.md).
+	sessionsName = "sessions_total"
 	// processStartTimeName is the gauge the operator's usage poller reads to
 	// tell a gateway that restarted in place from a counter that fell for
 	// another reason: the Go process collector's name, but captured once at
@@ -53,6 +81,38 @@ const (
 	// chat_metrics plugin serve it (docs/designs/usage-counters-producer.md,
 	// "Resets"). Unprefixed: it is the process's, not the gateway's.
 	processStartTimeName = "process_start_time_seconds"
+	// peopleSeenName is the gauge of distinct chat people seen in each
+	// window (people.go); it serves no sample until the people map holds
+	// the bucket.
+	peopleSeenName = "people_seen"
+	// peopleSeenHelp is peopleSeenName's help text.
+	peopleSeenHelp = "Distinct people whose last verified chat turn, within an hour, is inside the window."
+	// slackConnectedName is the gauge of the Slack adapter's Socket Mode
+	// connection, 1 while the websocket is up and 0 from a drop or a
+	// reconnect until it is up again; slackLastEventName is when the adapter
+	// last received an event or a click from Slack. Neither serves a sample
+	// unless a Slack adapter runs (slackCollector): a gateway on another
+	// backend never arms them, and a replica whose adapter stopped with its
+	// context, as on losing the lease, disarms them, so neither adds to a max
+	// over the install.
+	slackConnectedName = "slack_connected"
+	slackConnectedHelp = "1 while the Slack adapter's Socket Mode connection is up, 0 from a drop or a reconnect until it is up again; no sample unless a Slack adapter runs."
+	slackLastEventName = "slack_last_event_timestamp_seconds"
+	slackLastEventHelp = "When the Slack adapter last received an event or an interactive payload from Slack, in seconds since the unix epoch; no sample until the first."
+	// slackIngressLagName is how long a Slack message or click took to reach
+	// the gateway: its arrival time less the event's own timestamp (a
+	// message's event_ts, a click's action_ts), so a slow Socket Mode leg
+	// shows apart from the agent's own time. slackAPIDurationName times each
+	// Slack Web API call the adapter makes, by method and outcome, and
+	// slackRateLimitedName counts the ones Slack answered 429.
+	slackIngressLagName  = "slack_ingress_lag_seconds"
+	slackAPIDurationName = "slack_api_request_duration_seconds"
+	slackRateLimitedName = "slack_api_rate_limited_total"
+	// slackFirstAckName is how long a Slack ask waited for its first receipt:
+	// from the adapter receiving the message to its arrival reaction landing
+	// (the reactions call succeeded). Ingress lag before it
+	// and the agent's own time after it are measured apart.
+	slackFirstAckName = "slack_first_ack_seconds"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -61,6 +121,18 @@ const (
 	labelSource   = "source"
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
+	labelRating   = "rating"
+	labelAnswer   = "answer"
+	labelKind     = "kind"
+	labelWindow   = "window"
+	labelMethod   = "method"
+	// The Slack API outcomes: ok (a 2xx), rate_limited (a 429) and error
+	// (any other status, or no response at all). Slack answers most API
+	// errors 200 with ok false; those read ok here, as the call's latency
+	// is what this series is for.
+	slackAPIOK          = "ok"
+	slackAPIRateLimited = "rate_limited"
+	slackAPIError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -70,6 +142,20 @@ const (
 	platformSlack      = "slack"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
+	// The answer label's values: what the rated message answered with, the
+	// chain's own reply or a card's report that settled the ask (TaskRef.CardsAnswer).
+	// A rating no session record names the rated task for (unreadable, reaped,
+	// or the root aged out of its history) is counted as other.
+	answerReply = "reply"
+	answerCard  = "card"
+	// The kind label's values: what the rated post was, an alert (a keyed
+	// home post, whose thread its triage edits) or a report (any other home
+	// post: a scheduled or audit report, a digest).
+	postKindAlert  = "alert"
+	postKindReport = "report"
+	// The window label's values: peopleWindowShort and peopleWindowLong.
+	peopleWindowShortLabel = "7d"
+	peopleWindowLongLabel  = "30d"
 
 	// metricsLabelOther is the bucket for a value outside a closed list.
 	// observeTaskTerminal sees only the four final states and the four
@@ -135,6 +221,12 @@ var (
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsRatings         = []string{FeedbackUp, FeedbackDown}
+	metricsAnswers         = []string{answerReply, answerCard}
+	metricsPostKinds       = []string{postKindAlert, postKindReport}
+	// metricsRatedPlatforms are the backends that draw rating controls, each
+	// given a zero answer_feedback_total series per rating and answer.
+	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -143,6 +235,24 @@ var (
 		discordBackend: platformDiscord,
 		consoleBackend: platformConsole,
 	}
+	// metricsSlackAPIMethods are the Slack Web API methods the method label
+	// names; a call to any other (a method added later) is counted as other.
+	// A shortcut's response_url post goes through its own client and is not
+	// timed.
+	metricsSlackAPIMethods = []string{
+		"chat.postMessage", "chat.update", "chat.postEphemeral",
+		"reactions.add", "reactions.remove",
+		"views.publish", "views.open",
+		"users.info", "conversations.info", "conversations.members", "conversations.open",
+		"conversations.replies", "conversations.history",
+		"auth.test", "apps.connections.open", "assistant.threads.setSuggestedPrompts",
+		slackSessionsSetStatusMethod, slackSessionsRenameMethod,
+	}
+	// metricsSlackIngressBuckets reach from a Socket Mode delivery that is
+	// near instant to one a minute late; metricsSlackAPIBuckets from a fast
+	// Web API call to the client's 30-second bound (slackAPITimeout).
+	metricsSlackIngressBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
+	metricsSlackAPIBuckets     = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -159,9 +269,96 @@ type Metrics struct {
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
+	answerFeedback      *prometheus.CounterVec
+	postFeedback        *prometheus.CounterVec
+	sessions            *prometheus.CounterVec
+	slackIngressLag     *prometheus.HistogramVec
+	slackAPIDuration    *prometheus.HistogramVec
+	slackFirstAckSecs   *prometheus.HistogramVec
+	slackRateLimited    *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
 	processStart prometheus.Gauge
+	// peopleSource is the people desk's count, set once the count is on;
+	// unset, the people gauge serves no sample.
+	peopleSource atomic.Pointer[peopleCount]
+	// slack is the Slack adapter's connection, which the slack gauges serve.
+	slack slackConn
+}
+
+// slackConn is the Slack adapter's Socket Mode connection as the adapter last
+// reported it, under mu. armed is set while a Slack adapter runs; up is
+// whether its socket is connected; lastEvent is when the last event arrived,
+// zero before the first.
+type slackConn struct {
+	mu        sync.Mutex
+	armed     bool
+	up        bool
+	lastEvent time.Time
+}
+
+// slackCollector serves slackConnectedName and slackLastEventName from the
+// Metrics' slackConn: nothing until a Slack adapter runs.
+type slackCollector struct {
+	m         *Metrics
+	connected *prometheus.Desc
+	lastEvent *prometheus.Desc
+}
+
+// Describe sends the two Slack gauges' Descs.
+func (c *slackCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.connected
+	ch <- c.lastEvent
+}
+
+// Collect emits the connection gauge while a Slack adapter runs, and the last
+// event's time once one has arrived.
+func (c *slackCollector) Collect(ch chan<- prometheus.Metric) {
+	sc := &c.m.slack
+	sc.mu.Lock()
+	armed, up, last := sc.armed, sc.up, sc.lastEvent
+	sc.mu.Unlock()
+	if !armed {
+		return
+	}
+	connected := 0.0
+	if up {
+		connected = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.connected, prometheus.GaugeValue, connected)
+	if !last.IsZero() {
+		ch <- prometheus.MustNewConstMetric(c.lastEvent, prometheus.GaugeValue, float64(last.UnixNano())/float64(time.Second))
+	}
+}
+
+// peopleCount reports the distinct people seen in the short and long windows,
+// on the source's own clock, and whether the count holds the bucket (ok).
+type peopleCount func() (short, long int, ok bool)
+
+// peopleCollector serves peopleSeenName from the Metrics' people source: two
+// samples, one per window, while the source reports ok, and none otherwise.
+type peopleCollector struct {
+	m    *Metrics
+	desc *prometheus.Desc
+}
+
+// Describe sends the people gauge's one Desc.
+func (c *peopleCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+// Collect emits the two window samples when a source is set and reports ok.
+func (c *peopleCollector) Collect(ch chan<- prometheus.Metric) {
+	fn := c.m.peopleSource.Load()
+	if fn == nil {
+		return
+	}
+	short, long, ok := (*fn)()
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(short), peopleWindowShortLabel)
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(long), peopleWindowLongLabel)
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -204,18 +401,75 @@ func NewMetrics() *Metrics {
 			Name:      messagesInboundName,
 			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		answerFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      answerFeedbackName,
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+		}, []string{labelPlatform, labelRating, labelAnswer}),
+		postFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      postFeedbackName,
+			Help:      "Ratings verified chat users gave the posts the agent made on its own, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and kind (alert, a keyed home post its triage edits; report, any other home post; other); counted once per rating change, apart from answer_feedback_total.",
+		}, []string{labelPlatform, labelRating, labelKind}),
+		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      sessionsName,
+			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
+		}, []string{labelPlatform}),
+		slackIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackIngressLagName,
+			Help:      "Seconds from a Slack message's event_ts, or a click's action_ts, to the gateway receiving it over Socket Mode; a negative lag (clock skew) is observed as 0. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+			// No labels; a vec so the series appears with the first
+			// observation, and a gateway on another backend serves none.
+		}, nil),
+		slackAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackAPIDurationName,
+			Help:      "Seconds each Slack Web API call the Slack adapter made took, by method (chat.postMessage, chat.update, reactions.add, ..., other) and outcome (ok, a 2xx including Slack's ok:false answers; rate_limited, a 429; error, any other status or no response).",
+			Buckets:   metricsSlackAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		slackFirstAckSecs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackFirstAckName,
+			Help:      "Seconds from the Slack adapter receiving an ask to its arrival reaction landing (the reactions call succeeded); a click, an answer or a steer draws none, and a refused reaction is not counted. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+		}, nil),
+		slackRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackRateLimitedName,
+			Help:      "Slack Web API calls Slack answered 429 (rate limited), by method (chat.postMessage, chat.update, reactions.add, ..., other).",
+		}, []string{labelMethod}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeName,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.processStart)
+	people := &peopleCollector{
+		m:    m,
+		desc: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, peopleSeenName), peopleSeenHelp, []string{labelWindow}, nil),
+	}
+	slackGauges := &slackCollector{
+		m:         m,
+		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
+		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
+	}
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
 	for _, platform := range append(append([]string(nil), metricsPlatforms...), metricsLabelOther) {
 		m.messagesInbound.WithLabelValues(platform)
+		m.sessions.WithLabelValues(platform)
 	}
 	for _, state := range append(append([]lib.TaskState(nil), metricsTerminalStates...), metricsLabelOther) {
 		for _, source := range append(append([]TerminalSource(nil), metricsTerminalSources...), metricsLabelOther) {
@@ -225,7 +479,69 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
 	}
+	for _, platform := range metricsRatedPlatforms {
+		for _, rating := range metricsRatings {
+			for _, answer := range metricsAnswers {
+				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
+			for _, kind := range metricsPostKinds {
+				m.postFeedback.WithLabelValues(platform, rating, kind)
+			}
+		}
+	}
 	return m
+}
+
+// setPeopleSource makes fn the people gauge's source.
+func (m *Metrics) setPeopleSource(fn peopleCount) {
+	if m == nil {
+		return
+	}
+	m.peopleSource.Store(&fn)
+}
+
+// slackDown records the Slack connection as down: the adapter has started and
+// not yet connected, Socket Mode is reconnecting, or the adapter's Run failed.
+func (m *Metrics) slackDown() {
+	m.slackSet(true, false)
+}
+
+// slackUp records the Slack connection as up.
+func (m *Metrics) slackUp() {
+	m.slackSet(true, true)
+}
+
+// slackStopped disarms the Slack gauges: the adapter's Run ended because its
+// context did, a replica that lost the lease or a gateway shutting down, so
+// the replica holds no socket and is not the one to report it. The next Run
+// arms them again from down.
+func (m *Metrics) slackStopped() {
+	if m == nil {
+		return
+	}
+	m.slack.mu.Lock()
+	defer m.slack.mu.Unlock()
+	m.slack.armed, m.slack.up, m.slack.lastEvent = false, false, time.Time{}
+}
+
+// slackSet records whether a Slack adapter runs and whether its socket is up.
+func (m *Metrics) slackSet(armed, up bool) {
+	if m == nil {
+		return
+	}
+	m.slack.mu.Lock()
+	defer m.slack.mu.Unlock()
+	m.slack.armed, m.slack.up = armed, up
+}
+
+// slackEvent records an event or an interactive payload received from Slack.
+func (m *Metrics) slackEvent(now time.Time) {
+	if m == nil {
+		return
+	}
+	m.slack.mu.Lock()
+	defer m.slack.mu.Unlock()
+	m.slack.lastEvent = now
 }
 
 // Handler serves the registry in the Prometheus text format.
@@ -283,6 +599,17 @@ func (m *Metrics) messageInbound(platform string) {
 	m.messagesInbound.WithLabelValues(platform).Inc()
 }
 
+// sessionMinted counts one conversation whose session record this gateway
+// created, under its platform. Its one caller is mintSession, on the create
+// that won; the loser of a mint race adopts the winner's record and counts
+// nothing, so two replicas racing first contact count one session.
+func (m *Metrics) sessionMinted(platform string) {
+	if m == nil {
+		return
+	}
+	m.sessions.WithLabelValues(platform).Inc()
+}
+
 // metricsPlatformLabel is the platform label for a message that arrived
 // through backend, and false for a door, whose turns are not chat. A chat
 // backend added later without a row lands under other rather than minting
@@ -318,9 +645,10 @@ func metricsTerminalSourceLabel(source TerminalSource) string {
 	return metricsLabelOther
 }
 
-// MetricsServer is the metrics-only listener: MetricsPath and nothing else,
-// on its own port, so the NetworkPolicy rule that admits the collector to it
-// admits the collector and the operator to counters and nothing else.
+// MetricsServer is the metrics-only listener: MetricsPath, plus ReadyzPath
+// for the kubelet, on its own port, so the NetworkPolicy rule that admits the
+// collector to it admits the collector and the operator to counters and a
+// readiness line (whether the relay has bound) and nothing else.
 type MetricsServer struct {
 	listen  string
 	metrics *Metrics
@@ -329,13 +657,34 @@ type MetricsServer struct {
 	// listener, when set, is an already-bound listener Run serves on
 	// instead of binding listen. Test injection only.
 	listener net.Listener
+
+	// readiness answers ReadyzPath; nil answers ready (SetReadiness).
+	readiness func() (bool, string)
+}
+
+// SetReadiness sets what ReadyzPath reports: the gateway's Readiness. Call
+// before Run.
+func (s *MetricsServer) SetReadiness(readiness func() (bool, string)) { s.readiness = readiness }
+
+// serveReadyz answers ReadyzPath: 200 or 503, with the reason as the body so
+// a probe failure in `kubectl describe` and a curl both say what it waits on.
+func (s *MetricsServer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	ready, reason := true, "ready"
+	if s.readiness != nil {
+		ready, reason = s.readiness()
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	fmt.Fprintln(w, reason)
 }
 
 // NewMetricsServer builds the listener for a port. It binds every interface,
 // unlike the doors' loopback binds, because its callers, the collector and
 // the operator's poller, are on the pod network; what keeps anyone else off
 // it is the NetworkPolicy, and
-// what it serves is counters.
+// what it serves is counters and a readiness line.
 func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsServer, error) {
 	if port < metricsPortMin || port > metricsPortMax {
 		return nil, fmt.Errorf("metrics listener port %d is not in %d-%d", port, metricsPortMin, metricsPortMax)
@@ -349,11 +698,12 @@ func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsSer
 	return &MetricsServer{listen: fmt.Sprintf(":%d", port), metrics: metrics, log: log}, nil
 }
 
-// Run serves MetricsPath until ctx is done. Every other path is 404, and
+// Run serves MetricsPath and ReadyzPath until ctx is done. Every other path is 404, and
 // every method on it but GET (and the HEAD the mux answers with it) 405.
 func (s *MetricsServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle(http.MethodGet+" "+MetricsPath, s.metrics.Handler())
+	mux.HandleFunc(http.MethodGet+" "+ReadyzPath, s.serveReadyz)
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: metricsConnectionDeadline,
@@ -391,4 +741,41 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 		_ = srv.Shutdown(shutdownCtx)
 		return nil
 	}
+}
+
+// answerRated counts one rating. Every label comes from a closed list: a
+// platform, rating or answer outside them is counted as other.
+func (m *Metrics) answerRated(platform, rating, answer string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	if !slices.Contains(metricsAnswers, answer) {
+		answer = metricsLabelOther
+	}
+	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
+}
+
+// postRated counts one rating of a post the agent made on its own. Every
+// label comes from a closed list: a platform, rating or kind outside them is
+// counted as other.
+func (m *Metrics) postRated(platform, rating, kind string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	if !slices.Contains(metricsPostKinds, kind) {
+		kind = metricsLabelOther
+	}
+	m.postFeedback.WithLabelValues(platform, rating, kind).Inc()
 }

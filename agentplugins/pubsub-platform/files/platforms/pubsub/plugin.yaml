@@ -8,8 +8,6 @@ description: >
   to specific agent runs.
 author: Nous Research
 requires_env: []
-optional_env:
-  - name: GOOGLE_APPLICATION_CREDENTIALS
-    description: "Path to Google Cloud service account key JSON file"
-    prompt: "Service Account key path (optional)"
-    password: false
+# No credential: the adapter pulls through the credential broker's Pub/Sub
+# relay (PUBSUB_RELAY_URL, set by the operator), on the install's identity.
+optional_env: []

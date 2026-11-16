@@ -1,0 +1,140 @@
+# Upgrade-failure catalogue entry 19 (in-tree volumes lose their CSI path),
+# in the shape the seeded fleet plants it: intree-pd-volume on seeded-a, a
+# PersistentVolume (intree-pd) written against the in-tree gcePersistentDisk
+# plugin over the fleet's own disk, bound by the intree-pd claim in
+# seeded-shapes and mounted by intree-pd-reader. The in-tree plugin code
+# left Kubernetes at 1.28, so the attach goes through CSI migration to the PD
+# CSI driver on every supported minor; a cluster whose driver is off leaves
+# it unattachable.
+#
+# The prompt names no volume; the source vocabulary (in-tree
+# gcePersistentDisk, csi, other) is the prompt's, so the source objective is
+# a choice from that menu. It asks which PersistentVolumes on the seeded
+# clusters still use an in-tree volume source, and for the
+# answer to end in one declared line per such volume, in a fixed form; the
+# deterministic objectives read the planted volume's line and nothing else.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# The claim may carry its kind (`pvc`, `claim`, `persistentvolumeclaim`) before
+# `seeded-shapes/intree-pd`, as the list slots admit a kind before a name.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The source slot grades the word `in-tree`, followed by one plugin token
+# (`gcePersistentDisk`, `kubernetes.io/gce-pd`, optionally `plugin`) and a
+# parenthetical; a negation, `csi` or `other` as that token reads wrong, and
+# a tail after it is not admitted. The halves may be reversed: the plugin
+# (`gcePersistentDisk`, `gce-pd`, `kubernetes.io/gce-pd`) then `in-tree`, bare,
+# after a comma, or opening its parenthetical (an article or a `legacy`
+# qualifier may precede it there, and `plugin` may follow it); the first word
+# after it may not be a negation, `csi` or `other`, a hedge
+# mark reads wrong, and a later clause of that parenthetical is the judge's. The
+# claim may carry its namespace as `seeded-shapes/intree-pd`, as a tail
+# (`intree-pd in seeded-shapes`) or as a parenthetical (`intree-pd
+# (seeded-shapes)`, `(namespace seeded-shapes)`, `(seeded-shapes, Bound)`), and its kind as a word or a path segment (`pvc/`).
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the volume source. A CSI volume in its place is the
+# heal that passes every objective and empties the fixture.
+id: upgrades-intree-volume-named
+name: The PersistentVolume on an in-tree plugin is named before the upgrade that would strand it
+
+prompt: >-
+  Before the seeded clusters in this project are upgraded, tell me which
+  PersistentVolumes still use an in-tree volume source rather than a CSI
+  driver, what claims they serve, and what keeps them attachable today. Read
+  only; change nothing. End your answer with one line per such volume in
+  exactly this form, no other words on the line: "<cluster>/<volume>: source
+  <in-tree gcePersistentDisk|csi|other>; bound by <namespace/claim or none>;
+  attaches through csi migration: <yes|no>".
+
+expected_output: >-
+  It reads the PersistentVolumes on the seeded clusters and names intree-pd
+  on seeded-a: an in-tree gcePersistentDisk source over the disk
+  seeded-a-intree-pd, bound by seeded-shapes/intree-pd and mounted by
+  intree-pd-reader, attached today only because CSI migration hands it to
+  the PD CSI driver (the in-tree plugin code is gone upstream since 1.28). It
+  says what would strand it (the PD CSI driver disabled, or a cluster or
+  version where migration is not available) and recommends recreating the
+  volume on the CSI driver before then, without performing it. It cites no CVE identifiers and ends with the
+  declared line for each such volume, the planted one reading "source
+  in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches
+  through csi migration: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - intree-pd-volume
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases. The
+  # volume is cluster-scoped, so the line names the cluster and the volume.
+  - name: the-planted-volume-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-source-is-in-tree
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?:in-tree(?![a-z0-9])(?::? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z][a-z0-9./-]*(?: plugin)?)?|(?:gcepersistentdisk|(?:kubernetes\.io/)?gce-pd)(?:,? in-tree(?![a-z0-9])(?: plugin)?| ?\((?:(?:the|an?) )?(?:legacy )?in-tree(?![a-z0-9])(?:[,:]? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z0-9][^)\n;?!]*)?\)))(?: ?\([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!(?:in-tree(?![a-z0-9])(?::? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z][a-z0-9./-]*(?: plugin)?)?|(?:gcepersistentdisk|(?:kubernetes\.io/)?gce-pd)(?:,? in-tree(?![a-z0-9])(?: plugin)?| ?\((?:(?:the|an?) )?(?:legacy )?in-tree(?![a-z0-9])(?:[,:]? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z0-9][^)\n;?!]*)?\)))(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+
+  - name: the-declared-line-names-the-claim-and-the-migration
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\((?:(?:in|from|of) )?(?:(?:the )?namespaces? |ns )?seeded-shapes(?: namespace)?(?:[,:] ?[^)\n;]*)?\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\((?:(?:in|from|of) )?(?:(?:the )?namespaces? |ns )?seeded-shapes(?: namespace)?(?:[,:] ?[^)\n;]*)?\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The volume still has its in-tree source (the disk name carries the
+  # install's cluster prefix, so the field's presence is what is pinned).
+  - name: the-planted-volume-source-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: intree-pd-volume
+      kind: persistentvolume
+      resource_name: intree-pd
+      # Cluster-scoped; the role's namespace is given for the catalogue check,
+      # and kubectl ignores it for this kind.
+      namespace: seeded-shapes
+      path: spec.gcePersistentDisk
+      op: exists

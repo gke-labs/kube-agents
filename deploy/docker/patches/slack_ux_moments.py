@@ -32,8 +32,10 @@ reaches the thread as "⏸ <head> blocked: <reason>", clipped to 160
 characters, and the ``blocked`` wake has the Planning Agent explain it, so
 the thread gets the question twice, once as a paraphrase. With the flag on,
 :func:`needs_you` instead posts the reason as a question: the first line in
-bold (plain if bold would drop a ``*``), the rest below (clipped at 2,000
-characters), a choice button per option the question ends with, and "waiting
+bold (plain if bold would drop a ``*``; just its first sentence when the line
+is too long for a headline, cut at a word with an ellipsis when a question is
+too long as well, the rest of the line and any link in the bold line opening
+what is below), the rest below (clipped at 2,000 characters), a choice button per option the question ends with, and "waiting
 on you". Buttons need the card's thread, since a click answers in the thread
 it was clicked in; a card with no thread keeps its options as text.
 The wake still runs, since it is how the Planning Agent learns which card an

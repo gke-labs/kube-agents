@@ -169,16 +169,105 @@ func TestTheProvisionScriptReportsTheSubjectCapGapOnItsTerminationMessage(t *tes
 			}
 			// And the two ends agree: what the script wrote is what the
 			// reconcile parses.
-			finding, err := parseA2AProvisionReport(string(got))
+			findings, err := parseA2AProvisionReport(string(got))
 			if err != nil {
 				t.Fatalf("the reconcile cannot read what the script wrote: %v", err)
 			}
+			finding := findings.tasksSubjectCap
 			if tc.liveCap == 0 || tc.liveCap == -1 {
 				if finding == nil || finding.live != int64(tc.liveCap) || !finding.hasWant || finding.want != int64(want) {
 					t.Errorf("parsed finding = %+v, want live %d want %d", finding, tc.liveCap, want)
 				}
 			} else if finding != nil {
 				t.Errorf("a bounded stream parsed as a finding: %+v", finding)
+			}
+			if findings.topicsStateSubjectMissing {
+				t.Errorf("a TOPICS-STATE that carries the subject parsed as missing it: %q", got)
+			}
+		})
+	}
+}
+
+// TestTheProvisionScriptReportsAMissingTopologySkewSubjectOnItsTerminationMessage:
+// the second finding takes the same road as the first. An existing
+// TOPICS-STATE without the topology-skew subject writes its marker to the
+// report -- alone, or beside the cap gap when both stand -- and the reconcile
+// reads it back; a stream that carries the subject writes nothing under the
+// key. Exit 0 throughout: it is a report, not a failure (the unreadable
+// answer, which is one, is TestProvisionReportsATasksStreamOlderThanItsRender's).
+func TestTheProvisionScriptReportsAMissingTopologySkewSubjectOnItsTerminationMessage(t *testing.T) {
+	agent := a2aTestAgent()
+	older := topicsStateInfoJSON("a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe")
+	current := topicsStateInfoJSON("a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe")
+	for _, tc := range []struct {
+		name        string
+		liveCap     int
+		topicsJSON  string
+		wantReport  string
+		wantMissing bool
+	}{
+		{
+			name:        "a stream older than the topic is the finding",
+			liveCap:     a2aTasksMaxMsgsPerSubject,
+			topicsJSON:  older,
+			wantReport:  `{"topics_state_subject":{"missing":1}}`,
+			wantMissing: true,
+		},
+		{
+			name:        "both gaps stand side by side",
+			liveCap:     0,
+			topicsJSON:  older,
+			wantReport:  fmt.Sprintf(`{"tasks_subject_cap":{"live":0,"want":%d},"topics_state_subject":{"missing":1}}`, a2aTasksMaxMsgsPerSubject),
+			wantMissing: true,
+		},
+		{
+			name:       "a stream that carries the subject is clean",
+			liveCap:    a2aTasksMaxMsgsPerSubject,
+			topicsJSON: current,
+			wantReport: `{}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, reportPath := stageProvisionScriptReportingTo(t, dir, agent)
+			if err := os.WriteFile(reportPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			bash, err := exec.LookPath("bash")
+			if err != nil {
+				t.Skip("bash not on PATH")
+			}
+			stubNatsWithTopicsState(t, dir, liveTASKS(agent, tc.liveCap), tc.topicsJSON)
+			cmd := exec.Command(bash, script)
+			cmd.Env = append(os.Environ(),
+				"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"BUS_USER=test-agent-a2a-provision",
+			)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			cmd.Stdout = &strings.Builder{}
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("the script exited non-zero; a missing subject is a report, not a failure: %v\nstderr:\n%s", err, stderr.String())
+			}
+			got, err := os.ReadFile(reportPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.wantReport {
+				t.Errorf("termination message = %q, want %q", got, tc.wantReport)
+			}
+			if tc.wantMissing && !strings.Contains(stderr.String(), "NOTE: TOPICS-STATE does not carry subject "+a2aTopologySkewSubject) {
+				t.Errorf("stderr lost the human-readable NOTE; the termination message is a copy, not a replacement:\n%s", stderr.String())
+			}
+			findings, err := parseA2AProvisionReport(string(got))
+			if err != nil {
+				t.Fatalf("the reconcile cannot read what the script wrote: %v", err)
+			}
+			if findings.topicsStateSubjectMissing != tc.wantMissing {
+				t.Errorf("parsed topicsStateSubjectMissing = %v, want %v (report %q)", findings.topicsStateSubjectMissing, tc.wantMissing, got)
+			}
+			if (findings.tasksSubjectCap != nil) != (tc.liveCap == 0) {
+				t.Errorf("parsed tasksSubjectCap = %+v for live cap %d", findings.tasksSubjectCap, tc.liveCap)
 			}
 		})
 	}
@@ -376,6 +465,79 @@ func gapReport() string {
 	return fmt.Sprintf(`{"tasks_subject_cap":{"live":0,"want":%d}}`, a2aTasksMaxMsgsPerSubject)
 }
 
+// TestTheMissingTopologySkewSubjectIsAnEventOnTheCR: the second finding
+// reaches the CR the way the first does -- one Warning Event naming the
+// reason, the Job, the subject and the edit, and the Job stamped reported --
+// and both findings on one report are two Events, not one.
+func TestTheMissingTopologySkewSubjectIsAnEventOnTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	ctx := context.Background()
+	jobName := provisionedInstall(t, ctx, cl, r, agent, `{"topics_state_subject":{"missing":1}}`)
+
+	reconcileTwice(t, ctx, r, req)
+	events := drainEvents(rec)
+	if len(events) != 1 {
+		t.Fatalf("got %d Events on the passes that saw the Job complete, want exactly 1: %q", len(events), events)
+	}
+	for _, want := range []string{
+		corev1.EventTypeWarning, reasonTopicsStateSubjectMissing, jobName, a2aTopologySkewSubject,
+		"nats stream info TOPICS-STATE",
+		`nats stream edit TOPICS-STATE --subjects="<current subjects>,` + a2aTopologySkewSubject + `"`,
+	} {
+		if !strings.Contains(events[0], want) {
+			t.Errorf("the Event does not carry %q:\n%s", want, events[0])
+		}
+	}
+	if strings.Contains(events[0], reasonTasksSubjectCapMissing) {
+		t.Errorf("the Event names the cap gap, which this report did not carry:\n%s", events[0])
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
+		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+}
+
+func TestBothProvisionFindingsAreTwoEvents(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	ctx := context.Background()
+	provisionedInstall(t, ctx, cl, r, agent, fmt.Sprintf(`{"tasks_subject_cap":{"live":0,"want":%d},"topics_state_subject":{"missing":1}}`, a2aTasksMaxMsgsPerSubject))
+
+	reconcileTwice(t, ctx, r, req)
+	events := drainEvents(rec)
+	if len(events) != 2 {
+		t.Fatalf("got %d Events for a report carrying both findings, want 2: %q", len(events), events)
+	}
+	joined := strings.Join(events, "\n")
+	for _, want := range []string{reasonTasksSubjectCapMissing, reasonTopicsStateSubjectMissing} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("no Event carries reason %q:\n%s", want, joined)
+		}
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
+		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+}
+
+// TestAMalformedTopicsStateFindingIsNotAReport: the marker is the whole
+// finding; anything else under the key is not a report the script writes,
+// and the Job is stamped unreadable rather than clean.
+func TestAMalformedTopicsStateFindingIsNotAReport(t *testing.T) {
+	for _, message := range []string{
+		`{"topics_state_subject":{}}`,
+		`{"topics_state_subject":{"missing":0}}`,
+		`{"topics_state_subject":{"missing":2}}`,
+	} {
+		if _, err := parseA2AProvisionReport(message); err == nil {
+			t.Errorf("parseA2AProvisionReport(%q) = nil error, want one", message)
+		}
+	}
+}
+
 // TestTheSubjectCapGapIsAnEventOnTheCROncePerJobRun is the mechanism end to
 // end through Reconcile: the finding on the pod becomes exactly one Warning
 // Event naming the reason, the live and rendered caps, the Job and the
@@ -490,8 +652,8 @@ func TestAnEmptyTerminationMessageIsNotClean(t *testing.T) {
 }
 
 // TestTheReportWaitsForThePodAndReportsOnce: the Job reads complete before
-// its pod is in the cache. That pass stamps nothing, so the next one, with
-// the pod there, still reports; and it reports exactly once.
+// its pod comes back from the read. That pass stamps nothing, so the next
+// one, with the pod there, still reports; and it reports exactly once.
 func TestTheReportWaitsForThePodAndReportsOnce(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
@@ -524,7 +686,7 @@ func TestTheReportWaitsForThePodAndReportsOnce(t *testing.T) {
 // of the reader's selector. A Job deleted by hand and re-created under the
 // same digested name shares the namespace with the previous Job's pods until
 // the garbage collector reaches them; one of those, succeeded and carrying a
-// gap report, is not this Job's run. With no pod of its own in the cache the
+// gap report, is not this Job's run. With no pod of its own returned the
 // Job takes the waiting path while its completion is fresh (no Event, no
 // stamp) and the vanished-pod path once it is older than the grace (no
 // Event, stamped unreadable); the other Job's report reaches the
@@ -547,7 +709,7 @@ func TestAPodOfAnotherJobUnderTheSameNameIsNotRead(t *testing.T) {
 		t.Fatalf("another Job's pod was read as this Job's run: %d Event(s): %q", len(events), events)
 	}
 	if got := reportedJob(t, ctx, cl, agent); got != "" {
-		t.Fatalf("Job stamp = %q on a fresh completion with none of its own pods in the cache; want no stamp, the pass waits", got)
+		t.Fatalf("Job stamp = %q on a fresh completion with none of its own pods returned; want no stamp, the pass waits", got)
 	}
 
 	ageTheProvisionJob(t, ctx, cl, agent, 2*a2aProvisionReportGrace)
@@ -578,7 +740,7 @@ func TestAReconcilerWithoutARecorderStillStampsTheJob(t *testing.T) {
 }
 
 // ageTheProvisionJob moves the provision Job's completion back by age, so a
-// pass reads it as an old completion rather than one the cache may still be
+// pass reads it as an old completion rather than one the read may still be
 // catching up with.
 func ageTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent, age time.Duration) {
 	t.Helper()
@@ -622,7 +784,7 @@ func a2aGateTestReconcilerCountingProvisionPodLists(t *testing.T, agent *agentv1
 // TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce: the Job completed
 // and its succeeded pod is no longer there to read (the pod garbage
 // collector after a node scale-down, a Succeeded-pod cleanup, a hand
-// delete). That is not "the cache has not caught up": the Job counted the
+// delete). That is not "the pod is not visible yet": the Job counted the
 // success and the completion is well past the grace. The run's report is
 // lost, and the pass says so once, stamping the Job unreadable, rather than
 // re-listing the pods and re-logging on every pass for the rest of the
@@ -663,11 +825,11 @@ func TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce(t *testing.T) {
 }
 
 // TestAFreshCompletionWithNoPodStillWaits is the other side of the grace:
-// the Job completed just now, its counted pod is not in the cache yet, and
+// the Job completed just now, its counted pod is not back from the read yet, and
 // the pass leaves it unstamped for the next one. TestTheReportWaitsForThe-
 // PodAndReportsOnce covers the report that then arrives; this pins that the
 // wait is decided by the completion's age and not by the count alone, so
-// the vanished-pod branch cannot swallow a report the cache was about to
+// the vanished-pod branch cannot swallow a report the next read was about to
 // deliver.
 func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
 	job := &batchv1.Job{}
@@ -681,7 +843,7 @@ func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
 	old := metav1.NewTime(now.Add(-a2aProvisionReportGrace))
 	job.Status.CompletionTime = &old
 	if !a2aProvisionPodVanished(job, now) {
-		t.Fatal("a completion a whole grace old still read as the cache catching up")
+		t.Fatal("a completion a whole grace old still read as the pod not being visible yet")
 	}
 	job.Status.CompletionTime = nil
 	if !a2aProvisionPodVanished(job, now) {

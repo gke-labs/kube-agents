@@ -38,14 +38,18 @@ state on the agent's PVC, as the pod's KSA (model auth via Workload Identity for
 things are taken out. The agent's own values for the names the bridge sets for itself, and
 the agent's bus identity: `AGENT_SHARED_STATE_SETUP`, `NATS_URL`, `NATS_USER`,
 `NATS_PASSWORD`, `BRIDGE_CONCURRENCY`, `BRIDGE_EXECUTOR`, `A2A_ACTIVITY_SECRET`,
-`API_SERVER_KEY` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
+`API_SERVER_KEY`, `BRIDGE_MEMORY_LIMIT_BYTES` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
 bridge never holds ([Bus user and grants](#bus-user-and-grants)). Ports and probes are not
 copied. On top go the bridge's own: `AGENT_SHARED_STATE_SETUP=skip`, so the image's
 entrypoint runs its container-local init and execs the bridge as it does for the dashboard
 container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
 `NATS_PASSWORD` from the `bridge-password` key of `<agent>-a2a-nats-creds`;
 `BRIDGE_CONCURRENCY`; and `A2A_ACTIVITY_SECRET` from the same Secret's `bridge-activity-key`,
-optional; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
+optional; `BRIDGE_MEMORY_LIMIT_BYTES`, the container's own `limits.memory` through the
+Downward API, which the bridge turns into its Go soft memory limit (nine tenths of it; a
+`GOMEMLIMIT` set on the bridge itself wins, and the agent container's is not inherited), so
+the limit it paces to is the one the cluster admitted, an Autopilot clamp to the request
+included; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
 executor needs ([Executors](#executors)). It is set rather than inherited because the agent
 container's entry can come from an AgentPlugin's env, and a blank or unresolvable one would
 quietly switch the bridge to `cli`.
@@ -103,9 +107,19 @@ mode and again when the bridge arrives after the Job. The agent Deployment's str
 agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
 `True` the bridge stays in the pod on later renders.
 
-**It has its own resources, sized for the `api` executor.** The rendered bridge requests 100m
-CPU and 256Mi, with limits of 1 CPU and 512Mi. The request is sized to live under on its
-own, since GKE Autopilot without Pod bursting sets every limit to its request. On `api`, the default, it's a Go relay that
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
+CPU and 512Mi, with limits of 1 CPU and 1Gi. This paragraph is the one statement of that
+sizing; the operator's `a2aRenderedBridgeDefaultResources` comment points here rather than
+restating it. The request is sized to live under on its own, since GKE Autopilot without Pod
+bursting sets every limit to its request. Measured, one answer at the 8 MiB response cap takes
+about 80Mi to read, decode and publish, and three at once about 113Mi, not three times 80Mi:
+the first answer carries the fixed cost and each further one adds about 17Mi. Extrapolated
+along that line, ten at-cap answers at once, the rendered default of ten workers
+(`a2aRenderedBridgeDefaultConcurrency`) all busy, come to about 230Mi, under the 512Mi request,
+where the 256Mi it used to request held three and little else. The limit gives the same ten
+room twice over where bursting is on. A bridge given a `BRIDGE_CONCURRENCY` well above ten
+needs `A2A_BRIDGE_RESOURCES` raised with it. The pair sits in the 1 to 6.5 GiB per vCPU band
+Autopilot admits unchanged. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
@@ -131,7 +145,9 @@ opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/262
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
-every chat turn ends saying a card's answer cannot be posted back). The operator reads `BRIDGE_CONCURRENCY`
+every chat turn ends saying a card's answer cannot be posted back). The one thing the operator adds is the
+bus CA: `NATS_CA_FILE` and the bundle mount at `/etc/a2a-nats-ca`, overriding any value of the entry's own,
+since the bus requires TLS and a bridge that cannot verify it never connects. The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
 `API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the `api` executor's
 pod-wide hook is rendered; it writes none of those.
@@ -145,6 +161,14 @@ discarded on every reconcile: the switch is the install's, not the sidecar autho
 sets it deliberately wins. Both are inputs to the capability check below rather than
 deployment preferences - see "What scope the check runs at" for why the render has to
 supply `POD_NAMESPACE` at all, and for what a default install did before it did.
+
+**One more on a declared bridge.** `BRIDGE_DURABLE_PRECREATED=true` goes onto a sidecar
+recognised as the bridge, as the override. The provision Job creates the bridge's intake
+durable on `TASKS`, and the `bridge` principal is refused creating, updating or deleting
+it, so a bridge has to bind it rather than create it. A bridge on an image older than the
+operator ignores the flag, tries to create the durable, and is refused. That holds for the
+rendered bridge too, whose image follows the agent's tag, and for a gateway image pinned
+older than the operator: roll the agent, bridge and gateway images with the operator.
 
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
@@ -171,7 +195,9 @@ bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any fl
 for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
 follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
 that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped.
+a CR with none, the lane's own, is only flipped. Asked to end under `today`
+(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
+changing anything, since the last flip would leave them unset.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -211,8 +237,18 @@ do.
 The bridge connects as the static `bridge` user, whose grants are written for this
 program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
 `a2a.tasks.platform.*.events`, `$KV.runtime-state.>` both ways for the in-flight
-registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
+registry below, `_INBOX.bridge.>`, and the board route's two subjects below. Nothing wider - a bridge that can publish
 submissions is a bridge that can impersonate the gateway.
+
+The board route is the Slack Home tab's read of this pod: the bridge subscribes `chat.board`
+and answers each request with session-kv's `GET /v1/board`, published on the request's reply
+subject under `chat.board.reply.gateway.`, the one namespace it may publish there; a request
+replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
+key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and the route reads nothing else
+([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
+A request with a body is a board-health row's Retry or Drop instead (`lib.BoardAction`): the
+bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
+so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
@@ -308,7 +344,9 @@ name — is refused at admission, and stripped from the render on an install run
 A2A surface, because a volume hands a second container far more than the `bridge`
 principal's one password. `<agent>-a2a-nats-creds` and the `nats.conf` in
 `<agent>-a2a-nats-config` both carry `sys-password`, which is the `$SYS` account, and
-`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The
+`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The same
+refusal covers the other three Secrets the bus renders with a key in them:
+`<agent>-a2a-nats-tls`, `<agent>-a2a-nats-ca` and `<agent>-a2a-task-signing-key`. The
 agent's own credential is in none of them: under the callout the `agent` principal has
 no shared secret at all, and the `a2a-bus` audience projection is the only route to it
 as a credential. The seed is a way to mint one, which is the other reason that Secret is
@@ -320,9 +358,10 @@ lands in an unhelpful place. The retired `worker` user's subscribe grant was
 another addressee just worked. `bridge`'s grants name `platform` literally
 (`a2aBridgeAddressee`, which is also `defaultProfile` in the bridge's own `main.go`: one
 value living in two modules that cannot import each other). Override the env now and the
-intake half still works — the consumer is created and pulled over `$JS.API`, where the
-filter subject rides in the request body and no subject grant sees it — so the other
-addressee's task is delivered. It stops there. `accept` publishes `submitted` on
+bridge never starts consuming: the provision Job makes only `bridge-platform`, and a bridge
+binding its intake (`BRIDGE_DURABLE_PRECREATED`, which the operator sets) waits for
+`bridge-<other>`, which nothing creates. A bridge without that flag would create its own and
+have the other addressee's task delivered, and it stops there. `accept` publishes `submitted` on
 `a2a.tasks.<other>.*.events` before it puts anything on the worker queue, and that subject
 is not in the publish list, so the publish is refused, the submission is dropped, and
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
@@ -377,20 +416,46 @@ no key is refused at start.
 A kanban card the persona creates completes after the turn has answered, and the API server
 has no channel to push that completion back. So before a task's first turn the bridge records the
 conversation its session answers (the platform, the gateway's conversation key from the task's
-`authority.audience.conversation`, the `contextId`, and the kind of the prompt's ask, which the
-cards' posts keep marked while they run) in the pod's session-kv, with
+`authority.audience.conversation`, the `contextId`, the kind of the prompt's ask, which the
+cards' posts keep marked while they run, and `user_id` from `authority.requester.principal` plus
+`chat_type` from `authority.audience.kind` so the memory provider can isolate personal memory per
+user and disable personal memory in group conversations) in the pod's session-kv, with
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat or Slack conversation is posted back. A
-conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
+be posted back. A Google Chat, Slack or console conversation is posted back. A console
+conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
+entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
+
+Before the same first turn the bridge also reads the store the other way: a reply typed under a
+report the system pushed (a relayed scheduled report, the triage card's report the notifier posts
+under an alert, a card's report it posted into a Slack or Google Chat conversation) arrives with
+no link to that report, and under `next`
+nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
+the `api` executor. So the bridge asks session-kv for the row the poster stored
+(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
+recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
+names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
+`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
+the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
+gateway conversation (a console
+conversation's row carries the filing turn's task in its key, which a later reply does not know,
+so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
+since every later message there shares it and would carry the first stored report for the row's
+life). A row found is spliced ahead of
+the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
+the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
+the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
+prompt as typed; a steer queued during the task is not looked up, since its session has read the
+report, and a later message on the conversation is a new task and is.
 
 Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
 What the `api` executor does not do. A turn the bridge stops waiting
-for, on cancel or the deadline, may keep running in the server, and the next task on the same
+for at the deadline may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
+A cancelled turn is stopped in the server too (the turn stop, below).
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
@@ -417,11 +482,40 @@ message: `reason: hermes-exited-nonzero - exit status N; session: <id>; stdout t
 tail: …`. Both tails are bounded (2 KiB each),
 and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
 is the last thing the CLI writes before exiting), so the transcript under the profile's session
-store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
-gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
+store can be found from the terminal alone. The bridge keeps at most 8 MiB of the child's stdout
+(`cliStdoutCap` in `bridge.go`, the `api` executor's read cap) and counts the rest, so a child
+that prints without end cannot grow the bridge's heap with it; a clean exit whose stdout went
+past the cap ends `failed` with `reason: hermes-cli-oversize`, the limit named, refused rather
+than published cut; a non-zero exit past it keeps the terminal above, whose stdout tail is read
+from its own writer and so is the stream's end, with the bytes the cap dropped noted. Exit
+75 is Hermes's `EX_TEMPFAIL` for a turn that gave up on the provider's rate limit or billing; it
+is named `reason: hermes-rate-limited` instead,
 which the eval harness classes as infrastructure rather than the persona's failure (the image patch
 `apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
-already did). A
+already did). An answer whose first non-empty line (any case, surrounding whitespace ignored) is
+exactly `thought` or starts with `thought:` is the model's own reasoning written as content
+(#3206), and it is not published: on either executor, and on any turn of a steered task, the task
+ends `failed` with `reason: hermes-unstructured-reasoning - the agent's reply was withheld because
+it contained unstructured model reasoning instead of an answer; anything the agent did during the
+turn has already happened, so check that before asking again[; session: <id>][; turn: N]`, and the
+bridge logs a warning with the task, session and answer size, never the text. That holds when a
+cancel raced the end of the turn too: a withheld answer ends `failed`, not `completed`. The rule is
+`opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
+`apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
+model on later calls. On the API executor one more guard follows the answer: a reply that names a card
+or task id (`t_` and eight hex characters) when the turn's prompt, the user's words, names no task,
+card, board or kanban is asked for again, once, with a fixed user message in the same session under
+the turn's Idempotency-Key plus `/restate-card-id`, and the restated reply is the turn's answer; a
+restated reply that still names an id is delivered as it is, with a `card-id-restated` warning in
+the log. The chat UX rule keeps ids out of user text outside a board read, the Planning Agent's SOUL
+says so, and in a thread whose earlier replies carry an id the model copied them all the same
+(`card_id_leak.go`). The CLI executor has no such step. Output that never passes the bridge is not guarded: a kanban card's result
+posted by the notifier, a `today`-mode reply from Hermes's own gateway platforms, and cron
+deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
+fleet-audit job the image ships is already immune, because the relay posts the record the run's
+`finish` wrote, not its final message; a fleet-audit job created at runtime still posts its final
+message (`docs/designs/cron-report-relay.md`). For the rest the history patch only lowers the
+rate. A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
@@ -457,9 +551,10 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
-capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
-holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+then the one terminal. At each turn boundary the bridge checks each distinct capability among the
+queued follow-ups once, not once per follow-up, so a verifier it cannot reach holds the previous
+turn's answer back for one reach window per capability (`DefaultReachWindow` in
+`a2a/capability/service.go`): the check keeps asking for that long before it refuses. A turn's answer the bridge holds between
 turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
 the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
 `turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
@@ -556,24 +651,212 @@ had, where a read failure that dropped the task would leave it open with no term
 Under the `api` executor `working` is published when the task's turn starts, and cancel,
 shutdown and the deadline end the HTTP request, the read of the response body included, where
 the `cli` executor kills a process group, with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
-the request ends the bridge's wait; whether the server abandons the turn it was running is the
-server's. Turns on one session run one at a time; a task still waiting for the previous turn
+the request ends the bridge's wait, and the server interrupts the turn only for a streaming
+client, which the bridge is not. So after a cancel ends a turn's request, and its `canceled`
+terminal is out, the bridge asks the server to stop the turn running in the session (the turn
+stop): `POST /v1/kube-agents/sessions/{id}/stop` on the API server, with its key, a route
+the image's `api_session_stop` patch adds (`deploy/docker/patches/api_session_stop.py`). The
+route gives every turn running in that session upstream's hard interrupt and process reap, the
+pair `/v1/runs/{run_id}/stop` uses, interrupts a turn whose agent did not exist yet as soon as it
+does, and answers once they have ended or after 10 s; the bridge waits up to 15 s and holds the
+session's turn meanwhile. A stopped turn's `kanban_create` is refused. A server without the
+route answers 404, logged, and the turn runs on. A shutdown and the deadline send no stop.
+Turns on one session run one at a time; a task still waiting for the previous turn
 when its deadline passes ends `reason: session-busy - waited <d> for the session's previous
 turn; no request was sent`, and one cancelled while waiting ends `canceled-before-start`. The
 failures name themselves in the status message:
 
-| Reason                   | When                                                                                                                              | Eval harness class |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `hermes-rate-limited`    | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing         | infrastructure     |
-| `hermes-api-unreachable` | no response: still refused after the two-minute retry, the task's deadline passed before any connection, or the connection failed | infrastructure     |
-| `hermes-api-refused`     | any other 4xx answer: the server refused the request before running a turn                                                        | infrastructure     |
-| `session-busy`           | the deadline passed while the task waited for the session's previous turn; no request was sent                                    | infrastructure     |
-| `hermes-api-failed`      | a 5xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail       | persona            |
-| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                               | persona            |
-| `hermes-api-read-failed` | the response body broke off mid-read                                                                                              | persona            |
-| `hermes-api-oversize`    | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named            | persona            |
-| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                 | graded (unlisted)  |
-| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                  | graded (unlisted)  |
+| Reason                          | When                                                                                                                                 | Eval harness class |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------ |
+| `hermes-rate-limited`           | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing            | infrastructure     |
+| `hermes-api-unreachable`        | no response: still refused after the two-minute retry, the task's deadline passed before any connection, or the connection failed    | infrastructure     |
+| `hermes-api-refused`            | any other 4xx answer: the server refused the request before running a turn                                                           | infrastructure     |
+| `session-busy`                  | the deadline passed while the task waited for the session's previous turn; no request was sent                                       | infrastructure     |
+| `hermes-api-failed`             | a 5xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail          | persona            |
+| `hermes-api-unreadable`         | a 2xx answer that is not a chat completion with at least one choice                                                                  | persona            |
+| `hermes-api-read-failed`        | the response body broke off mid-read                                                                                                 | persona            |
+| `hermes-api-oversize`           | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named               | persona            |
+| `hermes-cli-oversize`           | a `cli` child exited 0 with over 8 MiB on stdout (`cliStdoutCap`, `bridge.go`); refused rather than truncated, with the limit named  | persona            |
+| `hermes-unstructured-reasoning` | the answer opens with a `thought` or `thought:` line, the model's reasoning written as content (#3206); withheld, on either executor | persona            |
+| `request-encode-failed`         | the bridge could not encode the request; a bridge fault, not expected in practice                                                    | graded (unlisted)  |
+| `request-build-failed`          | the bridge could not build the request; the URL is checked at start, so likewise                                                     | graded (unlisted)  |
+| `card-stop-unavailable`         | a card-stop control got no usable answer from session-kv ("Stopping a conversation's cards" below)                                   | not an eval task   |
+| `card-stop-unsupported`         | a card-stop control reached the `cli` executor, which has no conversation session                                                    | not an eval task   |
+
+## What of an answer reaches TASKS
+
+The answer stays on `TASKS`, because the gateway delivers it from there, so the copy a person is
+shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
+published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
+chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
+answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
+a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
+scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
+(`failureScrubWindowBytes`), scrubs that, then keeps 2 KiB, so a private key whose header is
+further from the end than the tail, or a value the cut would split, is still redacted. The rest of
+a status message is the bridge's own text. There are two passes:
+
+1. **Seen values.** The bridge keeps a per-task set of secret values from the task's tool results,
+   and exact-matches them out of the answer in both plain and base64 form. This catches a secret
+   with no shape of its own, such as a value decoded from a Secret and repeated in the answer or
+   in a card's report. The set has two pools:
+   - **Secret data.** Every `data` value (the base64 as given, and the decoded value when it is
+     text) and every `stringData` value of an object whose kind is `Secret`. It reads JSON at any
+     depth, including JSON text inside a result's strings (a terminal result is JSON whose output
+     is kubectl's JSON), and YAML documents and list items, each item for its own lines (a
+     `kubectl get secrets -o yaml` List), a comment on the kind line allowed. An item of a
+     `SecretList`'s `items` is a Secret: the API server's list (`kubectl get --raw`, a curl through
+     the API proxy) leaves kind off its items. A quoted YAML `stringData` value is tracked both as
+     written and with its escapes read. JSON cut short is
+     scanned object by object: a data block is read for its own object's kind, whatever other
+     kinds the text holds. kubectl prints a block before its object's kind, so an item cut inside
+     its data counts as a Secret only when every item of its list before it was one, and a single
+     Secret cut there is not read. YAML cut before a scope's kind line is not read either. The
+     connection settings `username`, `user`, `host`, `port` and `database` are skipped, and so
+     is a service account token Secret's `namespace`.
+   - **Shape-caught values.** A value a shape rule catches in a result's text, but only where the
+     key, flag or prose noun in front of it names a credential outright (password, passwd,
+     passphrase, token, api key, secret as a key's last component, with a digit or a value
+     qualifier allowed), or where the rule's own shape is a credential's (a token prefix, a URL's
+     password, a password flag, an `Authorization` header pair). JSON text is read both as a
+     structure and as text, so a pair that spans fields or list items (an env entry's name and
+     value, a flag and its value in `args`, a header list) is caught from `-o json` as from
+     `-o yaml`. A string under a JSON key that names a credential outright counts too, as
+     decoded, and also with its quotes and trailing punctuation taken off when that changes it,
+     unless the whole string is a state word (`disabled`, `required`) or an upper-case environment
+     variable reference (`${DB_PASSWORD}`). The bare word secret, a plural (`Mountable secrets`)
+     and a key naming a Secret object (`existingSecret`, `imagePullSecret`) do not, so a Secret's
+     name is never tracked. Neither is a value with a space in it (`14 bytes` in
+     `kubectl describe secret`, a phrase after a label), nor what the auth-scheme, password-file
+     and YAML-block rules catch, so an image digest is not.
+
+   A value under 8 bytes is not tracked. Each pool has a fixed reserve: Secret data 384 entries
+   and 768 KiB, shape-caught values 128 entries and 256 KiB. Each tool result has an allowance in
+   each pool (Secret 128 entries and 256 KiB, shape-caught 64 entries and 96 KiB, charged with
+   what it actually added) and may evict only its own earlier entries, never an earlier
+   result's. Past its allowance a new value replaces that result's own oldest entry. When a pool
+   is full of earlier results' entries the value is refused, and at finalize the bridge logs how
+   many it refused, at debug and as a number only (`seen-set refused N values`). So a task whose
+   results hold more secret values than the pools keep tracks the earliest ones; the rest are
+   caught only by their shape. The set is cleared and closed when the task finalizes, after the
+   result and the terminal are published, so a delivery still on its way past the door adds
+   nothing. None of it is logged or published.
+
+2. **Shape rules.** `scrubInlineSecrets` runs over the answer (the classes are listed under
+   "Activity" below).
+
+The bridge sees a tool's result only through the activity door. Hermes's `post_tool_call`
+delivery carries the tool's whole result (`extra.result`). Under `cli` that comes from the
+bridge's own child. Under `api` it comes from the pod-wide hook, so from the coordinator session
+and from the worker sessions of the cards the task filed or tracks. A worker that runs while the
+coordinator's turn is still going, before the task waits on its cards, matches no task's trace,
+but its result still reaches that task's set (`cardWorkerRun`). Secret data reaches a result when
+a tool prints the object: `kubectl get secret -o json` or `-o yaml` in the shell sandbox, where
+kubectl talks to the k8s API proxy itself, or a file or MCP result holding the same manifest.
+
+What the set does not cover:
+
+- A value printed bare, such as a jsonpath read piped through a base64 decode, has no structure
+  to read, so only the shape rules see it, and only by its shape or the label the answer puts in
+  front of it.
+- An exact match misses a transformed copy of a tracked value: JSON-escaped (a value holding a
+  quote or a backslash, shown in a JSON block), HTML- or percent-encoded, base64 wrapped across
+  lines, or split across lines.
+- The door reads a delivery before its publish lock, so a delivery that arrives after the answer
+  was published scrubs nothing. Hermes sends the hook from a background queue, which normally
+  drains well before the model's next answer, but nothing orders the two.
+- The set is per task. A later task in the same conversation that repeats a value read in an
+  earlier one is caught only by the shape rules.
+
+A card that settles after its turn has ended reaches the conversation as the agent's own
+`chat.notify` post: the kanban notifier posts it with `a2a notify` through the gateway. The bridge
+does not publish it, so this scrub does not cover it. When the same report is also folded into a
+later turn's answer (the #4975 double delivery), the folded copy is scrubbed and the posted copy
+is not.
+
+## Stopping a conversation's cards
+
+`stop` in a chat conversation cancels the front door's turn, and by then that turn has usually
+answered. What still runs is the kanban cards it filed, which the gateway can neither see nor
+reach (#3263). So the gateway can send the bridge a control task: a new submission whose
+message is one data part, `{"cardStop":{"v":1}}`, and no text (`lib.CardStopPart`,
+`lib.CardStopRequested`). The gateway is the only publisher on `a2a.tasks.*.*.in`, and it builds
+its other payloads from text alone, so no one can type a control. The same part on a follow-up
+is not a control: it has no text, so it is refused `no-text`.
+
+The bridge runs a control on a goroutine of its own, not on a worker, so it never waits behind
+long turns. It is still a task: the capability check, then `submitted`, `working` and one
+terminal. No Hermes turn runs. Instead the bridge:
+
+1. publishes `working`, then waits up to 20 s for the conversation's session turn
+   (`apiSessionID` of the `contextId`, so `a2a-<contextId>` or the hashed `a2a-h-…`). That is
+   the one exception to the rule that an `api` task waiting for its session stays `submitted`:
+   the stop has started, and the person who typed it sees it acknowledged while the turn they
+   stopped winds down. The wait lets the bridge's own request for the turn the gateway just
+   cancelled end first, and holds off the next bridge turn in the session while the cards are
+   archived. The cancelled task holds the session's turn until its turn stop has answered, so
+   the control looks for cards only once the Hermes turn has ended, and archives one it filed
+   before the interrupt reached it. A turn that outlasts the stop's wait still can't file one,
+   since its `kanban_create` is refused. A server without the stop route, or a turn the server
+   had not yet recorded when the stop arrived, can still file a card later; session-kv's
+   re-scan catches it only if it lands within the call. Only bridge turns: a
+   wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
+   stop doesn't wait. The wait is not first come, first served: a message sent right after
+   `stop` can take the session first, and a turn that keeps it past 20 s ends the control
+   `card-stop-unavailable`.
+2. sends `POST /v1/sessions/{id}/cards/stop` to session-kv, on the same `BRIDGE_ROUTE_URL` and
+   `SESSION_KV_API_KEY` bearer as the route PUT, with `{"context_id", "conversation"}`. The
+   conversation is the gateway's key from `authority.audience.conversation` on a Google Chat or
+   Slack conversation, and `""` otherwise. session-kv archives the cards in the agent container
+   (`agents/platform/scripts/session_kv_server.py`), because only there can Hermes kill a card's
+   worker; this sidecar shares the hostname but not the pid namespace.
+3. ends the task `completed`. The `result` artifact holds a short text and the cardStop result
+   part:
+   `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool,"notStopped":[{"id","title"}]}}`.
+   `notStopped` names the cards the three counts count, session-kv's failed, then pending, then
+   unresolved ones, and is left out when every card stopped.
+   The text counts what session-kv answered, and says plainly what the stop could not promise:
+   `unresolved` cards were stopped just after a worker was claimed for them, so a worker may
+   still start; `pending` archives were still running when session-kv ran out of time;
+   `failed` cards could not be archived; `truncated` means the conversation had more open
+   cards than one stop takes. Each list is cut at 200 cards, which sets `listsCut` (the cards
+   themselves are as the counts say), and each title at 200 runes, its "…" included. If the bus
+   refuses the result with the part, it goes out as the text alone, so the gateway must expect
+   a completed control with no cardStop part.
+
+The time budget, from the control's submission to its terminal, is about 60 s at worst: the
+capability check's 5 s, the 20 s turn wait, and the POST, bounded by
+`BRIDGE_CARD_STOP_TIMEOUT_SECONDS` (default 35). session-kv answers inside its own worst case,
+`CARD_STOP_WORST_CASE_S` (24 s), and the gateway waits 75 s for the control. Raise them
+together.
+
+A stop that gets no usable answer ends `failed` with `reason: card-stop-unavailable - <detail>`.
+That covers no `BRIDGE_ROUTE_URL` or key, a session turn that did not end inside the wait, a
+non-200 answer, a timeout, an answer over 1 MiB and an unreadable one. The `cli` executor runs no
+conversation session and ends a control `card-stop-unsupported`. A cancel that reaches a control
+still at its capability check ends it `canceled-before-start`. One during the turn wait or the
+POST ends it `canceled-by-request`. After the POST went out that ends only the bridge's wait:
+session-kv's route is a synchronous handler and carries on, so the cards may be archived
+all the same. A follow-up to a control is refused `task-ending`. A bridge older than the
+control rejects it `no-text-parts`. The gateway reads each of these as "the cards could not be
+stopped".
+
+**A cancel during the in-turn card wait** (a console or A2A door turn holding for the cards it
+filed) stops the session's cards the same way, with the same POST, and holds the canceled
+terminal until session-kv answers. A2A terminals are final, so the answer has to ride the
+terminal: its `result` reads `canceled; ` followed by the control's text, with the same
+cardStop part, or `canceled; the card stop was not confirmed (<why>)` when session-kv refused,
+timed out (`BRIDGE_CARD_STOP_TIMEOUT_SECONDS`) or the bridge is shutting down, which ends the
+hold at once. A2A door `tasks/cancel` returns before the terminal, so the hold delays only when
+`tasks/get` shows `canceled`. One POST goes out per canceled run that filed cards, whichever path
+asks first. A cancel outside the wait still stops the cards in the background.
+
+session-kv's stop is single-flight per session and conversation. A stop that arrives while
+another runs, or within 60 s of one, answers with that stop's result, marked `joined`, only when
+that result is complete (nothing failed, pending, unresolved, past the deadline or truncated) and
+no card in the conversation is open now: a complete stop left none open, so an open card was filed
+since. Anything else gets a fresh stop. So the control and a typed stop's cancel, which both run when
+the gateway's card stop is armed, report the same cards rather than one of them "stopped 0".
 
 ## Sizing against the eval harness
 
@@ -585,7 +868,7 @@ count: a task past it is accepted and `submitted` and then queued with no subpro
 worker frees, and the harness classifies a repetition that reaches its budget still
 `submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
 answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
-default 4, the nightly at 8, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
+default 4, the next-mode nightlies at 6, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
 that value; at the defaults two of every four concurrent units wait for as long as the two ahead
 of them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
 and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
@@ -600,12 +883,12 @@ read, the render in [Where it runs](#where-it-runs), the two env names it writes
 sidecar and the `api` executor's hook entry are the operator code the bridge has, and they
 retire with the bridge.
 
-## Activity: the persona's tool calls, and a heartbeat
+## Activity: the persona's tool calls, its plan steps, and a heartbeat
 
 Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
 bridge holds says nothing about tool calls while the run is on. What hermes does offer is
 its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs every
-`pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
+`pre_tool_call`, `post_tool_call` and `post_api_request` to a URL, fire-and-forget through a bounded queue,
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
 `127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
@@ -659,39 +942,55 @@ task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the
 read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
 costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. What of the input is published is its **shape**: its
-structure with every string value replaced by `<string, N chars>` and every key that is not
-shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
-`<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
-wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
-name, a wrapper's nested names). No grammar tells a resource name from a credential under the
-same key, so none is attempted, no string value rides the trace under any key, and there is no
-value scrub to have a reach: a credential a model pastes into a terminal command is one string
-under `command` and ships as a length. Values under keys with `token`, `secret`, `password`,
+nothing of it follows the final event. What of the input is published is the same under both executors:
+
+- **Shape mode (`cli` and `api`):** `input` is capped at 2 KiB (`activityInputCap`) and published as its **shape**: its
+  structure with every string value replaced by `<string, N chars>` and every key that is not
+  shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
+  `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
+  wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
+  name, a wrapper's nested names). No string value rides the trace under any key, under either executor, and no tool results are included (the one exception is `BRIDGE_DEBUG_ERROR_TEXT`'s scrubbed error line, a maintainer's debugging switch, below).
+- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `scrubInlineSecrets` and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `scrubInlineSecrets` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, a code-spanned value bounded by its backticks, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
+
+In both modes, values under keys with `token`, `secret`, `password`,
 `passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
 `signing_key`, `key_data`, `cookie` or `credential` as a whole component (`access_token`,
 `SECRET_KEY`, `accessToken`, `clientSecret`, `SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`,
 `client-key-data`, `Cookie`; not `tokenizer`, and not a key that opens with the word and goes on
-as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` before
-the shaping, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
+as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` first, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
 large file write is a few MiB); a larger one is refused and logged, and since the cut body cannot
 be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
 over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
 small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
-terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. `input` is capped (2 KiB): over the cap it becomes
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent, and its
+plan step without it. An over-size `post_api_request` (it carries the model's response) loses that
+request's boundary and its synthesis step, uncounted. Over the input cap (`2 KiB` on `cli`, `4 KiB` on `api`), `input` becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
-readable. Tool results are not published: no check
-reads them and they are the riskiest payload in the pod. One task publishes at most 3000
-trace and progress parts together: the task's events subject is capped at 4096 messages, and
+readable. One task publishes at most 3000
+trace, step, and progress parts together: the task's events subject is capped at 4096 messages, and
 a looping persona publishing without bound would evict its own `submitted` and `working`. The
-two have shares of their own: the heartbeat 120 (one a minute for the default two-hour
-deadline), the trace the rest, so the heartbeat keeps going on exactly the run that spends the
+heartbeat reserves 120 parts (one a minute for the default two-hour
+deadline), and trace/step parts share the remaining 2880, so the heartbeat keeps going on exactly the run that spends the
 trace's share, and an interval short enough to spend the heartbeat's share silences the
 heartbeat and never the trace. Past the trace's share, calls are counted and one entry, `tool` `activity-budget` with `status`
 `truncated` and `dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
+
+The turn's steps go on a `steps` artifact as `kube-agents.step/v1` records
+([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)):
+
+- **Under `cli`:** a `plan` step is made from the trace itself (`activity_steps.go`): each
+  `pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
+  same id its activity entry carries, so a renderer places each entry under its step.
+  Consecutive calls of one tool within one model request share a step; a call of another tool, the
+  next model request, or the task's finalize closes it and publishes it. `post_api_request` marks where one request ends and the next begins and emits the `synthesis` step (`Writing the answer`) when a request stops after work.
+- **Under `api`:** `post_api_request` (`activity_thinking.go`) builds descriptive `plan` steps from the planned tool calls (`expandPlannedToolCall` / `describePlannedTool`, grouping batch `kanban_create` calls into `Dispatching N specialist tasks on the Kanban board.`), reads the model's reasoning only for the step boundary it marks (a request that reasoned without planning a call or stopping is a `plan` step titled `Reasoning about the next step.`; none of the reasoning's text is published, on a step's `thought` or anywhere else), and emits a `synthesis` step (`Synthesizing findings into final response.` when planned titles or reasoning were seen, else `Writing the answer`) when the model stops after prior work. A `subtask` record names the card (its id, title, status and verdict) and carries none of its report, which the card's worker wrote and could repeat a value it read; the bridge's synthesis reads the report from `kanban.db`. A findings preview returns with a live channel that persists nothing (#4975). On console, MCP and A2A door origins only (`waitsForCardsInTurn`; a chat turn, whether or not its route was recorded, and the eval inject lane end at the acknowledgement, #5170, #5180), a turn that files Kanban cards holds the task open after the coordinator turn (`waitForKanbanCards`) and polls SQLite `kanban.db` (`resolveKanbanDBPath()` / `querySessionKanbanCards`, `kanban.go`) for the cards the task filed or tracks; an older card left unsettled on the same session is not waited on. As cards run and settle, it maps worker sessions (`SyncKanbanCard`, `/kanban/workspaces/<cardId>`) so worker tool call activity entries carry `worker` `card:<id> (<title>)` (or `card:<id>`), publishes `subtask` steps (`stepmsg.KindSubtask`, titled `Specialist check <end>: <shortTitle>.`, the end being `completed`, `blocked`, `failed` or `canceled`) and `progress` updates (`N/M settled`), and when multiple cards settle runs a synthesis turn (`Idempotency-Key: <taskId>/synth-<turn>`, step `Synthesizing findings across N specialist card(s).`, published only when that turn runs) to fold the card reports into the final `result` artifact. With one card, or when the synthesis turn fails, the card stands in the answer as itself: a completed card's report, a blocked card's question, and for any other end a line naming the card and its status (its error text only with `BRIDGE_DEBUG_ERROR_TEXT` on, its first line scrubbed and capped as on an activity entry). The turn's answer stays held while its cards run: if the task's deadline or a bridge shutdown ends the wait (the synthesis turn included, which ends on a shutdown and falls back to the cards' joined reports), the task completes with that answer rather than failing. A cancel while the turn's cards run stops the Hermes turn and asks session-kv to archive the session's open cards (`finalizeWaitCanceled`), whether or not the gateway's card-stop control (`A2A_CARD_STOP`) is on. The canceled terminal waits for that answer (bounded by `CardStopTimeout`, and ended at once on shutdown) and carries it: `canceled; stopped N cards…` and the `cardStop` part, or why there is no answer. The bridge also logs the answer (the cards stopped, plus any it could not stop, any still archiving at the deadline, or any stopped mid-claim that a worker may still start for). A failed read of `kanban.db` that persists for 30 polls ends the wait the same way. A card that settles after its turn has ended is not published to `TASKS` as a task of its own. Its report reaches the conversation as the agent's own `chat.notify` post. If it settles while a later turn on the same session is waiting on its own cards, that turn also folds it into its answer, so the report can arrive twice: a known limit, tracked under #4975.
+
+A step the record refuses to encode is skipped, with one log line per task. One task publishes at most
+256 steps, counted against the trace's share as well, and past either they are dropped uncounted
+(the `activity-budget` marker counts calls). The relay ignores `steps`, as it ignores `activity`.
 
 Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
 "Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
@@ -722,7 +1021,7 @@ that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The d
 when `BRIDGE_ACTIVITY_LISTEN` is unset or names the hook's port on `127.0.0.1` or a wildcard
 host. With several bridge sidecars, every one must qualify; a value the operator cannot read
 (`BRIDGE_EXECUTOR` or `BRIDGE_ACTIVITY_LISTEN` through `valueFrom`) disqualifies. Then
-`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
+`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call`, `post_tool_call` and `post_api_request` to
 `http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the
 `bridge-activity-key` entry of the a2a creds Secret. The operator puts it in the agent
 container's env; the sidecar needs it in its own. A `cli` bridge, including one that fell back
@@ -731,10 +1030,12 @@ cannot see, one that leaves `BRIDGE_CONCURRENCY` unset or takes it through `envF
 bridge with the door open and no key logs a warning at start, and so does one whose door is not
 where the hook posts; either reports `tool trace off`. Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
-it counts for the task whose session id matches and which holds that session's turn at the
-moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which
-carry their own session ids, never reach an A2A trace. Kanban work the turn delegates is
-therefore absent from the trace; only the gateway profile's own calls appear. The `cli`
+it counts for the task whose session id matches and which holds that session's turn (`inTurn`) or
+its Kanban card wait (`waitingCard`) at the moment — or, while a task is in `waitingCard`, a
+non-`a2a-` worker delivery matched by `matchWorkerDeliveryRun` through a claimed worker session id
+or a known `cardId` in the workspace path or `kanban_*` tool arguments — and is dropped otherwise,
+so another chat conversation's or an unrelated worker's tool calls, which
+carry their own session ids, never reach the task's trace. The `cli`
 executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
 managed config it is given, so a delivery is never signed twice. The managed scope merges per
 leaf and a list is one leaf, so the rendered `hooks.outbound` replaces any list a profile sets
@@ -793,11 +1094,12 @@ invalidates the expectation and the server still refuses the loser.
 The sweep assumes incarnations are serial. That assumption is real on this install -
 the kubelet restarts the sidecar container in place, and the operator renders the agent
 Deployment with strategy `Recreate`, so two bridges never run at once. It is an
-assumption, not a mechanism, and it has a named boundary: `Recreate` is the render's
-default only while replicas is 1 - `spec.deployment.availability.replicas` above 1
-switches the strategy to RollingUpdate (`resolveDeploymentReplicasAndStrategy`,
-`manifest_helpers.go`), and an overlapping incarnation could then sweep-fail a task
-its predecessor is still running. Real executor fencing belongs to the stage-3
+assumption, not a mechanism, and it has a named boundary: the operator renders
+`Recreate` because it runs the gateway as one replica, capping
+`spec.deployment.availability.replicas` at `supportedGatewayReplicas`
+(`resolveDeploymentReplicasAndStrategy`, `manifest_helpers.go`). Lifting that cap
+brings back the RollingUpdate strategy above one replica, and an overlapping
+incarnation could then sweep-fail a task its predecessor is still running. Real executor fencing belongs to the stage-3
 dispatcher, not to scaffolding with a demolition date.
 
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe

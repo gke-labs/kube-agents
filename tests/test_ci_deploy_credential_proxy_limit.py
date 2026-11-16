@@ -1,15 +1,18 @@
-"""The smoke pipeline's Helm release gives the eval install a credential-proxy memory limit its fan-out fits.
+"""The smoke pipeline's Helm release pins the eval install's credential-proxy memory limit at a figure its fan-out fits.
 
 The broker admits a request only while its child memory reservation fits the budget
 it derives from the container's limit (`agents/platform/scripts/credential_proxy.py`,
-`docs/designs/credential-proxy-child-memory-budget.md`). At the operator's 1Gi default
-that is four requests at once, and the eval runs `EVAL_TASK_PARALLELISM` lanes of Platform
-Agents, each fanning Cluster Agents out over the seeded fleet, so the queue behind those four slots
-reached p50 waits of 8 to 22 s and a longest wait of 56.7 s against the broker's 60 s
-refusal; Cluster Agents' commands timed out and the judge graded the answers as
-regressions on pull requests that did not touch the path (#2632). The limit is the
-budget's one knob, and `spec.deployment.credentialProxy.resources` is how a CR moves
-it, so `hack/ci-deploy.sh` raises it on the eval install and nowhere else.
+`docs/designs/credential-proxy-child-memory-budget.md`). At the 1Gi limit the operator
+once defaulted to, that was four requests at once, and the eval runs `EVAL_TASK_PARALLELISM`
+lanes of Platform Agents, each fanning Cluster Agents out over the seeded fleet, so the queue
+behind those four slots reached p50 waits of 8 to 22 s and a longest wait of 56.7 s against
+the broker's 60 s refusal; Cluster Agents' commands timed out and the judge graded the
+answers as regressions on pull requests that did not touch the path (#2632). The operator's
+default limit, and its default memory request on GKE Autopilot, are now 2Gi, the figure the
+eval sets, so the override is a pin: it keeps the eval install at the budget its cases were
+measured at if the default moves. The limit is the budget's one knob, and
+`spec.deployment.credentialProxy.resources` is how a CR moves it, so `hack/ci-deploy.sh`
+sets it on the eval install and nowhere else.
 
 The value rides two hops this repository can see from Python: the `--set-string` in
 `ci-deploy.sh` (a string, because the CRD's quantity is int-or-string and the chart
@@ -43,7 +46,6 @@ _QUANTITY_SUFFIX_BYTES = {"Mi": _MEBIBYTE, "Gi": 1024 * _MEBIBYTE}
 # and the chart's by tests/test_credential_proxy_sizing_parity.py).
 _BROKER_MEBIBYTE_TERMS = (
     "BROKER_RESIDENT_RESERVE_BYTES",
-    "CONTENT_WORKSPACE_RESERVE_BYTES",
     "REQUEST_CHILD_MEMORY_RESERVE_BYTES",
 )
 _BROKER_COUNT_TERMS = ("OUTPUT_COPIES_PER_COMMAND",)
@@ -83,11 +85,11 @@ def broker_terms() -> dict[str, int]:
 
 def requests_the_budget_admits(limit_bytes: int) -> int:
     """`requests_the_budget_admits` as the broker computes it for a slot-taking
-    request at the operator's output cap: the limit less the two fixed reserves,
+    request at the operator's output cap: the limit less the resident reserve,
     over one request's child reserve plus its output allowance."""
     terms = broker_terms()
     output_cap = int(_declared(_OPERATOR_OUTPUT_CAP_RE, _OPERATOR_MANIFESTS).group(1))
-    budget = limit_bytes - terms["BROKER_RESIDENT_RESERVE_BYTES"] - terms["CONTENT_WORKSPACE_RESERVE_BYTES"]
+    budget = limit_bytes - terms["BROKER_RESIDENT_RESERVE_BYTES"]
     per_request = terms["REQUEST_CHILD_MEMORY_RESERVE_BYTES"] + terms["OUTPUT_COPIES_PER_COMMAND"] * output_cap
     return max(0, budget // per_request)
 
@@ -125,9 +127,10 @@ class CiDeployCredentialProxyLimitTest(unittest.TestCase):
         )
 
     def test_the_limit_makes_the_slot_cap_the_binding_bound_again(self) -> None:
-        # At the operator's default the budget admits fewer requests than the
-        # slot cap, which is the queue #2632 measured. The eval's limit has to
-        # admit at least the slot cap, so the budget stops being the bound.
+        # At the 1Gi limit the operator once defaulted to, the budget admitted
+        # fewer requests than the slot cap, which is the queue #2632 measured.
+        # The pinned limit has to admit at least the slot cap, so the budget is
+        # not the bound.
         limit = eval_limit_bytes()
         floor = int(_declared(_BROKER_FLOOR_RE, _BROKER).group(1))
         slot_cap = int(_declared(_OPERATOR_SLOT_CAP_RE, _OPERATOR_MANIFESTS).group(1))

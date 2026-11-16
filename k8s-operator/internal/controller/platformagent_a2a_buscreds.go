@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -95,7 +96,7 @@ const (
 // cluster, and is called on the way out of Reconcile rather than at a point in
 // its sequence.
 //
-// The sequence has no point that works. Four refusals of today's stack return
+// The sequence has no point that works. Four refusals return
 // above the bus step -- ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
 // RuntimeClassNotFound, EgressAllowlistRefused -- and the bus step cannot move
 // above them, because it renders on top of what they withhold. Written after
@@ -112,11 +113,9 @@ const (
 // updateStatusReady and updateStatusDegraded, so it is not racing either of
 // them for the object's resourceVersion.
 //
-// wantNext decides only the absent case: a next install with no callout says
-// so, a today install carries no condition at all. It deliberately does not
-// decide the present case. A CR flipped to today whose refusal also withheld
-// cleanupA2A still has a callout running, and removing the condition there
-// would report a component gone while it is still authenticating the bus.
+// wantNext decides only the absent case: an install with no callout says so.
+// Every install wants the callout now; the parameter stays so the one caller
+// says what it asks for. It deliberately does not decide the present case.
 //
 // mapVersion is what this reconcile rendered, or empty on a pass that returned
 // before rendering -- in which case the version is read back off the ConfigMap
@@ -139,19 +138,37 @@ func (r *PlatformAgentReconciler) syncBusCredentialsReady(ctx context.Context, a
 	return r.setBusCredentialsReady(ctx, agent, dep, err != nil, mapVersion)
 }
 
-// renderedAuthMapVersion reads the version off the ConfigMap the callout
-// watches. Best effort: the caller only needs it for the condition's message,
-// and a message naming no version is better than a reconcile that fails
-// because it could not read one.
+// renderedAuthMapVersion reads the version off the identity map's shards on
+// the cluster. Shard 0, which every render has, carries the version and the
+// count, and every shard the count names must carry the same version: the
+// callout serves a version only once it holds every shard of it, so a set
+// that is incomplete or split across versions -- a pass that failed between
+// two shard applies, read back by a later pass that parked before rendering
+// -- is reported as unknown rather than as the version shard 0 happens to
+// carry while the callout still serves the one before it. Best effort: the
+// caller only needs it for the condition's message, and a message naming no
+// version is better than a reconcile that fails because it could not read one.
 func (r *PlatformAgentReconciler) renderedAuthMapVersion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
-	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}, cm); err != nil {
+	first := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}, first); err != nil {
 		return a2aAuthMapVersionUnknown
 	}
-	if v := cm.Annotations[a2aAuthMapVersionAnnotation]; v != "" {
-		return v
+	version := first.Annotations[a2aAuthMapVersionAnnotation]
+	count := first.Annotations[a2aAuthMapShardsAnnotation]
+	shards, err := strconv.Atoi(count)
+	if version == "" || err != nil || shards < 1 {
+		return a2aAuthMapVersionUnknown
 	}
-	return a2aAuthMapVersionUnknown
+	for i := 1; i < shards; i++ {
+		shard := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(agent, i), Namespace: agent.Namespace}, shard); err != nil {
+			return a2aAuthMapVersionUnknown
+		}
+		if shard.Annotations[a2aAuthMapVersionAnnotation] != version || shard.Annotations[a2aAuthMapShardsAnnotation] != count {
+			return a2aAuthMapVersionUnknown
+		}
+	}
+	return version
 }
 
 // setBusCredentialsReady writes the condition from the callout Deployment's
@@ -251,9 +268,8 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 	return r.Status().Update(ctx, agent)
 }
 
-// clearBusCredentialsReady removes the condition. A today install must not
-// carry a condition that describes a component it does not have — the darkness
-// property reaches status, not just objects.
+// clearBusCredentialsReady removes the condition: an install must not carry a
+// condition that describes a component it does not have.
 func (r *PlatformAgentReconciler) clearBusCredentialsReady(agent *agentv1alpha1.PlatformAgent) bool {
 	return meta.RemoveStatusCondition(&agent.Status.Conditions, busCredentialsReadyCondition)
 }

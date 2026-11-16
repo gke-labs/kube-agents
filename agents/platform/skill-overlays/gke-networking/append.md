@@ -14,8 +14,9 @@ gcloud container clusters describe {cluster_name} --region {region} \
 Do not infer support from the command succeeding. When external traffic is disabled, a caller that
 Google treats as internal gets a warning rather than an error, plus a kubeconfig pointing at the
 DNS endpoint that then returns HTTP 403 on first use — a failure that surfaces one step later than
-its cause. `gcloud container clusters update {cluster_name} --enable-dns-access` turns the
-setting on.
+its cause. The setting is turned on as Config Connector YAML on the cluster's `ContainerCluster`
+(`spec.controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic`) through
+`gcp-config-connector`, proposed as a pull request through `submit-suggestion`.
 
 The Platform Agent's own tooling makes this decision per cluster in
 `/opt/data/scripts/gke_endpoint.py`, so `switch_kube_context` and the Cluster Agent profile

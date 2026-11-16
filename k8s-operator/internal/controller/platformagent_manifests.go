@@ -60,13 +60,26 @@ const (
 	// agent use on kind.
 	inClusterContextName = "in-cluster"
 	// inClusterAPIServer is the in-cluster API server address; its certificate
-	// carries this name, so no IP has to be read at render time.
-	inClusterAPIServer = "https://kubernetes.default.svc"
+	// carries this name, so no IP has to be read at render time. The full
+	// name, because the pods that dial it run with ndots:2
+	// (publicAPICallerPodNdots), where the 2-dot kubernetes.default.svc would
+	// be asked of the upstream resolver before the search list resolves it.
+	// It needs the cluster.local DNS domain, as the Service URLs the operator
+	// renders already do.
+	inClusterAPIServer = "https://kubernetes.default.svc.cluster.local"
 
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// incidentWorkloadDedupDefaultSeconds is the default INCIDENT_WORKLOAD_DEDUP_SECONDS:
+	// the seconds an admitted event folds its workload's later events into
+	// one incident (session_kv_server.py). Rendered into the platform
+	// container so the window is on for every install and visible on the
+	// Deployment; the daemon's own fallback is the same hour. A
+	// spec.deployment.env entry replaces it (mergeEnvVars), and "0" turns
+	// folding off.
+	incidentWorkloadDedupDefaultSeconds = "3600"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
 	// and what the broker keeps of it while the command runs;
 	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
@@ -104,17 +117,71 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
-	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
-	// shell_sandbox_manifests.go the sandbox's claim at the same path.
+	// fluentBitStateMount is where the fluent-bit sidecar keeps its two tail
+	// cursor databases (fluentBitLogsDBFile, fluentBitAuditDBFile): a per-agent
+	// directory on the namespace's system-metadata claim, mounted read-write at
+	// subPath fluentBitStateSubPathPrefix + agent.Name. On an emptyDir the cursors
+	// died with the pod, and with Read_from_Head On every replacement pod read
+	// both inputs from byte zero, replaying up to Mem_Buf_Limit of old lines per
+	// file into Cloud Logging. The metadata claim rather than the agent's data
+	// claim because the agent and the dashboard mount that one at its root: a
+	// cursor file they rewrite into something SQLite cannot open makes the sidecar
+	// exit at every start. Every other mount of system-metadata the operator
+	// renders uses subPath session (TestFluentBitKeepsItsCursorsOnTheMetadataClaim
+	// holds it there), so no rendered container that runs model-authored code can
+	// reach this directory; spec.deployment.extraVolumeMounts can still name the
+	// claim, and validateExtraVolumeMounts does not refuse it. Both databases are
+	// rendered with DB.journal_mode sqliteJournalModeDelete: the claim is the
+	// gofer-backed mount under a runtime class, where WAL mode corrupts
+	// (sqliteJournalModeDelete says why), and a corrupt cursor here outlives the
+	// pod where the emptyDir reset it.
+	fluentBitStateMount = "/var/lib/fluent-bit"
+	// fluentBitStateSubPathPrefix is the directory on the system-metadata claim
+	// under which each agent's cursor directory sits. The claim is one per
+	// namespace, so the agent's name keeps two agents' cursors apart. The kubelet
+	// creates a missing subPath directory with the volume root's mode, which
+	// fsGroup (agentFSGroup) has made group-writable, as it does for session.
+	fluentBitStateSubPathPrefix = "fluent-bit-state/"
+	// fluentBitLogsDBFile and fluentBitAuditDBFile are the two tail inputs' DB
+	// files under fluentBitStateMount, one per input; two inputs sharing one file
+	// would overwrite each other's positions.
+	fluentBitLogsDBFile  = "fluent-bit.db"
+	fluentBitAuditDBFile = "fluent-bit-audit.db"
+	// agentDataStorageSize is the default size of the agent's own /opt/data
+	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
+	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
+	// the one place that decides, and every reader of the size calls it.
 	//
-	// The two are one constant on purpose. sandbox_mirror.py copies a subset of
+	// The two claims share one value on purpose. sandbox_mirror.py copies a subset of
 	// the agent's volume into the sandbox's on upgrade, so destination >= source
 	// makes the copy fit by construction and there is nothing left for a byte
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
 	// 10Gi and the mirror needed a cap that silently truncated the migration on
 	// any install whose working directories were larger than the guess.
-	agentDataStorageSize = "10Gi"
-	credentialProxyPort  = 8765
+	//
+	// 50Gi holds a scope of a few hundred clusters at today's per-profile cost.
+	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
+	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
+	// board's SQLite then failed every write while the CR stayed Ready. On an
+	// existing install growDataClaim widens both claims to the resolved size,
+	// online, where the StorageClass allows expansion. install.defaults.env and
+	// the Terraform variable carry the same default, and a test pins them equal.
+	agentDataStorageSize = "50Gi"
+	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
+	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
+	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
+	// for Hermes' session store at the default 90-day retention
+	// (hack/session_retention_sim.py; results on gke-labs/kube-agents#3704):
+	//   - per profile: a fleet-average Cluster Agent profile's ceiling, 86 MiB of
+	//     live sessions x slack 4.0 = 345 MiB (measured settled: 291 MiB), plus
+	//     Hermes' log cap for two log names (40 MiB) and the scaffold, rounded up;
+	//   - base: the Platform Agent profile's ceiling (5.45 GiB, settled 3.47 GiB),
+	//     the machine home's store, kanban and caches (about 0.14 GiB measured),
+	//     plus 25%, rounded up.
+	// Re-measure both if the session store or the retention default changes.
+	dataVolumeBaseSize       = "8Gi"
+	perClusterProfileStorage = "400Mi"
+	credentialProxyPort      = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
 	// form both consumers' env carries.
@@ -132,6 +199,24 @@ const (
 	credentialProxyMetricsPort     int32 = 8766
 	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
 	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyHealthPort is Envoy's health listener in the broker
+	// container, where the readinessProbe goes. The credentialed listener
+	// sends every path, /healthz included, through one upstream cluster, and
+	// the fleet's open cluster watches hold that cluster's connections, so a
+	// probe through it is refused with the watches' 503 and three of those
+	// remove the pod from the Service. The health listener routes /healthz
+	// alone, through a cluster with a breaker of its own on the same socket,
+	// so ready still means the broker answers and no watch can mark it
+	// unready. The number is baked into the image's Envoy config
+	// (deploy/shared/envoy-credential-proxy.yaml); the operator declares the
+	// container port and the probe, and a test holds the two equal. Neither
+	// the Service nor the NetworkPolicy admits it: the kubelet probes the pod
+	// IP outside both. 8767 is left to the broker's own listener. A broker
+	// image older than this listener never becomes Ready under an operator
+	// that probes it, which is the standing rule that a pinned image is at
+	// least as new as the operator.
+	credentialProxyHealthPort     int32 = 8768
+	credentialProxyHealthPortName       = "cred-health" // #nosec G101 -- Container port name, not a credential
 	// credentialProxyPortEnv tells the runtime the credentialed port, so its
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.
@@ -210,6 +295,20 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude when
+	// watcherAlertExcludeFileEnv is unset.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
+	// watcherAlertExcludeFileEnv names the mounted file that holds the same
+	// JSON; start-services.sh passes it as --alert-exclude-file.
+	watcherAlertExcludeFileEnv = "WATCHER_ALERT_EXCLUDE_FILE"
+	// eventWatcherAlertExcludeSuffix names the ConfigMap that holds the
+	// rules, after the agent's name; eventWatcherAlertExcludeKey is its one
+	// key, and the file's name in eventWatcherAlertExcludeMountPath.
+	eventWatcherAlertExcludeSuffix    = "-event-watcher-alert-exclude"
+	eventWatcherAlertExcludeKey       = "rules.json"
+	eventWatcherAlertExcludeVolume    = "event-watcher-alert-exclude"
+	eventWatcherAlertExcludeMountPath = "/etc/kube-agents/event-watcher"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -284,6 +383,45 @@ const (
 	// the inference gateway. Decoupled from the backing implementation (LiteLLM,
 	// vLLM, a custom proxy) so swapping the backend does not touch agent configs.
 	inferenceGatewayServiceName = "inference-gateway"
+
+	// The gateway container's startup and readiness probes run one command
+	// (agentAPIProbe) and differ only in these timings.
+	//
+	// The startup probe covers a cold boot that scaffolds every profile onto a
+	// fresh PVC: 5 + 10×90 = 905s, the budget gatewayProgressDeadlineSeconds is
+	// sized to outlast. Readiness afterwards withdraws the pod after 3 missed
+	// checks 15s apart — 45s of a gateway that accepts connections and answers
+	// nobody, the stall the agent-api-auth sidecar's upstream timeout otherwise
+	// turns into a 502 for every caller.
+	//
+	// Each TimeoutSeconds sits under its probe's period, so a slow check never
+	// pushes the next one: kubelet runs probes on a fixed ticker, so a longer
+	// timeout costs at most one timeout of detection latency and buys that much
+	// tolerance for an answer that is slow but true. The readiness answer is
+	// slow by construction before it is slow by load: Hermes' list_sessions_rich
+	// first calls flush_token_counts(timeout=5.0), waiting up to 5s for the
+	// token-accounting writer to drain, and on a sandboxed install (the chart
+	// default) the operator pins SQLite to the DELETE journal mode, where the
+	// read that follows takes the writer's lock (hermes_state.py _read_ctx)
+	// behind any turn persisting its transcript. Up to 5s can therefore pass before a
+	// byte is read; 10s under the 15s period covers the flush with as much
+	// again for the locked read and the exec spawn. The startup probe keeps 5s
+	// under its 10s period: at boot the answer is absent rather than slow, and
+	// the 90 retries are its tolerance.
+	//
+	// agentAPIProbeCurlMarginSeconds is how far curl's own --max-time sits under
+	// TimeoutSeconds, so a hung listener is curl's 28 to report, with its
+	// stderr in the probe event, rather than kubelet's to kill with "command
+	// timed out". 2s leaves the exec spawn and sh's exit inside kubelet's budget,
+	// as the dashboard probe's --max-time 3 under 5s already does.
+	agentAPIProbeInitialDelaySeconds       int32 = 5
+	agentAPIStartupProbePeriodSeconds      int32 = 10
+	agentAPIStartupProbeFailureThreshold   int32 = 90
+	agentAPIStartupProbeTimeoutSeconds     int32 = 5
+	agentAPIReadinessProbePeriodSeconds    int32 = 15
+	agentAPIReadinessProbeFailureThreshold int32 = 3
+	agentAPIReadinessProbeTimeoutSeconds   int32 = 10
+	agentAPIProbeCurlMarginSeconds         int32 = 2
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -526,7 +664,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
 	data := map[string]string{
 		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
-		managedEnvKey:     renderManagedEnv(agent),
+		managedEnvKey:     renderManagedEnvForPlugins(agent, agentPlugins),
 		"leader_elect.py": leaderElectScript,
 	}
 	data[scopeConfigKey] = renderScopeJSON(agent)
@@ -584,7 +722,12 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	return data
 }
 
-// renderManagedEnv pins the platform settings that decide whether the agent can reach
+// renderManagedEnv is renderManagedEnvForPlugins with no plugins.
+func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+	return renderManagedEnvForPlugins(agent, nil)
+}
+
+// renderManagedEnvForPlugins pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
 // The config layer alone would not hold them. load_gateway_config applies the managed
@@ -610,7 +753,11 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 // that names a missing key fails the mount and the pod never starts. Since API_SERVER_KEY
 // below is unconditional it is no longer ever empty in practice, but the projection still
 // depends on the key existing, not on it having content.
-func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+//
+// The AgentPlugins resolved for the agent pin one more key, the Pub/Sub
+// platform relay's URL, when one of their routes names a subscription the
+// operator can qualify. renderManagedEnv is this with none.
+func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
@@ -622,11 +769,9 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		// render never intended — and the mode this file delivers is read back
 		// through exactly that line shape (Hermes loads the file per-line into
 		// the environment with override semantics, last occurrence winning;
-		// agents/platform/scripts/runtime_mode.py answers from the result, and
-		// the entrypoint's a2a_mode_probe hands these same lines to that
-		// reader to gate the A2A skill overlay at boot), so a smuggled
-		// `KUBEAGENTS_MODE=next` line rendered after the operator's own pin is
-		// a mode flip written by whoever can edit the CR's chat settings.
+		// an older agent image's runtime_mode.py reads these same lines), so
+		// a smuggled `KUBEAGENTS_MODE=` line rendered after the operator's
+		// own pin would be written by whoever can edit the CR's chat settings.
 		// Stripped, not escaped: nothing downstream reads a multi-line value,
 		// so there is nothing to preserve.
 		value = strings.ReplaceAll(value, "\n", "")
@@ -634,7 +779,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -676,13 +821,21 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// one: save_env_value refuses to write a key this file holds.
 	add("HERMES_HOME_MODE", hermesHomeMode)
 
-	// The mode pin, also unconditional and also not about chat. The managed key
-	// is the only way the mode reaches the agent runtime, and pinning it is what
-	// keeps the agent from writing a competing answer into the PVC .env — which
-	// stack the install runs is not the agent's to decide. Deliberately absent
-	// from the container env: one delivery path means one answer
-	// (docs/designs/spec-mode-switch.md).
-	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
+	// The mode pin, kept for an agent image older than the removal of
+	// spec.mode today: that image's runtime_mode.py reads this key and treats
+	// an absent one as the retired stack. Pinning it keeps the agent from
+	// writing a competing answer into the PVC .env. Deliberately absent from
+	// the container env: one delivery path means one answer.
+	add(kubeagentsModeEnvKey, kubeagentsModeValue)
+
+	// The earned-autonomy switches, unconditional for the reason the chat keys
+	// are: a switch left out because it is off is one the agent could turn on
+	// with a line in the PVC .env. Normalised to a value the switch knows, else
+	// "off". Pinned here rather than on the container env, as the mode is, and
+	// read from this file by agents/platform/scripts/kubeagents_switches.py.
+	for _, name := range autonomySwitchNames {
+		add(name, autonomySwitchValue(agent, name))
+	}
 
 	// The scope path, pinned for the same reason as HERMES_HOME_MODE: the container env
 	// is the layer a line in the PVC .env outranks, and the reconcile is a cron script
@@ -691,15 +844,65 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// would hand it a declaration it authored; with it, save_env_value refuses the key
 	// and the ConfigMap stays the only answer to "what is declared".
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
+	// The resolved scope's path, pinned for the same reason (#5621): under mode next to
+	// the mounted ConfigMap, and empty elsewhere, since an absent key is one the agent
+	// may write and the publisher's ConfigMap exists only under next.
+	if scopePublisherRendered(agent) {
+		add(resolvedScopeFileEnvKey, resolvedScopeDir+"/"+scopeResolvedDataKey)
+	} else {
+		add(resolvedScopeFileEnvKey, "")
+	}
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
-	// ahead of the metadata server, and since the scope prune exists a management
-	// identity that changes retires the old project's profiles. Unpinned, one line in
-	// the PVC .env would re-point it, and two clean runs later every profile of the
-	// real management project would be gone. Nothing in the operator or the chart sets
-	// it, so pinning it empty costs no install anything; the script treats an empty
-	// value as unset and asks the metadata server.
+	// first, and since the scope prune exists a management identity that changes
+	// retires the old project's profiles. Unpinned, one line in the PVC .env would
+	// re-point it, and two clean runs later every profile of the real management
+	// project would be gone. Nothing in the operator or the chart sets it, so pinning it
+	// empty costs no install anything; the script treats an empty value as unset and
+	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
+	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
+	// gateway reaches no metadata server, so this is now the answer. The container env
+	// carries it too, but the PVC .env beats the container env, so without this pin one
+	// line there would re-point the management project exactly as above.
+	// Not on kind, where the container env deliberately carries no GKE_PROJECT_ID
+	// (buildPodTemplateSpec): pinning `kind` here would hand every reader in the
+	// gateway a project that does not exist.
+	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
+		add(gkeProjectEnvKey, harness.ProjectID)
+	}
+
+	// The stall watch's three knobs (spec.harness.stallWatch), pinned on every install and
+	// empty when the CR does not set them; stall_watch.py reads an empty value as its
+	// default. The watch is a cron script that inherits the gateway's environment after
+	// the PVC .env is applied, and each knob changes what it reads or when it alerts. Unpinned, one
+	// `STALL_WATCH_EXCLUDE_NAMESPACES=payments` line written by the agent would silence
+	// the alerts for a namespace nobody excluded; pinned, save_env_value refuses the keys
+	// and the CR stays the only answer. Not in the container env: one delivery path means
+	// one answer, as for the mode key.
+	var stallWatch agentv1alpha1.StallWatchSpec
+	if harness := agent.Spec.Harness; harness != nil && harness.StallWatch != nil {
+		stallWatch = *harness.StallWatch
+	}
+	stallWatchMinAge := ""
+	if stallWatch.MinStallAgeMinutes != nil {
+		stallWatchMinAge = strconv.FormatInt(int64(*stallWatch.MinStallAgeMinutes), 10)
+	}
+	add(stallWatchExcludeNamespacesEnvKey, strings.Join(stallWatch.ExcludeNamespaces, stallWatchListSeparator))
+	add(stallWatchMinAgeEnvKey, stallWatchMinAge)
+	add(stallWatchKindsEnvKey, strings.Join(stallWatch.Kinds, stallWatchListSeparator))
+
+	// The Pub/Sub platform adapter's relay URL, on the same terms as the chat
+	// relays below: pinned so the agent cannot write its own and pull from
+	// somewhere else. Pinned on every render, empty when no plugin configures a
+	// Pub/Sub platform, so the agent cannot supply one either (pubsubRelayURL).
+	// Before the integration guard: a Pub/Sub platform needs no chat
+	// integration. Not a "platform" for the gateway-wide allowlist pair below,
+	// which is about chat users.
+	add(pubsubRelayURLEnvVar, pubsubRelayURL(agent, agentPlugins))
+	add(pubsubRelayProjectEnvVar, pubsubRelayProject(agent))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -710,26 +913,10 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// records where it started rather than testing `lines` for emptiness.
 	platformStart := len(lines)
 
-	// legacyChatConsumer rather than the enabled flag: under next the A2A
-	// gateway takes Chat and the Hermes platform is off, so its pins would
-	// pin a platform that does not run. The two predicates are complements;
-	// see a2aChatArmed.
-	if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
-		add("GOOGLE_CHAT_RELAY_URL", credentialProxyBaseURL(agent))
-		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
-		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
-		add("GOOGLE_CHAT_ALLOWED_USERS", strings.Join(gchat.AllowedUsers, ","))
-		add("GOOGLE_CHAT_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(gchat.AllowedUsers)))
-	}
-
-	// legacySlackConsumer, for Chat's reason above: under next the A2A
-	// gateway takes Slack and the Hermes platform is off; see a2aSlackArmed.
-	if slack := integration.Slack; legacySlackConsumer(agent) {
-		add("SLACK_RELAY_URL", credentialProxyBaseURL(agent))
-		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
-		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
-	}
-
+	// Google Chat and Slack have no pins: the A2A gateway is their one
+	// consumer, so the Hermes google_chat and slack platforms never run
+	// (a2aChatArmed, a2aSlackArmed), and a pin would pin a platform that
+	// does not run.
 	if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 		add("TEAMS_RELAY_URL", credentialProxyBaseURL(agent))
 		add("TEAMS_ALLOWED_USERS", strings.Join(teams.AllowedUsers, ","))
@@ -953,7 +1140,8 @@ const (
 	// moves the config hash and rolls the pod (docs/designs/multi-project-scope.md §5).
 	scopeConfigKey = "scope.json"
 
-	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container. The
+	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container (and,
+	// under mode next, for the scope publisher, and into brokerScopeDir for the broker). The
 	// volume is marked optional so a ConfigMap written by an older operator, which has no
 	// such key, still mounts (as an empty directory) instead of holding the pod in
 	// ContainerCreating during a roll; the reader treats the missing file as "no render",
@@ -964,26 +1152,41 @@ const (
 	scopeFileName   = "scope.json"
 
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
-	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
-	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
-	// by design; a third code site naming this key is a review comment.
+	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
+	// boundary is in force, for the platform MCP server's fleet_scope tool, the
+	// upgrade-readiness-watch, upgrade-readiness-weekly-review and sa-role-watch
+	// jobs, the onboarding inventory scan (bootstrap_scan_gate.py) and the front
+	// door's roster (agent_roster.py, injected block and list_agents). Two modules
+	// spell the key, by design; other code reads it only through their constants, and
+	// a third spelling is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
 	reconcileProjectEnvKey = "RECONCILE_PROJECT"
+	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
+	// container and pinned in the managed .env (see renderManagedEnv).
+	gkeProjectEnvKey = "GKE_PROJECT_ID"
+	// stallWatchExcludeNamespacesEnvKey, stallWatchMinAgeEnvKey and stallWatchKindsEnvKey
+	// carry spec.harness.stallWatch to stall_watch.py. They are pinned in the managed .env
+	// only (see renderManagedEnv), and the script names the same keys.
+	stallWatchExcludeNamespacesEnvKey = "STALL_WATCH_EXCLUDE_NAMESPACES"
+	stallWatchMinAgeEnvKey            = "STALL_WATCH_MIN_AGE_MINUTES"
+	stallWatchKindsEnvKey             = "STALL_WATCH_KINDS"
+	// stallWatchListSeparator joins a list field into one env value; the script splits on it.
+	stallWatchListSeparator = ","
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
 	gitopsStateVolumeName = "gitops-state-volume"
 	gitopsStateDir        = "/etc/gitops"
 
-	// kubeagentsModeEnvKey carries the mode switch into the managed .env — the
-	// only way the mode reaches the agent runtime (docs/designs/spec-mode-switch.md).
-	// Agent-side, exactly one reader exists: agents/platform/scripts/runtime_mode.py.
-	// The spec's grep rule holds the pair to that: a third code site naming this
-	// key is a review comment, so new readers go through runtime_mode, and any
-	// operator-side use goes through this constant.
+	// kubeagentsModeEnvKey is the managed .env key an agent image from before
+	// the removal of spec.mode today reads to learn which stack it runs, and
+	// kubeagentsModeValue the one answer. The agent image's runtime_mode.py
+	// still reads it; the pin goes once no supported agent image predates the
+	// removal.
 	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
+	kubeagentsModeValue  = agentv1alpha1.PlatformAgentModeNext
 )
 
 // loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
@@ -1055,12 +1258,87 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
 // measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
 // gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
-// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// resident without holding a slot. The credential proxy's 2Gi default admits ten
 // brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
 // eight, shared with the listing pools).
 // TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
+
+// The defaults for spec.harness.tuning.admission, the memory admission the kanban
+// dispatcher applies to its own workers. resolveKanbanAdmission renders the block
+// into the managed scope on every install, so the dispatcher never runs without
+// one. The budget has no constant: unset, it is the agent container's resolved
+// memory request in MiB (agentMemoryRequestMiB), the figure the kubelet evicts the
+// pod against under node pressure, so a CR that raises the request raises the
+// budget with it.
+//
+// The worker cap is three and a half times the 430 MiB a worker measured on a live
+// install (resolveResources): a fleet-wide audit that holds a large listing fits,
+// and one worker cannot take the whole of the default 2048 MiB budget by itself.
+// The queue bound is 24 ticks at kanbanDispatchIntervalSeconds: long enough for a
+// worker that is finishing to give its slot back, short enough that the thread
+// that filed the card is told it is throttled before it gives up waiting. Closed is
+// the default for an unreadable memory sample because the counters go unreadable
+// on the installs the budget exists for: a sandbox runtime that hides the cgroup
+// files also hides the pressure, and an open tick there spawns into the eviction
+// the budget was meant to prevent.
+const (
+	defaultAdmissionWorkerRssCapMiB   = 1536
+	defaultAdmissionQueueBoundSeconds = 600
+	defaultAdmissionFailClosed        = true
+	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
+	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
+	// figure too. A request the operator cannot read as a budget (a bare "2", a
+	// 256Mi, an explicit 0) would otherwise render 0, which the dispatcher reads
+	// as no budget and answers with upstream's meminfo guard, silently. At the
+	// floor the dispatcher still admits nothing on any measured container (the
+	// idle working set is above 512 MiB) and refuses every card after the queue
+	// bound; what the clamp buys is a refusal that names its figures in the log
+	// and in every reply, instead of a silent fallback. The CR is the place to
+	// fix the request.
+	admissionMemoryBudgetFloorMiB = 512
+)
+
+// defaultSessionRetentionDays is how long an ended session is kept when
+// spec.harness.retention.sessionDays says nothing: Hermes' own default
+// (hermes_cli/config_defaults.py, sessions.retention_days), so an upgrade that
+// starts rendering the key deletes nothing it would not have deleted anyway. The
+// fleet-scale requirements propose 7 days for working data; flipping to that is
+// this one constant, plus the release note that names the deletion it causes.
+const defaultSessionRetentionDays = 90
+
+// managedSessionsConfig is the `sessions` block in the managed scope. Hermes
+// prunes ended sessions inactive for retention_days whenever a CLI or the gateway
+// starts (at most once a day per state.db), and the session-retention cron job
+// runs the same maintenance daily for profiles that do not start on their own.
+// auto_prune is rendered true so a later Hermes default cannot switch it off.
+type managedSessionsConfig struct {
+	AutoPrune     bool `json:"auto_prune"`
+	RetentionDays int  `json:"retention_days"`
+}
+
+// managedKanbanAdmission is the `kanban.admission` block in the managed scope,
+// read by the dispatcher's spawn tick. Every key is rendered, defaults applied, so
+// the dispatcher reads one number per setting and never has to guess a default of
+// its own. No omitempty on fail_closed for the same reason: a false would drop the
+// key and read as whatever the reader falls back to.
+type managedKanbanAdmission struct {
+	MemoryBudgetMiB   int  `json:"memory_budget_mib"`
+	WorkerRssCapMiB   int  `json:"worker_rss_cap_mib"`
+	QueueBoundSeconds int  `json:"queue_bound_seconds"`
+	FailClosed        bool `json:"fail_closed"`
+}
+
+// resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
+// defaultSessionRetentionDays when it is unset.
+func resolveSessionRetentionDays(agent *agentv1alpha1.PlatformAgent) int {
+	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Retention != nil &&
+		agent.Spec.Harness.Retention.SessionDays != nil {
+		return *agent.Spec.Harness.Retention.SessionDays
+	}
+	return defaultSessionRetentionDays
+}
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
@@ -1263,8 +1541,9 @@ var frontDoorPlugins = []string{
 // profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
 // back-fill never extends a list the live file already holds, so a plugin the image
 // enabled after that volume was first written stays off there. The front-door overlay
-// unions these in so the flag cannot hide one. pr_opened records each pull request a
-// worker opens on its card, which is what posts the thread's PR message.
+// unions these in so the flag cannot hide one. pr_opened claims each pull request record
+// through the broker, strips its token and writes the origin ledger; in a worker it also
+// records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
 }
@@ -1290,6 +1569,83 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxInProgress
 	}
 	return defaultKanbanMaxInProgress
+}
+
+// resolveKanbanAdmission is the live kanban.admission block: each field is the CR's
+// spec.harness.tuning.admission value where it sets one, else the operator's
+// default. The budget's default is derived from the agent container's resolved
+// memory request (agentMemoryRequestMiB); the others are the constants beside
+// defaultKanbanMaxInProgress. renderConfigYAML pins the block in the managed scope
+// next to max_in_progress, so it reaches every dispatch entry point the way the cap
+// does.
+func resolveKanbanAdmission(agent *agentv1alpha1.PlatformAgent) managedKanbanAdmission {
+	resolved := managedKanbanAdmission{
+		MemoryBudgetMiB:   agentMemoryRequestMiB(agent),
+		WorkerRssCapMiB:   defaultAdmissionWorkerRssCapMiB,
+		QueueBoundSeconds: defaultAdmissionQueueBoundSeconds,
+		FailClosed:        defaultAdmissionFailClosed,
+	}
+	tuning := agentTuning(agent)
+	if tuning == nil || tuning.Admission == nil {
+		return resolved
+	}
+	admission := tuning.Admission
+	if admission.MemoryBudgetMiB != nil {
+		resolved.MemoryBudgetMiB = int(*admission.MemoryBudgetMiB)
+	}
+	if admission.WorkerRssCapMiB != nil {
+		resolved.WorkerRssCapMiB = int(*admission.WorkerRssCapMiB)
+	}
+	if admission.QueueBoundSeconds != nil {
+		resolved.QueueBoundSeconds = int(*admission.QueueBoundSeconds)
+	}
+	if admission.FailClosed != nil {
+		resolved.FailClosed = *admission.FailClosed
+	}
+	return resolved
+}
+
+// agentMemoryRequestMiB is the agent container's memory request in whole MiB, as
+// the kubelet sees it: the CR's spec.deployment.resources request, else its limit
+// (a container that declares only a limit is given a request equal to it), else
+// the operator's default request (resolveResources). It is the default memory
+// budget for the dispatcher's admission because the kubelet evicts the pod under
+// node pressure once its usage passes this figure, whatever the limit says.
+func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
+	var deployment *agentv1alpha1.DeploymentSpec
+	if agent != nil {
+		deployment = agent.Spec.Deployment
+	}
+	resources := resolveResources(deployment)
+	mib, ok := memoryMiB(resources.Requests)
+	if !ok {
+		mib, ok = memoryMiB(resources.Limits)
+	}
+	if !ok {
+		mib, _ = memoryMiB(resolveResources(nil).Requests)
+	}
+	if mib < admissionMemoryBudgetFloorMiB {
+		name := ""
+		if agent != nil {
+			name = agent.Name
+		}
+		manifestsLog.Info("admission memory budget clamped to the floor: the agent container's memory request is below it",
+			"platformagent", name, "requestMiB", mib, "budgetMiB", admissionMemoryBudgetFloorMiB)
+		return admissionMemoryBudgetFloorMiB
+	}
+	return mib
+}
+
+// memoryMiB is the list's memory quantity in whole MiB, rounded down, and whether
+// the list carries one. An explicit zero is carried: the API defaults a request to
+// the limit only when the request is unset, so "0" is a request of zero, which the
+// floor clamp answers, not a missing one that the limit stands in for.
+func memoryMiB(list corev1.ResourceList) (int, bool) {
+	quantity, ok := list[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	return int(quantity.Value() / bytesPerMiB), true
 }
 
 // frontDoorKanban renders the `kanban` subtree for the platform profile when the gateway
@@ -1439,6 +1795,14 @@ func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.Agent
 			"/bin/sh",
 			"-c",
 			stageScript,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -1669,6 +2033,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 			if host := resolved.GitHubHost(); host != agentv1alpha1.DefaultGitHubHost {
 				data[gitopsStateGitHubHostKey] = host
 			}
+			if repo, ok := declaredGitOpsRepo(agent); ok && repo != "" {
+				data[gitopsStateGitOpsRepoKey] = repo
+			}
 			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
 				gitopsStateManagedReposKey: managed,
 				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
@@ -1766,7 +2133,7 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
 // reads, and tools/environments/ssh.py turns them into an ssh command line.
 //
-// Six of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
+// Seven of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
 // and a value here would replace each profile's own (see the note on
 // renderConfigYAML). `ssh_persistent` is absent because Hermes has no env var for
 // it, so rendering it would look like a setting and be one only for in-process
@@ -1789,7 +2156,17 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // cleanup() no longer reaches the master either. The value stays because
 // reaping reclaims nothing here.
 //
-// `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
+// `timeout` is the terminal tool's per-call limit for a command run without a
+// `timeout=` argument. Hermes' code default is 180s, but the image's first boot
+// seeds $HERMES_HOME/.env from Hermes' .env.example, which sets
+// TERMINAL_TIMEOUT=60, and .env beats the code default. So without this key every
+// install ran at 60s: a polling `sleep 60` with no `timeout=` raced it, and the
+// scripts that budget against 180s (cluster_preflight.sh) were cut short. A
+// seeded .env is never reseeded, so only a key that outranks it reaches an
+// existing install;
+// deploy/shared/terminal_env_pin.py copies it into each profile's .env.
+//
+// `workspace_root` is the eighth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
 // ssh_host and needs one more fact about the far side — the directory a proxied
 // command must run in, which is shellSandboxDataPath, the sandbox's data volume.
@@ -1805,8 +2182,15 @@ type managedTerminalConfig struct {
 	SSHPort         int    `json:"ssh_port"`
 	SSHKey          string `json:"ssh_key"`
 	LifetimeSeconds int    `json:"lifetime_seconds"`
+	TimeoutSeconds  int    `json:"timeout"`
 	WorkspaceRoot   string `json:"workspace_root"`
 }
+
+// shellSandboxTerminalTimeoutSeconds is what the operator publishes as
+// terminal.timeout — see the note above. Hermes' own code default
+// (`_parse_env_var("TERMINAL_TIMEOUT", "180")` in tools/terminal_tool.py), which
+// cluster_preflight.sh mirrors as TERMINAL_TOOL_TIMEOUT_SECONDS.
+const shellSandboxTerminalTimeoutSeconds = 180
 
 // shellSandboxEnvLifetimeSeconds is what the operator publishes as
 // terminal.lifetime_seconds — see the note above. 30 days, not "off": Hermes
@@ -1894,15 +2278,24 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// opt back into the mode that corrupts the file every other profile shares
 		// the volume with.
 		Database *managedDatabaseConfig `json:"database,omitempty"`
-		// Hooks carries the bridge activity door's pod-wide entry under
-		// mode next with an api-executor bridge in the pod, rendered or
-		// declared (a2aActivityHook); absent otherwise, so a today
-		// install's config is unchanged.
+		// Hooks carries the bridge activity door's pod-wide entry with an
+		// api-executor bridge in the pod, rendered or declared
+		// (a2aActivityHook); absent otherwise.
 		Hooks *managedHooks `json:"hooks,omitempty"`
-		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		// The board-wide kanban worker cap and the dispatcher's memory admission.
+		// Always rendered; see where they are set.
 		Kanban struct {
-			MaxInProgress int `json:"max_in_progress"`
+			MaxInProgress int                    `json:"max_in_progress"`
+			Admission     managedKanbanAdmission `json:"admission"`
 		} `json:"kanban"`
+		// Session retention, read by Hermes' own state.db auto-maintenance in every
+		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
+		// Always rendered, and rendered here because it meets both of this function's
+		// tests. Uniform: one retention policy for the install's working data, the
+		// same for every profile. Beyond the agent's repair: a profile that lengthened
+		// its own retention would keep conversation history past the period the
+		// install promises to delete it after.
+		Sessions managedSessionsConfig `json:"sessions"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1936,6 +2329,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHPort:         shellSandboxPort,
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+		TimeoutSeconds:  shellSandboxTerminalTimeoutSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
 	}
 
@@ -1972,6 +2366,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	// The dispatcher's memory admission, beside the cap and pinned for the same
+	// reasons: the board is shared, every dispatch entry point reads its settings
+	// from whichever profile it runs as, and the failure it prevents (a pod evicted
+	// for passing its memory request under node pressure, workers and all) is one
+	// the agent cannot see coming. The budget follows the agent container's memory
+	// request, so a CR that raises the request raises the budget on the same
+	// reconcile.
+	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
+	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -1996,21 +2399,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
-			// The platform is on only while Hermes is the Chat consumer;
-			// under next the A2A gateway is, and this platform would pull
-			// the same subscription beside it.
-			cfg.Platforms.GoogleChat.Enabled = legacyChatConsumer(agent)
-			if cfg.Platforms.GoogleChat.Enabled {
-				// Rebrand the Google Chat "thinking" marker card from the
-				// upstream default ("Hermes is thinking…") to our product name.
-				cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
-			}
+			// The Hermes google_chat platform stays off: the A2A gateway is
+			// the one Chat consumer, and this platform would pull the same
+			// subscription beside it (a2aChatArmed).
+			cfg.Platforms.GoogleChat.Enabled = false
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
 		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
-			// On only while Hermes is the Slack consumer; under next the A2A
-			// gateway is, see a2aSlackArmed.
-			cfg.Platforms.Slack.Enabled = legacySlackConsumer(agent)
+			// The Hermes slack platform stays off too: the A2A gateway is the
+			// one Slack consumer, and this platform would open a second Socket
+			// Mode connection on the same app beside it (a2aSlackArmed).
+			cfg.Platforms.Slack.Enabled = false
 		}
 		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
 			cfg.Platforms.Teams.Enabled = *teams.Enabled
@@ -2123,11 +2522,45 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+					corev1.ResourceStorage: ResolveAgentDataStorageSize(agent),
 				},
 			},
 		},
 	}
+}
+
+// ResolveDataStorageSize is the size of the sandbox's data claim, and the floor
+// of the agent's (ResolveAgentDataStorageSize): spec.storage.size when it is
+// set and above zero, and agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// or less, but the chart ships the webhook off; the fallback keeps such a CR on
+// the default rather than on a claim the API server refuses to create.
+func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	if storage := agent.Spec.Storage; storage != nil && storage.Size != nil && storage.Size.Sign() > 0 {
+		return storage.Size.DeepCopy()
+	}
+	return resource.MustParse(agentDataStorageSize)
+}
+
+// ResolveAgentDataStorageSize is the size of the agent's own data claim:
+// ResolveDataStorageSize, raised to dataVolumeBaseSize + N x
+// perClusterProfileStorage (rounded up to whole GiB) when
+// spec.storage.expectedClusterProfiles sets N. It never comes out lower than
+// ResolveDataStorageSize, so the field can only grow the claim.
+func ResolveAgentDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	size := ResolveDataStorageSize(agent)
+	storage := agent.Spec.Storage
+	if storage == nil || storage.ExpectedClusterProfiles == nil || *storage.ExpectedClusterProfiles < 1 {
+		return size
+	}
+	base := resource.MustParse(dataVolumeBaseSize)
+	perProfile := resource.MustParse(perClusterProfileStorage)
+	need := base.Value() + int64(*storage.ExpectedClusterProfiles)*perProfile.Value()
+	const gib = int64(1) << 30
+	formula := resource.NewQuantity((need+gib-1)/gib*gib, resource.BinarySI)
+	if formula.Cmp(size) > 0 {
+		return *formula
+	}
+	return size
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
@@ -2350,7 +2783,18 @@ type renderOptions struct {
 	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
 	// the declaration cannot name the organisation (see heldGitHubOrg).
 	heldGitHubOrg string
+	// enabledProfiles is the sorted list of resolved, non-terminating optional
+	// built-in Hermes specialist AgentProfile names (such as "tse") bound to this
+	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
+	// so the zero value renders byte-identical manifests.
+	enabledProfiles []string
 }
+
+const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
+
+// agentSlackHomeChannelEnvVar is the agent's own idea of the Slack home
+// channel, the name today's Hermes platform reads.
+const agentSlackHomeChannelEnvVar = "SLACK_HOME_CHANNEL"
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
@@ -2530,7 +2974,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agentServiceAccountName(agent)
+	// The gateway's own ServiceAccount, not the broker's: see
+	// gatewayServiceAccountName.
+	saName := gatewayServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -2579,10 +3025,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// projected bus token that belongs to the platform-agent container alone.
 	// Take the mount away from anything else that names it, before the
 	// operator's own containers join the slices -- see
-	// a2aStripBusTokenMounts for what a sidecar holding it would be. Gated on
-	// the surface for the same reason the plugin env drop is: on a today
-	// install there is no such volume, and dropping a name only the next stack
-	// cares about would be one more way to tell the feature exists.
+	// a2aStripBusTokenMounts for what a sidecar holding it would be.
 	//
 	// Two halves. The name half takes the reserved volume name. The source
 	// half takes any user volume that would deliver the same credential under
@@ -2594,24 +3037,22 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// callout cannot tell which container presented one. Both are a guard
 	// against a misconfiguration by the CR's author, and are worth having on
 	// those terms -- see a2aBusCredentialVolumeNames.
-	if a2aAgentSurface(agent) {
-		initContainers = a2aStripBusTokenMounts(initContainers)
-		sidecars = a2aStripBusTokenMounts(sidecars)
-		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
-		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
+	initContainers = a2aStripBusTokenMounts(initContainers)
+	sidecars = a2aStripBusTokenMounts(sidecars)
+	sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
+	extraVolumes = a2aStripBusTokenVolume(extraVolumes)
 
-		droppedSources := a2aBusCredentialVolumeNames(agent)
-		initContainers = stripContainerMountsNamed(initContainers, droppedSources)
-		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
-		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
-		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
+	droppedSources := a2aBusCredentialVolumeNames(agent)
+	initContainers = stripContainerMountsNamed(initContainers, droppedSources)
+	sidecars = stripContainerMountsNamed(sidecars, droppedSources)
+	sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
+	extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
 
-		// Last, after every strip: the executor environment the pod cannot
-		// resolve for itself. Ordering is not incidental -- the strips above
-		// remove what a sidecar must not hold, and this adds what one that
-		// executes tasks cannot run without. See a2aExecutorSidecarEnv.
-		sidecars = a2aExecutorSidecarEnv(sidecars)
-	}
+	// Last, after every strip: the executor environment the pod cannot
+	// resolve for itself. Ordering is not incidental -- the strips above
+	// remove what a sidecar must not hold, and this adds what one that
+	// executes tasks cannot run without. See a2aExecutorSidecarEnv.
+	sidecars = a2aExecutorSidecarEnv(sidecars)
 
 	homeDir := "/opt/data"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
@@ -2687,6 +3128,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		{
 			Name:  "GITOPS_STATE_PATH",
 			Value: path.Join(gitopsStateDir, "managed_repos"),
+		},
+		{
+			Name:  "INCIDENT_WORKLOAD_DEDUP_SECONDS",
+			Value: incidentWorkloadDedupDefaultSeconds,
 		},
 	}
 
@@ -2789,69 +3234,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
-		// The legacy relay env; under next the A2A gateway carries Chat
-		// instead, see a2aChatArmed.
-		if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
-			envVars = append(envVars, []corev1.EnvVar{
-				{
-					Name:  "GOOGLE_CHAT_RELAY_URL",
-					Value: credentialProxyBaseURL(agent),
-				},
-				{
-					Name:  "GOOGLE_CHAT_PROJECT_ID",
-					Value: gchat.ProjectID,
-				},
-				{
-					Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-					Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
-				},
-				{
-					Name:  "GOOGLE_CHAT_ALLOWED_USERS",
-					Value: strings.Join(gchat.AllowedUsers, ","),
-				},
-				{
-					Name:  "GOOGLE_CHAT_HOME_CHANNEL",
-					Value: gchat.HomeChannel,
-				},
-			}...)
-			// Shared with renderManagedEnv, and emitted on the same terms: always, with
-			// the real answer. The managed .env pins the same key, and the two
-			// disagreeing would leave the allowlist decided by load order.
-			envVars = append(envVars, corev1.EnvVar{
-				Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
-				Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers)),
-			})
-		}
-		// The legacy relay env; under next the A2A gateway carries Slack
-		// instead, see a2aSlackArmed.
-		if slack := integration.Slack; legacySlackConsumer(agent) {
-			envVars = append(envVars, []corev1.EnvVar{
-				{
-					Name:  "SLACK_RELAY_URL",
-					Value: credentialProxyBaseURL(agent),
-				},
-				{
-					Name:  "SLACK_ALLOWED_USERS",
-					Value: strings.Join(slack.AllowedUsers, ","),
-				},
-				{
-					Name:  "SLACK_ALLOW_ALL_USERS",
-					Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers)),
-				},
-			}...)
-			if slack.HomeChannel != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_HOME_CHANNEL",
-					Value: slack.HomeChannel,
-				})
-			}
-			if slack.HomeChannelName != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_HOME_CHANNEL_NAME",
-					Value: slack.HomeChannelName,
-				})
-			}
-		}
+		// No Google Chat or Slack relay env: the A2A gateway carries both
+		// (a2aChatArmed, a2aSlackArmed). The Slack home channel the agent's
+		// readers want renders with the notify lists (agentSlackHomeChannelEnvVar).
 		// GITHUB_ORG still names GitHub because that is what the agent reads it
 		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
 		// and doing it here would rename a variable the pod's scripts still spell
@@ -2935,10 +3320,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// does not shadow a same-named plugin entry — it sits beside it, and
 		// server-side apply refuses a duplicate key in `env`, which would wedge
 		// every reconcile of this CR (the EVENT_WATCHER_ENABLED comment in
-		// buildCredentialProxyContainer records the same rule). Gated on the
-		// surface rather than unconditional so a today install's plugin env is
-		// untouched — dropping a name only the next stack cares about would be
-		// one more way to tell the feature exists.
+		// buildCredentialProxyContainer records the same rule).
 		//
 		// NATS_USER and NATS_PASSWORD are not appended any more — A5 moved this
 		// container onto a projected token — so the duplicate-key argument does
@@ -2956,28 +3338,40 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// operator never renders it, the client prefers it over the projected
 		// path with no fallback, and a plugin that set it would choose which
 		// file this container presents as its bearer token.
-		if a2aAgentSurface(agent) {
-			kept := extEnvs[:0]
-			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
-					e.Name == a2aBusTokenFileEnv ||
-					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
-					continue
-				}
-				kept = append(kept, e)
-			}
-			extEnvs = kept
-		}
-		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
-		// every install, not only while the A2A surface is up: on a today
-		// install a plugin's value would reroute Google Chat posts from
-		// hermes send to a chat.notify route that does not exist there. The
-		// operator renders them only under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
-				kept = append(kept, e)
+			if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aNATSTLSServerNameEnv || e.Name == a2aBusUserEnv ||
+				e.Name == a2aBusTokenFileEnv ||
+				e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+				continue
 			}
+			kept = append(kept, e)
+		}
+		extEnvs = kept
+		// A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, and
+		// KUBE_AGENTS_ENABLED_PROFILES are dropped too: a plugin's notify
+		// value would reroute Google Chat posts, and a plugin's
+		// KUBE_AGENTS_ENABLED_PROFILES would scaffold or archive optional
+		// specialist profiles outside the operator's AgentProfile
+		// reconciliation. The operator renders them after this merge.
+		// Drop any plugin env entry that references a forge credentialsRef
+		// Secret, matching the reconcile-time refusal in
+		// validateExtraVolumeMounts so buildPodTemplateSpec never renders a
+		// forge Secret into the platform-agent container even when called
+		// directly in unit tests.
+		var forgeSecrets []string
+		if agent.Spec.Integration != nil {
+			forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
+		}
+		kept = extEnvs[:0]
+		for _, e := range extEnvs {
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+				continue
+			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				continue
+			}
+			kept = append(kept, e)
 		}
 		extEnvs = kept
 		if len(extEnvs) > 0 {
@@ -3009,6 +3403,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  scopeFileEnvKey,
 		Value: scopeDir + "/" + scopeFileName,
 	})
+	// The resolved scope's path, as the managed .env pins it (empty outside next).
+	resolvedScopeFile := ""
+	if scopePublisherRendered(agent) {
+		resolvedScopeFile = resolvedScopeDir + "/" + scopeResolvedDataKey
+	}
+	envVars = append(envVars, corev1.EnvVar{Name: resolvedScopeFileEnvKey, Value: resolvedScopeFile})
 	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
 	// two renders must agree, so the container env carries the same empty value.
 	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})
@@ -3085,9 +3485,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// plugin able to supply the URL is that wiring, arriving from a field further
 	// down the same CR.
 	//
-	// This is tidiness, not containment. GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL
-	// above still name the broker, so anything in this container that can form an
-	// HTTP request can still reach it — what stops that being free is the token
+	// This is tidiness, not containment. TEAMS_RELAY_URL above names the broker
+	// when Teams is on, and anything in this container that can form an HTTP
+	// request can reach it anyway — what stops that being free is the token
 	// below, which the broker now checks on every call.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
@@ -3097,6 +3497,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The kube-api proxy's URL, under a name nothing in this container acts on,
+	// so no shim or kubectl behaviour here changes. The scripts here that hop
+	// into the shell sandbox for a get-credentials (stall_watch,
+	// platform_mcp_server) read it to know the sandbox's shim writes a kube-proxy
+	// kubeconfig, which the sandbox always does (buildShellSandboxStatefulSet sets
+	// KUBE_PROXY_URL there), and so skip choosing endpoint flags that would not
+	// reach it (gke_endpoint.KUBE_PROXY_ENVS). When the shim cannot answer and the
+	// broker runs the fetch, the broker decides the endpoint for a fetch that
+	// names none (credential_proxy's _decision_for_callers_fetch).
+	envVars = append(envVars, corev1.EnvVar{Name: kubeProxyInUseURLEnv, Value: kubeProxyURL(agent)})
 	// Unconditional and in both modes, unlike the chat relay URLs: the remote
 	// MCP servers are in every profile that runs here, and mcp-remote presents
 	// the token above to reach them. A plugin cannot redirect it; the operator
@@ -3104,6 +3514,28 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  mcpRelayURLEnvVar,
 		Value: mcpRelayURL(agent),
+	})
+	// The Pub/Sub platform adapter's relay, whatever the chat integration:
+	// the broker's URL exactly when the broker is told the subscription set
+	// (buildCredentialProxyEnvForPlugins), so the two cannot disagree, and
+	// empty otherwise. Unconditional and after the plugin merge for the reason
+	// the MCP relay URL above is: a name the operator never emits leaves an
+	// AgentPlugin's spec.env as the only writer, and this one names where the
+	// adapter presents the token above. Pinned in the managed .env too
+	// (renderManagedEnvForPlugins).
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayURLEnvVar,
+		Value: pubsubRelayURL(agent, agentPlugins),
+	})
+	// The project the adapter qualifies a short route name with: the one the
+	// operator composed the broker's set with, so the two cannot disagree.
+	// GCP_PROJECT_ID above is on the overridable side of the plugin merge; a
+	// plugin that set it would have the adapter ask for a subscription the
+	// broker refuses, and the route would deliver nothing. Pinned in the
+	// managed .env too.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayProjectEnvVar,
+		Value: pubsubRelayProject(agent),
 	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is
@@ -3134,59 +3566,67 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// container at all — the SensitiveEnvVars membership is what turns the
 	// attempt into a webhook rejection instead of a silent no-op.
 	//
-	// Nothing here is Optional any more and nothing needs to be, which is the
-	// one thing the token makes simpler: the skew branch of a2aAgentSurface
-	// used to need Optional on the SecretKeyRef so a today-lineage install that
-	// hit skew would not roll the pod into CreateContainerConfigError against a
+	// Nothing here is Optional, which is the one thing the token makes
+	// simpler (the bus CA bundle volume further down is, and says why): a
+	// SecretKeyRef used to need Optional so an install whose bus had not
+	// rendered would not roll the pod into CreateContainerConfigError against a
 	// Secret that had never existed. A projected token volume has no such
 	// failure — the kubelet mints it from the pod's own ServiceAccount, which
 	// exists on every lineage — so the freeze the helper promises costs two
 	// inert env vars and a mount.
-	if a2aAgentSurface(agent) {
-		envVars = append(envVars,
-			corev1.EnvVar{
-				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
-			},
-			corev1.EnvVar{
-				Name:  a2aBusUserEnv,
-				Value: a2aAgentBusUser,
-			},
-		)
+	envVars = append(envVars,
+		// The same URL every other client is handed: tls://, on the
+		// Service name the bus certificate carries.
+		corev1.EnvVar{
+			Name:  "NATS_URL",
+			Value: a2aNATSClientURL(agent),
+		},
+		a2aNATSCAFileEnvVar(),
+		corev1.EnvVar{
+			Name:  a2aBusUserEnv,
+			Value: a2aAgentBusUser,
+		},
+	)
+	if len(opts.enabledProfiles) > 0 {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  enabledProfilesEnvVar,
+			Value: strings.Join(opts.enabledProfiles, ","),
+		})
 	}
-	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
-	// so the agent-side callers that used to `hermes send` a proactive post
-	// route it to the gateway's chat.notify home channel instead. This names
-	// the platform they reroute; the bus identity above is what sends it.
-	// Only with a home channel the route posts to: otherwise every proactive
-	// post would be refused, and on a Chat-and-Slack install the agent would
-	// count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
-		// Slack's half of the same rule: the Hermes slack platform is off
-		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed.
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
-		// The agent's own idea of the Slack home channel, as under today: the
-		// audit relay gates its report card on knowing a channel and records
-		// it on the incident's routing row. The Hermes slack platform is off
-		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: "SLACK_HOME_CHANNEL", Value: a2aSlackHomeChannel(agent)})
+	// The Hermes Google Chat and Slack platforms are off: the gateway holds
+	// them (a2aChatArmed, a2aSlackArmed), so the agent-side callers that
+	// used to `hermes send` a proactive post route it to the gateway's
+	// chat.notify instead; the bus identity above is what sends it.
+	// A2A_NOTIFY_CONVERSATIONS names every armed route, Chat first: a kanban
+	// card's report back to the conversation it was filed in, and
+	// onboarding's first report, need no home. A2A_NOTIFY_PLATFORM names the
+	// armed routes whose home channel the CR sets, and is absent when none
+	// is. The agent adds Slack when the projected file below names a channel
+	// the gateway learned, and sends home posts to every armed route when no
+	// platform has a home; the gateway keeps a home-less platform's posts for
+	// the digest it posts once a channel is set (a2a/gateway/notify_refused.go).
+	// The alert picks one of those on its own, Chat first. Both lists read CR
+	// fields only, so a learn rolls no pod.
+	notify := strings.Join(a2aNotifyHomePlatforms(agent), a2aNotifyPlatformSeparator)
+	conversations := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)
+	if notify != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: notify})
 	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
-	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
+	// The agent's own idea of the Slack home channel: the audit relay gates
+	// its report card on knowing a channel and records it on the incident's
+	// routing row. Only the CR's channel travels as env; a channel the
+	// gateway learned reaches the agent through the projection file mounted
+	// below (platformagent_home_channel_record.go), which the agent's readers
+	// take after a non-empty env, so a learn replaces no pod. It renders
+	// between the two lists, where it always has, so an upgrade that leaves
+	// the values alone rolls no pod.
+	if a2aSlackNotifyArmed(agent) {
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
+		}
 	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
-	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
+	if conversations != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: conversations})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -3295,9 +3735,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// wearing the agent's identity, and the split A5 made would be undone by a
 	// volumeMount. The bridge sidecar authenticates with its own password for
 	// exactly that reason — see bridgeIdentity.
-	if a2aAgentSurface(agent) {
-		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
-	}
+	mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+	// The bus CA, which, unlike the token, the bridge sidecar inherits
+	// from this container: trusting the bus is not an identity.
+	mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
 	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
@@ -3344,7 +3785,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			volumes = append(volumes, corev1.Volume{
 				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
+					EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(pluginStagingSizeLimit))},
 				},
 			})
 		}
@@ -3356,9 +3797,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
-	if a2aAgentSurface(agent) {
-		volumes = append(volumes, a2aBusTokenVolumeSource())
+	if a2aSlackArmed(agent) {
+		// The home-channel projection (platformagent_home_channel_record.go):
+		// Optional and out of the pod-template hashes, so its content rolls
+		// no pod; the agent's readers follow the file within a kubelet sync.
+		volumes = append(volumes, homeChannelProjectionVolume(agent))
 	}
+	volumes = append(volumes, a2aBusTokenVolumeSource())
+	// Optional here and only here: on a first pass the bus, and so the
+	// bundle, may not have rendered yet, and a required ConfigMap volume
+	// would hold the agent pod in ContainerCreating for a bus it cannot use
+	// anyway.
+	ca := a2aNATSCABundleVolume(agent)
+	ca.ConfigMap.Optional = ptr.To(true)
+	volumes = append(volumes, ca)
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -3403,6 +3855,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
+			// ndots:3, see brokerCallerPodDNSConfig: the relay clients here
+			// dial the broker by its 4-dot Service name.
+			DNSConfig: brokerCallerPodDNSConfig(),
 			// No ShareProcessNamespace, and under mode: next the field is
 			// load-bearing rather than a default. The agent container holds
 			// the A2A bus credential — since A5 not as NATS_PASSWORD in its
@@ -3415,8 +3870,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			// every container in this Pod runs as the same UID (see
 			// RunAsUser below), so the DAC check that would otherwise stop it
 			// passes. Moving the credential out of `env` narrowed which CR
-			// fields can reach it; it did not weaken this. Under mode: today
-			// the credential is absent and only the weaker reason applies:
+			// fields can reach it; it did not weaken this. The weaker reason
+			// also applies:
 			// the next container added here should not inherit a shared
 			// namespace by default. Do not set this field on the strength of
 			// that weaker reason alone.
@@ -3430,6 +3885,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 			ServiceAccountName:           saName,
 			AutomountServiceAccountToken: ptr.To(false),
+			// See gatewayTerminationGracePeriodSeconds: covers the gateway's
+			// own cron drain and cleanup reserve before the kubelet SIGKILLs.
+			TerminationGracePeriodSeconds: ptr.To(gatewayTerminationGracePeriodSeconds),
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: ptr.To(agentFSGroup),
 				// Every container in this Pod runs as the agent image's user.
@@ -3455,11 +3913,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// the 905s cold boot the startup probe already sanctions (the agentAPIStartupProbe*
+// constants at the top of this file) — the kubelet is
 // told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
 const gatewayProgressDeadlineSeconds int32 = 1800
+
+// gatewayTerminationGracePeriodSeconds is how long the kubelet waits between
+// SIGTERM and SIGKILL for a gateway pod. Kubernetes defaults it to 30s, which
+// is shorter than the gateway's own stop path: on SIGTERM, stop() waits up to
+// agent.cron_drain_timeout (30s by default) for an in-flight cron run, then
+// keeps a 10s cleanup reserve to interrupt agents, kill tool subprocesses,
+// mark jobs and disconnect adapters. Hermes sizes its own systemd unit for the
+// same path at a 60s TimeoutStopSec floor (gateway/restart.py:
+// SYSTEMD_TIMEOUT_STOP_SEC_FLOOR). Under 30s a SIGTERM that arrives while a
+// cron job runs is followed by SIGKILL during cleanup, and the job stays at
+// last_status=running instead of being recorded as interrupted.
+//
+// The cost on an idle gateway is nothing: the pod exits as soon as stop()
+// returns (0.18s on 2026-10-17, ka-webconsole-pr2321), so a Recreate rollout
+// is not lengthened. The grace period only extends shutdown when there is
+// work to drain.
+const gatewayTerminationGracePeriodSeconds int64 = 60
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
@@ -3834,8 +4310,10 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // The harness triple is part of the condition rather than a validation reported
 // elsewhere. The detector requires --project; --cluster-name requires
-// --cluster-location; and it checks that name against the cluster its credentials
-// actually reach, exiting on a mismatch. An install that asks for the detector
+// --cluster-location; and, where its in-cluster probe can reach the metadata server
+// (not inside the gateway, where the probe times out and the triple is taken on
+// trust), it checks that name against the cluster its credentials actually reach,
+// exiting on a mismatch. An install that asks for the detector
 // without naming its cluster would therefore get a restart loop for as long as the
 // pod lives, so the operator reports it as off and leaves the pod quiet.
 //
@@ -3932,22 +4410,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -3975,8 +4445,8 @@ func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) core
 // the same image, with CREDENTIAL_PROXY_ROLE=api-proxy telling
 // deploy/shared/start-services.sh to start neither Envoy nor the executor, and
 // its environment is built here rather than by buildCredentialProxyEnv so that
-// the Slack and Google Chat tokens, the token-broker URL and the gcloud
-// bootstrap stay out of the gateway pod entirely. The agent container cannot
+// the token-broker URL and the gcloud bootstrap stay out of the gateway pod
+// entirely. The agent container cannot
 // reach a credentialed endpoint on this pod's loopback because there is no
 // longer one to reach — which is the property the sandbox split is for.
 //
@@ -4105,7 +4575,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4121,6 +4591,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watchers' broker token. Here and in no other container of this
 			// Pod: the watcher role is what reaches the fleet through the broker.
 			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
+			// The alert-exclude rules. No subPath: a subPath mount never sees
+			// a change to the ConfigMap.
+			{Name: eventWatcherAlertExcludeVolume, MountPath: eventWatcherAlertExcludeMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4155,10 +4628,71 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// The rules reach the watcher as a file from a ConfigMap, which the
+	// watcher reads again every minute, so a change to the list applies
+	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
+	// env takes the same key for an image whose entrypoint predates the file.
+	// Both are written whether or not the list is set, so setting the first
+	// rule or removing the last one changes no pod template either. Managed,
+	// so reserved by the merge below, except when the list is empty and
+	// spec.deployment.env sets WATCHER_ALERT_EXCLUDE: that entry, which the
+	// watcher read before this field existed, then applies as it did.
+	if eventWatcherAlertExclude(agent) != "" || !deploymentEnvSets(agent, watcherAlertExcludeEnv) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: watcherAlertExcludeEnv, ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+				Key:                  eventWatcherAlertExcludeKey,
+			}}},
+			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
+		)
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// deploymentEnvSets reports whether spec.deployment.env has an entry named name.
+func deploymentEnvSets(agent *agentv1alpha1.PlatformAgent, name string) bool {
+	if agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEventWatcherAlertExcludeConfigMap holds the alert-exclude rules for the
+// agent-api-auth container, as eventWatcherAlertExclude renders them, or ""
+// for none. It is mounted without subPath and is in no pod-template hash, so
+// the kubelet updates the file in place, usually within a minute, and the
+// watcher puts the change in force on its next read of the file.
+func buildEventWatcherAlertExcludeConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + eventWatcherAlertExcludeSuffix,
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{eventWatcherAlertExcludeKey: eventWatcherAlertExclude(agent)},
+	}
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -4187,7 +4721,18 @@ func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
 	return harness != nil && harness.Location == kindLocation
 }
 
+// buildCredentialProxyEnv is buildCredentialProxyEnvForPlugins with no plugins:
+// every variable but the platform Pub/Sub relay's subscription set.
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	return buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
+}
+
+// buildCredentialProxyEnvForPlugins renders the broker's environment for an
+// agent and the AgentPlugins resolved for it. The plugins contribute one
+// variable: the subscriptions the Pub/Sub platform relay may reach. profiles
+// is the profile role's configuration (credentialProxyProfileEnv); its zero
+// value renders no profile role.
+func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership, profiles credentialProxyProfileConfig) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
@@ -4271,6 +4816,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
+	// The scratch volumes' caps, for the broker's resource watermark gate. See
+	// credentialProxyStateLimitEnv for why they are values and why reserved;
+	// in the managed set, so the merge below reserves both names.
+	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -4298,12 +4847,6 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
 	// unset, so a broker rendered without these would crash-loop at boot rather
 	// than serve credentials to whoever reached the port.
-	//
-	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
-	// share no volume, so a working-tree clone in a directory the agent named is
-	// not something the broker can do at all — the fallback the flag guards
-	// elsewhere does not exist here, and an install that could switch it off
-	// would only be choosing to have the GitHub-writing skills fail.
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
@@ -4314,7 +4857,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// than as "the gateway has the shell's role" — so the two can roll in
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		// The profile workers' ServiceAccounts join the list only with a
+		// profile caller to confer the role on; the broker holds each to the
+		// profile audience by the identity map rendered below.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, owned)}, profiles.callers()...), ",")},
 		// The watchers' audience, in both modes: agent-api-auth always runs
 		// them.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
@@ -4334,10 +4880,16 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
 		)
 	}
+	// The MCP server's audience, under its flag on a mode-next install only
+	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
+	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
+	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
+	// The profile workers' audience, identity map and the task-signing public
+	// key, with a profile caller only (credential_proxy_profiles.go).
+	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
@@ -4399,17 +4951,11 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
 			}
 		}
-		// The pair arms the broker's own Socket Mode connection
-		// (credential_proxy.py, serve: SlackRelay), the legacy consumer.
-		// Under next the A2A gateway opens the app's connection on the same
-		// refs, and Slack spreads an app's events across every connection it
-		// has open, so the broker is not handed the pair; see a2aSlackArmed.
-		if slack := integration.Slack; legacySlackConsumer(agent) {
-			envVars = append(envVars,
-				corev1.EnvVar{Name: "SLACK_BOT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")}},
-				corev1.EnvVar{Name: "SLACK_APP_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")}},
-			)
-		}
+		// No Slack token pair: the A2A gateway opens the app's one Socket
+		// Mode connection on the CR's refs, and Slack spreads an app's events
+		// across every connection it has open, so the broker's own relay
+		// (credential_proxy.py, serve: SlackRelay) is never armed; see
+		// a2aSlackArmed.
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			envVars = append(envVars,
 				corev1.EnvVar{Name: "TEAMS_APP_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppIdSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_ID")}},
@@ -4424,6 +4970,10 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	// is what enforces the base, and the agent and the shell sandbox get no
 	// copy they could be mistaken for the authority over.
 	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
+	// The Pub/Sub platform relay's subscription set, from the AgentPlugin
+	// configs (platformagent_pubsub_relay.go). Absent when no plugin configures
+	// a Pub/Sub platform, and the broker refuses every relayed Pub/Sub call.
+	envVars = append(envVars, platformPubsubEnv(pluginPubsubSubscriptions(agent, agentPlugins))...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
@@ -4508,6 +5058,37 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the MCP audience would decide who holds the mcp
+		// role. The MCP pod's own pair is not merged with spec.deployment.env
+		// at all; reserved here as well so no broker-side container can be
+		// handed a name the MCP client reads.
+		credentialProxyMCPAudienceEnvVar,
+		// And one that could set the MCP callers could unbind the MCP
+		// ServiceAccount from its audience, or bind another to it.
+		credentialProxyMCPCallersEnvVar,
+		// The scope role's three: one that could set the audience or the
+		// callers would decide who holds the scope role, and one that could
+		// set the file would choose the declaration that bounds its
+		// arguments.
+		credentialProxyScopeAudienceEnvVar,
+		credentialProxyScopeCallersEnvVar,
+		credentialProxyScopeFileEnvVar,
+		a2aMCPBrokerURLEnvVar,
+		a2aMCPBrokerTokenFileEnvVar,
+		// The profile role's four, by name because each is rendered only
+		// with a profile caller. One that could set the audience or the
+		// identity map would decide who holds the profile role and as which
+		// (profile, tier); one that could set the signing keys would choose
+		// whose task credentials the broker trusts, and so which cluster a
+		// profile task's calls are confined to; one that could set the
+		// lifetime would choose how long a credential lives.
+		credentialProxyProfileAudienceEnvVar,
+		credentialProxyProfileIdentitiesEnvVar,
+		credentialProxyTaskSigningKeysEnvVar,
+		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -4517,6 +5098,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		watcherSubscriptionEnvVar,
 		watcherBrokerURLEnvVar,
 		watcherBrokerTokenFileEnvVar,
+		// The platform Pub/Sub relay's set, by name: it is rendered only
+		// when a plugin configures a Pub/Sub platform, so the managed-names
+		// loop does not protect it on an install without one, and a CR
+		// that set it would open the relay to whatever the broker's
+		// credential can pull.
+		platformPubsubSubscriptionsEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a
@@ -4716,8 +5303,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Reports: a fleet-audit cron report and the first inventory report
 	//     post as Block Kit, laid out again as a headline and the top findings
 	//     (the audit's rest counted and left to its ledger, the inventory's
-	//     behind a "See all" button), through the credential
-	//     proxy's Slack relay to the channel or thread the report was already
+	//     behind a "See all" button), through the A2A gateway's
+	//     notify route to the channel or thread the report was already
 	//     bound for; the audit's counts come from its ledger issue, read
 	//     through the forge broker.
 	//   - Thread status: less of a delegated card's delivery posts in the
@@ -4770,6 +5357,71 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
+
+		// Seconds a workload's admitted event folds its later events into
+		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
+		// session_kv_server.py). The container carries the default
+		// (incidentWorkloadDedupDefaultSeconds); an entry here replaces it,
+		// and "0" turns folding off. Parsed as a whole number and capped at a
+		// day, and a value that does not parse means the default, so it
+		// bounds a count of chat messages and triage turns and reaches
+		// nothing else.
+		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
+
+		// "true" has an event triage also file a card that opens the
+		// report's recommended fix as a GitOps pull request, without waiting
+		// for a human `apply` (INCIDENT_TRIAGE_OPEN_PULL_REQUEST in
+		// session_kv_server.py). Any other value, unset included, is off. It
+		// changes which cards the front door files and nothing else: the pull
+		// request still goes through submit-suggestion and a human merges it.
+		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
+
+		// How many Cluster Agent profiles one reconcile run scaffolds before it
+		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
+		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a
+		// positive integer reads as the default, so an arbitrary value bounds
+		// how many profiles a run creates and reaches nothing else.
+		"BOOTSTRAP_MAX_CREATES_PER_TICK": {},
+
+		// The group size above which the front door's injected roster counts
+		// a shared-role group (the Cluster Agents) by project and location
+		// instead of naming each (agents/chat/scripts/agent_roster.py,
+		// summary_threshold; default 20). Parsed as a whole number of zero
+		// or more, and any other value means the default, so it changes how
+		// many names one block of prompt text carries and reaches nothing
+		// else: the names it withholds come back through the same module's
+		// list_agents filter, and no value adds an agent, a path or a
+		// destination.
+		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
+
+		// The idle policy's two thresholds, in days
+		// (agents/chat/scripts/cron_idle_policy.py): after this many days
+		// without a chat message the dispatcher holds the Platform Agent's
+		// model-run cron jobs to once a window, and after the second it holds
+		// them until a message arrives. Each is parsed as a whole number; `0`
+		// turns its stage off and anything else means the default. A value
+		// changes only how often jobs already on the roster run, by moving
+		// their next_run_at in the profile's own store, and adds no job, path,
+		// destination or credential.
+		"CRON_IDLE_HIBERNATE_DAYS": {},
+		"CRON_IDLE_THROTTLE_DAYS":  {},
+
+		// The catch-up policy's step, in minutes
+		// (agents/chat/scripts/cron_catch_up_policy.py): after a pause the
+		// dispatcher skips a model-run cron job's catch-up when it is a whole
+		// period late and releases the rest this far apart. Parsed as a whole
+		// number; `0` turns the policy off and anything else means the
+		// default. Like the two above it changes only when jobs already on
+		// the roster run, by moving their next_run_at in the profile's own
+		// store, and adds no job, path, destination or credential.
+		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -4834,7 +5486,7 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
-		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		{Name: brokerMinterVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
@@ -4915,15 +5567,27 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // agentAPIProbe returns a probe that asks the Hermes API on loopback for one
-// session. Callers supply periodSeconds and failureThreshold, which is the only
-// difference between the gateway's startup and readiness probes: the startup
-// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
-// while readiness afterwards should withdraw the pod quickly.
+// session. Callers supply the period, failure threshold and timeout, which is
+// the only difference between the gateway's startup and readiness probes: the
+// startup one has to cover a cold boot that scaffolds every profile onto a
+// fresh PVC, while readiness afterwards should withdraw the pod quickly. The
+// values, and why each is what it is, are the agentAPI*Probe* constants at the
+// top of this file.
 //
 // /api/sessions is the endpoint the agent's own callers use — see the pubsub
 // adapter and admin_console — and the Authorization: Bearer form is theirs too.
-// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
-// 1-second default timeout is far too tight for a container this busy at boot.
+// It stays the probe's target although Hermes also serves an unauthenticated,
+// constant GET /health: that route proves the listener and nothing else, while
+// this one proves the bearer key the entrypoint handed the container matches
+// the one the API server loaded (a disagreement holds the pod out of Ready
+// instead of 401ing every in-pod caller quietly; docker-entrypoint.sh checks
+// the same agreement before exec and names this probe in its warning) and
+// that the session store the callers write to answers. Every timing is
+// explicit, per the gke-reliability skill's
+// rule 3; kubelet's 1-second default timeout is far too tight for a container
+// this busy at boot. curl's --max-time sits agentAPIProbeCurlMarginSeconds
+// under TimeoutSeconds, so a listener that accepts and then hangs is curl's
+// exit 28 rather than kubelet's exec kill.
 //
 // The exit-7 branch is what makes this probe safe above one replica. At
 // replicas > 1 the container runs leader_elect.py, and a pod that does not hold
@@ -4941,13 +5605,13 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 // which still fail. Detecting the standby by looking for the process instead
 // would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
 // the string "hermes gateway run" never appears in any command line to match.
-func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+func agentAPIProbe(periodSeconds, failureThreshold, timeoutSeconds int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
 				Command: []string{
 					"sh", "-c",
-					`curl --fail --silent --show-error -o /dev/null ` +
+					fmt.Sprintf(`curl --fail --silent --show-error --max-time %d -o /dev/null `, timeoutSeconds-agentAPIProbeCurlMarginSeconds) +
 						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
 						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
 						`[ "$rc" -eq 0 ] && exit 0; ` +
@@ -4956,9 +5620,9 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 				},
 			},
 		},
-		InitialDelaySeconds: 5,
+		InitialDelaySeconds: agentAPIProbeInitialDelaySeconds,
 		PeriodSeconds:       periodSeconds,
-		TimeoutSeconds:      5,
+		TimeoutSeconds:      timeoutSeconds,
 		FailureThreshold:    failureThreshold,
 	}
 }
@@ -4993,19 +5657,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// container below and to platform-agent-dashboard further down. A CR that
 	// names the projected bus token here therefore puts the agent's own bus
 	// identity into a second container -- see a2aStripBusTokenVolumeMounts.
-	// Gated on the surface for the same reason the strips up there are: on a
-	// today install there is no such volume, and dropping a name only the next
-	// stack cares about would be one more way to tell the feature exists.
 	// The source half of the same reservation takes the mounts of any user
 	// volume buildPodTemplateSpec dropped for what it projects or which
 	// Secret it names; see a2aBusCredentialVolumeNames.
 	// The watchers' broker token, on this fifth surface; see
 	// watcherTokenSourceNames. In either mode.
 	extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, watcherTokenSourceNames(agent))
-	if a2aAgentSurface(agent) {
-		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
-		extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))
-	}
+	extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+	extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))
 
 	resources := resolveResources(agent.Spec.Deployment)
 
@@ -5017,10 +5676,16 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		userVolumeMounts = append(userVolumeMounts, extraVolumeMounts...)
 	}
 	volumeMounts := append(dropTmpScratchIfClaimed(buildDefaultVolumeMounts(homeDir), userVolumeMounts), userVolumeMounts...)
+	if scopePublisherRendered(agent) {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: resolvedScopeVolumeName, MountPath: resolvedScopeDir, ReadOnly: true})
+	}
 	// The staged SSH key, read-only. Only the emptyDir the init container wrote —
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
+	if a2aSlackArmed(agent) {
+		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
+	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
@@ -5162,8 +5827,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 90),
-			ReadinessProbe:  agentAPIProbe(15, 3),
+			StartupProbe:    agentAPIProbe(agentAPIStartupProbePeriodSeconds, agentAPIStartupProbeFailureThreshold, agentAPIStartupProbeTimeoutSeconds),
+			ReadinessProbe:  agentAPIProbe(agentAPIReadinessProbePeriodSeconds, agentAPIReadinessProbeFailureThreshold, agentAPIReadinessProbeTimeoutSeconds),
 			SecurityContext: hardenedSecurityContext(),
 		},
 	}
@@ -5395,15 +6060,20 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				ReadOnly:  true,
 			},
 			{
-				Name:      "fluent-bit-state",
-				MountPath: "/fluent-bit/state",
+				Name:      "system-metadata",
+				MountPath: fluentBitStateMount,
+				SubPath:   fluentBitStateSubPathPrefix + agent.Name,
 			},
 		},
 		// Read-only root and no /tmp, the only container here with neither. The config
-		// above buffers in memory (Mem_Buf_Limit, no storage.path), keeps its tail DB on
-		// the fluent-bit-state volume and outputs to stdout, so it writes nothing to the
-		// root filesystem. Handing it the agent's tmp-scratch would only give an
-		// LLM-driven container a path into the log shipper.
+		// above buffers in memory (Mem_Buf_Limit, no storage.path) and outputs to
+		// stdout, so it writes nothing to the root filesystem. Its one writable path
+		// is the cursor directory on the system-metadata claim (fluentBitStateMount),
+		// which no other container the operator renders mounts: the agent and the
+		// dashboard reach that claim only through subPath session, and only a CR's
+		// spec.deployment.extraVolumeMounts could hand them its root. Handing it the
+		// agent's tmp-scratch would only give an LLM-driven container a path into the
+		// log shipper.
 		SecurityContext: hardenedSecurityContext(),
 	})
 
@@ -5416,7 +6086,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 // buildDefaultVolumes generates the default volumes for PlatformAgent
 func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
-	return []corev1.Volume{
+	vols := []corev1.Volume{
 		{
 			Name: "platform-agent-data-vol",
 			VolumeSource: corev1.VolumeSource{
@@ -5491,12 +6161,6 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			},
 		},
 		{
-			Name: "fluent-bit-state",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
 			Name: "system-metadata",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
@@ -5542,10 +6206,46 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			},
 		},
 	}
+	// The scope publisher's resolved scope, under mode next only (#5621): optional,
+	// since the publisher writes the ConfigMap after the agent starts.
+	if scopePublisherRendered(agent) {
+		vols = append(vols, corev1.Volume{
+			Name: resolvedScopeVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: scopeResolvedConfigMapName(agent)},
+					Items:                []corev1.KeyToPath{{Key: scopeResolvedDataKey, Path: scopeResolvedDataKey}},
+					Optional:             ptr.To(true),
+					DefaultMode:          ptr.To(int32(0444)),
+				},
+			},
+		})
+	}
+	return vols
+}
+
+// agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.
+func agentAllowsSecretsRead(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead
+	}
+	return true
 }
 
 // buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
 func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+	return buildMinimalPlatformRoleWithSecrets(agent, agentAllowsSecretsRead(agent))
+}
+
+func buildMinimalPlatformRoleWithSecrets(agent *agentv1alpha1.PlatformAgent, allowSecretsRead bool) *rbacv1.ClusterRole {
+	coreResources := []string{
+		"nodes", "namespaces", "pods", "pods/log", "services", "endpoints",
+		"events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas",
+		"limitranges", "configmaps", "serviceaccounts",
+	}
+	if allowSecretsRead {
+		coreResources = append(coreResources, "secrets")
+	}
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5557,7 +6257,7 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"},
+				Resources: coreResources,
 				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
@@ -5593,6 +6293,37 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 			{
 				APIGroups: []string{"apiextensions.k8s.io"},
 				Resources: []string{"customresourcedefinitions"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			// The GitOps reconcilers' sync objects: which repository and directory
+			// syncs a cluster is often recorded only here, applied once by hand or
+			// by an installer. The gitops-helm-chart skill reads it to decide how to
+			// declare a chart; this grant merges after that skill, so the reader is in
+			// the tree before the read is. Only the kinds that name a sync's source and
+			// destination; HelmReleases, ApplicationSets, AppProjects and
+			// HelmRepositories are not needed for that and stay out, as do Argo
+			// CD's cluster and repository Secrets. An Application can still carry
+			// inline Helm values and a Kustomization substitutions, which this
+			// grant makes readable: the same exposure as the ConfigMap read above,
+			// accepted for now. Inert where the CRDs are absent.
+			{
+				APIGroups: []string{"argoproj.io"},
+				Resources: []string{"applications"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"kustomize.toolkit.fluxcd.io"},
+				Resources: []string{"kustomizations"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"source.toolkit.fluxcd.io"},
+				Resources: []string{"gitrepositories", "ocirepositories"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"configsync.gke.io"},
+				Resources: []string{"rootsyncs", "reposyncs"},
 				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
@@ -5749,7 +6480,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name              tail
     Tag               agent.logs
     Path              ` + fluentBitDataMount + `/logs/*.log
-    DB                /fluent-bit/state/fluent-bit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitLogsDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -5762,7 +6495,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Tag               agent.audit
     Path              ` + fluentBitAuditTailPath + `
     Parser            audit_json
-    DB                /fluent-bit/state/fluent-bit-audit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitAuditDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -5897,6 +6632,25 @@ func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptio
 
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: leaderRoleRules(replicas),
+	}
+}
+
+// leaderRoleRules is the leader Role's rule set for a gateway rendered at
+// replicas. Split from buildPlatformLeaderRole so the multi-replica rule set
+// stays testable while supportedGatewayReplicas keeps every render at one
+// (TestLeaderRolePodsRuleVerbsAboveOneReplica).
+func leaderRoleRules(replicas int32) []rbacv1.PolicyRule {
 	rules := []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{"coordination.k8s.io"},
@@ -5930,34 +6684,21 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	// the two policies in config/admission/agent-rbac-policy.yaml govern the
 	// content of a Role and the subject of a RoleBinding, not the objects a
 	// bound identity may then reach.
-	if replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment); replicas > 1 {
+	if replicas > 1 {
 		rules = append(rules, rbacv1.PolicyRule{
 			APIGroups: []string{""},
 			Resources: []string{"pods"},
 			Verbs:     []string{"get", "patch"},
 		})
 	}
-
-	return &rbacv1.Role{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "Role",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
-			Namespace: agent.Namespace,
-		},
-		Rules: rules,
-	}
+	return rules
 }
 
-// buildLeaderRoleBinding generates the RoleBinding manifest for leader election in the agent namespace
+// buildLeaderRoleBinding binds the leader Role to the gateway's own
+// ServiceAccount alone. Leader election runs in the gateway (leader_elect.py);
+// nothing in the credential broker's Pod touches a Lease or patches a pod, so
+// the broker, which used to share this subject, holds none of it.
 func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5967,13 +6708,7 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 			Name:      bindingName,
 			Namespace: agent.Namespace,
 		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
+		Subjects: []rbacv1.Subject{gatewaySubject(agent)},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
@@ -6331,11 +7066,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		apiPeers = formatCIDRPeers([]string{"10.96.0.1"}, true)
 	}
 
-	// The link-local address a workload actually connects to. Dataplane V2 (eBPF)
-	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
-	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
-	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
 			From: []networkingv1.NetworkPolicyPeer{
@@ -6420,47 +7150,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: dnsPeers,
 		},
-		// 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
-		//    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
-		//    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
-		//    the pre-NAT ALTS handshaker port, is deliberately absent — rule 3 says why.
-		{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-			},
-			To: linkLocalPeers,
-		},
-	}
-
-	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
-	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
-	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
-	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
-	//
-	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
-	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
-	//    because kube-agents components use standard OAuth2/REST token fetches and no client
-	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
-	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
-	//
-	//    That is a deviation from the guidance, which warns that workloads omitting these
-	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
-	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
-	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
-	//    of them.
-	if profile.MetadataDaemonIP != "" {
-		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
-		port := profile.MetadataDaemonPort
-		if port == 0 {
-			port = metadataDaemonDefaultPort
-		}
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
-			},
-			To: metadataDaemonPeers,
-		})
+		// No metadata-server rule. The gateway pod holds no Google identity (its
+		// ServiceAccount carries no Workload Identity annotation; the broker's does),
+		// and everything in it that called Google -- the remote MCP servers, the
+		// event watcher and the drift detector -- goes through the broker. The two
+		// rules that used to sit here admitted the link-local token fetch (port 80
+		// pre-NAT, the WI daemon port post-NAT); without them a token request from
+		// any container in the pod is dropped, which is what the conformance suite's
+		// metadata assertion checks.
 	}
 
 	egressRules = append(egressRules,
@@ -6630,8 +7327,8 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 
 	// 12. The credential broker. The gateway holds no credential and calls nothing
 	//     on the broker's credential surface, but the chat relay moved into that
-	//     pod with it, so GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL both address
-	//     this Service now — see credentialProxyBaseURL. Without the rule the
+	//     pod with it, so TEAMS_RELAY_URL addresses this Service — see
+	//     credentialProxyBaseURL. Without the rule the
 	//     gateway's pull against /v1/chat/events is dropped and the agent stops
 	//     receiving chat, while every pod stays Running and the CR reads Ready.
 	//     buildCredentialProxyNetworkPolicy already admits the gateway on this
@@ -6655,23 +7352,21 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	//     an address silently stops matching. Egress here is deny-by-default,
 	//     and a missing rule does not refuse the dial — it hangs it to the
 	//     timeout, the least diagnosable shape this failure has.
-	if a2aAgentSurface(agent) {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					PodSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							labelPartOf:       a2aPartOf,
-							a2aComponentLabel: "nats",
-						},
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: "nats",
 					},
 				},
 			},
-		})
-	}
+		},
+	})
 
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.

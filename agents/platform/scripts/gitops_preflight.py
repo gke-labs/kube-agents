@@ -42,7 +42,7 @@ under NO_REGISTERED_REPO.
 
 With --list it prints both registries instead, for reading rather than
 gating: `managed_repos` (swept, audited, sent pull requests) and
-`context_repos` (read for declared intent only, never written):
+`context_repos` (read-only: declared intent and diagnosis, never written):
 
     MANAGED: <repo> ... | none | none usable (<n> registered, unusable: ...)
     CONTEXT: <host/path>[@<ref>] ... | none           exit 0, or 5 if unreadable
@@ -105,8 +105,9 @@ REGISTRATION_STEPS = (
 # clipped notice keeps its start, so the fact and the remedy come before the
 # worker's instruction.
 STOP = (
-    'Stop now: call kanban_block(kind="needs_input") with this line, change nothing, '
-    "and do not look for another route or check again another way."
+    "Stop now: run no further commands. Your next call is "
+    'kanban_block(kind="needs_input") with this line; change nothing, and do not '
+    "look for another route or check again another way."
 )
 
 

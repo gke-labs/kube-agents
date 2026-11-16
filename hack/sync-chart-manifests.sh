@@ -2,11 +2,23 @@
 # Syncs the Helm chart's copies of operator-owned manifests from their source
 # of truth under k8s-operator/config/:
 #   - charts/kube-agents/crds/*.yaml are verbatim copies of config/crd/bases/.
-#   - The ClusterRole rules in templates/operator-rbac.yaml are spliced from
-#     config/rbac/role.yaml between the GENERATED RULES markers.
+#   - The RBAC rules in templates/operator-rbac.yaml are spliced from
+#     config/rbac/role.yaml: the ClusterRole document between the GENERATED RULES
+#     markers, the namespaced Role document between the GENERATED NAMESPACED RULES
+#     markers.
+#   - k8s-operator/config/profiles/role.yaml is the Role document of config/rbac/role.yaml,
+#     copied whole for the profile namespace's kustomization (kustomize refuses a resource
+#     above its own directory). The one destination under k8s-operator/config/.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
+#   - templates/a2a-gateway-pod-admission-policy.yaml is config/admission/a2a-gateway-pod-policy.yaml,
+#     verbatim, wrapped in the kube-agents.a2aGatewayPodPolicyEnabled helper, which the operator's
+#     A2A_GATEWAY_POD_POLICY env is set from too.
+#   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
+#     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
+#   - templates/a2a-dispatcher-job-admission-policy.yaml is config/admission/a2a-dispatcher-job-policy.yaml,
+#     likewise, under kube-agents.a2aDispatcherJobPolicyEnabled and A2A_DISPATCHER_JOB_POLICY.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
 #     the cert-manager objects), so it is compared rather than rewritten:
 #     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
@@ -14,9 +26,11 @@
 # And one derived file whose source is NOT under config/:
 #   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
 #     renders, which the chart's quota preflight cannot compute for itself. It is summed
-#     from the operator's golden manifest for the default example CR, not from config/ and
-#     not from a live render, so the golden is what you edit: change the operator, re-bless
-#     the golden, then sync. Syncing before re-blessing regenerates the old numbers.
+#     from the operator's settled golden manifest for the default example CR
+#     (platformagent-settled.yaml, the render once the bus is provisioned, which carries the
+#     hermes-bridge container, the provisioning Job and the A2A gateway), not from config/ and
+#     not from a live render, so the goldens are what you edit: change the operator, re-bless
+#     the goldens, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -25,13 +39,20 @@ CRD_SRC=k8s-operator/config/crd/bases
 CRD_DST=charts/kube-agents/crds
 ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
+readonly PROFILE_ROLE_DST=k8s-operator/config/profiles/role.yaml
 VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
+readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
+readonly GATEWAY_POD_VAP_TPL=charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_SRC=k8s-operator/config/admission/web-console-cr-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_TPL=charts/kube-agents/templates/web-console-cr-admission-policy.yaml
+readonly DISPATCHER_JOB_VAP_SRC=k8s-operator/config/admission/a2a-dispatcher-job-policy.yaml
+readonly DISPATCHER_JOB_VAP_TPL=charts/kube-agents/templates/a2a-dispatcher-job-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
 readonly FOOTPRINT_GEN=scripts/generate_chart_footprint.py
-readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml
+readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml
 readonly FOOTPRINT_DST=charts/kube-agents/files/footprint.yaml
 
 check=false
@@ -64,32 +85,48 @@ for dst in "$CRD_DST"/*.yaml; do
   fi
 done
 
-# ClusterRole rules: splice role.yaml's rules block between the markers.
-# Without the BEGIN marker the awk pass would copy the template unchanged and
-# both modes would silently pass with stale rules, so fail up front.
+# RBAC rules: role.yaml carries two documents, the ClusterRole from the
+# markers without `namespace=` and the Role from the ones with it (the write
+# verbs on every kind the operator renders, bound in the install namespace and
+# the profile namespace). Each document's rules block is spliced
+# between its own pair of markers: GENERATED RULES for the ClusterRole,
+# GENERATED NAMESPACED RULES for the Role. Without the BEGIN markers the awk
+# pass would copy the template unchanged and both modes would silently pass
+# with stale rules, so fail up front.
 grep -q '# BEGIN GENERATED RULES' "$RBAC_TPL" ||
   fail "missing BEGIN GENERATED RULES marker in $RBAC_TPL"
+grep -q '# BEGIN GENERATED NAMESPACED RULES' "$RBAC_TPL" ||
+  fail "missing BEGIN GENERATED NAMESPACED RULES marker in $RBAC_TPL"
 tmp=$(mktemp)
 awk -v rolefile="$ROLE_SRC" '
-  /# BEGIN GENERATED RULES/ {
-    print
-    found = 0
+  # splice(kind) prints the rules of the role.yaml document whose kind is
+  # kind: lines after that document'"'"'s "rules:" up to the next "---".
+  function splice(kind,    line, inkind, found, printed) {
+    inkind = 0; found = 0; printed = 0
     while ((getline line < rolefile) > 0) {
-      if (found) print line
-      if (line == "rules:") found = 1
+      if (line == "---") { inkind = 0; found = 0; continue }
+      if (line == "kind: " kind) { inkind = 1; continue }
+      if (inkind && found) { print line; printed++ }
+      if (inkind && line == "rules:") found = 1
     }
     close(rolefile)
-    skip = 1
-    next
+    if (printed == 0) {
+      print "ERROR: no rules found for kind " kind " in " rolefile > "/dev/stderr"
+      exit 1
+    }
   }
+  /# BEGIN GENERATED NAMESPACED RULES/ { print; splice("Role"); skip = 1; next }
+  /# BEGIN GENERATED RULES/ { print; splice("ClusterRole"); skip = 1; next }
+  /# END GENERATED NAMESPACED RULES/ { skip = 0 }
   /# END GENERATED RULES/ { skip = 0 }
   !skip { print }
-' "$RBAC_TPL" >"$tmp"
+' "$RBAC_TPL" >"$tmp" || { rm -f "$tmp"; fail "splice failed — check $ROLE_SRC formatting"; }
 
 # Sanity-check the splice: a missing END marker would truncate the template,
 # and a reformatted role.yaml (e.g. "rules:" no longer at column 0) would
 # splice zero rules into the ClusterRole.
 grep -q '# END GENERATED RULES' "$tmp" || { rm -f "$tmp"; fail "splice lost the END marker in $RBAC_TPL"; }
+grep -q '# END GENERATED NAMESPACED RULES' "$tmp" || { rm -f "$tmp"; fail "splice lost the END NAMESPACED marker in $RBAC_TPL"; }
 grep -q '^  - apiGroups:' "$tmp" || { rm -f "$tmp"; fail "splice produced no rules — check $ROLE_SRC formatting"; }
 
 if $check; then
@@ -97,6 +134,30 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$RBAC_TPL"
+fi
+
+# The profile namespace's copy of the Role document, for the kustomize path.
+# config/profiles is its own kustomization (config/default's `namespace:`
+# would rewrite the Role into the install namespace), and kustomize refuses a
+# resource above its own directory, so the Role document is copied there
+# whole, under a header, and held to role.yaml here the way the chart's
+# spliced block is. The kustomization's namespace and prefix do the rest.
+tmp=$(mktemp)
+{
+  echo "# GENERATED from $ROLE_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo "# The Role document of that file (the +kubebuilder:rbac markers with"
+  echo "# \`namespace=\`), rendered into the profile namespace by this kustomization."
+  # Records are the `---`-separated documents; the one whose kind line reads
+  # `kind: Role` (and not `kind: ClusterRole`) is the namespaced document.
+  awk 'BEGIN { RS = "---\n"; ORS = "" } /\nkind: Role\n/ { print "---\n" $0 }' "$ROLE_SRC"
+} >"$tmp"
+grep -q '^kind: Role$' "$tmp" || { rm -f "$tmp"; fail "no Role document found in $ROLE_SRC for $PROFILE_ROLE_DST"; }
+if $check; then
+  [[ -f "$PROFILE_ROLE_DST" ]] || { rm -f "$tmp"; fail "profile Role copy missing: $PROFILE_ROLE_DST"; }
+  diff -u "$PROFILE_ROLE_DST" "$tmp" >&2 || { rm -f "$tmp"; fail "profile Role copy out of date vs $ROLE_SRC: $PROFILE_ROLE_DST"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$PROFILE_ROLE_DST"
 fi
 
 # Admission policies: the whole template is generated, so there is nothing in it
@@ -134,6 +195,74 @@ else
   mv "$tmp" "$VAP_TPL"
 fi
 
+# The gateway's pod policy: the same shape, under the helper rather than an inline gate,
+# because the operator Deployment's A2A_GATEWAY_POD_POLICY is rendered from that helper
+# too, and one condition in one place is what keeps the two from disagreeing. Verbatim:
+# the policy names no release-scoped identity, so there is nothing to substitute.
+[[ -f "$GATEWAY_POD_VAP_SRC" ]] || fail "admission policy source missing: $GATEWAY_POD_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}'
+  echo "# GENERATED from $GATEWAY_POD_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.a2aGatewayPodPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30. The operator'"'"'s A2A_GATEWAY_POD_POLICY'
+  echo '# is set from the same helper.'
+  cat "$GATEWAY_POD_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$GATEWAY_POD_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $GATEWAY_POD_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$GATEWAY_POD_VAP_TPL"
+fi
+
+# The web console's PlatformAgent policy: the same shape, under its own helper, which
+# also holds it to the installs where the console's ServiceAccount and its Role on the
+# CR render. Verbatim: the policy selects the console by its name's suffix, so there is
+# nothing release-scoped to substitute.
+[[ -f "$WEB_CONSOLE_CR_VAP_SRC" ]] || fail "admission policy source missing: $WEB_CONSOLE_CR_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.webConsoleCRPolicyEnabled" . }}'
+  echo "# GENERATED from $WEB_CONSOLE_CR_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.webConsoleCRPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30, with the web console and its'
+  echo '# environment page on.'
+  cat "$WEB_CONSOLE_CR_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$WEB_CONSOLE_CR_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $WEB_CONSOLE_CR_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$WEB_CONSOLE_CR_VAP_TPL"
+fi
+
+# The dispatcher's Job policy: the gateway's shape, under its own helper, which the
+# operator's A2A_DISPATCHER_JOB_POLICY is rendered from (the operator runs Job mode only
+# under it).
+[[ -f "$DISPATCHER_JOB_VAP_SRC" ]] || fail "admission policy source missing: $DISPATCHER_JOB_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.a2aDispatcherJobPolicyEnabled" . }}'
+  echo "# GENERATED from $DISPATCHER_JOB_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.a2aDispatcherJobPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30. The operator'"'"'s A2A_DISPATCHER_JOB_POLICY'
+  echo '# is set from the same helper.'
+  cat "$DISPATCHER_JOB_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$DISPATCHER_JOB_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $DISPATCHER_JOB_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$DISPATCHER_JOB_VAP_TPL"
+fi
+
 # Webhooks: compared, not generated. The failure message is deliberately not fail(),
 # because `make chart-sync` does not touch this template; the fix is a hand edit.
 # The script exits 1 on drift and 2 when it could not run (no helm, no PyYAML,
@@ -156,7 +285,7 @@ if $check; then
   python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
   if [[ $footprint_rc -eq 1 ]]; then
     echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
-    echo "       $FOOTPRINT_SRC is a golden, so re-bless it before syncing:" >&2
+    echo "       Both are goldens, so re-bless them before syncing:" >&2
     echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
     echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
     echo "       unrelated -update flag of its own that exits 0 and leaves this golden stale." >&2

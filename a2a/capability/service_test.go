@@ -228,6 +228,7 @@ func TestABrokerThatCannotReachTheVerifierIsRefusedRatherThanAllowed(t *testing.
 	nc := runServer(t) // no verifier subscribed
 	c := clientAs(t, nc, podB)
 	c.Timeout = 200 * time.Millisecond
+	c.ReachWindow = time.Second // the reach window has its own tests (reach_test.go)
 	err := c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1},
 		VerbTaskExecute, "project/P")
 	mustRefuse(t, err, "the verifier could not be reached")

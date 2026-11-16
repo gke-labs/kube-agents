@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("hermes.plugin.common.redactor")
 
 SALT_ENV_VAR = "SESSION_KV_SALT"
+RULE_FILE_ENCODING = "utf-8"
 
 # The two things a configured rule may do to a match. `mask` replaces it with
 # a fixed marker; `pseudonym` replaces it with a salted HMAC prefix, so the
@@ -102,6 +103,11 @@ EMAIL_MARKER = "[REDACTED_EMAIL]"
 # a blanked `password: [REDACTED_SECRET]` line into `[REDACTED_SECRET]]`.
 REDACTED_MARKER_PREFIX = "[REDACTED_"
 WHOLE_MARKER_PATTERN = re.compile(r"^\[REDACTED_[A-Z0-9_]+\]$")
+#: A marker this module writes, wherever it sits in a text: a mask ``[REDACTED_<NAME>]``
+#: or a pseudonym ``[<name>:<hex>]``. ``apply_rules`` never rewrites one, so a second
+#: pass over redacted text, at the gateway after the image or the other way round,
+#: is a no-op and both layers hold the same token.
+MARKER_SPAN_PATTERN = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9][A-Za-z0-9_.\-]*:[0-9a-f]{%d})\]" % PSEUDONYM_HEX_LENGTH)
 # Values a credential-named key can hold that are not credentials:
 # `automountServiceAccountToken: false` is a switch, `value: none` a
 # placeholder, and masking either puts a marker where a manifest needs the
@@ -646,8 +652,40 @@ class AuditRedactor:
         given for that reason; this method reads ``rules`` once and trusts it.
         """
         counts: Dict[str, int] = {}
-        if not text:
+        if not text or not rules:
             return text, counts
+        # Rules run over the gaps between markers already in the text, never over
+        # a marker: a pattern loose enough to match a rule name or a hex run would
+        # otherwise nest a marker inside the one a previous pass wrote.
+        pieces: List[str] = []
+        position = 0
+        for marker in MARKER_SPAN_PATTERN.finditer(text):
+            pieces.append(cls._apply_rules_to_gap(text[position:marker.start()], rules, counts))
+            pieces.append(marker.group(0))
+            position = marker.end()
+        pieces.append(cls._apply_rules_to_gap(text[position:], rules, counts))
+        return "".join(pieces), counts
+
+    @classmethod
+    def _apply_rules_to_gap(cls, text: str, rules: Sequence[RedactionRule], counts: Dict[str, int]) -> str:
+        if not text:
+            return text
+        for rule in rules:
+
+            def substitute(match: "re.Match[str]", rule: RedactionRule = rule) -> str:
+                matched = match.group(0)
+                value: Optional[str] = matched
+                if rule.canonical is not None:
+                    value = rule.canonical(matched)
+                    if value is None:
+                        return matched
+                counts[rule.name] = counts.get(rule.name, 0) + 1
+                if rule.action == RULE_ACTION_PSEUDONYM:
+                    return f"[{rule.name}:{cls.hmac_hash(value)[:PSEUDONYM_HEX_LENGTH]}]"
+                return rule.mask
+
+            text = rule.pattern.sub(substitute, text)
+        return text
         for rule in rules:
 
             def substitute(match: "re.Match[str]", rule: RedactionRule = rule) -> str:
@@ -697,6 +735,32 @@ class AuditRedactor:
             RedactionRule(IP_RULE_NAME, IPV4_CANDIDATE_PATTERN, action, canonical),
             RedactionRule(IP_RULE_NAME, IPV6_CANDIDATE_PATTERN, action, canonical),
         ]
+
+    @classmethod
+    def rules_from_file(cls, path: str) -> List[RedactionRule]:
+        """Read the rendered ``redaction.yaml`` and build the rule list; raise ``ValueError`` on any defect.
+
+        The one loader for the gateway's pre-call hook and the agent image's
+        on-disk redaction, so the two cannot drift on an edge case: an empty or
+        falsy document is the empty mapping (the default IP rules), anything
+        else that is not a mapping is refused by name, and a file that cannot
+        be read or parsed is refused with the reason.
+        """
+        import yaml  # every caller runs where PyYAML is installed; not needed by the string paths
+
+        try:
+            with open(path, "r", encoding=RULE_FILE_ENCODING) as handle:
+                config = yaml.safe_load(handle) or {}
+        except OSError as error:
+            raise ValueError(f"cannot read {path}: {error}") from error
+        except yaml.YAMLError as error:
+            raise ValueError(f"{path} is not valid YAML: {error}") from error
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} must hold a mapping, not {type(config).__name__}")
+        try:
+            return cls.rules_from_config(config)
+        except ValueError as error:
+            raise ValueError(f"{path}: {error}") from error
 
     @classmethod
     def rules_from_config(cls, config: Optional[Mapping[str, Any]]) -> List[RedactionRule]:

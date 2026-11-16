@@ -87,6 +87,11 @@ func IsStatusQuery(text string, wide bool) bool {
 	return statusish && interrogative
 }
 
+// DelegateWord opens a delegation (IsDelegate). Exported so a reader that
+// has to recognise the bare word, which IsDelegate refuses, matches the
+// same spelling.
+const DelegateWord = "delegate"
+
 // IsDelegate reports whether the turn asks for a delegated session worker -
 // the demo's "Delegate" flow, W4 amendment. Deterministic prefix, no model,
 // same shape as IsStatusQuery: the normalized text must START with
@@ -94,7 +99,7 @@ func IsStatusQuery(text string, wide bool) bool {
 // keeps its punctuation and casing - it is the task) is returned. A bare
 // "delegate" with nothing to do is not a delegation.
 func IsDelegate(text string) (string, bool) {
-	const word = "delegate"
+	const word = DelegateWord
 	trimmed := strings.TrimSpace(text)
 	if len(trimmed) < len(word) || !strings.EqualFold(trimmed[:len(word)], word) {
 		return "", false
@@ -117,13 +122,36 @@ func IsDelegate(text string) (string, bool) {
 	return rest, true
 }
 
-// slashSessionWord and slashOffWord spell the one slash command the gateway
-// resolves itself. Spec-chatops-gateway "Sessions by default": a slash
-// command resolves first, names a route rather than a handle, and is a
+// slashSessionWord and slashOffWord spell the first of the slash commands
+// the gateway resolves itself. Spec-chatops-gateway "Sessions by default": a
+// slash command resolves first, names a route rather than a handle, and is a
 // debugging/opt-in door for the transition rather than the taught interface.
+// slashFeedbackWord is the second (docs/designs/chat-feedback-command.md):
+// bare, the gateway answers it with the two reporting links below; with text
+// after it, the gateway passes the message through as typed.
 const (
-	slashSessionWord = "session"
-	slashOffWord     = "off"
+	slashSessionWord  = "session"
+	slashOffWord      = "off"
+	slashFeedbackWord = "feedback"
+	// slashSetHomeWord is Hermes's own "/sethome", and the typed "/hermes
+	// sethome" its legacy plugin used to unwrap, which the Slack adapter
+	// answers itself under mode next (IsSetHomeCommand).
+	slashSetHomeWord = "sethome"
+	slashHermesWord  = "hermes"
+	// slashFeedbackSummaryWord is the one argument the gateway answers itself:
+	// "/feedback summary" posts the install's identifier-free usage and
+	// feedback summary (docs/designs/chat-feedback-command.md, part 7).
+	slashFeedbackSummaryWord = "summary"
+)
+
+// The two places a report about kube-agents itself goes, as the gateway's
+// bare-/feedback notice hands them out. The same two links are pinned in the
+// personas by tests/test_feedback_reference.py, and the short link is the
+// docs site's redirect to the form (scripts/feedback_form/README.md), never
+// a Google Forms URL, so a recreated form needs no release.
+const (
+	FeedbackTrackerURL = "https://github.com/gke-labs/kube-agents/issues"
+	FeedbackFormURL    = "https://gke-labs.github.io/kube-agents/feedback"
 )
 
 // IsSessionCommand reports whether the turn is "/session": a leading "/"
@@ -136,16 +164,62 @@ const (
 // is refused client-side), so there the form is "@<bot> /session" - the
 // mention is stripped before this reads the text.
 func IsSessionCommand(text string) (string, bool) {
+	return slashWord(text, slashSessionWord)
+}
+
+// IsFeedbackCommand reports whether the turn is "/feedback": the same shape
+// as IsSessionCommand. rest is "" for a bare "/feedback", which the gateway
+// answers itself with FeedbackTrackerURL and FeedbackFormURL; "summary" is
+// the usage summary the gateway also answers itself (IsFeedbackSummaryCommand);
+// anything else is the report the person wants written up, and the gateway
+// hands the text on as typed, prefix included, for the agent to compose and
+// confirm.
+func IsFeedbackCommand(text string) (string, bool) {
+	return slashWord(text, slashFeedbackWord)
+}
+
+// IsFeedbackSummaryCommand reports whether the turn is "/feedback summary",
+// the one "/feedback <text>" the gateway answers in place rather than handing
+// to the agent: the text after the word is exactly "summary", case-insensitively.
+func IsFeedbackSummaryCommand(text string) bool {
+	rest, ok := IsFeedbackCommand(text)
+	return ok && strings.EqualFold(rest, slashFeedbackSummaryWord)
+}
+
+// IsSetHomeCommand reports whether the turn asks to set the home channel the
+// Hermes way: "/sethome" (bare or with text after it, since Hermes's own took
+// none) or "/hermes sethome", case-insensitively. Not part of IsCommand: the
+// Slack adapter answers it itself before the text becomes a turn, and every
+// other reader of a turn's text treats it as the turn it was.
+func IsSetHomeCommand(text string) bool {
+	if _, ok := slashWord(text, slashSetHomeWord); ok {
+		return true
+	}
+	rest, ok := slashWord(text, slashHermesWord)
+	if !ok {
+		return false
+	}
+	word := rest
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		word = rest[:end]
+	}
+	return strings.EqualFold(word, slashSetHomeWord)
+}
+
+// slashWord resolves one slash command: a leading "/" (after trimming)
+// followed by word, case-insensitively, then the end of the text or
+// whitespace. rest is the ORIGINAL text after the word, trimmed.
+func slashWord(text, word string) (string, bool) {
 	trimmed := strings.TrimSpace(text)
-	if len(trimmed) < 1+len(slashSessionWord) || trimmed[0] != '/' {
+	if len(trimmed) < 1+len(word) || trimmed[0] != '/' {
 		return "", false
 	}
 	body := trimmed[1:]
-	word, rest := body, ""
+	got, rest := body, ""
 	if end := strings.IndexFunc(body, unicode.IsSpace); end >= 0 {
-		word, rest = body[:end], strings.TrimSpace(body[end:])
+		got, rest = body[:end], strings.TrimSpace(body[end:])
 	}
-	if !strings.EqualFold(word, slashSessionWord) {
+	if !strings.EqualFold(got, word) {
 		return "", false
 	}
 	return rest, true
@@ -171,7 +245,7 @@ func IsStop(text string) bool {
 }
 
 // IsCommand reports whether the gateway would act on text as a command on
-// any route and in any task state: the superset of the four matchers, with
+// any route and in any task state: the superset of the five matchers, with
 // the status ask in its wide form. A chat message's choice must not be one
 // (spec-a2a-payloads.md, "Chat messages"), since a click posts its text as
 // the clicker's own message.
@@ -180,6 +254,12 @@ func IsCommand(text string) bool {
 		return true
 	}
 	if _, ok := IsSessionCommand(text); ok {
+		return true
+	}
+	// The bare form and "/feedback summary", the two the gateway answers in
+	// place: any other "/feedback <text>" is an ordinary turn the agent
+	// answers, and a button may well offer one.
+	if rest, ok := IsFeedbackCommand(text); ok && (rest == "" || IsFeedbackSummaryCommand(text)) {
 		return true
 	}
 	_, ok := IsDelegate(text)

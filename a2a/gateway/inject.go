@@ -118,6 +118,12 @@ const (
 	// costs, so it gets a turn's bound.
 	probeParam   = "probe"
 	probeTimeout = turnTimeout
+	// usageParam=usageChain asks a probed read for the front door's usage
+	// (ConversationState.Usage). The per-poll probe leaves it out because
+	// summing a delegation chain reads one stream per link; a caller asks
+	// once, after the terminal.
+	usageParam = "usage"
+	usageChain = "chain"
 
 	// injectSeenCap bounds the dedupe memory for accepted POSTs, keyed by
 	// the caller's backend message id -- the same shape and size as the
@@ -477,6 +483,31 @@ type probeReport struct {
 	// Progress is the last text part of the progress artifact -- the line
 	// the relay's rolling edit shows -- at the instant of the read.
 	Progress string `json:"progress,omitempty"`
+	// Usage is what the front door's own turns cost at the read
+	// (ConversationState.Usage): the task's usage parts summed with, for a
+	// delegation chain's root, every wake's that continued it, and never a
+	// child's. Present only on a read that asked for it (usageParam), and
+	// absent then when no turn published usage, when a stream could not be
+	// read, and on a door older than the field. A read after the terminal
+	// carries every turn's, since each executor publishes a turn's usage
+	// before its terminal.
+	Usage *lib.Usage `json:"usage,omitempty"`
+	// ChildUsage is the same sum over the chain's child tasks, the
+	// addressees the front door delegated to, and UsagePartial says a
+	// link's stream could not be read, so both sums are short of that link
+	// (ConversationState). Present, like Usage, only on a read that asked.
+	ChildUsage   *lib.Usage `json:"childUsage,omitempty"`
+	UsagePartial bool       `json:"usagePartial,omitempty"`
+	// ChildAddressees names whom the chain delegated to, each child's
+	// addressee once in the order delegated: the profile its address
+	// resolved to (a pinned profile's own name, when a cluster target picked
+	// it) or platform, never a task id (ConversationState). On every read,
+	// since it comes from the record: [] when the chain delegated nothing,
+	// null when the read had no task to look at (no record, no task, or a
+	// read that failed), and absent only on a door older than
+	// the field, so a harness can tell "none" from "can't say". The inject
+	// door's alone: no chat surface or the console reports it.
+	ChildAddressees []string `json:"childAddressees"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1817,6 +1848,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 		wait = injectMaxWait
 	}
 	taskID := r.URL.Query().Get("task")
+	chainUsage := r.URL.Query().Get(usageParam) == usageChain
 	probeAsked, err := intParam(r, probeParam)
 	if err != nil {
 		injectError(w, http.StatusBadRequest, err.Error())
@@ -1824,7 +1856,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	var probed *probeReport
 	if probeAsked != 0 {
-		probed = a.runProbe(r.Context(), key, taskID)
+		probed = a.runProbe(r.Context(), key, taskID, chainUsage)
 		probed.LastPost = a.lastPost(key)
 		if probed.Final {
 			// A terminal on the stream is the answer; nothing the relay
@@ -1842,7 +1874,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			if probeAsked != 0 && waited {
 				// Time moved on under the wait; the probe has to describe
 				// where the stream is now, beside the entries that are.
-				probed = a.runProbe(r.Context(), key, taskID)
+				probed = a.runProbe(r.Context(), key, taskID, chainUsage)
 				probed.LastPost = a.lastPost(key)
 			}
 			writeJSON(w, http.StatusOK, conversationResponse{
@@ -1873,9 +1905,12 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 // Never a failure status: the transcript half of the reply is good whatever
 // the probe found, and a caller reads "could not look" out of the report's
 // error rather than out of a 5xx it would retry the whole poll for.
-func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probeReport {
+func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainUsage bool) *probeReport {
 	if a.probe == nil {
 		return &probeReport{Error: "the gateway offered this door no probe"}
+	}
+	if chainUsage {
+		ctx = withChainUsage(ctx)
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -1894,10 +1929,14 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 		ReachedWorking: state.ReachedWorking,
 		// Bounded like an entry: a result is an agent's report and rides
 		// the same in-memory transcript budget.
-		TerminalSource: string(state.TerminalSource),
-		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
-		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
-		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
+		TerminalSource:  string(state.TerminalSource),
+		Result:          truncateRunes(state.Result, injectMaxEntryBytes),
+		Reason:          truncateRunes(state.Reason, injectMaxEntryBytes),
+		Progress:        truncateRunes(state.Progress, injectMaxEntryBytes),
+		Usage:           state.Usage,
+		ChildUsage:      state.ChildUsage,
+		UsagePartial:    state.UsagePartial,
+		ChildAddressees: state.ChildAddressees,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.

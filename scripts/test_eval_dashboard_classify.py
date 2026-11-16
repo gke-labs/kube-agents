@@ -61,6 +61,18 @@ def _scorer_ceiling_marker() -> str:
 
 
 SCORER_CEILING_MARKER = _scorer_ceiling_marker()
+FORGES = SCORER.parent / "forges.py"
+
+
+def _forge_marker() -> str:
+    for line in FORGES.read_text(encoding="utf-8").splitlines():
+        if line.startswith("FORGE_UNAVAILABLE_MARKER = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"FORGE_UNAVAILABLE_MARKER not found in {FORGES}")
+
+
+FORGE_MARKER = _forge_marker()
+FORGE = f"{FORGE_MARKER}: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: {FORGE_MARKER} (answered 503): unexpected GitHub response 503"
 CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 OUTAGE = {"state": "OUTAGE", "condition": "shared_break", "failing_cases": CRASHLOOP_TRIO}
 STORM = {"state": "DEGRADED", "condition": "storm", "failing_cases": []}
@@ -74,6 +86,7 @@ def rep(letter):
         "i": {"result": "infra", "reason": NEVER_RAN},
         "e": {"result": "fail", "reason": NEVER_RAN},
         "c": {"result": "infra", "reason": CEILING},
+        "g": {"result": "infra", "reason": FORGE},
     }[letter]
 
 
@@ -115,6 +128,11 @@ class RepAndOutcomeTest(unittest.TestCase):
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": GRADED_FAIL}), "fail")
         self.assertEqual(classify.rep_kind({"result": "pass"}), "pass")
 
+    def test_a_rung_2_block_quoting_a_rate_limit_is_a_graded_fail(self):
+        # The scorer gives each errored check's reason, which can quote a 429.
+        reason = "blocked -- checks errored rather than ran: ['either-read'] -- either-read: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub said API rate limit exceeded / GitHub denied ..."
+        self.assertEqual(classify.rep_kind({"result": "fail", "reason": reason}), "fail")
+
     def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
         broken_reasons = (
             (
@@ -125,6 +143,11 @@ class RepAndOutcomeTest(unittest.TestCase):
             (
                 "the record is not evidence of a real agent run: "
                 "record status is 'error', not 'success' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (block wake: RuntimeError: card t_1 would not block); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
@@ -221,6 +244,56 @@ class RepAndOutcomeTest(unittest.TestCase):
         mixed = run(2, 1, T0, tasks=gate_tasks() + [task("x", "cci")], result="SUCCESS")
         self.assertEqual(case(classify_run(mixed, [mixed], health_at=STORM), "x")["cls"], "storm")
 
+
+    def test_the_forge_marker_is_the_bench_modules(self):
+        self.assertEqual(classify.FORGE_UNAVAILABLE_MARKER, FORGE_MARKER)
+
+    def test_a_forge_rep_is_its_own_kind_outside_the_storm(self):
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": FORGE}), "forge")
+        quoted = f"{NEVER_RAN} ({FORGE_MARKER} quoted)"
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": quoted}), "storm", "the marker must lead")
+        blocked = f"checks errored rather than ran: ['a-check'] -- a-check: {FORGE_MARKER} (answered 503): x / GitHub denied"
+        self.assertEqual(classify.rep_kind({"result": "fail", "reason": blocked}), "fail", "a rung-2 block stays a graded fail")
+        counts = classify.rep_counts(task("a", "ggg"))
+        self.assertEqual((counts["infra"], counts["forge"]), (0, 3))
+        self.assertEqual(classify.outcome_of(counts), "infra")
+        self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "fgg"))), "failed", "forge reps never soften a collapse")
+        target = run(1, 1, T0, tasks=[task("x", "ggg")] + gate_tasks())
+        self.assertEqual(classify.storm_reps(target), 0)
+        rates = classify.case_pass_rates([target, run(2, 2, T0, tasks=[task("x", "pgg")])], T0)
+        self.assertEqual(rates["x"], 1.0, "the denominator is graded reps only")
+
+    def test_a_case_lost_to_a_forge_outage_is_classed_as_such(self):
+        target = run(1, 1, T0, tasks=gate_tasks() + [task("x", "ggg")], result="SUCCESS")
+        row = case(classify_run(target, [target], health_at=STORM), "x")
+        self.assertEqual((row["outcome"], row["cls"], row["do"]), ("infra", classify.CLS_FORGE, classify.DO_FORGE))
+        self.assertEqual(row["reps"]["forge"], 3)
+        beside_ceiling = run(2, 1, T0, tasks=gate_tasks() + [task("x", "gcc")], result="SUCCESS")
+        self.assertEqual(case(classify_run(beside_ceiling, [beside_ceiling], health_at=STORM), "x")["cls"], classify.CLS_FORGE)
+        # Beside a real storm rep, the storm's rules decide as before.
+        mixed = run(3, 1, T0, tasks=gate_tasks() + [task("x", "ggi")], result="SUCCESS")
+        self.assertEqual(case(classify_run(mixed, [mixed], health_at=STORM), "x")["cls"], "storm")
+
+    def test_nothing_graded_on_a_mix_without_a_storm_rep_does_not_blame_the_storm(self):
+        names = sorted(ADMITTED)
+        target = run(1, 1, T0, tasks=[task(n, "ggg" if i % 2 else "ccc") for i, n in enumerate(names)], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertNotIn("quota storm's shape", verdict["lede"])
+        self.assertIn("forge outage", verdict["headline"])
+
+    def test_a_few_storm_reps_below_the_signature_keep_the_storm_headline(self):
+        """Unclassed ungraded cases (no storm signature, no declared storm) are
+        not the ceiling's, a fixture's or the forge's: the never-ran headline."""
+        names = sorted(ADMITTED)[:2]
+        target = run(1, 1, T0, tasks=[task(n, "i") for n in names], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("lost before the agent ran", verdict["headline"])
+
+    def test_nothing_graded_because_of_a_forge_outage_says_so(self):
+        target = run(1, 1, T0, tasks=[task(n, "ggg") for n in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("forge read", verdict["headline"])
+        self.assertEqual(verdict["verdict"], "infra")
 
     def test_a_run_of_ceiling_hits_matches_a_declared_ceiling_wave(self):
         wave = dict(STORM, condition="delegation_ceiling")
@@ -795,7 +868,7 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertEqual((verdict["storm_reps"], verdict["ceiling_reps"]), (0, 3 * (len(ADMITTED) + 1)))
         self.assertTrue(verdict["matches_incident"])
         self.assertEqual(case(verdict, HOLD_OUT)["cls"], classify.CLS_CEILING)
-        self.assertNotIn("quota storm", verdict["lede"])
+        self.assertNotIn("quota storm's shape", verdict["lede"])
         self.assertFalse(classify_run(target, [target], health_at=STORM)["matches_incident"], "ceiling reps are not the storm's signature")
 
     def test_without_the_suites_list_the_lost_cases_are_the_admitted_ones_that_graded_nothing(self):
@@ -858,6 +931,75 @@ class NotEvaluatedTest(unittest.TestCase):
         verdict = classify_run(target, [target], health_at=STORM)
         self.assertEqual(verdict["verdict"], "infra")
         self.assertTrue(verdict["headline"].startswith("Nothing was graded"))
+
+
+
+# The bench module's label, read out of its source like the ceiling marker.
+FIXTURE_DRIFT_MODULE = SCORER.parent / "fixture_drift.py"
+
+
+def _bench_fixture_drift_label() -> str:
+    for line in FIXTURE_DRIFT_MODULE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("FIXTURE_DRIFT_LABEL = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"FIXTURE_DRIFT_LABEL not found in {FIXTURE_DRIFT_MODULE}")
+
+
+# A repetition hack/ci-eval-pr.sh recorded without running it, as the scorer
+# words it and the collector carries it (`result: infra`).
+DRIFTED = (
+    "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+    f"({_bench_fixture_drift_label()}:version-laggard: cluster currentMasterVersion minor_behind_channel_default: "
+    "observed 1.34.1-gke.100, the REGULAR default (seeded-fleet scan of kube-agents-evals-7 at lease time; "
+    "the case was not run against a fixture out of its designed state))"
+)
+
+
+def drifted_task(name, n=3):
+    return {"name": name, "result": "infra", "reps": [{"n": i + 1, "result": "infra", "reason": DRIFTED} for i in range(n)]}
+
+
+class FixtureDriftTest(unittest.TestCase):
+    """A case not run because the lease-time scan saw its fixture drifted is
+    infrastructure, never a failure, and is not the storm's."""
+
+    def test_the_label_is_the_bench_modules(self):
+        self.assertEqual(classify.FIXTURE_DRIFT_LABEL, _bench_fixture_drift_label())
+
+    def test_a_drifted_rep_is_its_own_kind(self):
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": DRIFTED}), "fixture")
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": NEVER_RAN}), "storm")
+
+    def test_a_drifted_case_is_infra_and_outside_the_storm_count(self):
+        counts = classify.rep_counts(drifted_task("upgrades-lagging-master-probe"))
+        self.assertEqual((counts["pass"], counts["fail"], counts["infra"], counts["fixture"]), (0, 0, 0, 3))
+        self.assertEqual(classify.outcome_of(counts), "infra")
+        target = run(1, 1, T0, tasks=[drifted_task("upgrades-lagging-master-probe"), drifted_task("x")] + gate_tasks())
+        self.assertEqual(classify.storm_reps(target), 0, "six drifted reps are not a storm's signature")
+        self.assertNotIn("upgrades-lagging-master-probe", classify.collapsed_cases(target))
+
+    def test_the_case_row_names_the_role_and_says_it_is_not_the_prs(self):
+        tasks = [t for t in gate_tasks() if t["name"] != "upgrades-lagging-master-probe"] + [drifted_task("upgrades-lagging-master-probe")]
+        target = run(1, 1, T0, tasks=tasks, result="SUCCESS")
+        verdict = classify_run(target, [target], health_at=STORM)
+        row = case(verdict, "upgrades-lagging-master-probe")
+        self.assertEqual((row["outcome"], row["cls"], row["do"]), ("infra", classify.CLS_FIXTURE_DRIFT, classify.DO_FIXTURE_DRIFT))
+        self.assertIn("fixture-drift:version-laggard", row["reason"])
+        self.assertEqual(row["reps"]["fixture"], 3)
+        self.assertEqual(verdict["verdict"], "green")
+        # An unrelated case on the same run is graded as before.
+        self.assertEqual(case(verdict, "reliability-pdb-probe")["outcome"], "passed")
+
+    def test_drift_beside_a_storm_rep_is_the_storms(self):
+        mixed = {"name": "x", "result": "infra", "reps": [{"n": 1, "result": "infra", "reason": DRIFTED}, {"n": 2, "result": "infra", "reason": NEVER_RAN}]}
+        target = run(1, 1, T0, tasks=gate_tasks() + [mixed], result="SUCCESS")
+        self.assertEqual(case(classify_run(target, [target], health_at=STORM), "x")["cls"], "storm")
+
+    def test_nothing_graded_because_every_fixture_drifted_says_so(self):
+        target = run(1, 1, T0, tasks=[drifted_task(n) for n in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("drifted", verdict["headline"])
+        self.assertEqual(verdict["verdict"], "infra")
 
 
 if __name__ == "__main__":

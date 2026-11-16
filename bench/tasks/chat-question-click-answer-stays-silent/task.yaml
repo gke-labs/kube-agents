@@ -25,6 +25,13 @@
 #
 # `fixtures: []`: the case plants and archives its own card and reads no
 # cluster.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the reply to
+# the click is silent, and the planted card carries the answer and is
+# unblocked. On next the reply to the wake is posted nowhere, so it is not
+# graded; the click turn is the text next's gateway sends
+# (chat_message.NEEDS_YOU_REPLY). It does not grade how the agent got there
+# (kanban_comment or kanban_unblock called; replay_card reads the card itself).
 id: chat-question-click-answer-stays-silent
 name: Front door routes a button answer to the card and says nothing after it
 prompt: |-
@@ -58,25 +65,6 @@ verification_spec:
     check:
       type: reply_is_silent
       reply: answer
-  - name: the-wake-reply-is-silent
-    role: objective
-    mode: assert
-    check:
-      type: reply_is_silent
-  - name: the-answer-was-recorded-on-the-card
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_comment"]
-      require_success: true
-  - name: the-card-was-released
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_unblock"]
-      require_success: true
   - name: the-planted-card-carries-the-answer-and-is-unblocked
     role: objective
     mode: assert

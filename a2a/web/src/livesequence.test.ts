@@ -13,7 +13,10 @@
  * shapes pass — a per-session worker (retires to done) and a standing
  * service answering for a profile (does not).
  *
- *   A2A_WS_URL=ws://127.0.0.1:9222 A2A_WEB_PASS=... npm test -- livesequence
+ *   A2A_WS_URL=ws://localhost:8080/bus A2A_WEB_PASS=... npm test -- livesequence
+ *
+ * (through a port-forward of svc/platform-agent-a2a-console 8080:8080; the
+ * bus's own 9222 serves TLS under the bus CA.)
  *
  * A2A_SEQ_WAIT_MS bounds each leg's wait (default 300s).
  */

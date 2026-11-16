@@ -12,6 +12,7 @@ import hashlib
 import http.client
 import importlib.util
 import io
+import re
 import sys
 import tarfile
 import tempfile
@@ -135,7 +136,8 @@ class SkillBlocksTest(unittest.TestCase):
             skill.write_text(
                 "```bash\nls\n```\n```yaml\nkey: value\n```\n```\ntool_call()\n```\n```zsh\npwd\n```\n"
             )
-            (Path(tmp) / "demo" / "README.md").write_text("```bash\nrm -rf /\n```\n")
+            (Path(tmp) / "demo" / "scripts").mkdir()
+            (Path(tmp) / "demo" / "scripts" / "README.md").write_text("```bash\nrm -rf /\n```\n")
             got = check.skill_blocks("agents/platform/skills", Path(tmp))
         self.assertEqual(
             [
@@ -443,6 +445,22 @@ class InstallTirithTest(unittest.TestCase):
     def test_an_archive_without_the_binary_is_refused(self):
         with self.assertRaises(check.ScannerUnavailable):
             self.install(_archive({"README": b"x"}))
+
+
+
+class DockerfilePinTest(unittest.TestCase):
+    """The image installs the Tirith this check pins, so the two copies must agree."""
+
+    def test_the_dockerfile_pins_the_same_tirith_version_and_digests(self):
+        dockerfile = (REPO_ROOT / "deploy" / "docker" / "Dockerfile").read_text()
+        args = dict(re.findall(r"^ARG (TIRITH_[A-Z0-9_]+)=(\S+)$", dockerfile, re.M))
+        self.assertEqual(args["TIRITH_VERSION"], check.TIRITH_VERSION)
+        self.assertEqual(args["TIRITH_SHA256_AMD64"], check.TIRITH_ARCHIVE_SHA256["x86_64-unknown-linux-gnu"])
+        self.assertEqual(args["TIRITH_SHA256_ARM64"], check.TIRITH_ARCHIVE_SHA256["aarch64-unknown-linux-gnu"])
+
+    def test_the_image_build_scans_with_the_shipped_binary(self):
+        dockerfile = (REPO_ROOT / "deploy" / "docker" / "Dockerfile").read_text()
+        self.assertIn("check_skill_commands.py \\\n        --tirith-bin /usr/local/bin/tirith", dockerfile)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,39 @@
+# The a2a profile dispatcher image (#3655).
+#
+# The only fetcher and holder of AgentProfile submissions: it reads the
+# profiles' shared durables, holds each submission for the life of its task,
+# and hands it to a ready worker under a lease. See
+# docs/designs/spec-profiles-dispatch.md.
+#
+# The Deployment that runs it is one replica, replaced with Recreate: two at
+# once would each count their own share of every durable's in-flight work and
+# enforce the ceiling against half the picture.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.dispatcher -t <registry>/a2a-dispatcher:<tag> .
+
+# Bases come from images.json, as in Dockerfile.verifier, whose comments carry
+# the argument for each pin.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/dispatcher ./cmd/dispatcher
+
+# The binary writes nothing to disk: its state is the PROFILE_LEASES bucket
+# and its config the ConfigMap it watches. So a static distroless base is the
+# whole runtime and the Deployment mounts the root filesystem read-only.
+# `USER nonroot` is the image's default only; the Deployment's runAsUser 1000
+# wins (see Dockerfile.verifier).
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/dispatcher /dispatcher
+USER nonroot
+ENTRYPOINT ["/dispatcher"]

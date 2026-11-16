@@ -25,6 +25,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitops_workspace  # noqa: E402
+import no_live_kubectl  # noqa: E402
 import vcs_client  # noqa: E402
 
 LEASE = "compliance-audit"
@@ -34,13 +35,23 @@ def setUpModule():
     # in_operator_pod() keys on the real /etc/gitops, and in the pod a test's
     # own GITOPS_STATE_PATH is then ignored. Keep every test off the host's
     # mount; TestReadersIgnoreWorkerSources points it at a temp dir of its own.
-    global _NO_MOUNT
+    global _NO_MOUNT, _NO_KUBECTL
     _NO_MOUNT = patch("gitops_workspace.GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
     _NO_MOUNT.start()
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    _NO_KUBECTL = no_live_kubectl.install()
 
 
 def tearDownModule():
     _NO_MOUNT.stop()
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class WorkspaceTestCase(unittest.TestCase):
@@ -289,7 +300,7 @@ class TestEnsureWorkspace(WorkspaceTestCase):
 class TestEnsureScratchWorkspace(WorkspaceTestCase):
     """The same lease, with no clone in it.
 
-    What the content-passing path hands the agent. Two things have to hold at
+    What the broker paths hand the agent. Two things have to hold at
     once and they pull in opposite directions: there must be no `.git` here,
     and the lease bookkeeping — the path, the marker, the reaper — has to be
     the same as the clone path's, because `start` and `finish` find each other
@@ -446,6 +457,16 @@ class TestLeaseMarker(WorkspaceTestCase):
         second = gitops_workspace.read_lease(self.holder())
         self.assertEqual(first["created_at"], second["created_at"])
         self.assertGreater(marker.stat().st_mtime, time.time() - 60)
+
+    def test_the_stamps_read_the_same_clock_as_time_time(self):
+        # `time.gmtime()` with no argument reads the coarse C clock, which can
+        # trail `time.time()` by a second right after a second boundary. The
+        # fleet audit compares `refreshed_at` with an in-flight note stamped
+        # from `time.time()`, so the marker has to read that clock and no other.
+        with patch("time.time", return_value=1_000_000_000.0):
+            record = gitops_workspace.write_lease(self.holder(), LEASE, "acme/fleet")
+        self.assertEqual(record["created_at"], "2001-09-09T01:46:40Z")
+        self.assertEqual(record["refreshed_at"], "2001-09-09T01:46:40Z")
 
     def test_unreadable_and_malformed_markers_read_as_absent(self):
         self.holder().mkdir(parents=True)
@@ -1080,7 +1101,7 @@ class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
 
     def test_a_registered_entry_this_image_cannot_use_is_not_called_unregistered(self):
         (self.mount / "managed_repos").write_text(
-            json.dumps([{"type": "bitbucket", "url": "https://bitbucket.org/acme/fleet"}]), encoding="utf-8")
+            json.dumps([{"type": "gogs", "url": "https://gogs.example.com/acme/fleet"}]), encoding="utf-8")
         with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()
@@ -1825,8 +1846,6 @@ def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
     return origin
 
 
-
-
 class TestForgeNeutralNames(unittest.TestCase):
     """A managed repository on another forge, named the way the verbs take it."""
 
@@ -1849,6 +1868,15 @@ class TestForgeNeutralNames(unittest.TestCase):
         self.assertEqual(
             ["gitlab.example.com/acme/platform/infra"],
             self.names(("gitlab", "https://gitlab.example.com/acme/platform/infra.git")),
+        )
+
+    def test_a_gitea_entry_with_a_url_port_is_named_with_its_host(self):
+        self.assertEqual(
+            ["gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac"],
+            self.names(
+                ("gitea", "http://gitea-http.gitea.svc.cluster.local:3000/demo/gke-fleet-iac"),
+                ("gitea", "https://gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac.git"),
+            ),
         )
 
     def test_a_second_forge_leaves_githubs_names_bare(self):
@@ -1908,13 +1936,13 @@ class TestForgeNeutralNames(unittest.TestCase):
         # also adds the host to the slug.
         with self.assertLogs("gitops_workspace", level="WARNING"):
             self.assertEqual(
-                ["github.com/acme/fleet", "github.com/acme/gitea", "acme/infra"],
+                ["github.com/acme/fleet", "github.com/acme/forgejo", "acme/infra"],
                 self.names(
                     ("github", "https://github.com/acme/fleet"),
-                    ("github", "https://github.com/acme/gitea"),
+                    ("github", "https://github.com/acme/forgejo"),
                     ("github", "https://github.com/acme/infra"),
                     ("gitlab", "https://gitlab.example.com:8443/acme/fleet"),
-                    ("gitea", "https://gitea.example.com/acme/gitea"),
+                    ("forgejo", "https://forgejo.example.com/acme/forgejo"),
                 ),
             )
 
@@ -2209,12 +2237,24 @@ class TestPortedHostIsSkipped(unittest.TestCase):
         entries = [
             {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/infra"},
             {"type": "gitlab", "url": "gitlab.example.com:8443/acme/infra"},
+            {"type": "gitea", "url": "gitea.example.com:3000/acme/infra"},
+            {"type": "gitea", "url": "git@gitea.example.com:3000/infra"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
         ]
         with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
             names = gitops_workspace._forge_repo_names(entries, "managed_repos")
-        self.assertEqual(["gitlab.com/acme/infra"], names)
+        self.assertEqual(
+            ["gitea.example.com/3000/infra", "gitlab.com/acme/infra"],
+            names,
+        )
         self.assertEqual(2, sum("a host with a port is not supported" in line for line in logs.output))
+        self.assertEqual(
+            1,
+            sum(
+                "write a Gitea repository with a port as a full URL" in line
+                for line in logs.output
+            ),
+        )
 
 
 class TestGroupEntryIsSkipped(unittest.TestCase):
@@ -2260,6 +2300,90 @@ class TestManagedReposRegistered(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertTrue(self.registered(text))
+
+
+class TestGetGitopsRepo(WorkspaceTestCase):
+    """`get_gitops_repo`: the operator's `gitops_repo` key, named as `get_managed_repos` names it."""
+
+    def state(self, managed, gitops=None, github_host=None, context=None):
+        (self.tmp_path / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
+        if gitops is not None:
+            text = gitops if isinstance(gitops, str) else json.dumps(gitops)
+            (self.tmp_path / "gitops_repo").write_text(text, encoding="utf-8")
+        if github_host is not None:
+            (self.tmp_path / "github_host").write_text(github_host, encoding="utf-8")
+        if context is not None:
+            (self.tmp_path / "context_repos").write_text(json.dumps(context), encoding="utf-8")
+
+    def read(self):
+        env = {"GITOPS_STATE_PATH": str(self.tmp_path / "managed_repos")}
+        with patch.dict(os.environ, env), patch("subprocess.run") as run:
+            answer = gitops_workspace.get_gitops_repo()
+            run.assert_not_called()
+            return answer
+
+    def test_github_com_is_bare(self):
+        gitops = {"type": "github", "url": "https://github.com/acme/gitops"}
+        self.state([{"type": "github", "url": "https://github.com/acme/terraform"}, gitops], gitops)
+        self.assertEqual(self.read(), "acme/gitops")
+
+    def test_gitlab_is_host_and_path(self):
+        gitops = {"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}
+        self.state([{"type": "gitlab", "url": "https://gitlab.example.com/platform/terraform"}, gitops], gitops)
+        self.assertEqual(self.read(), "gitlab.example.com/platform/infra/gitops")
+
+    def test_github_enterprise_server_is_host_and_path(self):
+        gitops = {"type": "github", "url": "https://ghe.example.com/acme/gitops"}
+        self.state(
+            [gitops, {"type": "github", "url": "https://ghe.example.com/acme/terraform"}],
+            gitops,
+            github_host="ghe.example.com",
+        )
+        self.assertEqual(self.read(), "ghe.example.com/acme/gitops")
+
+    def test_the_name_matches_the_managed_list_when_github_is_qualified(self):
+        # A GitLab context entry with the same path qualifies the GitHub name.
+        gitops = {"type": "github", "url": "https://github.com/acme/gitops"}
+        self.state(
+            [gitops, {"type": "github", "url": "https://github.com/acme/terraform"}],
+            gitops,
+            context=[{"type": "gitlab", "url": "https://gitlab.com/acme/gitops"}],
+        )
+        answer = self.read()
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.tmp_path / "managed_repos")}):
+            self.assertIn(answer, gitops_workspace.get_managed_repos())
+        self.assertEqual(answer, "github.com/acme/gitops")
+
+    def test_another_spelling_of_a_registered_repository_matches(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/terraform"},
+             {"type": "github", "url": "git@github.com:acme/gitops.git"}],
+            {"type": "github", "url": "https://github.com/acme/gitops"},
+        )
+        self.assertEqual(self.read(), "acme/gitops")
+
+    def test_none_without_a_usable_key(self):
+        managed = [{"type": "github", "url": "https://github.com/acme/gitops"},
+                   {"type": "github", "url": "https://github.com/acme/terraform"}]
+        for gitops in (None, "", "   ", "[not json", '["acme/gitops"]', '{"url": "https://github.com/acme/gitops"}'):
+            with self.subTest(gitops=gitops):
+                (self.tmp_path / "gitops_repo").unlink(missing_ok=True)
+                self.state(managed, gitops)
+                self.assertIsNone(self.read())
+
+    def test_none_for_a_repository_that_is_not_registered(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/terraform"}],
+            {"type": "github", "url": "https://github.com/acme/removed"},
+        )
+        self.assertIsNone(self.read())
+
+    def test_none_for_a_registered_path_on_another_forge(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/gitops"}],
+            {"type": "gitlab", "url": "https://gitlab.com/acme/gitops"},
+        )
+        self.assertIsNone(self.read())
 
 
 if __name__ == "__main__":

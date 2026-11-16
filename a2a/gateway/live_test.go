@@ -39,7 +39,9 @@ const liveTestRelayDurable = "gateway-relay-livetest"
 //
 // Skipped unless the env is set:
 //
-//	A2A_LIVE_NATS_URL=nats://127.0.0.1:4222 \
+//	A2A_LIVE_NATS_URL=tls://127.0.0.1:4222 \
+//	NATS_CA_FILE=<the install's <name>-a2a-nats-ca-bundle ca.crt> \
+//	NATS_TLS_SERVER_NAME=<name>-a2a-nats.<namespace>.svc \
 //	A2A_LIVE_GATEWAY_PASSWORD=... A2A_LIVE_BRIDGE_PASSWORD=... \
 //	go test ./gateway -run TestLive -v -count=1
 func TestLiveAgainstInstallNATS(t *testing.T) {
@@ -176,7 +178,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	// becomes a task with backend console, and the gateway's notice lands on
 	// the conversation's .out subject.
 	if consolePass != "" {
-		browser, err := nats.Connect(url, nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))
+		browser, err := nats.Connect(url, append(lib.TLSOptions(), nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))...)
 		if err != nil {
 			t.Fatalf("connect as console: %v", err)
 		}
@@ -397,7 +399,8 @@ func TestLiveEndToEndThroughBridge(t *testing.T) {
 // rides an ephemeral ordered consumer of its own.
 //
 //	kubectl --context "$CTX" -n kubeagents-system port-forward svc/platform-agent-a2a-nats 14222:4222 &
-//	A2A_LIVE_NATS_URL=nats://127.0.0.1:14222 \
+//	A2A_LIVE_NATS_URL=tls://127.0.0.1:14222 NATS_CA_FILE=<the bundle's ca.crt> \
+//	NATS_TLS_SERVER_NAME=platform-agent-a2a-nats.<namespace>.svc \
 //	A2A_LIVE_GATEWAY_PASSWORD=... \
 //	A2A_LIVE_KUBECONTEXT=gke_bnaylor-kagents-dev_northamerica-northeast1_a2a-next-dev \
 //	go test ./gateway -run TestLiveSessionCapOnInstall -v -count=1 -timeout 15m
@@ -443,7 +446,11 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	cfg := &Config{
 		// The spawned pods dial the bus in-cluster; only this process rides
 		// the port-forward.
-		NATSURL:               envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
+		NATSURL: envOr("A2A_LIVE_INCLUSTER_NATS_URL", "tls://platform-agent-a2a-nats."+ns+".svc:4222"),
+		// The bus requires TLS: the spawned pod mounts the install's CA bundle
+		// at the path the operator renders for every client.
+		NATSCAFile:            envOr("A2A_LIVE_INCLUSTER_NATS_CA_FILE", "/etc/a2a-nats-ca/ca.crt"),
+		NATSCAConfigMap:       envOr("A2A_LIVE_NATS_CA_CONFIGMAP", "platform-agent-a2a-nats-ca-bundle"),
 		PrincipalMapPath:      mapFile,
 		DefaultAddressee:      "platform",
 		MaxSessions:           2,
@@ -688,7 +695,11 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &Config{
-		NATSURL:               envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
+		NATSURL: envOr("A2A_LIVE_INCLUSTER_NATS_URL", "tls://platform-agent-a2a-nats."+ns+".svc:4222"),
+		// The bus requires TLS: the spawned pod mounts the install's CA bundle
+		// at the path the operator renders for every client.
+		NATSCAFile:            envOr("A2A_LIVE_INCLUSTER_NATS_CA_FILE", "/etc/a2a-nats-ca/ca.crt"),
+		NATSCAConfigMap:       envOr("A2A_LIVE_NATS_CA_CONFIGMAP", "platform-agent-a2a-nats-ca-bundle"),
 		PrincipalMapPath:      mapFile,
 		DefaultAddressee:      "platform",
 		IdleTTL:               30 * time.Minute,

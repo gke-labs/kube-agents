@@ -1,0 +1,19 @@
+{
+  "payload": {
+    "name": "status:triage",
+    "color": "#fbca04",
+    "description": "Needs a look."
+  },
+  "responses": [
+    [],
+    {
+      "id": 1,
+      "name": "status:triage",
+      "exclusive": false,
+      "is_archived": false,
+      "color": "fbca04",
+      "description": "Needs a look.",
+      "url": "https://gitea.example.test/api/v1/repos/acme/infra/labels/1"
+    }
+  ]
+}

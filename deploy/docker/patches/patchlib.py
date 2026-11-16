@@ -195,6 +195,33 @@ class Definition(_Site):
                 f"keyword-only {', '.join(missing)}. {self.patch.note}"
             )
 
+    def expect_parameters(self, *names: str) -> None:
+        """Assert the signature still declares each parameter, of whatever kind.
+
+        For a prologue that rebinds parameters by name: positional, keyword-only
+        or positional-only, the prologue reads them as locals, and a parameter
+        upstream renamed would compile as a free global and raise ``NameError``
+        at the first call. Same contract as :meth:`expect_keyword_only`.
+        """
+        arguments = self.node.args
+        present = {
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        }
+        for extra in (arguments.vararg, arguments.kwarg):
+            if extra is not None:
+                present.add(extra.arg)
+        missing = [name for name in names if name not in present]
+        if missing:
+            raise self.patch._fail(
+                f"the {self.label} def {self.node.name}() no longer takes "
+                f"{', '.join(missing)}. {self.patch.note}"
+            )
+
     def keyword_only_end(self) -> int:
         """Offset just past the last keyword-only parameter, for adding one.
 
@@ -449,6 +476,31 @@ class Patch:
         if len(found) != 1:
             raise self._fail(
                 f"expected 1 module-level def {name}() for the {label}, found "
+                f"{len(found)}. {self.note}"
+            )
+        return Definition(self, found[0], label)
+
+    def find_method(self, class_name: str, name: str, *, label: str) -> Definition:
+        """Locate the one ``def`` called ``name`` in the module-level class ``class_name``."""
+        classes = [
+            node
+            for node in self._tree().body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        ]
+        if len(classes) != 1:
+            raise self._fail(
+                f"expected 1 module-level class {class_name} for the {label}, found "
+                f"{len(classes)}. {self.note}"
+            )
+        found = [
+            node
+            for node in classes[0].body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ]
+        if len(found) != 1:
+            raise self._fail(
+                f"expected 1 def {name}() in class {class_name} for the {label}, found "
                 f"{len(found)}. {self.note}"
             )
         return Definition(self, found[0], label)

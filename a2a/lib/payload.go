@@ -2,8 +2,13 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TaskState is the A2A task state machine, plus rejected. auth-required is
@@ -63,23 +68,540 @@ const (
 	// with a chat message. Each one posts once and is never edited
 	// (spec-a2a-payloads.md, "Reserved artifact names").
 	ArtifactNotice = "notice"
+	// ArtifactHandoff says a completed task handed work to kanban cards,
+	// which report into the task's conversation themselves: one text part,
+	// HandoffCards. The hermes-bridge's API executor publishes it ahead of the
+	// terminal of such a task whenever the conversation route was recorded
+	// (Slack or Google Chat); the gateway never
+	// renders it and reads it as a delegated child's cards-pending signal
+	// beside the terminal's chat mark, which the bridge sets only on Slack
+	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
+	// names").
+	ArtifactHandoff = "handoff"
+	// ArtifactUsage is what a task's turns cost: one data part per finished
+	// turn, a Usage object, published by the executor before the turn's
+	// answer settles (the worker adapter on each harness result, the
+	// hermes-bridge on each API turn's answer) and never after the
+	// terminal. Every field is optional and a reader tolerates the
+	// artifact's absence; UsageTotal folds a task's turns (#2816;
+	// spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactUsage = "usage"
 )
 
-// DelegateRequest is the ArtifactDelegate data part's shape: one child task
-// to mint, addressee and the task text. It is also the wire shape the
-// session pod's MCP server sends over the adapter's unix socket (the socket
-// hop is how the call gets from the harness's delegate tool to the adapter
-// that actually publishes the artifact), so it is named here, beside
-// ArtifactDelegate, rather than duplicated per caller.
-type DelegateRequest struct {
-	Addressee string `json:"addressee"`
-	Text      string `json:"text"`
+// HandoffCards is the ArtifactHandoff text part: the work went to kanban
+// cards.
+const HandoffCards = "cards"
+
+// Usage is one finished turn's cost, the ArtifactUsage data part. Model is
+// the model the executor asked for or was told it ran; InputTokens is every
+// token the model read for the turn, cached reads included, and OutputTokens
+// every token it wrote; CostUsd is the producer's own estimate, carried only
+// when the producer had a figure it did not invent (a harness that prices
+// its turns; never Hermes behind the gateway, which records 0.0); DurationMs
+// is the turn's wall time as the producer measured it. A zero is "not
+// known" and is omitted on the wire, so a reader never mistakes unknown for
+// free; a part with no figure at all is refused.
+type Usage struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUsd      float64 `json:"costUsd,omitempty"`
+	DurationMs   int64   `json:"durationMs,omitempty"`
 }
 
-// DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
-// longer request before it reaches the bus and the gateway ignores one that
-// arrives anyway, so the two sides cannot disagree on the number.
+// hasFigure reports whether u carries at least one figure; a model name
+// alone is not usage.
+func (u Usage) hasFigure() bool {
+	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CostUsd > 0 || u.DurationMs > 0
+}
+
+// negative reports whether any figure is below zero, which no producer can
+// have measured.
+func (u Usage) negative() bool {
+	return u.InputTokens < 0 || u.OutputTokens < 0 || u.CostUsd < 0 || u.DurationMs < 0
+}
+
+// UsagePart is u as the ArtifactUsage data part: the object itself, as an
+// activity entry is. A usage with no figure, or a negative one, is refused
+// here so it never reaches the bus.
+func UsagePart(u Usage) (Part, error) {
+	if !u.hasFigure() || u.negative() {
+		return Part{}, fmt.Errorf("usage part carries no figure, or a negative one: %+v", u)
+	}
+	data, err := json.Marshal(u)
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// UsageOf reads p as a usage part. A part that is not data, does not decode
+// as an object, carries no figure or a negative one is not usage; a key the
+// reader does not know is ignored.
+func UsageOf(p Part) (Usage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return Usage{}, false
+	}
+	var u Usage
+	if err := json.Unmarshal(p.Data, &u); err != nil || !u.hasFigure() || u.negative() {
+		return Usage{}, false
+	}
+	return u, true
+}
+
+// UsageFigure is a producer's count or duration, read from a float, as the
+// whole number a Usage part carries, and whether it is one: a figure that is
+// not finite, below zero or at or above 2^63 (which int64 cannot hold and a
+// conversion would wrap) is not, and the producer drops that field and names
+// it rather than refuse the part or publish a wrapped value.
+func UsageFigure(f float64) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// UsageTotal folds the turns of one task: the figures sum and Model is the
+// last one named. An absent figure stays absent.
+func UsageTotal(turns []Usage) Usage {
+	var total Usage
+	for _, u := range turns {
+		if u.Model != "" {
+			total.Model = u.Model
+		}
+		total.InputTokens += u.InputTokens
+		total.OutputTokens += u.OutputTokens
+		total.CostUsd += u.CostUsd
+		total.DurationMs += u.DurationMs
+	}
+	return total
+}
+
+// DelegateRequest is the ArtifactDelegate data part's shape: the child tasks
+// to mint, either one (addressee, text and parameters) or a batch (Tasks). It
+// is also the wire shape the session pod's MCP server sends over the
+// adapter's unix socket (the socket hop is how the call gets from the
+// harness's delegate tool to the adapter that actually publishes the
+// artifact), so it is named here, beside ArtifactDelegate, rather than
+// duplicated per caller.
+//
+// Parameters are the child task's parameters (TaskParameters), the target
+// cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
+// and child results"): the gateway carries them into the child's submission
+// and refuses a child whose target is not inside its parent's. The gateway
+// holds the names to the target profile's declared ones.
+//
+// Tasks is a batch: several children minted from one request, each entry
+// shaped like the single fields (spec-a2a-payloads.md, "Task parameters and
+// child results"). A request sets the single fields or Tasks, never both
+// (ValidateDelegateRequest). An adapter sends Tasks only to a gateway that
+// advertised a width over one on the turn (DelegateTargets.WidthMax), so a
+// gateway built before batches never sees one, and a request without Tasks is
+// the single shape on the wire, unchanged.
+type DelegateRequest struct {
+	Addressee  string            `json:"addressee,omitempty"`
+	Text       string            `json:"text,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+	Tasks      []DelegateTask    `json:"tasks,omitempty"`
+}
+
+// DelegateTask is one entry of a batch delegation: the child's addressee, its
+// text (held to DelegateTextCap, like the single shape's) and its parameters.
+type DelegateTask struct {
+	Addressee  string            `json:"addressee"`
+	Text       string            `json:"text"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+}
+
+// DelegateTextCap bounds DelegateRequest.Text, and each batch entry's text, in
+// bytes: the adapter refuses a longer request before it reaches the bus and
+// the gateway ignores one that arrives anyway, so the two sides cannot
+// disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// DelegateBatchMax is the ceiling on a batch's length, whatever width a
+// gateway is configured with: the gateway refuses a width setting above it,
+// and every reader refuses a longer batch as malformed. The width a turn may
+// use is the gateway's setting, advertised as DelegateTargets.WidthMax.
+const DelegateBatchMax = 16
+
+// IsBatch reports a request that carries a tasks list (possibly empty, which
+// ValidateDelegateRequest refuses).
+func (r DelegateRequest) IsBatch() bool {
+	return r.Tasks != nil
+}
+
+// Entries is the request as the children it asks for: the single fields as
+// one entry, or each batch entry in order.
+func (r DelegateRequest) Entries() []DelegateTask {
+	if r.IsBatch() {
+		return r.Tasks
+	}
+	return []DelegateTask{{Addressee: r.Addressee, Text: r.Text, Parameters: r.Parameters}}
+}
+
+// ValidateDelegateRequest holds a request to its shape: the single fields or a
+// batch, never both; a batch neither empty nor past DelegateBatchMax; and each
+// entry's text present and within DelegateTextCap. The addressee and the
+// parameters are checked by each side's own rules per entry (the adapter's
+// validateDelegate, the gateway's route and allowlists).
+func ValidateDelegateRequest(r DelegateRequest) error {
+	if r.IsBatch() {
+		if r.Addressee != "" || r.Text != "" || len(r.Parameters) > 0 {
+			return errors.New("delegate: send either addressee and text, or tasks, not both")
+		}
+		if len(r.Tasks) == 0 {
+			return errors.New("delegate: the tasks list is empty")
+		}
+		if len(r.Tasks) > DelegateBatchMax {
+			return fmt.Errorf("delegate: %d tasks, at most %d in one request", len(r.Tasks), DelegateBatchMax)
+		}
+		for i, e := range r.Tasks {
+			if err := validateDelegateText(e.Text); err != nil {
+				return fmt.Errorf("delegate: task %d: %w", i+1, err)
+			}
+		}
+		return nil
+	}
+	if err := validateDelegateText(r.Text); err != nil {
+		return fmt.Errorf("delegate: %w", err)
+	}
+	return nil
+}
+
+func validateDelegateText(text string) error {
+	switch {
+	case strings.TrimSpace(text) == "":
+		return errors.New("text is required")
+	case len(text) > DelegateTextCap:
+		return errors.New("text is too long for a delegation")
+	}
+	return nil
+}
+
+// TaskParameters is the taskParameters data part on a profile task's
+// submission: the parameters its persona declares (the cluster persona's
+// project, location and cluster), set by the gateway from what the client
+// or the parent task asked. The dispatcher builds the verifier's resource
+// from them and hands each to the worker as PROFILE_TASK_<NAME>; the
+// verifier refuses a target outside the grant's scope, which is what makes
+// these message fields authoritative. They never ride the authority block.
+type TaskParameters struct {
+	Parameters map[string]string `json:"parameters"`
+}
+
+// The bounds ValidateTaskParameters holds a parameter set to. A name is a
+// lower-case identifier (TaskParameterNameRE), as a persona declares it and as the worker's
+// PROFILE_TASK_<NAME> spells it upper-cased. A value is one token with no
+// '/' or space, because the dispatcher joins values into a verifier resource
+// path (project/<p>/location/<l>/cluster/<c>) and a '/' would let a value
+// name a different resource. It starts with a letter or digit, so it is
+// never "." or ".." (a path step) and never reads as a flag ("-x") where a
+// worker passes it to a command.
+const (
+	TaskParametersMax        = 16
+	TaskParameterValueMaxLen = 128
+)
+
+var (
+	// TaskParameterNameRE is a parameter name: the persona loader declares
+	// names by it (lib/persona), and a submission carries names by it, so a
+	// name a persona can declare is one its tasks can be handed.
+	TaskParameterNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	taskParameterValue  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+)
+
+// ValidateTaskParameters reports the first way params break the bounds
+// above, or nil. An empty or nil set is valid: a task with no parameters.
+func ValidateTaskParameters(params map[string]string) error {
+	if len(params) > TaskParametersMax {
+		return fmt.Errorf("task parameters: %d, at most %d", len(params), TaskParametersMax)
+	}
+	for name, value := range params {
+		if !TaskParameterNameRE.MatchString(name) {
+			return fmt.Errorf("task parameter name %q is not a lower-case identifier of at most 63 characters", name)
+		}
+		if len(value) > TaskParameterValueMaxLen || !taskParameterValue.MatchString(value) {
+			return fmt.Errorf("task parameter %s: the value is not one token (a letter or digit, then letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
+		}
+	}
+	return nil
+}
+
+const taskParametersKey = "taskParameters"
+
+// TaskParametersPart is p as a data part, refused when p breaks the bounds.
+func TaskParametersPart(p TaskParameters) (Part, error) {
+	if err := ValidateTaskParameters(p.Parameters); err != nil {
+		return Part{}, err
+	}
+	if p.Parameters == nil {
+		p.Parameters = map[string]string{}
+	}
+	data, err := json.Marshal(map[string]TaskParameters{taskParametersKey: p})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// TaskParametersOf finds the taskParameters part among parts. A data part
+// that is not one is skipped. One that is but breaks the bounds is an
+// error rather than skipped, so a reader never runs a task as though it had
+// no parameters when its submission carried bad ones; so are two such
+// parts, which leave the task's target ambiguous.
+func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
+	var found *TaskParameters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, taskParametersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return TaskParameters{}, true, errors.New("task parameters: more than one taskParameters part")
+		}
+		var tp TaskParameters
+		if err := json.Unmarshal(raw, &tp); err != nil {
+			return TaskParameters{}, true, fmt.Errorf("task parameters: %w", err)
+		}
+		// A null part, a null set or a misspelt field decodes to no
+		// parameters at all; that is a broken part, not an empty set, which
+		// is written {"parameters":{}}.
+		if tp.Parameters == nil {
+			return TaskParameters{}, true, errors.New("task parameters: the part carries no parameters object")
+		}
+		if err := ValidateTaskParameters(tp.Parameters); err != nil {
+			return TaskParameters{}, true, err
+		}
+		found = &tp
+	}
+	if found == nil {
+		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// DelegateTargets is the delegateTargets data part on a session turn's
+// submission: the agents the turn's requester may delegate to, as the gateway
+// resolved them when it submitted the turn (platform, then each AgentProfile
+// whose card admits them). The session pod's delegate tool names them in its
+// addressee description, so the model is told what it can address rather than
+// a fixed name. It's a hint for the model, not a grant: the gateway checks a
+// delegation against the same rules when it arrives, so a stale list costs at
+// most a refused delegation.
+//
+// The part's presence is the marker: a turn that carries one has exactly the
+// agents listed (an empty list is none), and a turn with none reads as
+// platform only. Truncated says the gateway left agents out to stay inside
+// the bounds below.
+//
+// WidthMax is how many children one delegation from this turn may ask for
+// (the gateway's A2A_DELEGATION_WIDTH_MAX). Absent means one: the single
+// shape only, which is all a gateway built before batches takes, so the
+// session's tool offers a batch only when the part says more (Width).
+type DelegateTargets struct {
+	Targets   []DelegateTarget `json:"targets"`
+	Truncated bool             `json:"truncated,omitempty"`
+	WidthMax  int              `json:"widthMax,omitempty"`
+}
+
+// Width is the batch width the part advertises: WidthMax, or one when unset.
+func (t DelegateTargets) Width() int {
+	if t.WidthMax < 1 {
+		return 1
+	}
+	return t.WidthMax
+}
+
+// DelegateTarget is one agent a session may delegate to: its addressee, its
+// card's routing blurb, and the parameters its card declares (a pinned
+// profile's cluster, say), which a delegation may pass.
+type DelegateTarget struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	Parameters  []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// The bounds a delegateTargets part is held to. A name is a subject token (an
+// addressee); a description is one line of at most DelegateTargetDescriptionMax
+// bytes, cut by the gateway (DelegateTargetDescription); a parameter is named
+// by TaskParameterNameRE, at most TaskParametersMax a target. The encoded part
+// is at most DelegateTargetsMaxBytes, so the session pod can hand it to its
+// tool server in one environment variable.
+const (
+	DelegateTargetsMax           = 32
+	DelegateTargetDescriptionMax = 200
+	DelegateTargetsMaxBytes      = 16 * 1024
+)
+
+const delegateTargetsKey = "delegateTargets"
+
+// DelegateTargetDescription is a card's description as a delegate target
+// carries it: control characters and line breaks folded to spaces, runs of
+// space collapsed, and cut to DelegateTargetDescriptionMax bytes on a rune
+// boundary.
+func DelegateTargetDescription(s string) string {
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if len(s) <= DelegateTargetDescriptionMax {
+		return s
+	}
+	cut := DelegateTargetDescriptionMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	// A cut that lands after a space would leave it trailing, and the
+	// description would no longer read back as itself.
+	return strings.TrimRight(s[:cut], " ")
+}
+
+func validateDelegateTargets(t DelegateTargets) error {
+	if len(t.Targets) > DelegateTargetsMax {
+		return fmt.Errorf("delegate targets: %d, at most %d", len(t.Targets), DelegateTargetsMax)
+	}
+	if t.WidthMax < 0 || t.WidthMax > DelegateBatchMax {
+		return fmt.Errorf("delegate targets: width %d, want 1 to %d", t.WidthMax, DelegateBatchMax)
+	}
+	for _, d := range t.Targets {
+		if !ValidSubjectToken(d.Name) {
+			return fmt.Errorf("delegate target %q is not an addressee", d.Name)
+		}
+		if d.Description != DelegateTargetDescription(d.Description) {
+			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
+		}
+		if len(d.Parameters) > TaskParametersMax {
+			return fmt.Errorf("delegate target %s: %d parameters, at most %d", d.Name, len(d.Parameters), TaskParametersMax)
+		}
+		for _, p := range d.Parameters {
+			if !TaskParameterNameRE.MatchString(p.Name) {
+				return fmt.Errorf("delegate target %s: parameter %q is not a lower-case identifier", d.Name, p.Name)
+			}
+		}
+	}
+	if raw, err := json.Marshal(t); err != nil || len(raw) > DelegateTargetsMaxBytes {
+		return fmt.Errorf("delegate targets: encoded past %d bytes", DelegateTargetsMaxBytes)
+	}
+	return nil
+}
+
+// DelegateTargetsPart is t as a data part, refused when t breaks the bounds.
+func DelegateTargetsPart(t DelegateTargets) (Part, error) {
+	if err := validateDelegateTargets(t); err != nil {
+		return Part{}, err
+	}
+	if t.Targets == nil {
+		t.Targets = []DelegateTarget{}
+	}
+	data, err := json.Marshal(map[string]DelegateTargets{delegateTargetsKey: t})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegateTargetsOf finds the delegateTargets part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader falls back
+// to what it would show with none.
+func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
+	var found *DelegateTargets
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegateTargetsKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: more than one delegateTargets part")
+		}
+		var t DelegateTargets
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return DelegateTargets{}, true, fmt.Errorf("delegate targets: %w", err)
+		}
+		if t.Targets == nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: the part carries no targets list")
+		}
+		if err := validateDelegateTargets(t); err != nil {
+			return DelegateTargets{}, true, err
+		}
+		found = &t
+	}
+	if found == nil {
+		return DelegateTargets{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// ChildResult is the childResult data part: a child task's end, which the
+// gateway delivers on its parent's .in as a message, for a parent that waits
+// by staying open (a profile task under the dispatcher). A chat session's
+// turn ends when it delegates, so a session parent is woken with the child's
+// result as a new turn instead (spec-a2a-payloads.md, "Task parameters and
+// child results").
+type ChildResult struct {
+	ChildTaskID string    `json:"childTaskId"`
+	Addressee   string    `json:"addressee"`
+	State       TaskState `json:"state"`
+	// Text is the child's deliverable when it completed, and the reason it
+	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
+	Text string `json:"text,omitempty"`
+}
+
+// ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
+// longer deliverable and says so; the child's own result artifact keeps it
+// whole on TASKS.
+const ChildResultTextCap = 64 * 1024
+
+const childResultKey = "childResult"
+
+// ChildResultPart is c as a data part, refused without a child task id or a
+// terminal state, or with text past ChildResultTextCap.
+func ChildResultPart(c ChildResult) (Part, error) {
+	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
+		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	}
+	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ChildResultOf finds the childResult part among parts. A data part that is
+// not one, or one without a task id or a terminal state or with text past
+// the cap, is skipped: a malformed child result is no event, where a
+// malformed parameter set (TaskParametersOf) would change what runs.
+func ChildResultOf(parts []Part) (ChildResult, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, childResultKey)
+		if !ok {
+			continue
+		}
+		var c ChildResult
+		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
+			len(c.Text) > ChildResultTextCap {
+			continue
+		}
+		return c, true
+	}
+	return ChildResult{}, false
+}
+
+// wrappedData is a data part's payload under key, when p is a data part
+// wrapping one.
+func wrappedData(p Part, key string) (json.RawMessage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return nil, false
+	}
+	var wrap map[string]json.RawMessage
+	if json.Unmarshal(p.Data, &wrap) != nil {
+		return nil, false
+	}
+	raw, ok := wrap[key]
+	return raw, ok
+}
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
@@ -145,6 +667,140 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 	return SteerNotice{}, false
 }
 
+// CardStop is the cardStop data part: the gateway's request that the
+// executor stop the kanban cards a conversation's turns filed (#3263), and
+// the executor's answer. It rides a task of its own, so the request is
+// answered on the same stream as any task: the terminal, and the result
+// artifact before it.
+//
+// The request is a submission whose message carries this part and nothing
+// else, no text (CardStopRequested):
+//
+//	{"cardStop":{"v":1}}
+//
+// The result is the same key on the completed task's result artifact,
+// beside a text part that says the same for a reader that does not know it:
+//
+//	{"cardStop":{"v":1,"stopped":[{"id":"t_1","title":"…","priorStatus":"running"}],
+//	  "settled":[{"id":"t_2","title":"…"}],"failed":0,"pending":0,"unresolved":0,
+//	  "truncated":false,"deadline":false,"listsCut":false}}
+//
+// stopped is the cards the stop archived, with the status each had;
+// settled the conversation's cards that had already finished. The counts
+// own up to what it could not promise: failed, cards it could not archive;
+// pending, archives still running when it ran out of time, so those cards
+// may or may not end; unresolved, stopped cards that were claimed just
+// before the stop with no worker seen yet, so a worker may still start for
+// them (the executor's log names each card). truncated says the
+// conversation had more open cards than one stop takes, so some may still
+// be open; deadline that the stop ran out of time. listsCut says only that
+// the executor cut stopped, settled or notStopped to fit the part, each at
+// CardStopListMax, so the list that was cut is one at that length: the
+// cards themselves are as the counts say. A stop that found nothing open answers empty lists.
+// A stop that failed answers no part: its terminal is failed, and the
+// reason says why.
+type CardStop struct {
+	V int `json:"v"`
+	// The result's fields; nil on a request. Embedded so the wire form is
+	// one flat object either way, and a request carries none of them.
+	*CardStopResult
+}
+
+// CardStopListMax is the most cards a result's stopped or settled list
+// carries; an executor cuts a longer one there and sets listsCut.
+const CardStopListMax = 200
+
+// CardStopResult is the result form's fields (CardStop).
+type CardStopResult struct {
+	Stopped    []CardStopCard `json:"stopped"`
+	Settled    []CardStopCard `json:"settled"`
+	Failed     int            `json:"failed"`
+	Pending    int            `json:"pending"`
+	Unresolved int            `json:"unresolved"`
+	Truncated  bool           `json:"truncated"`
+	Deadline   bool           `json:"deadline"`
+	ListsCut   bool           `json:"listsCut"`
+	// NotStopped names the cards Failed, Pending and Unresolved count, in that
+	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
+	// older executor's result, which reads as none named.
+	NotStopped []CardStopCard `json:"notStopped,omitempty"`
+}
+
+// CardStopCard is one card a result names. PriorStatus is set on a stopped
+// card only: the status it had before the stop archived it.
+type CardStopCard struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	PriorStatus string `json:"priorStatus,omitempty"`
+}
+
+// CardStopVersion is the cardStop part's version, the only one there is. A
+// part of any other version is not read as one.
+const CardStopVersion = 1
+
+const cardStopKey = "cardStop"
+
+// CardStopPart is c as a data part, at CardStopVersion: the request when
+// c.CardStopResult is nil, the result otherwise. A result's nil lists go
+// out empty, so a result never reads as a request.
+func CardStopPart(c CardStop) (Part, error) {
+	c.V = CardStopVersion
+	if r := c.CardStopResult; r != nil {
+		norm := *r
+		if norm.Stopped == nil {
+			norm.Stopped = []CardStopCard{}
+		}
+		if norm.Settled == nil {
+			norm.Settled = []CardStopCard{}
+		}
+		c.CardStopResult = &norm
+	}
+	data, err := json.Marshal(map[string]CardStop{cardStopKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// CardStopOf finds the cardStop part among parts, request or result,
+// whatever else they hold. A data part that is not one, or one of another
+// version, is skipped.
+func CardStopOf(parts []Part) (CardStop, bool) {
+	for _, p := range parts {
+		if p.Kind != "data" || len(p.Data) == 0 {
+			continue
+		}
+		var wrap map[string]json.RawMessage
+		if json.Unmarshal(p.Data, &wrap) != nil {
+			continue
+		}
+		raw, ok := wrap[cardStopKey]
+		if !ok {
+			continue
+		}
+		var c CardStop
+		if json.Unmarshal(raw, &c) != nil || c.V != CardStopVersion {
+			continue
+		}
+		return c, true
+	}
+	return CardStop{}, false
+}
+
+// CardStopRequested reports whether parts are a card-stop request: data
+// parts only, one of them a cardStop part in its request form. A message
+// with a text or file part is a question, whatever data rides beside it, so
+// a message that asks something is never taken for the control.
+func CardStopRequested(parts []Part) bool {
+	for _, p := range parts {
+		if p.Kind != "data" {
+			return false
+		}
+	}
+	c, ok := CardStopOf(parts)
+	return ok && c.CardStopResult == nil
+}
+
 // The A2A object shapes below carry only the fields the library consults.
 // Payloads travel as raw bytes end to end (assertion 6); these views are for
 // validation and folding, never re-serialized onto the wire.
@@ -206,9 +862,38 @@ type ArtifactUpdate struct {
 	LastChunk bool     `json:"lastChunk,omitempty"`
 }
 
-// AgentCard carries only the field validation needs.
+// AgentCard is the directory card on a2a.agents.<name>. Validation needs
+// only Name; the rest is what the gateway routes a profile on (#3655), all
+// optional so a card without them still parses.
 type AgentCard struct {
 	Name string `json:"name"`
+	// Description is the routing blurb, a sentence a router can read.
+	Description string `json:"description,omitempty"`
+	// Tiers are the tiers the profile may run at (its allowedTiers).
+	Tiers []string `json:"tiers,omitempty"`
+	// ClusterRef pins a profile to one cluster; absent on a profile that
+	// takes its target as task parameters.
+	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
+	// Parameters are the task parameters the profile's persona declares.
+	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to its target cluster, when there is one: the generic cluster
+	// agent sets it, and a specialist addressed by name keeps the task.
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
+}
+
+// ClusterRef names one GKE cluster.
+type ClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// ProfileParameter is one task parameter a profile declares: its name, as
+// TaskParameterNameRE, and whether a submission must carry it.
+type ProfileParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 func protocolErrf(format string, args ...any) error {

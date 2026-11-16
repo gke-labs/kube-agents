@@ -1,0 +1,90 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -14,9 +14,10 @@ metadata:
+ This reference covers running batch processing and high-performance computing
+ (HPC) workloads on GKE.
+ 
+-> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`,
+-> `describe_k8s_resource`, `get_k8s_logs`, `delete_k8s_resource`,
++> **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`, `get_k8s_logs`,
+ > `list_k8s_events`
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## When to Use
+ 
+@@ -81,12 +82,13 @@ spec:
+ 
+ ### Kueue (Job Queuing)
+ 
+-Kueue manages job scheduling and resource allocation for batch workloads:
+-
+-```bash
+-# Install Kueue
+-kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml
+-```
++Kueue manages job scheduling and resource allocation for batch workloads. Its release
++manifests and the queues below are proposed as a pull request through `submit-suggestion`.
++Pin the manifests to a release tag rather than `latest`: the `manifests.yaml` asset at
++`https://github.com/kubernetes-sigs/kueue/releases/download/<TAG>/manifests.yaml`, with the
++tag named in the pull request.
++Kueue's CRDs are too large for client-side apply, so the repository's applier must use
++server-side apply; say so in the pull request if it does not:
+ 
+ ```yaml
+ # Define a ClusterQueue
+@@ -121,27 +123,19 @@ spec:
+ ### Compact Placement (Low-Latency Networking)
+ 
+ For tightly-coupled HPC workloads that need low-latency inter-node
+-communication:
+-
+-```bash
+-# Standard clusters: create node pool with compact placement
+-gcloud container node-pools create hpc-pool \
+-  --cluster <CLUSTER_NAME> --region <REGION> \
+-  --machine-type c3-standard-44 \
+-  --placement-type COMPACT \
+-  --num-nodes 8 \
+-  --enable-autoscaling --min-nodes 0 --max-nodes 16 \
+-  --quiet
+-```
++communication, Standard clusters use a node pool with compact placement, proposed as a
++`ContainerNodePool` in Config Connector YAML through `gcp-config-connector`: for example
++`spec.nodeConfig.machineType: c3-standard-44`, `spec.placementPolicy.type: COMPACT`,
++`spec.initialNodeCount: 8`, and `spec.autoscaling` with `minNodeCount: 0` and
++`maxNodeCount: 16`.
+ 
+ ### MPI Workloads
+ 
+-Use the MPI Operator for MPI-based HPC applications:
+-
+-```bash
+-# Install MPI Operator
+-kubectl apply -f https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml
+-```
++Use the MPI Operator for MPI-based HPC applications. Its manifest and the `MPIJob` below
++are proposed as a pull request through `submit-suggestion`. Pin the manifest to a release tag
++rather than `master`:
++`https://raw.githubusercontent.com/kubeflow/mpi-operator/<TAG>/deploy/v2beta1/mpi-operator.yaml`,
++with the tag named in the pull request:
+ 
+ ```yaml
+ apiVersion: kubeflow.org/v2beta1
+@@ -197,7 +191,7 @@ For batch clusters, allow node pools to scale to zero when no jobs are running:
+ 
+ -   Autopilot (golden path): Automatic, nodes scale to zero when no pods are
+     scheduled
+--   Standard: Set `--min-nodes 0` on batch node pools
++-   Standard: Set `spec.autoscaling.minNodeCount: 0` on batch node pools' `ContainerNodePool`
+ 
+ ## Best Practices & Production Guidelines
+ 

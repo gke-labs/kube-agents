@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*checkout-gateway is crashlooping on an OOM.*\n\nIt hit its 256Mi limit.\n\nRaise it to 512Mi.",
+    "widgets": null
+  }
+]

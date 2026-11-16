@@ -23,6 +23,7 @@ counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
 Usage:
     python3 hack/conformance-mutations.py            # every mutation
     python3 hack/conformance-mutations.py --list
+    python3 hack/conformance-mutations.py --summary  # counts, nothing run
     python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 
 The tree must be clean. It edits tracked files in place and restores them, so a
@@ -57,13 +58,79 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
-    #: and B1-gke-mcp-overlay-copy-redundant.
+    #: and KILLED is the failure. `--summary` names the current ones.
     must_survive: bool = False
 
 
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
+    Mutation(
+        "A3-profile-context-unchecked",
+        "agents/platform/scripts/task_confinement.py",
+        ("    for value in contexts:\n        if value != target.context_name:\n",
+         "    for value in contexts:\n        if False:\n"),
+        "test_A3_a_profile_call_outside_its_tasks_target_is_refused",
+        "trust a profile worker's --context, since the managed kubeconfig only "
+        "holds one context anyway -- until the broker regenerates the one it names",
+    ),
+    Mutation(
+        "A3-profile-no-credential-runs",
+        "agents/platform/scripts/task_confinement.py",
+        ("    if target is None:\n        if not local:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster",
+         "    if target is None:\n        if False:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster"),
+        "test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster",
+        "let a profile worker with no credential run as a session would, on "
+        "the host cluster, so a task the dispatcher gave no target still works",
+    ),
+    Mutation(
+        "A3-profile-reaches-vcs",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
+        "let a profile worker read a proposal the way the MCP pod does -- a "
+        "forge read no task target confines",
+    ),
+    Mutation(
+        "A3-profile-reaches-gke-mcp",
+        "agents/platform/scripts/mcp_policy.py",
+        ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
+         '    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n'
+         '    "gke": GKE_READ_TOOLS,\n}'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a profile worker call the gke MCP server, whose tools name any "
+        "project and cluster in their arguments, so a task confined to one "
+        "cluster could read every other",
+    ),
+    Mutation(
+        "A3-profile-mcp-without-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if principal.task is None:\n        return (\n",
+         "    if False:\n        return (\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a warm profile pod between tasks read through the MCP relay "
+        "with no task credential",
+    ),
+    Mutation(
+        "A3-profile-mcp-uses-the-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return mcp_policy.evaluate_for_profile(server_name, message), offered\n",
+         "    return mcp_policy.evaluate(server_name, message), offered\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "decide a profile worker's call on the relay's whole table, so every "
+        "gke read and answer_query reach it",
+    ),
+    Mutation(
+        "A3-profile-mcp-full-offer",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())\n',
+         '    offered = None\n'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "offer a profile worker the table's whole tool list, answer_query "
+        "and every gke read among it",
+    ),
     Mutation(
         "A3-inject-auth",
         "agents/platform/scripts/session_kv_server.py",
@@ -143,8 +210,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A1-refusal-content",
         "agents/platform/scripts/command_policy.py",
-        ('                "Identity and API server address belong to the broker. Remove "',
-         '                f"Identity belongs to the broker; {argv} was refused. Remove "'),
+        ('                "Identity and API server address belong to the broker.",\n',
+         '                f"Identity belongs to the broker; {argv} was refused.",\n'),
         "test_A1_a_refusal_names_no_caller_supplied_value",
         "make the refusal more helpful by naming what was refused -- the "
         "obvious improvement that turns a denial into an oracle",
@@ -155,25 +222,56 @@ MUTATIONS: list[Mutation] = [
         # the operator holds full CRUD through"; the auth callout has since
         # brought bind back, scoped to one name, and A4-bind-unscoped below
         # is the mutation that covers the scoping. This one stays on escalate.
+        # The anchor is the ClusterRole's rbac rule, whose resource list ends
+        # in `clusterroles` since the Role and RoleBinding writes moved to the
+        # Role document; `roles` followed by `create` is in that document now,
+        # where C5's write-verb ceiling would catch the escalate first.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
-        ("      - roles\n    verbs:\n      - create\n",
-         "      - roles\n    verbs:\n      - create\n      - escalate\n"),
+        ("      - clusterroles\n    verbs:\n      - create\n",
+         "      - clusterroles\n    verbs:\n      - create\n      - escalate\n"),
         "test_A4_the_operator_cannot_escalate_its_own_grants",
         "grant the operator escalate so a reconcile can widen a role in place "
         "-- the ceiling in C5 becomes advisory",
     ),
     Mutation(
+        # The operator's Secret write verbs are a namespaced Role, the second
+        # document in role.yaml; the ClusterRole holds the reads only. This
+        # adds `create` to the ClusterRole's core read rule, the one that
+        # names secrets, configmaps, pods and serviceaccounts together, which
+        # is the pre-#4906 shape for every kind in it: write of every Secret
+        # on the cluster. The anchor is that rule's last resource and its
+        # first verb, a pair no other rule in either document has (the Role
+        # document's core rule ends in `services` too, but its first verb is
+        # `create`), so the first-occurrence replace lands on the ClusterRole.
+        "C5-operator-secrets-cluster-wide",
+        "k8s-operator/config/rbac/role.yaml",
+        ("      - services\n    verbs:\n      - get\n",
+         "      - services\n    verbs:\n      - create\n      - get\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "add create to the operator ClusterRole's core read rule, the rule that already names "
+        "secrets and pods, so one marker edit makes the operator cluster-admin in effect",
+    ),
+    Mutation(
+        # The positive half of the same test: the Role document must name
+        # every namespaced kind the operator renders, so dropping one is a
+        # write the operator can no longer do and the equality assertion is
+        # what says so. `configmaps` is followed by `persistentvolumeclaims`
+        # only in the Role document (the ClusterRole's read rule has
+        # `endpoints` between them), so the anchor is unique.
+        "C5-operator-role-drops-configmaps",
+        "k8s-operator/config/rbac/role.yaml",
+        ("      - configmaps\n      - persistentvolumeclaims\n",
+         "      - persistentvolumeclaims\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "drop configmaps from the operator's namespaced Role, the shape of a marker split that "
+        "forgot a kind, which the self-check would report only once an install ran it",
+    ),
+    Mutation(
         "A1-refusal-emptied",
         "agents/platform/scripts/command_policy.py",
-        ('                message=(\n'
-         '                    "Identity and API server address belong to the broker. Remove "\n'
-         '                    "--server, --token, --user, --client-certificate, "\n'
-         '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured. "\n'
-         '                    + _FLAG_BOUNDARY_NOTICE\n'
-         '                ),\n',
-         '                message="",\n'),
+        ('    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)\n',
+         '    return Decision(allowed=False, rule_id=rule_id, message="", offending_flag=flag)\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",
         "collapse a refusal onto its rule id -- the cheapest way to satisfy "
         "A1's no-caller-supplied-byte bound is to stop saying anything, and an "
@@ -243,6 +341,114 @@ MUTATIONS: list[Mutation] = [
         "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
         "give the chart's operator role an unrestricted bind the kustomize "
         "role does not carry -- one delivery path quietly grows a ceiling",
+    ),
+    Mutation(
+        # A tier is authority (#3659): the operator reads tiers and writes
+        # their status, and only cluster administrators write them.
+        "A4-operator-writes-tiers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the operator create Tiers, so a compromised operator sets what "
+        "tasks may do instead of a cluster administrator",
+    ),
+    Mutation(
+        "A4-operator-writes-tiers-wildcard-group",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - '*'\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard API group, which a group-name match misses",
+    ),
+    Mutation(
+        "A4-operator-writes-tiers-wildcard-resource",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - '*'\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard resource, which a resource-name match misses",
+    ),
+    Mutation(
+        # The A2A stack reads tiers through an operator-rendered ConfigMap, so
+        # no role it mints needs them. A builder that grants them shows up in
+        # the settled golden when it is regenerated, which is what this edits.
+        "A4-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
+         "    verbs:\n      - get\n      - list\n      - watch\n"
+         "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the A2A gateway read tiers directly, as tier-aware "
+        "routing might, instead of through the operator's ConfigMap",
+    ),
+    Mutation(
+        "A4-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
+         "    verbs:\n      - get\n"
+         "  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the next-mode auth callout a wildcard read on the operator's API "
+        "group, which reaches tiers without naming them",
+    ),
+    Mutation(
+        "A4-operator-tiers-wildcard-subresource",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - '*/finalizers'\n    verbs:\n      - update"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the operator put finalizers on Tiers through `*/finalizers`, "
+        "which matches tiers/finalizers without spelling tiers or `*/status`",
+    ),
+    Mutation(
+        "A4-kustomize-leader-election-writes-tiers",
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("rules:\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the kustomize leader-election Role a verb on tiers: the chart "
+        "reads its copy of that Role, so the kustomize side has to read this one",
+    ),
+    Mutation(
+        "A4-tiers-aggregated-by-wildcard",
+        "k8s-operator/config/rbac/role_binding.yaml",
+        ("    namespace: system\n",
+         "    namespace: system\n---\napiVersion: rbac.authorization.k8s.io/v1\n"
+         "kind: ClusterRole\nmetadata:\n  name: kube-agents-admin\n  labels:\n"
+         "    rbac.authorization.k8s.io/aggregate-to-admin: \"true\"\nrules:\n"
+         "  - apiGroups: [\"kubeagents.x-k8s.io\"]\n    resources: [\"*\"]\n"
+         "    verbs: [\"*\"]\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "aggregate a kubeagents.x-k8s.io wildcard into admin: every namespace "
+        "admin writes tiers, and the word tiers appears nowhere in the role",
+    ),
+    Mutation(
+        "A4-chart-role-templated-resources",
+        "charts/kube-agents/templates/web-console.yaml",
+        ('    resources: ["nodes", "namespaces", "pods"]\n',
+         '    resources: {{ toJson .Values.webConsole.clusterResources }}\n'),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "template a chart role's resources, so the parse reads a placeholder "
+        "and a values file decides whether the role reaches tiers",
+    ),
+    Mutation(
+        "A4-web-console-reads-tiers",
+        "charts/kube-agents/templates/web-console.yaml",
+        ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
+         '    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]\n'
+         '  - apiGroups: ["kubeagents.x-k8s.io"]\n    resources: ["tiers"]\n    verbs: ["update"]'),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give a chart-shipped product role a verb on tiers, outside the operator's goldens",
     ),
     Mutation(
         # The chart half was three literal string scans until #1319; this is
@@ -428,16 +634,21 @@ Mutation(
         # never sees it: GitHub resolves `uses:` case-insensitively, so this
         # runs the identical action. The test walked straight past it and
         # reported OK until the filter was lowercased. Pins the action SHA
-        # because the flip and the ref are not contiguous otherwise -- a pin
-        # bump reports STALE here, and the fix is to paste the new SHA in.
+        # because the flip and the ref are not contiguous otherwise -- so the
+        # anchor stops just before the pin and the replacement inserts a
+        # case-flipped checkout step ahead of the original. The anchor holds no
+        # SHA, so a Dependabot bump of actions/checkout leaves it intact; the
+        # SHA in the replacement is never matched against the file.
         "B4-pull-request-target-checkout-case",
         ".github/workflows/risk_classify.yml",
-        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+        ("      - name: Checkout the default branch\n"
+         "        uses: actions/checkout@",
+         "      - name: Checkout the default branch\n"
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
          "        with:\n"
-         "          ref: ${{ github.event.repository.default_branch }}",
-         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-         "        with:\n"
-         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}\n"
+         "      - name: Checkout the default branch, displaced\n"
+         "        uses: actions/checkout@"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "capitalise both the action name and the expression context while "
         "repointing the ref, which is the shape a case-flip evasion takes",
@@ -498,8 +709,8 @@ Mutation(
     Mutation(
         "B1-mcp-relay-opened-to-the-sandbox",
         "agents/platform/scripts/credential_proxy.py",
-        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
-         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE, CALLER_ROLE_SHELL)),\n"),
         "test_B1_only_the_gateway_reaches_the_mcp_relay",
         "let the shell sandbox call MCP tools too, for a skill script -- every "
         "model-authored command then has a GKE read path it never had",
@@ -511,6 +722,80 @@ Mutation(
         "test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route",
         "rename the route on one side only -- every mcp-remote child then dials "
         "a 404 and the gke tools stop working with no policy refusal to read",
+    ),
+    Mutation(
+        "C1-gateway-identity-annotated",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n',
+         '  annotations:\n    iam.gke.io/gcp-service-account: kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com\n'
+         '  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n'),
+        "test_C1_the_gateway_identity_carries_no_cloud_annotation",
+        "copy the broker's annotation onto the gateway's ServiceAccount so a script "
+        "in the gateway can call a Google API -- the model's pod is back on the "
+        "install's whole IAM grant",
+    ),
+    Mutation(
+        "C1-gateway-identity-gains-a-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n',
+         '  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "bind the gateway to the broker's TokenReview role too -- the agent can then "
+        "validate any bearer token it gets hold of, a grant its own token use never "
+        "asked for",
+    ),
+    Mutation(
+        # The callout's Role reads the bus identity map, and its name carries
+        # no tier. Before the parse learned to pass a tierless name through
+        # whole, this edit crashed the test with an IndexError rather than
+        # failing it -- red for the wrong reason.
+        "C1-gateway-identity-reads-the-identity-map",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "let the gateway resolve a principal itself by reading the identity "
+        "map the callout serves, saving a bus round trip -- the model's pod "
+        "gains a read on the table that joins chat identities to bus "
+        "principals, which is what the callout exists to keep behind a "
+        "TokenReview",
+    ),
+    Mutation(
+        "C1-broker-keeps-the-leader-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n',
+         '  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n'
+         '  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "leave the broker on the leader Role as well -- at replicas > 1 it carries "
+        "namespace-wide pods get/patch the broker never uses",
+    ),
+    Mutation(
+        "C1-api-token-in-the-agent-container",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('              name: agent-credential-proxy-token\n              readOnly: true\n',
+         '              name: agent-credential-proxy-token\n              readOnly: true\n'
+         '            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n'
+         '              name: event-watcher-ksa-token\n'
+         '              readOnly: true\n'),
+        "test_C1_only_agent_api_auth_holds_a_kubernetes_api_token_in_the_gateway",
+        "mount the in-cluster token into platform-agent for a kubectl-free skill -- "
+        "the model's container then holds a Kubernetes API credential with the "
+        "minimal ClusterRole's reads",
+    ),
+    Mutation(
+        "C1-gateway-metadata-rule-restored",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
+        ('            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n',
+         '            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n'
+         '      to:\n        - ipBlock:\n            cidr: 169.254.169.254/32\n'
+         '    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n'),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "put the gateway's port-80 metadata rule back for a script that wants the "
+        "project id -- every container in the gateway pod can then fetch a token "
+        "again wherever the pod still has an identity to fetch",
     ),
     Mutation(
         "C1-watcher-token-in-the-agent-container",
@@ -546,11 +831,80 @@ Mutation(
         "for each fleet cluster that has client certificate issuance on",
     ),
     Mutation(
+        "C1-gateway-metadata-dns-rule-widened-to-a-range",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
+        ("        - port: 53\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n",
+         "        - port: 53\n          endPort: 988\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n"),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "widen the gateway's DNS rule to a range for a new resolver port -- "
+        "{port: 53, endPort: 988} still reads as port 53 and admits the "
+        "pre-NAT and post-NAT token fetches",
+    ),
+    Mutation(
+        "C3-management-project-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
+         "    RECONCILE_PROJECT=\n"),
+        "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
+        "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
+        "line in the agent-writable PVC .env then re-points the management "
+        "project, and two clean runs later its profiles are retired",
+    ),
+    Mutation(
+        "C3-stall-watch-exclusion-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    STALL_WATCH_EXCLUDE_NAMESPACES=\n", ""),
+        "test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file",
+        "drop the empty STALL_WATCH_EXCLUDE_NAMESPACES pin because the CR does not "
+        "set it -- one line in the agent-writable PVC .env then silences the stall "
+        "watch for a namespace nobody excluded",
+    ),
+    Mutation(
+        "C1-watcher-reads-a-reconciler-kind-the-agent-cannot",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("configsync.gke.io", "reposyncs"),\n',
+         '        ("configsync.gke.io", "reposyncs"),\n        ("helm.toolkit.fluxcd.io", "helmreleases"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "let the drift join read Flux HelmReleases too, for richer drift context "
+        "-- the broker relays an object, inline values and all, that the agent's "
+        "own role was deliberately never granted",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-custom-kind-outside-the-reconciler-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("cert-manager.io", "certificates"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add cert-manager Certificates to the watcher table for drift on TLS "
+        "objects -- straight into WATCHER_NAMED_READS, so the reconciler table "
+        "and the agent's role never hear about it",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-crd-under-a-k8s-io-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("gateway.networking.k8s.io", "httproutes"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add Gateway API HTTPRoutes to the watcher table, which look built-in by "
+        "their .k8s.io suffix -- the broker relays a CRD the agent's role was "
+        "never granted, and a suffix rule waves it through",
+    ),
+    Mutation(
+        "C1-agent-role-drops-a-reconciler-kind",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - rootsyncs\n      - reposyncs\n",
+         "      - rootsyncs\n"),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "trim RepoSyncs from the agent's role as unused by the Helm skill -- "
+        "the drift join still enriches them, so the two grants no longer say "
+        "the same thing",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
          '_EVENTS_LIST = re.compile(r"api/v1/(events|pods)")\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "let the watcher list pods too, for a richer triage message -- the "
         "events-only route becomes a fleet-wide pod dump on the broker's credential",
     ),
@@ -559,19 +913,140 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})\n',
          'REFUSED_PATH_SEGMENTS = frozenset({"proxy"})\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "drop `watch` from the refused segments as a leftover of an older API -- "
         "the server still serves watch/secrets, and the named-GET rule reads it "
         "as an object called `secrets`",
     ),
     Mutation(
+        "C1-watcher-kind-list-widened",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("", "configmaps"),\n',
+         '        ("", "configmaps"),\n        ("", "nodes"),\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
+        "add nodes to the watcher's kind table so drift on a node label is "
+        "enriched -- every fleet node, its addresses and taints, becomes "
+        "readable on the broker's credential for a kind no person edits",
+    ),
+    Mutation(
+        "C1-watcher-kind-group-ignored",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
+         '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
+        "match the table on the plural alone to save a parse -- any CRD that "
+        "names its plural `deployments` or `roles` is then read as if it were "
+        "the built-in kind",
+    ),
+    Mutation(
+        "C1-watcher-secrets-moved-into-the-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
+         'REFUSED_RESOURCES = frozenset()\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
+        "drop the separate Secrets refusal as redundant now that the kind table "
+        "exists -- it is the only rule that refuses a Secret under a group the "
+        "table may one day list, and the import check leans on it",
+    ),
+    Mutation(
+        "C1-watcher-count-list-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept):\n',
+         '        if accept and not accepts_metadata_only(accept):\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "let a count list through when the caller sends no Accept at all, for an "
+        "older watcher -- the one item then comes back as the whole object, spec "
+        "and status beside the ObjectMeta the metadata Accept already relays, on "
+        "the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n',
+         '        if accept and not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "let a named Pod read through when the caller sends no Accept at all -- the "
+        "Pod then comes back whole, spec, env and status, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:\n',
+         '    if match.groupdict().get("ns") and match.group("resource") == POD_RESOURCE:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "drop the core-group guard on the named Pod rule, so any API group's "
+        "resource called pods (metrics.k8s.io's PodMetrics, a CRD's plural) is "
+        "relayed on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-unprojected-labels",
+        "agents/platform/scripts/watcher_policy.py",
+        ('                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}\n',
+         '                projected["labels"] = dict(labels)\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay every label of a named Pod instead of the owner lookup's one, "
+        "widening what the watcher token reads of any Pod in the fleet",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-controller-kind",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):\n',
+         '        if kind != POD_METADATA_HASH_OWNER_KIND or has_hash:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay a named Pod's controller whatever its kind (a static Pod's Node, a "
+        "custom controller), which the owner lookup never folds on",
+    ),
+    Mutation(
+        "C1-watcher-count-list-widened-to-secrets",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
+         '        "apis/batch/v1/cronjobs",\n        "api/v1/secrets",\n    }\n)\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "count Secrets too, for a sizing figure -- the first-sorted Secret's "
+        "ObjectMeta, its last-applied-configuration annotation and the data an "
+        "applied manifest carries in it included, becomes readable on the "
+        "broker's credential",
+    ),
+    Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
-        ('        if not subscription or match.group("sub") != subscription:\n',
-         '        if not subscription:\n'),
+        ('    if match.group("sub") not in subscriptions:\n',
+         '    if not subscriptions:\n'),
         "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
-        "drop the equality check when renaming the subscription env -- the "
-        "relay then pulls and acks any subscription the broker can reach",
+        "drop the membership check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach "
+        "(the platform relay shares the check, so its test goes red too)",
+    ),
+    Mutation(
+        "C1-platform-pubsub-pinned-to-project-not-subscription",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n',
+         '    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)\n'
+         '    if match and any(match.group("sub").rsplit("/", 2)[0] == s.rsplit("/", 2)[0] for s in subscriptions):\n'
+         '        subscriptions = subscriptions | {match.group("sub")}\n'
+         '    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n'),
+        "test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions",
+        "let a plugin pull any subscription in a project it already has one in, "
+        "so a new route needs no operator render -- the gateway then reads the "
+        "drift watcher's and every other subscription in the harness project",
+    ),
+    Mutation(
+        "C1-platform-pubsub-route-opened-to-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay",
+        "let a skill in the shell sandbox pull the stockout subscription directly "
+        "-- the agent's own commands then drain a queue meant for the gateway",
+    ),
+    Mutation(
+        "C1-platform-adapter-default-credential",
+        "agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py",
+        ("import json\n",
+         "import json\n\nimport google.auth  # the project id from the pod's default credential when the env is unset\n"),
+        "test_C1_no_shipped_platform_adapter_holds_a_google_credential_path",
+        "fall back to google.auth.default() for the project id -- the path that "
+        "failed quietly for every alert once the gateway lost Workload Identity",
     ),
     Mutation(
         "C1-watcher-routes-opened-to-chat",
@@ -718,6 +1193,17 @@ Mutation(
         "do-not-merge check, so a held pull request is enqueued anyway",
     ),
     Mutation(
+        "B2-enqueue-retry-skips-labels",
+        "scripts/merge_gate.py",
+        ('    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n',
+         '    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n'
+         '    if pull.get("retry") and not queued:\n'
+         '        return ENABLE\n'),
+        "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
+        "put a pull request back on its retry before the label test, since it "
+        "was approved when it entered, so one that lost lgtm is enqueued anyway",
+    ),
+    Mutation(
         "B2-app-token-grants-pull-requests",
         ".github/workflows/rc-create-tag.yml",
         ("          permission-contents: write\n",
@@ -854,6 +1340,20 @@ Mutation(
         "destination while still looking like an allowlist entry",
     ),
     Mutation(
+        "C1-postgres-guard-tied-to-api-toggle",
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "{{- $postgresqlNetworkPolicy := and $hindsightNetworkPolicy "
+            ".Values.hindsight.postgresql.networkPolicy.enabled }}",
+            "{{- $postgresqlNetworkPolicy := $apiNetworkPolicy }}",
+        ),
+        "test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone",
+        "render the Postgres guard under the api policy's toggle, so the "
+        "bring-your-own-gateway escape (api policy off) takes the only guard on "
+        "the passwordless database with it -- the one-boolean shape the chart "
+        "had before the toggles were split",
+    ),
+    Mutation(
         "C1-cidr-guard-inert",
         "k8s-operator/internal/controller/platformagent_egress_policy.go",
         ("\tif reason := ipv4MappedRefusal(prefix, cidr); reason != \"\" {\n\t\treturn reason\n\t}\n", ""),
@@ -881,6 +1381,37 @@ Mutation(
         "every IAM principal in a tool result then reaches the model as "
         "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
         "turned off",
+    ),
+    Mutation(
+        "A1-flag-refusal-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("    stripped = _strip_refused_flags(argv)\n",
+         "    return None\n    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "skip the remainder check to save an evaluation per refusal -- every "
+        "flag refusal on a write invites the flagless retry again, and the "
+        "agent runs the bare write it was always going to be refused",
+    ),
+    Mutation(
+        "A1-kubectl-flag-refusal-forbids-the-halting-retry",
+        "agents/platform/scripts/command_policy.py",
+        ('    if argv[0] == "kubectl":\n        return None\n    stripped = _strip_refused_flags(argv)\n',
+         "    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "apply the refused-retry wording to kubectl too, for consistency -- "
+        "a kubectl write refused for a flag tells the agent not to retry, the "
+        "flag refusal does not count toward the runtime halt, and the retry "
+        "that would have halted the turn is never made",
+    ),
+    Mutation(
+        "A1-unknown-flag-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("        if retry_refused:\n",
+         "        if False and retry_refused:\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "drop the write variant of the unreadable refusal as an edge case -- "
+        "an unknown flag on clusters update says re-run without the flag, "
+        "seven times over",
     ),
     Mutation(
         "C2-unknown-flag-fail-open",
@@ -935,8 +1466,11 @@ Mutation(
     Mutation(
         "C4-unpinned-action",
         ".github/workflows/prettier.yml",
-        ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-         "actions/checkout@v7"),
+        # Anchored on the prefix, not the pin, so a Dependabot bump leaves it
+        # intact: the replacement floats the ref to a tag and turns the old SHA
+        # into a trailing comment.
+        ("uses: actions/checkout@",
+         "uses: actions/checkout@v7 # was "),
         "test_C4_every_third_party_action_is_pinned_to_a_commit",
         "float one action back to a tag, which a Dependabot conflict "
         "resolution can produce by hand",
@@ -944,7 +1478,9 @@ Mutation(
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294", ""),
+        # Anchored on the separator, not the digest, so a base-image bump
+        # leaves it intact: the digest moves to a comment line below the tag.
+        ("@sha256:", "\n# was @sha256:"),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
     ),
@@ -1050,6 +1586,15 @@ Mutation(
         ("  failurePolicy: Fail", "  failurePolicy: Ignore"),
         "test_C5_the_admission_policy_fails_closed",
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
+    ),
+    Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
     ),
     Mutation(
         "C1-broker-colocation-flag-restored",
@@ -1169,13 +1714,45 @@ Mutation(
         "cannot see it",
     ),
     Mutation(
+        # The one binding allowed to name system:auth-delegator is the
+        # callout's, and the test pins its subject list. A second subject
+        # on that binding is the cheapest way to hand another identity a
+        # TokenReview and SubjectAccessReview oracle without a new object.
+        "C5-callout-binding-gains-the-sandbox",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-shell\n    namespace: kubeagents-system\n'),
+        "test_C5_no_agent_binding_names_the_auth_delegator_role",
+        "let the sandbox's tooling validate bearer tokens itself instead of "
+        "asking the callout, by adding it to the binding that already exists "
+        "-- the roleRef is unchanged, so a test that checks roleRefs alone "
+        "sees nothing, and the pod where model-authored shell runs gains a "
+        "TokenReview and SubjectAccessReview oracle over the cluster",
+    ),
+    Mutation(
+        # The spawner's pod rule is the one place a write verb already sits,
+        # so one more verb there reads as housekeeping. patch on pods is a
+        # route into a running session: labels off the fence's selector, an
+        # ephemeral container, a changed image.
+        "C5-spawner-role-gains-pod-patch",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n',
+         '      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n      - patch\n'),
+        "test_C5_the_spawner_role_holds_exactly_its_audited_rules",
+        "let the gateway relabel a session pod it owns, so a stuck session can "
+        "be taken out of the fence's selector for debugging -- which is also "
+        "what a compromised gateway would do to a session it wants unfenced",
+    ),
+    Mutation(
         "C5-leader-reaches-configmaps",
-        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
-        # rule renders only above one replica, and the HA fixture is the only
-        # golden that sets it.
+        # platformagent-ha.yaml: the fixture that asks for more than one
+        # replica. Since the operator caps the gateway at one replica (#3027),
+        # its leader Role renders the leases rule only, so the mutation widens
+        # that rule.
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
-        ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
-         "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
+        ("    resources:\n      - leases\n    verbs:\n",
+         "    resources:\n      - configmaps\n      - leases\n    verbs:\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
         "add the ConfigMap lock client-go's configmapsleases mode still "
         "supports, which turns a coordination role into a namespace read-write "
@@ -1200,12 +1777,22 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
+    ),
+    Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        (
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch",
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch\n      - patch",
+        ),
         "test_D1_no_product_role_can_write_the_identity_table",
-        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
-        "beside the configmaps it already reads",
+        "grant a write verb on secrets in the platform agent's minimal ClusterRole",
     ),
     Mutation(
         "D2-workflow-mode",
@@ -1222,9 +1809,13 @@ Mutation(
         "stretch the projection to a day to stop a rotation warning",
     ),
     Mutation(
+        # Anchored at the line's own indentation: a shorter prefix matches the
+        # same line as a substring, leaves four stray spaces behind and breaks
+        # the golden's YAML parse, which fails every golden reader at once --
+        # a kill for the wrong reason that hid whether D4 saw the audience go.
         "D4-audience-dropped",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("              audience: kubeagents-credential-proxy\n", ""),
+        ("                  audience: kubeagents-credential-proxy\n", ""),
         "test_D4_the_broker_token_is_audience_bound",
         "drop the audience, making the broker's token a general-purpose "
         "cluster bearer token and TokenReview a formality",
@@ -1448,7 +2039,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
         "test_A3_the_inject_door_renders_only_under_the_operator_flag",
         "render the eval door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door has no customer-facing purpose and maps a principal out of a "
         "request body, so an install that never asked for it must not carry "
         "it. The operator's own flag-off render test "
@@ -1502,7 +2093,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = append(injectEnv,"),
         "test_A3_the_a2a_door_renders_only_under_the_operator_flag",
         "render the A2A door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door resolves a caller the request names into an eval identity, so "
         "an install that never asked for it must not carry it; the "
         "conformance test is the one that has to notice, from the source, "
@@ -1640,11 +2231,20 @@ Mutation(
     Mutation(
         "A3-slack-foreign-workspace-admitted",
         "a2a/gateway/slack.go",
-        ("\tif s.foreignSender(m) {\n\t\treturn InboundMessage{}, false\n\t}\n", ""),
+        ("\trefused, author := s.foreignSender(m)\n\tif refused {\n\t\treturn InboundMessage{}, false\n\t}\n",
+         "\t_, author := s.foreignSender(m)\n"),
         "test_A3_another_workspaces_member_is_not_a_turn",
         "drop the workspace check, so under allow-all a Slack Connect guest from "
         "another organisation is admitted as slack:<member id> with the install's "
         "capability",
+    ),
+    Mutation(
+        "A3-slack-guest-admitted-without-an-entry",
+        "a2a/gateway/slack.go",
+        ("\treturn entry, s.guests[entry]", "\treturn entry, true"),
+        "test_A3_another_workspaces_member_is_not_a_turn",
+        "admit every member of another workspace as slack:T…:U…, entry or not, so "
+        "allow-all serves any connected organisation",
     ),
     Mutation(
         "A3-slack-map-asserts-member-prefix",
@@ -1771,6 +2371,16 @@ Mutation(
         "each module's test compares its constant to itself",
     ),
     Mutation(
+        "C1-session-audience-env-renamed-in-kube-proxy",
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
+         'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the session-audience env var in k8s-api-proxy while "
+        "k8s-operator still renders CREDENTIAL_PROXY_SESSION_AUDIENCE: both Go "
+        "suites pass while session kubectl fails with 401",
+    ),
+    Mutation(
         "C1-shim-token-env-renamed-in-the-spawner",
         "a2a/gateway/spawn.go",
         ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
@@ -1853,32 +2463,121 @@ Mutation(
         "site instead of referencing lib.ArtifactDelegate",
     ),
     Mutation(
-        "C1-delegate-text-cap-hand-spelled-in-delegation",
+        "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 16*1024 {'),
+        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "hand-type the cap in the gateway's own length check instead of "
-        "referencing lib.DelegateTextCap -- agrees with the constant today "
-        "and silently stops the day someone edits only the constant",
+        "drop the gateway's call to lib.ValidateDelegateRequest: an "
+        "over-length text, or a malformed batch, that reached the bus without "
+        "the adapter would then be minted, and the gateway's line of defence "
+        "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-in-delegation",
+        "C1-delegate-gateway-validates-only-some-requests",
         "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 {'),
+        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
+         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift the magic-number regex does not "
-        "name; only the positive check, scoped to handleDelegateRequest, "
-        "sees that the shared constant is gone from the check (the rest of "
-        "delegation.go still references it)",
+        "condition the gateway's validator call so it guards only batches: "
+        "the call still appears, but a single over-length task that reached "
+        "the bus without the adapter is minted",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-under-a-comment-naming-it",
-        "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 { // lib.DelegateTextCap, as a shift'),
+        "C1-delegate-validator-cap-hand-spelled",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 16*1024:"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift and leave the constant's name in "
-        "a comment on the same line; only a pin that reads the function's "
-        "code without its comments sees the constant gone",
+        "hand-type the cap in lib's shared validator instead of referencing "
+        "DelegateTextCap -- agrees with the constant today and silently "
+        "stops the day someone edits only the constant",
+    ),
+    Mutation(
+        "C1-delegate-validator-cap-shifted",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 1<<14:"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the validator's cap as a shift the magic-number regex does not "
+        "name; only the positive check, scoped to validateDelegateText, sees "
+        "that the shared constant is gone from the comparison",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-batch-entries",
+        "a2a/lib/payload.go",
+        ("validateDelegateText(e.Text)", "error(nil)"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop checking each batch entry's text in lib's shared validator: the "
+        "gateway then mints a batch entry of any length that reached the bus "
+        "without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-batch-entries",
+        "a2a/worker-adapter/delegate.go",
+        ('if why := validateDelegate(lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}); why != "" {',
+         'if why := ""; why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating each batch entry in the worker-adapter's "
+        "validateDelegateFor: the adapter then publishes a batch whose "
+        "entries it never capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-checks-the-wrong-batch-text",
+        "a2a/worker-adapter/delegate.go",
+        ("Text: e.Text, Parameters: e.Parameters}); why", 'Text: "ok", Parameters: e.Parameters}); why'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "validate each batch entry with a fixed text instead of its own: the "
+        "per-entry call still runs, but no entry's real text is capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-batch-refusal-neutered",
+        "a2a/worker-adapter/delegate.go",
+        ('Parameters: e.Parameters}); why != "" {', 'Parameters: e.Parameters}); false {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the per-entry validateDelegate call but never act on its answer: "
+        "the call is still there, and every batch entry is published unchecked",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-refusal-neutered",
+        "a2a/worker-adapter/adapter.go",
+        ('validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'validateDelegateFor(ask.req, a.delegateWidth); false && why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the adapter's validateDelegateFor call but never refuse on it: "
+        "an over-length request is published to the bus",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-check-commented-out",
+        "a2a/worker-adapter/adapter.go",
+        ('if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'if why := ""; why != "" { // validateDelegateFor(ask.req, a.delegateWidth)'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "drop the adapter's check and leave its call in a comment on the same "
+        "line: only a pin that reads code without comments sees it gone",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-the-single-request",
+        "a2a/worker-adapter/delegate.go",
+        ("\t\treturn validateDelegate(req)\n", "\t\treturn \"\"\n"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating a single (non-batch) request in the worker-adapter's "
+        "entry point: validateDelegate then guards nothing the adapter publishes",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-the-single-text",
+        "a2a/lib/payload.go",
+        ("if err := validateDelegateText(r.Text); err != nil {", "if err := error(nil); err != nil {"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop capping a single (non-batch) request's text in the shared "
+        "validator: the gateway then mints an over-length single task that "
+        "reached the bus without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-wire-tasks-renamed",
+        "a2a/lib/payload.go",
+        ('json:"tasks,omitempty"', 'json:"batch,omitempty"'),
+        "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
+        "rename the batch's wire field without touching the tool schema: the "
+        "model sends `tasks` by the schema and the adapter reads a `batch` "
+        "that was never sent",
     ),
     Mutation(
         "C1-delegate-text-cap-hand-spelled-in-worker-adapter",
@@ -1891,8 +2590,8 @@ Mutation(
     Mutation(
         "C1-delegate-schema-property-renamed",
         "a2a/worker-adapter/mcp.go",
-        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
-         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        ('"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},',
+         '"target": map[string]any{"type": "string", "description": addresseeDescription(targets)},'),
         "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
         "rename the schema's addressee property to target without touching "
         "lib.DelegateRequest: the model calls the tool exactly as the schema "
@@ -1984,7 +2683,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:               true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",
@@ -1992,13 +2691,43 @@ Mutation(
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
         "after a harness crash. An executor can then declare itself dead as "
         "infrastructure",
+    ),
+    Mutation(
+        "A3-bridge-writes-stop-records",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.stop.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' stop records, so the "
+        "platform agent can stop a profile task it delegated. It can then stop "
+        "tasks other requesters started",
+    ),
+    Mutation(
+        "A3-bridge-submits-profile-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.submit.*.*.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' submit subject, so the "
+        "platform agent can hand a profile work without a gateway hop. It "
+        "then starts tasks under grants the gateway never minted for them",
+    ),
+    Mutation(
+        "A3-session-submits-profile-tasks",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSubmitSubject("*", "*", "*", "*"),\n\t\t},'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "derive every executor a grant on profiles' submit subject, the "
+        "shortcut a worker delegating straight to a profile would take. A "
+        "worker can then start tasks of its own outside the gateway's checks",
     ),
     Mutation(
         "A3-bridge-sends-a-notify",
@@ -2022,10 +2751,20 @@ Mutation(
         "channel without the agent",
     ),
     Mutation(
+        "A3-bridge-sends-a-console-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.console",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the console notify subject, so "
+        "a task the bridge runs can put a report into any console "
+        "conversation whose context it knows, without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "
@@ -2034,18 +2773,39 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod a publish grant on the notify subject, so a "
-        "session can post its result to the home channel itself. The gateway "
-        "then posts as the install's bot for whatever runs in a session pod",
+        "derive a session pod (and, through the shared executorTaskGrants, an "
+        "AgentProfile pod) a publish grant on the notify subject, so a session "
+        "can post its result to the home channel itself. The gateway then "
+        "posts as the install's bot for whatever runs in that pod",
+    ),
+    Mutation(
+        "A3-agent-answers-the-board",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the board reply namespace, so the agent "
+        "container can answer the gateway's board request itself. What it "
+        "answers is drawn on the Slack Home tab of every admitted member",
+    ),
+    Mutation(
+        "A3-session-asks-the-board",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the board request, so "
+        "whatever runs in a session pod can make the bridge read session-kv "
+        "on its behalf",
     ),
     Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
@@ -2054,22 +2814,24 @@ Mutation(
     Mutation(
         "A3-profile-pod-writes-its-own-supervisor-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "derive an AgentProfile's pods a grant on their profile's supervisor "
-        "subject, the janitor's. A profile pod could then end its own task, or "
-        "a sibling's, and have it read as the janitor declaring it dead",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "grant on its profile's supervisor subject, the janitor's. A profile "
+        "pod could then end its own task, or a sibling's, and have it read as "
+        "the janitor declaring it dead",
     ),
     Mutation(
         "A3-profile-pod-writes-its-own-in-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
-        "derive an AgentProfile's pods a publish grant on their profile's in "
-        "subject. Every pod of the profile could then steer or cancel any of "
-        "the profile's tasks as if from the requester",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "publish grant on its profile's in subject. Every pod of the profile "
+        "could then steer or cancel any of the profile's tasks as if from the "
+        "requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",
@@ -2144,8 +2906,8 @@ Mutation(
     Mutation(
         "C1-bus-token-file-reservation-spelled-by-hand",
         "k8s-operator/internal/controller/platformagent_manifests.go",
-        ('\t\t\t\t\te.Name == a2aBusTokenFileEnv ||',
-         '\t\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
+        ('\t\t\t\te.Name == a2aBusTokenFileEnv ||',
+         '\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
         "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
         "inline the constant at the plugin-env drop, which changes no "
         "behaviour today and is the shape a reviewer waves through. It costs "
@@ -2183,8 +2945,8 @@ Mutation(
     Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\tuser:           a2aAgentBusUser,',
-         '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
+        ('\t\tuser:    a2aAgentBusUser,',
+         '\t\tuser:    a2aAgentBusUser,\n\t\tcredsKey: a2aBridgePasswordKey,'),
         "test_C1_the_agent_principal_carries_no_static_bus_password",
         "give the agent's callout principal a Secret key as well, so the same "
         "name is answered for by both the callout and nats.conf's auth_users "
@@ -2281,7 +3043,12 @@ def _run_suite() -> tuple[set[str], set[str]]:
         capture_output=True,
         text=True,
         timeout=300,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        # CONFORMANCE_MUTATION_RUN: the suite's anchor self-check
+        # (test_every_mutation_still_finds_the_text_it_edits) skips itself
+        # here. A mutation removes its own anchor by design, so that check
+        # would fire on every mutated tree and read every verdict as NOISY or
+        # OVERSHOT; this script checks the anchor itself before mutating.
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CONFORMANCE_MUTATION_RUN": "1"},
     )
     output = process.stdout + process.stderr
     failed = set(re.findall(r"^(?:FAIL|ERROR): (\S+)", output, re.MULTILINE))
@@ -2299,13 +3066,37 @@ def _git_clean() -> bool:
     ).stdout.strip()
 
 
-def main() -> int:
+def summary(mutations: list[Mutation]) -> str:
+    """The counts a reader wants from the mutation table, computed (#3553).
+
+    The README used to restate them by hand, so every pull request that added
+    a mutation rewrote the same line and conflicted with every other one. What
+    a run measures (killed, noisy) is true only of the commit it ran on, and
+    belongs to the pull request that ran it.
+    """
+    controls = [m.id for m in mutations if m.must_survive]
+    return (
+        f"{len(mutations)} mutations, {len(controls)} must_survive control(s): "
+        f"{', '.join(controls) or 'none'}.\n"
+        f"A full run's last line counts the other {len(mutations) - len(controls)}: "
+        f"killed + noisy + survived + stale. A control that passes, SURVIVED (expected), "
+        f"is none of those; one that goes red (OVERSHOT) counts as survived, and one "
+        f"whose anchor moved counts as stale."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--summary", action="store_true",
+                        help="print the mutation and must_survive counts; runs nothing")
     parser.add_argument("-k", "--filter", default="")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     selected = [m for m in MUTATIONS if arguments.filter in m.id]
+    if arguments.summary:
+        print(summary(selected))
+        return 0
     if arguments.list:
         for mutation in selected:
             print(f"{mutation.id:38} {mutation.path}")

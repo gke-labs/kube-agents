@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -83,8 +85,8 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 // What rolling buys is not that the new pods can read the map -- with a
 // mutable tag they pull a binary that can, but that is the registry's doing,
 // not ours. It is that a pod which refuses its FIRST map has no previous one to
-// fall back on, so Store.Ready is false, /readyz answers 503 `no identity map:
-// ...`, the Deployment never goes Available and the rollout stops with the
+// fall back on, so Store.Ready is false, /readyz answers 503 `no identity map;
+// the last one was refused: ...`, the Deployment never goes Available and the rollout stops with the
 // reason on the pod. The silent case only exists because the refusing replica
 // was already serving something. Rolling removes the fallback, and with it the
 // silence.
@@ -102,7 +104,13 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	1 -> serviceAccount, user, account, grants
 //	2 -> adds narrowing
 //	3 -> adds profile and topics (the AgentProfile entry)
-const a2aIdentityMapSchema = "3"
+//	4 -> adds tier (one AgentProfile entry per tier, #3655)
+//	5 -> adds shard and shards (the map is cut into numbered ConfigMaps;
+//	     a callout from before it watches a name no longer rendered)
+//	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
+//	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
+//	     refuses both
+const a2aIdentityMapSchema = "6"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -119,6 +127,23 @@ const (
 	// addressee names (renderA2AReservedAddressees). The callout refuses to
 	// start without it, so it and the image that reads it ship together.
 	a2aCalloutReservedAddresseesEnvVar = "A2A_RESERVED_ADDRESSEES"
+
+	// a2aCalloutTaskSigningKeysEnvVar names the callout's list of
+	// task-signing public keys (#3889), comma separated. Optional to the
+	// callout, which honours no task connection without it, and refused
+	// there if malformed (authcallout.ParseTaskSigningKeys).
+	a2aCalloutTaskSigningKeysEnvVar = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+
+	// a2aCalloutAuthMapNameEnvVar carries the stem of the identity map's
+	// shard names (a2aAuthMapName) and a2aCalloutAuthMapShardsEnvVar the
+	// shard count; the callout watches <stem>-0 through <stem>-<count-1>
+	// by name and refuses to start without the count, so a callout image
+	// from after sharding never runs against an operator from before it on
+	// a guess. The count is rendered from the same render that cut the
+	// shards and wrote the Role's resourceNames, so the three agree by
+	// construction and a change in the count rolls the callout once.
+	a2aCalloutAuthMapNameEnvVar   = "A2A_AUTHMAP_NAME"
+	a2aCalloutAuthMapShardsEnvVar = "A2A_AUTHMAP_SHARDS"
 
 	// a2aReservedAddresseesSeparator joins the list. The callout's
 	// authcallout.ParseReservedAddressees splits on a bare comma.
@@ -408,6 +433,15 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // and so whoever writes the sidecar can already name any scope they like. The
 // override bought nothing and cost a silent clobber. The bridge sets neither
 // name, so it still takes the downward API and still gets the ENOENT repair.
+//
+// NATS_CA_FILE and the bus CA mount go on with the switch, as overrides. The
+// bus requires TLS, and a bridge the CR declares carries its own NATS_URL and
+// credentials (a2a/docs/hermes-bridge.md) but nothing that trusts the
+// operator's CA, so without these it fails verification and crash-loops the
+// agent pod. The name is ours, and a CR value pointing at another file would
+// choose which server the sidecar accepts as the bus. The mount is skipped
+// where the container already has one by that volume name or at that path, as
+// the rendered bridge does by inheritance.
 func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 	if len(containers) == 0 {
 		return containers
@@ -425,11 +459,24 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 		}
 		switchOverride := []corev1.EnvVar{
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+			a2aNATSCAFileEnvVar(),
+		}
+		// A declared bridge binds its intake durable as the rendered one does:
+		// the provision Job creates it, and the bridge principal is refused
+		// creating it (#4173).
+		if a2aIsBridgeSidecar(c) {
+			switchOverride = append(switchOverride, corev1.EnvVar{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"})
 		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
 		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
+		mount := a2aNATSCABundleMount()
+		if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == mount.Name || m.MountPath == mount.MountPath
+		}) {
+			c.VolumeMounts = append(slices.Clone(c.VolumeMounts), mount)
+		}
 		out = append(out, c)
 	}
 	return out
@@ -518,8 +565,8 @@ const a2aAuthDelegatorRole = "system:auth-delegator"
 // Each would rewrite the other's Subjects on every reconcile, so one namespace's
 // callout silently loses TokenReview and refuses every connection with an error
 // indistinguishable from a bad token; and teardown then fails the ownership
-// check and returns "refusing to delete unowned" forever. The controller
-// already spells cluster-scoped names this way elsewhere.
+// check and leaves the binding to the other agent. The controller already
+// spells cluster-scoped names this way elsewhere.
 func a2aCalloutClusterRoleBindingName(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("kubeagents:a2a-callout-tokenreview:%s:%s", agent.Namespace, agent.Name)
 }
@@ -575,14 +622,24 @@ func buildA2ACalloutClusterRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbac
 // serves a map and its readiness probe stays red. That is a loud failure with
 // BusCredentialsReady false and a named error in the log, not a silent one —
 // which is the reason this is acceptable rather than hedged with a wider grant.
-func buildA2ACalloutRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+//
+// authMapShards is how many shards the map was cut into this pass: one
+// resourceName per shard, and nothing wider. A label selector over the
+// namespace's ConfigMaps would discover the shards without re-rendering the
+// Role when the count changes, and would also hand the callout every ConfigMap
+// in the namespace; the count is one number from the same render, so the Role
+// names each shard instead. On the pass where the count grows, the new shard is
+// applied before this Role is, and the callout's watch of it is forbidden until
+// the Role lands moments later; the informer retries, and the callout serves
+// its previous map meanwhile.
+func buildA2ACalloutRole(agent *agentv1alpha1.PlatformAgent, authMapShards int) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "callout")},
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups:     []string{""},
 			Resources:     []string{"configmaps"},
-			ResourceNames: []string{a2aAuthMapName(agent)},
+			ResourceNames: a2aAuthMapShardNames(agent, authMapShards),
 			Verbs:         []string{"get", "list", "watch"},
 		}},
 	}
@@ -615,8 +672,13 @@ func a2aCalloutPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string
 	return map[string]string{"app": a2aCalloutName(agent)}
 }
 
-// buildA2ACalloutDeployment renders the service.
-func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+// buildA2ACalloutDeployment renders the service. taskSigningPublic is the
+// task-signing public key (ensureA2ATaskSigningKeySecret), rendered as a value:
+// the callout gets the public half and never a reference to the Secret holding
+// the seed.
+// authMapShards is the shard count the identity map was cut into this pass,
+// handed to the callout beside the name stem (a2aCalloutAuthMapShardsEnvVar).
+func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPublic string, authMapShards int) *appsv1.Deployment {
 	name := a2aCalloutName(agent)
 	labels := a2aLabels(agent, "callout")
 	selector := a2aCalloutPodSelector(agent)
@@ -625,7 +687,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -700,6 +762,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+							a2aNATSCAFileEnvVar(),
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -708,9 +771,16 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
 								FieldPath: "metadata.namespace",
 							}}},
-							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
+							{Name: a2aCalloutAuthMapNameEnvVar, Value: a2aAuthMapName(agent)},
+							{Name: a2aCalloutAuthMapShardsEnvVar, Value: strconv.Itoa(authMapShards)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
+							// The longest a profile task's credential may live
+							// (#3889): the same resolver the dispatch config
+							// clamps task deadlines with, so the dispatcher never
+							// issues a credential this callout refuses. A callout
+							// from before #3889 ignores it.
+							a2aTaskCredentialMaxLifetimeEnv(agent),
 							// The static nats.conf users, which no identity map
 							// carries: a narrowed pod named after one would
 							// hold its inbox. Plain names, no password.
@@ -719,6 +789,12 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// on a fixed name: a narrowed pod named after
 							// one would be handed them. Plain names.
 							{Name: a2aCalloutReservedAddresseesEnvVar, Value: renderA2AReservedAddressees()},
+							// The task-signing public key, whose
+							// credentials narrow a worker's task
+							// connection to one task. Public, so a plain
+							// value: a reference to its Secret would be a
+							// reference to the dispatcher's seed.
+							{Name: a2aCalloutTaskSigningKeysEnvVar, Value: taskSigningPublic},
 							// The seeds. This Deployment is the only
 							// thing that reads them, and the issuer is the
 							// key that decides what every connection on
@@ -742,6 +818,11 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								Key:                  a2aCalloutXKeySeedKey,
 							}}},
 						},
+						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+						// The operator GETs /status on this port by pod IP, from
+						// every Ready replica, for A2AIdentityMapApplied (#4487):
+						// a NetworkPolicy added here later must admit the
+						// operator, or the condition turns StatusUnreadable.
 						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -779,10 +860,13 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
+					Volumes: []corev1.Volume{a2aNATSCABundleVolume(agent)},
 				},
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	return dep
 }
 
 // buildA2ACalloutService fronts the status endpoints. The bus reaches the
@@ -839,9 +923,10 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aCalloutPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
 			// AlwaysAllow rather than the IfHealthyBudget default, for the
-			// verifier's reason. /readyz needs the bus connection, and the
-			// bus is a one-replica StatefulSet, so while it is down, or its
-			// PVC is Pending, BOTH callouts are Running and NotReady. Under
+			// verifier's reason. /readyz needs the bus connection, so while
+			// the bus is down (a single-server bus restarting, or every
+			// server of a cluster gone), or its PVC is Pending, BOTH
+			// callouts are Running and NotReady. Under
 			// the default that is currentHealthy 0 against desiredHealthy
 			// 1, zero disruptions allowed, and every eviction of either pod
 			// refused until the bus returns: a budget holding a node's drain
@@ -863,13 +948,16 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 // informer later in the same pass, and the apply's response is the one
 // number that says whether the copy it gets is the object this pass wrote
 // or the one before it (a2aGatewayWaitsForCallout).
-func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (int64, error) {
-	callout := buildA2ACalloutDeployment(agent)
+//
+// authMapShards is the shard count of the identity map this pass applied,
+// which the Role and the Deployment's environment both carry.
+func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, taskSigningPublic string, authMapShards int) (int64, error) {
+	callout := buildA2ACalloutDeployment(agent, taskSigningPublic, authMapShards)
 	// Namespaced objects get an owner reference so they are reclaimed with
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
 	// collector, which deletes it immediately. It is reclaimed by name
-	// instead, from both the mode flip and the deletion path.
+	// instead, from the deletion path.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
 		// The provision Job's identity, applied here so it exists before the
@@ -880,7 +968,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		// is rejected by the API server, which the gateway would surface as a
 		// failed spawn rather than as a misconfiguration.
 		buildA2ASessionServiceAccount(agent),
-		buildA2ACalloutRole(agent),
+		buildA2ACalloutRole(agent, authMapShards),
 		buildA2ACalloutRoleBinding(agent),
 		callout,
 		// The budget after the Deployment whose pods it selects, as the
@@ -908,7 +996,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 
 	// Cluster-scoped: no owner reference, because the garbage collector
 	// treats a cluster-scoped object owned by a namespaced one as an orphan
-	// and deletes it immediately. cleanupA2A removes it by name.
+	// and deletes it immediately. handleDeletion removes it by name.
 	for _, obj := range []client.Object{
 		buildA2ACalloutClusterRoleBinding(agent),
 	} {

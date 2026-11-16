@@ -93,6 +93,31 @@ class TestListAgentsDelegates(unittest.TestCase):
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
             self.assertIn("No specialist agents", router.list_agents())
 
+    def test_a_filter_reaches_the_shared_lookup(self):
+        # The lookup is the module's too, so a counted block and the names the
+        # filter hands back come from one discovery.
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            for name in ("platform", "cluster-p-seeded-a-us", "cluster-p-seeded-b-us"):
+                (base / name).mkdir(parents=True)
+            for name, cluster in (("cluster-p-seeded-a-us", "seeded-a"), ("cluster-p-seeded-b-us", "seeded-b")):
+                (base / name / "CAPABILITIES.md").write_text("One cluster.")
+                (base / name / "config.yaml").write_text(
+                    f"cluster_identity:\n  cluster: {cluster}\n  location: us\n  project: p\n"
+                )
+            agent_roster.PROFILES_BASE = base
+
+            self.assertEqual(router.list_agents(filter="seeded-a"), agent_roster.render_filtered("seeded-a"))
+            out = router.list_agents(filter="seeded-a")
+            self.assertIn("cluster-p-seeded-a-us (the seeded-a cluster agent", out)
+            self.assertNotIn("seeded-b", out)
+            # Blank is no filter: the tool renders what the block renders.
+            self.assertEqual(router.list_agents(filter="  "), agent_roster.render())
+
+    def test_an_unreadable_filtered_roster_says_so_too(self):
+        with mock.patch.object(agent_roster, "render_filtered", return_value=None):
+            self.assertEqual(router.list_agents(filter="x"), agent_roster.UNKNOWN_ROSTER)
+
     def test_an_unreadable_roster_says_so_rather_than_claiming_none(self):
         # render() answers None when discovery itself failed. A tool has to
         # return a string, and "no specialist agents" is the one string it must

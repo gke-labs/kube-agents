@@ -55,8 +55,8 @@ func TestMain(m *testing.M) {
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
 // empty because FromEnv validates it before NATS_URL: a CI environment with
 // a stray value there would otherwise change which error fires. The Slack
-// pair is cleared for the same reason — it arms a third backend, so a stray
-// SLACK_BOT_TOKEN turns a one-backend case into a two-backend refusal.
+// pair is cleared for the same reason: a stray SLACK_BOT_TOKEN arms Slack,
+// and half a pair turns any case into the half-pair refusal.
 func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 	cases := []struct {
 		name string
@@ -69,47 +69,12 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			want: "NATS_URL",
 		},
 		{
-			name: "two backends set",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-			},
-			// The refusal names what is armed, so an operator reading it
-			// knows which variable to unset.
-			want: "more than one chat backend is configured",
-		},
-		{
-			name: "slack and discord set",
-			env: map[string]string{
-				"NATS_URL":        "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":   "tok",
-				"SLACK_BOT_TOKEN": "xoxb-tok",
-				"SLACK_APP_TOKEN": "xapp-tok",
-			},
-			want: "more than one chat backend is configured (the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair, DISCORD_TOKEN)",
-		},
-		{
 			name: "half a slack pair",
 			env: map[string]string{
 				"NATS_URL":        "nats://127.0.0.1:1",
 				"SLACK_BOT_TOKEN": "xoxb-tok",
 			},
 			want: "SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together",
-		},
-		{
-			// The door is a side door: beside one real backend it is
-			// accepted, so the refusal here is the two BACKENDS, and the
-			// message must not send the reader to unset the door.
-			name: "two backends with the door open as well",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-				"A2A_INJECT_LISTEN":   ":8099",
-				"A2A_INJECT_TOKEN":    "s3cret",
-			},
-			want: "more than one chat backend is configured",
 		},
 		{
 			// A door with no token never arms. The fence in front of it does
@@ -143,6 +108,8 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			t.Setenv("SLACK_APP_TOKEN", "")
 			t.Setenv("A2A_INJECT_LISTEN", "")
 			t.Setenv("A2A_INJECT_TOKEN", "")
+			t.Setenv("A2A_DOOR_LISTEN", "")
+			t.Setenv("A2A_CONSOLE_DOOR", "")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
@@ -276,7 +243,7 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	s := startTestServer(t)
 	cfg := &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x"}
 	primary := newFakePrimary()
-	m, err := buildAdapters(cfg, primary, nil, slog.Default())
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"discord": primary}, nil, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,6 +252,58 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	}
 	if _, err := m.Post("discord:g/c", "hi"); err != nil {
 		t.Errorf("primary not wired: %v", err)
+	}
+}
+
+// TestBuildAdaptersCarriesEveryRealBackend proves two armed backends both sit
+// behind the mux beside the console: a post to each prefix reaches its own
+// adapter.
+func TestBuildAdaptersCarriesEveryRealBackend(t *testing.T) {
+	s := startTestServer(t)
+	cfg := &gateway.Config{NATSURL: s.ClientURL(), GchatRelayURL: "http://relay", SlackBotToken: "xoxb-1", SlackAppToken: "xapp-1"}
+	gchat, slack := newFakePrimary(), newFakePrimary()
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conv := range []string{"console:tab-1", "gchat:spaces/A", "slack:C1/1.1"} {
+		if _, err := m.Post(conv, "hi"); err != nil {
+			t.Errorf("%s not wired: %v", conv, err)
+		}
+	}
+	if len(gchat.posts) != 1 || len(slack.posts) != 1 {
+		t.Fatalf("posts reached gchat=%d slack=%d, want one each", len(gchat.posts), len(slack.posts))
+	}
+}
+
+// TestChatNotifiersArmOnePerBackend proves each real backend gets its own
+// chat.notify route, in cfg.Backends() order, and that one backend's
+// malformed home channel leaves the other's route armed.
+func TestChatNotifiersArmOnePerBackend(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slack, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	// The malformed-home case below logs its refusal by design; keep it out of the test output.
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &gateway.Config{GchatRelayURL: "http://relay.invalid", SlackBotToken: "xoxb-stub", SlackAppToken: "xapp-stub",
+		GchatHomeChannel: "spaces/AAAA", SlackHomeChannel: "C0HOME"}
+	ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet)
+	if len(ns) != 2 {
+		t.Fatalf("%d routes armed, want 2", len(ns))
+	}
+	if ns[0].Backend() != lib.NotifyPlatformGchat || ns[1].Backend() != lib.NotifyPlatformSlack {
+		t.Fatalf("routes = %s, %s; want %s then %s", ns[0].Backend(), ns[1].Backend(), lib.NotifyPlatformGchat, lib.NotifyPlatformSlack)
+	}
+	// A malformed Slack home arms Chat's route alone.
+	cfg.SlackHomeChannel = "#ops"
+	if ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet); len(ns) != 1 || ns[0].Backend() != lib.NotifyPlatformGchat {
+		t.Fatalf("with a malformed Slack home: %d routes, want Chat's alone", len(ns))
 	}
 }
 
@@ -311,9 +330,9 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var primary gateway.Adapter
+			var backends map[string]gateway.Adapter
 			if tc.primary != nil {
-				primary = tc.primary
+				backends = map[string]gateway.Adapter{"discord": tc.primary}
 			}
 			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
 			if tc.cfg.A2ADoorArmed() {
@@ -323,7 +342,7 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 				}
 				doors = append(doors, gateway.A2ADoorSpec(a2a))
 			}
-			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
+			a, err := composeAdapters(tc.cfg, backends, doors, nil, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -451,7 +470,7 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 				return nil
 			}
 
-			if err := serve(ctx, cfg, gateway.NewMetrics(), log, run); err != nil {
+			if err := serve(ctx, cfg, gateway.NewMetrics(), nil, log, run); err != nil {
 				t.Fatalf("serve returned %v, want nil: a metrics listener that cannot start must not end the gateway", err)
 			}
 			if !reached {
@@ -465,6 +484,44 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
 			}
 		})
+	}
+}
+
+// serve hands the gateway's readiness to the metrics listener, so the
+// kubelet's probe reads whether the relay has bound, with the reason.
+func TestServeAnswersReadyzFromTheGatewaysReadiness(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &gateway.Config{MetricsPort: port}
+	readiness := func() (bool, string) { return false, "waiting for stream TASKS" }
+
+	var status int
+	var body string
+	run := func(context.Context) error {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, gateway.ReadyzPath))
+			if err == nil {
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				status, body = resp.StatusCode, string(b)
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return nil
+	}
+	if err := serve(ctx, cfg, gateway.NewMetrics(), readiness, slog.New(slog.DiscardHandler), run); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "waiting for stream TASKS") {
+		t.Fatalf("GET %s = %d %q, want 503 with the gateway's reason", gateway.ReadyzPath, status, body)
 	}
 }
 
@@ -599,6 +656,57 @@ func (stubConversations) Post(string, string) (string, error)                   
 func (stubConversations) PostMessage(string, gateway.OutMessage) (string, error)      { return "", nil }
 func (stubConversations) EditMessage(string, string, gateway.OutMessage) error        { return nil }
 
+// A chat backend with no home channel drops every proactive post while
+// conversations keep working, so the startup line saying so is a warning
+// (#3320): at Info it was the only trace, and nobody reads Info. With a home
+// channel the line is absent.
+func TestNoHomeChannelIsLoggedAsAWarning(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		cfg     *gateway.Config
+		warned  bool
+	}{
+		{"chat with no home channel", gchat, &gateway.Config{}, true},
+		{"slack with no home channel", slackBackend, &gateway.Config{}, true},
+		{"chat with a home channel", gchat, &gateway.Config{GchatHomeChannel: "spaces/AAAA"}, false},
+		{"slack with a home channel", slackBackend, &gateway.Config{SlackHomeChannel: "C0HOME"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged syncBuffer
+			chatNotifier(tc.cfg, tc.backend, conversations, slog.New(slog.NewJSONHandler(&logged, nil)))
+			var found map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logged.buf.String()), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) == nil && strings.HasPrefix(fmt.Sprint(rec["msg"]), "chat.notify home posts not armed") {
+					found = rec
+				}
+			}
+			if !tc.warned {
+				if found != nil {
+					t.Fatalf("logged %v with a home channel set", found)
+				}
+				return
+			}
+			if found == nil {
+				t.Fatalf("no \"home posts not armed\" line; log: %s", logged.buf.String())
+			}
+			if found["level"] != "WARN" {
+				t.Errorf("level = %v, want WARN", found["level"])
+			}
+		})
+	}
+}
+
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban
 // card's report back to its conversation needs them, and with no home channel
@@ -641,5 +749,80 @@ func TestTheChatNotifyRouteArmsWithConversations(t *testing.T) {
 				t.Fatal("the route armed without the gateway's conversations: every card report would be refused")
 			}
 		})
+	}
+}
+
+// TestALeaderCanBindTheDoorTheStandbyAnsweredOn: the standby answers on the
+// doors' addresses until its replica leads, and the doors bind those same
+// addresses inside lead, so the wrapper closes the standby first. Without
+// it every elected leader's doors would fail to listen and the replica
+// would crash-loop.
+func TestALeaderCanBindTheDoorTheStandbyAnsweredOn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	cfg := &gateway.Config{InjectListen: addr, InjectToken: "t"}
+	standby, err := gateway.StartStandbyDoors(standbyListens(cfg), "kubeagents-system", &gateway.LeaseView{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer standby.Stop()
+	lead := leadAfterStandby(standby, func(context.Context, gateway.RunOptions) error {
+		door, err := net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		return door.Close()
+	})
+	if err := lead(context.Background(), gateway.RunOptions{}); err != nil {
+		t.Fatalf("the door couldn't bind where the standby answered: %v", err)
+	}
+}
+
+// TestTheStandbyAnswersOnEveryArmedDoor: the inject door and the A2A door,
+// whichever are armed, and nothing when neither is.
+func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
+	if got := standbyListens(&gateway.Config{}); len(got) != 0 {
+		t.Fatalf("no doors armed, standby listens %v", got)
+	}
+	got := standbyListens(&gateway.Config{InjectListen: "127.0.0.1:8099", InjectToken: "t", A2ADoorListen: "127.0.0.1:8100", A2ADoorToken: "u"})
+	if strings.Join(got, ",") != "127.0.0.1:8099,127.0.0.1:8100" {
+		t.Fatalf("standby listens %v", got)
+	}
+}
+
+// A gateway that gave its term up because the bus was down mid-term exits
+// with a termination message naming ErrTermBusLost and how long the bus was
+// down, so the restart reads as that in kubectl describe; another failure
+// writes none.
+func TestServeExplainsABusLostExit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "termination-log")
+	old := terminationLogPath
+	terminationLogPath = path
+	t.Cleanup(func() { terminationLogPath = old })
+	cfg := &gateway.Config{}
+	log := slog.New(slog.DiscardHandler)
+
+	lost := fmt.Errorf("%w for 1m0s, so the lease goes to a replica whose bus may", gateway.ErrTermBusLost)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return lost }); !errors.Is(err, gateway.ErrTermBusLost) {
+		t.Fatalf("serve = %v, want the bus-lost error back", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("termination message: %v", err)
+	}
+	if msg := string(b); !strings.HasPrefix(msg, "ErrTermBusLost: ") || !strings.Contains(msg, "1m0s") {
+		t.Fatalf("termination message = %q, want ErrTermBusLost and the duration", msg)
+	}
+
+	_ = os.Remove(path)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return errors.New("something else") }); err == nil {
+		t.Fatal("serve swallowed the error")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("another failure wrote a termination message: %v", err)
 	}
 }

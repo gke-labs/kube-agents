@@ -9,7 +9,8 @@
         "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
         "commit": {
           "author": {
-            "name": "Example Author",
+            "name": "kube-agents[bot]",
+            "email": "210943+kube-agents[bot]@users.noreply.github.com",
             "date": "2026-08-29T09:00:00Z"
           },
           "committer": {
@@ -19,7 +20,9 @@
           "message": "ingest: raise the batch limit"
         },
         "author": {
-          "login": "kube-agents[bot]"
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
         },
         "html_url": "https://github.com/acme/infra/commit/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
       },
@@ -27,7 +30,8 @@
         "sha": "b2c3d4e5f60718293a4b5c6d7e8f901234567890",
         "commit": {
           "author": {
-            "name": "Example Author",
+            "name": "platform-agent",
+            "email": "platform-agent@kube-agents.invalid",
             "date": "2026-08-30T12:00:00Z"
           },
           "committer": {

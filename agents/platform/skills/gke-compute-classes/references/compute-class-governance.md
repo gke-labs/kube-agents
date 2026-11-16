@@ -61,7 +61,8 @@ leaving `statefulsets`/`daemonsets`/`replicasets` (apps), `jobs`/`cronjobs`
 -   `failurePolicy: Fail` — fail closed.
 -   Scope with `namespaceSelector.matchLabels` (e.g.
     `kubernetes.io/metadata.name: <NS>`).
--   Apply: `kubectl apply -f restrict-computeclass-usage-vap.yaml`.
+-   Propose `restrict-computeclass-usage-vap.yaml` as a pull request through
+    `submit-suggestion`.
 
 Denial surfaces as: `admission webhook ... denied the request: This namespace
 cannot request ComputeClass <NAME> ...`.

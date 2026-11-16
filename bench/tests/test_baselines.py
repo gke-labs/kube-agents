@@ -22,7 +22,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
 2. **A key with no record is STALE, not admitted and not silently compared.**
    A baseline measured on a different agent, judge, or verifier is not
    evidence about this run, and the expensive failure is not noticing.
-3. **Three of the five components are read off the run**, so they cannot go
+3. **Three of the six components are read off the run**, so they cannot go
    stale: `setupId` and `scoringVersion` are devops-bench's own, and it
    changes them when the thing they name changes. The captured fixtures are
    what proves those fields exist and where.
@@ -49,6 +49,8 @@ import pytest
 from kube_agents_bench.baselines import (
     DEFAULT_ADMISSION_MIN_RUNS,
     DEFAULT_ADMISSION_RATE,
+    MODE_NEXT,
+    MODE_TODAY,
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
@@ -199,6 +201,7 @@ def test_the_key_round_trips_through_json():
         ("judge_model", "gemini-4-judge"),
         ("fleet", 2),
         ("verifiers", 2),
+        ("mode", "next"),
     ],
 )
 def test_every_component_alone_changes_the_key(field, value):
@@ -211,6 +214,76 @@ def test_every_component_alone_changes_the_key(field, value):
     import dataclasses
 
     assert dataclasses.replace(KEY, **{field: value}) != KEY
+
+
+NEXT_KEY = VersionKey(
+    setup_id=KEY.setup_id,
+    scoring_version=KEY.scoring_version,
+    judge_model=KEY.judge_model,
+    fleet=KEY.fleet,
+    verifiers=KEY.verifiers,
+    mode=MODE_NEXT,
+)
+
+
+def test_a_today_key_serialises_without_a_mode():
+    """Byte-compatible with every line recorded before the mode existed."""
+    assert KEY.mode == MODE_TODAY
+    assert "mode" not in KEY.to_dict()
+    assert list(KEY.to_dict()) == ["setup_id", "scoring_version", "judge_model", "fleet", "verifiers"]
+
+
+def test_a_next_key_serialises_its_mode_and_round_trips():
+    assert NEXT_KEY.to_dict()["mode"] == "next"
+    assert VersionKey.from_dict(json.loads(json.dumps(NEXT_KEY.to_dict()))) == NEXT_KEY
+
+
+@pytest.mark.parametrize("doc_mode", [None, "", "today"])
+def test_an_absent_mode_reads_as_today(doc_mode):
+    doc = {k: v for k, v in KEY.to_dict().items()}
+    if doc_mode is not None:
+        doc["mode"] = doc_mode
+    assert VersionKey.from_dict(doc) == KEY
+
+
+def test_an_unknown_mode_matches_neither_today_nor_next():
+    """Kept as written: a mode this reader does not know is not pooled into
+    one it does."""
+    other = VersionKey.from_dict({**KEY.to_dict(), "mode": "later"})
+    assert other != KEY and other != NEXT_KEY
+
+
+def test_from_run_carries_the_mode():
+    kwargs = {"setup_id": KEY.setup_id, "scoring_version": "v1", "judge_model": KEY.judge_model, "versions": VERSIONS}
+    assert VersionKey.from_run(**kwargs) == KEY
+    assert VersionKey.from_run(**kwargs, mode=MODE_NEXT) == NEXT_KEY
+
+
+def test_evidence_pools_within_one_mode_only(tmp_path):
+    """Today's lines, written before the mode existed, are today's window and
+    never next's; next's lines are next's window and never today's."""
+    store = BaselineStore.load(
+        write_store(
+            tmp_path,
+            "planted-pdb",
+            [
+                record(runs=20, passes=20, judged={"OutcomeValidity": {"mean": 0.75, "n": 20}}, recorded_at="2026-08-01T00:00:00Z"),
+                record(NEXT_KEY, runs=3, passes=1, judged={"OutcomeValidity": {"mean": 0.5, "n": 3}}, recorded_at="2026-08-02T00:00:00Z"),
+            ],
+        )
+    )
+    today = store.evidence_for("planted-pdb", KEY)
+    nxt = store.evidence_for("planted-pdb", NEXT_KEY)
+    assert (today.runs, today.passes, today.judged_means) == (20, 20, {"OutcomeValidity": 0.75})
+    assert (nxt.runs, nxt.passes, nxt.judged_means) == (3, 1, {"OutcomeValidity": 0.5})
+
+
+def test_a_next_key_with_only_today_history_is_stale(tmp_path):
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", [record()]))
+    assert store.evidence_for("planted-pdb", NEXT_KEY) is None
+    verdict = store.record_verdict("planted-pdb", NEXT_KEY, bar=AdmissionBar())
+    assert verdict.state == "stale"
+    assert "mode next" in verdict.detail
 
 
 # --------------------------------------------------------------------------

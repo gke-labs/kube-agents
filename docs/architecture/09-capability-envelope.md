@@ -239,6 +239,30 @@ other way and keep their reasons, because those reach a legitimate caller holdin
 capability who needs to know what it lacks. The split is deliberate: chain shape is not the
 caller's business, and what a capability permits is.
 
+**Profile tasks** (#3659). A tier permits an explicit set of verbs, not a rank, and narrowing means
+a child's set is inside its parent's. Two tiers exist for profile tasks: `read` (`task.execute` and
+`profile.run`) and `unattended` (`profile.run` only). Neither nests with `platform` ⊃
+`cluster-admin` ⊃ `developer-team`. A profile task's root carries one more field, `profile`, the
+AgentProfile it is minted for, and only a profile tier carries one. The gateway's per-profile mint
+is not built yet; until it is, every root is the install-wide one described in §5. A profile tier
+narrows only to itself, and a hop (a child entry a broker writes) carries its parent's profile
+unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
+chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
+the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
+crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream}`, added
+11/11, #4685): the unattended trigger whose submission the gateway minted it for. Only that tier
+carries one, and a hop carries it unchanged, as it does `profile`. The dispatcher asks the verb
+`profile.run` with three request fields of its own, `profile`, `tier` and an optional `trigger`
+(the one the submission claims), and a target scope (`project/P/location/L/cluster/C`, or the install's
+`namespace/N` for a task with no target, never empty). The verifier allows it only when the verb is
+in the grant's tier set, the target is inside the grant's scope, `tier` is the grant's own tier and
+`profile` is the grant's profile, and `trigger` equals the grant's in both directions (a claimed
+trigger the grant lacks, or a grant trigger the request omits, is refused). It still answers yes or
+no, and the dispatcher never reads a tier or a trigger out of the grant. Any other verb carrying
+`profile`, `tier` or `trigger` is refused rather than having the fields ignored. These refusals are verb refusals, so they keep their reasons. That tells the asker
+which tier and profile the grant carries, which the split above allows: the asker is the leaf
+delegate, already holding the capability.
+
 The caller identity in the first check **must be request-scoped**. An identity shared across
 concurrent requests cannot separate them, and the guarantee this design exists to make is void
 without it. "The identity the verifier authenticates" below states what that requires of the
@@ -482,7 +506,13 @@ back to advisory bytes. And the reply subject has to be namespaced the same way:
 `a2a.cap.reply.<caller>.*` rather than `_INBOX`, because under `_INBOX` the verifier's publish
 grant would have to be `_INBOX.>`, which would let it forge JetStream API replies into any
 principal's inbox -- including the gateway's. The verifier also drops any request whose reply
-subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen.
+subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen. Each
+check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
+echoes on every verdict, and the client acts only on a reply that echoes its own id. That's defence
+in depth for the dispatcher's admission, which mints a task's credentials on the answer: a reply
+carrying another id is dropped, and a check with no answer of its own fails closed at its timeout,
+as does one whose reply doesn't parse. A reply with no id, from a verifier older than the echo, is
+still acted on while a release without the echo is inside the rollback window.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose
@@ -683,7 +713,8 @@ the party being revoked from. **Shipped in that state**: no component deletes a 
 revocation -- the property this design prefers over TTLs, and the reason it can tolerate "nothing
 expires" -- is the one advertised feature with no implementation behind it.
 
-**The envelope has no requester field.** It carries a tier and a scope. [03](03-security-model.md)
+**The envelope has no requester field.** It carries a tier and a scope (and, for a profile task, the
+profile it was minted for). [03](03-security-model.md)
 §4a stays canonical for the requirement and that requirement is authorization against the
 requester's own identity, which a hop cannot perform from a resolved capability because it does not
 know who the human is. The goal below is written as "agent ceiling ∩ requester" while the mechanism
@@ -775,7 +806,8 @@ layer down.
 - **Not a defence against a compromised gateway.** The gateway is the root of trust for the whole
   chain; if it lies about who asked, everything below inherits the lie.
 - **Not per-user granularity.** Capabilities carry the same `tier` the `Agent` CR does
-  ([02](02-agent-personas.md) §6.1), so this is as fine-grained as that field and no finer.
+  ([02](02-agent-personas.md) §6.1), or one of the two profile tiers, which add only a profile name,
+  so this is as fine-grained as that field plus the profile and no finer.
 
 ## 9. Verification
 
@@ -806,6 +838,10 @@ server, and against the shipped render rather than a hand-written config.**
   a reviewer will ask for. Build the attacker before the verifier. A design that has only ever seen
   well-formed capabilities has not been tested, and the tell is a suite where every capability was
   minted by the code under test.
+- **A profile grant cannot be relabelled or repointed:** a child that changes `read` to
+  `unattended`, or changes or drops `profile` or `trigger`, fails resolution; `profile.run` naming
+  another tier, profile or trigger is refused; `profile`, `tier` or `trigger` on any other verb is
+  refused.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
 - **A concurrent capability belonging to another request is refused:** one agent is handed two

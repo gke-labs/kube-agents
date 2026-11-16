@@ -1,0 +1,26 @@
+Subject: Check Terraform syntax with tofu fmt, not terraform init and validate
+
+Why: the sandbox carries OpenTofu for `tofu fmt` only, and no `terraform` binary; `init` and `validate` need a provider registry and a cloud identity the sandbox does not have, and the all-skills guard in test_command_policy.py allows no Terraform command but `tofu fmt`.
+Local-Issue: #2936 (gcp-terraform, #2999)
+Upstream-Issue: none
+Retire-When: never; the sandbox's Terraform tooling is this repository's
+
+diff --git a/references/gke_configuration_prerequisites.md b/references/gke_configuration_prerequisites.md
+--- a/references/gke_configuration_prerequisites.md
++++ b/references/gke_configuration_prerequisites.md
+@@ -225,10 +225,13 @@ After deploying alerting policies, run the following verification steps:
+ 1.  **Validate Terraform Syntax**:
+ 
+     ```bash
+-    terraform init
+-    terraform validate
++    tofu fmt -check -diff <directory holding the .tf files>
+     ```
+ 
++    `tofu fmt` parses every file it formats and needs no provider plugins,
++    state or credentials. `init` and `validate` need a provider registry and
++    a cloud this shell cannot reach; they are the repository's CI's to run.
++
+ 2.  **Validate PromQL Rules**:
+ 
+     ```bash

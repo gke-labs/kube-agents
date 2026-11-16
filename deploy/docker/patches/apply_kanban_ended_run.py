@@ -45,6 +45,20 @@ DB_TRAILER = (
     "block_task = _kanban_stop_worker_on_external_block(\n"
     "    _kanban_sys.modules[__name__], block_task\n"
     ")\n"
+    "from tools.kanban_ended_run import (  # noqa: E402\n"
+    "    saved_result_banner as _kanban_saved_result_banner,\n"
+    ")\n"
+)
+
+# The top of the worker context, before the header: a re-claimed card whose
+# previous run saved its result and blocked on a dependency reads that first
+# (#3252).
+CONTEXT_ANCHOR = "    lines: list[str] = []\n    _ctx_header(lines, task)\n"
+CONTEXT_PATCHED = (
+    "    lines: list[str] = []\n"
+    "    # kube-agents patch: a saved result from a re-queued run leads (#3252).\n"
+    "    lines.extend(_kanban_saved_result_banner(conn, task_id))\n"
+    "    _ctx_header(lines, task)\n"
 )
 
 
@@ -75,6 +89,7 @@ COMPLETE_REFUSAL = (
     "        # kube-agents patch: never another run's failure (#2947).\n"
     '        _check(ok, "" if ok else (\n'
     "            _kanban_ended_run_refusal(tid, conn) or\n"
+    "            _kanban_waiting_parent_refusal(tid, conn) or\n"
     "            _kanban_current_run_failure(tid, conn) or\n"
     '            f"could not complete {tid} (unknown id, stale run, or already terminal)"))\n',
 )
@@ -96,6 +111,7 @@ TOOLS_TRAILER = (
     "    current_run_failure as _kanban_current_run_failure,\n"
     "    ended_run_refusal as _kanban_ended_run_refusal,\n"
     "    refuse_ended_run as _kanban_refuse_ended_run,\n"
+    "    waiting_parent_refusal as _kanban_waiting_parent_refusal,\n"
     ")\n"
 )
 
@@ -104,6 +120,7 @@ def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     db = patchlib.Patch(root, DB_RELATIVE, prefix="kanban_ended_run")
     db.refuse_if_patched("_kanban_stop_worker_on_external_block")
+    db.substitute(CONTEXT_ANCHOR, CONTEXT_PATCHED, label="worker-context saved-result banner")
     db.append(DB_TRAILER)
 
     tools = patchlib.Patch(root, TOOLS_RELATIVE, prefix="kanban_ended_run")
@@ -114,7 +131,7 @@ def apply(root: Path) -> None:
     tools.substitute(*BLOCK_REFUSAL, label="kanban_block refusal text")
     tools.append(TOOLS_TRAILER)
 
-    db.commit("block_task wrapper")
+    db.commit("block_task wrapper, 1 anchor")
     tools.commit("4 anchors")
 
 

@@ -3649,7 +3649,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
 
 class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
-    install.env. With next, Slack on and Chat off, Slack moves to the A2A
+    install.env. With Slack on, Chat on or off, Slack moves to the A2A
     gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
     SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
     The refusal sits beside refuse_full_apply_dropping_next and before the
@@ -3670,7 +3670,8 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         stubs = (
             "print_step() { :; }\n"
             "refuse_apply_over_undeclared_scope() { :; }\n"
-            "announce_platform_agent_mode_for_apply() { :; }\n"
+            # The notice, leaving the reads of a cluster with no PlatformAgent type.
+            "announce_platform_agent_mode_for_apply() { PLATFORM_AGENT_CR_READ=none; }\n"
             "check_scope_container_access() { :; }\n"
             "check_service_account_ownership() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\n'
@@ -3693,6 +3694,9 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     def test_next_with_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
         base = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true"}
         for extra, says in (
+            # Google Chat beside Slack shares the gateway, so it lifts nothing.
+            ({"GOOGLE_CHAT_ENABLED": "true", "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"},
+             "SLACK_BOT_TOKEN holds 2 tokens"),
             ({"SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"},
              "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
             ({"SLACK_HOME_CHANNEL": "D0123ABCD"},
@@ -3724,16 +3728,10 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     def test_the_cases_the_refusal_leaves_alone_apply(self):
         for keys in (
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
-            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
-            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
              "SLACK_HOME_CHANNEL": "C0123ABCD", "SLACK_BOT_TOKEN": "xoxb-1-secretpart"},
-            # Chat holds the gateway; Slack stays on the today path.
-            {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
-             "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
-             "SLACK_BOT_TOKEN": "xoxb-a,xoxb-b"},
         ):
             with self.subTest(keys=sorted(keys.items())):
                 proc = self._run(keys)
@@ -3741,7 +3739,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     _PLAN_START = 'if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning (read-only)"\n'
@@ -3786,11 +3784,56 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         self.assertNotIn("secretpart", out)
         self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
 
-    def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
+    def test_a_plan_warns_when_the_key_still_says_today(self):
+        # The apply leaves spec.mode next whatever the key says
+        # (platform_agent_mode_after_apply), so Slack moves to the gateway
+        # and the plan says what an applying run would refuse.
+        proc = self._plan({"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails",
+                      proc.stdout + proc.stderr)
+
+    def test_a_plan_warns_with_google_chat_beside_slack(self):
+        # The gateway takes Slack beside Google Chat, so the plan still warns.
         proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
                            "SLACK_ALLOWED_USERS": "alice@example.com"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails",
+                      proc.stdout + proc.stderr)
+
+    # ── #3320: no home channel for the gateway's chat backend ──
+
+    _NO_HOME = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD"}
+
+    def test_a_plan_warns_of_no_home_channel_and_ends_on_it(self):
+        proc = self._plan(self._NO_HOME)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertLess(out.index("SLACK_HOME_CHANNEL is empty"), out.index("PLANNED"))
+        tail = [l for l in proc.stdout.splitlines() if l.strip()][-2:]
+        self.assertIn("No home channel: proactive posts are not delivered there yet.", tail[0], proc.stdout)
+        self.assertIn("Set SLACK_HOME_CHANNEL", tail[1], proc.stdout)
+        quiet = self._plan({**self._NO_HOME, "SLACK_HOME_CHANNEL": "C0123ABCD"})
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertNotIn("SLACK_HOME_CHANNEL is empty", quiet.stdout + quiet.stderr)
+        self.assertNotIn("No home channel", quiet.stdout + quiet.stderr)
+
+    def test_the_full_arm_warns_of_no_home_channel_and_still_applies(self):
+        proc = self._run(self._NO_HOME)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("APPLIED terraform", proc.stdout)
+        self.assertLess(out.index("SLACK_HOME_CHANNEL is empty"), out.index("APPLIED terraform"))
+
+    def test_the_upgrade_ends_on_the_home_channel_summary(self):
+        # The closing summary sits after the run's last step, where a
+        # non-interactive log ends.
+        source = _UPGRADE_SH.read_text()
+        done = source.index('  print_step "🎉 Upgrade Complete!"\n')
+        self.assertIn("    print_next_home_channel_unset_summary\n", source[done:source.index("\n}\n", done)])
 
     def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
         arm = self._arm()
@@ -3801,6 +3844,486 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         # Guarded: an older target's installer_common.sh lacks it.
         self.assertIn("if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then\n        " + self._CALL, arm)
         self.assertLess(call, arm.index('UPGRADE_APPLY_STARTED="true"'))
+
+
+
+class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
+    """#3615. A full upgrade applies the chat keys from install.env, so its
+    end prints the chat setup checklist for the mode the CR is left on, as
+    install.sh does after each of its applies. The tail of main(), lifted as
+    written over the real installer_common.sh with gcloud stubbed, calls the
+    helper on the full arm only, under a declare -F guard an older target's
+    installer_common.sh fails, with the project number read only when Google
+    Chat is on and the rendered topic, before the home-channel summary. One
+    run uses the real helper and printers, so the checklist is on record."""
+
+    _STUB_HELPER = (
+        'print_chat_setup_checklists() { echo "CHECKLIST mode=$1 number=${PROJECT_NUMBER:-} '
+        'env=${INSTALL_ENV_FILE:-} topic=${CHAT_TOPIC_NAME:-}"; }\n'
+    )
+
+    def _tail(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index('  print_step "🎉 Upgrade Complete!"\n')
+        return source[start:source.index("\n}\n", start)]
+
+    def _run(self, mode, keys, helper=_STUB_HELPER, install_env_file="/x/install.env", env=None):
+        """Runs the tail; returns the process and the gcloud calls it made."""
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                f"{helper}"
+                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
+                "print_step() { :; }\n"
+                'print_next_home_channel_unset_summary() { echo "SUMMARY"; }\n'
+                "set -Eeuo pipefail\n"
+                f"{exports}"
+                f"PARAM_UPGRADE_MODE={mode}; PROJECT_ID=proj; DEFAULT_PLATFORM_AGENT_MODE=today\n"
+                f"_tail() {{\nlocal install_env_file={shlex.quote(install_env_file)}\n{self._tail()}\n}}\n"
+                "_tail\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+                env=get_isolated_test_env(env, absent=("PLATFORM_AGENT_MODE", "CHAT_TOPIC_NAME")),
+            )
+            calls = gcloud_log.read_text() if gcloud_log.exists() else ""
+        return proc, calls
+
+    def test_a_full_upgrade_prints_the_checklist_for_the_mode_after_the_apply(self):
+        proc, calls = self._run("full", {"GOOGLE_CHAT_ENABLED": "true", "PLATFORM_AGENT_MODE": "today",
+                                         "PLATFORM_AGENT_MODE_AFTER_APPLY": "next", "CHAT_TOPIC_NAME": "t"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["CHECKLIST mode=next number=123456 env=/x/install.env topic=t", "SUMMARY"])
+        self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
+
+    def test_the_mode_falls_back_to_the_key_and_the_number_is_read_for_google_chat_only(self):
+        # A file that names no topic rendered the default, which the helper is
+        # handed, since the generator keeps its default local.
+        proc, calls = self._run("full", {"SLACK_ENABLED": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["CHECKLIST mode=today number= env=/x/install.env topic=platform-agent-chat-events", "SUMMARY"])
+        self.assertEqual(calls, "")
+
+    def test_the_retag_arms_and_an_older_target_print_no_checklist(self):
+        for mode, helper in (("harness", self._STUB_HELPER), ("operator", self._STUB_HELPER),
+                             ("full", "unset -f print_chat_setup_checklists\n")):
+            with self.subTest(mode=mode, older_common=helper.startswith("unset")):
+                proc, calls = self._run(mode, {"GOOGLE_CHAT_ENABLED": "true"}, helper=helper)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout.splitlines(), ["SUMMARY"])
+                self.assertEqual(calls, "")
+                self.assertNotIn("command not found", proc.stderr)
+
+    def test_the_real_checklist_prints_from_a_file_that_names_no_topic(self):
+        """The real helper and the real Google Chat printer, under --dry-run,
+        from an install.env rendered off install.env.example (the topic
+        commented out): the checklist names the default topic and the DM link
+        the project number, and the summary follows it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text("PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\n")
+            proc, calls = self._run(
+                "full", {"GOOGLE_CHAT_ENABLED": "true", "NAMESPACE": "kubeagents-system"}, helper="",
+                install_env_file=str(install_env), env={"HOME": tmp, "TERM": "dumb"},
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Pub/Sub Topic Name:", out)
+        self.assertIn("projects/proj/topics/platform-agent-chat-events", out)
+        self.assertNotIn("topics/\x1b", out)
+        self.assertNotIn("is missing", out)
+        self.assertIn("https://chat.google.com/dm/123456", out)
+        self.assertLess(out.index("Pub/Sub Topic Name:"), out.index("SUMMARY"))
+        self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
+
+
+class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
+    """#3615. The chat checklist's re-run command names the run's install.env,
+    for a paste from any directory, so a relative KUBE_AGENTS_INSTALL_ENV is
+    made absolute where upgrade.sh resolves it, as install.sh does; an
+    absolute one is left alone."""
+
+    def _resolve(self, pointer, cwd):
+        source = _UPGRADE_SH.read_text()
+        start = source.index('  install_env_file="$(resolve_install_env_file "$repo_dir" "$install_checkout")"\n')
+        block = source[start:source.index("  esac\n", start) + len("  esac\n")]
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            "set -Eeuo pipefail\n"
+            f"repo_dir={shlex.quote(cwd)}; install_checkout=''\n"
+            f"{block}"
+            'echo "FILE=[$install_env_file]"\n'
+        )
+        env = get_isolated_test_env({"KUBE_AGENTS_INSTALL_ENV": pointer})
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, cwd=cwd)
+
+    def test_a_relative_pointer_is_made_absolute_and_the_others_are_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = str(pathlib.Path(tmp).resolve())
+            for pointer, expected in (("prod/install.env", f"{cwd}/prod/install.env"),
+                                      ("/abs/install.env", "/abs/install.env")):
+                with self.subTest(pointer=pointer):
+                    proc = self._resolve(pointer, cwd)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(f"FILE=[{expected}]", proc.stdout)
+
+
+class DowngradeCheckTest(unittest.TestCase):
+    """check_downgrade: a move that leaves behind a commit marked as a breaking
+    change is refused, naming it, and completes when nothing it leaves is marked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="downgrade-check-")
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self._git("init", "-q", "-b", "main")
+        self.sha = {}
+        self._commit("init", "chore: start")
+        self._git("tag", "0.1.0")
+        self._commit("clean", "fix: mend a thing")
+        self._git("tag", "0.2.0")
+        self._commit("bang", "feat(operator)!: drop the old field")
+        self._git("tag", "0.3.0")
+        self._commit("footer", "fix: rename a value", "Some prose.\n\nBREAKING CHANGE: the value is renamed")
+        self._git("tag", "0.4.0")
+        # A GA tag as releases cut it: a stamp commit on a release line off main.
+        self._git("switch", "-q", "-c", "release/0.2", self.sha["clean"])
+        self._commit("stamp", "chore(release): stamp release version 0.2.1")
+        self._git("tag", "0.2.1")
+        self._git("switch", "-q", "--orphan", "unrelated")
+        self._commit("unrelated", "feat: elsewhere")
+        self._git("switch", "-q", "main")
+        self.no_history = self.tmp / "bundle"
+        self.no_history.mkdir()
+        self.scratch = self.tmp / "scratch"
+        self.scratch.mkdir()
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def _commit(self, key, subject, body=""):
+        message = subject + (f"\n\n{body}" if body else "")
+        self._git("commit", "-q", "--allow-empty", "-m", message)
+        self.sha[key] = self._git("rev-parse", "HEAD")
+
+    def _check(self, target, installed, repo_dir=None, url=None, allow=False, plan=False):
+        setup = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'KUBE_AGENTS_REPO_URL={shlex.quote(url or str(self.repo))}\n'
+            f'PARAM_ALLOW_BREAKING_DOWNGRADE={"true" if allow else "false"}\n'
+            f'PARAM_PLAN={"true" if plan else "false"}\n'
+            f'check_downgrade {shlex.quote(str(repo_dir or self.repo))} {shlex.quote(target)} {shlex.quote(installed)}\n'
+            'echo CONTINUED\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", setup], capture_output=True, text=True,
+            env=get_isolated_test_env(overrides={"TMPDIR": str(self.scratch)}), cwd=str(self.tmp),
+        )
+        return proc, proc.stdout + proc.stderr
+
+    def _short(self, key):
+        return self._git("rev-parse", "--short", self.sha[key])
+
+    def test_a_clean_rollback_continues(self):
+        proc, out = self._check("0.1.0", "0.2.0")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("no commit it leaves behind is marked as a breaking change", out)
+        self.assertIn("CONTINUED", out)
+
+    def test_a_bang_subject_is_refused_and_named(self):
+        proc, out = self._check("0.2.0", "0.3.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(f"{self._short('bang')} feat(operator)!: drop the old field", out)
+        self.assertIn("--allow-breaking-downgrade", out)
+        self.assertIn("https://gke-labs.github.io/kube-agents/deploy/rollback/", out)
+        self.assertNotIn("CONTINUED", out)
+
+    def test_a_breaking_change_footer_is_refused_and_named(self):
+        proc, out = self._check("0.3.0", "0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(f"{self._short('footer')} fix: rename a value", out)
+        self.assertNotIn("drop the old field", out)
+
+    def test_every_blocking_commit_in_a_longer_range_is_named(self):
+        proc, out = self._check("0.1.0", "0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("leaves behind 2 commit(s)", out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn(self._short("footer"), out)
+        self.assertNotIn("mend a thing", out)
+
+    def test_the_bypass_continues_and_still_names_the_commits(self):
+        proc, out = self._check("0.2.0", "0.4.0", allow=True)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn("CONTINUED", out)
+
+    def test_a_plan_warns_and_continues(self):
+        proc, out = self._check("0.2.0", "0.3.0", plan=True)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn("A real run refuses this move", out)
+
+    def test_a_forward_move_and_the_same_tag_say_nothing(self):
+        for target, installed in (("0.4.0", "0.1.0"), ("0.3.0", "0.3.0"), ("0.10.0", "0.9.0")):
+            with self.subTest(target=target, installed=installed):
+                proc, out = self._check(target, installed)
+                self.assertEqual(proc.returncode, 0, out)
+                self.assertNotIn("Moving from", out)
+
+    def test_a_commit_sha_older_than_the_installed_one_is_a_rollback(self):
+        proc, out = self._check(self.sha["clean"], self.sha["footer"])
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn(self._short("footer"), out)
+
+    def test_a_commit_build_moved_to_a_ga_tag_on_its_release_line_is_checked(self):
+        # The release line forks from main before the marked commits, so the
+        # tag is not an ancestor of the installed commit, and they are left behind.
+        proc, out = self._check("0.2.1", self.sha["footer"])
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn(self._short("footer"), out)
+        self.assertNotIn("stamp release version", out)
+
+    def test_a_ga_tag_named_by_its_stamp_commit_is_checked(self):
+        proc, out = self._check(self.sha["stamp"], "0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+
+    def test_a_commit_build_moved_forward_to_a_ga_tag_that_contains_it_says_nothing(self):
+        proc, out = self._check("0.2.1", self.sha["clean"])
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertNotIn("Moving from", out)
+
+    def test_a_record_separator_byte_in_a_message_does_not_split_the_commit(self):
+        self._git("switch", "-q", "-c", "odd", self.sha["footer"])
+        self._commit("odd_bang", "docs: odd body", "line\x1e\nx feat!: not a subject")
+        self._commit("odd_footer", "fix: odd footer", "line\x1e\nBREAKING CHANGE: still a footer")
+        self._git("switch", "-q", "main")
+        proc, out = self._check(self.sha["footer"], self.sha["odd_footer"])
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("leaves behind 1 commit(s)", out)
+        self.assertIn(f"{self._short('odd_footer')} fix: odd footer", out)
+        self.assertNotIn("not a subject", out)
+
+    def test_a_release_tag_and_its_own_commit_are_the_same_install(self):
+        proc, out = self._check("0.3.0", self.sha["bang"])
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertNotIn("Moving from", out)
+
+    def test_an_unrelated_commit_is_not_a_rollback(self):
+        proc, out = self._check(self.sha["unrelated"], self.sha["footer"])
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertNotIn("Moving from", out)
+
+    def test_sources_without_history_read_it_from_the_repository_and_clean_up(self):
+        proc, out = self._check("0.2.0", "0.3.0", repo_dir=self.no_history)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        proc, out = self._check(self.sha["clean"], self.sha["bang"], repo_dir=self.no_history)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(list(self.scratch.iterdir()), [], "the commit-only clone is left behind")
+
+    def test_a_shallow_checkout_with_both_refs_reads_the_full_history(self):
+        # Shallow history cuts the merge base, which would make the move read as unrelated.
+        shallow = self.tmp / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", "--no-single-branch", f"file://{self.repo}", str(shallow)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(shallow), "fetch", "-q", "--depth", "1", "origin", "tag", "0.2.0", "tag", "0.3.0"],
+                       check=True, capture_output=True)
+        proc, out = self._check("0.2.0", "0.3.0", repo_dir=shallow)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+
+    def test_a_release_rollback_whose_history_cannot_be_read_is_refused(self):
+        proc, out = self._check("0.2.0", "0.3.0", repo_dir=self.no_history, url=str(self.tmp / "missing"))
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("could not be read", out)
+        proc, out = self._check("0.2.0", "0.3.0", repo_dir=self.no_history, url=str(self.tmp / "missing"), allow=True)
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_commits_whose_history_cannot_be_read_are_let_through_with_a_warning(self):
+        # Nothing says a pair of commit SHAs is a rollback until their history is read.
+        proc, out = self._check(self.sha["clean"], self.sha["bang"], repo_dir=self.no_history, url=str(self.tmp / "missing"))
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("the downgrade check is skipped", out)
+
+    def test_an_unreadable_installed_tag_warns_and_continues(self):
+        proc, out = self._check("0.2.0", "")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Could not read the tag the install runs, so the downgrade check is skipped", out)
+
+    def _check_mode(self, mode, target, agent, operator, repo_dir=None, extra="", agent_ref=None, operator_ref=None):
+        """check_downgrade_for_mode against a stub kubectl that serves each Deployment's image."""
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$3" in\n'
+            f'  platform-agent-gateway) echo "ghcr.io/x/platform-agent{agent_ref or ":" + agent}" ;;\n'
+            f'  kube-agents-controller-manager) echo "ghcr.io/x/k8s-operator{operator_ref or ":" + operator}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        kubectl.chmod(0o755)
+        setup = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'KUBE_AGENTS_REPO_URL={shlex.quote(str(self.repo))}\n'
+            f'check_downgrade_for_mode ns {mode} {shlex.quote(target)} {shlex.quote(str(repo_dir or self.repo))}\n'
+            f'{extra}'
+            'echo CONTINUED\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", setup], capture_output=True, text=True, cwd=str(self.tmp),
+            env=get_isolated_test_env(overrides={"TMPDIR": str(self.scratch)}, bin_dir=str(bin_dir)),
+        )
+        return proc, proc.stdout + proc.stderr
+
+    def test_operator_mode_checks_the_operator_tag_not_the_agent_tag(self):
+        # Between the steps of a mode-by-mode upgrade the agent is still on the
+        # target while the operator has moved past the marked commit.
+        proc, out = self._check_mode("operator", "0.2.0", agent="0.2.0", operator="0.3.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        proc, out = self._check_mode("operator", "0.2.0", agent="0.3.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_harness_mode_checks_the_agent_tag_not_the_operator_tag(self):
+        proc, out = self._check_mode("harness", "0.2.0", agent="0.3.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 1, out)
+        proc, out = self._check_mode("harness", "0.2.0", agent="0.2.0", operator="0.3.0")
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_full_mode_checks_both_and_reads_a_shared_tag_once(self):
+        proc, out = self._check_mode("full", "0.2.0", agent="0.2.0", operator="0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("footer"), out)
+        proc, out = self._check_mode("full", "0.1.0", agent="0.2.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(out.count("no commit it leaves behind"), 1, out)
+
+    def test_a_digest_pinned_image_is_checked_by_its_tag(self):
+        digest = "@sha256:" + "a" * 64
+        proc, out = self._check_mode("harness", "0.2.0", agent="", operator="", agent_ref=":0.3.0" + digest)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        proc, out = self._check_mode("harness", "0.2.0", agent="", operator="", agent_ref=digest)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Could not read the tag deployment/platform-agent-gateway runs", out)
+
+    def test_full_mode_without_local_history_clones_once_and_cleans_up(self):
+        proc, out = self._check_mode(
+            "full", "0.1.0", agent="0.2.0", operator="0.3.0", repo_dir=self.no_history,
+            extra=f'echo "CLONES=$(ls {shlex.quote(str(self.scratch))} | wc -l | tr -d " ")"\n',
+        )
+        self.assertEqual(proc.returncode, 1, out)
+        proc, out = self._check_mode(
+            "full", self.sha["init"], agent=self.sha["clean"], operator="0.2.0", repo_dir=self.no_history,
+            extra=f'echo "CLONES=$(ls {shlex.quote(str(self.scratch))} | wc -l | tr -d " ")"\n',
+        )
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("CLONES=1", out)
+        self.assertEqual(list(self.scratch.iterdir()), [], "a commit-only clone is left behind")
+
+    def test_an_installed_tag_that_names_no_release_skips_the_check(self):
+        proc, out = self._check("0.2.0", "latest")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("names no release or commit", out)
+
+
+class DowngradeCheckAgreesWithTheReleaseDefinitionTest(unittest.TestCase):
+    """upgrade.sh holds its own copy of what counts as a breaking change; it has
+    to give the answer scripts/release/common.sh gives, commit by commit."""
+
+    MESSAGES = (
+        ("feat!: drop it", ""),
+        ("feat(operator)!: drop it", ""),
+        ("fix(chart)!: rename", "body"),
+        ("feat: add it", ""),
+        ("feat(scope): add it", "mentions BREAKING CHANGE: inline only"),
+        ("fix: rename", "BREAKING CHANGE: renamed"),
+        ("fix: rename", "prose\n\nBREAKING-CHANGE: renamed"),
+        ("fix: rename", "  BREAKING CHANGE:   indented"),
+        ("fix: rename", "BREAKING CHANGE:"),
+        ("Feat!: capitalised type", ""),
+        ("revert: feat!: undo", ""),
+        ("chore(deps): bump x", "Signed-off-by: someone"),
+    )
+
+    def test_each_message_gets_the_same_answer(self):
+        common_sh = _REPO_ROOT / "scripts" / "release" / "common.sh"
+        with tempfile.TemporaryDirectory(prefix="breaking-parity-") as temp_dir:
+            repo = pathlib.Path(temp_dir)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("commit", "-q", "--allow-empty", "-m", "chore: start")
+            for subject, body in self.MESSAGES:
+                with self.subTest(subject=subject, body=body):
+                    parent = git("rev-parse", "HEAD")
+                    git("commit", "-q", "--allow-empty", "-m", subject + (f"\n\n{body}" if body else ""))
+                    ours = subprocess.run(
+                        ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"; '
+                                       f'breaking_commits_between . {parent} HEAD'],
+                        capture_output=True, text=True, cwd=str(repo), env=get_isolated_test_env(),
+                    )
+                    self.assertEqual(ours.returncode, 0, ours.stderr)
+                    theirs = subprocess.run(
+                        ["bash", "-c", f'source "{common_sh}"; commit_messages_have_breaking_change '
+                                       f'"$(git log -1 --format=%s)" "$(git log -1 --format=%b)"'],
+                        capture_output=True, text=True, cwd=str(repo), env=get_isolated_test_env(),
+                    )
+                    self.assertEqual(bool(ours.stdout.strip()), theirs.returncode == 0, ours.stdout + theirs.stderr)
+
+
+class DowngradeCheckWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.text = _UPGRADE_SH.read_text()
+
+    def test_it_runs_before_the_first_write_to_the_cluster(self):
+        main = self.text[self.text.index("main() {"):]
+        call = main.index('check_downgrade_for_mode "$target_namespace" "$PARAM_UPGRADE_MODE" "$PARAM_IMAGE_TAG" "$repo_dir"')
+        self.assertLess(main.index('PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"'), call)
+        self.assertLess(call, main.index('backfill_session_kv_keys "$target_namespace"'))
+        self.assertLess(call, main.index('ensure_clean_helm_release "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"'))
+
+    def test_a_tag_read_off_the_install_is_not_checked(self):
+        # A tagless plan's state tag trails the running tag on an environment that
+        # tracks main; checking it would report image lag as a rollback.
+        main = self.text[self.text.index("main() {"):]
+        named = main.index('[ -z "$PARAM_IMAGE_TAG" ] || target_named_by_run="true"')
+        self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(tf_state_image_tag)"'))
+        self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"'))
+        self.assertIn('if [ "$target_named_by_run" = "true" ]; then\n    check_downgrade_for_mode', main)
+
+    def test_the_flag_is_parsed_and_documented(self):
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"; '
+                           'parse_args --allow-breaking-downgrade; echo "$PARAM_ALLOW_BREAKING_DOWNGRADE"; show_help'],
+            capture_output=True, text=True, env=get_isolated_test_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.startswith("true\n"), proc.stdout)
+        self.assertIn("--allow-breaking-downgrade", proc.stdout.split("\n", 1)[1])
 
 
 if __name__ == "__main__":

@@ -147,16 +147,21 @@ spec:
             # scored.
             - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
               value: "true"
-          # The request covers steady state: at rest the API sits near 9m of
-          # CPU, and the request is what the scheduler places, what Autopilot
-          # bills and what a ResourceQuota counts, so it stays small. The limit
-          # is the ceiling recall may burst to: recall is CPU-bound on the
-          # cross-encoder reranker, which runs a transformer forward pass per
-          # candidate in-process (see docs/designs/memory.md, "What a recall
-          # costs"). CPU above the request is best-effort, so on a node shared
-          # with other CPU-heavy tenants the request is the number to raise,
-          # and an Autopilot cluster without Pod bursting resets the limit to
-          # the request, so raise the request there too if recall is slow.
+          # The memory request is sized to be livable as the limit: an
+          # Autopilot cluster without Pod bursting sets each limit equal to
+          # its request, and this container loads 1.4 GB of embedding and
+          # reranking model weights in process, which a 1Gi request clamped
+          # to 1Gi could not hold. 2Gi holds them with room to serve. The CPU
+          # request is above steady state (at rest the API sits near 9m) for
+          # the same clamp, so recall keeps half a core there; the request is
+          # what the scheduler places, what Autopilot bills and what a
+          # ResourceQuota counts, so it stays under one core. The limit is
+          # the ceiling recall may burst to where bursting is on: recall is
+          # CPU-bound on the cross-encoder reranker, which runs a transformer
+          # forward pass per candidate in-process (see docs/designs/memory.md,
+          # "What a recall costs"). CPU above the request is best-effort, so
+          # on a node shared with other CPU-heavy tenants the request is the
+          # number to raise.
           #
           # Do not raise the limit expecting a speedup — that experiment has
           # been run. Going from 500m/2 to 2/4 left recall latency unchanged. The
@@ -173,8 +178,8 @@ spec:
           # would leave this pod Pending forever.
           resources:
             requests:
-              cpu: 250m
-              memory: 1Gi
+              cpu: 500m
+              memory: 2Gi
             limits:
               cpu: "4"
               memory: 4Gi

@@ -20,6 +20,7 @@ from admin_console.agent_runtime import (
     HistoryResult,
     MessageResult,
     TaskUpdateResult,
+    held_per_target,
 )
 from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app, target_runtime_factory
@@ -99,7 +100,7 @@ class PortalApiClient:
         if target is None:
             raise ValueError("target is required when no portal API URL is configured")
         service = ChatService(
-            lambda: RuntimeChatBackend(target),
+            held_per_target(lambda: target, RuntimeChatBackend),
             poll_interval=0.001,
             quiet_polls=2,
             task_timeout=5,

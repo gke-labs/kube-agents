@@ -16,8 +16,9 @@ metadata:
 This reference covers enterprise multi-tenancy patterns on GKE, including
 namespace isolation, RBAC planning, resource quotas, and network segmentation.
 
-> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`, `check_k8s_auth`,
-> `describe_k8s_resource`, `delete_k8s_resource`
+> **MCP Tools:** `get_k8s_resource`, `check_k8s_auth`, `describe_k8s_resource`
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## When to Use
 
@@ -47,11 +48,22 @@ namespace isolation, RBAC planning, resource quotas, and network segmentation.
 
 ### 1. Create Namespaces
 
-```bash
-kubectl create namespace team-a
-kubectl create namespace team-b
-kubectl label namespace team-a team=a
-kubectl label namespace team-b team=b
+The namespaces are proposed as a pull request through `submit-suggestion`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    team: a
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+  labels:
+    team: b
 ```
 
 ### 2. RBAC Configuration
@@ -175,19 +187,14 @@ spec:
 
 ### Labels for Cost Attribution
 
-```bash
-# Label namespaces for billing
-kubectl label namespace team-a cost-center=engineering
-kubectl label namespace team-b cost-center=data-science
-```
+Label namespaces for billing in their manifests, proposed as a pull request through
+`submit-suggestion`: for example `cost-center: engineering` on `team-a` and
+`cost-center: data-science` on `team-b`.
 
 ### GKE Cost Allocation
 
-Enable GKE cost allocation to break down costs by namespace and label:
-
-```bash
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --enable-cost-allocation
-```
+Enable GKE cost allocation to break down costs by namespace and label. It is a cluster
+setting (`spec.costManagementConfig.enabled`), changed as Config Connector YAML on the
+cluster's `ContainerCluster` through `gcp-config-connector`.
 
 View in Cloud Billing > GKE Cost Allocation.

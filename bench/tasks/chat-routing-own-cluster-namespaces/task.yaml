@@ -11,7 +11,6 @@ infrastructure:
   deployer: noop
 validated: false
 domain: chat-and-routing
-owner: maintainers
 verification_spec:
   - name: the-answer-names-the-agents-own-namespace
     role: objective

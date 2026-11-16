@@ -4,8 +4,8 @@
  * computes anything itself.
  */
 import {
-  SPEND_TBD_REASON,
   failuresOf,
+  spendTile,
   tasksInFlight,
   typesOf,
   worstCapacity,
@@ -49,6 +49,7 @@ export default function StatusStrip({ state, onFocus }: { state: UiState; onFocu
   const linkDown = state.connection !== "up";
   const streamsShort = state.streamsUp < state.streamsTotal;
   const worst = worstCapacity(state);
+  const spend = spendTile(state);
   return (
     <div className="status-strip">
       <Tile
@@ -92,8 +93,8 @@ export default function StatusStrip({ state, onFocus }: { state: UiState; onFocu
       >
         {worst === null ? "no limits set" : `${worst.stream} ${Math.round((worst.fraction as number) * 100)}%`}
       </Tile>
-      <Tile id="spend" label="spend" panel="spend" title={SPEND_TBD_REASON} onFocus={onFocus}>
-        tbd
+      <Tile id="spend" label="spend" panel="spend" title={spend.title} onFocus={onFocus}>
+        {spend.text}
       </Tile>
     </div>
   );

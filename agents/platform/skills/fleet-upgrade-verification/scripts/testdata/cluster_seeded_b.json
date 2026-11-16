@@ -1,0 +1,48 @@
+{
+  "currentMasterVersion": "1.34.12-gke.1011000",
+  "location": "us-central1-a",
+  "locations": ["us-central1-a"],
+  "maintenancePolicy": {
+    "resourceVersion": "d99d38e9",
+    "window": {
+      "dailyMaintenanceWindow": {
+        "duration": "PT4H0M0S",
+        "startTime": "03:00"
+      },
+      "maintenanceExclusions": {
+        "hold-the-minor-lag": {
+          "endTime": "2027-01-05T18:27:10Z",
+          "maintenanceExclusionOptions": {
+            "scope": "NO_MINOR_UPGRADES"
+          },
+          "startTime": "2026-10-07T18:27:10Z"
+        }
+      }
+    }
+  },
+  "name": "seeded-b",
+  "nodePools": [
+    {
+      "instanceGroupUrls": [
+        "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-seeded-b-default-pool-4176890d-grp"
+      ],
+      "locations": ["us-central1-a"],
+      "name": "default-pool",
+      "status": "RUNNING",
+      "version": "1.34.12-gke.1011000"
+    },
+    {
+      "instanceGroupUrls": [
+        "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-seeded-b-no-surge-pool-235d7913-grp"
+      ],
+      "locations": ["us-central1-a"],
+      "name": "no-surge-pool",
+      "status": "RUNNING",
+      "version": "1.34.11-gke.1209000"
+    }
+  ],
+  "releaseChannel": {
+    "channel": "REGULAR"
+  },
+  "status": "RUNNING"
+}

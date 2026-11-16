@@ -89,13 +89,12 @@ no list.
 
 **Category or summary records are not findings.** Some tools emit per-category rollup lines
 (`kind=health.category …  status=degraded total=3`) alongside the individual findings they count.
-Those lines describe the same problems a second time. Use them for the posture sentence in the
-report — how much was scanned, what is healthy — never as items in the ranked list, and never
-register them.
+Those lines describe the same problems a second time. Use them only for how much was scanned,
+never as items in the ranked list, and never register them.
 
 **But a category that could not be checked must still be reported.** A record marking a category
 `unavailable`, `skipped`, or `error` is not a finding either, and it is not a clean result: it means
-that area was never examined. Say so in the posture sentence, naming the category and the reason
+that area was never examined. Say so in the posture (Step 6), naming the category and the reason
 ("control-plane checks did not run: no cloud-provider metrics available"). Dropping it leaves the
 user reading a report that looks like full coverage. A silent gap reads as "clean" — the same reason
 the discovery sweep is required to name a cluster whose scan failed rather than omit it.
@@ -397,13 +396,14 @@ prints a `roll-up:` line with how many items it did not list and how many of tho
 Write the report's roll-up line from it: one line giving the count, saying how many are critical
 when any are, and where the rest lives, e.g. `Also found: 14 more items, 2 of them critical,
 tracked in the findings queue — I'll bring them to you a few a day.` When it prints a `pace:` line,
-say when the rest arrives, using the times and counts it prints, or, when it says they are not added
-in chat, that they wait in the queue until the user asks. **Omit the roll-up line entirely
+say how many arrive a day, using the count it prints, and leave out the hour; or, when it says they
+are not added in chat, that they wait in the queue until the user asks. **Omit the roll-up line entirely
 when it prints `roll-up: none`** — printing `Also found: 0 items` is noise.
 
 **A report that lists no item is a correct report.** When `select` prints `list no item; there are
-no critical findings`, say so plainly in the posture, give the roll-up line, and say when the rest
-arrives. A quiet cluster is a good result and should read like one. When it prints `list no item;
+no critical findings`, write the posture, the roll-up line, and how many arrive a day. Add no verdict
+on the fleet: no critical finding among this scan's checks says nothing about the checks the
+first-run audits run, and they post their own findings soon after. When it prints `list no item;
 the limit is 0`, the install has turned the list off: write the posture and the roll-up line only.
 Never fill the list with non-critical findings. They reach the user through the nudge, which adds
 them only once nothing critical is waiting, and a report padded with them is the failure this stage
@@ -422,8 +422,18 @@ gathered into a listed line, or counted in the roll-up.
 Write clean Markdown that reads well in a chat client. Structure:
 
 1. **One-line heading**, e.g. `# GKE Environment Scan`.
-2. **One or two sentences of posture:** what was scanned (clusters, nodes, workloads) and the
-   headline judgement. Give the reader the shape of their environment before the problems.
+2. **The posture, as separate paragraphs:**
+   - what was scanned, counted from the raw file's coverage table, in exactly this form:
+     `Scanned 5 clusters and 221 workloads.`, or `Scanned 1 cluster and 6 workloads.` for one;
+   - when the raw file names a cluster or category that could not be scanned, one sentence naming
+     it and the reason (Step 1);
+   - the `posture:` line `select` printed, copied exactly, without the `posture:` label.
+
+   Nothing else: no judgement of the fleet, such as "healthy", "clean", or "no critical
+   vulnerabilities". The scan runs only the checks that line counts, plus what it sees in passing that no first-run audit checks. The first-run audits check
+   security and RBAC, reliability, capacity and cost minutes later and post their own findings,
+   so a verdict here contradicts them.
+
 3. **The selected findings**, in the order `select` printed, as a numbered list. **Two lines each,
    no sub-bullets:** a bold one-line headline that opens with the severity label `Critical:` and names
    the problem and where it is (cluster, namespace and object, or for a gathered line the count and

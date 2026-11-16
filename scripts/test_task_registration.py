@@ -47,6 +47,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 import unittest.mock
 
 import yaml
@@ -89,14 +90,15 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         )
 
     def test_every_task_is_in_exactly_one_place(self):
-        # Presubmit, nightly, FIXTURE_NOT_READY and KNOWN_UNREGISTERED are
-        # four answers to one question; a case with two of them has a stale
-        # one. The shell rejects the presubmit/nightly overlap itself (it
+        # Presubmit, nightly, the certification suite line, FIXTURE_NOT_READY
+        # and KNOWN_UNREGISTERED are five answers to one question; a case with
+        # two of them has a stale one. The shell rejects the presubmit/nightly overlap itself (it
         # would run the case twice a night); the allowlist overlaps are the
         # validator's stale sweep, asserted here as one set rule.
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "suite: certification (task files)": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -264,15 +266,15 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
-    def test_every_task_names_an_owner(self):
+    def test_every_task_owner_is_a_person(self):
         for needle, guidance in (
             (
-                "declares no 'owner:'",
-                "These cases name nobody to answer when they flake -- see "
-                "bench/CONTRIBUTING.md:",
+                "is no longer allowed",
+                "These cases still say 'owner: maintainers'; delete the line -- "
+                "see bench/CONTRIBUTING.md:",
             ),
             ("leading at sign", "These cases write the owner as a mention:"),
-            ("neither a GitHub login", "These cases carry an owner that is not a login:"),
+            ("is not a GitHub login (", "These cases carry an owner that is not a login:"),
         ):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
@@ -282,6 +284,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
             "is not a YAML boolean",
             "These cases carry an 'expected_fail:' that is not a bare true or "
             "false; bench-gate would refuse it after the cluster lease:",
+        )
+
+    def test_no_run_record_is_committed(self):
+        # Tree-level like the sanitizer, so validate_all() does not carry it
+        # and this is the assertion that gates it.
+        findings = validator.committed_run_records()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nThese files sit under a case's evidence/ directory. A run's record "
+            "is not committed; cite the run by its directory name or build id:\n  "
+            + "\n  ".join(findings),
         )
 
     def test_no_fixture_carries_a_real_address_or_credential(self):
@@ -435,6 +449,109 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_finding_scope_without_its_check_is_rejected(self):
+        """The verifier's model refuses the pair after the cluster lease; this
+        rule refuses it here."""
+        for node, phrase in (
+            ({"scope": "finding", "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [" "], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": 123, "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [123], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"finding_check": "no-pdb", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"finding_check": "", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"scope": "finding_ids", "finding_check": [], "any_of_phrases": ["x"]}, "read only under scope 'finding'"),
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn(phrase, problems[0])
+        for node in (
+            {"scope": "finding", "finding_check": "no-pdb", "required_phrases": ["x"]},
+            {"scope": "finding", "finding_check": ["a", "b"], "required_phrases": ["x"]},
+            {"scope": "finding_ids", "any_of_phrases": ["x"]},
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+
+    def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
+        """The verifier compares `value` raw and the API holds a bool, so a
+        quoted boolean never compares equal and the check asserts nothing; the
+        run would go red only after the lease. Judged by (parent, field) pair,
+        read as a JSONPath parser would: filters stripped, every other bracket
+        selector dropped (an index, a negative index, a slice, a union, a
+        wildcard), padding ignored, quoted keys whole, the object root as
+        parent ""."""
+        flagged = (
+            ("resource_property", "eq", "spec.suspend"),
+            ("fleet_resource_property", "ne", "spec.suspend"),
+            ("resource_property", "ne", "$.spec['suspend']"),
+            ("fleet_resource_property", "eq", "spec.template.spec.hostNetwork"),
+            ("resource_property", "eq", "spec.template.spec.containers[?(@.name=='app')].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[?(@.name=='data')].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0].configMap.optional"),
+            ("resource_property", "ne", "spec.template.spec.containers[0].volumeMounts[?(@.name=='data')].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[*].readOnly"),
+            ("fleet_resource_property", "eq", "$.immutable"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[-1].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0:2].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0,1].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.containers[*].securityContext.privileged"),
+            ("resource_property", "eq", "spec. suspend"),
+            ("fleet_resource_property", "eq", "automountServiceAccountToken"),
+            ("resource_property", "eq", "spec.nodePoolAutoCreation.enabled"),
+        )
+        for check_type, op, path in flagged:
+            problems = []
+            validator._check_assertions(
+                {"type": check_type, "path": path, "op": op, "value": " True "},
+                "check 'x'", problems,
+            )
+            self.assertEqual(len(problems), 1, (check_type, op, path, problems))
+            self.assertIn("asserts nothing", problems[0])
+            self.assertIn("value: true", problems[0])
+            self.assertIn("BOOLEAN_FIELD_PAIRS", problems[0])
+        problems = []
+        validator._check_assertions(
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": "true", "across_matches": "none"},
+            "check 'x'", problems,
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("asserts nothing", problems[0])
+
+    def test_string_fields_bare_booleans_and_other_shapes_pass_the_boolean_rule(self):
+        """Only a known (parent, field) pair is judged: a Service selector, a
+        label, a data key, a quoted dotted key, a CRD's own `spec.enabled`, an
+        unknown map and a condition status compared to "true" are correct
+        cases. A wrong parent is silent. A path the reader does not follow,
+        recursive descent, is a miss and never a wrong flag. A bare boolean,
+        `op: exists` and malformed shapes raise no problem from this rule and
+        must not crash."""
+        for node in (
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": True},
+            {"type": "fleet_resource_property", "path": "spec.suspend", "op": "ne", "value": False},
+            {"type": "resource_property", "path": "spec.selector.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.labels.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.template.metadata.annotations['safe-to-evict']", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "data.enabled", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "spec.hard['feature.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.annotations['autoscaling.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.foo.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.jobTemplate.suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec..suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "$..privileged", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.taints[?(@.key=='seeded-role')].value", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "status.conditions[?(@.type=='Ready')].status", "op": "eq", "value": "True"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "exists", "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": ["eq"], "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": ["true"]},
+            {"type": "resource_property", "path": None, "op": "eq", "value": "true"},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
         # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
         # case, not a missing entry: pull_request_opened fails on a report
@@ -466,7 +583,6 @@ class TestTheValidatorItself(unittest.TestCase):
             "id": "made-up-case",
             "name": "A case",
             "domain": "security",
-            "owner": "maintainers",
             "fixtures": ["rbac-overgrant"],
             "verification_spec": [
                 {
@@ -516,7 +632,6 @@ class TestTheRulesReject(unittest.TestCase):
         "id": "made-up-case",
         "name": "A case",
         "domain": "security",
-        "owner": "maintainers",
         "fixtures": ["rbac-overgrant"],
         "verification_spec": [
             {
@@ -527,13 +642,15 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
-            return validator.validate_case("made-up-case", path, registered=set(registered))
+            return validator.validate_case(
+                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+            )
 
     def _only(self, needle, **kwargs):
         """The one problem this mutation causes, and nothing else."""
@@ -548,6 +665,49 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
+
+    # -- the certification suite: the bare line is the registration --
+
+    def test_a_certification_case_registers_by_its_line(self):
+        # Registered nowhere else: the line is the registration, so the
+        # "registered nowhere" finding stays quiet.
+        self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+
+    def test_a_suite_spelling_the_lane_does_not_read_is_reported(self):
+        for text in ('id: made-up-case\nsuite: "certification"\n', "id: made-up-case\nsuite: certification  # the page row\n"):
+            with self.subTest(text=text):
+                spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
+                self._only("spelling the lane does not read", text=text + spec, certification=set())
+
+    def test_a_crlf_suite_line_is_a_spelling_the_lane_does_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
+            path.parent.mkdir()
+            spec = yaml.safe_dump({**self.VALID, "suite": "certification"})
+            path.write_bytes(spec.replace("\n", "\r\n").encode())
+            problems = validator.validate_case("made-up-case", path, registered=set(), certification=set())
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("spelling the lane does not read", problems[0])
+
+    def test_a_part_line_is_accepted_bare_and_reported_otherwise(self):
+        self.assertEqual(self._validate(suite="certification", certification_part=2, certification=set()), [])
+        self._only("without 'suite: certification'", certification_part=2)
+        self._only("is not a whole number from 1", suite="certification", certification_part="2", certification=set())
+        self._only("is not a whole number from 1", suite="certification", certification_part=0, certification=set())
+        spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
+        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: certification\ncertification_part: 2  # note\n" + spec, certification=set())
+
+    def test_a_parked_case_may_not_carry_the_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+        with unittest.mock.patch.dict(validator.KNOWN_UNREGISTERED, {"made-up-case": "must not run"}, clear=False):
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+
+    def test_a_suite_case_in_a_roster_file_is_reported(self):
+        self._only("runs on that lane only", suite="certification", certification={"made-up-case"})
+
+    def test_an_unknown_suite_is_reported(self):
+        self._only("the only suite is 'certification'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 
@@ -620,8 +780,55 @@ class TestTheRulesReject(unittest.TestCase):
         # value, which would be a traceback instead of a finding.
         self._only("is not a slug string", domain=["security", "cost"])
 
-    def test_a_missing_owner_is_rejected(self):
-        self._only("declares no 'owner:'", owner=DELETE)
+    def test_a_missing_owner_passes(self):
+        # Optional: the case's bugs go to its domain's owner.
+        self.assertEqual(self._validate(owner=DELETE), [])
+
+    def _text_with(self, line):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        return yaml.safe_dump(spec) + line
+
+    def test_a_bare_owner_line_passes_like_a_missing_one(self):
+        # Both readers see a bare `owner:` as absent.
+        self.assertEqual(self._validate(text=self._text_with("owner:\n")), [])
+
+    def test_an_owner_the_filer_would_read_differently_is_rejected(self):
+        # YAML reads these as absent or as bob; case_owner's scan does not.
+        for line in ("owner: null\n", "owner: Null\n", "owner: >-\n  bob\n", "owner: &a bob\n", '"owner": bob\n'):
+            with self.subTest(line=line):
+                self._only("to scripts/case_owner.py", text=self._text_with(line))
+
+    def test_a_domain_the_filer_would_read_differently_is_rejected(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "domain"}
+        text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
+        problem = self._only("'domain:' reads as", text=text)
+        self.assertNotIn("'owner:'", problem)
+
+    def test_a_domains_row_the_filer_would_read_differently_fails_the_lint(self):
+        rows = {
+            "slug not first": "domains:\n  - name: Security\n    slug: security\n    owner: alice\n",
+            "quoted slug": 'domains:\n  - slug: "security"\n    owner: alice\n',
+        }
+        for label, text in rows.items():
+            with self.subTest(row=label), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "domains.yaml"
+                path.write_text(text)
+                with mock.patch.object(validator, "DOMAINS_FILE", path):
+                    with self.assertRaisesRegex(validator.CaseError, "security"):
+                        self._validate()
+
+    def test_an_owner_line_inside_another_field_names_the_cause(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        text = yaml.safe_dump(spec) + 'notes: "first\nowner: mallory"\n'
+        self.assertIn("inside another field", self._only("to scripts/case_owner.py", text=text))
+
+    def test_an_empty_string_owner_is_rejected(self):
+        self._only("is not a GitHub login string", owner="")
+
+    def test_the_retired_maintainers_owner_is_rejected(self):
+        for owner in ("maintainers", "Maintainers"):
+            with self.subTest(owner=owner):
+                self._only("is no longer allowed", owner=owner)
 
     def test_an_owner_with_a_leading_at_sign_is_rejected(self):
         self._only("leading at sign", owner="@someone")
@@ -631,13 +838,17 @@ class TestTheRulesReject(unittest.TestCase):
         # shapes a contributor is likely to write; GitHub accepts none of them.
         for owner in ("someone@example.com", "Some One", "some--one", "-someone"):
             with self.subTest(owner=owner):
-                self._only("neither a GitHub login", owner=owner)
+                self._only("is not a GitHub login (", owner=owner)
 
     def test_an_owner_that_is_not_a_string_is_rejected(self):
         self._only("is not a GitHub login string", owner=["a", "b"])
 
-    def test_a_login_owner_passes(self):
-        self.assertEqual(self._validate(owner="some-one1"), [])
+    def test_any_login_passes(self):
+        # Any GitHub login, not only people in OWNERS: whether GitHub accepts
+        # it as an assignee is checked when a bug is filed, not offline.
+        for owner in ("some-one1", "GinnyJI"):
+            with self.subTest(owner=owner):
+                self.assertEqual(self._validate(owner=owner), [])
 
     # -- audit_streams --
 
@@ -652,6 +863,30 @@ class TestTheRulesReject(unittest.TestCase):
         for value in ([], "compliance-audit", [1], [""], ["  "], ["compliance-audit\n"]):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
+
+    # -- scope_exclude --
+
+    def test_a_declared_scope_exclusion_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
+
+    def test_a_scope_exclusion_with_absent_clusters_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"], "absent": 1}), [])
+
+    def test_an_absent_count_out_of_range_is_rejected(self):
+        for absent in (0, -1, 9, True, "1"):
+            with self.subTest(absent=absent):
+                self._only("must be {slots:", scope_exclude={"slots": ["b"], "absent": absent})
+
+    def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
+        self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
+
+    def test_excluding_every_slot_is_rejected(self):
+        self._only("excludes every seeded slot", scope_exclude={"slots": ["a", "b", "c", "d"]})
+
+    def test_a_scope_exclusion_the_runner_cannot_read_is_rejected(self):
+        for value in (None, ["b"], {"slots": []}, {"slots": ["b", "b"]}, {"slots": ["seeded-b"]}, {"clusters": ["b"]}):
+            with self.subTest(value=value):
+                self._only("must be {slots:", scope_exclude=value)
 
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
@@ -674,6 +909,51 @@ class TestTheRulesReject(unittest.TestCase):
         for value in (1, 0, ["true"]):
             with self.subTest(value=value):
                 self._only("is not a YAML boolean", expected_fail=value)
+
+    def test_a_requested_pull_requests_key_above_the_cases_own_leaves_passes(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self.assertEqual(self._validate(verification_spec=spec, requested_pull_requests=2), [])
+
+    def test_a_requested_pull_requests_key_the_cases_own_leaves_already_reach_is_rejected(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self._only("is not above the 1", verification_spec=spec, requested_pull_requests=1)
+
+    def test_a_requested_pull_requests_key_that_is_not_a_count_is_rejected(self):
+        for value in (True, "2", -1, 1.5):
+            with self.subTest(value=value):
+                self._only("is not a bare non-negative decimal", requested_pull_requests=value)
+
+    def test_a_requested_pull_requests_key_in_a_non_decimal_spelling_is_rejected(self):
+        # YAML reads `0x2` as 2 and `2#c` as the string '2#c'; the roster
+        # script's text read sees neither as the count, and the validator says
+        # so rather than crashing on the string.
+        text = yaml.safe_dump({**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})})
+        for line in ("requested_pull_requests: 0x2\n", "requested_pull_requests: 2#c\n", "requested_pull_requests: +2\n"):
+            with self.subTest(line=line.strip()):
+                self._only("is not a bare non-negative decimal", text=text + line)
+
+    def test_a_draft_not_named_task_yaml_is_read_from_the_path_it_was_given(self):
+        # `validate_paths` accepts a scratch draft outside the tree; the key check
+        # reads that file, never a task.yaml rebuilt from the draft's name.
+        spec = {**self.VALID, "id": "draft", "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        with tempfile.TemporaryDirectory() as tmp:
+            draft = pathlib.Path(tmp) / "draft.yaml"
+            draft.write_text(yaml.safe_dump(spec))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 2}))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 1}))
+            problems = validator.validate_case("draft", draft, registered={"draft"})
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("is not above the 1", problems[0])
+
+    def test_a_key_line_inside_a_quoted_scalar_is_rejected(self):
+        # A continuation line of a multi-line quoted prompt can start at column
+        # 0; YAML folds it into the string, but a text read takes it for the key.
+        spec = {**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        spec.pop("prompt", None)
+        text = yaml.safe_dump(spec) + 'prompt: "first line\nrequested_pull_requests: 5\nlast line"\n'
+        self._only("sits inside another value", text=text)
 
     def test_a_bare_boolean_expected_fail_passes(self):
         for value in (True, False):
@@ -737,6 +1017,41 @@ class TestTheRulesReject(unittest.TestCase):
         self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:a}: ok$", "(?m)^{cluster:any}: ok$"]})), [])
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "#1 plants slot e"}):
             self.assertEqual([p for p in self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:e}: ok$"]})) if "does not declare" in p], [])
+
+    def test_a_fleet_prompt_placeholder_is_well_formed_listed_and_catalogued(self):
+        # The valid case lists rbac-overgrant in fixtures:.
+        good = "on {{FLEET_CLUSTER_NAME:rbac-overgrant}} in {{FLEET_CLUSTER_PROJECT:rbac-overgrant}}"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("malformed fleet placeholder", prompt="on {{FLEET_CLUSTER_ZONE:rbac-overgrant}}")
+        self._only("doesn't list", prompt="on {{FLEET_CLUSTER_NAME:crashloop-workload}}", fixtures=["rbac-overgrant"])
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
+        # world-open-ingress is in the catalogue with cluster_slot: null: the
+        # runner records no cluster for it, so every run would fail.
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:world-open-ingress}}", fixtures=["rbac-overgrant", "world-open-ingress"])
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_misspelled_fleet_opener_is_rejected(self):
+        for prompt in (
+            "on {FLEET_CLUSTER_NAME:rbac-overgrant}}",
+            "on {{ FLEET_CLUSTER_NAME:rbac-overgrant }}",
+            "on {{fleet_cluster_name:rbac-overgrant}}",
+        ):
+            with self.subTest(prompt=prompt):
+                self._only("malformed fleet placeholder", prompt=prompt)
+
+    def test_a_fleet_placeholder_outside_the_prompt_is_rejected(self):
+        problem = self._only(
+            "which only the prompt expands",
+            verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["{{FLEET_CLUSTER_NAME:rbac-overgrant}}"]}),
+        )
+        self.assertIn("verification_spec", problem)
+
+    def test_a_scalar_fixtures_beside_a_fleet_placeholder_is_reported_not_raised(self):
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:rbac-overgrant}}", fixtures=True)
+        self.assertTrue(problems, "a scalar fixtures: passed")
 
     def test_a_cluster_placeholder_outside_report_contains_is_rejected(self):
         # worker_commands searches its patterns as written, so the placeholder
@@ -804,6 +1119,45 @@ class TestTheRulesReject(unittest.TestCase):
         )
         self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
 
+    def test_a_project_scoped_role_is_rejected_in_fixture_role(self):
+        # startup-fail-vm has cluster_slot null: the runner writes no
+        # kubeconfig for it, so a check cannot read its objects.
+        problem = self._only(
+            "a project-scoped role",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={
+                "type": "fleet_resource_property", "fixture_role": "startup-fail-vm", "kind": "deployment",
+                "resource_name": "x", "path": "spec.replicas", "op": "eq", "value": 1,
+            }),
+        )
+        self.assertIn("'fixture_role:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_roles(self):
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["startup-fail-vm"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_accepted_in_fixtures(self):
+        self.assertEqual(self._validate(fixtures=["startup-fail-vm"]), [])
+
+    def test_a_project_scoped_catalogue_role_the_overlay_omits_is_a_disagreement(self):
+        roles = {**validator._catalog_roles(), "made-up-vm": {"cluster_slot": None, "probes": ["instance/made-up-*"]}}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-vm' is project-scoped", problems[0])
+
+    def test_a_catalogue_role_that_is_not_a_mapping_is_rejected_not_project_scoped(self):
+        roles = {**validator._catalog_roles(), "made-up-broken": "cluster_slot: a"}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            self.assertNotIn("made-up-broken", validator._catalog_project_roles())
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-broken' is not a mapping", problems[0])
+
     def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
         problem = self._only(
             "'fixture_roles:' must be a list of role slugs",
@@ -867,7 +1221,6 @@ class TestTheRulesReject(unittest.TestCase):
             text=(
                 "id: made-up-case\n"
                 "domain: security\n"
-                "owner: maintainers\n"
                 "verification_spec: [{name: n, role: objective, "
                 "check: {type: report_contains, required_phrases: [x]}}]\n"
             ),
@@ -969,6 +1322,33 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
+
+
+class TestTheRunRecordGuard(unittest.TestCase):
+    """committed_run_records() on a temporary tree: any file under a case's
+    evidence/ directory is a finding; a file elsewhere in the case is not."""
+
+    def _findings(self, relatives):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for relative in relatives:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+            return validator.committed_run_records(root)
+
+    def test_a_record_at_depth_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/results.json"])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("a-case/evidence/run_1/results.json", found[0])
+        self.assertIn("not committed", found[0])
+
+    def test_any_file_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/campaign.json", "a-case/evidence/notes.md"])
+        self.assertEqual(len(found), 2, found)
+
+    def test_a_file_outside_evidence_passes(self):
+        self.assertEqual(self._findings(["a-case/fixture/results.json", "a-case/task.yaml"]), [])
 
 
 class TestTheSanitizer(unittest.TestCase):
@@ -1108,6 +1488,27 @@ class TestTheSanitizer(unittest.TestCase):
         )
         self.assertTrue(found.startswith("tf/prebuilt/stack/main.tf:1:"), found)
 
+    def test_a_module_file_is_scanned(self):
+        # Rooted the way the repository scan is, so what is under test is
+        # SANITIZED_ROOTS rather than a walk of the whole temporary tree.
+        roots = [r.relative_to(validator.REPO_ROOT) for r in validator.SANITIZED_ROOTS]
+        found = self._findings(
+            {
+                "bench/tasks/case/task.yaml": "ok: 192.0.2.1\n",
+                "bench/tf/modules/drift-inject/main.tf": 'ip = "10.0.0.1"\n',
+            },
+            roots=roots,
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("IPv4 literal 10.0.0.1", found[0])
+        self.assertTrue(found[0].startswith("bench/tf/modules/drift-inject/main.tf:1:"), found[0])
+
+    def test_sanitized_roots_includes_modules_dir(self):
+        self.assertEqual(
+            validator.SANITIZED_ROOTS,
+            (validator.TASKS_DIR, validator.PREBUILT_DIR, validator.MODULES_DIR),
+        )
+
     def test_dot_directories_and_local_tofu_artefacts_are_skipped(self):
         files = {
             "stack/.terraform/x.txt": "10.0.0.1\n",
@@ -1212,13 +1613,13 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         # test_the_exclusion_lists_do_not_rot passes on a clean tree whether or
         # not this function does anything; this is what proves it does.
         with unittest.mock.patch.dict(
-            validator.KNOWN_NO_DOMAIN, {"deleted-case": "gone"}, clear=False
+            validator.KNOWN_UNREGISTERED, {"deleted-case": "gone"}, clear=False
         ):
             stale = validator.stale_allowlist_entries()
-        self.assertIn("KNOWN_NO_DOMAIN: deleted-case", stale)
+        self.assertIn("KNOWN_UNREGISTERED: deleted-case", stale)
 
-    def test_all_four_allowlists_are_swept(self):
-        for name in ("KNOWN_UNREGISTERED", "KNOWN_NO_DOMAIN", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
+    def test_all_three_allowlists_are_swept(self):
+        for name in ("KNOWN_UNREGISTERED", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
             with self.subTest(allowlist=name):
                 with unittest.mock.patch.dict(
                     getattr(validator, name), {"deleted-case": "gone"}, clear=False
@@ -1256,7 +1657,7 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             validator.FIXTURE_NOT_READY, {"agent-kanban-smoke": "#1 waiting"}, clear=False
         ):
             self.assertIn(
-                "FIXTURE_NOT_READY: agent-kanban-smoke (also in a roster file)",
+                "FIXTURE_NOT_READY: agent-kanban-smoke (also registered: a roster file or the suite line)",
                 validator.stale_allowlist_entries(),
             )
 

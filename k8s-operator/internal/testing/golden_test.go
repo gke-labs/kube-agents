@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -61,9 +62,10 @@ func newTestScheme() *runtime.Scheme {
 	_ = agentv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
-	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
-	// reconcile, which is every golden case.
+	// batchv1: the A2A render lists its provision Jobs on every reconcile.
 	_ = batchv1.AddToScheme(s)
+	// The gateway's election Lease, on by default.
+	_ = coordinationv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
@@ -79,6 +81,7 @@ func TestAgentsGolden(t *testing.T) {
 		expectedPath  string
 		newAgent      func() client.Object
 		newReconciler func(client.Client, *runtime.Scheme) reconcile.Reconciler
+		settled       bool
 	}{
 		{
 			name:         "PlatformAgent",
@@ -125,6 +128,28 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// The credential broker's exec tier at 1 replica: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierOneReplica",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-1.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-1.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// The credential broker's exec tier at 2 replicas: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierTwoReplicas",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-2.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-2.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
 			// A spec.scope block. Diff this against platformagent-tagged.yaml and the
 			// whole of what phases 1 to 3 of docs/designs/multi-project-scope.md render is
 			// one ConfigMap key, scope.json, sorted regardless of declaration order (projects, folders, organisations, Shared VPC hosts, Metrics Scopes, exclusions);
@@ -139,14 +164,30 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// The above-one-replica shape. This is the only fixture that
-			// renders the leader Role's pods get/patch rule, and it is here
-			// because that rule is the agent identity's one write grant --
-			// the shape a reviewer most needs to be able to read off a
-			// manifest, and the one every other fixture renders away.
+			// availability.replicas: 3, which the operator caps at one
+			// replica. The expected output is identical to
+			// platformagent-tagged.yaml's, so the cap is visible as the
+			// absence of every multi-replica object; see the fixture's
+			// header for why the gateway is capped.
 			name:         "PlatformAgentHighAvailability",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-ha.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// spec.deployment.credentialProxy.resources.limits.ephemeral-storage
+			// raised from the 8Gi default to 10Gi, the most a pod may request on
+			// Autopilot. The proxy's state emptyDir grows by the headroom (5Gi +
+			// 2Gi) and its /tmp keeps 2Gi, which
+			// tests/test_manifest_resource_parity.py reads to check the grown
+			// volumes still fit under the raised limit; the fixture's header
+			// says why 10Gi.
+			name:         "PlatformAgentCredentialProxyResources",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-credential-proxy-resources.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-credential-proxy-resources.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
@@ -167,12 +208,58 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
+		{
+			// The default example CR reconciled until settled, so the golden
+			// carries what later passes add (the bridge's activity hook); the
+			// chart's footprint.yaml sums the A2A stack from this golden.
+			name:         "PlatformAgentSettled",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-settled.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-settled.yaml"),
+			settled:      true,
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// A shellSandbox.resources override that raises the memory pair.
+			// Diff this against platformagent-tagged.yaml and the whole of what
+			// the field renders is the shell container's requests.memory and
+			// limits.memory on the sandbox StatefulSet, the CPU defaults kept.
+			name:         "PlatformAgentShellSandboxResources",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-sandbox-resources.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sandbox-resources.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// spec.deployment.sizingProfile medium. Diff this against
+			// platformagent-tagged.yaml and the whole of what the field renders
+			// is the credential-proxy container's requests and limits on the
+			// proxy Deployment and the agent-api-auth sidecar's memory limit on
+			// the gateway pod; the shell keeps the small row, which has no
+			// medium figure. The default golden stays byte-identical, which is
+			// what holds an install that never set the field where it was.
+			name:         "PlatformAgentSizingMedium",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-sizing-medium.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sizing-medium.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			testutil.RunGoldenTest(
+			run := testutil.RunGoldenTest
+			if tt.settled {
+				run = testutil.RunSettledGoldenTest
+			}
+			run(
 				t,
 				tt.inputPath,
 				tt.expectedPath,

@@ -1,4 +1,11 @@
 locals {
+  # A zonal Standard cluster this composition creates: one node in its default
+  # pool (standard_node_count is per zone), too few for a three-server A2A bus.
+  # An adopted cluster's node count is not known here, so it keeps the
+  # operator's default, which holds a running bus at its count. A today install
+  # runs no bus and ignores the field, so the mode does not enter into it.
+  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
+
   # iam, monitoring, and logging are here because Terraform must enable every
   # API its own resources call, where gcloud enables them implicitly.
   base_apis = [
@@ -12,6 +19,10 @@ locals {
     # credential broker's relay on the Trace role granted below; the API has
     # to be on for the grant to buy anything.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences on the GKE Hub role granted below; the API has
+    # to be on for the grant to buy anything.
+    "gkehub.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -58,6 +69,13 @@ locals {
   vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
 
+  use_openai_compatible = var.model_provider == "openai_compatible"
+  # The providers the chart knows a default model for; any other slug needs
+  # model_default_name, checked below so the plan fails rather than the render.
+  model_provider_has_default = contains(["gemini", "anthropic", "openai", "vertex_ai", "sap"], var.model_provider)
+  # The key the CA bundle Secret holds the PEM under, as for the GitLab CA.
+  openai_compatible_ca_key = "ca.crt"
+
   # The minter chart values need the GitOps repository split into owner and
   # name. Accepts the same forms integration.github.gitRepo takes: owner/repo,
   # or a github.com URL. Anything else leaves both parts empty, which the
@@ -90,7 +108,31 @@ locals {
   # https://<host>/api/v3 from this declaration. github = null removes the
   # alias from the release values. A github.com install (gitops_host empty)
   # renders the alias, as before.
-  gitops_is_ghes = !local.gitops_is_gitlab && var.gitops_host != ""
+  # A Bitbucket GitOps repository, Cloud or Data Center: one forge named after
+  # its provider, with the token Secret, the workspace or project key as its
+  # namespace, and the repository slug on it as the gitops role. Cloud has one
+  # host and no CA; Data Center names its host and may name a CA Secret.
+  # identity is the account an access token acts as (see gitops_identity).
+  gitops_is_bitbucket = contains(["bitbucket", "bitbucket-datacenter"], var.gitops_forge)
+  gitops_repo_parts   = split("/", var.gitops_repo_path)
+  bitbucket_forges = [merge(
+    {
+      name           = var.gitops_forge
+      provider       = var.gitops_forge
+      namespace      = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[0] : ""
+      credentialsRef = { name = var.gitops_token_secret_name != "" ? var.gitops_token_secret_name : "bitbucket-forge-token" }
+    },
+    var.gitops_forge == "bitbucket-datacenter" ? { host = var.gitops_host } : {},
+    var.gitops_ca_secret_name != "" ? { caBundleRef = { name = var.gitops_ca_secret_name } } : {},
+    var.gitops_identity != "" ? { identity = var.gitops_identity } : {}
+  )]
+  bitbucket_repositories = [{
+    forge      = var.gitops_forge
+    repository = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[1] : var.gitops_repo_path
+    role       = "gitops"
+  }]
+
+  gitops_is_ghes = var.gitops_forge == "github" && var.gitops_host != ""
   ghes_forges = [merge(
     { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
     var.github_ca_secret_name != "" ? { caBundleRef = { name = var.github_ca_secret_name } } : {}
@@ -110,19 +152,23 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+        }, var.slack_home_channel_policy != "" ? {
+        homeChannelPolicy = var.slack_home_channel_policy
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
+    local.gitops_is_bitbucket ? { forges = local.bitbucket_forges } : {},
+    local.gitops_is_bitbucket ? { repositories = local.bitbucket_repositories } : {},
     local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
     local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
     local.gitops_is_ghes ? { github = null } : {},
-    (!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
+    (!local.gitops_is_gitlab && !local.gitops_is_bitbucket && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
       github = merge(
         local.github_org != "" ? { org = local.github_org } : {},
         var.github_repo != "" ? { gitRepo = var.github_repo } : {}
@@ -149,6 +195,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -185,6 +232,9 @@ locals {
       ANTHROPIC_API_KEY       = var.anthropic_api_key
       GEMINI_API_KEY          = var.gemini_api_key
       OPENAI_API_KEY          = var.openai_api_key
+      # Read by the gateway for openai_compatible only, and sent to that
+      # server alone.
+      OPENAI_COMPATIBLE_API_KEY = var.openai_compatible_api_key
     } : key => value if value != ""
   }
 
@@ -217,11 +267,9 @@ locals {
   }
 
   # The registry third-party images are pulled from on a mirrored install:
-  # third_party_image_registry, falling back to image_registry, the same
-  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
-  # Empty means the upstream registries.
+  # third_party_image_registry. Empty means the upstream registries.
   third_party_registry = trimsuffix(
-    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+    var.third_party_image_registry,
     "/"
   )
 
@@ -320,6 +368,26 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
   )
+
+  # Whether the release will deploy the web console, by either door that
+  # reaches the field (web_console_enabled or extra_helm_values.webConsole.enabled).
+  web_console_requested = (
+    var.web_console_enabled ||
+    try(tobool(var.extra_helm_values.webConsole.enabled) == true, false)
+  )
+}
+
+# A warning rather than a precondition: setting image_registry without
+# third_party_image_registry is a valid configuration if the operator only
+# intends to mirror first-party images. But third-party images (cert-manager,
+# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# will remain on upstream public registries. On restricted or air-gapped clusters,
+# operators must be informed so deployments do not fail on ImagePullBackOff.
+check "unmirrored_third_party_images" {
+  assert {
+    condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+  }
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -415,6 +483,16 @@ module "gke_cluster" {
   enable_backup_agent        = var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
+  sizing_profile             = var.sizing_profile
+  standard_machine_type      = var.standard_machine_type
+  standard_node_count        = var.standard_node_count
+  standard_disk_size_gb      = var.standard_disk_size_gb
+  standard_disk_type         = var.standard_disk_type
+  gvisor_machine_type        = var.gvisor_machine_type
+  gvisor_min_node_count      = var.gvisor_min_node_count
+  gvisor_max_node_count      = var.gvisor_max_node_count
+  gvisor_disk_size_gb        = var.gvisor_disk_size_gb
+  gvisor_disk_type           = var.gvisor_disk_type
 
   resource_labels = {
     "kube-agents-host" = "true"
@@ -706,10 +784,26 @@ module "github_minter" {
   location           = var.location
   namespace          = var.namespace
   service_account_id = var.github_minter_service_account_id
+  ksa_name           = var.github_minter_ksa_name
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
+  # The owning install, which lifecycle.sh's adoption step checks before it
+  # imports a key ring or key this state doesn't hold (#3504). None on a key
+  # this install shares on purpose: the labels stay its owner's. `labels` on
+  # the crypto key is non-authoritative (provider 5.x), so an empty map leaves
+  # the owner's labels where they are rather than removing them.
+  owner_labels = var.github_minter_shared_kms_key == "${var.github_minter_kms_keyring}/${var.github_minter_kms_key}" ? {} : {
+    "kube-agents-cluster"   = var.cluster_name
+    "kube-agents-namespace" = var.namespace
+  }
+  owner_description = "kube-agents GitHub token minter for install ${var.cluster_name}/${var.namespace}"
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster for the reason module.kube_agents_iam's depends_on
+  # states in full: the module's workload_identity binding names the pool as
+  # an interpolated string, so Terraform sees no edge to the cluster whose
+  # creation brings the pool into existence, and on a first install into a new
+  # project the binding fails with "Identity Pool does not exist".
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
@@ -840,6 +934,15 @@ locals {
   alert_daily_limits = { for bucket, limit in var.alert_daily_limits : bucket => limit if limit != null }
 }
 
+# The operator's own data volume size (agentDataStorageSize), which is also the
+# platform_agent_storage_size default. That value passes the chart nothing, so
+# the CR carries no spec.storage and the operator default applies.
+# tests/test_platform_agent_storage_size_defaults.py pins this local, the
+# variable default and install.defaults.env to the operator constant.
+locals {
+  platform_agent_default_storage_size = "50Gi"
+}
+
 resource "helm_release" "kube_agents" {
   name             = "kube-agents"
   chart            = "${path.module}/../../../charts/kube-agents"
@@ -857,18 +960,38 @@ resource "helm_release" "kube_agents" {
   wait    = true
   timeout = 600
 
+  # Opt-in (HELM_UPGRADE_INSTALL in install.env). The helm provider can drop a
+  # live release from state when a refresh lookup errors
+  # (hashicorp/terraform-provider-helm#1669), and the next apply then plans a
+  # create that fails with "cannot re-use a name that is still in use" (#4108).
+  # With this on, that create runs as `helm upgrade --install` and adopts the
+  # release. It adopts any release of this name in the namespace, including one
+  # another Terraform state or a manual `helm install` owns, so it is only for
+  # long-lived environments whose own state owns the release. Off, a conflicting
+  # first install fails loudly.
+  upgrade_install = var.helm_upgrade_install
+
+  # The chart's own version, stated so the provider never infers it. With
+  # upgrade_install on and version unset, the provider's plan asks the cluster
+  # for the installed release's version: that fails before the cluster exists,
+  # so a from-nothing install could not plan, and it plans the installed
+  # version, so the apply after any chart version change fails with
+  # "Provider produced inconsistent result". This is the value the provider
+  # computes from the chart anyway, so it changes no existing plan.
+  version = yamldecode(file("${path.module}/../../../charts/kube-agents/Chart.yaml")).version
+
   values = [yamlencode({
-    # Reaches every image this release pulls, including the three the chart
-    # does not render itself — the agent Deployment, the shell sandbox
-    # StatefulSet, and the fluent-bit sidecar the operator resolves at
-    # reconcile time. See the chart README's "Installing from a mirrored
-    # registry".
+    # Reaches every image this release pulls, including the two the chart
+    # does not render itself — the agent Deployment and the shell sandbox
+    # StatefulSet the operator resolves at reconcile time (the fluent-bit
+    # sidecar follows thirdPartyImageRegistry). See the chart README's
+    # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
-    # local.cert_manager_mirror_values carries the same registry to that
-    # release's image repositories, so a mirrored install pulls every image —
-    # cert-manager's included — from the mirror.
+    # When third_party_image_registry is set, local.cert_manager_mirror_values
+    # carries it to that release's image repositories, so a fully mirrored
+    # install pulls cert-manager from the mirror too.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry
@@ -878,9 +1001,10 @@ resource "helm_release" "kube_agents" {
     }
     # The sandbox is built from this repository at the same commit as the
     # agent and the operator, so it takes image_tag with them. It needs its own
-    # entry because the operator does not derive it: unlike the credential
-    # broker, which comes from the agent image with the trailing name swapped,
-    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # entry because the chart always names it in AGENT_SANDBOX_IMAGE, which
+    # wins over the operator's own derivation: unlike the credential broker,
+    # which comes from the agent image with the trailing name swapped, nothing
+    # moves the sandbox with the agent image.
     # Leaving it out pins the sandbox to Chart.appVersion while everything
     # around it moves, which fails the pull rather than running the wrong code.
     agentSandbox = {
@@ -906,6 +1030,10 @@ resource "helm_release" "kube_agents" {
         modelDefaultName = var.model_default_name
         maxTokens        = var.model_max_tokens
       },
+      # Only when named, so an install without one renders the values it did.
+      var.litellm_env_secret_name != "" ? {
+        envFromSecret = var.litellm_env_secret_name
+      } : {},
       local.use_vertex ? {
         vertex = {
           serviceAccountName = local.litellm_ksa
@@ -914,6 +1042,20 @@ resource "helm_release" "kube_agents" {
           }
           projectId = local.vertex_project
           location  = local.vertex_location
+        }
+      } : {},
+      # Only for this provider, so every other install renders the values it
+      # did before. A target port of 0 is the variable's "unset", which the
+      # chart spells null.
+      local.use_openai_compatible ? {
+        openaiCompatible = {
+          apiBase     = var.openai_compatible_api_base
+          targetPort  = var.openai_compatible_target_port == 0 ? null : var.openai_compatible_target_port
+          egressCIDRs = var.openai_compatible_egress_cidrs
+          caBundleSecretRef = {
+            name = var.openai_compatible_ca_secret_name
+            key  = local.openai_compatible_ca_key
+          }
         }
       } : {},
       # Only while on, so an install that never turns redaction on renders the
@@ -928,11 +1070,21 @@ resource "helm_release" "kube_agents" {
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
         }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
+        }
       } : {}
     )
     # merge(), so "today" adds no key and the values this composition hands the
     # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null.
+    # leaves spec.mode out of the CR while its value is null. The storage size
+    # works the same way: the default adds no key, and the CR carries no
+    # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
@@ -975,6 +1127,14 @@ resource "helm_release" "kube_agents" {
             subscription = module.drift_pubsub[0].subscription_name
             enabled      = var.enable_drift_detector ? true : null
           }
+        } : {},
+        # A one-server A2A bus where the cluster cannot hold three: the bus's
+        # three NATS servers each need their own node, and a zonal Standard
+        # cluster's default pool is one node, so the second server would wait
+        # Pending and the bus would never form. extra_helm_values can still
+        # set busReplicas (the second document deep-merges over this one).
+        local.bus_single_server ? {
+          tuning = { busReplicas = 1 }
         } : {}
       )
       deployment = merge(
@@ -1008,6 +1168,7 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        disallowSecretsRead = var.disallow_secrets_read
         # The mapping the credential broker selects from, one row per project
         # the module provisioned a member for. It has to reach the cluster as
         # data rather than being recomputed there: the broker refuses a
@@ -1055,6 +1216,8 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
+      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
+      storage = { size = var.platform_agent_storage_size }
       }, var.platform_agent_mode == "today" ? {} : {
       mode = var.platform_agent_mode
     })
@@ -1069,7 +1232,9 @@ resource "helm_release" "kube_agents" {
         org     = local.github_org
         repo    = local.github_repo_name
         appId   = var.github_app_id
-        # The minty rule's only gate on either scope is assertion.email
+        # The minty rule's only gate on each of its three scopes
+        # (platform-agent-scope, platform-agent-read-scope and
+        # platform-agent-sweep-scope) is assertion.email
         # against this value; left unset the chart falls back to the fixed
         # kubeagents-platform-gsa name, so an install that overrides
         # agent_service_account_id would annotate one GSA and allowlist another.
@@ -1084,10 +1249,25 @@ resource "helm_release" "kube_agents" {
       # github_minter_service_account_id would create one GSA and have the pod
       # impersonate another. Only when the module exists: a null here would
       # be a Helm null, which deletes the chart default instead of keeping it.
+      # ksaName from the same variable as the module's ksa_name, so the
+      # binding and the pod name one KSA.
       var.enable_github_minter ? {
         gsaName = module.github_minter[0].service_account_id
+        ksaName = var.github_minter_ksa_name
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Its image
+    # follows platformAgent.deployment.image.tag and global.imageRegistry,
+    # and its Service is ClusterIP by construction. agentIdentity is what the
+    # console's identity box shows: the console holds no credentials to read
+    # IAM, so the agent's GSA and project roles are recorded here at apply.
+    webConsole = {
+      enabled = var.web_console_enabled
+      agentIdentity = {
+        gcpServiceAccount = module.kube_agents_iam.service_account_email
+        roles             = sort(module.kube_agents_iam.agent_project_roles)
+      }
+    }
     plugins = {
       pubsubPlatform = merge(
         {
@@ -1148,6 +1328,23 @@ resource "helm_release" "kube_agents" {
   ]
 
   lifecycle {
+    # The chart refuses to render openai_compatible without these, and a
+    # render failure inside helm_release arrives after the cluster and IAM
+    # have been built; a precondition fails the plan instead. The egress rules
+    # (a target port for a Service, CIDRs otherwise) are the chart's to judge.
+    precondition {
+      condition     = !local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"openai_compatible\" requires model_default_name, the model the server serves; the provider has no default."
+    }
+    precondition {
+      condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
+      error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+    }
+    precondition {
+      condition     = local.model_provider_has_default || local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"${var.model_provider}\" is a LiteLLM provider slug outside the chart's table, which has no default model: set model_default_name to the model it serves."
+    }
+
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
@@ -1159,6 +1356,43 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.gitops_is_gitlab || (var.gitlab_repo != "" && var.github_repo == "" && !var.enable_github_minter)
       error_message = "gitops_forge = \"gitlab\" needs gitlab_repo set, and github_repo and enable_github_minter left unset: a GitLab install has no GitHub App."
+    }
+
+    # A Bitbucket install has no GitHub App either, and names its repository
+    # as workspace/slug (Cloud) or KEY/slug (Data Center), the grammars of the
+    # operator's bitbucketWorkspaceRegex and bitbucketProjectKeyRegex.
+    precondition {
+      condition = !local.gitops_is_bitbucket || (var.github_repo == "" && !var.enable_github_minter && (
+        var.gitops_forge == "bitbucket"
+        ? can(regex("^[a-z0-9][a-z0-9_-]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+        : can(regex("^[A-Za-z][A-Za-z0-9_]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+      ))
+      error_message = "gitops_forge = \"bitbucket\" needs gitops_repo_path as workspace/repo-slug, and \"bitbucket-datacenter\" as PROJECTKEY/repo-slug; github_repo and enable_github_minter stay unset: a Bitbucket install has no GitHub App."
+    }
+
+    # Bitbucket Cloud is bitbucket.org only, with the public CAs; a Data
+    # Center instance names its host, which is never a hosted service's.
+    precondition {
+      condition     = var.gitops_forge != "bitbucket" || (var.gitops_host == "" && var.gitops_ca_secret_name == "")
+      error_message = "gitops_forge = \"bitbucket\" is Bitbucket Cloud at bitbucket.org: leave gitops_host and gitops_ca_secret_name unset. For a Data Center instance, use gitops_forge = \"bitbucket-datacenter\"."
+    }
+    precondition {
+      condition     = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
+      error_message = "gitops_forge = \"bitbucket-datacenter\" needs gitops_host: the instance's own hostname, not bitbucket.org or another hosted service's domain."
+    }
+    precondition {
+      condition     = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
+      error_message = "gitops_identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces."
+    }
+    # The CRD's grammar for identity, on both Bitbucket providers.
+    precondition {
+      condition     = var.gitops_identity == "" || can(regex("^[A-Za-z0-9._@+{}-]{1,255}$", var.gitops_identity))
+      error_message = "gitops_identity is 1 to 255 letters, digits and . _ @ + { } -."
+    }
+    # The Bitbucket inputs under another forge would be dropped silently.
+    precondition {
+      condition     = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
+      error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\" or \"bitbucket-datacenter\"; set it, or leave them unset."
     }
 
     # The reverse: GitLab inputs under the default forge would be dropped,
@@ -1182,8 +1416,8 @@ resource "helm_release" "kube_agents" {
     # it; github.com is the default and needs no host; and a GitLab host is
     # not GitHub's.
     precondition {
-      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
-      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com|bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like), gitlab.com, or a Bitbucket or Atlassian domain is not one."
     }
 
     # On a GitHub Enterprise Server, github_repo is required, as owner/name
@@ -1254,6 +1488,16 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.extra_helm_values_countermands_detector
       error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+    }
+
+    # The web console holds the Platform Agent's API key with no login of its
+    # own; its deny-all-ingress NetworkPolicy is what confines access to
+    # kubectl port-forward. On a cluster that enforces no NetworkPolicy
+    # (create_cluster = false with accept_no_network_policy = true), any pod in
+    # the cluster could reach the console Service and drive the agent.
+    precondition {
+      condition     = !local.web_console_requested || module.gke_cluster.network_policy_enforced
+      error_message = "the web console requires a cluster that enforces NetworkPolicy (web_console_enabled = true or webConsole.enabled in extra_helm_values cannot be used when NetworkPolicy is not enforced, such as create_cluster = false with accept_no_network_policy = true): its deny-all-ingress NetworkPolicy is what confines access to kubectl port-forward, and without enforcement any pod in the cluster can reach the console Service and drive the agent."
     }
   }
 }

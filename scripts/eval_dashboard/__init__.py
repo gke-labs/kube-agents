@@ -5,10 +5,11 @@ shared with the renderer and the publisher -- see SCHEMA.md in this directory
 before changing any field. `render.py` turns one data.json (schema_version 1)
 into six pages -- `index.html` (the incident Brief), `run.html` (the per-run
 PR view), `grid.html` (every case by every run, with the merges and
-incidents marked), `cases.html` (how reliable each test is) and
-`nightly.html` (last night's run of the nightly tier, `nightly.py`) and
-`trend.html` (scores over time on main from the evidence store `store.py`
-reads, `trend.py`) -- plus
+incidents marked), `cases.html` (how reliable each test is, and its
+scenarios view: what kube-agents can do, scenario by scenario, with a
+confidence level per case), `nightly.html` (last night's run of the nightly
+tier, `nightly.py`) and `trend.html` (scores over time on main from the
+evidence store `store.py` reads, `trend.py`) -- plus
 `brief.json`, the document they all render from: the per-run classification
 `classify.py` produces (the one place the "is this red mine?" rule lives)
 and the per-case record; and a copy of the data file. `publish.py` ships an
@@ -19,9 +20,15 @@ computed from data.json alone -- the optional extra inputs are
 adjudicator's `health.json` / `health-history.jsonl` when published;
 render.py's docstring owns the details.
 
-Two more readers of the same data.json live here: `health.py` decides
+More readers of the same data.json live here: `health.py` decides
 whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
-`post_health.py` tells a Google Chat space when that changes, with one line
-on last night's nightly run in its daily digest.
-docs/ci-health.md is the page for both.
+`post_health.py` tells a Google Chat space when that changes, with a
+section on last night's nightly run in its daily digest (`nightly_digest.py`;
+its latency block, `nightly_latency.py`). `nightly_bugs.py` files an
+issue for a case the nightly fails on every run three nights in a row, and
+(`nightly_infra.py`) one for the infra owner when the nightly or a case is
+kept from running. `weekly_email.py` renders the weekly health email
+from the same nightly runs, refusing when an integrity check fails, and
+`weekly_chat.py` posts its summary to the Chat space once a week.
+docs/ci-health.md is the page for all of them.
 """

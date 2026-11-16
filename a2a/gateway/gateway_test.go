@@ -49,11 +49,19 @@ func startServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
+// connectTest dials a test's own nats-server with the product's dial bound
+// (lib.DialTimeout) rather than nats.go's 2s default: the package's tests run
+// in parallel under -race, where a loopback dial can take longer than that,
+// and a test that fails on a slow dial is a flake, not a finding.
+func connectTest(url string, opts ...nats.Option) (*nats.Conn, error) {
+	return nats.Connect(url, append([]nats.Option{nats.Timeout(lib.DialTimeout)}, opts...)...)
+}
+
 // provision creates the TASKS stream and the session-state and cap buckets
 // the way the W6 operator's provision Job does.
 func provision(t *testing.T, url string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -71,6 +79,24 @@ func provision(t *testing.T, url string) {
 		MaxAge:    72 * time.Hour,
 	}); err != nil {
 		t.Fatalf("create TASKS: %v", err)
+	}
+	// Profile submissions' own stream, as the provision Job makes it.
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      lib.ProfileSubmitStream,
+		Subjects:  []string{lib.SubmitSubjectPrefix + ">"},
+		Retention: jetstream.LimitsPolicy,
+	}); err != nil {
+		t.Fatalf("create %s: %v", lib.ProfileSubmitStream, err)
+	}
+	// Profile tasks' stop records, as the provision Job makes it.
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              lib.DispatchStopStream,
+		Subjects:          []string{lib.DispatchStopPrefix + ">"},
+		Retention:         jetstream.LimitsPolicy,
+		MaxMsgsPerSubject: 1,
+		AllowDirect:       true,
+	}); err != nil {
+		t.Fatalf("create %s: %v", lib.DispatchStopStream, err)
 	}
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
 		t.Fatalf("create session-state: %v", err)
@@ -90,13 +116,13 @@ func provision(t *testing.T, url string) {
 // Not before the gateway's relay has bound its durable on the stream, though.
 // The rig starts Run on a goroutine, and Run binds the relay before it starts
 // the adapter that reads the inbox; a stream deleted ahead of that bind leaves
-// Run retrying "stream not found" for the whole bind window (lib's
-// subscribeBindWindow, 45s), so no turn is ever read and the test times out
+// Run waiting for the stream to exist again (the relay's WaitForStream), so
+// no turn is ever read and the test times out
 // waiting for a failure the gateway never got to have. Under a loaded
 // `go test ./...` the goroutine can lose that race.
 func deleteTasksStream(t *testing.T, url string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -123,9 +149,10 @@ func deleteTasksStream(t *testing.T, url string) {
 // the wait gone the stream is deleted at once and the late create fails
 // "stream not found", which is the race #2696 hit from the gateway's side.
 func TestDeleteTasksStreamWaitsForTheRelayDurable(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	provision(t, s.ClientURL())
-	nc, err := nats.Connect(s.ClientURL())
+	nc, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -201,6 +228,35 @@ type fakeAdapter struct {
 	reactions []string
 	// verified records InboundVerified calls (verifiedCalls).
 	verified []string
+	// feedbacks records every PostMessage's feedback mark, when it has one,
+	// and markedTexts the text each marked post carried.
+	feedbacks   []string
+	markedTexts []string
+	// takesTerminals makes PostTerminal record the terminal in terminals, as
+	// the console adapter publishes a terminal frame; without it the fake
+	// answers errNoTerminalFrames, as a chat backend would.
+	takesTerminals bool
+	terminals      []fakeTerminal
+	// stopLines records every post and edit that carried OutMessage.Stop,
+	// a running task's live message; laidOut the messages whose current
+	// edit is a layout, so an edit back to text is recorded in chatEdits as
+	// nil, and a text edit of a text line is not.
+	stopLines []fakePost
+	laidOut   map[string]bool
+	// privates records every PostPrivate (privatePosts), the posts one
+	// viewer alone sees; they are not in posts.
+	privates []fakePrivatePost
+}
+
+type fakePrivatePost struct {
+	Conversation string
+	Viewer       string
+	Text         string
+}
+
+type fakeTerminal struct {
+	Conversation string
+	ConsoleTerminal
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -246,8 +302,20 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 }
 
 func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Feedback != "" {
+		a.mu.Lock()
+		a.feedbacks = append(a.feedbacks, m.Feedback)
+		a.markedTexts = append(a.markedTexts, m.Text)
+		a.mu.Unlock()
+	}
 	if m.Chat == nil {
-		return a.Post(conversation, m.Text)
+		id, err := a.Post(conversation, m.Text)
+		if err == nil && m.Stop != "" {
+			a.mu.Lock()
+			a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+			a.mu.Unlock()
+		}
+		return id, err
 	}
 	a.mu.Lock()
 	rendersChat, refuseChat := a.rendersChat, a.refuseChat
@@ -261,8 +329,25 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 	id, err := a.Post(conversation, m.Text)
 	a.mu.Lock()
 	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.setLaidOutLocked(id, true)
+	if m.Stop != "" {
+		a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+	}
 	a.mu.Unlock()
 	return id, err
+}
+
+func (a *fakeAdapter) setLaidOutLocked(messageID string, laidOut bool) {
+	if a.laidOut == nil {
+		a.laidOut = map[string]bool{}
+	}
+	a.laidOut[messageID] = laidOut
+}
+
+func (a *fakeAdapter) stopLinesCopy() []fakePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePost(nil), a.stopLines...)
 }
 
 func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
@@ -286,7 +371,13 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 		return err
 	}
 	a.mu.Lock()
-	a.chatEdits = append(a.chatEdits, m.Chat)
+	if m.Chat != nil || a.laidOut[messageID] {
+		a.chatEdits = append(a.chatEdits, m.Chat)
+	}
+	a.setLaidOutLocked(messageID, m.Chat != nil)
+	if m.Stop != "" {
+		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -325,6 +416,19 @@ func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
 	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
 }
 
+func (a *fakeAdapter) PostPrivate(conversation, viewer, text string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.privates = append(a.privates, fakePrivatePost{conversation, viewer, text})
+	return nil
+}
+
+func (a *fakeAdapter) privatePosts() []fakePrivatePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePrivatePost(nil), a.privates...)
+}
+
 func (a *fakeAdapter) verifiedCalls() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -335,6 +439,28 @@ func (a *fakeAdapter) reactionCalls() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.reactions...)
+}
+
+func (a *fakeAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.takesTerminals {
+		return errNoTerminalFrames
+	}
+	a.terminals = append(a.terminals, fakeTerminal{conversation, t})
+	return nil
+}
+
+func (a *fakeAdapter) setTakesTerminals() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.takesTerminals = true
+}
+
+func (a *fakeAdapter) terminalPosts() []fakeTerminal {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakeTerminal(nil), a.terminals...)
 }
 
 func (a *fakeAdapter) postTexts() []string {
@@ -369,6 +495,10 @@ type rig struct {
 	// stop cancels the gateway's context, on the rigs restartRig can
 	// replace (startRigWithSpawnerCap); nil elsewhere.
 	stop context.CancelFunc
+	// ran is closed when the gateway's Run returns, on the same rigs: a
+	// gateway is stopped once Run has returned, the order cmd/gateway keeps
+	// before it closes the client. nil elsewhere.
+	ran chan struct{}
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -474,7 +604,7 @@ func waitForRecord(t *testing.T, r *rig, conv, what string, cond func(*SessionRe
 // inSubjectEnvelopes replays everything on a task's in subject.
 func inSubjectEnvelopes(t *testing.T, url, addressee string) []*lib.Envelope {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,6 +688,7 @@ func (r *rig) execFor(t *testing.T, origin *lib.Envelope, addressee string) *lib
 // ---- tests -------------------------------------------------------------
 
 func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "discord:g1/thread1", Kind: "group",
@@ -607,6 +738,7 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 // purpose: a channel mention mints a fresh conversation every time, so a
 // conversation-scoped dedupe would be no bound at all.
 func TestUnmappedSenderIsDropped(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	for i := 0; i < 2; i++ {
 		r.adapter.inbox <- InboundMessage{
@@ -646,6 +778,7 @@ func TestVerifiedByNamesTheMechanism(t *testing.T) {
 }
 
 func TestReplyRelayAndRollingProgressLine(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread2"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "do the thing"}
@@ -709,6 +842,7 @@ func TestReplyRelayAndRollingProgressLine(t *testing.T) {
 }
 
 func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread3"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -773,6 +907,7 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 }
 
 func TestStatusQueryAnsweredByReplayNotForwarded(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread4"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -818,6 +953,7 @@ func TestStatusQueryAnsweredByReplayNotForwarded(t *testing.T) {
 }
 
 func TestStopPublishesCancelAndDetaches(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread5"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -847,6 +983,7 @@ func TestStopPublishesCancelAndDetaches(t *testing.T) {
 }
 
 func TestRegistrySurvivesRestartShapedReload(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread6"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -920,6 +1057,7 @@ func TestNormalizePhrases(t *testing.T) {
 }
 
 func TestStaleActiveTaskHealsInsteadOfSteering(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread7"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -995,6 +1133,7 @@ func seedTasklessDelegate(t *testing.T, r *rig, conv string, age time.Duration) 
 // session, a spawn), not a steer into the task that never started, and the
 // conversation is told why.
 func TestTasklessActiveTaskPastGraceHealsIntoNewDelegation(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-taskless-old"
 	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
@@ -1030,6 +1169,7 @@ func TestTasklessActiveTaskPastGraceHealsIntoNewDelegation(t *testing.T) {
 // The message steers, as before, and nothing is released. A record with no
 // SubmittedAt at all has no age to judge and is left alone the same way.
 func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	for name, age := range map[string]time.Duration{"discord:g1/thread-taskless-young": time.Minute, "discord:g1/thread-taskless-unaged": 0} {
 		conv := name
@@ -1102,6 +1242,7 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 // verifier outage produces, not on any refusal, because that is the one the
 // bare line was actively misleading about.
 func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-rejected"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -1112,7 +1253,10 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const reason = "reason: capability-refused - the verifier could not be reached"
+	// The notice carries the detail and never the token or the prefix
+	// (.agents/rules/chat_ux.md, "No plumbing in user text").
+	const detail = "the verifier could not be reached"
+	const reason = "reason: capability-refused - " + detail
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID: origin.TaskID, ContextID: origin.ContextID,
 		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
@@ -1134,15 +1278,21 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 
 	waitFor(t, "the refusal posts with its reason", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, reason) {
+			if strings.Contains(p, detail) {
 				return true
 			}
 		}
 		return false
 	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, reasonPrefix) || strings.Contains(p, "capability-refused") {
+			t.Fatalf("the notice carries the executor's plumbing: %q", p)
+		}
+	}
 }
 
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread8"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
@@ -1414,9 +1564,10 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	ran := make(chan struct{})
+	go func() { _ = g.Run(ctx); close(ran) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // restartRig stops r's gateway and starts a second one over the same server,
@@ -1436,9 +1587,16 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
+	return restartRigWith(t, r, wrap, RunOptions{}, whileDown...)
+}
+
+// restartRigWith is restartRigWrapped with the second gateway run under opts,
+// as an elected gateway runs (RunWith).
+func restartRigWith(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, opts RunOptions, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
 	r.stop()
 	select {
-	case <-r.adapter.stopped:
+	case <-r.ran:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the first gateway did not stop")
 	}
@@ -1467,8 +1625,9 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
-	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
+	ran := make(chan struct{})
+	go func() { _ = g.RunWith(ctx, opts); close(ran) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
@@ -1476,6 +1635,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 // prefix stripped, and spawns the pod; steers follow the delegated task; the
 // next plain ask re-homes to the default addressee.
 func TestDelegatePrefixSpawnsSessionWorker(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "discord:g1/thread-d1", Kind: "group",
@@ -1564,6 +1724,7 @@ func TestDelegatePrefixSpawnsSessionWorker(t *testing.T) {
 // is not an affordance - the turn routes to the default addressee with its
 // text intact (stripping the prefix without an executor would lie).
 func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "discord:g1/thread-d2", Kind: "group",
@@ -1585,6 +1746,7 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 // reach the worker as a steer - only the exact phrases stay status
 // affordances, or a correction is stolen and answered by replay.
 func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d3"
 	r.adapter.inbox <- InboundMessage{
@@ -1644,6 +1806,7 @@ func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
 // it rather than write the literal RouteSession sentinel into Addressee -
 // that would publish the task to an addressee no executor owns.
 func TestPreFlipRecordUpgradesToSessionRoute(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	conv := "discord:g1/thread-preflip"
 	rec := &SessionRecord{Key: conv, ContextID: "ctx-preflip", Addressee: "platform", Kind: "group"}
@@ -1670,6 +1833,7 @@ func TestPreFlipRecordUpgradesToSessionRoute(t *testing.T) {
 // the previous incarnation's pod - once PodName is cleared, reap can never
 // find it again, so the gateway deletes it instead.
 func TestDelegateDeletesPreviousIncarnationPod(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d4"
 	r.adapter.inbox <- InboundMessage{
@@ -1730,6 +1894,7 @@ func TestAddresseeForStragglerTask(t *testing.T) {
 // right after the result — the most ordinary message a session carries —
 // was dropped. The relay stamps LastActivity when it clears the task.
 func TestTaskEndCountsAsActivity(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-activity"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "a-1", Text: "take your time"}
@@ -1779,6 +1944,7 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 // not re-open the window the reap just closed. Only an executor's end of a
 // live task is activity.
 func TestSupervisorTerminalIsNotActivity(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-sup-terminal"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "long one"}
@@ -1835,6 +2001,7 @@ func TestSupervisorTerminalIsNotActivity(t *testing.T) {
 // one "@bot stop" in a thread whose task ended hours ago re-admits it for a
 // whole idle TTL.
 func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-no-task-turn"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "n-1", Text: "first ask"}
@@ -1864,13 +2031,11 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		}
 		return false
 	})
-	after, err := r.g.reg.Get(ctx, conv)
-	if err != nil || after == nil {
-		t.Fatal(err)
-	}
-	if !after.LastActivity.After(stale) {
-		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
-	}
+	// The gateway writes the record after it posts the answer, so the
+	// reap's clock is polled for rather than read once (see waitForRecord).
+	after := waitForRecord(t, r, conv, "a verified turn to count for the reap", func(rec *SessionRecord) bool {
+		return rec.LastActivity.After(stale)
+	})
 	if !after.LastTaskActivity.Equal(stale) {
 		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
 	}
@@ -1884,6 +2049,7 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 // the task's clock like any executor terminal; only the supervisor's (the
 // reap's own) does not.
 func TestExecutorCanceledOnAStoppedTaskCountsAsActivity(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-exec-canceled"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "x-1", Text: "long one"}
@@ -1926,6 +2092,7 @@ func TestExecutorCanceledOnAStoppedTaskCountsAsActivity(t *testing.T) {
 // thread goes quiet the moment its lost answer is posted. Driven with a
 // "stop" after the heal, which starts nothing, so nothing else restamps.
 func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-heal-activity"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ha-1", Text: "summarize the fleet"}
@@ -2006,6 +2173,7 @@ func postedContaining(r *rig, needle string) func() bool {
 // pod would be retired by the first message); it marks the record and the
 // next plain message opens the pod with its text as the task.
 func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s1"
 	sessionRigTurn(r, conv, "s-100", "/session")
@@ -2042,6 +2210,7 @@ func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
 // TestSessionCommandWithTextRunsItAsTheFirstTurn: "/session <text>" marks the
 // route and spawns once, with <text> as the task.
 func TestSessionCommandWithTextRunsItAsTheFirstTurn(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s2"
 	sessionRigTurn(r, conv, "s-110", "/session list the pods in ns x")
@@ -2064,6 +2233,7 @@ func TestSessionCommandWithTextRunsItAsTheFirstTurn(t *testing.T) {
 // /session off deletes the incarnation, clears the route, and the next plain
 // message is a platform task.
 func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s3"
 	sessionRigTurn(r, conv, "s-120", "/session first task")
@@ -2104,6 +2274,7 @@ func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
 // TestSessionOffRefusesWhileASessionTaskRuns: the way back never kills a
 // running task silently; the user stops it first.
 func TestSessionOffRefusesWhileASessionTaskRuns(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s4"
 	sessionRigTurn(r, conv, "s-130", "/session long task")
@@ -2131,6 +2302,7 @@ func TestSessionOffRefusesWhileASessionTaskRuns(t *testing.T) {
 // platform task running, "/session off" is answered, not forwarded as a
 // stop and not steered into the task.
 func TestSessionOffOffTheRouteIsNotAStop(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s5"
 	sessionRigTurn(r, conv, "s-140", "check the fleet")
@@ -2160,6 +2332,7 @@ func TestSessionOffOffTheRouteIsNotAStop(t *testing.T) {
 // TestSessionCommandWithoutSpawnerIsNotAnAffordance: with the spawner dark,
 // /session answers that sessions are off and routes nothing.
 func TestSessionCommandWithoutSpawnerIsNotAnAffordance(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-s6"
 	sessionRigTurn(r, conv, "s-150", "/session")
@@ -2209,6 +2382,7 @@ func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
 // TestSessionCommandIgnoredOnAnExplicitCancel: a programmatic cancel is a
 // cancel whatever its text says.
 func TestSessionCommandIgnoredOnAnExplicitCancel(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s9"
 	sessionRigTurn(r, conv, "s-180", "check the fleet")
@@ -2236,6 +2410,7 @@ func TestSessionCommandIgnoredOnAnExplicitCancel(t *testing.T) {
 // opens a pod - that message steers the running task. The reply says the
 // task finishes first, and the message after it is the one that spawns.
 func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s10"
 	sessionRigTurn(r, conv, "s-190", "check the fleet")
@@ -2264,6 +2439,7 @@ func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
 // TestSessionCommandWithTextWhileATaskRunsHoldsTheText: the route turns on,
 // the text is not sent, and the reply says so.
 func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s11"
 	sessionRigTurn(r, conv, "s-200", "check the fleet")
@@ -2339,6 +2515,7 @@ func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
 // TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
 // /session with the text "status", a first turn, not a status ask.
 func TestSessionStatusIsAFirstTurn(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s15"
 	sessionRigTurn(r, conv, "s-240", "/session status")
@@ -2358,6 +2535,7 @@ func TestSessionStatusIsAFirstTurn(t *testing.T) {
 // or every message in that conversation publishes to an addressee nothing
 // serves until the operator re-arms.
 func TestSessionOffWorksWithoutASpawner(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-s16"
 	rec := &SessionRecord{Key: conv, ContextID: "ctx-s16", Kind: "group", SessionRouted: true, Profile: "chat",
@@ -2402,6 +2580,7 @@ func TestHasSessionDoesNotCountATaskLessRoutedRecord(t *testing.T) {
 // is a session already, "/session <text>" is <text>, an ordinary turn - not a
 // confirmation that silently drops the ask.
 func TestSessionWithTextOnSessionDefaultRunsTheText(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	conv := "discord:g1/thread-s17"
 	sessionRigTurn(r, conv, "s-260", "/session list the pods in ns x")
@@ -2425,6 +2604,7 @@ func TestSessionWithTextOnSessionDefaultRunsTheText(t *testing.T) {
 // protects a running SESSION task's pod; a platform task has no pod to lose,
 // so the way back goes through and leaves that task running.
 func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s18"
 	sessionRigTurn(r, conv, "s-270", "check the fleet")
@@ -2456,6 +2636,7 @@ func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
 // "/session stop" must be the stop it unwraps to - a cancel on the running
 // task, never a steer whose text reads "stop" and never a new task.
 func TestPostFlipSessionStopIsAStop(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	conv := "discord:g1/thread-s19"
 	sessionRigTurn(r, conv, "s-280", "check the fleet")
@@ -2489,6 +2670,7 @@ func TestPostFlipSessionStopIsAStop(t *testing.T) {
 // own task running, "/session <text>" is what a plain message would be - a
 // steer into that task - not an ack that drops the text.
 func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-s20"
 	sessionRigTurn(r, conv, "s-290", "/session long task")
@@ -2519,26 +2701,76 @@ func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
 // unmentioned thread reply only once a task has started there, so the ack
 // after a bare /session in a Slack channel must not promise that the next
 // message opens the pod - it asks for the mention. DMs and every other
-// backend keep the plain promise. A Slack DM is told to reply in the thread:
-// each top-level DM is a conversation of its own, so the binding holds only
-// there.
+// backend keep the plain promise. A threaded Slack DM is told to reply in the
+// thread: each top-level DM is a conversation of its own, so the binding
+// holds only there.
 func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
-	slackChannel := sessionOnAck("slack", "group", "platform")
+	slackChannel := sessionOnAck("slack", "group", true, "platform")
 	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
 		t.Fatalf("slack channel ack = %q", slackChannel)
 	}
-	slackDM := sessionOnAck("slack", "dm", "platform")
+	slackDM := sessionOnAck("slack", "dm", true, "platform")
 	if !strings.Contains(slackDM, "reply in this thread") || strings.Contains(slackDM, "mention") || strings.Contains(slackDM, "your next message opens") {
 		t.Fatalf("slack dm ack = %q", slackDM)
 	}
 	for _, c := range [][2]string{{"discord", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
-		ack := sessionOnAck(c[0], c[1], "platform")
+		ack := sessionOnAck(c[0], c[1], false, "platform")
 		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
 			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)
 		}
 	}
-	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
+	if !strings.Contains(sessionOnAck("discord", "group", false, "platform"), "`platform`") {
 		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
+// TestSessionOnAckTellsThreadedDMsToReplyInThread: a Google Chat DM roots
+// each top-level message in a conversation of its own, as a Slack DM does,
+// so a DM record keyed by its thread gets Slack's DM wording. A DM record
+// with no thread (a thread-less Google Chat key, a legacy Slack key) shares
+// its key with every later message, and a Discord DM has no threads: both
+// keep the generic wording.
+func TestSessionOnAckTellsThreadedDMsToReplyInThread(t *testing.T) {
+	ack := func(backend, key string) string {
+		return sessionOnAck(backend, sessionKindDM, conversationIsOwnThread(backend, key), "bridge")
+	}
+	want := ack(slackBackend, "slack:dm/D1/200.1")
+	if !strings.Contains(want, "reply in this thread") {
+		t.Fatalf("threaded Slack DM ack = %q, want the thread wording", want)
+	}
+	if got := ack(gchatBackend, "gchat:dm/spaces/D1/threads/T1"); got != want {
+		t.Fatalf("threaded gchat DM ack = %q, want Slack's DM wording %q", got, want)
+	}
+	generic := sessionOnAck(discordBackend, sessionKindGroup, false, "bridge")
+	for _, c := range [][2]string{{gchatBackend, "gchat:dm/spaces/D1"}, {slackBackend, "slack:dm/D1"}, {discordBackend, "discord:dm/1001"}} {
+		if got := ack(c[0], c[1]); got != generic {
+			t.Errorf("%s DM ack = %q, want the generic wording %q", c[1], got, generic)
+		}
+	}
+}
+
+// TestConversationIsOwnThreadReadsTheKeyShape: only a key that names a
+// thread is its own thread; a whole-space key, a thread-less DM key, a key
+// that does not parse and a backend without threads are not.
+func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
+	for _, c := range []struct {
+		backend, key string
+		want         bool
+	}{
+		{gchatBackend, "gchat:dm/spaces/D1/threads/T1", true},
+		{gchatBackend, "gchat:spaces/S1/threads/T1", true},
+		{gchatBackend, "gchat:dm/spaces/D1", false},
+		{gchatBackend, "gchat:space/spaces/S1", false},
+		{gchatBackend, "not-a-key", false},
+		{slackBackend, "slack:dm/D1/200.1", true},
+		{slackBackend, "slack:C1/200.1", true},
+		{slackBackend, "slack:dm/D1", false},
+		{slackBackend, "not-a-key", false},
+		{discordBackend, "discord:g1/thread-s1", false},
+	} {
+		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
+			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)
+		}
 	}
 }
 
@@ -2628,7 +2860,7 @@ func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate
 // bucket, or a gateway whose $KV.cap.root.* grant is missing, looks from here.
 func deleteCapBucket(t *testing.T, url string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -2655,6 +2887,7 @@ func deleteCapBucket(t *testing.T, url string) {
 // later, with the reason surfacing in a different component's log than the
 // one the operator is reading.
 func TestAMintFailureRefusesTheTurn(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	deleteCapBucket(t, r.url)
 	conv := "discord:g1/thread-mint-refuses"
@@ -2681,6 +2914,7 @@ func TestAMintFailureRefusesTheTurn(t *testing.T) {
 // accident (the return dropped, the condition inverted) would otherwise look
 // exactly like correct behaviour.
 func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.CapabilityOptional = true })
 	deleteCapBucket(t, r.url)
 	conv := "discord:g1/thread-mint-relaxed"
@@ -2709,6 +2943,7 @@ func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
 // turn asks the gateway to mint a child task) and the pseudonymized
 // attribution, never the plaintext principal.
 func TestStartTaskRecordsTheRequester(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-req"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "how is the fleet?"}
@@ -2765,6 +3000,7 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 // requester it is handed verbatim (already hashed), and writes the chain
 // fields onto the history entry.
 func TestStartTaskWithCarriesTheChain(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	if r.g.cfg.DelegationDepthMax != 3 {
 		t.Fatalf("New left DelegationDepthMax = %d on a hand-built Config, want 3", r.g.cfg.DelegationDepthMax)
@@ -2809,6 +3045,7 @@ func TestStartTaskWithCarriesTheChain(t *testing.T) {
 // backend plus the normalized id hashed under the install salt; the email
 // appears nowhere in the record, in any case.
 func TestStartTaskHashesAGchatRequester(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"alice@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-req"
 	r.adapter.inbox <- InboundMessage{
@@ -2861,6 +3098,7 @@ func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
 // TTL (>=), for the history entry's requester exactly as for the active
 // task's ask, and a nanosecond younger is not, for either.
 func TestAskTTLBoundaryClearsBothCopies(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
 	conv := "discord:g1/thread-ttl-edge"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
@@ -2911,6 +3149,7 @@ func TestTaskRefOmitsAZeroStartedAt(t *testing.T) {
 // requester and attribution the way ActiveTask drops its Ask; the entry itself
 // stays, as do entries written before the fields existed.
 func TestAskTTLClearsTheRequesterToo(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
 	conv := "discord:g1/thread-ttl"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
@@ -2940,6 +3179,7 @@ func TestAskTTLClearsTheRequesterToo(t *testing.T) {
 // session-state KV as the requester does, the normalized email hashed, the
 // email nowhere in the record.
 func TestAGchatSteerAuthorIsStoredHashed(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"alice@example.com", "bob@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-steer"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "alice@example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?"}
@@ -2968,6 +3208,7 @@ func TestAGchatSteerAuthorIsStoredHashed(t *testing.T) {
 // requester, the overflow mark with them; an entry holding only steer
 // authors (its requester already cleared) is found and cleared too.
 func TestAskTTLClearsTheSteerAuthors(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
 	conv := "discord:g1/thread-ttl-steer"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
@@ -2997,6 +3238,7 @@ func TestAskTTLClearsTheSteerAuthors(t *testing.T) {
 // it is marked incomplete, so the incarnation's delegations fail closed as a
 // cleared requester's do.
 func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
 	conv := "discord:g1/thread-ttl-incarnation"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
@@ -3076,6 +3318,7 @@ func lastInSubject(t *testing.T, r *rig, origin *lib.Envelope) *lib.Envelope {
 }
 
 func TestRelayPostsEachTurnAnswerThenTheDeliverable(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-turns"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tu-1", Text: "check the fleet"}
@@ -3101,6 +3344,7 @@ func TestRelayPostsEachTurnAnswerThenTheDeliverable(t *testing.T) {
 }
 
 func TestRelayRendersARefusedFollowUp(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-refused"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rf-1", Text: "check the fleet"}
@@ -3117,6 +3361,7 @@ func TestRelayRendersARefusedFollowUp(t *testing.T) {
 // says none was given; quoting the empty token would post "the executor said
 // ." to the room.
 func TestRelayWordsARefusalWithNoReason(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-refused-bare"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rb-1", Text: "check the fleet"}
@@ -3148,6 +3393,7 @@ func TestRelayWordsARefusalWithNoReason(t *testing.T) {
 // shown it answers follow-ups: on an earlier follow-up of the same task, or
 // on an earlier task to the same addressee since the gateway started.
 func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
+	t.Parallel()
 	t.Run("a notice earlier in the task", func(t *testing.T) {
 		r := startRig(t)
 		conv := "discord:g1/thread-missed"
@@ -3232,6 +3478,7 @@ func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
 // follow-up was missed and posts no missed line: the ack and the old
 // "steering received" text are all the room sees.
 func TestRelayPostsNoMissedLineForAnExecutorThatSendsNoNotices(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-oldbridge"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ob-1", Text: "check the fleet"}
@@ -3268,6 +3515,7 @@ func terminalEdited(r *rig, state lib.TaskState) func() bool {
 // "did not run" line: the cancel landed between the turn answer and the
 // spawn.
 func TestRelayCountsAFollowUpStoppedBeforeItsTurnRan(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-gap"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "gp-1", Text: "check the fleet"}
@@ -3289,6 +3537,7 @@ func TestRelayCountsAFollowUpStoppedBeforeItsTurnRan(t *testing.T) {
 // Two queued follow-ups that both ran: two turn answers post in order, then
 // the deliverable, and no shortfall line.
 func TestRelayPostsTwoTurnAnswersInOrder(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-two-turns"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tt-1", Text: "check the fleet"}
@@ -3319,6 +3568,7 @@ func TestRelayPostsTwoTurnAnswersInOrder(t *testing.T) {
 // A turn answer whose last chunk never came is posted, whole, when the next
 // turn's first (non-append) chunk arrives, ahead of that turn.
 func TestRelayFlushesAChunkedTurnAtTheNextNonAppendChunk(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-chunked"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ch-1", Text: "check the fleet"}
@@ -3344,6 +3594,7 @@ func TestRelayFlushesAChunkedTurnAtTheNextNonAppendChunk(t *testing.T) {
 // once, one line per follow-up, while the task still runs: not the ack and
 // then silence until the terminal. Nothing more is said at the terminal.
 func TestRelayPostsANoResumeRefusalAtOnce(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-noresume"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "nr-1", Text: "check the fleet"}
@@ -3385,6 +3636,7 @@ func TestRelayPostsANoResumeRefusalAtOnce(t *testing.T) {
 // later (its executor now continues sessions) puts it back on the exact
 // phrases, so the same ask steers again.
 func TestNoResumeAddresseeGetsTheWideStatusMatcher(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-noresume-status"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ns-1", Text: "check the fleet"}
@@ -3425,6 +3677,7 @@ func TestNoResumeAddresseeGetsTheWideStatusMatcher(t *testing.T) {
 // lost to a crash with only a failed terminal) are one line at the
 // terminal, not one per follow-up.
 func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		refuseAtEnd bool
@@ -3463,5 +3716,103 @@ func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
 				t.Fatal("a task-ended refusal posted its own line")
 			}
 		})
+	}
+}
+
+// TestStopAfterTheTurnEndedSaysACardKeepsWorking pins gke-labs#3263's reply.
+// The front door's turn ends seconds after it files a kanban card, so by the
+// time a user says "stop" the conversation holds no active task while the
+// card is still working and will post here. The gateway cannot see or cancel
+// the card, and its reply must say so rather than a bare "nothing is running".
+// The rig models the turn, not the card: what the gateway keys on is that the
+// conversation ran a task and holds none now. A conversation that never ran
+// one gets the plain reply (TestStopWithNothingToStopStartsNoTask).
+func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	conv := "discord:g1/thread-card-stop"
+	ctx := context.Background()
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "check the pods on x"}
+	origin := r.awaitTask(t, "platform")
+	completeTask(t, r.execFor(t, origin, "platform"), "checking the pods on x")
+	waitFor(t, "the turn's terminal to release the conversation", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "stop"}
+	waitFor(t, "the stop to be answered with the card notice", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == nothingRunningCardNotice {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is the
+// gateway's second slash command (docs/designs/chat-feedback-command.md). It
+// posts the two reporting links and submits nothing to the bus.
+func TestBareFeedbackAnswersWithTheLinksAndStartsNoTask(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	conv := "discord:g1/thread-fb1"
+	sessionRigTurn(r, conv, "fb-100", "/feedback")
+	waitFor(t, "notice", postedContaining(r, chattext.FeedbackFormURL))
+	if !postedContaining(r, chattext.FeedbackTrackerURL)() {
+		t.Fatal("the notice must carry the tracker link too")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("a bare /feedback submitted %d envelope(s); it must submit none", n)
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
+		t.Fatalf("a bare /feedback left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept: "/feedback <text>" is
+// the agent's to answer, so it becomes a task whose text is what the person
+// typed, prefix included, and no links notice is posted.
+func TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	conv := "discord:g1/thread-fb2"
+	sessionRigTurn(r, conv, "fb-110", "/feedback the status line stuck on working")
+	origin := r.awaitTask(t, "platform")
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "/feedback the status line stuck on working" {
+		t.Fatalf("task text = %q, want the text as typed, prefix included", got)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback with text")
+	}
+}
+
+// TestFeedbackWithTextWhileATaskRunsIsASteer: with a task running, a
+// "/feedback <text>" is a follow-up like any other message, not swallowed by
+// the command branch.
+func TestFeedbackWithTextWhileATaskRunsIsASteer(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	conv := "discord:g1/thread-fb3"
+	sessionRigTurn(r, conv, "fb-120", "start")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "fb-121", "/feedback the answer was wrong")
+	waitFor(t, "steer ack", postedContaining(r, ackSteerQueued))
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	if steer := envs[len(envs)-1]; steer.TaskID != origin.TaskID {
+		t.Fatalf("the /feedback follow-up minted a new task: %s vs %s", steer.TaskID, origin.TaskID)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback follow-up")
 	}
 }

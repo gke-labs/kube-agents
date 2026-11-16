@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Should I merge PR #412, which raises the memory limit of checkout-gateway in seeded-reliability to 512Mi, or close it and open one that rolls back…*\n\n<https://github.com/acme/gitops/pull/412|PR #412>\n…the image instead?",
+    "widgets": null
+  }
+]

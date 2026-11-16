@@ -33,11 +33,14 @@ argv. `api` is the one network seam; the tests replace it.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import http.client
 import json
 import os
+import pathlib
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -48,6 +51,12 @@ import ci_reset_audit_ledgers as ledgers
 
 DEFAULT_HOST = "gitlab.com"
 USER_AGENT = "kube-agents-ci-eval-gitlab"
+# A self-managed instance (kube-agents#3682) presents a certificate from a
+# private CA; its PEM file comes in this variable (the eval script exports it
+# from the run's forge state directory) or through configure_ca, and every
+# call here then verifies against it. Unset, the system trust store applies,
+# which is what gitlab.com needs.
+CA_FILE_ENV = "GITLAB_CA_FILE"
 REQUEST_TIMEOUT_SECONDS = 30
 PER_PAGE = 100
 MAX_PAGES = 20
@@ -98,13 +107,22 @@ PROBE_REPLY_EXCERPT_CHARS = 120
 PROBE_RESET_SCOPE = "by the ledger-path probe, which opened it a moment earlier"
 TOKEN_SELF_PATH = "/personal_access_tokens/self"
 
-# A transient answer -- a 5xx, GitLab's 429, a connection that dropped or
-# timed out -- is tried again, twice, 2 s then 8 s apart, as the GitHub pulls
-# reset does: these fail closed, so one such answer would otherwise grade a
-# repetition MISSING on a hiccup. A 429 waits what Retry-After asks, capped.
-# Any other 4xx is the request's fault and is not retried.
+# A transient answer -- a 5xx, a connection that dropped or timed out -- is
+# tried again, twice, 2 s then 8 s apart, as the GitHub pulls reset does:
+# these fail closed, so one such answer would otherwise grade a repetition
+# MISSING on a hiccup. Any other 4xx is the request's fault and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
+# gitlab.com holds a Free-plan user to 100 requests a minute (ratelimit-name
+# burst_traffic_per_user_free_plan; 5,000 an hour sustained), and the bot is
+# one user, so the sweep, the eval lane's resets and the agent all draw on it
+# (kube-agents#5215). Every call here starts this long after the previous one
+# (about 85 a minute, the rest left to the others), and a 429 that lands anyway
+# is waited out (Retry-After, 60 s when unnamed, capped) this many times before
+# it is RateLimited: a burst clears within a minute, and one that does not is
+# the hourly limit or a block, which no wait here would outlast.
+REQUEST_SPACING_SECONDS = 0.7
+RATE_LIMIT_WAITS = 3
 TOO_MANY_REQUESTS_CODE = 429
 RETRY_AFTER_HEADER = "Retry-After"
 RETRY_AFTER_DEFAULT_SECONDS = 60
@@ -114,17 +132,67 @@ ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class RateLimited(Exception):
-    """GitLab refused the token under its limit twice over, or once with no
-    attempt left to wait for. The caller ends its run rather than visiting
-    every project through the cooldown, as the GitHub sweep does; a write
-    loop lets this through where it swallows an ordinary fault."""
+    """GitLab refused the token under its limit RATE_LIMIT_WAITS times over on
+    one request, each refusal waited out. The caller ends its run rather than
+    visiting every project through the cooldown, as the GitHub sweep does; a
+    write loop lets this through where it swallows an ordinary fault."""
 
     def __init__(self, exc: urllib.error.HTTPError):
-        super().__init__(f"GitLab answered HTTP 429 on {exc.url} with no retry left to wait; the token is rate-limited")
+        super().__init__(f"GitLab answered HTTP 429 on {exc.url} {RATE_LIMIT_WAITS + 1} times over; the token is rate-limited")
         self.cause = exc
 
+
+class Pacer:
+    """Holds each call until `spacing` seconds after the previous one started
+    (REQUEST_SPACING_SECONDS, above). One per process, shared by every call,
+    since the limit is the user's and not any one listing's; the clock and the
+    sleep are seams the tests replace."""
+
+    def __init__(self, spacing: float, clock=time.monotonic, sleep=time.sleep):
+        self.spacing = spacing
+        self.clock = clock
+        self.sleep = sleep
+        self.last_started: float | None = None
+
+    def wait(self) -> None:
+        now = self.clock()
+        if self.last_started is not None and now - self.last_started < self.spacing:
+            self.sleep(self.spacing - (now - self.last_started))
+            now = self.clock()
+        self.last_started = now
+
+
 pause = time.sleep
+pacer = Pacer(REQUEST_SPACING_SECONDS)
 ResetError = ledgers.ResetError
+_ca_file: str | None = None
+
+
+def configure_ca(path: str | None) -> None:
+    """Trust `path` (a PEM CA) for every call from here on; None clears it."""
+    global _ca_file
+    _ca_file = path or None
+
+
+_contexts: dict[str, ssl.SSLContext] = {}
+
+
+def ssl_context() -> ssl.SSLContext | None:
+    """The context api() verifies with: the private CA when one is configured
+    (configure_ca, else CA_FILE_ENV), otherwise None for the system store. A
+    CA file that does not load is a ResetError naming it, not a traceback at
+    the first call. Built once per path; every page of every listing reuses it."""
+    path = _ca_file or os.environ.get(CA_FILE_ENV) or None
+    if not path:
+        return None
+    if path not in _contexts:
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=path)
+        except (OSError, ssl.SSLError) as exc:
+            raise ResetError(f"the forge CA file {path} did not load: {exc}") from exc
+        _contexts[path] = context
+    return _contexts[path]
 
 
 def api_root(host: str = DEFAULT_HOST) -> str:
@@ -160,7 +228,7 @@ def api(method: str, path: str, token: str, body: dict | None = None, host: str 
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(api_root(host) + path, method=method, headers=headers, data=data)
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS, context=ssl_context()) as response:
         raw = response.read()
     if not raw:
         return None
@@ -176,37 +244,39 @@ def _transient(exc: BaseException) -> bool:
     return isinstance(exc, (OSError, http.client.HTTPException))
 
 
-def _retry_after(exc: urllib.error.HTTPError, default: float) -> float:
+def _retry_after(exc: urllib.error.HTTPError) -> float:
+    """What a 429 asks to wait, 1 s to RETRY_AFTER_MAX_SECONDS."""
     try:
         asked = int((exc.headers or {}).get(RETRY_AFTER_HEADER, "") or RETRY_AFTER_DEFAULT_SECONDS)
     except (TypeError, ValueError):
         asked = RETRY_AFTER_DEFAULT_SECONDS
-    return float(min(max(asked, 1), RETRY_AFTER_MAX_SECONDS)) if exc.code == TOO_MANY_REQUESTS_CODE else default
+    return float(min(max(asked, 1), RETRY_AFTER_MAX_SECONDS))
 
 
 def call(method: str, path: str, token: str, body: dict | None = None, host: str = DEFAULT_HOST):
-    """One GitLab call, tried again after a transient answer: a 5xx or a
-    dropped connection twice, a 429 once after its Retry-After and then
-    RateLimited. `api` stays the raw seam the tests replace; this is what
-    every read and write below uses."""
-    limited_once = False
-    for delay in (*RETRY_DELAYS_SECONDS, None):
+    """One GitLab call, paced, and tried again after a transient answer: a
+    5xx or a dropped connection twice, a 429 after each Retry-After up to
+    RATE_LIMIT_WAITS times and then RateLimited. The two counts are separate,
+    so a 429 costs none of the 5xx attempts. `api` stays the raw seam the
+    tests replace; this is what every read and write below uses."""
+    delays = iter((*RETRY_DELAYS_SECONDS, None))
+    limited_waits = 0
+    while True:
+        pacer.wait()
         try:
             return api(method, path, token, body, host)
         except CALL_FAULTS as exc:
-            # The 429 case is classified before the last-attempt test, so a
-            # second 429 is RateLimited whatever came between the two.
-            limited = isinstance(exc, urllib.error.HTTPError) and exc.code == TOO_MANY_REQUESTS_CODE
-            if limited and (limited_once or delay is None):
-                raise RateLimited(exc) from exc
-            if delay is None or not _transient(exc):
-                raise
-            if limited:
-                limited_once = True
-                delay = _retry_after(exc, delay)
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == TOO_MANY_REQUESTS_CODE:
+                if limited_waits >= RATE_LIMIT_WAITS:
+                    raise RateLimited(exc) from exc
+                limited_waits += 1
+                delay = _retry_after(exc)
+            else:
+                delay = next(delays)
+                if delay is None or not _transient(exc):
+                    raise
             print(f"  {method} {path} answered {exc}; trying again in {delay:g}s", file=sys.stderr)
             pause(delay)
-    raise AssertionError("unreachable")
 
 
 def _pages(path: str, query: dict, token: str, host: str, what: str) -> list[dict]:
@@ -470,10 +540,13 @@ def probe_ledger_main(argv: list[str] | None = None) -> int:
 def empty_record() -> dict:
     """The keys reset_merge_requests fills: hack/ci_reset_agent_pulls.py's
     record shape (new_record there), so the artifact reads the same on either
-    forge; scripts/test_ci_gitlab_forge.py pins the two equal."""
+    forge; scripts/test_ci_gitlab_forge.py pins the two equal. The stack_files
+    lists stay empty here: the GitLab path deletes no file a stack planted, and
+    the one stack that plants one writes to GitHub only."""
     return {
         "open_before": 0, "kept_open": [], "labelled": [], "closed": [], "unclosed": [],
         "branches_before": 0, "deleted": [], "undeleted": [], "kept_branches": [],
+        "stack_files_deleted": [], "stack_files_undeleted": [], "stack_files_kept": [],
         "open_after": None, "branches_after": None, "clean": False,
     }
 
@@ -485,6 +558,67 @@ def project_view(path: str, token: str, host: str = DEFAULT_HOST) -> tuple[int, 
     if not isinstance(payload, dict) or not payload.get("id") or not payload.get("default_branch"):
         raise ResetError(f"GitLab answered the project lookup for {path} without an id and a default branch")
     return int(payload["id"]), str(payload["default_branch"])
+
+
+FILE_PRESENT = "present"
+FILE_ABSENT = "absent"
+
+
+def repository_file(path: str, file_path: str, token: str, host: str = DEFAULT_HOST, ref: str | None = None) -> tuple[str, str]:
+    """(FILE_PRESENT, the file's text) or (FILE_ABSENT, "") at `ref`, the default branch when None.
+
+    Decoded as the audit's index reads a file (`errors="replace"`), so a stray
+    byte is the index's verdict, not a failure here. Every other answer raises.
+    """
+    branch = ref or project_view(path, token, host=host)[1]
+    try:
+        payload = call("GET", f"/projects/{encoded(path)}/repository/files/{encoded(file_path)}?ref={urllib.parse.quote(branch, safe='')}", token, host=host)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return FILE_ABSENT, ""
+        raise
+    if not isinstance(payload, dict) or payload.get("encoding") != "base64":
+        raise ResetError(f"GitLab answered the read of {file_path} in {path} without base64 content")
+    return FILE_PRESENT, base64.b64decode(payload.get("content") or "").decode("utf-8", errors="replace")
+
+
+def repository_blobs(path: str, prefix: str, token: str, host: str = DEFAULT_HOST, ref: str | None = None) -> list[str]:
+    """Every blob path under `prefix` at `ref` (the default branch when None), the recursive tree listing."""
+    branch = ref or project_view(path, token, host=host)[1]
+    entries = _pages(
+        f"/projects/{encoded(path)}/repository/tree",
+        {"path": prefix, "recursive": "true", "ref": branch},
+        token,
+        host,
+        f"the tree of {path} under {prefix}",
+    )
+    if len(entries) >= MAX_PAGES * PER_PAGE:
+        # `_pages` stops at MAX_PAGES full pages and says nothing; a reader
+        # judging a one-file rule from a cut listing would pass on what it
+        # did not see, so the cut is an error here, not a shorter answer.
+        raise ResetError(f"the tree of {path} under {prefix} has more than {MAX_PAGES * PER_PAGE} entries; the listing is cut and cannot be judged")
+    return sorted(str(e.get("path")) for e in entries if isinstance(e, dict) and e.get("type") == "blob")
+
+
+def seed_repository_file(path: str, file_path: str, message: str, content: str, token: str, host: str = DEFAULT_HOST) -> str:
+    """Write `file_path` on the default branch when it is absent; FILE_PRESENT when it is there already.
+
+    The create is a POST on the files API, which GitLab refuses with 400 when
+    the file exists, so a race with another seeder ends in that refusal and
+    not in a second commit over the first. Returns "created" after the write.
+    """
+    _, branch = project_view(path, token, host=host)
+    state, _ = repository_file(path, file_path, token, host=host, ref=branch)
+    if state == FILE_PRESENT:
+        return FILE_PRESENT
+    _write(
+        "POST",
+        f"/projects/{encoded(path)}/repository/files/{encoded(file_path)}",
+        token,
+        {"branch": branch, "content": content, "commit_message": message},
+        host,
+    )
+    return "created"
 
 
 def open_merge_requests(path: str, token: str, host: str = DEFAULT_HOST) -> list[dict]:
@@ -618,12 +752,20 @@ def reset_merge_requests(path: str, project: str, build: str, scope: str, token:
     if dry_run:
         print(f"would close {len(agent)} merge request(s) and delete {len(leftover) - len(record['kept_branches'])} branch(es) in {path} {scope}")
         return record
-    after = open_merge_requests(path, token, host)
-    still_agent = [mr["iid"] for mr in after if is_agent_merge_request(mr, project_id, bot_login)]
-    heads_after: set[str] = set()
-    for mr in after:
-        heads_after |= _branches_in_use(mr, project_id)
-    still_branches = [n for n in branch_names(path, token, host) if n != default and n not in heads_after and branch_exists(path, n, token, host)]
+    if record["closed"] or record["unclosed"] or record["deleted"] or record["undeleted"]:
+        # Read back only after a write was attempted. A project with nothing
+        # to close and no branch to delete is as the two listings found it,
+        # and reading it again would spend the same calls for the same answer:
+        # across a wide sweep those repeats are what tripped gitlab.com's
+        # burst limit (kube-agents#5215).
+        after = open_merge_requests(path, token, host)
+        still_agent = [mr["iid"] for mr in after if is_agent_merge_request(mr, project_id, bot_login)]
+        heads_after: set[str] = set()
+        for mr in after:
+            heads_after |= _branches_in_use(mr, project_id)
+        still_branches = [n for n in branch_names(path, token, host) if n != default and n not in heads_after and branch_exists(path, n, token, host)]
+    else:
+        still_agent, still_branches = [], []
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
     record["clean"] = not still_agent and not still_branches
@@ -704,10 +846,69 @@ def whoami_main(argv: list[str] | None = None) -> int:
         return 1
 
 
+SEED_TOKEN_ENV = "GITLAB_SEED_TOKEN"
+
+
+def seed_file_main(argv: list[str] | None = None) -> int:
+    """`python3 ci_gitlab_forge.py seed-file --project-id ID --path F --message M --content-file C [--host HOST]`:
+    write one file to a pool project's GitLab project, `gke-agentic/<ID>-infra`,
+    when it is absent (docs/ci-pool-projects.md 5.6; the fixture the
+    remediation cases read). The path is derived, never typed, and
+    `expected_project` holds it to the pool's layout as every other write
+    here is held. The token arrives in GITLAB_SEED_TOKEN, never on argv, and
+    has to push to the default branch: the group Owner's, not the bot's.
+    `--content-file -` reads stdin."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="ci_gitlab_forge.py seed-file")
+    parser.add_argument("--project-id", required=True, help="the pool project, e.g. kube-agents-evals-7; its GitLab project is gke-agentic/<id>-infra")
+    parser.add_argument("--path", required=True, help="the file's path in the repository")
+    parser.add_argument("--message", required=True, help="the commit message")
+    parser.add_argument("--content-file", required=True, help="the file's content, or - for stdin")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    args = parser.parse_args(argv)
+    token = os.environ.get(SEED_TOKEN_ENV, "").strip()
+    if not token:
+        print("seed-file: no token in %s" % SEED_TOKEN_ENV, file=sys.stderr)
+        return 2
+    if any(ch.isspace() or not ch.isprintable() for ch in token):
+        # http.client would refuse the header with the value in its error
+        # text; refused here instead, and never printed. A header file with
+        # a second line, cut as the recipe cuts it, reads like this.
+        print("seed-file: %s is not one token on one line; export the bare token" % SEED_TOKEN_ENV, file=sys.stderr)
+        return 2
+    project = f"{GROUP}/{args.project_id}{PROJECT_SUFFIX}"
+    try:
+        expected_project(project, args.project_id)
+    except ResetError as exc:
+        print("seed-file: %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        content = sys.stdin.read() if args.content_file == "-" else pathlib.Path(args.content_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print("seed-file: cannot read --content-file %s: %s" % (args.content_file, exc), file=sys.stderr)
+        return 2
+    if not content.strip():
+        print("seed-file: the content is empty; refusing to write an empty %s" % args.path, file=sys.stderr)
+        return 2
+    try:
+        outcome = seed_repository_file(project, args.path, args.message, content, token, host=args.host)
+    except urllib.error.HTTPError as exc:
+        print("seed-file: %s %s at %s: HTTP %d" % (project, args.path, args.host, exc.code), file=sys.stderr)
+        return 1
+    except (RateLimited, ResetError, OSError, http.client.HTTPException, ValueError) as exc:
+        print("seed-file: %s %s at %s: %s" % (project, args.path, args.host, exc), file=sys.stderr)
+        return 1
+    print("%s %s: %s" % (project, args.path, outcome))
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["seed-file"]:
+        sys.exit(seed_file_main(sys.argv[2:]))
     if sys.argv[1:2] == ["whoami"]:
         sys.exit(whoami_main(sys.argv[2:]))
     if sys.argv[1:2] == ["probe-ledger"]:
         sys.exit(probe_ledger_main(sys.argv[2:]))
-    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST]  (tokens in %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV), file=sys.stderr)
+    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST] | seed-file --project-id ID --path F --message M --content-file C [--host HOST]  (tokens in %s, %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV, SEED_TOKEN_ENV), file=sys.stderr)
     sys.exit(2)

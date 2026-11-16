@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,10 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -56,10 +60,11 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 				Location:    "us-central1",
 				ClusterName: "cluster",
 			},
-			// Both chat relays are enabled because they are hosted in the
-			// broker's process, so their URLs have to address its Service. With
-			// them off, an assertion about those two variables would be an
-			// assertion about nothing.
+			// Both chat platforms are enabled: the A2A gateway consumes them,
+			// so the agent container must carry neither relay URL; the Teams
+			// relay, which Hermes still polls, is added by
+			// brokerPodAgentWithTeams where a test needs a relay that does
+			// address the broker Service.
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled:          ptr.To(true),
@@ -71,6 +76,18 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 			},
 		},
 	}
+}
+
+// brokerPodAgentWithTeams is brokerPodAgent with Teams enabled too: the one
+// chat platform Hermes still serves, whose relay URL addresses the broker.
+func brokerPodAgentWithTeams() *agentv1alpha1.PlatformAgent {
+	agent := brokerPodAgent()
+	agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{
+		Enabled:              ptr.To(true),
+		AppIdSecretRef:       &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "id"},
+		AppPasswordSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "password"},
+	}
+	return agent
 }
 
 func brokerContainerNamed(containers []corev1.Container, name string) *corev1.Container {
@@ -127,24 +144,36 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	// CREDENTIAL_PROXY_URL is emitted empty: the agent runs no wrapped CLI, so an
 	// address for the broker in its environment is an invitation and not a
 	// dependency. Emitted rather than omitted so an AgentPlugin cannot be the
-	// only writer of the name — see buildPodTemplateSpec. The two relay URLs are
-	// different; they are polled by the chat clients the agent container does run.
+	// only writer of the name — see buildPodTemplateSpec. TEAMS_RELAY_URL is
+	// different; the Hermes Teams platform, which the agent container runs, polls it.
 	if value, found := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_URL"); !found || value != "" {
 		t.Errorf("the agent container must not be told where the broker is, got %q (present=%v)", value, found)
 	}
+	// With Chat and Slack both on, the A2A gateway consumes both, so neither
+	// relay URL is rendered on the agent container; Teams, which only Hermes
+	// serves, is the relay that still addresses the broker Service.
+	for _, name := range []string{"SLACK_RELAY_URL", "GOOGLE_CHAT_RELAY_URL"} {
+		if value, found := brokerEnvValue(agentContainer.Env, name); found {
+			t.Errorf("%s = %q on the agent container; the gateway consumes Chat and Slack", name, value)
+		}
+	}
 	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
-	for _, name := range []string{"GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
-		value, found := brokerEnvValue(agentContainer.Env, name)
-		if !found {
-			t.Errorf("expected %s to be set so the assertion below means something", name)
-			continue
-		}
-		if value != wantURL {
-			t.Errorf("expected %s to address the broker Service, got %q", name, value)
-		}
+	teamsPod := buildPodTemplateSpec(brokerPodAgentWithTeams(), "c", "f", "s", "p", nil, renderOptions{})
+	if value, found := brokerEnvValue(brokerContainerNamed(teamsPod.Spec.Containers, "platform-agent").Env, "TEAMS_RELAY_URL"); !found {
+		t.Error("expected TEAMS_RELAY_URL to be set so the assertion below means something")
+	} else if value != wantURL {
+		t.Errorf("expected TEAMS_RELAY_URL to address the broker Service, got %q", value)
 	}
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
+	}
+	// The kube-api proxy URL, under the name gke_endpoint reads here and the same
+	// value the shell sandbox gets as KUBE_PROXY_URL; not KUBE_PROXY_URL itself.
+	if value, _ := brokerEnvValue(agentContainer.Env, kubeProxyInUseURLEnv); value != kubeProxyURL(agent) {
+		t.Errorf("expected %s = %q, got %q", kubeProxyInUseURLEnv, kubeProxyURL(agent), value)
+	}
+	if _, found := brokerEnvValue(agentContainer.Env, "KUBE_PROXY_URL"); found {
+		t.Errorf("the agent container must not carry KUBE_PROXY_URL")
 	}
 	// The remote MCP servers reach Google through the broker, on every install
 	// and in both modes: the address is set unconditionally, unlike the relay
@@ -232,14 +261,15 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 	}
 	broker := deployment.Spec.Template.Spec.Containers[0]
 
-	// Both callers are named: the gateway's chat clients present the agent's
-	// ServiceAccount token, the sandbox's wrapped CLIs present the sandbox's.
+	// Every caller is named: the gateway's chat clients present the agent's
+	// ServiceAccount token, the sandbox's wrapped CLIs present the sandbox's,
+	// and the A2A gateway, which consumes Chat, presents its own.
 	want := map[string]string{
 		"CREDENTIAL_PROXY_ROLE":            "broker",
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell",
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway",
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 	}
 	for name, expected := range want {
@@ -283,8 +313,8 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 	if value, found := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_WORKSPACE_ROOT"); found {
 		t.Errorf("the broker has no shared workspace, so naming one points it at a path that is not there: %q", value)
 	}
-	if value, _ := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_CONTENT_WORKSPACE"); value != "1" {
-		t.Errorf("with no shared filesystem, content has to move over the workspace API; got %q", value)
+	if value, found := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_CONTENT_WORKSPACE"); found {
+		t.Errorf("the content workspace is retired, so the broker carries no switch for it: %q", value)
 	}
 }
 
@@ -353,17 +383,19 @@ func TestTheBrokerServiceAddressesTheBrokerPod(t *testing.T) {
 // time, which is why this checks the URL the agent is actually given rather
 // than a port somebody remembered to write down.
 func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
-	agent := brokerPodAgent()
+	// Teams is the one chat relay Hermes still polls: the A2A gateway holds
+	// Chat and Slack, so their relay URLs are not rendered.
+	agent := brokerPodAgentWithTeams()
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
 	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
 
-	relay, found := brokerEnvValue(agentContainer.Env, "SLACK_RELAY_URL")
+	relay, found := brokerEnvValue(agentContainer.Env, "TEAMS_RELAY_URL")
 	if !found || relay == "" {
-		t.Fatal("SLACK_RELAY_URL is unset, so this test asserts nothing")
+		t.Fatal("TEAMS_RELAY_URL is unset, so this test asserts nothing")
 	}
 	target, err := url.Parse(relay)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL is not a URL: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL is not a URL: %v", err)
 	}
 	if target.Hostname() == "127.0.0.1" || target.Hostname() == "localhost" {
 		t.Fatalf("the relay is back on loopback (%q); this test and the rule it "+
@@ -371,7 +403,7 @@ func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
 	}
 	port, err := strconv.ParseInt(target.Port(), 10, 32)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL names no port: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL names no port: %v", err)
 	}
 
 	gateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
@@ -416,7 +448,7 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 	envVars := buildCredentialProxyEnv(agent)
 	expected := map[string]string{
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent),
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent, allBrokerCallersOwned),
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
@@ -655,6 +687,16 @@ func TestARefusalStillReconcilesTheAgentsNetworkPolicies(t *testing.T) {
 			},
 			reason: reasonForbiddenVolumeMount,
 		},
+		{
+			name: "an override naming the gateway's ServiceAccount",
+			mutate: func(agent *agentv1alpha1.PlatformAgent) {
+				if agent.Spec.Security == nil {
+					agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+				}
+				agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+			},
+			reason: reasonReservedServiceAccount,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			agent := brokerPodAgent()
@@ -889,22 +931,243 @@ func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 	}
 }
 
+// TestTheBrokerReadinessProbeIsOnTheHealthListener: the probe reads Envoy's
+// health listener, declared as its own container port, and nothing else
+// reaches that port. On the credentialed port the probe shared the upstream
+// breaker with every open cluster watch, so a fleet at the ceiling removed
+// the pod from the Service. No livenessProbe: the start script supervises
+// both processes, and a probe-driven restart would drop every open watch.
+func TestTheBrokerReadinessProbeIsOnTheHealthListener(t *testing.T) {
+	agent := brokerPodAgent()
+	container := buildCredentialProxyContainer(agent)
+
+	probe := container.ReadinessProbe
+	if probe == nil || probe.ProbeHandler.HTTPGet == nil {
+		t.Fatalf("the broker container has no HTTP readinessProbe: %#v", probe)
+	}
+	if got := probe.ProbeHandler.HTTPGet; got.Path != "/healthz" || got.Port != intstr.FromString(credentialProxyHealthPortName) {
+		t.Fatalf("readinessProbe is %s on port %v; want /healthz on %q, the health listener, so open watches cannot fail it", got.Path, got.Port, credentialProxyHealthPortName)
+	}
+	if container.LivenessProbe != nil || container.StartupProbe != nil {
+		t.Fatalf("the broker container declares a liveness or startup probe (%#v, %#v); a probe-driven restart drops every open watch", container.LivenessProbe, container.StartupProbe)
+	}
+
+	var declared []corev1.ContainerPort
+	for _, p := range container.Ports {
+		if p.Name == credentialProxyHealthPortName || p.ContainerPort == credentialProxyHealthPort {
+			declared = append(declared, p)
+		}
+	}
+	if len(declared) != 1 || declared[0].Name != credentialProxyHealthPortName || declared[0].ContainerPort != credentialProxyHealthPort {
+		t.Fatalf("want exactly one %s container port on %d, got %#v", credentialProxyHealthPortName, credentialProxyHealthPort, container.Ports)
+	}
+	for _, other := range []int32{credentialProxyPort, credentialProxyMetricsPort} {
+		if other == credentialProxyHealthPort {
+			t.Fatalf("the health port %d collides with another broker port", credentialProxyHealthPort)
+		}
+	}
+
+	for _, port := range buildCredentialProxyService(agent).Spec.Ports {
+		if port.Port == credentialProxyHealthPort || port.TargetPort == intstr.FromString(credentialProxyHealthPortName) || port.TargetPort == intstr.FromInt32(credentialProxyHealthPort) {
+			t.Fatalf("the Service exposes the health listener: %#v", port)
+		}
+	}
+	for _, rule := range buildCredentialProxyNetworkPolicy(agent).Spec.Ingress {
+		for _, port := range rule.Ports {
+			if port.Port != nil && (*port.Port == intstr.FromInt32(credentialProxyHealthPort) || *port.Port == intstr.FromString(credentialProxyHealthPortName)) {
+				t.Fatalf("the NetworkPolicy admits a peer on the health listener: %#v", rule)
+			}
+		}
+	}
+}
+
+// The Envoy config baked into the broker image, as far as the operator's side
+// of the contract reads it: the listeners' ports, the routes, and the breakers.
+type envoyCredentialProxyConfig struct {
+	StaticResources struct {
+		Listeners []struct {
+			Name    string `json:"name"`
+			Address struct {
+				SocketAddress *struct {
+					Address   string `json:"address"`
+					PortValue int32  `json:"port_value"`
+				} `json:"socket_address"`
+			} `json:"address"`
+			FilterChains []struct {
+				Filters []struct {
+					TypedConfig struct {
+						RouteConfig struct {
+							VirtualHosts []struct {
+								Routes []struct {
+									Match struct {
+										Prefix string `json:"prefix"`
+										Path   string `json:"path"`
+									} `json:"match"`
+									Route struct {
+										Cluster string `json:"cluster"`
+									} `json:"route"`
+								} `json:"routes"`
+							} `json:"virtual_hosts"`
+						} `json:"route_config"`
+					} `json:"typed_config"`
+				} `json:"filters"`
+			} `json:"filter_chains"`
+		} `json:"listeners"`
+		Clusters []struct {
+			Name            string `json:"name"`
+			CircuitBreakers struct {
+				Thresholds []struct {
+					Priority           string `json:"priority"`
+					MaxConnections     int    `json:"max_connections"`
+					MaxPendingRequests int    `json:"max_pending_requests"`
+					MaxRequests        int    `json:"max_requests"`
+				} `json:"thresholds"`
+			} `json:"circuit_breakers"`
+			LoadAssignment struct {
+				Endpoints []struct {
+					LBEndpoints []struct {
+						Endpoint struct {
+							Address struct {
+								Pipe *struct {
+									Path string `json:"path"`
+								} `json:"pipe"`
+							} `json:"address"`
+						} `json:"endpoint"`
+					} `json:"lb_endpoints"`
+				} `json:"endpoints"`
+			} `json:"load_assignment"`
+		} `json:"clusters"`
+	} `json:"static_resources"`
+	Admin struct {
+		Address struct {
+			Pipe          *struct{} `json:"pipe"`
+			SocketAddress *struct{} `json:"socket_address"`
+		} `json:"address"`
+	} `json:"admin"`
+}
+
+// The numbers the Envoy config has to carry. The credentialed cluster's
+// breaker is what a fleet of open watches fills; Envoy's default per priority
+// is 1024 connections and 1024 requests, and a thousand watched clusters sat
+// at it. The health cluster's is a kubelet's probes many times over and no
+// more, so that nothing arriving on the health listener can hold the socket.
+const (
+	envoyRuntimeMaxConnections     = 4096
+	envoyRuntimeMaxPendingRequests = 1024
+	envoyRuntimeMaxRequests        = 4096
+	envoyHealthThreshold           = 64
+	envoyLoopbackAddress           = "127.0.0.1"
+)
+
+// TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker reads the config the
+// image bakes, since the operator renders none of it and `go test` would
+// otherwise pass with a probe pointed at a port Envoy does not open: the
+// health listener's port is the constant the probe is declared on, its one
+// route is /healthz to a cluster of its own on the broker's socket with its
+// own small breaker, the credentialed cluster declares the raised breaker on
+// both priorities, every listener binds loopback for start-services.sh to
+// rebind, and admin stays on its unix socket.
+func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "shared", "envoy-credential-proxy.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var config envoyCredentialProxyConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+
+	listeners := map[string]int32{}
+	for _, listener := range config.StaticResources.Listeners {
+		if listener.Address.SocketAddress == nil {
+			t.Fatalf("listener %s is not a socket listener", listener.Name)
+		}
+		if listener.Address.SocketAddress.Address != envoyLoopbackAddress {
+			t.Fatalf("listener %s binds %s in the image; start-services.sh rebinds %s to the address the operator passes and nothing else, so a listener baked on any other address stays where it is in every Pod, the sidecar arrangement's loopback-only one included", listener.Name, listener.Address.SocketAddress.Address, envoyLoopbackAddress)
+		}
+		listeners[listener.Name] = listener.Address.SocketAddress.PortValue
+	}
+	if got := listeners["credential_proxy"]; got != credentialProxyPort {
+		t.Fatalf("the credentialed listener is on %d; the operator declares %d", got, credentialProxyPort)
+	}
+	if got := listeners["credential_health"]; got != credentialProxyHealthPort {
+		t.Fatalf("the health listener is on %d; the readinessProbe is declared on %d", got, credentialProxyHealthPort)
+	}
+	if listeners["credential_health"] == listeners["credential_proxy"] || listeners["credential_health"] == credentialProxyMetricsPort {
+		t.Fatalf("the health listener shares a port with another broker listener: %v", listeners)
+	}
+
+	var healthRoutes int
+	for _, listener := range config.StaticResources.Listeners {
+		if listener.Name != "credential_health" {
+			continue
+		}
+		for _, chain := range listener.FilterChains {
+			for _, filter := range chain.Filters {
+				for _, host := range filter.TypedConfig.RouteConfig.VirtualHosts {
+					for _, route := range host.Routes {
+						healthRoutes++
+						if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
+							t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+						}
+					}
+				}
+			}
+		}
+	}
+	if healthRoutes != 1 {
+		t.Fatalf("the health listener has %d routes; want one, /healthz", healthRoutes)
+	}
+
+	sockets := map[string]string{}
+	for _, cluster := range config.StaticResources.Clusters {
+		want := [3]int{envoyRuntimeMaxConnections, envoyRuntimeMaxPendingRequests, envoyRuntimeMaxRequests}
+		if cluster.Name == "credential_health" {
+			want = [3]int{envoyHealthThreshold, envoyHealthThreshold, envoyHealthThreshold}
+		}
+		priorities := map[string]bool{}
+		for _, threshold := range cluster.CircuitBreakers.Thresholds {
+			priorities[threshold.Priority] = true
+			got := [3]int{threshold.MaxConnections, threshold.MaxPendingRequests, threshold.MaxRequests}
+			if got != want {
+				t.Fatalf("cluster %s priority %s has connections/pending/requests %v; want %v", cluster.Name, threshold.Priority, got, want)
+			}
+		}
+		if !priorities["DEFAULT"] || !priorities["HIGH"] {
+			t.Fatalf("cluster %s declares breakers for %v; both DEFAULT and HIGH must be declared or one inherits Envoy's 1024", cluster.Name, priorities)
+		}
+		for _, endpoint := range cluster.LoadAssignment.Endpoints {
+			for _, lb := range endpoint.LBEndpoints {
+				if lb.Endpoint.Address.Pipe == nil {
+					t.Fatalf("cluster %s has an endpoint that is not the broker's unix socket: %#v", cluster.Name, lb.Endpoint.Address)
+				}
+				sockets[cluster.Name] = lb.Endpoint.Address.Pipe.Path
+			}
+		}
+	}
+	if sockets["credential_runtime"] == "" || sockets["credential_health"] != sockets["credential_runtime"] {
+		t.Fatalf("the health cluster reaches %q and the credentialed cluster %q; ready has to mean the same broker answers", sockets["credential_health"], sockets["credential_runtime"])
+	}
+	if config.Admin.Address.Pipe == nil || config.Admin.Address.SocketAddress != nil {
+		t.Fatalf("Envoy's admin interface is not on a unix socket alone: %#v", config.Admin.Address)
+	}
+}
+
 // TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
-// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true on a
-// mode-next install, and never otherwise.
+// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true, and
+// never otherwise.
 func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	agent := brokerPodAgent()
-	agent.Spec.Mode = ptr.To("next")
-	// Chat off: under next with Google Chat enabled the A2A gateway is a
-	// caller too (a2aChatArmed), and this test is about the session flag
-	// alone.
+	// Chat off: with Google Chat enabled the A2A gateway is a caller too
+	// (a2aChatArmed), and this test is about the session flag alone.
 	if agent.Spec.Integration != nil {
 		agent.Spec.Integration.GoogleChat = nil
 	}
 	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
-	if strings.Contains(allowedBrokerCallers(agent), sessionCaller) {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
 		t.Fatal("the session ServiceAccount is a broker caller with the flag unset")
 	}
 	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -916,8 +1179,8 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
-	if got := allowedBrokerCallers(agent); got != want {
+	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	if got := allowedBrokerCallers(agent, allBrokerCallersOwned); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -934,22 +1197,12 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 }
 
-// TestSessionClusterViewIsInertOutsideModeNext: the flag means nothing on a
-// today install, where no session pod exists to be a caller.
-func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
-	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	agent := brokerPodAgent() // mode unset: today
-	if a2aSessionClusterViewEnabled(agent) {
-		t.Fatal("enabled outside mode next")
-	}
-	if strings.Contains(allowedBrokerCallers(agent), "a2a-session") {
-		t.Fatal("session caller named on a today install")
-	}
+// TestSessionClusterViewArmsOnlyOnTheLiteralTrue: no other spelling of the
+// flag enables the view.
+func TestSessionClusterViewArmsOnlyOnTheLiteralTrue(t *testing.T) {
 	for _, v := range []string{"", "false", "TRUE", "1"} {
 		t.Setenv(a2aSessionClusterViewEnvVar, v)
-		next := brokerPodAgent()
-		next.Spec.Mode = ptr.To("next")
-		if a2aSessionClusterViewEnabled(next) {
+		if a2aSessionClusterViewEnabled(brokerPodAgent()) {
 			t.Errorf("value %q enabled the view; only the literal true may", v)
 		}
 	}
@@ -982,5 +1235,71 @@ func TestTheBrokerPinsTheDriftDetectorsOwnSubscription(t *testing.T) {
 	off := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})
 	if _, found := brokerEnvValue(buildCredentialProxyEnv(off), watcherSubscriptionEnvVar); found {
 		t.Errorf("with the detector off the broker must name no subscription, so every Pub/Sub call is refused")
+	}
+}
+
+// TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount pins that
+// the controller refuses the collision before step 3, with no webhook in
+// front of it: no ServiceAccount of that name is written, and above all not
+// with the broker's Workload Identity annotation, which would hand the gateway
+// the broker's cloud identity.
+func TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount(t *testing.T) {
+	agent := brokerPodAgent()
+	if agent.Spec.Security == nil {
+		agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+	}
+	agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+	agent.Spec.Security.ServiceAccountAnnotations = map[string]string{
+		"iam.gke.io/gcp-service-account": "broker@p.iam.gserviceaccount.com",
+	}
+	if msg := ReservedServiceAccountOverride(agent); msg == "" {
+		t.Fatal("the override is not recognised as a collision")
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	sa := &corev1.ServiceAccount{}
+	err := cl.Get(ctx, types.NamespacedName{Name: gatewayServiceAccountName(agent), Namespace: agent.Namespace}, sa)
+	if err == nil {
+		t.Fatalf("a ServiceAccount named %q was written, annotations %v", sa.Name, sa.Annotations)
+	}
+	if !errors.IsNotFound(err) {
+		t.Fatalf("get: %v", err)
+	}
+}
+
+// TestTheManagedEnvPinsTheManagementProjectExceptOnKind pins GKE_PROJECT_ID in
+// the managed .env, which the agent's PVC .env cannot outrank, on a GKE
+// harness; and leaves it out on kind, where the container env carries none.
+func TestTheManagedEnvPinsTheManagementProjectExceptOnKind(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		harness *agentv1alpha1.HarnessSpec
+		want    string
+	}{
+		{"gke", &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-project", Location: "us-east4", ClusterName: "mgmt"}, "GKE_PROJECT_ID=mgmt-project"},
+		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"}, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Harness: testCase.harness},
+			}
+			var pinned []string
+			for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+				if strings.HasPrefix(line, "GKE_PROJECT_ID=") {
+					pinned = append(pinned, line)
+				}
+			}
+			switch {
+			case testCase.want == "" && len(pinned) != 0:
+				t.Errorf("kind harness pins %v; the container env carries no project there", pinned)
+			case testCase.want != "" && (len(pinned) != 1 || pinned[0] != testCase.want):
+				t.Errorf("managed .env pins %v, want [%s]", pinned, testCase.want)
+			}
+		})
 	}
 }

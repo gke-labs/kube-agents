@@ -5,21 +5,28 @@ Platform Agent later reads back out of `session_metadata` is exactly what a
 compromised database would leak.
 """
 
+import contextvars
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from chat_metrics import metrics as chat_metrics  # noqa: E402
 from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
 
 import store  # noqa: E402
+import turn_context  # noqa: E402
 from store import SessionMetadata, SessionMetadataStore, log_event_to_db  # noqa: E402
 
 EMAIL = "alice@example.com"
@@ -151,6 +158,122 @@ class TestWriteThrough(SaltedTestCase):
         SessionMetadataStore._close_unlocked()
         with self.assertLogs(store.logger, level="ERROR"):
             store.write_session_metadata("sess-1", {"session_id": "sess-1"})
+
+    def _sessions_counted(self, registry):
+        return dict(re.findall(r'^kubeagents_chat_sessions_total\{platform="([a-z]+)"\} (\d+)$', registry.render(), re.M))
+
+    def test_a_session_is_counted_once_on_the_chat_metrics_registry(self):
+        # The first message of a session is the one that creates its row;
+        # every later message updates the row and counts no session. The
+        # count lands on the chat_metrics module's registry, the one its
+        # listener serves, under the platform spelling the operator reads.
+        registry = chat_metrics.ChatMetrics()
+        with mock.patch.object(chat_metrics, "REGISTRY", registry):
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+            log_event_to_db(_event(platform="slack", user_id="U123"), gateway=None, session_store=_SessionStore("sess-2"))
+        self.assertEqual({"googlechat": "1", "slack": "1"}, self._sessions_counted(registry))
+
+    def test_a_session_whose_row_was_not_written_is_not_counted(self):
+        os.environ["SESSION_KV_DB_PATH"] = "/proc/kube-agents-does-not-exist/session.db"
+        SessionMetadataStore._close_unlocked()
+        registry = chat_metrics.ChatMetrics()
+        with mock.patch.object(chat_metrics, "REGISTRY", registry), self.assertLogs(store.logger, level="ERROR"):
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        self.assertEqual({}, self._sessions_counted(registry))
+
+    def test_a_registry_that_raises_is_logged_and_the_turn_continues(self):
+        class Exploding:
+            def record_session(self, platform):
+                raise RuntimeError("registry is down")
+
+        with mock.patch.object(chat_metrics, "REGISTRY", Exploding()), self.assertLogs(store.logger, level="ERROR"):
+            self.assertIsNone(log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-9")))
+        self.assertIsNotNone(self._stored("sess-9"), "the row is written before the count")
+
+    def _row(self, session_id):
+        raw = self._stored(session_id)
+        return json.loads(raw) if raw else None
+
+    def _seed(self, session_id, metadata):
+        conn = sqlite3.connect(os.environ["SESSION_KV_DB_PATH"])
+        try:
+            conn.execute(store.CREATE_SESSION_METADATA_TABLE_SQL)
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session_id, json.dumps(metadata)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_write_keeps_an_origin_another_writer_set(self):
+        self._seed("sess-1", {"origin": "drift", "origin_platform": ""})
+        log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        row = self._row("sess-1")
+        self.assertEqual("drift", row["origin"])
+        self.assertEqual("", row["origin_platform"])
+        self.assertEqual("spaces/AAA", row["chat_id"], "the event's own keys are still written")
+
+    def test_write_sets_chat_with_the_platform_when_absent(self):
+        log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        row = self._row("sess-1")
+        self.assertEqual("chat", row["origin"])
+        self.assertEqual("googlechat", row["origin_platform"])
+        log_event_to_db(_event(platform="slack", user_id="U1"), gateway=None, session_store=_SessionStore("sess-2"))
+        self.assertEqual(("chat", "slack"), (self._row("sess-2")["origin"], self._row("sess-2")["origin_platform"]))
+
+    def test_write_sets_no_origin_off_a_chat_platform(self):
+        # The gateway's API port and a platform outside the chat metrics map
+        # are not chat: the row carries no origin keys, so the session
+        # resolves as `other`.
+        log_event_to_db(_event(platform="api_server", user_id="U1"), gateway=None, session_store=_SessionStore("sess-api"))
+        row = self._row("sess-api")
+        self.assertIsNotNone(row)
+        self.assertNotIn("origin", row)
+        self.assertNotIn("origin_platform", row)
+        log_event_to_db(_event(platform="api", user_id="U1"), gateway=None, session_store=_SessionStore("sess-api2"))
+        self.assertNotIn("origin", self._row("sess-api2"))
+        log_event_to_db(_event(platform="cli", user_id="U1"), gateway=None, session_store=_SessionStore("sess-cli"))
+        self.assertNotIn("origin", self._row("sess-cli"))
+        log_event_to_db(_event(platform="slack", user_id="U1"), gateway=None, session_store=_SessionStore("sess-slack"))
+        self.assertEqual(("chat", "slack"), (self._row("sess-slack")["origin"], self._row("sess-slack")["origin_platform"]))
+
+    def test_write_merges_under_one_transaction(self):
+        # Another writer (the Session KV server) holds the write lock and is
+        # recording the session's origin: the plugin's write waits for it and
+        # then carries that origin forward rather than replacing the row with
+        # what it read before.
+        self._seed("sess-1", {"chat_id": "spaces/AAA"})
+        SessionMetadataStore.get_db_connection()  # the pod's database is already in WAL mode
+        other = sqlite3.connect(os.environ["SESSION_KV_DB_PATH"], isolation_level=None)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(
+            "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+            (json.dumps({"chat_id": "spaces/AAA", "origin": "console", "origin_platform": ""}), "sess-1"),
+        )
+        writer = threading.Thread(
+            target=log_event_to_db, args=(_event(),), kwargs={"gateway": None, "session_store": _SessionStore("sess-1")}
+        )
+        writer.start()
+        time.sleep(0.3)
+        self.assertTrue(writer.is_alive(), "the write waits for the other writer's transaction")
+        other.execute("COMMIT")
+        writer.join(timeout=10)
+        self.assertFalse(writer.is_alive())
+        row = self._row("sess-1")
+        self.assertEqual("console", row["origin"])
+        self.assertEqual("spaces/AAA/threads/BBB", row["thread_id"])
+
+    def test_dispatch_binds_the_hermes_session_id(self):
+        def dispatch():
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("20261103_101500_ab12cd34"))
+            return turn_context.current_session()
+
+        before = turn_context.current_session()
+        self.assertEqual("20261103_101500_ab12cd34", contextvars.copy_context().run(dispatch))
+        self.assertEqual(before, turn_context.current_session(), "the binding stays in the turn's context")
 
     def test_an_empty_session_id_writes_nothing(self):
         # Not even the database file: the early return happens before the

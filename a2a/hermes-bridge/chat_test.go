@@ -9,12 +9,14 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nuid"
 
@@ -200,6 +202,11 @@ func TestBridgeSharedCases(t *testing.T) {
 			if out := c.Expected[0]; !ok || out.Carrier != string(chatmsg.Result) || !sameChat(t, part, out.Chat) {
 				t.Errorf("%s: result chat = %s, want %s", c.Name, part.Data, out.Chat)
 			}
+			if m, err := chatmsg.Parse(part.Data); err != nil {
+				t.Errorf("%s: %v", c.Name, err)
+			} else if findings := chatmsg.Lint(m); len(findings) > 0 {
+				t.Errorf("%s: the answer breaks the chat UX rules: %v", c.Name, findings)
+			}
 			continue
 		}
 		ask := ""
@@ -359,6 +366,129 @@ func TestAPI_ATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
 	}
 }
 
+// A turn that filed kanban cards with its route recorded publishes the
+// handoff artifact ahead of its terminal on a Google Chat conversation, where
+// the terminal's cards mark never fires (cardsSettleTheAsk is Slack with
+// KAGE_SLACK_UX on), so a delegating session hears that the work went to a
+// card rather than reading "on it" as the answer (#3258). No card filed, a
+// failed kanban_create or an unrecorded route: none.
+func TestAPI_ATurnThatFiledCardsPublishesTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, prompt string
+		storeStatus  int
+		want         bool
+	}{
+		{"filed", "diagnose the pod restarts in crash-ns; fan out", http.StatusOK, true},
+		{"failed-call", "diagnose the pod restarts in crash-ns; broken", http.StatusOK, false},
+		{"direct", "is checkout-gateway restarting in seeded-a?", http.StatusOK, false},
+		{"route-refused", "diagnose the pod restarts in crash-ns; fan out", http.StatusBadRequest, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				switch {
+				case strings.Contains(tc.prompt, "fan out"):
+					postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+					postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				case strings.Contains(tc.prompt, "broken"):
+					postDeliveryStatus(t, u, shared, c.sessionID, kanbanCreateTool, "call_1", ActivityStatusError)
+				}
+				writeCompletion(w, c.sessionID, "focusing on memory limits")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, "ctx-"+tc.name, "gchat:spaces/A/threads/B", tc.prompt)
+			task := waitTerminal(t, c, "task-"+tc.name)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed", task.State)
+			}
+			art := task.Artifact(lib.ArtifactHandoff)
+			got := art != nil && len(art.Parts) == 1 && art.Parts[0].Text == lib.HandoffCards
+			if got != tc.want {
+				t.Fatalf("handoff artifact = %+v, want present=%v", art, tc.want)
+			}
+		})
+	}
+}
+
+// The handoff is task-wide, like the cards mark: turn 1 files a card and
+// acks, a queued follow-up answers directly as turn 2, and turn 1's card is
+// still going to report into the conversation, so the terminal still carries
+// the handoff. On Slack with KAGE_SLACK_UX on the mark says the same.
+func TestAPI_AFollowUpAfterACardStillReportsTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	release := make(chan struct{})
+	var door atomic.Value
+	var turns atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if turns.Add(1) == 1 {
+			u := door.Load().(string)
+			postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+			postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+			<-release
+			writeCompletion(w, c.sessionID, "on it: a card is checking")
+			return
+		}
+		writeCompletion(w, c.sessionID, "payments-worker exits: DB_URL is not set")
+	})
+	b := startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.ActivityListen = "127.0.0.1:0"
+		cfg.ActivitySecret = shared
+		cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+	})
+	door.Store(b.ActivityURL())
+	c := gatewayClient(t, url)
+	origin := submitFromEnv(t, c, "task-followup", "ctx-followup", "gchat:spaces/A/threads/B", "diagnose crash-ns")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return turns.Load() == 1 })
+	sendSteer(t, c, origin, "just tell me why it crashes")
+	waitFor(t, 10*time.Second, "follow-up queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || turns.Load() != 2 {
+		t.Fatalf("state %s after %d turns, want completed after 2", task.State, turns.Load())
+	}
+	if art := task.Artifact(lib.ArtifactHandoff); art == nil {
+		t.Fatal("no handoff for a task whose first turn filed a card that is still to report")
+	}
+}
+
+// submitFromEnv is submitFrom returning the submission, for a test that
+// steers it.
+func submitFromEnv(t *testing.T, c *lib.Client, taskID, contextID, conversation, prompt string) *lib.Envelope {
+	t.Helper()
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, taskID, "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": conversation, "kind": "dm"}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
+		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), env); err != nil {
+		t.Fatalf("submission publish: %v", err)
+	}
+	return env
+}
+
 // postDeliveryStatus is postDelivery's closing delivery for a call that ended
 // with status, as hermes reports a failed tool call.
 func postDeliveryStatus(t *testing.T, url, key, sessionID, tool, callID, status string) {
@@ -448,5 +578,225 @@ func TestSplitAnswerStaysLinear(t *testing.T) {
 	} {
 		splitAnswer(line)
 		plainLine(line)
+	}
+}
+
+// visibleText takes off every step-shaped line at an answer's end, refused or
+// not: the line is plumbing no surface shows as text.
+func TestVisibleText(t *testing.T) {
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]":                  "Up.",
+		"Up.\n[next: a]\n[next: b]\n":                    "Up.",
+		"Up.\r\n\r\n[next: check seeded-a]\r\n":          "Up.",
+		"Up.\n\n[next: " + strings.Repeat("x", 80) + "]": "Up.",
+		"Up. [next: inline]":                             "Up. [next: inline]",
+		"Up.\n[next: a]\x0c\n[next: b]":                  "Up.",
+		"Up.\n\u00a0[next: b]":                           "Up.",
+		"Up.":                                            "Up.",
+		"[next: check]":                                  "",
+	} {
+		if got := visibleText(in); got != want {
+			t.Errorf("visibleText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// withNote puts a note above a declared step's line, which has to stay last,
+// and after the answer when it declares none.
+func TestWithNote(t *testing.T) {
+	note := "\n\n(note)"
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]": "Up.\n\n(note)\n\n[next: check seeded-a]",
+		"Up.":                           "Up.\n\n(note)",
+	} {
+		got := withNote(in, note)
+		if got != want {
+			t.Errorf("withNote(%q) = %q, want %q", in, got, want)
+		}
+		if _, step := nextStep(got); strings.Contains(in, "[next:") && step != "check seeded-a" {
+			t.Errorf("withNote(%q) lost the step: nextStep = %q", in, step)
+		}
+	}
+}
+
+// A turn that files a card ends at its acknowledgement unless it came from
+// the console, MCP or the A2A door: neither a chat turn whose route the store
+// refused nor a turn with no chat conversation (the eval inject lane) holds
+// its task open while the card runs. Holding them dropped the agent's own
+// report of the card's result from the answer (#5170); the A2A door holds
+// again (#5180).
+func TestAPI_OnlyAConsoleOrA2ADoorTurnHoldsItsTaskWhileItsCardRuns(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, conversation string
+		storeStatus        int
+		holds              bool
+	}{
+		{"no-conversation", "", http.StatusOK, false},
+		{"route-refused", "gchat:spaces/A/threads/B", http.StatusBadRequest, false},
+		{"console", "console:tab-1", http.StatusOK, true},
+		{"a2a-door", "a2a:caller-1:ctx-hold", http.StatusOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			contextID := "ctx-hold-" + tc.name
+			// A card on the session that keeps running.
+			db := filepath.Join(t.TempDir(), "kanban.db")
+			initScript := `
+import sqlite3, sys, time
+db, sess = sys.argv[1], sys.argv[2]
+now = time.time()
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_hold1", "Check prod-a", "running", "cluster-diagnostics", sess, "", "", now, now, None))
+c.commit()
+`
+			if out, err := exec.Command("python3", "-c", initScript, db, apiSessionID(contextID)).CombinedOutput(); err != nil {
+				t.Fatalf("init db: %v\n%s", err, out)
+			}
+			t.Setenv(hermesKanbanDBEnv, db)
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+				postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				writeCompletion(w, c.sessionID, "Filed a card for prod-a.")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, contextID, tc.conversation, "check prod-a")
+			if tc.holds {
+				time.Sleep(3 * time.Second)
+				got, err := c.TasksGet(testCtx(t), "platform", "task-"+tc.name)
+				if err != nil {
+					t.Fatalf("read the console task: %v", err)
+				}
+				if got.Final {
+					t.Fatalf("a %s turn ended while its card runs: %+v", tc.name, got.State)
+				}
+				return
+			}
+			task := waitTerminalFor(t, c, "task-"+tc.name, 5*time.Second)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed at the acknowledgement", task.State)
+			}
+		})
+	}
+}
+
+// A stop that lands while a console or A2A door turn holds for its cards
+// (#5407) ends the hold: the task goes canceled, and the bridge asks
+// session-kv to stop the session's cards (finalizeWaitCanceled, or
+// markRunCanceled for a cancel outside the wait). The cancel
+// arrives as KindCancel on the task's .in, which is what the gateway sends
+// for a console or MCP typed stop and for an A2A door tasks/cancel. That
+// archive does not follow A2A_CARD_STOP (#4999 item 2): a stop of a turn
+// that holds for its cards always reaches them.
+func TestAPI_ACancelDuringTheInTurnCardWaitEndsTheTurnAndStopsItsCards(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct{ name, conversation string }{
+		{"console", "console:tab-stop"},
+		{"a2a-door", "a2a:caller-1:ctx-stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			contextID := "ctx-stop-" + tc.name
+			sessionID := apiSessionID(contextID)
+			db := filepath.Join(t.TempDir(), "kanban.db")
+			initScript := `
+import sqlite3, sys, time
+db, sess = sys.argv[1], sys.argv[2]
+now = time.time()
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_stop1", "Scale checkout-gateway", "running", "platform-agent", sess, "", "", now, now, None))
+c.commit()
+`
+			if out, err := exec.Command("python3", "-c", initScript, db, sessionID).CombinedOutput(); err != nil {
+				t.Fatalf("init db: %v\n%s", err, out)
+			}
+			t.Setenv(hermesKanbanDBEnv, db)
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+				postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				writeCompletion(w, c.sessionID, "Filed a card to scale checkout-gateway.")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			taskID := "task-stop-" + tc.name
+			origin := submitFromEnv(t, c, taskID, contextID, tc.conversation, "scale checkout-gateway to 4")
+
+			// The turn holds: its card is still running.
+			time.Sleep(3 * time.Second)
+			held, err := c.TasksGet(testCtx(t), "platform", taskID)
+			if err != nil {
+				t.Fatalf("read the held task: %v", err)
+			}
+			if held.Final {
+				t.Fatalf("the %s turn ended before the stop: %+v", tc.name, held.State)
+			}
+
+			cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+				origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), cancelEnv); err != nil {
+				t.Fatal(err)
+			}
+			task := waitTerminalFor(t, c, taskID, 10*time.Second)
+			if task.State != lib.StateCanceled {
+				t.Fatalf("state = %s, want canceled: a stop during the card wait ends the turn", task.State)
+			}
+
+			wantPath := "POST " + strings.Replace(cardStopPathFormat, "%s", sessionID, 1)
+			var stop *routePut
+			waitFor(t, 5*time.Second, "the session's card stop at session-kv", func() bool {
+				for _, p := range store.seen() {
+					if p.path == wantPath {
+						stop = &p
+						return true
+					}
+				}
+				return false
+			})
+			if stop.auth != "Bearer kv-key" {
+				t.Fatalf("card stop auth = %q, want the route key", stop.auth)
+			}
+		})
 	}
 }

@@ -17,16 +17,15 @@ import (
 // exit alive.
 const sideDoorDrainBound = 3 * injectShutdownGrace
 
-// The side doors beside a real backend: one gateway, several ingresses.
+// The side doors beside the real backends: one gateway, several ingresses.
 //
-// The one-backend guard refuses two real backends because two processes on
-// one Chat relay durable split its event deliveries, and the symptom is a
-// gateway that answers half the messages. A door has no such failure mode --
-// it consumes nothing and competes for nothing -- and stage 2 of the eval
-// transport needs the inject door and the Chat relay on one install so the
-// two can be compared against it (the A2A owner's reading, 2026-09-17). The
-// A2A door sits beside them for the same reason: an external agent and a
-// chat user reach the same gateway.
+// The mux carries every armed real backend, each on its own transport, so a
+// door beside them competes with nothing. The doors are still not backends,
+// decided 2026-09-17: a door consumes nothing and competes for nothing, and
+// stage 2 of the eval transport needs the inject door and the Chat relay on
+// one install so the two can be compared against it (the A2A owner's
+// reading). The A2A door sits beside them for the same reason: an external
+// agent and a chat user reach the same gateway.
 //
 // So this composite, rather than a second Deployment: Run delivers from every
 // half into the same handleInbound, and everything the gateway sends back is
@@ -93,6 +92,11 @@ func WithSideDoors(primary Adapter, doors []DoorSpec, log *slog.Logger) Adapter 
 		log = slog.Default()
 	}
 	return &sideDoorAdapter{primary: primary, doors: doors, log: log}
+}
+
+// Close closes the chat adapters behind the doors (closeAdapter).
+func (s *sideDoorAdapter) Close() {
+	closeAdapter(s.primary)
 }
 
 // doorFor reports which door a conversation belongs to, or nil. The prefix
@@ -259,6 +263,21 @@ func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal reaches the primary for its own conversations when it
+// implements TerminalPoster; a door's conversations take no frames
+// (errNoTerminalFrames), and their callers read results through the
+// observer calls.
+func (s *sideDoorAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	if s.doorFor(conversation) != nil {
+		return errNoTerminalFrames
+	}
+	poster, ok := s.primary.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the primary's own conversations; a door keeps
 // its rolling line, which its caller reads.
 func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
@@ -267,6 +286,29 @@ func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
 	}
 	shower, ok := s.primary.(StatusShower)
 	return ok && shower.ShowsTaskStatus(conversation)
+}
+
+// PostPrivate goes to the primary for its own conversations (PrivatePoster);
+// a door's conversation has one reader, its caller, and no private post.
+func (s *sideDoorAdapter) PostPrivate(conversation, viewer, text string) error {
+	if s.doorFor(conversation) != nil || s.primary == nil {
+		return errNoPrivatePosts
+	}
+	poster, ok := s.primary.(PrivatePoster)
+	if !ok {
+		return errNoPrivatePosts
+	}
+	return poster.PostPrivate(conversation, viewer, text)
+}
+
+// AnswersOnLine answers for the primary's own conversations; a door keeps
+// the terminal edit, which its caller reads.
+func (s *sideDoorAdapter) AnswersOnLine(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	answerer, ok := s.primary.(LineAnswerer)
+	return ok && answerer.AnswersOnLine(conversation)
 }
 
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
@@ -278,11 +320,16 @@ func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verifi
 	}
 }
 
-// OpenDirect goes to the real backend, because a user id is not qualified the
-// way a conversation is and the DM switch is a chat affordance: the caller
-// that will one day use it is a classifier deciding to move a reply out of a
-// room, which only a room has. With no real backend the first door answers,
-// as the inject door alone did when it was the gateway's only ingress.
+// OpenDirect goes to the chat stack, because the DM switch is a chat
+// affordance: the caller that will one day use it is a classifier deciding to
+// move a reply out of a room, which only a room has. Behind the mux a user id
+// may name its backend as <backend>:<id>, and the mux routes it there with
+// the bare id. A chat backend name the mux knows (gchat, slack, discord,
+// console) that is not armed is refused by name. On
+// a one-backend mux any id without a known backend prefix goes whole to that
+// backend; with several backends armed, a bare or unknown-prefixed id is
+// refused. With no chat stack the first door answers, as the inject door
+// alone did when it was the gateway's only ingress.
 func (s *sideDoorAdapter) OpenDirect(userID string) (string, error) {
 	if s.primary != nil {
 		return s.primary.OpenDirect(userID)
@@ -346,6 +393,17 @@ func (s *sideDoorAdapter) TaskDelivered(conversation, taskID, result string) {
 	}
 }
 
+// TaskCardStop reaches the owning door, as TaskDelivered does.
+func (s *sideDoorAdapter) TaskCardStop(conversation, taskID, text string, cardStop lib.Part) {
+	if door := s.doorFor(conversation); door != nil {
+		if observer, ok := door.(CardStopObserver); ok {
+			observer.TaskCardStop(conversation, taskID, text, cardStop)
+		}
+	} else if observer, ok := s.primary.(CardStopObserver); ok {
+		observer.TaskCardStop(conversation, taskID, text, cardStop)
+	}
+}
+
 // MessageDropped and TurnFinished reach the owning door alone, for the same
 // reason: a chat user reads their own conversation, and a door's caller is
 // the one that would otherwise have to guess what became of its message.
@@ -371,6 +429,32 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	}
 }
 
+// SetHome hands the Home tab's admission rule and board reader to the
+// primary, the half with a home view; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	if sink, ok := s.primary.(HomeSink); ok {
+		sink.SetHome(admits, board)
+	}
+}
+
+// SetBoardActor hands the board-health card's Retry and Drop route to the
+// primary, the half that draws the card; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetBoardActor(actor BoardActor) {
+	if sink, ok := s.primary.(BoardActSink); ok {
+		sink.SetBoardActor(actor)
+	}
+}
+
+// SetBoardAdmits hands the rule a board tap is admitted by to the primary,
+// as SetBoardActor hands the route.
+func (s *sideDoorAdapter) SetBoardAdmits(admits BoardAdmits) {
+	if sink, ok := s.primary.(BoardAdmitSink); ok {
+		sink.SetBoardAdmits(admits)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation
@@ -380,5 +464,22 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	if sink, ok := s.primary.(SessionLookupSink); ok {
 		sink.SetSessionLookup(lookup, idleTTL)
+	}
+}
+
+// SetSenderAdmission hands the gateway's admission gate to the primary, the
+// chat half that posts in a sender's conversation; the door's callers are
+// programs the door itself admits.
+func (s *sideDoorAdapter) SetSenderAdmission(admits SenderAdmission) {
+	if sink, ok := s.primary.(SenderAdmissionSink); ok {
+		sink.SetSenderAdmission(admits)
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to the primary, the
+// chat half that draws rating controls; a door's callers are programs.
+func (s *sideDoorAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	if sink, ok := s.primary.(FeedbackSink); ok {
+		sink.SetFeedbackRecorder(r)
 	}
 }

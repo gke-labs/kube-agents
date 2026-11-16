@@ -3,14 +3,16 @@
  * credential, the URL named a user with no password for it, or the connect
  * failed. The names are the default install's (namespace kubeagents-system,
  * PlatformAgent platform-agent). The console server answers only on local
- * port 8080, because that is the origin the bus allows; the bus itself
- * answers on 9222.
+ * port 8080, because that is the origin the bus allows. Every page reaches
+ * the install's bus through the console server's /bus, the read-only one
+ * included: the bus's own listener serves TLS under a CA no browser trusts.
  */
 
 const PORT_FORWARD = "kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080";
 const CONSOLE_URL = "http://localhost:8080";
 const LOCAL_DEV_QUERY = "?ws=ws://localhost:9222&user=console&pass=dev-console";
-const READ_ONLY_PORT_FORWARD = "kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-nats 9222:9222";
+/** The console server's bus proxy, which passes a page's own credential through. */
+const CONSOLE_BUS_URL = "ws://localhost:8080/bus";
 /** The prefix a2a/console sends when the credential Secret is missing or empty. */
 const MISSING_CREDENTIAL_PREFIX = "503:";
 
@@ -51,11 +53,11 @@ export default function NotConnected({
       )}
       {namedUserScreen ? (
         <p className="connect-hint">
-          Port-forward the bus itself:
+          Forward the console server:
           <br />
-          <code>{READ_ONLY_PORT_FORWARD}</code>
+          <code>{PORT_FORWARD}</code>
           <br />
-          and open this page with <code>{`?ws=ws://localhost:9222&user=${namedUser}&pass=<password>`}</code>.
+          and open this page with <code>{`?ws=${CONSOLE_BUS_URL}&user=${namedUser}&pass=<password>`}</code>.
         </p>
       ) : missingCredential ? (
         <p className="connect-hint">

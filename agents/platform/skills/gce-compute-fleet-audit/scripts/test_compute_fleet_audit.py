@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,11 @@ import compute_fleet_audit as cf  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 _fleet_scope_args = cf.fleet_scope_args  # the collector's own import; one module, one path
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -414,6 +420,39 @@ class CollectProjectTest(unittest.TestCase):
         that stands for a project reads as a fleet of Standard clusters."""
         entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
         self.assertNotIn("autopilot", entry)
+
+    def test_every_list_read_issues_its_projection_and_descends_lists_with_brackets(self):
+        """The five list reads go out with their `--format=json(...)`
+        projections (a read back on the whole resource meets the credential
+        proxy's output cap on a project with thousands of instances), and the
+        instance read spells `metadata.items[].key`: in a `json()` projection
+        a plain dotted component applied to a list projects nothing, so
+        `metadata.items.key` would drop `metadata` from every item and §2.1
+        would read no console wherever the project's common metadata sets no
+        startup script. The fakes answer by substring, so only the argv says."""
+        issued = []
+        inner = self.fake_run(self.clean())
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return inner(argv, **kwargs)
+
+        cf.collect_project("proj-1", run=run)
+        formats = {" ".join(argv[1:argv.index("list") + 1]): argv[-1] for argv in issued if argv[0] == "gcloud" and "list" in argv}
+        self.assertEqual(
+            {
+                "compute instances list": cf.INSTANCES_FORMAT,
+                "compute instance-groups managed list": cf.MIGS_FORMAT,
+                "compute sole-tenancy node-groups list": cf.NODE_GROUPS_FORMAT,
+                "compute disks list": cf.DISKS_FORMAT,
+                "compute snapshots list": cf.SNAPSHOTS_FORMAT,
+            },
+            formats,
+        )
+        for fmt in formats.values():
+            self.assertRegex(fmt, r"^--format=json\([^()]+\)$", fmt)
+        self.assertEqual(cf.INSTANCES_FORMAT, "--format=json(name,status,zone,metadata.items[].key)")
+        self.assertNotIn("items.key", cf.INSTANCES_FORMAT.replace("items[].key", ""))
 
     def test_every_commands_entry_is_an_object_with_a_string_check_and_int_rc(self):
         """`cross_check_manifest` reads `entry.get("check")` with no isinstance
@@ -1000,12 +1039,15 @@ class CollectProjectTest(unittest.TestCase):
     def test_the_recorded_command_is_the_argv_that_ran(self):
         """The pre-manifest revision recorded `--project=<id>` while running
         `--project <id>`, and recorded the project-wide enumeration for a
-        finding produced by a per-instance read."""
+        finding produced by a per-instance read. Each part of the recorded
+        line is one argv that ran, quoted so a shell reads it back as the same
+        argv: the list reads' `--format=json(...)` projections carry `(`, `)`
+        and `[]`, which bash refuses unquoted."""
         seen = []
 
         def run(argv, **kwargs):
+            seen.append(list(argv))
             joined = " ".join(argv)
-            seen.append(joined)
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
@@ -1013,9 +1055,17 @@ class CollectProjectTest(unittest.TestCase):
             return run_of(0, "[]")
 
         entry = cf.collect_project("proj-1", run=run)
+        self.assertTrue(entry["commands"])
         for record in entry["commands"]:
             for part in record["command"].split(" && "):
-                self.assertIn(part.strip(), seen)
+                self.assertIn(shlex.split(part.strip()), seen, part)
+            self.assertIn("'--format=json(", record["command"])
+            # The symptom itself: bash parses the whole recorded line.
+            proc = subprocess.run(["bash", "-n", "-c", record["command"]], capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode, (record["command"], proc.stderr))
+        for candidate in entry["candidates"]:
+            if candidate.get("command"):
+                self.assertIn(shlex.split(candidate["command"]), seen, candidate["command"])
 
     def test_the_serial_read_names_port_one(self):
         """§2.1's command and its evidence example both spell `--port=1`, and
@@ -1213,7 +1263,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "object": candidate["object"],
             "impact": candidate["impact"],
             "evidence": {
-                "command": "gcloud compute instances list --project proj-1 --format=json",
+                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                 "excerpt": candidate["excerpt"],
             },
             "recommendation": {
@@ -1307,7 +1357,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         data["scope"]["clusters"][0]["checks_run"].append(
             {
                 "check": "sole-tenant-headroom",
-                "command": "gcloud compute sole-tenancy node-groups list --project proj-1 --format=json",
+                "command": f"gcloud compute sole-tenancy node-groups list --project proj-1 {shlex.quote(cf.NODE_GROUPS_FORMAT)}",
             }
         )
         with self.assertRaises(audit_report.ValidationError) as caught:
@@ -1388,7 +1438,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                         "checks_run": [
                             {
                                 "check": "gce-startup-script-status",
-                                "command": "gcloud compute instances list --project proj-1 --format=json",
+                                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                             }
                         ],
                     }
@@ -2243,14 +2293,12 @@ class ApiDisabledTest(unittest.TestCase):
 
 
 class SweepPoolTest(unittest.TestCase):
-    def test_pool_matches_the_fleet_audit_collectors_admitted_count(self):
-        # This collector sweeps projects through the same credential proxy as the
-        # fleet-audit collectors, so its pool is the same admitted count they pin
-        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). Tied to
-        # collect.MAX_WORKERS rather than a lone literal so the collectors move
-        # together. Discovered by the pool it runs, like the fleet-audit scan, so a
-        # collector added to this skill under any constant name is caught too.
-        import collect  # noqa: E402 -- fleet-audit/scripts is on sys.path above
+    def test_pool_resolves_the_broker_width(self):
+        # This collector sweeps projects through the same credential broker as the
+        # fleet-audit collectors, so its pool width is the broker's, read the same
+        # way (broker_admission.sweep_width()). Discovered by the pool it runs, like
+        # the fleet-audit scan, so a collector added to this skill is caught too.
+        from test_collect import assert_resolves_the_broker_width  # noqa: E402 -- fleet-audit/scripts is on sys.path above
 
         here = Path(os.path.dirname(__file__))
         pooled = sorted(
@@ -2261,16 +2309,7 @@ class SweepPoolTest(unittest.TestCase):
         self.assertIn("compute_fleet_audit.py", [p.name for p in pooled])
         for path in pooled:
             with self.subTest(collector=path.name):
-                mod = importlib.import_module(path.stem)
-                self.assertTrue(
-                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
-                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin",
-                )
-                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
-                self.assertEqual(
-                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
-                    mod.MAX_WORKERS,
-                )
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

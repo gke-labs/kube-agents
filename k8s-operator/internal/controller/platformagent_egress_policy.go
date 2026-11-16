@@ -68,17 +68,13 @@ package controller
 //     NetworkPolicy. The operator cannot detect that: an unenforced policy is
 //     accepted by the API server, stored, and returned by kubectl get exactly
 //     like an enforced one. There is no field, condition or event to read.
-//   - It can be undone from outside, and today it is. Policies selecting one
-//     Pod are additive, and another selects this one and permits the metadata
-//     path: <name>-gateway-netpol, which this same operator renders on every
-//     reconcile (buildNetworkPolicy — 169.254.169.254/32 on TCP 80, the
-//     discovered metadata-daemon port (988 by default) to both link-local
-//     metadata addresses, and TCP 443 to 0.0.0.0/0 minus
-//     the private ranges). So the policy
-//     below denies the metadata server, and the Pod it selects can still
-//     reach it. Narrowing the gateway policy is not done here: the metadata
-//     path is still what Workload Identity uses, and the broker Pod is the one
-//     that needs it. Scoping the allowance to that Pod alone is the follow-up.
+//   - It can be undone from outside. Policies selecting one Pod are additive,
+//     and another selects this one: <name>-gateway-netpol, which this same
+//     operator renders on every reconcile (buildNetworkPolicy). That policy no
+//     longer opens the metadata path (the gateway Pod holds no Google identity
+//     to fetch a token for), but it still permits TCP 443 to 0.0.0.0/0 minus
+//     the private and link-local ranges, so the allowlist below does not narrow
+//     the gateway's internet egress while that rule stands.
 
 import (
 	"fmt"
@@ -309,8 +305,8 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 
 	// The credential broker. This is the agent's route to every credentialed
 	// command it is allowed to run, so denying it denies the product:
-	// CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all
-	// address it (credentialProxyBaseURL). The Service publishes
+	// CREDENTIAL_PROXY_URL and, with Teams on, TEAMS_RELAY_URL address it
+	// (credentialProxyBaseURL). The Service publishes
 	// credentialProxyPort onto a target port of the same number, and the
 	// selector here is the broker Deployment's own "app" label — Pod selectors,
 	// not the Service, because that is what NetworkPolicy matches after the
@@ -399,8 +395,9 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// in the broker Pod and the minter call is the broker's egress, not the
 	// agent's; gemma-server and standalone-replay, because buildAgentConfig pins
 	// the agent's model base_url to LiteLLM unconditionally, so those backends
-	// are LiteLLM's egress. The gateway policy names all three anyway; narrowing
-	// it is the work that turns this field into a control.
+	// are LiteLLM's egress (litellm-policy admits a model server only through
+	// AnnotationLiteLLMUpstreamEgress). <name>-gateway-netpol names all three
+	// anyway; narrowing it is the work that turns this field into a control.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{tcpPort(8888)},
 		To: []networkingv1.NetworkPolicyPeer{{
@@ -413,29 +410,25 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 		}},
 	})
 
-	// The A2A bus, rendered only when the agent surface is up (mode: next, or
-	// version skew freezing a running next stack — a2aAgentSurface owns that
-	// asymmetry). buildPodTemplateSpec sets NATS_URL to the operator's own
-	// NATS Service under the same gate, so the destination comes from this
+	// The A2A bus. buildPodTemplateSpec sets NATS_URL to the operator's own
+	// NATS Service, so the destination comes from this
 	// repository's render, not a guess. The peer selects the NATS pods by the
 	// labels buildA2ANATSStatefulSet stamps, and mirrors the gateway policy's
 	// bus rule exactly, for the reason the sandbox rule above duplicates rule
 	// 11: either policy can be the only one present, and a missing rule here
 	// does not refuse the dial — it hangs it to the client timeout on an
 	// install whose CR reads Ready.
-	if a2aAgentSurface(agent) {
-		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4222)},
-			To: []networkingv1.NetworkPolicyPeer{{
-				PodSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						labelPartOf:       a2aPartOf,
-						a2aComponentLabel: "nats",
-					},
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(4222)},
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					labelPartOf:       a2aPartOf,
+					a2aComponentLabel: "nats",
 				},
-			}},
-		})
-	}
+			},
+		}},
+	})
 
 	// The Kubernetes API server, if and only if the operator was told where it
 	// is. There is no NetworkPolicy peer for "the API server": on GKE the
@@ -443,8 +436,9 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// Service address is translated to it before policy is evaluated. So it
 	// has to be a CIDR the cluster's owner supplies. Left empty, this rule is
 	// absent and nothing in the agent Pod can reach the API — which matters
-	// above one replica, where the container runs leader_elect.py and holds a
-	// Lease, and to any sidecar or plugin the operator added. That is a
+	// to any sidecar or plugin the operator added, and would matter to
+	// leader_elect.py above one replica, which the operator does not render
+	// today (supportedGatewayReplicas). That is a
 	// deliberate under-allow: inventing a range here would mean permitting a
 	// guess.
 	//

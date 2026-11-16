@@ -628,18 +628,14 @@ starlight-toc a[aria-current='true']:hover {
 }
 
 /* --- Tables ---
- * Fix identifier wrapping in the first column: tool names like
- * `read_many_files` were breaking at underscores. Also prevent any
- * inline code inside a table cell from wrapping mid-token.
+ * Keep inline code tokens (such as tool names like `read_many_files`) on one
+ * line so they never break mid-identifier, while allowing prose cells in any
+ * column — including the first — to wrap inside the content column.
  */
 .sl-markdown-content table:where(:not(.not-content *)) code {
   white-space: nowrap;
   word-break: keep-all;
   overflow-wrap: normal;
-}
-.sl-markdown-content table:where(:not(.not-content *)) td:first-child,
-.sl-markdown-content table:where(:not(.not-content *)) th:first-child {
-  white-space: nowrap;
 }
 /* `display: block` + `overflow-x: auto` keeps a wide table scrolling
  * inside its column instead of widening the whole document — the

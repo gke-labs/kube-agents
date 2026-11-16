@@ -11,15 +11,15 @@
 # Fix: route non-DaemonSet system pods to a dedicated, cheap class. Expensive
 # nodes only host actual workloads, and consolidation can drain them freely.
 #
-# After kubectl apply, label the namespace (the -non-daemonset variant leaves
+# In the same pull request, label the namespace (the -non-daemonset variant leaves
 # DaemonSets alone — they need to run everywhere anyway, and CA already
 # ignores DaemonSet-only nodes for scale-down):
 #
-#   kubectl label namespace kube-system \
-#     cloud.google.com/default-compute-class-non-daemonset=system-pool
+#   cloud.google.com/default-compute-class-non-daemonset: system-pool
+#   on the kube-system Namespace
 #
 # Existing system pods don't reschedule on their own — wait for natural
-# restarts or `kubectl rollout restart deployment -n kube-system <name>`.
+# restarts.
 #
 # whenUnsatisfiable: ScaleUpAnyway is intentional — never let priority
 # exhaustion block a kube-system pod (would cascade into a wider outage).

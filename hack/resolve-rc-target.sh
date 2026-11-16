@@ -110,10 +110,9 @@ fi
 # (required_release_images_at, which check_commit_images_exist reads; the
 # diagnostic below walks the same list, since this tree may be a newer main
 # whose list has grown past the candidate's), deliberately, though an eval
-# install on this path renders only the operator, the agent, the proxy and the sandbox: both
-# plugins default to enabled=false, and the A2A next-stack images and the
-# bridge belong to a mode: next install, which this path refuses
-# (hack/ci-deploy.sh, RC_COMMIT_SHA with EVAL_MODE_NEXT). The gate
+# install on this path never renders the two plugin images (both default to
+# enabled=false); the A2A next-stack images and the bridge it does render,
+# under EVAL_MODE_NEXT=1 (hack/ci-deploy.sh, step 4). The gate
 # asks "is this commit published", and that is the release path's question with
 # the release path's answer; a shorter list here would be a second definition of
 # a published commit, disagreeing with verify_release_eligibility.sh about which

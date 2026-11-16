@@ -11,13 +11,14 @@ the flag set names the six next-stack images and fills the operator.extraEnv
 values the release expands (the five image overrides, the inject door's flag,
 and two settings of the bridge the operator renders: its image and its
 concurrency; its executor is left to the bridge's default, api, which the
-start-line wait requires), the Cloud Build's `a2a` and `a2a-bridge`
+start-line wait requires; and the card stop), the Cloud Build's `a2a` and `a2a-bridge`
 steps run with `docker` stubbed build and push those six in order with the
-bridge FROM this build's platform image, the three guards (release-candidate
-path, Prow run with no pull request that is not a next-lane job, the
-concurrency's grammar) run against the values they refuse and admit, and the
-release-candidate refusal sits at the top of the branch the script says it
-guards.
+bridge FROM this build's platform image, the two guards (Prow run with no
+pull request that is not a job on the allow-list, the concurrency's grammar)
+run against the values they refuse and admit. On the release-candidate path
+the same section builds nothing and hands the operator the candidate's
+published images under the same names, with the same inject flag and bridge
+settings.
 
 The names the flag path hands the operator, or reads back from what it
 renders, are copied from the operator's Go source, the bridge's, and the eval
@@ -52,6 +53,7 @@ that ships.
 
 import json
 import pathlib
+import tempfile
 import re
 import shlex
 import subprocess
@@ -72,6 +74,8 @@ _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
+_A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
+_A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
@@ -88,20 +92,42 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_VERIFIER_URI",
     "_A2A_CONSOLE_URI",
     "_A2A_BRIDGE_URI",
+    "_A2A_DISPATCHER_URI",
+    "_PERSONA_CLUSTER_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
-# The next lane's Prow jobs (oss-test-infra), the only runs section 2b
-# admits the flag on without a pull request; the today nightly and a made-up job
-# stand for every other Prow run.
+# The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
+# request: the merge-blocking presubmit (in a batch Tide ran), the main
+# nightly's eight parts, the GitLab next nightly, the forge lanes' weekly
+# jobs and the certification lane's first slice; the retired today-mode GitLab
+# nightly's name and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
-    "pull-kube-agents-smoke-test-next",
-    "ci-kube-agents-eval-next",
-    "ci-kube-agents-eval-nightly-next-claude",
+    "pull-kube-agents-smoke-test",
+    "ci-kube-agents-eval-nightly",
+    "ci-kube-agents-eval-nightly-main-b",
+    "ci-kube-agents-eval-nightly-main-c",
+    "ci-kube-agents-eval-nightly-main-d",
+    "ci-kube-agents-eval-nightly-main-e",
+    "ci-kube-agents-eval-nightly-writers",
+    "ci-kube-agents-eval-nightly-writers-b",
+    "ci-kube-agents-eval-nightly-writers-c",
+    "ci-kube-agents-eval-nightly-gitlab-next",
+    "ci-kube-agents-eval-weekly-ghes-next",
+    "ci-kube-agents-eval-weekly-gitlab-ce-next",
+    "ci-kube-agents-certification-1",
+    # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
+    "post-kube-agents-eval-rc",
+    # The replay lane: a periodic replaying the next-mode nightlies' recordings.
+    "ci-kube-agents-eval-replay-lane",
+    # The Slack lane's nightly: hack/slack-lane/run.sh in place of the matrix.
+    "ci-kube-agents-eval-nightly-slack",
 )
-_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
+_RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
+_RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
+_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly-gitlab"
 _OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
@@ -153,7 +179,7 @@ def go_int_constant(path: pathlib.Path, name: str) -> int:
 # The variables a lifted section reads from the job environment. Unset first,
 # so "not exported by the test" means unset rather than whatever the shell
 # running the tests happens to export (a developer reproducing a flag run).
-_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
+_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_ROLLBACK_LANE", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
 
 
 def run_bash(script: str) -> subprocess.CompletedProcess:
@@ -220,7 +246,7 @@ def flag_line(mode_next: str | None) -> str:
 _BRIDGE_CONCURRENCY = "6"
 
 
-def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
+def run_build_section(mode_next: str | None, *extra: str) -> subprocess.CompletedProcess:
     """Run section 4 with `gcloud` stubbed to print its argv on stderr, then
     print the operator.extraEnv values it left for the release.
     MODE_NEXT_BRIDGE_CONCURRENCY is set as section 2b leaves it under the
@@ -241,6 +267,7 @@ def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
                 'gcloud() { printf "%s\\n" "$@" >&2; case "$1 $2" in "builds submit") printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
                 'timeout() { shift 2; "$@"; }',
                 flag_line(mode_next),
+                *extra,
                 constants_block(),
                 lifted(*_BUILD_SECTION),
                 'for arg in ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"}; do echo "HELM=${arg}"; done',
@@ -299,7 +326,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         """The a2a step pushes from inside itself because `images:` cannot be
         conditional; the list must not have grown to include them."""
         config = yaml.safe_load(text(_CLOUDBUILD))
-        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI"])
+        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI", "$_KUBE_PROXY_URI"])
         for name in _A2A_SUBSTITUTIONS:
             self.assertEqual(config["substitutions"][name], "")
 
@@ -391,6 +418,58 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"operator.extraEnv[7].name={go_constant(_A2A_BRIDGE, 'a2aBridgeConcurrencyOperatorEnvVar')}",
             "--set-string",
             f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
+        ]
+        # The card stop, armed on the lane so chat-stop-halts-delegated-remediation
+        # grades it, under the name the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[8].name={go_constant(_A2A_MANIFESTS, 'a2aCardStopEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[8].value=true",
+        ]
+        # The gateway's election, off for installs and on for the lane, under
+        # the name the operator reads it by, which opens it only on "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[9].name={go_constant(_A2A_GATEWAY_LEASE, 'a2aGatewayElectionEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[9].value=true",
+        ]
+        # The AgentProfile dispatcher runs by default, so the lane runs it,
+        # at this build's image, under the name the operator reads.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[10].name={go_constant(_A2A_DISPATCHER, 'a2aDispatcherImageEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
+        ]
+        # The cluster profile's images, at this build: its persona and worker.
+        # Unset, the chart would take ghcr at the CI tag.
+        for key, image in (
+            ("profiles.cluster.persona", "persona-cluster"),
+            ("profiles.cluster.harness", "a2a-worker"),
+        ):
+            expected += [
+                "--set-string",
+                f"{key}.image.repository={_AR_REPO}/{image}",
+                "--set-string",
+                f"{key}.image.tag={_TAG}",
+            ]
+        # The A2A door, for the card-wait stopped ask (#5407), under the name
+        # the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[11].name={go_constant(_A2A_MANIFESTS, 'a2aAgentDoorEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[11].value=true",
+        ]
+        # The bus's debug logging (#5708), under the name the operator reads,
+        # which turns it on only for "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[12].name={go_constant(_A2A_MANIFESTS, 'a2aNATSDebugEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[12].value=true",
         ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
@@ -523,26 +602,60 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
         self.assertIn("{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()}", text(_A2A_BRIDGE))
 
-    def test_the_release_candidate_path_refuses_the_flag(self) -> None:
-        script = text(_CI_DEPLOY)
-        rc_branch = script.index('if [ -n "${RC_COMMIT_SHA:-}" ]; then')
-        refusal = script.index('if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then', rc_branch)
-        self.assertLess(refusal - rc_branch, 600, "the refusal belongs at the top of the RC branch")
-        # Run, not only read: the inner guard, lifted, refuses under the flag
-        # and lets an RC run through without it.
-        guard = script[refusal:]
-        guard = guard[: guard.index("\n  fi\n") + len("\n  fi\n")]
-        self.assertEqual(run_bash(f"export EVAL_MODE_NEXT=1\n{guard}").returncode, 1)
-        self.assertEqual(run_bash(guard).returncode, 0)
+    def test_the_release_candidate_path_names_the_candidates_published_images(self) -> None:
+        """The release-candidate eval grades next (#2007): section 4 under the
+        flag with RC_COMMIT_SHA set submits no build and hands the operator the
+        same nine values, with the five A2A references and the bridge's under
+        the published registry at the candidate's commit, the image names
+        REQUIRED_RELEASE_IMAGES publishes."""
+        result = run_build_section(
+            "1",
+            f'export RC_COMMIT_SHA="{_RC_COMMIT_SHA}"',
+            f'RC_REGISTRY_PREFIX="{_RC_REGISTRY_PREFIX}"',
+            f'export TAG="{_RC_COMMIT_SHA}"',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("builds", result.stderr, "the release-candidate path must not submit a build")
+        values = [arg for arg in helm_args(result) if ".value=" in arg]
+        published = [f"operator.extraEnv[{i}].value={_RC_REGISTRY_PREFIX}/{image}:{_RC_COMMIT_SHA}" for i, image in enumerate(_A2A_IMAGES[:5])]
+        self.assertEqual(values[:5], published)
+        self.assertEqual(values[5], "operator.extraEnv[5].value=true")
+        self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
+        self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
+        self.assertEqual(values[8], "operator.extraEnv[8].value=true")
+        # The gateway's election, on for the lane on this path too.
+        self.assertEqual(values[9], "operator.extraEnv[9].value=true")
+        # The dispatcher, at the candidate's published image.
+        self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
+        self.assertEqual(values[11], "operator.extraEnv[11].value=true")
+        self.assertEqual(values[12], "operator.extraEnv[12].value=true")
+        self.assertEqual(len(values), 13, values)
+        self.assertNotIn(_AR_REPO, result.stdout)
+        # The names are the ones the release publishes.
+        common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
+        for image in _A2A_IMAGES:
+            self.assertIn(f'  "{image}"\n', common, f"{image} is not in REQUIRED_RELEASE_IMAGES")
+        # And the release-candidate branch of section 2a no longer refuses the flag.
+        self.assertNotIn("together with RC_COMMIT_SHA", text(_CI_DEPLOY))
+
+    def test_the_release_candidate_path_without_the_flag_hands_the_operator_nothing(self) -> None:
+        result = run_build_section(
+            None,
+            f'export RC_COMMIT_SHA="{_RC_COMMIT_SHA}"',
+            f'RC_REGISTRY_PREFIX="{_RC_REGISTRY_PREFIX}"',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(helm_args(result), [])
+        self.assertNotIn("builds", result.stderr)
 
     def test_a_prow_run_without_a_pull_request_refuses_the_flag_unless_the_job_is_the_lanes(self) -> None:
         """Section 2b admits the flag on a pull request's run and on the jobs
-        EVAL_MODE_NEXT_JOB_NAMES lists (the next lane's periodic and nightly have
+        EVAL_MODE_NEXT_JOB_NAMES lists (the nightlies and the RC postsubmit have
         no PULL_NUMBER); every other Prow run under it is still refused, with the
         error naming the job, and the flag unset changes nothing."""
         guard = prow_guard()
         lane_jobs = constants()["EVAL_MODE_NEXT_JOB_NAMES"].split()
-        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the next lane's jobs")
+        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the jobs that deploy under the flag")
         cases = {
             # (flag, IS_PROW_RUN, PULL_NUMBER, JOB_NAME) -> refused
             ("1", "true", "", _OTHER_JOB_NAME): True,
@@ -562,9 +675,9 @@ class FlagSetIsNextTest(unittest.TestCase):
                 if refused:
                     self.assertIn(f"no PULL_NUMBER (JOB_NAME={job})", result.stderr)
                     # The consequence the error names is the one the tree has:
-                    # a flagged run records nothing, so the refused job would
-                    # go missing from main's record, not move it.
-                    self.assertIn("record nothing to main's", result.stderr)
+                    # a flagged run records under next's key, so the refused
+                    # job's today-mode dashboard record would go missing.
+                    self.assertIn("leaving\n       its today-mode dashboard record silently missing", result.stderr)
                     self.assertNotIn("would record next-mode samples", result.stderr)
                     self.assertEqual(result.stdout, "")
                 elif flag == "1" and prow == "true" and not pull:
@@ -572,9 +685,34 @@ class FlagSetIsNextTest(unittest.TestCase):
                 else:
                     self.assertEqual(result.stdout, "", "the flag unset, a pull request's run, or a laptop logs nothing here")
 
+    def test_the_rollback_lane_without_the_flag_is_refused_at_second_zero(self) -> None:
+        """EVAL_ROLLBACK_LANE=1 rolls a next install back to today before the
+        matrix, so without EVAL_MODE_NEXT=1 there is nothing to roll back; the
+        deploy refuses it beside the 2b refusal, before anything is built, and
+        lets every other combination through."""
+        script = text(_CI_DEPLOY)
+        start = 'if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ "${EVAL_MODE_NEXT:-}" != "1" ]; then'
+        self.assertLess(script.index(start), script.index("# ─── 4. Build Container Images"), "the refusal belongs before the build")
+        guard = lifted_block(start, "fi", "the rollback-lane refusal")
+        cases = {
+            # (EVAL_ROLLBACK_LANE, EVAL_MODE_NEXT) -> refused
+            ("1", ""): True,
+            ("1", "0"): True,
+            ("1", "1"): False,
+            ("", "1"): False,
+            ("", ""): False,
+            ("0", ""): False,
+        }
+        for (lane, flag), refused in cases.items():
+            with self.subTest(lane=lane, flag=flag):
+                result = run_bash(f'export EVAL_ROLLBACK_LANE="{lane}" EVAL_MODE_NEXT="{flag}"\n{guard}')
+                self.assertEqual(result.returncode, 1 if refused else 0, result.stderr)
+                if refused:
+                    self.assertIn("EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1", result.stderr)
+
     def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
         """A prefix, a suffix or a substring of a listed name is not the job:
-        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse.
+        `ci-kube-agents-eval-nightly-2` or `kube-agents-eval-nightly` must refuse.
         So must a value spelling two adjacent entries with the space between
         them, which a pattern over the joined list would have admitted."""
         guard = prow_guard()
@@ -619,11 +757,13 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_gates_run_in_dependency_order_and_skip_the_two_that_cannot(self) -> None:
         block = lifted(*_MODE_SECTION)
+        # The bus first, through its own gate (quorum, then every server).
+        self.assertEqual(re.findall(r'gate_mode_next_bus "(\S+)"', block), ["statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"])
+        self.assertLess(block.index('gate_mode_next_bus "'), block.index('gate_mode_next_rollout "'))
         gated = re.findall(r'gate_mode_next_rollout "(\S+)"', block)
         self.assertEqual(
             gated,
             [
-                "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats",
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Twice: the operator adds the bridge to the agent pod only
@@ -668,6 +808,62 @@ class FlagSetIsNextTest(unittest.TestCase):
                 for line in block.splitlines():
                     if "rollout status" in line or "gate_mode_next_rollout" in line:
                         self.assertNotIn(never_gated, line)
+
+    def test_the_bus_gate_passes_at_a_quorum_and_waits_longer_for_the_rest(self) -> None:
+        """A three-server bus serves on two, and on Autopilot each further
+        server waits on a node scale-up: the gate passes the bus at a quorum
+        within the rollout budget, gives the rest the longer budget, and stops
+        the deploy if either runs out. The function is lifted whole and run
+        against a kubectl stub that answers readyReplicas from a sequence, on
+        budgets of a few seconds."""
+        consts = constants()
+        self.assertGreater(int(consts["MODE_NEXT_BUS_FULL_TIMEOUT"].rstrip("s")), int(consts["MODE_NEXT_ROLLOUT_TIMEOUT"].rstrip("s")))
+
+        def run(replicas: int, ready: list[int]) -> subprocess.CompletedProcess:
+            seq = " ".join(str(r) for r in ready)
+            script = f"""
+MODE_NEXT_GENERATION_ATTEMPTS=1 MODE_NEXT_POLL_SECONDS=0.2 MODE_NEXT_ROLLOUT_TIMEOUT=2s MODE_NEXT_BUS_FULL_TIMEOUT=3s
+NAMESPACE=ns MODE_NEXT_START=$SECONDS
+READY=({seq}); COUNTER="$(mktemp)"; echo 0 > "$COUNTER"
+# kubectl runs in $(...), a subshell, so the read count lives in a file.
+kubectl() {{
+  case "$*" in
+    *"{{.spec.replicas}}"*) echo {replicas} ;;
+    *readyReplicas*)
+      local n; n="$(cat "$COUNTER")"; echo $((n + 1)) > "$COUNTER"
+      local i=$(( n < ${{#READY[@]}} ? n : ${{#READY[@]}} - 1 ))
+      echo "${{READY[$i]}}" ;;
+    *) return 0 ;;
+  esac
+}}
+dump_mode_next_state() {{ echo DUMPED; }}
+{shell_function("gate_mode_next_bus")}
+gate_mode_next_bus "statefulset/x-a2a-nats"
+echo PASSED
+"""
+            return run_bash(script)
+
+        # Quorum at once, the third a little later: passes, after both lines.
+        ok = run(3, [2, 2, 2, 3])
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn("serving on 2 of 3 servers (quorum 2)", ok.stdout)
+        self.assertIn("rolled out: 3 of 3", ok.stdout)
+        self.assertIn("PASSED", ok.stdout)
+        # Quorum but the third never schedules: stops after the longer budget.
+        stalled = run(3, [2])
+        self.assertEqual(stalled.returncode, 1, stalled.stdout)
+        self.assertIn("still has 2 of 3 servers Ready", stalled.stdout)
+        self.assertIn("DUMPED", stalled.stdout)
+        self.assertNotIn("PASSED", stalled.stdout)
+        # No quorum within the rollout budget: stops there.
+        short = run(3, [1])
+        self.assertEqual(short.returncode, 1, short.stdout)
+        self.assertIn("short of its quorum of 2", short.stdout)
+        self.assertNotIn("serving on", short.stdout)
+        # A single server's quorum is the one server.
+        one = run(1, [0, 1])
+        self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
+        self.assertIn("rolled out: 1 of 1", one.stdout)
 
     def test_the_provisioning_job_gate_stops_on_either_terminal_condition(self) -> None:
         """The gate polls the Jobs' True conditions and stops on Complete or
@@ -784,6 +980,66 @@ class TasksBudgetSizingTest(unittest.TestCase):
         # The default lane fits; the reason the sizing exists.
         default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
         self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
+
+    def test_the_next_lane_turns_the_audits_automatic_sweep_off_at_install(self) -> None:
+        """#3439: the lane's write safeguard charges any pull request in a repetition's
+        window to the case in flight, and the fleet audits' sweep opens one on every
+        fresh install once the pool repositories declare checkout-gateway. The switch
+        rides the install's own helm args, gated on EVAL_MODE_NEXT=1, so the today
+        lane's release is unchanged; the operator forwards the name to the shell
+        sandbox and audit_report.py reads it (pinned across the three files)."""
+        script = _CI_DEPLOY.read_text()
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
+        self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
+        assert block is not None
+        self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
+        # The cluster profile, which a delegation case reads (#5194). Not tse,
+        # whose placeholder persona a dispatched worker can't stage (#3842).
+        self.assertIn('--set "profiles.cluster.enabled=true"', block.group(1))
+        self.assertNotIn("profiles.tse", block.group(1))
+        self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
+        self.assertIn("KUBEAGENTS_AUDIT_AUTO_PROMOTE", (root / "deploy/sandbox/entrypoint.sh").read_text())
+        self.assertIn('AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "agents/platform/skills/fleet-audit/scripts/audit_report.py").read_text())
+
+    def test_every_lane_turns_the_brokers_readings_sweep_off(self) -> None:
+        """#4611: the eval projects share one GitHub App installation, and the
+        readings sweep's hourly budget is sized for one install per installation,
+        so concurrent lanes drained its quota. Every lane's install sets the
+        broker's switch, at the env index just before the next lane's own, and
+        the broker reads that exact name and value."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('--set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS"', script)
+        self.assertIn('--set-string "platformAgent.deployment.env[3].value=off"', script)
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
+        assert block is not None
+        self.assertNotIn("CREDENTIAL_PROXY_VCS_READINGS", block.group(1), "set on every lane, not the next lane alone")
+        broker = (_CI_DEPLOY.parent.parent / "agents/platform/scripts/credential_proxy.py").read_text()
+        self.assertIn('VCS_READINGS_ENV = "CREDENTIAL_PROXY_VCS_READINGS"', broker)
+        self.assertIn('VCS_READINGS_OFF = "off"', broker)
+
+    def test_every_lane_excludes_the_stalled_config_connector_namespace_from_the_event_watcher(self) -> None:
+        """The kcc-stalled-declaration stack holds a ContainerNodePool at
+        DependencyNotFound for the whole run, and that reason is on the
+        watcher's list. Every lane's install excludes the stack's namespace,
+        by the name the stack and the case use."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"', script)
+        release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
+        assert release is not None
+        self.assertIn(
+            '--set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}"',
+            release.group(0),
+        )
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
+        assert block is not None
+        self.assertNotIn("alertExclude", block.group(1), "set on every lane, not the next lane alone")
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn('kcc_namespace: "eval-kcc-stalled"', (root / "bench/tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml").read_text())
+        self.assertIn('"DependencyNotFound"', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
+        self.assertIn("DependencyNotFound", (root / "deploy/shared/start-services.sh").read_text())
 
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()
@@ -1083,14 +1339,16 @@ class ProvisionRerunGateTest(unittest.TestCase):
     def test_the_status_words_are_the_operators(self) -> None:
         consts = constants()
         controller = text(_CONTROLLER / "platformagent_controller.go")
-        self.assertIn(f'agent.Status.Phase = "{consts["CR_PHASE_DEGRADED"]}"', controller)
+        # The phase is a constant the usage gauges' vocabulary shares (usage_gauges.go).
+        self.assertIn("agent.Status.Phase = degradedPhase", controller)
+        self.assertRegex(controller, rf'degradedPhase\s+= "{consts["CR_PHASE_DEGRADED"]}"')
         self.assertIn(f'r.updateStatusDegraded(ctx, instance, "{consts["CR_READY_REASON_PROVISION_FAILED"]}", a2aState.message', controller)
         self.assertRegex(controller, r'Type:\s*"Ready",\s*Status:\s*metav1\.ConditionFalse,\s*Reason:\s*reason,')
         self.assertIn('ObservedGeneration int64 `json:"observedGeneration,omitempty"`', text(_API_TYPES))
         # The ordering the wait relies on: the pass rolls the agent
         # Deployment before it creates or sweeps the provision Job, and
         # nothing watches Jobs, so the Failed status arrives on a requeue.
-        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance)"))
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance,"))
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 
@@ -1687,19 +1945,20 @@ class BridgeImageBuildTest(unittest.TestCase):
             ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
             ("a2a-verifier", "A2A_VERIFIER_IMAGE"),
             ("a2a-console", "A2A_CONSOLE_IMAGE"),
+            ("a2a-dispatcher", "A2A_DISPATCHER_IMAGE"),
             ("hermes-bridge", "A2A_BRIDGE_IMAGE"),
         ):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_five_in_order(self) -> None:
-        """The five A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_six_in_order(self) -> None:
+        """The six A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:5], strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher"), strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             # The worker's Dockerfile copies the credential broker's shim client
             # from agents/platform/scripts, so it builds from the repository
@@ -1707,6 +1966,10 @@ class BridgeImageBuildTest(unittest.TestCase):
             context = "." if suffix == "worker" else "a2a"
             expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
             expected.append(f"docker push {uri}")
+        # The cluster persona, from its own directory, as the ghcr workflow builds it.
+        uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_the_bridge_step_waits_for_the_platform_image_and_builds_from_it(self) -> None:
@@ -1737,6 +2000,42 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("built FROM this run's platform image", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+
+class CrStatusReportTest(unittest.TestCase):
+    """report_cr_status: the agent's full status, which names the model the
+    install serves, goes to the job's artifacts; the job log, which Prow
+    streams to anyone while a run is in progress, gets the phase and the
+    Ready condition only."""
+
+    def test_the_log_line_names_no_model_and_the_artifact_holds_the_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                "\n".join(
+                    [
+                        f'export ARTIFACTS="{tmp}/artifacts"',
+                        'export NAMESPACE="kubeagents-system"',
+                        'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                        "kubectl() {",
+                        '  case "$*" in',
+                        '    *"-o yaml"*) printf "status:\\n  phase: Running\\n  inference:\\n    model: secret-model-name\\n    provider: vertex_ai\\n" ;;',
+                        '    *jsonpath*) printf "Running\\tAgentReady: the agent is up" ;;',
+                        "  esac",
+                        "}",
+                        lifted_block("readonly DEPLOY_ARTIFACT_DIR=", "readonly CR_PHASE_READY_JSONPATH", "the artifact dir and status constants"),
+                        shell_function("report_cr_status"),
+                        'report_cr_status "probe"',
+                    ]
+                )
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("secret-model-name", result.stdout + result.stderr)
+            self.assertIn("Running", result.stdout)
+            self.assertIn("AgentReady", result.stdout)
+            artifact = pathlib.Path(tmp) / "artifacts" / "platformagent-status-probe.yaml"
+            self.assertTrue(artifact.exists(), result.stdout)
+            self.assertIn("secret-model-name", artifact.read_text())
 
 
 if __name__ == "__main__":

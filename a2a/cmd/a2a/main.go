@@ -69,6 +69,9 @@ func main() {
 		if errors.Is(err, errNotifyRouteUnavailable) {
 			os.Exit(notifyExitRouteUnavailable)
 		}
+		if errors.Is(err, errNotifyKept) {
+			os.Exit(notifyExitKept)
+		}
 		os.Exit(1)
 	}
 }

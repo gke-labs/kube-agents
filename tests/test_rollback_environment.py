@@ -139,11 +139,14 @@ class RunUpgradeTest(unittest.TestCase):
         text = _SCRIPT.read_text()
         start = text.index("run_upgrade() {")
         function = text[start : text.index("\n}\n", start) + len("\n}\n")]
-        flag = re.search(r"^readonly DROP_UNDECLARED_VALUES_FLAG=.*$", text, re.MULTILINE).group(0)
+        flags = "\n".join(
+            re.search(rf"^readonly {name}=.*$", text, re.MULTILINE).group(0)
+            for name in ("DROP_UNDECLARED_VALUES_FLAG", "ALLOW_BREAKING_DOWNGRADE_FLAG")
+        )
         script = f"""
 set -euo pipefail
 DIAGNOSTICS_DIR={tmp.name}
-{flag}
+{flags}
 {function}
 run_upgrade {checkout} 0.7.0 operator {drop}
 """
@@ -160,6 +163,17 @@ run_upgrade {checkout} 0.7.0 operator {drop}
         proc = self._run("true", '#!/usr/bin/env bash\necho "args=$*"\n')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("args=--non-interactive --upgrade-mode=operator --image-tag 0.7.0\n", proc.stdout)
+
+    def test_the_rollback_leg_passes_the_breaking_change_bypass_to_a_script_that_takes_it(self):
+        stub = '#!/usr/bin/env bash\n# --drop-undeclared-values --allow-breaking-downgrade\necho "args=$*"\n'
+        proc = self._run("true", stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            "args=--non-interactive --upgrade-mode=operator --image-tag 0.7.0 --drop-undeclared-values --allow-breaking-downgrade\n",
+            proc.stdout,
+        )
+        forward = self._run("false", stub)
+        self.assertNotIn("--allow-breaking-downgrade", forward.stdout.split("args=")[1])
 
     def test_only_the_rollback_calls_ask_for_the_drop(self):
         lines = (line.strip() for line in _SCRIPT.read_text().splitlines())

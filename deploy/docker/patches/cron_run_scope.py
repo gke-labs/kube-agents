@@ -4,6 +4,13 @@ Installed into the image at ``/opt/hermes/tools/cron_run_scope.py`` and wired
 into ``cron/scheduler.py``, ``tools/cronjob_tools.py``, and
 ``tools/kanban_tools.py`` by ``deploy/docker/Dockerfile``.
 
+The same applier wires the origin of the work into the scheduler and the
+cronjob tool: the scheduler tick runs each job inside
+:func:`cron_tick_origin_scope`, the cronjob tool's ``run`` action runs inside
+:func:`cron_direct_origin_scope` with the asking turn's origin, and
+``cronjob_manage`` records a job's origin on ``create`` and ``update``.
+``cron_job_template.py`` holds how a tick's origin is resolved and recorded.
+
 Two upstream defects combine badly when an orchestrator profile dispatches a
 cron job with ``cronjob(action='run')``. Both were observed in production on
 2026-08-04, when three of the five fleet-audit streams published wrong results
@@ -95,9 +102,11 @@ and hand the card to a second worker.
 from __future__ import annotations
 
 import contextlib
+import functools
+import importlib
 import os
 from contextvars import ContextVar
-from typing import Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 
 #: Name of the marker, used for both the context variable and the env var.
 CRON_RUN_ENV = "HERMES_KANBAN_CRON_RUN"
@@ -119,6 +128,21 @@ DEFAULT_CRON_RISK = "high"
 
 #: Declared risk tier of the cron job executing in this context (default "high").
 _CRON_RUN_RISK: ContextVar = ContextVar(CRON_RISK_ENV, default="")
+
+#: Name of the run-origin context variable.
+CRON_ORIGIN_VAR = "kube_agents_cron_run_origin"
+
+#: ``(origin, platform)`` of the cron run executing in this context, or None
+#: outside a run. See :func:`cron_tick_origin_scope` and
+#: :func:`cron_direct_origin_scope`.
+_CRON_RUN_ORIGIN: ContextVar = ContextVar(CRON_ORIGIN_VAR, default=None)
+
+#: Where Hermes installs the template matcher, and the name a test loads it under.
+CRON_JOB_TEMPLATE_MODULES = ("tools.cron_job_template", "cron_job_template")
+#: Where Hermes installs the turn-origin resolver, and the name a test loads it under.
+KANBAN_ORIGIN_MODULES = ("hermes_cli.kanban_origin", "kanban_origin")
+#: A run's origin when no resolver is installed or the turn does not resolve.
+UNRESOLVED_RUN_ORIGIN = ("other", "")
 
 
 @contextlib.contextmanager
@@ -143,6 +167,97 @@ def cron_run_scope(job_id: str, risk: str = DEFAULT_CRON_RISK) -> Iterator[None]
     finally:
         _CRON_RUN_RISK.reset(risk_token)
         _CRON_RUN_JOB.reset(token)
+
+
+@contextlib.contextmanager
+def cron_tick_origin_scope(job: Mapping) -> Iterator[None]:
+    """Mark the current context as a tick-started run of ``job``, with its origin.
+
+    Entered by the scheduler's tick path only (``_process_due_job``, patched by
+    ``apply_cron_run_scope.py``), around ``run_one_job``. The cronjob tool's
+    direct run calls ``run_one_job`` without it and enters
+    :func:`cron_direct_origin_scope` instead. The origin is
+    ``cron_job_template.run_origin(job)``: ``audit`` or ``scheduled`` for a job
+    that matches the image's template, else the job's Session KV record, else
+    ``other``. A ContextVar for the same reasons as :func:`cron_run_scope`:
+    ``run_job`` copies the context into the agent's worker thread.
+    """
+    origin = _resolve_run_origin(job)
+    token = _CRON_RUN_ORIGIN.set(origin)
+    try:
+        yield
+    finally:
+        _CRON_RUN_ORIGIN.reset(token)
+
+
+@contextlib.contextmanager
+def cron_direct_origin_scope(origin: tuple) -> Iterator[None]:
+    """Mark the current context as a direct run started by a turn of ``origin``.
+
+    A direct run (``cronjob(action='run')``) runs as the session that asked
+    for it. The run itself cannot find that session: Hermes' cron run scope
+    blanks the session platform and chat id, and the cron agent publishes its
+    own ``cron_<job>_<ts>`` session id, which has no origin record. So the
+    asking turn's origin is resolved before the run starts
+    (:func:`direct_run_origin`) and bound here, in the same ContextVar the tick
+    path uses. The background path's pool copies the context at submit, and
+    ``run_job`` copies it into the agent's worker thread, so both paths see it.
+    """
+    token = _CRON_RUN_ORIGIN.set(tuple(origin or UNRESOLVED_RUN_ORIGIN))
+    try:
+        yield
+    finally:
+        _CRON_RUN_ORIGIN.reset(token)
+
+
+def direct_run_origin() -> tuple:
+    """The current turn's ``(origin, platform)``, or ``("other", "")``. Never raises.
+
+    ``kanban_origin.turn_origin``: a kanban worker's card stamp, else a cron
+    run's origin when this turn is one, else the trusted session's record,
+    else the console id convention.
+    """
+    for name in KANBAN_ORIGIN_MODULES:
+        try:
+            resolver = importlib.import_module(name)
+        except ImportError:
+            continue
+        try:
+            return tuple(resolver.turn_origin())
+        except Exception:  # noqa: BLE001 — an unresolved turn never stops a run
+            return UNRESOLVED_RUN_ORIGIN
+    return UNRESOLVED_RUN_ORIGIN
+
+
+def with_direct_origin(action: Callable[..., Any]) -> Callable[..., Any]:
+    """Run the cronjob tool's ``run`` action inside the asking turn's origin."""
+
+    @functools.wraps(action)
+    def wrapper(*args, **kwargs):
+        with cron_direct_origin_scope(direct_run_origin()):
+            return action(*args, **kwargs)
+
+    return wrapper
+
+
+def _resolve_run_origin(job: Mapping) -> tuple:
+    for name in CRON_JOB_TEMPLATE_MODULES:
+        try:
+            template = importlib.import_module(name)
+        except ImportError:
+            continue
+        return template.run_origin(job)
+    return UNRESOLVED_RUN_ORIGIN
+
+
+def current_cron_origin() -> Optional[tuple]:
+    """``(origin, platform)`` of the cron run in this context, or None.
+
+    A tick-started run's template or recorded origin; a direct run's asking
+    turn. No environment fallback: the origin must come from the scheduler's own
+    context, never a variable a process could inherit or plant.
+    """
+    return _CRON_RUN_ORIGIN.get()
 
 
 def current_cron_risk(environ: Optional[Mapping[str, str]] = None) -> str:

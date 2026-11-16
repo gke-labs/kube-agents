@@ -75,6 +75,7 @@ def _profile_configs():
     return {
         "platform": merge(shared, platform),
         "cluster": yaml.safe_load(h.text("cluster_config")),
+        "tse": yaml.safe_load(h.text("tse_config")),
     }
 
 
@@ -259,7 +260,10 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
             if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_TARGETS)
         }
-        modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
+        modelled = {
+            h.SOURCES[name].path
+            for name in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config")
+        }
         self.assertEqual(
             set(),
             declaring - modelled,
@@ -540,7 +544,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         """
         relay = "${KUBE_AGENTS_MCP_RELAY_URL}/"
         checked = 0
-        for source in ("shared_defaults_config", "platform_config", "cluster_config"):
+        for source in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config"):
             servers = (yaml.safe_load(h.text(source)) or {}).get("mcp_servers") or {}
             for alias, spec in servers.items():
                 spec = spec or {}
@@ -567,11 +571,15 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
 
     def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
-        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        """The relay is the gateway's: the sandbox and session pods get no new read path.
+
+        Profile workers are the one other role, narrowed in the handler to the
+        servers whose tools name no cluster (A3, PROFILE_SERVER_TOOLS, #3658).
+        """
         prefix = h.mcp_policy.MCP_RELAY_PREFIX
         self.assertEqual(
             h.credential_proxy.required_roles(prefix + "gke"),
-            (h.credential_proxy.CALLER_ROLE_CHAT,),
+            (h.credential_proxy.CALLER_ROLE_CHAT, h.credential_proxy.CALLER_ROLE_PROFILE),
         )
 
     def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:
@@ -624,18 +632,24 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Six workflows hold it, and none can give an approval:
+        Seven workflows hold it, and none can give an approval:
 
+        - auto-enqueue: `schedule`, `workflow_dispatch` and
+          `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`. Its
+          `GITHUB_TOKEN` pull-request write is one comment on a pull request
+          removed from the merge queue, saying why and how to put it back. Its
+          auto-merge calls run on a GitHub App token, which the tests below
+          pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
-        - auto-assign-milestone: triggers on `pull_request_target: closed`
-          gated on `merged == true`, so it runs only after the merge decision
-          has been taken, and its one call is `gh pr edit --milestone`.
         - coverage-comment: `workflow_run`-triggered in the base repository,
           job-gated on `github.repository`, and its one write is posting the
           coverage comment.
         - risk_classify: `pull_request_target` with `permissions: {}` at the
-          top, the grant job-scoped, checkout pinned to the default branch,
-          and its one write is swapping the `risk:*` label.
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch, and its one write is swapping the
+          `risk:*` label.
         - hold-unresolved-threads: `schedule` plus `pull_request_target:
           labeled`, `permissions: {}` at the top, the grant job-scoped,
           checkout pinned to the default branch, and its writes are the
@@ -648,10 +662,19 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - retest-actions: `issue_comment` on a `/retest` that opens the
+          comment, from an owner, member or collaborator; `permissions: {}`
+          at the top, the grant job-scoped, checkout of the default branch
+          with `persist-credentials: false`, the two event fields passed as
+          integers through the environment. Its one pull-request write is a
+          reaction on the comment that asked; its other writes are re-runs of
+          the pull request's own failed workflow runs, under `actions: write`,
+          which execute with their original actor's privileges. It re-runs a
+          check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so a
-        seventh holder is a red test and a conversation rather than a silent
+        a capability, and this asserts membership rather than absence so an
+        eighth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -669,11 +692,12 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                     break
         self.assertEqual(
             [
-                "auto-assign-milestone.yml",
+                "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "retest-actions.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),
@@ -691,11 +715,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         auto-merge, which with a merge queue on `main` means "enqueue once the
         required checks pass". That is assent by policy: it fires only on
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
-        merges on today, and Prow sets those two labels only for accounts the
-        `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant, so the holder
-        list above does not show it; the App-token test below pins who mints
-        one. The next test pins the predicate; any other script under
+        merged on before the merge queue, and Prow sets those two labels only
+        for accounts the `OWNERS` files name. No model verdict is an input.
+        The call runs on a GitHub App token, not on a `pull-requests: write` grant: the holder
+        list above shows `auto-enqueue.yml` only for its left-out comment, and
+        the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
         """
         merging = (
@@ -730,8 +754,10 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
-        labels Tide's query excludes. Every other combination must leave it
-        off.
+        labels Tide's query excluded. Every other combination must leave it
+        off. That holds on each removal path too: never removed, removed with
+        the one retry after a `failed_checks` removal due, and removed with it
+        spent, which stays out.
         """
         scripts = h.REPO_ROOT / "scripts"
         if str(scripts) not in sys.path:
@@ -751,13 +777,21 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                         labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
                         if hold:
                             labels.add(hold)
-                        pull = {"draft": draft, "labels": labels, "auto_merge": False, "queue_entry": None}
-                        expected = lgtm and approved and not hold and not draft
-                        with self.subTest(labels=sorted(labels), draft=draft):
-                            self.assertEqual(
-                                expected,
-                                merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
-                            )
+                        for removed, retry in ((False, False), (True, True), (True, False)):
+                            pull = {
+                                "draft": draft,
+                                "labels": labels,
+                                "auto_merge": False,
+                                "queue_entry": None,
+                                "removed_since_push": removed,
+                                "retry": retry,
+                            }
+                            expected = lgtm and approved and not hold and not draft and (retry or not removed)
+                            with self.subTest(labels=sorted(labels), draft=draft, removed=removed, retry=retry):
+                                self.assertEqual(
+                                    expected,
+                                    merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                                )
 
 
     def test_B2_app_token_write_grants_are_pinned(self) -> None:
@@ -767,7 +801,17 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `auto-enqueue.yml` alone also mints Pull requests write, for the
         enqueue sweep above: it turns auto-merge on and off and dequeues, and
         the script scan holds it to that. Its key is read nowhere else, so no
-        other workflow can mint the same token. A new grant is a red test and
+        other workflow can mint the same token. `ci-health.yml` mints Issues
+        write for the bots' issue repository (`KUBE_AGENTS_ISSUES_REPO`, a
+        different App and key, `ISSUES_APP_PRIVATE_KEY`), scoped to that one
+        repository; it files, edits and closes the bots' own issues and
+        nothing else. `release-publish.yml`'s `relabel-upgrade-table` job also
+        mints Pull requests write, with Contents write and without Workflows:
+        after a release it pushes a docs-only branch and opens the pull request
+        that relabels the upgrade table's `pending` rows (#5673). It cannot land
+        that change itself: main takes a pull request only through review and
+        the merge queue, and `lgtm` comes only from the OWNERS file's people,
+        which lists no machine account. A new grant is a red test and
         a conversation, as for the holder list above, and so is a minting step
         that names no scope, which gets every permission the App holds.
         """
@@ -798,6 +842,8 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             "staging-promotion-pipeline.yml",
         ) for scope in release}
         expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
+        expected.add(("ci-health.yml", "permission-issues"))
+        expected.add(("release-publish.yml", "permission-pull-requests"))
         self.assertEqual(expected, grants)
         self.assertEqual({"auto-enqueue.yml"}, key_readers)
 

@@ -75,19 +75,29 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; an
+            # explicit GOMEMLIMIT wins). Read from the container itself so it
+            # follows the limit below, and on Autopilot the limit the cluster
+            # admitted rather than the one written here.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
-            # images (gateway, worker, auth callout, console) take their
-            # registry and tag from it, else from PLATFORM_AGENT_IMAGE. The manager
+            # images and kube-proxy take their registry and tag from it, else
+            # from PLATFORM_AGENT_IMAGE. The manager
             # discovers it from its pod spec only when PLATFORM_AGENT_IMAGE is
             # unset too, so name both when you name the agent image.
             # PLATFORM_AGENT_IMAGE is the default agent image when a
             # PlatformAgent CR omits spec.deployment.image; the credential-proxy
             # image is derived from the agent image unless
             # CREDENTIAL_PROXY_IMAGE is set explicitly. AGENT_SANDBOX_IMAGE is
-            # the shell sandbox StatefulSet's image, which is not derived —
-            # it is a separate repository — and is overridden per agent by
+            # the shell sandbox StatefulSet's image; unset, it is derived from
+            # OPERATOR_IMAGE with the repository swapped to agent-sandbox, else
+            # the ghcr.io default. It is overridden per agent by
             # spec.harness.experimental.shellSandbox.image.
             # - name: OPERATOR_IMAGE
             #   value: "registry.example.com/kube-agents/k8s-operator:latest"
@@ -98,7 +108,7 @@ spec:
             # - name: AGENT_SANDBOX_IMAGE
             #   value: "registry.example.com/kube-agents/agent-sandbox:latest"
             # - name: FLUENT_BIT_IMAGE
-            #   value: "registry.example.com/mirror/fluent-bit:5.1.2"
+            #   value: "registry.example.com/mirror/fluent-bit:5.1.5"
             # IMAGE_PULL_SECRETS is the pull identity for those images, as
             # comma-separated names of Secrets that must already exist in each
             # agent's namespace. Needed only for a registry the nodes cannot
@@ -137,13 +147,51 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Memory here is the manager's cache, and the cache holds one entry
+          # per object in the CLUSTER, not per install: every informer it
+          # starts is cluster-wide, Owns() included (it filters events by
+          # owner, it does not scope the watch). Pods are read live instead,
+          # because they outnumber every other kind, as Secrets and the A2A
+          # bookkeeping objects already were (podReader, #3493). What stays
+          # is what SetupWithManager names:
+          # Deployments, StatefulSets, Services, ServiceAccounts, ConfigMaps,
+          # PersistentVolumeClaims, NetworkPolicies and PodDisruptionBudgets;
+          # ClusterRoles, ClusterRoleBindings, Roles and RoleBindings; and the
+          # custom resources themselves (PlatformAgent always, AgentPlugin,
+          # AgentProfile and Tier where their CRDs are installed and
+          # readable). Deployments, StatefulSets, Services and
+          # PersistentVolumeClaims grow with the cluster's workloads, a
+          # Deployment carrying a whole pod template, so a cluster with
+          # thousands of them is the case to raise this for; the rest grow
+          # with its namespaces.
+          #
+          # Sized from a measurement rather than the Kubebuilder scaffold it
+          # replaces: on a 3-node install the store holds 675 objects in
+          # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
+          # with charts/kube-agents/values.yaml's operator.resources.
+          #
+          # The requests are sized to be livable as the limits: GKE Autopilot
+          # without Pod bursting (a cluster or compute class with bursting
+          # off) sets each limit equal to its request, so the request is
+          # what the manager then runs under, and 128Mi, right for the
+          # measurement above, left no room for the cache to grow with the
+          # cluster before the manager was OOM-killed. 256Mi holds a cluster
+          # several times the measured one; the manager reads whichever limit
+          # was admitted through OPERATOR_MEMORY_LIMIT_BYTES. requests.cpu is
+          # 100m rather than the 10m the manager needs because Autopilot
+          # admits a pod unchanged only at 50m or more and between 1 and
+          # 6.5 GiB of memory per vCPU on the requests pair, and raises the
+          # smaller request into that band; 100m beside 256Mi is 2.5 GiB per
+          # vCPU, inside it. Where Autopilot raises a pod to its per-pod
+          # minimums (250m CPU, 512 MiB) the admitted pod is still larger
+          # than this manifest; where it does not, this is the pod it admits.
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 512Mi
             requests:
-              cpu: 10m
-              memory: 64Mi
+              cpu: 100m
+              memory: 256Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert

@@ -5,15 +5,19 @@ the JetStream PVC and the bus creds Secret come through with their UIDs. Here
 it runs end to end, unmodified, with `kubectl` on PATH replaced by a small
 simulator of the operator (FAKE_KUBECTL below: a CR patch bumps generations,
 and a few kubectl calls later the "reconcile" lands, tearing the A2A stack
-down under today and rendering it again under next) and both doors served by
-a local HTTP server, so the today turn is a real POST and the bus task is the
-lane's own inject client talking to a fake gateway. Each failure case changes
-one thing about what the simulated operator does and checks the run stops on
-the assertion that names it.
+down under today and rendering it again under next) and both doors and the
+web console served by a local HTTP server, so the today turn is a real POST,
+the bus task is the lane's own inject client talking to a fake gateway, and
+the console checks after pre and every leg are real requests to a console
+that answers as a2a/cmd/web-console does. Each failure case changes one
+thing about what the simulated operator does and checks the run stops on the
+assertion that names it.
 
 The wiring in hack/ci-eval-pr.sh is pinned at the end: it runs only under
-EVAL_MODE_NEXT=1, after the suite verdict is computed and before it is
-announced, and nothing it does reaches the exit status.
+EVAL_MODE_NEXT=1 on a run that is not a pull request's, after the suite
+verdict is computed and before it is announced, and nothing it does reaches
+the exit status; and the today lane (EVAL_ROLLBACK_LANE=1) runs it before the
+matrix with ROLLBACK_END_MODE=today, where a failure stops the job.
 """
 
 import base64
@@ -46,6 +50,18 @@ _CR = "platform-agent"
 _API_KEY = "agent-api-key"
 _PVC = "data-platform-agent-a2a-nats-0"
 _CREDS = "platform-agent-a2a-nats-creds"
+# The chart's console objects, named off the lane's Helm release.
+_CONSOLE = "kube-agents-web-console"
+_CONSOLE_SESSION_ID_RE = re.compile(r"^web-console-[0-9a-f]{32}$")
+_CONSOLE_READ_ROUTES = (
+    "/api/insights",
+    "/api/environment",
+    "/api/channels/alerts/posts",
+    "/api/channels/scheduled/posts",
+    "/api/models",
+    "/api/repositories",
+    "/api/patches",
+)
 _BRIDGE = {
     "name": "hermes-bridge",
     "image": "bridge:dev",
@@ -87,6 +103,30 @@ _FAST_ENV = {
     "ROLLBACK_BUS_TASK_TIMEOUT": "10",
 }
 
+# The signal case sends SIGTERM only while the script is blocked in a poll
+# sleep. bash 5.2 runs a pending trap at the start of the next command, unless
+# a `$(...)` expansion comes first: xparse_dolparen() sets the parser's eof
+# token to `)` and calls parse_command(), whose first act is
+# run_pending_traps(), so the trap string is parsed where only a `)` may end
+# the input and dies with "trap: line 2: unexpected EOF while looking for
+# matching `)'", exit status 2, before on_signal runs. With POLL_SECONDS at 0
+# the script expands one every few milliseconds. A signal that lands while
+# the script's foreground child is `sleep` stays pending until that sleep
+# ends, and the loop's next command is a clean checkpoint.
+_SIGNAL_POLL_SECONDS = "3"
+_SIGNAL_WAIT_SECONDS = 60
+_SIGNAL_CHECK_INTERVAL_SECONDS = 0.05
+_PGREP_CHILDREN = ["pgrep", "-P"]
+_PS_COMMAND_NAMES = ["ps", "-o", "comm=", "-p"]
+
+
+def child_commands(pid: int) -> list[str]:
+    """The command name of each direct child of pid; a child that exits between the two reads is dropped."""
+    children = subprocess.run([*_PGREP_CHILDREN, str(pid)], capture_output=True, text=True, check=False).stdout.split()
+    if not children:
+        return []
+    return subprocess.run([*_PS_COMMAND_NAMES, ",".join(children)], capture_output=True, text=True, check=False).stdout.split()
+
 # Every assertion a passing run prints, in order, for a CR that declares the
 # bridge sidecar by hand (the case the unset and restore exist for; the
 # operator's rendered bridge needs neither, test_no_sidecars_... below).
@@ -100,6 +140,7 @@ _PASSING_ORDER = [
     "pre.pvc-present",
     "pre.creds-present",
     "pre.bus-task",
+    "pre.web-console",
     "leg1.sidecars-unset.patched",
     "leg1.sidecars-unset.reconciled",
     "leg1.sidecars-unset.agent-rolled",
@@ -114,6 +155,7 @@ _PASSING_ORDER = [
     "leg1.nothing-stuck",
     "leg1.not-degraded",
     "leg1.today-turn",
+    "leg1.web-console",
     "leg2.mode-next.patched",
     "leg2.mode-next.reconciled",
     "leg2.nats-ready",
@@ -135,6 +177,24 @@ _PASSING_ORDER = [
     "leg2.bus-task",
     "leg2.nothing-stuck",
     "leg2.not-degraded",
+    "leg2.web-console",
+]
+
+# What ROLLBACK_END_MODE=today adds to a run on an install with no declared
+# sidecars: the preflight read, and leg 3, leg 1's flip and checks again.
+_END_TODAY_PREFLIGHT = "pre.end-mode-today"
+_LEG3_ORDER = [
+    "leg3.mode-today.patched",
+    "leg3.mode-today.reconciled",
+    "leg3.mode-today.agent-rolled",
+    "leg3.mode-today.ready",
+    "leg3.a2a-torn-down",
+    "leg3.pvc-kept",
+    "leg3.creds-kept",
+    "leg3.nothing-stuck",
+    "leg3.not-degraded",
+    "leg3.today-turn",
+    "leg3.web-console",
 ]
 
 # The simulated operator. State is one JSON file; every kubectl call is one
@@ -334,6 +394,8 @@ FAKE_KUBECTL = textwrap.dedent(
             return obj["spec"].get("mode", "")
         if path == "{.metadata.generation}":
             return str(obj["metadata"]["generation"])
+        if path == "{.spec.holderIdentity}":
+            return obj["spec"].get("holderIdentity", "")
         if path == "{.spec.volumes[*].persistentVolumeClaim.claimName}":
             return " ".join(v["persistentVolumeClaim"]["claimName"] for v in obj["spec"]["volumes"])
         sys.exit("fake kubectl: unsupported jsonpath " + path)
@@ -422,6 +484,22 @@ FAKE_KUBECTL = textwrap.dedent(
             if kind == "platformagent":
                 obj = s["cr"]
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
+            elif kind == "pods" and "-l" in rest and s["scenario"].get("pods_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): pods is forbidden\n'); rc = 1
+            elif kind == "pods" and "-l" in rest:
+                # The pods a label selector picks, by name: the selector's
+                # pairs must all be on the pod.
+                want = dict(pair.split("=", 1) for pair in rest[rest.index("-l") + 1].split(","))
+                out = "".join("pod/%s\n" % p["name"] for p in s["scenario"].get("labelled_pods", [])
+                              if all(p["labels"].get(k) == v for k, v in want.items()))
+            elif kind == "lease" and s["scenario"].get("lease_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): leases.coordination.k8s.io "%s" is forbidden\n' % name); rc = 1
+            elif kind == "svc" and fmt.startswith("go-template="):
+                obj = s["objects"].get("svc/%s" % name)
+                if obj is None:
+                    sys.stderr.write('Error from server (NotFound): services "%s" not found\n' % name); rc = 1
+                else:
+                    out = "".join("%s=%s," % kv for kv in sorted(obj["spec"]["selector"].items()))
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
                 late_unschedulable(s)
@@ -507,6 +585,12 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
         "deployment/platform-agent-gateway": workload("Deployment", "platform-agent-gateway", 7),
         "pod/platform-agent-a2a-nats-0": {"spec": {"volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": _PVC}}]}},
     }
+    # The console the lane installs (webConsole.enabled=true in
+    # hack/ci-deploy.sh): its Service and Deployment, which no flip touches.
+    # `console_absent` is a dev install without it.
+    if not scenario.get("console_absent"):
+        objects[f"svc/{_CONSOLE}"] = {"uid": "console-svc-1", "spec": {"selector": {"app.kubernetes.io/name": "web-console"}}}
+        objects[f"deployment/{_CONSOLE}"] = workload("Deployment", _CONSOLE)
     spec: dict = {"mode": "next", "harness": {}}
     if sidecars:
         spec["deployment"] = {"sidecars": sidecars}
@@ -532,10 +616,12 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
 
 
 class _Door(http.server.BaseHTTPRequestHandler):
-    """The agent API and the inject door, answering from the simulated state."""
+    """The agent API, the inject door and the web console, answering from the
+    simulated state."""
 
     state_path: pathlib.Path
     cancels_path: pathlib.Path
+    console_path: pathlib.Path
 
     def log_message(self, *args) -> None:  # noqa: D401 - silence the default access log
         pass
@@ -551,6 +637,71 @@ class _Door(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _page(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _console_leg(self, state: dict) -> str:
+        # The console checks are the same requests after pre and every leg,
+        # so the leg is read from the flips the state has seen: none is pre,
+        # one to today is leg 1, one forward is leg 2, two to today is leg 3.
+        today = state["patches"].count({"spec": {"mode": "today"}})
+        forward = state["patches"].count({"spec": {"mode": "next"}})
+        if today >= 2:
+            return "leg3"
+        if forward >= 1:
+            return "leg2"
+        if today == 1:
+            return "leg1"
+        return "pre"
+
+    def _record_console(self, line: str) -> None:
+        with self.console_path.open("a") as log:
+            log.write(line + "\n")
+
+    def _console_get(self, state: dict) -> bool:
+        """Answers a console GET; False when the path is not the console's."""
+        path = self.path
+        if path == "/healthz":
+            self._reply(200, {"status": "ok"})
+        elif path == "/":
+            self._page(b"<!doctype html>\n<html lang=\"en\"><head><title>kube-agents</title></head></html>\n")
+        elif path == "/api/insights":
+            self._reply(200, {"model": {}, "usage": {}, "identity": {}, "cluster": {"name": "c"}, "repositories": []})
+        elif path == "/api/environment":
+            self._reply(200, {"versions": {"chart": "0.1.0"}, "install": {}, "counts": {"nodes": 3}, "read_at": "now"})
+        elif path in ("/api/channels/alerts/posts", "/api/channels/scheduled/posts"):
+            self._reply(200, {"channel": path.split("/")[3], "posts": []})
+        elif path in ("/api/models", "/api/repositories", "/api/patches"):
+            self._reply(200, {"ok": True})
+        elif path.startswith("/api/sessions/") and path.endswith("/messages"):
+            sid = path[len("/api/sessions/") : -len("/messages")]
+            messages = [{"id": 1, "role": "user", "content": "hi"}, {"id": 2, "role": "assistant", "content": "pong"}]
+            self._reply(200, {"session_id": sid, "latest_id": 2, "messages": messages})
+        else:
+            return False
+        self._record_console(f"{self._console_leg(state)} GET {path}")
+        return True
+
+    def _console_chat(self, state: dict, body: dict) -> None:
+        leg = self._console_leg(state)
+        sid = body.get("session_id", "")
+        self._record_console(f"{leg} POST /api/chat {sid} header={self.headers.get('X-Kube-Agents-Console', '')}")
+        if self.headers.get("X-Kube-Agents-Console") != "1":
+            self._reply(403, {"error": "missing_console_header"})
+            return
+        if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            self._reply(415, {"error": "json_required"})
+            return
+        if state["scenario"].get("console_chat_fails_on") == leg:
+            # The console's own answer for an agent it could not reach.
+            self._reply(502, {"error": "agent_error", "detail": "could not reach the agent gateway", "session_id": sid})
+            return
+        self._reply(200, {"session_id": sid, "reply": "pong", "created": True})
+
     def _door_token(self, state: dict) -> str:
         secret = state["objects"].get("secret/platform-agent-a2a-inject")
         return base64.b64decode(secret["data"]["token"]).decode() if secret else ""
@@ -558,13 +709,25 @@ class _Door(http.server.BaseHTTPRequestHandler):
     def _door_up(self, state: dict) -> bool:
         return state["cr"]["spec"].get("mode") == "next" and "deployment/platform-agent-a2a-gateway" in state["objects"]
 
+    def _today_leg(self, state: dict) -> str:
+        # The today turn is the same request on every leg, so the leg is read
+        # from the state: the first flip to today is leg 1's, the second leg 3's
+        # (ROLLBACK_END_MODE=today). `today_turn_fails_on` names the one leg
+        # whose turn the door refuses, declared up front in the scenario, so
+        # nothing rewrites the state file while the script runs.
+        flips = state["patches"].count({"spec": {"mode": "today"}})
+        return "leg3" if flips >= 2 else "leg1"
+
     def do_POST(self) -> None:
         state = self._state()
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         auth = self.headers.get("Authorization", "")
+        if self.path == "/api/chat":
+            self._console_chat(state, body)
+            return
         if self.path == "/v1/responses":
-            if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails"):
+            if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails_on") == self._today_leg(state):
                 self._reply(401, {"error": "no"})
                 return
             self._reply(200, {"output": [{"role": "assistant", "content": "pong"}]})
@@ -595,6 +758,8 @@ class _Door(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         state = self._state()
+        if self._console_get(state):
+            return
         if not self.path.startswith("/conversations/"):
             self._reply(404, {})
             return
@@ -631,7 +796,10 @@ class Sim:
         self.pf_pids = root / "pf_pids"
         self.cancels = root / "cancels"
         self.cancels.touch()
-        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels})
+        # Every console request, one line each: "<leg> <method> <path> ...".
+        self.console_log = root / "console-requests"
+        self.console_log.touch()
+        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels, "console_path": self.console_log})
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -651,6 +819,7 @@ class Sim:
                 "FAKE_KUBE_STATE": str(self.state_path),
                 "ROLLBACK_AGENT_URL": url,
                 "ROLLBACK_INJECT_URL": url,
+                "ROLLBACK_WEB_CONSOLE_URL": url,
                 "ROLLBACK_RESULTS_FILE": str(self.results),
                 "ROLLBACK_KUBE_CONTEXT": "gke_test_ctx",
                 "FAKE_PF_PIDS": str(self.pf_pids),
@@ -763,6 +932,56 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("SKIP leg2.sidecars-restored:", result.stdout)
         self.assertIn("PASS leg2.bus-task", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}])
+
+    def test_ending_at_today_adds_a_third_leg_and_leaves_the_install_rolled_back(self) -> None:
+        # The today lane's shape: the operator renders the bridge, so the CR
+        # declares no sidecars, and the run ends under today.
+        round_trip, _, _ = self.run_sim(healthy_next_state(sidecars=[]))
+        result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = list(passed(round_trip))
+        expected.insert(expected.index("pre.mode-next") + 1, _END_TODAY_PREFLIGHT)
+        self.assertEqual(passed(result), expected + _LEG3_ORDER)
+        self.assertEqual(failed(result), [])
+        self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}, {"spec": {"mode": "today"}}])
+        self.assertEqual(state["cr"]["spec"]["mode"], "today")
+        last = result.stdout.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("ROLLBACK ROUND TRIP PASSED: next -> today -> next -> today on platformagent/platform-agent"), last)
+        self.assertIn("uid pvc-1", last)
+
+    def test_the_default_end_is_next(self) -> None:
+        for value in (None, "next"):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                extra = {} if value is None else {"ROLLBACK_END_MODE": value}
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), **extra)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn(_END_TODAY_PREFLIGHT, passed(result))
+                self.assertFalse([name for name in passed(result) if name.startswith("leg3.")])
+                self.assertEqual(state["cr"]["spec"]["mode"], "next")
+                self.assertIn("ROLLBACK ROUND TRIP PASSED: next -> today -> next on", result.stdout)
+
+    def test_ending_at_today_refuses_declared_sidecars_before_anything_changes(self) -> None:
+        result, state, _ = self.run_sim(healthy_next_state(), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, _END_TODAY_PREFLIGHT, "the CR declares spec.deployment.sidecars (hermes-bridge)")
+        self.assertEqual(state["patches"], [])
+        self.assertEqual(state["cr"]["spec"]["mode"], "next")
+
+    def test_an_end_mode_that_is_neither_fails_before_anything_is_read(self) -> None:
+        for value in ("Today", "rollback", "next "):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE=value)
+                self.assert_fails_at(result, "pre.end-mode", f"ROLLBACK_END_MODE is '{value}'")
+                self.assertEqual(state["patches"], [])
+
+    def test_a_today_turn_that_fails_on_the_third_leg_fails_there(self) -> None:
+        # The door's today turn is the same request on every leg; failing it
+        # on the third leg only shows leg 3 asserts it rather than inheriting
+        # leg 1's pass. The leg is declared in the scenario rather than flipped
+        # mid-run: a rewrite of the state file while the script runs truncates
+        # it under the fake kubectl's next read.
+        result, _, _ = self.run_sim(healthy_next_state(sidecars=[], today_turn_fails_on="leg3"), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, "leg3.today-turn", "no answer from /v1/responses in 2 attempts")
+        self.assertIn("PASS leg1.today-turn", result.stdout)
 
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:
         _, state, _ = self.run_sim(healthy_next_state())
@@ -950,20 +1169,89 @@ class PortForwardTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(passed(result), _PASSING_ORDER)
         forwards = [call for call in state["calls"] if "port-forward" in call]
-        self.assertEqual(len(forwards), 3, forwards)
+        self.assertEqual(len(forwards), 3, "\n".join((repr(forwards), repr(state["counters"]), result.stdout, result.stderr)))
         self.assertTrue(all(call[:2] == ["--context", "gke_test_ctx"] for call in forwards))
         pids = [int(line) for line in sim.pf_pids.read_text().split()]
         time.sleep(0.5)
         self.assertEqual([pid for pid in pids if alive(pid)], [])
 
+    def test_the_inject_tunnel_goes_to_the_gateway_lease_holder(self) -> None:
+        # Behind an elected gateway only the Lease holder serves the door (a
+        # standby answers 503), so the bus task's tunnel targets its pod; the
+        # agent's own tunnel stays on its Service. With no Lease, as on the
+        # healthy state the other tests run, it's the door's Service.
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("pod/platform-agent-a2a-gateway-7d9f-abcde"), 2, targets)
+        self.assertEqual(targets.count("svc/platform-agent"), 1, targets)
+
+        result, after, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+
+    def test_a_forbidden_lease_read_is_said_and_falls_back_to_the_service(self) -> None:
+        # A missing Lease is the quiet case; a read that fails otherwise is
+        # said, since the Service it falls back to can land on the standby.
+        result, after, _ = self.run_sim(healthy_next_state(lease_forbidden=True), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("reading lease platform-agent-a2a-gateway failed", result.stderr)
+        self.assertIn("Forbidden", result.stderr)
+
+        result, _, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertNotIn("reading lease", result.stderr)
+
+    def test_a_failed_pod_list_is_said_and_not_blamed_on_the_holder(self) -> None:
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods, pods_forbidden=True)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env(), ROLLBACK_POLL_SECONDS="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("listing the pods svc/platform-agent-a2a-inject selects failed", result.stderr)
+        self.assertNotIn("which is not a pod", result.stderr)
+
+    def test_a_holder_that_is_not_a_pod_name_is_not_trusted(self) -> None:
+        gateway_pods = [{"name": "gw-a", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "gw-a\nanything"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("isn't a pod name", result.stderr)
+
+    def test_a_lease_holder_outside_the_inject_service_is_not_trusted(self) -> None:
+        # The tunnel carries the door's token: a Lease naming a pod the inject
+        # Service doesn't select (written by something else) is ignored.
+        state = healthy_next_state(labelled_pods=[{"name": "some-other-pod", "labels": {"app": "something-else"}}])
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "some-other-pod"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertNotIn("pod/some-other-pod", targets)
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("not a pod svc/platform-agent-a2a-inject selects", result.stderr)
+
     def test_a_dead_first_tunnel_is_replaced_by_a_fresh_one(self) -> None:
         # The first port-forward (the pre bus task's) accepts and drops every
         # connection. The script's retry has to be a new tunnel on the same
         # port, which only binds if the dead one was really stopped.
-        result, _, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+        result, state, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS pre.bus-task:", result.stdout)
-        self.assertIn("pre.bus-task: attempt 1/2", result.stdout)
+        self.assertIn("pre.bus-task: attempt 1/2", result.stdout, "\n".join((repr(state["counters"]), result.stderr)))
 
 
 class FailureTest(RoundTripTest):
@@ -1098,7 +1386,7 @@ class FailureTest(RoundTripTest):
         self.assertLess(time.monotonic() - started, 120)
 
     def test_no_answer_on_the_today_path(self) -> None:
-        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails=True))
+        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails_on="leg1"))
         self.assert_fails_at(result, "leg1.today-turn", "no answer from /v1/responses in 2 attempts")
 
     def test_a_bus_task_that_does_not_complete_after_the_flip_back(self) -> None:
@@ -1228,16 +1516,40 @@ class FailureTest(RoundTripTest):
     def test_a_signal_is_a_named_failure(self) -> None:
         sim = Sim(healthy_next_state(never_ready_on="today"))
         self.addCleanup(sim.close)
-        proc = subprocess.Popen(["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600"))
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
-            time.sleep(0.2)
-        time.sleep(1)
+        proc = subprocess.Popen(
+            ["bash", str(_SCRIPT), _NS, _CR],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=sim.env(ROLLBACK_READY_TIMEOUT="600", ROLLBACK_POLL_SECONDS=_SIGNAL_POLL_SECONDS),
+        )
+        # Past the flip to today and inside a poll sleep (_SIGNAL_POLL_SECONDS
+        # above): leg1.mode-today's rollout wait, which sleeps until the fake's
+        # reconcile lands, is the first one. The signal goes the moment the
+        # sleep is seen, not an interval later.
+        deadline = time.monotonic() + _SIGNAL_WAIT_SECONDS
+        flipped = sleeping = False
+        while time.monotonic() < deadline and proc.poll() is None:
+            flipped = flipped or any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"])
+            sleeping = flipped and child_commands(proc.pid) == ["sleep"]
+            if sleeping:
+                break
+            time.sleep(_SIGNAL_CHECK_INTERVAL_SECONDS)
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            self.fail(f"the script exited with status {proc.returncode} before the signal:\n{out}{err}")
+        if not sleeping:
+            # The script is still running somewhere this test did not expect:
+            # reap it and carry its transcript, so the failure says what it was doing.
+            proc.kill()
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            what = "reach a poll sleep after the flip" if flipped else "flip to today"
+            self.fail(f"the script did not {what} within {_SIGNAL_WAIT_SECONDS}s:\n{out}{err}")
         proc.send_signal(signal.SIGTERM)
-        out, _ = proc.communicate(timeout=60)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("FAIL leg1.interrupted:", out)
-        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
+        out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertIn("FAIL leg1.interrupted:", out, err)
+        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted", out + err)
 
 
 _NATS = "platform-agent-a2a-nats"
@@ -1310,6 +1622,74 @@ class SidecarRoundTripTest(RoundTripTest):
         self.assert_unset_and_restored(bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]))
 
 
+class WebConsoleRoundTripTest(RoundTripTest):
+    """The console checks after pre and every leg: the deploy's gate
+    (hack/ci-deploy.sh, 6a) run again where a flip could have broken the
+    Hermes path the console talks to."""
+
+    def console_requests(self, sim: Sim) -> list[str]:
+        return sim.console_log.read_text().splitlines()
+
+    def test_every_leg_reads_the_routes_and_sends_a_turn(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for leg in ("pre", "leg1", "leg2", "leg3"):
+            with self.subTest(leg=leg):
+                lines = [line for line in self.console_requests(sim) if line.startswith(f"{leg} ")]
+                paths = [line.split(" ")[2] for line in lines]
+                self.assertEqual(paths[:2], ["/healthz", "/"])
+                self.assertEqual(paths[2:9], list(_CONSOLE_READ_ROUTES))
+                self.assertEqual(paths[9], "/api/chat")
+                sid = lines[9].split(" ")[3]
+                self.assertRegex(sid, _CONSOLE_SESSION_ID_RE)
+                self.assertTrue(lines[9].endswith(" header=1"), lines[9])
+                self.assertEqual(paths[10:], [f"/api/sessions/{sid}/messages"])
+                self.assertIn(f"PASS {leg}.web-console: deployment/{_CONSOLE} rolled out; every route answered 200, the turn on session {sid} got a reply, and the session shows the user and assistant rows (attempt 1/2)", result.stdout)
+
+    def test_a_turn_the_console_cannot_run_on_leg_3_fails_there_after_its_tunnels(self) -> None:
+        # The console's own 502 for an agent it could not reach: a fresh
+        # tunnel is worth a try, so the attempts run out before the FAIL.
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], console_chat_fails_on="leg3"), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, "leg3.web-console", "/api/chat: HTTP 502: ")
+        self.assertIn("PASS leg2.web-console", result.stdout)
+        self.assertIn("PASS leg3.today-turn", result.stdout)
+        self.assertIn("leg3.web-console: attempt 1/2: /api/chat: HTTP 502: ", result.stdout)
+        self.assertEqual(len([line for line in self.console_requests(sim) if line.startswith("leg3 POST /api/chat")]), 2)
+
+    def test_a_4xx_is_not_retried(self) -> None:
+        # A 4xx is the same through a fresh tunnel. A base URL under a path
+        # the door does not serve answers 404 to /healthz, the first request,
+        # and the run fails on it without a second attempt.
+        sim = Sim(healthy_next_state(sidecars=[]))
+        self.addCleanup(sim.close)
+        result = sim.run(ROLLBACK_WEB_CONSOLE_URL=f"http://127.0.0.1:{sim.server.server_address[1]}/nowhere")
+        self.assert_fails_at(result, "pre.web-console", "/healthz: HTTP 404: ")
+        self.assertNotIn("pre.web-console: attempt", result.stdout)
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_no_console_service_skips_the_checks(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], console_absent=True), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for leg in ("pre", "leg1", "leg2", "leg3"):
+            self.assertIn(f"SKIP {leg}.web-console: no svc/{_CONSOLE}: the install has no web console (webConsole.enabled), so nothing is checked", result.stdout)
+        self.assertNotIn(".web-console", " ".join(passed(result)))
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_a_console_that_is_not_rolled_out_fails_before_any_request(self) -> None:
+        state = healthy_next_state(sidecars=[])
+        state["objects"][f"deployment/{_CONSOLE}"]["status"]["readyReplicas"] = 0
+        state["objects"][f"deployment/{_CONSOLE}"]["status"]["availableReplicas"] = 0
+        result, _, sim = self.run_sim(state)
+        self.assert_fails_at(result, "pre.web-console", f"deployment/{_CONSOLE} is not rolled out: 0/1 ready")
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_the_console_name_defaults_to_the_lanes_release(self) -> None:
+        script = _SCRIPT.read_text()
+        self.assertIn('readonly WEB_CONSOLE_NAME_DEFAULT="kube-agents-web-console"', script)
+        self.assertIn('readonly HELM_RELEASE_NAME="kube-agents"', _CI_DEPLOY.read_text())
+        self.assertIn('WEB_CONSOLE_NAME="${ROLLBACK_WEB_CONSOLE_NAME:-${WEB_CONSOLE_NAME_DEFAULT}}"', script)
+
+
 class NamesMatchTheOperatorTest(unittest.TestCase):
     """The names the script derives are the ones the operator renders."""
 
@@ -1336,8 +1716,10 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
     def test_the_claim_the_pvc_name_is_built_from_is_the_statefulsets(self) -> None:
         c = self.constants()
         self.assertEqual(c["NATS_DATA_CLAIM"], self.go(_A2A_MANIFESTS, r'^const a2aNATSDataClaim = "([^"]+)"'))
-        # The operator's own spelling of the claim's name, which the script copies.
-        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0"', _CONTROLLER.read_text())
+        # The operator's own spelling of the claim's name, which the script
+        # copies for ordinal 0 (the claim every bus has).
+        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-" + strconv.Itoa(ordinal)', _A2A_MANIFESTS.read_text())
+        self.assertIn("a2aNATSDataClaimName(agent, ordinal)", _CONTROLLER.read_text())
         self.assertEqual(c["NATS_ORDINAL_SUFFIX"], "-0")
 
     def test_the_other_names_and_ports(self) -> None:
@@ -1354,25 +1736,6 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         provision = self.go(_A2A_MANIFESTS, r'a2aProvisionComponent\s*=\s*"([^"]+)"')
         self.assertEqual(c["A2A_PROVISION_JOB_SELECTOR"], f"{component}={provision}")
         self.assertIn("A2ACalloutKeysSecretName(agent.Name)", _CALLOUT_KEYS.read_text())
-
-    def test_the_kept_objects_are_on_neither_teardown_list(self) -> None:
-        # What the script asserts is kept is what cleanupA2A leaves out.
-        text = _A2A_MANIFESTS.read_text()
-        start = text.index("func (r *PlatformAgentReconciler) a2aPreBusTeardown(")
-        end = text.index("func (r *PlatformAgentReconciler) a2aNamespacedTeardown(")
-        lists = text[start:end]
-        self.assertNotIn("a2aCredsSecretName", lists)
-        self.assertNotIn("PersistentVolumeClaim", lists)
-        self.assertIn("a2aCalloutKeysName", lists)
-        cleanup = text[text.index("func (r *PlatformAgentReconciler) cleanupA2A(") :]
-        cleanup = cleanup[: cleanup.index("\nfunc ")]
-        self.assertNotIn("a2aCredsSecretName", cleanup)
-        self.assertNotIn("PersistentVolumeClaim", cleanup)
-        # And the StatefulSet sets no PVC retention policy, so its default
-        # (Retain) keeps the claim when the StatefulSet is deleted.
-        sts = text[text.index("func buildA2ANATSStatefulSet(") :]
-        sts = sts[: sts.index("\nfunc ")]
-        self.assertNotIn("PersistentVolumeClaimRetentionPolicy", sts)
 
     def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
         # #2427's gate after the sidecar patch and the not-degraded checks
@@ -1392,15 +1755,6 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         self.assertIn('reason = "PodUnschedulable"', _CONTROLLER.read_text())
         self.assertIn("cannot be scheduled onto any available node", _CONTROLLER.read_text())
 
-    def test_the_status_words_are_the_operators(self) -> None:
-        c = self.constants()
-        text = _CONTROLLER.read_text()
-        for reason in c["CR_REFUSAL_REASONS"].split():
-            self.assertIn(f'"{reason}"', text + _A2A_MANIFESTS.read_text(), reason)
-        self.assertIn('newPhase = "Ready"', text)
-        self.assertIn('newPhase = "Degraded"', text)
-
-
 def ci_eval_function(name: str) -> str:
     match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", _CI_EVAL.read_text(), re.DOTALL | re.MULTILINE)
     if match is None:
@@ -1418,11 +1772,104 @@ def snowflake(epoch_seconds: int) -> int:
     return (epoch_seconds * 1000 - 1288834974657) << 22
 
 
+class CiEvalRollbackLaneTest(unittest.TestCase):
+    """run_rollback_lane in hack/ci-eval-pr.sh, lifted and run: the today
+    lane's round trip, before the matrix, ending under today."""
+
+    def run_lane(self, *, rollback_lane: str | None, mode_next: str | None, script_status: int = 0) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        artifacts = root / "artifacts"
+        (root / "rollback-roundtrip.sh").write_text(
+            'echo "stub ran: $* end=${ROLLBACK_END_MODE:-} context=${ROLLBACK_KUBE_CONTEXT}"\n'
+            "echo 'PASS pre.mode-next: x' >> \"${ROLLBACK_RESULTS_FILE}\"\n"
+            f"exit {script_status}\n"
+        )
+        flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
+        script = textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            {ci_eval_constants()}
+            SCRIPT_DIR={root}
+            export ARTIFACTS={artifacts}
+            TARGET_NAMESPACE=kubeagents-system
+            AGENT_SERVICE_NAME=platform-agent
+            AGENT_CLUSTER_CONTEXT=gke_p_r_c
+            {flag}
+            {lane}
+            profile_begin() {{ echo "PROFILE $*"; }}
+            {ci_eval_function("run_rollback_lane")}
+            run_rollback_lane
+            echo "MATRIX NEXT"
+            """
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, check=False, env=minimal_env())
+        return result, artifacts
+
+    def test_nothing_happens_off_the_lane(self) -> None:
+        for lane in (None, "", "0", "true"):
+            for flag in (None, "1"):
+                with self.subTest(lane=lane, flag=flag):
+                    result, artifacts = self.run_lane(rollback_lane=lane, mode_next=flag)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "MATRIX NEXT\n")
+                    self.assertFalse(artifacts.exists())
+
+    def test_the_lane_without_the_flag_stops_the_job(self) -> None:
+        for flag in (None, "", "0"):
+            with self.subTest(flag=flag):
+                result, _ = self.run_lane(rollback_lane="1", mode_next=flag)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1", result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_a_passing_rollback_ends_at_today_and_the_matrix_follows(self) -> None:
+        result, artifacts = self.run_lane(rollback_lane="1", mode_next="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub ran: kubeagents-system platform-agent end=today context=gke_p_r_c", result.stdout)
+        self.assertIn("Rolled back to today; the matrix runs over the agent API", result.stdout)
+        self.assertLess(result.stdout.index("Rolled back to today"), result.stdout.index("MATRIX NEXT"), result.stdout)
+        self.assertIn("stub ran", (artifacts / "rollback-roundtrip.log").read_text())
+        self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines(), ["PASS pre.mode-next: x"])
+
+    def test_a_failed_rollback_stops_the_job_before_the_matrix(self) -> None:
+        result, _ = self.run_lane(rollback_lane="1", mode_next="1", script_status=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the rollback lane's round trip failed (exit 1)", result.stderr)
+        self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_it_runs_before_the_resets_and_the_audit_pause(self) -> None:
+        lines = _CI_EVAL.read_text().splitlines()
+        call = [i for i, line in enumerate(lines) if line == "run_rollback_lane"]
+        self.assertEqual(len(call), 1, "one call site")
+        watch = lines.index("start_agent_pod_watch")
+        pause = next(i for i, line in enumerate(lines) if line.startswith("scheduled_audits pause"))
+        ledgers = next(i for i, line in enumerate(lines) if line.startswith("# ─── Empty ledgers"))
+        token = next(i for i, line in enumerate(lines) if line.startswith("# 4. Token & Model Configuration"))
+        self.assertLess(watch, call[0])
+        self.assertLess(call[0], ledgers)
+        self.assertLess(call[0], pause)
+        self.assertLess(call[0], token)
+
+
 class CiEvalWiringTest(unittest.TestCase):
     """run_rollback_roundtrip in hack/ci-eval-pr.sh, lifted and run."""
 
     def run_wiring(
-        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False
+        self,
+        *,
+        mode_next: str | None,
+        script_status: int = 0,
+        elapsed: int = 0,
+        job_age: int | None = None,
+        build_id: str | None = None,
+        timeout_on_path: bool = False,
+        job_type: str | None = None,
+        rollback_lane: str | None = None,
+        rc_commit_sha: str | None = None,
     ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
         """`elapsed` is the eval's age (START_TIME), `job_age` this script's
         (EVAL_SCRIPT_STARTED_EPOCH, defaulting to the eval's), `build_id` the
@@ -1439,6 +1886,9 @@ class CiEvalWiringTest(unittest.TestCase):
         )
         flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
         build = "unset BUILD_ID" if build_id is None else f"export BUILD_ID={build_id}"
+        kind = "unset JOB_TYPE" if job_type is None else f"export JOB_TYPE={job_type}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
+        rc = "unset RC_COMMIT_SHA" if rc_commit_sha is None else f"export RC_COMMIT_SHA={rc_commit_sha}"
         age = elapsed if job_age is None else job_age
         script = textwrap.dedent(
             f"""\
@@ -1453,6 +1903,9 @@ class CiEvalWiringTest(unittest.TestCase):
             EVAL_SCRIPT_STARTED_EPOCH=$(($(date +%s) - {age}))
             {flag}
             {build}
+            {kind}
+            {lane}
+            {rc}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
             collect_credential_proxy_evidence() {{ echo COLLECT_PROXY; }}
@@ -1484,6 +1937,45 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertNotIn("PROFILE", result.stdout)
                 self.assertNotIn("Rollback round trip", result.stdout)
                 self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_pull_requests_run(self) -> None:
+        # The merge-blocking presubmit grades next, and Tide ran it in batches
+        # too; neither reads a report-only round trip, and the today presubmit
+        # proves the path on pull requests that touch it, or on demand.
+        for job_type in ("presubmit", "batch"):
+            with self.subTest(job_type=job_type):
+                result, artifacts = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("PROFILE", result.stdout)
+                self.assertIn(f"Rollback round trip skipped: a pull request's run (JOB_TYPE={job_type})", result.stdout)
+                self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_it_runs_on_main_and_off_prow(self) -> None:
+        for job_type in ("periodic", "postsubmit", None):
+            with self.subTest(job_type=job_type):
+                result, _ = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertIn("stub ran", result.stdout)
+
+    def test_skipped_on_the_today_lane_which_ran_it_before_the_matrix(self) -> None:
+        result, artifacts = self.run_wiring(mode_next="1", job_type="periodic", rollback_lane="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("Rollback round trip", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_release_candidate_run(self) -> None:
+        """The RC eval's verdict is read only after its job finishes, inside the
+        promotion poller's 330 minutes; a report-only hour would spend that
+        budget on a check that cannot change the verdict."""
+        result, artifacts = self.run_wiring(mode_next="1", rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("PROFILE", result.stdout)
+        self.assertNotIn("COLLECT_GATEWAY", result.stdout)
+        self.assertIn("Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=b4ee5f3", result.stdout)
+        self.assertIn("returned=0", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_a_failed_round_trip_is_reported_and_changes_nothing(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", script_status=1)

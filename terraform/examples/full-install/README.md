@@ -13,7 +13,10 @@ install without the interview.
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
   by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  (with an optional gVisor node pool; `sizing_profile = "fleet"` or the
+  `standard_*` and `gvisor_*` inputs resize both pools, per the module's
+  [sizing section](../../modules/gke-cluster/README.md#sizing-the-node-pools))
+  — with Workload Identity, Cloud KMS
   database encryption (CMEK), the Backup for GKE agent enabled, and the
   `kube-agents-host=true` discovery label applied. Setting
   `create_cluster = false` instead makes the module read an existing cluster:
@@ -55,12 +58,21 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
+  the gateway spends per period, and `install.sh` sets it from
+  `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
+  `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
-  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
-  `install.env`. Changing it on a running install is a mode switch
+  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
+  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
+  which a first install records as `"next"`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
+  so the CR carries no `storage` field) sets the `PlatformAgent`'s
+  `spec.storage.size`, the size of the agent's data volume and the shell
+  sandbox's. A raise grows both claims where the StorageClass allows it, and a
+  lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
+  in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that
@@ -93,6 +105,26 @@ install without the interview.
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
+- Optionally (`model_provider = "openai_compatible"`) a server speaking the OpenAI
+  chat-completions API (vLLM, TGI, an internal gateway), reached through the
+  gateway. No GCP resource: the composition passes the chart
+  `litellm.openaiCompatible` from `openai_compatible_api_base` (the base URL
+  including `/v1`), `openai_compatible_target_port` (the server pod's port, for
+  an in-cluster Service), `openai_compatible_egress_cidrs` (the private ranges
+  any other host is reached at; none for a public endpoint on 443) and
+  `openai_compatible_ca_secret_name` (a Secret you create holding the CA under
+  `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
+  Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
+  it; the plan fails without it or the base URL.
+- Optionally (`litellm_env_secret_name`) a Secret you create in the agent's
+  namespace that the gateway reads whole as environment variables. No GCP
+  resource and nothing in state: the composition passes the name as the chart's
+  `litellm.envFromSecret`. It is how `model_provider = "sap"` (SAP AI Core,
+  `AICORE_SERVICE_KEY` and `AICORE_RESOURCE_GROUP`), any other LiteLLM provider
+  slug (its driver's variables; `model_default_name` is then required and the
+  plan fails without it) and an `openai_compatible` gateway behind OAuth2
+  client credentials (`OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`, `_CLIENT_ID`,
+  `_CLIENT_SECRET`) get their credentials.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -170,7 +202,12 @@ run it again after a few minutes and it untaints the key ring or key the first
 run created, where a bare `terraform apply` would plan their replacement and 409.
 Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
-bare `terraform apply` fails on. The table under
+bare `terraform apply` fails on. For the minter's key ring and key it adopts only
+this install's own, by the owner labels on the key, or the one
+`github_minter_shared_kms_key` names. A key with no owner labels is adopted as
+this install's own, and labelled, when `github_minter_adopt_unlabelled_kms_key`
+names it (the installer sets it when `KMS_KEYRING` and `KMS_KEY` were given). Any
+other, and any key another install's labels claim, refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
@@ -205,7 +242,10 @@ installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
 `GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
-names the key to set. Do not rely on a shell
+names the key to set. The minter's KSA (`github_minter_ksa_name`,
+`GITHUB_MINTER_KSA_NAME`) is the other half of its Workload Identity binding:
+`install.sh` names a new install's after its cluster and records it, so two
+installs sharing the namespace don't bind one member. Do not rely on a shell
 `export` or a hand-edited `terraform.tfvars` instead: the export dies with the
 shell and the file is regenerated on every run, and either way the next run
 resolves the name back to the default and plans the GSA's destroy-and-recreate
@@ -215,7 +255,11 @@ release namespace (`NAMESPACE` in `install.env`) has the same guard,
 so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
 `guard_kms_identity`): on a cluster this state created, a renamed key would be
 destroyed and recreated, which schedules the live key's versions for destruction.
-A key is rotated in Cloud KMS, not by renaming it here.
+A key is rotated in Cloud KMS, not by renaming it here. On a Standard cluster
+`standard_node_count` is the cluster's own `initial_node_count`, ForceNew on the
+cluster itself, and a `TF_VAR_standard_node_count` line in `install.env` reaches
+it: `guard_standard_node_count` refuses a count other than the one the cluster
+was created with, because the plan would be the cluster's destroy-and-recreate.
 And a distinct GSA name un-collides creation, not identity: the Workload
 Identity principal names a namespace and KSA project-wide, no cluster, so two
 installs that share the namespace and the default KSA name bind the same
@@ -237,6 +281,23 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The Standard pools' sizing inputs (`sizing_profile`, `standard_*`, `gvisor_*`)
+travel the same way, as `TF_VAR_` lines the generator never writes, and the
+lines have to be present on every later `install.sh` and `upgrade.sh` run: a
+lost one resolves the `small` profile, and the apply would recreate every node
+of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
+sizing input asks for the change: the pool's own input, set to any value, or,
+for an attribute no explicit input decided at the last apply, a profile other
+than the one that apply recorded. Two root outputs carry what the last apply
+decided them with: `sizing_profile`, and `node_pool_shape_inputs`, the
+explicit inputs that were set. A profile kept beside a lost explicit line asks
+for nothing, and a changed profile asks nothing about an attribute an explicit
+line set, so both of those applies are refused until the line is back or the
+pool's input names the shape. An install applied before the two outputs
+existed plans them once, `+ sizing_profile = "<profile>"` and
+`+ node_pool_shape_inputs = "<names>"` under `Changes to Outputs` and nothing
+else, which `-detailed-exitcode` reports as 2 and `./upgrade.sh --plan` as
+drift, until the next apply records them.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and
@@ -289,6 +350,13 @@ with the two overrides the BackupPlan recipe below writes — and then re-run
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
 rather than 409ing on the cluster halfway through. Through `install.sh` the
 probe derives `create_cluster = false` instead and adopts the cluster.
+
+Every input the guards read goes through the remote state: each `tfvar` read
+is a `terraform console` that opens it, and the pre-apply guards make about
+fifty of them. When Cloud Storage answers a transient 429 or 5xx, or the
+connection drops, the script asks again, up to `STATE_BACKEND_ATTEMPTS` times
+(4) with `STATE_BACKEND_WAIT_SECONDS` (15) between. Any other error fails the
+read at once, as before, with the Terraform error printed.
 
 ### Asking what an apply would change
 
@@ -494,13 +562,15 @@ For production, always pin a validated numeric SemVer release tag or full commit
 For a cluster that may only pull from an approved registry, copy the images
 there first — `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from
 the repository root, driven by `images.json` — then set `image_registry` to the
-same prefix. It reaches the two images the chart never renders as well (the
-agent Deployment and the fluent-bit sidecar the operator resolves at reconcile
-time); the [chart README](../../../charts/kube-agents/README.md) explains how.
-Add `third_party_image_registry` only if the mirror keeps LiteLLM and
-fluent-bit under a different path.
+same prefix. It reaches the runtime images the chart never renders as well (the
+agent Deployment and shell sandbox StatefulSet the operator resolves at reconcile
+time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
+[chart README](../../../charts/kube-agents/README.md) explains how.
+Add `third_party_image_registry` to mirror third-party images (cert-manager,
+LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+their upstream registries.
 
-`IMAGE_TAG` is not optional here. The four first-party images take whatever tag
+`IMAGE_TAG` is not optional here. The first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
 for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
 `v1.2.3` holds no reference the install will ever request. `terraform apply`
@@ -528,15 +598,15 @@ chart renders and, through `IMAGE_PULL_SECRETS` on the operator and
 `spec.deployment.imagePullSecrets` on the `PlatformAgent`, the agent pods the
 operator renders too.
 
-**cert-manager images follow the same prefix, but not the same credentials.**
+**cert-manager images follow `third_party_image_registry`, not `image_registry`.**
 `helm_release.cert_manager` is a separate release of an upstream chart and
 never sees the `helm_release.kube_agents` values, but the composition passes
-it the same registry through its own image overrides
-(`local.cert_manager_mirror_values`), so its five images
+`var.third_party_image_registry` through its own image overrides
+(`local.cert_manager_mirror_values`), so when set, its five images
 (`cert-manager-controller`, `-cainjector`, `-webhook`, `-acmesolver`,
 `-startupapicheck`) are pulled as `<prefix>/<name>:<tag>` — the layout
 `make mirror-images` writes from `images.json`, which carries all five
-entries. `image_pull_secrets` does **not** reach it, so a mirror that needs
+entries. Empty leaves them on `quay.io`. `image_pull_secrets` does **not** reach it, so a mirror that needs
 credentials means installing cert-manager yourself (below). Also not covered
 is the chart itself: it is fetched over the network from
 `https://charts.jetstack.io`, which an air-gapped runner cannot
@@ -760,6 +830,8 @@ With `enable_github_minter = true`, set `github_repo` to your primary GitOps rep
 For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
+
+With `gitops_forge = "bitbucket"` (Bitbucket Cloud, at `bitbucket.org` only) or `gitops_forge = "bitbucket-datacenter"`, set `gitops_repo_path` to `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center), and, for Data Center, `gitops_host` to the instance's hostname. The instance must serve at the root path on port 443. The CR then declares one forge named after its provider, with the workspace or project key as its namespace and the repository slug as its `gitops` repository, and `credentialsRef` naming `gitops_token_secret_name` (default `bitbucket-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A Data Center instance behind a private CA sets `gitops_ca_secret_name`. A Bitbucket Cloud workspace, project or repository access token cannot name its own account, so set `gitops_identity` to the account UUID it acts as; an API token needs none. A Bitbucket install has no GitHub App, so `github_repo` and `enable_github_minter` stay unset. See [Bitbucket as the GitOps forge](../../../docs/site/src/content/docs/install/bitbucket.md).
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
@@ -1052,6 +1124,7 @@ What each one does that raw Terraform cannot:
 | Asymmetry                                                                                                                                          | Handled by                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | KMS key rings and keys can never be deleted, so the next apply 409s                                                                                | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                                                                                                                                    |
+| Installs in a project that use the same cluster key share its one grant to the GKE service agent                                                   | `tf-destroy` forgets the grant from state first (`forget_kms`), so the other clusters keep their access to the key; the next apply puts it back in state                                                                                                                                                                                                                                       |
 | Cloud KMS 403s some requests for a few minutes after a project's first enablement, which the same apply (or the installer just before it) performs | `tf-apply` retries an approved apply (`ARGS=-auto-approve`, which the front doors and CI pass) on that message after a wait, untainting a key ring or key the failed attempt created first (`run_apply`, `adopt_kms`); an unapproved apply at a terminal runs once, and its re-run untaints the same way; `KMS_API_PROPAGATION_ATTEMPTS` and `KMS_API_PROPAGATION_WAIT_SECONDS` size the retry |
 | The `PlatformAgent` finalizer strands the CR and hangs the namespace                                                                               | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                                                                                                                                  |
 | A `BackupPlan` cannot be deleted while it owns backups                                                                                             | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                                                                                                                                   |
@@ -1070,6 +1143,10 @@ Running `terraform destroy` directly still works, but you own the destroy steps
 above yourself — starting with `kubectl delete platformagent <name> -n
 kubeagents-system --wait` while the operator is still running, and setting
 `deletion_protection = false` and applying before the cluster can be removed.
+`tf-destroy` also forgets the KMS key rings and keys and the cluster key's grant
+to the GKE service agent from state first (`forget_kms`). Other installs in the
+project that use the same key need that grant, so a raw destroy must
+`terraform state rm` the keys and the grant as well.
 
 > [!WARNING]
 > Destroying also uninstalls cert-manager when this composition installed it,
@@ -1080,8 +1157,21 @@ kubeagents-system --wait` while the operator is still running, and setting
 > you did not create here.
 
 > [!NOTE]
-> Cloud KMS key rings and crypto keys (for GKE CMEK and optional GitHub minter)
-> cannot be deleted from GCP — `terraform destroy` only removes them from state,
-> and they stay in the project forever. `make tf-apply` imports them back
-> automatically. Applying with bare `terraform apply` after a destroy fails with
-> a 409 until you either import them yourself or choose new key/keyring names.
+> Cloud KMS key rings and crypto keys (for GKE CMEK and the optional GitHub
+> minter) cannot be deleted from GCP, and they stay in the project forever. A
+> raw `terraform destroy` does more than forget them: destroying a crypto key
+> schedules every version of it for destruction, so the key can no longer
+> encrypt and a cluster that uses it cannot read its etcd. `make tf-destroy`
+> (`lifecycle.sh destroy`, which `uninstall.sh` runs) forgets the keys from
+> state first, so they stay usable; a raw destroy needs the `terraform state rm`
+> in the paragraph above. When `make tf-apply` imports them back, which it does
+> automatically, it also restores any cluster key version a raw destroy
+> scheduled, as long as its destruction time has not passed. A minter key with
+> no enabled version stops `make tf-apply` before that step: run
+> `./lifecycle.sh adopt-kms` first, which imports and restores both keys.
+> Applying with bare `terraform apply` after a destroy fails with a 409 until
+> you either import them yourself or choose new key/keyring names. A key you
+> import by hand is not restored: restore and enable each scheduled version
+> with `gcloud kms keys versions restore` and `enable` before its destruction
+> time. See
+> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).

@@ -14,8 +14,8 @@
 
 `gitops_workspace.workspace_path()` used to derive the clone location as a pure function of the
 repository name: `/opt/data/gitops/<owner>__<name>`. One repository, one clone, shared by every agent
-in the Pod. A PlatformAgent Pod runs six audit crons on colliding schedules, a Chat Agent, and one
-kanban worker per dispatched card, all against the same PersistentVolumeClaim. Three consequences
+in the Pod. A PlatformAgent Pod runs every scheduled audit on the Platform Agent's roster, on colliding
+schedules, a Chat Agent, and one kanban worker per dispatched card, all against the same PersistentVolumeClaim. Three consequences
 followed.
 
 **`submit_suggestion.py` had no working directory at all.** It ran `git push -f` in whatever

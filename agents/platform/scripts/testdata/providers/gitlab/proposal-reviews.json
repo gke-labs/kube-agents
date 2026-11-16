@@ -1,0 +1,54 @@
+{
+  "payload": {
+    "number": 7,
+    "limit": 30
+  },
+  "responses": [
+    {
+      "id": 50044807,
+      "iid": 7,
+      "project_id": 1001,
+      "title": "ingest: change 7",
+      "description": "body text",
+      "state": "opened",
+      "created_at": "2026-10-03T09:00:00.000Z",
+      "updated_at": "2026-10-04T08:00:00.000Z",
+      "merge_status": "can_be_merged",
+      "approved": true,
+      "approvals_required": 0,
+      "approvals_left": 0,
+      "require_password_to_approve": false,
+      "approved_by": [
+        {
+          "user": {
+            "id": 50031807,
+            "username": "example-maintainer",
+            "name": "Example Maintainer",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+            "web_url": "https://gitlab.com/example-maintainer"
+          }
+        },
+        {
+          "user": {
+            "id": 50099002,
+            "username": "project_1001_bot_77d0e1",
+            "name": "policy-checker",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/50099002/avatar.png",
+            "web_url": "https://gitlab.com/project_1001_bot_77d0e1"
+          }
+        }
+      ],
+      "suggested_approvers": [],
+      "approvers": [],
+      "approver_groups": [],
+      "user_has_approved": false,
+      "user_can_approve": false,
+      "approval_rules_left": [],
+      "has_approval_rules": false,
+      "merge_request_approvers_available": false,
+      "multiple_approval_rules_available": false
+    }
+  ]
+}

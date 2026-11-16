@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -78,10 +79,7 @@ func TestTheCalloutRoleAuthorizesTheInformerItIsPairedWith(t *testing.T) {
 		buildA2ACalloutServiceAccount(agent), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("serviceaccount: %v", err)
 	}
-	authMap, _, err := buildA2AAuthMapConfigMap(agent, nil)
-	if err != nil {
-		t.Fatalf("rendering the identity map: %v", err)
-	}
+	authMap, _ := singleA2AAuthMapShard(t, agent, nil)
 	if _, err := admin.CoreV1().ConfigMaps(ns).Create(ctx, authMap, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("configmap: %v", err)
 	}
@@ -95,7 +93,7 @@ func TestTheCalloutRoleAuthorizesTheInformerItIsPairedWith(t *testing.T) {
 	}
 
 	// The real rendered Role and RoleBinding, not a hand-written stand-in.
-	if _, err := admin.RbacV1().Roles(ns).Create(ctx, buildA2ACalloutRole(agent), metav1.CreateOptions{}); err != nil {
+	if _, err := admin.RbacV1().Roles(ns).Create(ctx, buildA2ACalloutRole(agent, 1), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("role: %v", err)
 	}
 	if _, err := admin.RbacV1().RoleBindings(ns).Create(ctx, buildA2ACalloutRoleBinding(agent), metav1.CreateOptions{}); err != nil {
@@ -111,7 +109,9 @@ func TestTheCalloutRoleAuthorizesTheInformerItIsPairedWith(t *testing.T) {
 		t.Fatalf("impersonated client: %v", err)
 	}
 
-	byName := "metadata.name=" + a2aAuthMapName(agent)
+	// Shard 0: the map these tests render fits one shard, and the Role
+	// names every shard the render cut (buildA2ACalloutRole).
+	byName := "metadata.name=" + a2aAuthMapShardName(agent, 0)
 
 	t.Run("the narrowed LIST the informer issues is authorized", func(t *testing.T) {
 		list, err := as.CoreV1().ConfigMaps(ns).List(ctx, metav1.ListOptions{FieldSelector: byName})
@@ -150,8 +150,17 @@ func TestTheCalloutRoleAuthorizesTheInformerItIsPairedWith(t *testing.T) {
 	})
 
 	t.Run("the identity map itself is readable by name", func(t *testing.T) {
-		if _, err := as.CoreV1().ConfigMaps(ns).Get(ctx, a2aAuthMapName(agent), metav1.GetOptions{}); err != nil {
+		if _, err := as.CoreV1().ConfigMaps(ns).Get(ctx, a2aAuthMapShardName(agent, 0), metav1.GetOptions{}); err != nil {
 			t.Errorf("the callout cannot get its own identity map: %v", err)
+		}
+	})
+
+	t.Run("a shard the Role does not name is unreadable", func(t *testing.T) {
+		// The Role is rendered per count. A callout told of more shards
+		// than the Role names cannot read the extra one, which is the
+		// loud failure a count mismatch is meant to produce.
+		if _, err := as.CoreV1().ConfigMaps(ns).Get(ctx, a2aAuthMapShardName(agent, 1), metav1.GetOptions{}); err == nil || !apierrors.IsForbidden(err) {
+			t.Errorf("reading an unnamed shard = %v, want forbidden", err)
 		}
 	})
 }

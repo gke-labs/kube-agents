@@ -218,10 +218,12 @@ func (t *Task) mergeArtifact(u ArtifactUpdate) {
 	t.Artifacts = append(t.Artifacts, u.Artifact)
 }
 
-// TaskReplaySubjects is the pair tasks/get folds, in one stream order: the
-// executor's events and the supervisor's terminal, if it wrote one.
+// TaskReplaySubjects is what tasks/get folds, in one stream order: the
+// executor's events and the supervisor's terminal, if it wrote one, in either
+// supervisor form (ProfileSupervisorSubject: a profile task's, once the
+// dispatcher writes it there). All three are on TASKS, and no two overlap.
 func TaskReplaySubjects(addressee, taskID string) []string {
-	return []string{TaskEventsSubject(addressee, taskID), TaskSupervisorSubject(addressee, taskID)}
+	return []string{TaskEventsSubject(addressee, taskID), TaskSupervisorSubject(addressee, taskID), ProfileSupervisorSubject(addressee, taskID)}
 }
 
 // TasksGet replays the task's events and supervisor subjects from sequence 1
@@ -545,7 +547,7 @@ func chatMessagePart(p Part) bool {
 // result is the deliverable, thinking is text, progress is text with a chat
 // message beside each chunk's text (spec "Chat messages"; the folded
 // artifact holds every chunk's parts), activity is the structured tool-call
-// trace.
+// trace, usage is one usage object per finished turn.
 func (t *Task) ValidateArtifacts() error {
 	if t.State == StateCompleted && t.Artifact(ArtifactResult) == nil {
 		return &ProtocolError{Msg: fmt.Sprintf("task %q completed without a result artifact", t.ID)}
@@ -566,6 +568,12 @@ func (t *Task) ValidateArtifacts() error {
 			for _, p := range a.Parts {
 				if p.Kind != "data" {
 					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part; the tool-call trace is data parts", a.Name, p.Kind)}
+				}
+			}
+		case ArtifactUsage:
+			for _, p := range a.Parts {
+				if _, ok := UsageOf(p); !ok {
+					return &ProtocolError{Msg: fmt.Sprintf("artifact %q carries a %q part that is not a usage object; each part is one turn's usage", a.Name, p.Kind)}
 				}
 			}
 		}

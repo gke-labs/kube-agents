@@ -9,8 +9,9 @@ serves, so any other reader of the same shapes (a review of what an upgrade did,
 fact) imports this module instead of carrying a copy. A table is appended to, never
 rewritten: a constant keeps its name and its shape once it exists. Every table names its
 source beside it; a date beside one is the day a page that moves was read. The tables
-are deliberately small: a rule whose input has no row here grades `unknown` with the reason
-rather than guessing (docs/designs/upgrade-readiness-checks.md, "What a run produces").
+are deliberately small: a rule whose input has no row here grades `unknown`, or files a note
+where the rule cannot block, with the reason rather than guessing
+(docs/designs/upgrade-readiness-checks.md, "What a run produces").
 Nothing here is computed from a cluster and nothing here runs a command.
 
 Each section names the catalogue entries it serves, as docs/designs/upgrade-failure-catalogue.md
@@ -121,7 +122,8 @@ DEPRECATED_API_SUCCESSORS_SOURCE = "https://kubernetes.io/blog/2025/03/26/kubern
 
 # Defaults that change at a minor (entry 8), keyed by the minor that changes them. A
 # minor at or below DEFAULT_CHANGES_AS_OF with no key changes nothing in this table; a
-# target above it is not covered, and the rule says `unknown`. Row fields: `setting`
+# target above it is graded on the minors the table covers, with a note that the table
+# ends there (the rule cannot block). Row fields: `setting`
 # names what changes; `detector` names the object shape the row is matched against
 # (namespace Pod Security labels, or workloads carrying a gitRepo volume); `side` says
 # which component's version the change rides on, so the rule measures the minors crossed
@@ -250,8 +252,9 @@ DEFAULT_CHANGES_BY_MINOR = {
 # container image (registry kept, tag and digest stripped) and its release read from the
 # tag. A support row maps an add-on release to the Kubernetes minors it supports,
 # inclusive, as the vendor's page listed them on the day given. An add-on detected with
-# no row here, or at a release the rows do not list, is reported `unknown` with the page
-# to read; no range is ever inferred from a neighbouring release.
+# no row here, or at a release the rows do not list, is a note naming the page to read
+# ("version not graded"; the rule cannot block); no range is ever inferred from a
+# neighbouring release.
 ADDON_IMAGES = {
     "quay.io/jetstack/cert-manager-controller": "cert-manager",
     "docker.io/istio/pilot": "istio",
@@ -308,6 +311,25 @@ DROPPED_NODE_LABELS = (
     ("node-role.kubernetes.io/master", None, (1, 24), "kubeadm 1.24 stops setting it (kubernetes/kubernetes#107533)"),
     ("cloud.google.com/gke-container-runtime", "docker", (1, 24), "GKE 1.24 removes Docker node images"),
 )
+# Label keys GKE and the kubelet set on every node from the pool's configuration and the
+# machine: the pool, accelerator, machine-family, OS-distribution, runtime, spot and
+# preemptible labels under cloud.google.com/, the arch, os, hostname, zone, region and
+# instance-type labels under kubernetes.io/, node.kubernetes.io/ and topology.kubernetes.io/,
+# the GKE topology and networking labels, and the deprecated beta spellings. A selector on
+# one of these names a pool shape, not a label a node image could stop setting: whether a
+# pool of that shape exists is another rule's question (entry 18 asks it for accelerators),
+# so the removed-node-label rule asks the carried question only of other keys.
+# Sources: docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pools (the labels GKE
+# sets); kubernetes.io/docs/reference/labels-annotations-taints/ (the kubelet's).
+GKE_NODE_LABEL_PREFIXES = (
+    "cloud.google.com/",
+    "kubernetes.io/",
+    "node.kubernetes.io/",
+    "topology.kubernetes.io/",
+    "topology.gke.io/",
+    "iam.gke.io/",
+    "networking.gke.io/",
+) + DEPRECATED_NODE_LABEL_PREFIXES
 
 # ------------------------------------------------------------------ entry 13: the container runtime
 
@@ -384,6 +406,9 @@ JDK_FIRST_MAJOR_WITH_CGROUP_V2 = 15
 # milestone 5.0.0) and its runtime change dotnet/runtime#34334; .NET Core 3.1 and 2.1 read
 # cgroup v1 only.
 DOTNET_IMAGE_REPO_MARKERS = ("mcr.microsoft.com/dotnet/", "microsoft/dotnet")
+# .NET Framework (4.x) ships in Windows containers only, which run on Windows pools where
+# cgroups do not exist; its images are outside the rule, on either registry path.
+DOTNET_FRAMEWORK_IMAGE_MARKERS = ("mcr.microsoft.com/dotnet/framework/", "microsoft/dotnet-framework")
 DOTNET_TAG_RE = re.compile(r"^(\d+)\.(\d+)")
 DOTNET_CGROUP_V2_VERSION = (5, 0)
 # From Kubernetes 1.28 the kubelet sets memory.oom.group on every container on a cgroup v2
@@ -450,11 +475,15 @@ GPU_DRIVER_INSTALLATION_DISABLED = "INSTALLATION_DISABLED"
 AUTOPILOT_GPU_DRIVER_LABEL = "cloud.google.com/gke-gpu-driver-version"
 AUTOPILOT_GPU_DRIVER_LATEST = "latest"
 # The NVIDIA driver branch GKE installs per minor, (default, latest), from the GPU how-to
-# (docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus, "Install drivers
-# automatically", read 2026-10-09). The rows entered are 1.26 to 1.33 for
-# Container-Optimized OS and 1.31 to 1.33 for Ubuntu; the page also lists Ubuntu rows below
-# 1.31, not entered here, so an Ubuntu target there is `unknown` until a reader copies them
-# from the page. A target outside a table is `unknown`.
+# (GKE_GPU_DRIVER_SOURCE, "Install drivers automatically", read 2026-10-09 and again on
+# 2026-10-20: both tables on the page end at 1.33, with no row for 1.34 or later, and the
+# `latest` entered is the highest branch the page lists for the minor). The rows entered are
+# 1.26 to 1.33 for Container-Optimized OS and 1.31 to 1.33 for Ubuntu; the page also lists
+# Ubuntu rows below 1.31 as "R470 or R535" without saying which the default is, so they are
+# not entered and an Ubuntu target there is `unknown`. A target below a table's first row is
+# `unknown`; one past its last row is a risk naming the page, since the page has no row yet and
+# the rule cannot tell a driver floor the target image falls below from one it clears.
+GKE_GPU_DRIVER_SOURCE = "https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus"
 GKE_COS_GPU_DRIVERS = {
     (1, 26): (470, 550),
     (1, 27): (470, 550),

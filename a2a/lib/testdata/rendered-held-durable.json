@@ -1,0 +1,16 @@
+{
+  "ackPolicy": "explicit",
+  "ackWait": "2m0s",
+  "durable": "profile-tse-read-top",
+  "filter": "a2a.submit.tse.read.top.*",
+  "maxAckPending": 3,
+  "metadata": {
+    "kube-agents.held-delivery": "v1"
+  },
+  "poolLabels": {
+    "kubeagents.x-k8s.io/a2a-component": "agentprofile-worker",
+    "kubeagents.x-k8s.io/agentprofile": "tse",
+    "kubeagents.x-k8s.io/agentprofile-tier": "read"
+  },
+  "stream": "PROFILE_SUBMITS"
+}

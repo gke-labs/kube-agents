@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/console"
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/memlimit"
 )
 
 const (
@@ -32,6 +34,26 @@ const (
 	envUser         = "CONSOLE_USER"
 	envPasswordFile = "CONSOLE_PASSWORD_FILE"
 	envAllowedHosts = "CONSOLE_ALLOWED_HOSTS"
+	// envCAFile is the bus CA every bus client reads, under the one name the
+	// operator sets for all of them; it has no default, because a CA the
+	// operator did not mount is not one to trust.
+	envCAFile = lib.EnvNATSCAFile
+	// envTLSServerName is the port-forwarded-tooling override every bus
+	// client honours; the operator never sets it.
+	envTLSServerName = lib.EnvNATSTLSServerName
+	// envMemoryLimit carries this container's memory limit in bytes, which
+	// the operator writes from the container's own limits.memory through the
+	// Downward API (a2aConsoleMemoryLimitEnvVar in
+	// k8s-operator/internal/controller/platformagent_a2a_console.go), so the
+	// Go soft memory limit follows whatever limit the cluster admitted, an
+	// Autopilot clamp included. The chart's web console reads the same name.
+	// Unset, the runtime default stands; an explicit GOMEMLIMIT wins
+	// (lib/memlimit).
+	envMemoryLimit = "WEB_CONSOLE_MEMORY_LIMIT_BYTES"
+	// memoryLimitFraction is the share of the container limit the console
+	// takes as its soft limit: alone in its container, the tenth left over
+	// covers what the cgroup counts and the heap does not.
+	memoryLimitFraction = 0.9
 
 	defaultListen       = ":8080"
 	defaultStaticDir    = "/srv/console"
@@ -102,6 +124,8 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 		console: console.Config{
 			StaticDir:    or(envStaticDir, defaultStaticDir),
 			BusURL:       bus,
+			CAFile:       getenv(envCAFile),
+			ServerName:   getenv(envTLSServerName),
 			User:         or(envUser, defaultUser),
 			PasswordFile: or(envPasswordFile, defaultPasswordFile),
 			AllowedHosts: hosts,
@@ -110,6 +134,12 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 }
 
 func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	if limitBytes, applied, reason := memlimit.Apply(envMemoryLimit, memoryLimitFraction); applied {
+		log.Info("Go soft memory limit set from the container's memory limit",
+			"bytes", limitBytes, "source", envMemoryLimit, "fraction", memoryLimitFraction)
+	} else {
+		log.Info("Go soft memory limit not derived; the runtime default applies", "reason", reason)
+	}
 	s, err := configFromEnv(getenv)
 	if err != nil {
 		log.Error("console config", "err", err)

@@ -51,7 +51,7 @@ To determine which users have interacted with the system via Google Chat in the 
 - Run the packaged Python helper script to automatically query and parse the GKE container logs from Google Cloud Logging:
 
   ```bash
-  python3 ./scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>] [--limit <N>]
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>] [--limit <N>]
 
   ```
 
@@ -79,7 +79,7 @@ To determine which users have interacted with the system via Google Chat in the 
   ```
 - Read the scrape configuration off the `PodMonitoring` resources, not off Deployment annotations: the operator renders none. The Helm chart renders four where the cluster serves the `PodMonitoring` API (`platformAgent.podMonitoring`, `null` by default, forces them on or off); the fourth, `<name>-a2a-gateway-monitoring` (port 9096), selects the A2A gateway pod and is empty on an install that runs none. The three that carry the watcher, the chat plugin and the broker:
   - `<name>-gateway-monitoring`: the event watcher, listening in the gateway pod's `agent-api-auth` container on its `event-metrics` port (9095), on every replica.
-  - `<name>-gateway-chat-monitoring`: the `chat_metrics` plugin, listening in the gateway pod's `platform-agent` container on its `chat-metrics` port (9097) with `kubeagents_chat_messages_inbound_total`. It selects the pod carrying `kubeagents.io/is-leader: "true"`: above one replica only the leader runs Hermes, so only the leader has the port; at one replica the operator puts the label on the one pod.
+  - `<name>-gateway-chat-monitoring`: the `chat_metrics` plugin, listening in the gateway pod's `platform-agent` container on its `chat-metrics` port (9097) with its `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` and the rest). It selects the pod carrying `kubeagents.io/is-leader: "true"`: above one replica only the leader runs Hermes, so only the leader has the port; at one replica the operator puts the label on the one pod.
   - `<name>-credential-proxy-monitoring`: the credential broker, serving its `kubeagents_*` series on the broker pod's metrics-only `cred-metrics` port (8766).
   ```bash
   kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml
@@ -99,14 +99,14 @@ To determine which users have interacted with the system via Google Chat in the 
 
 - Run the python script to fetch LiteLLM total token metrics from Cloud Monitoring:
   ```bash
-  python3 ./scripts/check_token_usage.py --project-id <project-id>
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
   ```
 
 ### 4. List LiteLLM Metric Descriptors
 
 - Run the python script to list all available metric descriptors for LiteLLM:
   ```bash
-  python3 ./scripts/get_metric_descriptors.py --project-id <project-id>
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/get_metric_descriptors.py --project-id <project-id>
   ```
 
 ## Traces
@@ -156,7 +156,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 - Run the trace latency analyzer script:
 
   ```bash
-  python3 ./scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
   ```
 
   **Example Output:**
@@ -174,7 +174,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 
 - Alternatively, run the raw trace list script:
   ```bash
-  python3 ./scripts/fetch_traces.py --project-id <project-id> --hours 24
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/fetch_traces.py --project-id <project-id> --hours 24
   ```
 
 ## Agent Status and Health

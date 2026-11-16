@@ -1,4 +1,4 @@
-"""Wire agent/credential_redaction.py into the three upstream sites it needs.
+"""Wire agent/credential_redaction.py into the five upstream sites it needs.
 
 One edit per file, none of them touched by another applier, so this runs at any
 point after ``credential_redaction.py`` is installed at
@@ -20,8 +20,19 @@ point after ``credential_redaction.py`` is installed at
    statement of ``main()``, the console entry point every ``hermes`` argv
    resolves to, ahead of the fast-launch returns and of the first print.
    ``find_def("main").body_start`` places it after the docstring.
+4. ``hermes_state_messages.py`` -- ``SessionMessagesMixin._message_row_params``,
+   the one binder every message insert goes through, gets a prologue that
+   passes the message dict and its tool calls through
+   ``redact_message_for_store``. ``find_method`` locates it inside the mixin,
+   and ``expect_parameters`` asserts the two names the prologue rebinds.
+5. ``hermes_cli/kanban_db.py`` -- ``create_task``, ``complete_task`` and
+   ``edit_completed_task_result`` each get a prologue that passes their text
+   parameters (title and body; result and summary) through
+   ``redact_store_text``, located and checked the same way before any insert.
 
-None of the three consumes its anchor, so the count check cannot tell a fresh
+The trailer in 1 also rebinds ``redact_sensitive_text`` to the operator-rules
+composition, outside the registration's ``try``, so an unreadable rule file
+stops the import. None of the five consumes its anchor, so the count check cannot tell a fresh
 file from a patched one; each edit names a marker only the insert contains
 and refuses to run twice.
 
@@ -40,6 +51,8 @@ PREFIX = "credential-redaction"
 REDACT_RELATIVE = "agent/redact.py"
 DISPLAY_RELATIVE = "agent/display.py"
 MAIN_RELATIVE = "hermes_cli/main.py"
+STATE_RELATIVE = "hermes_state_messages.py"
+KANBAN_RELATIVE = "hermes_cli/kanban_db.py"
 
 #: The upstream function the trailer calls; located, not anchored, so a moved
 #: or reformatted definition still passes and a removed one still fails.
@@ -60,7 +73,27 @@ try:
     _kube_agents_register_patterns()
 except Exception:  # noqa: BLE001 - a failed registration must not break import
     logger.warning("kube-agents: credential pattern registration failed", exc_info=True)
+
+# kube-agents patch: the operator's redaction rules (KUBE_AGENTS_REDACTION_CONFIG,
+# the file the gateway's pre-call hook reads) applied after the masking above,
+# so agent.log, the terminal-output cache, the worker transcript and the
+# ``💻 $`` line carry them too. Rebound here, at the end of the module, so
+# every later import and every call through the module global gets the
+# composed form. Not inside the try above: a rule file that does not parse
+# must stop the process at import, as it stops the gateway, rather than let
+# it run with the rules silently off. Nothing changes while no rule file is
+# projected or named. See agent/credential_redaction.py.
+try:
+    from agent.credential_redaction import (
+        install_operator_rules as _kube_agents_install_operator_rules,
+    )
+except Exception:  # noqa: BLE001 - the module ships in the image; a missing one is logged
+    logger.warning("kube-agents: operator rule redaction unavailable", exc_info=True)
+    _kube_agents_install_operator_rules = None
+if _kube_agents_install_operator_rules is not None:
+    redact_sensitive_text = _kube_agents_install_operator_rules(redact_sensitive_text)
 '''
+RULES_MARKER = "_kube_agents_install_operator_rules"
 
 DISPLAY_ANCHOR = (
     '    if tool_name == "browser_type" and isinstance(args.get("text"), str):\n'
@@ -109,9 +142,54 @@ MAIN_PROLOGUE_LINES = (
 )
 
 
+STATE_CLASS = "SessionMessagesMixin"
+STATE_METHOD = "_message_row_params"
+STATE_PARAMETERS = ("msg", "tool_calls")
+STATE_MARKER = "_kube_agents_redact_message_for_store"
+#: Indented by the applier to the body's own indentation.
+STATE_PROLOGUE_LINES = (
+    "# kube-agents patch: with the operator's rule file projected (or named by",
+    "# KUBE_AGENTS_REDACTION_CONFIG), what this row carries to state.db --",
+    "# content, reasoning, tool-call arguments -- goes through the forced",
+    "# redactor first, credential shapes and the operator's rules alike, in",
+    "# copies. A no-op while no rule file is present.",
+    "# See agent/credential_redaction.py.",
+    "from agent.credential_redaction import (",
+    "    redact_message_for_store as _kube_agents_redact_message_for_store,",
+    ")",
+    "msg, tool_calls = _kube_agents_redact_message_for_store(msg, tool_calls)",
+)
+#: Each kanban writer and the text parameters its prologue rebinds: a card's
+#: title and body, a worker's result and summary, a comment's body (the path
+#: the ended-run patch sends a worker's result down when a parent is linked
+#: mid-run) and a block's reason. The board's other text columns are names,
+#: states and ids the tools write from their own vocabulary.
+KANBAN_WRITERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("create_task", ("title", "body")),
+    ("complete_task", ("result", "summary")),
+    ("edit_completed_task_result", ("result", "summary")),
+    ("add_comment", ("body",)),
+    ("block_task", ("reason",)),
+)
+KANBAN_MARKER = "_kube_agents_redact_store_text"
+KANBAN_PROLOGUE_HEAD = (
+    "# kube-agents patch: with the operator's rule file projected (or named by",
+    "# KUBE_AGENTS_REDACTION_CONFIG), the text this writer puts on the board",
+    "# goes through the forced redactor first. A no-op while no rule file is",
+    "# present. See agent/credential_redaction.py.",
+    "from agent.credential_redaction import (",
+    "    redact_store_text as _kube_agents_redact_store_text,",
+    ")",
+)
+
+
+def _prologue(site, lines) -> str:
+    return "".join((site.body_indent + line if line else "") + "\n" for line in lines)
+
+
 def _apply_redact(root: Path) -> None:
     patch = patchlib.Patch(root, REDACT_RELATIVE, prefix=PREFIX)
-    patch.refuse_if_patched(REDACT_MARKER)
+    patch.refuse_if_patched(REDACT_MARKER, RULES_MARKER)
     patch.find_def(REGISTRY_FUNCTION, label="pattern registry")
     patch.append(REDACT_TRAILER)
     patch.commit("kube-agents pattern registration trailer")
@@ -135,10 +213,37 @@ def _apply_main(root: Path) -> None:
     patch.commit("worker transcript redaction prologue")
 
 
+def _apply_state(root: Path) -> None:
+    patch = patchlib.Patch(root, STATE_RELATIVE, prefix=PREFIX)
+    patch.refuse_if_patched(STATE_MARKER)
+    site = patch.find_method(STATE_CLASS, STATE_METHOD, label="message row binder")
+    site.expect_parameters(*STATE_PARAMETERS)
+    patch.insert(site.body_start, _prologue(site, STATE_PROLOGUE_LINES))
+    patch.commit("session store redaction prologue")
+
+
+def _apply_kanban(root: Path) -> None:
+    patch = patchlib.Patch(root, KANBAN_RELATIVE, prefix=PREFIX)
+    patch.refuse_if_patched(KANBAN_MARKER)
+    # Located before any insert: an offset taken earlier moves with each one.
+    for name, parameters in KANBAN_WRITERS:
+        site = patch.find_def(name, label=f"kanban writer {name}")
+        site.expect_parameters(*parameters)
+    for name, parameters in KANBAN_WRITERS:
+        site = patch.find_def(name, label=f"kanban writer {name}")
+        lines = KANBAN_PROLOGUE_HEAD + tuple(
+            f"{parameter} = {KANBAN_MARKER}({parameter})" for parameter in parameters
+        )
+        patch.insert(site.body_start, _prologue(site, lines))
+    patch.commit("kanban board redaction prologues")
+
+
 def apply(root: Path) -> None:
     _apply_redact(root)
     _apply_display(root)
     _apply_main(root)
+    _apply_state(root)
+    _apply_kanban(root)
 
 
 if __name__ == "__main__":

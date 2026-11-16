@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -18,8 +19,8 @@ import (
 // taskId matches the subject token, and the writer the envelope names is the
 // writer the subject implies. Disagreement is a protocol error and the message
 // carries no identity. Nothing here is signed and nothing is looked up; every
-// check is a field-to-token comparison, plus the one supervisor name a
-// consumer is configured with.
+// check is a field-to-token comparison, plus the supervisor names a consumer
+// is configured with.
 //
 // `from` therefore stops being "routing and display only" and becomes a
 // refusal input - but never the source of identity. Identity comes from the
@@ -36,6 +37,19 @@ type AgreementPolicy struct {
 	// `…supervisor` writer check falls back to the negative form: anyone but
 	// the addressee.
 	Supervisor string
+
+	// OtherSupervisors are further `from.session` values the render assigns
+	// a supervisor's role beside Supervisor: the profile dispatcher
+	// (DispatcherSession), which writes the terminal of a profile task it
+	// refuses or fails on that task's `…supervisor`. Read only when
+	// Supervisor is set. Which `…supervisor` subjects each may write is the
+	// grant's business; this only lets its terminal agree with them.
+	OtherSupervisors []string
+
+	// Submitter is the `from.session` allowed to write a profile's
+	// submissions (`…submit`): the gateway, for a dispatcher. Empty falls back
+	// to the negative form, as Supervisor does: anyone but the profile.
+	Submitter string
 
 	// StrictEventsWriter makes the `…events` writer-class check a hard
 	// disagreement. Off, the check is ADVISORY: reported so the caller can
@@ -82,6 +96,9 @@ func IsAdvisoryDisagreement(err error) bool {
 func CheckSubjectAgreement(subject string, env *Envelope, p AgreementPolicy) error {
 	if addressee, taskID, class, ok := ParseTaskSubject(subject); ok {
 		return checkTaskAgreement(subject, addressee, taskID, class, env, p)
+	}
+	if profile, _, _, taskID, ok := ParseSubmitSubject(subject); ok {
+		return checkSubmitAgreement(subject, profile, taskID, env, p)
 	}
 	if profile, ok := strings.CutPrefix(subject, agentsPrefix); ok && ValidSubjectToken(profile) {
 		return checkDirectoryAgreement(subject, profile, env)
@@ -142,7 +159,7 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 			return disagree(subject, "non-final status-update on a supervisor subject; supervisors emit only terminal events")
 		}
 		switch {
-		case p.Supervisor != "" && env.From.Session != p.Supervisor:
+		case p.Supervisor != "" && env.From.Session != p.Supervisor && !slices.Contains(p.OtherSupervisors, env.From.Session):
 			return disagree(subject, "from.session %q is not the supervisor %q", env.From.Session, p.Supervisor)
 		case p.Supervisor == "" && namesAddressee(env.From, addressee):
 			return disagree(subject, "from %s names the addressee; an executor is not its own supervisor", describeParty(env.From))
@@ -157,6 +174,33 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 		if namesAddressee(env.From, addressee) {
 			return disagree(subject, "from %s names the addressee; an executor does not write its own in subject", describeParty(env.From))
 		}
+	}
+	return nil
+}
+
+// checkSubmitAgreement: a submission is a new task's first message, so the
+// kind is `message` alone (a cancel goes on `…in`, to the task it cancels).
+// taskId and `to` agree with the tokens as on every task subject. The writer
+// is the gateway, submitting as itself, so a child it mints for the same
+// profile passes. A consumer that names it (AgreementPolicy.Submitter)
+// refuses any other writer; one that doesn't refuses only the profile writing
+// to itself. The tier and kind tokens have no envelope field to agree with;
+// who may write them is the grant's business.
+func checkSubmitAgreement(subject, profile, taskID string, env *Envelope, p AgreementPolicy) error {
+	if env.TaskID != taskID {
+		return disagree(subject, "taskId %q does not match the subject's %q", env.TaskID, taskID)
+	}
+	if env.To != nil && env.To.Session != profile {
+		return disagree(subject, "to %q disagrees with the subject's profile %q", env.To.Session, profile)
+	}
+	if env.Kind != KindMessage {
+		return disagree(subject, "kind %q on a submission subject; a submission is a message", env.Kind)
+	}
+	switch {
+	case p.Submitter != "" && env.From.Session != p.Submitter:
+		return disagree(subject, "from.session %q is not the submitter %q", env.From.Session, p.Submitter)
+	case p.Submitter == "" && namesAddressee(env.From, profile):
+		return disagree(subject, "from %s names the profile; an executor does not submit to itself", describeParty(env.From))
 	}
 	return nil
 }

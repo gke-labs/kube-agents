@@ -39,11 +39,14 @@ import (
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (a
 // follow-up waits for the turn to end and runs as the next turn in the same
-// session; bridge.go, queueSteer). A kanban card's completion never reaches
-// the A2A task (the API server has no push channel); it goes back to the
-// conversation through the gateway's chat.notify route instead, on the route
-// this executor records before a task's first turn (route.go). Both are
-// named in a2a/docs/hermes-bridge.md.
+// session; bridge.go, queueSteer). On routed chat turns (Slack and Google
+// Chat), a kanban card's completion goes back to the conversation
+// asynchronously through the gateway's chat.notify route, using the route
+// this executor records before a task's first turn (route.go). On console,
+// MCP and A2A door turns only (waitsForCardsInTurn), runTaskAPI waits in-turn
+// for the session's kanban cards to settle and synthesizes their findings
+// into the task's answer (kanban.go); every other turn ends at its
+// acknowledgement. Both are named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -120,6 +123,7 @@ const (
 	// it is absent, and the task ends hermes-api-unreachable.
 	DefaultAPIConnectRetry  = 2 * time.Minute
 	apiConnectRetryInterval = time.Second
+	kanbanStartGraceSeconds = 2
 )
 
 // errWaitingForTurn is the error a task whose context ended while it waited
@@ -216,7 +220,9 @@ type apiChatMessage struct {
 }
 
 // apiChatResponse is the subset of the chat-completions response the bridge
-// reads: the first choice's text, and the server's own verdict on the turn.
+// reads: the first choice's text, the server's own verdict on the turn, and
+// what the turn cost (Model and Usage, each optional; a server that sends
+// neither leaves the usage artifact with the turn's wall time alone).
 // A turn that failed with no text comes back as an OpenAI error envelope
 // with a non-2xx status, read as text; one that failed with text (a
 // provider error, a rate limit the retries did not outlast, the failure
@@ -231,6 +237,88 @@ type apiChatResponse struct {
 		Failed bool   `json:"failed"`
 		Error  string `json:"error"`
 	} `json:"hermes"`
+	// Raw, decoded on their own by apiTurnUsage: telemetry must not fail
+	// the decode that carries the answer, so a model or usage in a shape
+	// the bridge does not expect is dropped, never the turn.
+	Model json.RawMessage `json:"model"`
+	Usage json.RawMessage `json:"usage"`
+}
+
+// apiUsage is a response's token counts, in either spelling the server may
+// use: the chat-completions one (prompt_tokens, completion_tokens) or the
+// responses one (input_tokens, output_tokens). Hermes's prompt_tokens is
+// every token the model read, cached reads included, which is what the
+// usage artifact's inputTokens means. The counts are float64 so a count
+// written as 1200.0 still decodes; the part carries whole tokens.
+type apiUsage struct {
+	PromptTokens     float64 `json:"prompt_tokens"`
+	CompletionTokens float64 `json:"completion_tokens"`
+	InputTokens      float64 `json:"input_tokens"`
+	OutputTokens     float64 `json:"output_tokens"`
+}
+
+// apiTurnUsage is one answered turn's usage part: the server's model name
+// when it sent one (the alias the request named otherwise), its token
+// counts when it sent them in a shape the bridge reads, and the turn's wall
+// time as the bridge measured it from the request to the body read. No
+// cost: Hermes behind the gateway prices nothing
+// (docs/site/src/content/docs/deploy/telemetry.md), and the artifact
+// carries no figure the producer invented. A field that is present but does
+// not decode is left out and named in dropped, for the one warning the
+// caller logs per turn; it never fails the turn.
+func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) (u lib.Usage, dropped []string) {
+	u = lib.Usage{DurationMs: turnMillis(took)}
+	switch {
+	case len(out.Model) == 0:
+	case json.Unmarshal(out.Model, &u.Model) != nil:
+		dropped = append(dropped, "model")
+	}
+	if u.Model == "" {
+		u.Model = requested
+	}
+	var counts apiUsage
+	switch {
+	case len(out.Usage) == 0:
+	case json.Unmarshal(out.Usage, &counts) != nil:
+		dropped = append(dropped, "usage")
+	default:
+		// A count that is negative or past what the part carries is that
+		// field dropped, named, so the part keeps its time and model.
+		var ok bool
+		if u.InputTokens, ok = lib.UsageFigure(max(counts.PromptTokens, counts.InputTokens)); !ok {
+			dropped = append(dropped, "usage.prompt_tokens")
+		}
+		if u.OutputTokens, ok = lib.UsageFigure(max(counts.CompletionTokens, counts.OutputTokens)); !ok {
+			dropped = append(dropped, "usage.completion_tokens")
+		}
+	}
+	return u, dropped
+}
+
+// publishTurnUsage publishes an answered or failed API turn's usage under
+// run.mu, and logs the fields the response carried in a shape the bridge
+// does not read, once per turn.
+func (b *Bridge) publishTurnUsage(run *taskRun, out *apiChatResponse, took time.Duration) {
+	u, dropped := apiTurnUsage(out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	run.mu.Lock()
+	if run.state == stateRunning {
+		b.publishUsageLocked(run, u)
+	}
+	run.mu.Unlock()
+}
+
+// turnMillis is a turn's wall time for the usage part: whole milliseconds,
+// and at least one for a turn that took any time at all, so a fast turn is
+// a figure rather than the zero the part omits.
+func turnMillis(took time.Duration) int64 {
+	if took <= 0 {
+		return 0
+	}
+	return max(1, took.Milliseconds())
 }
 
 // apiTurnFailed reports whether the server marked the turn failed, the case
@@ -299,11 +387,22 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	// The session's origin and its conversation route are written side by
+	// side under one deadline, so a store that hangs delays the first turn
+	// by one timeout, not two.
+	recordCtx, cancelRecord := context.WithTimeout(taskCtx, routeTimeout)
+	originDone := make(chan struct{})
+	go func() {
+		defer close(originDone)
+		b.recordOrigin(recordCtx, sessionID, run.origin)
+	}()
 	// Recorded before the first turn, so a card any turn files finds it;
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.
 	routeLost := false
-	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	routeErr := b.recordRoute(recordCtx, sessionID, run.origin)
+	<-originDone
+	cancelRecord()
 	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
 		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
 			"task", taskID, "session", sessionID, "err", routeErr)
@@ -312,11 +411,23 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	// Only a console, MCP or A2A door turn waits on its cards in turn
+	// (#5170, #5180); every other turn ends at its acknowledgement, as
+	// before the in-turn wait.
+	waitKanbanInTurn := waitsForCardsInTurn(run.origin)
+	if waitKanbanInTurn {
+		b.rememberConsoleSession(sessionID, run.origin)
+	}
+	// The opening turn only: a follow-up runs in a session that has already
+	// read the report, and the hook this mirrors reads the thread once per
+	// message a person sends, which the opening turn is.
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn - every turn of it.
 	act := newSessionActivityState(sessionID, b.apiTraced())
+	act.waitInTurn.Store(waitKanbanInTurn)
 	act.inTurn.Store(true)
 	defer act.inTurn.Store(false)
 	run.mu.Lock()
@@ -328,12 +439,56 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	carriedCards := false
+	if waitKanbanInTurn {
+		b.beginKanbanWait(sessionID)
+		defer func() {
+			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
+				b.markRunCanceled(run, sessionID)
+			}
+			b.endKanbanWait(sessionID)
+		}()
+	}
+	taskStartUnix := time.Now().Unix() - kanbanStartGraceSeconds
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
-		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
+		// A follow-up's synthesis step needs work of its own (beginTurn).
+		act.beginTurn()
+		if waitKanbanInTurn {
+			act.cardsFiled.Store(false)
+		}
+		key := apiTurnKey(run.origin.TaskID, steer)
+		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev, key)
 		if !ok {
 			return
+		}
+		if leaksCardID(prompt, text) {
+			// A card id where the user asked about no task (card_id_leak.go):
+			// one more message to the session asks for the reply without
+			// it, under its own key; what comes back is the turn's answer,
+			// id or not.
+			b.cfg.Logger.Warn("answer names a card id outside a board read; asking the agent to restate it",
+				"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			restated, ok := b.apiTurn(run, taskCtx, sessionID, cardIDRestatePrompt, nil, turn, text, key+cardIDRestateKeySuffix)
+			if !ok {
+				return
+			}
+			if leaksCardID(prompt, restated) {
+				b.cfg.Logger.Warn("the restated answer still names a card id; delivered as it is",
+					"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			}
+			text = restated
+		}
+		if waitKanbanInTurn {
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
+			if !ok {
+				return
+			}
+			carriedCards = act.cardsFiled.Load()
+			if !carriedCards {
+				taskStartUnix = time.Now().Unix() - kanbanStartGraceSeconds
+			}
 		}
 		next, nextPrompt := b.runnableSteer(ctx, run)
 		if next == nil {
@@ -341,7 +496,8 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			// completed wins, per the payload spec's cancel mapping, as on
 			// the subprocess path.
 			if routeLost {
-				text += routeLostNote
+				// Above a declared step's line, which has to stay last.
+				text = withNote(text, routeLostNote)
 			}
 			b.finalize(run, lib.StateCompleted, "", &text)
 			return
@@ -374,7 +530,9 @@ func apiTurnKey(taskID string, steer *lib.Envelope) string {
 // canceled, past its deadline or the bridge stopping, which sends nothing
 // and ends the task with prev still attached as the result
 // (finalizeTurnNotSent).
-func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
+// key is the turn's Idempotency-Key (apiTurnKey), or that key with a suffix
+// for a second request the same turn makes (card_id_leak.go).
+func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev, key string) (string, bool) {
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -392,7 +550,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
 	req.Header.Set(apiSessionKeyHeader, sessionID)
 	req.Header.Set(apiSessionIDHeader, sessionID)
-	req.Header.Set(apiIdempotencyHeader, apiTurnKey(run.origin.TaskID, steer))
+	req.Header.Set(apiIdempotencyHeader, key)
 
 	if steer != nil {
 		run.mu.Lock()
@@ -425,18 +583,24 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		run.mu.Unlock()
 	}
 
-	resp, err := b.sendAPI(taskCtx, req, body)
+	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	defer resp.Body.Close()
 	// taskCtx stays cancelable through the body read: the server can send
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(b.responseCap)+1))
+	// The turn's wall time: from the connection the server answered on to
+	// the end of the body, before any lock below adds to it, and without
+	// the refused dials sendAPI retried first.
+	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	if err != nil {
@@ -454,23 +618,32 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// turn that ran and failed answers 5xx.
 			reason = "hermes-api-refused"
 		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			// A turn that ran and failed with no answer: the server's error
+			// envelope carries no counts the bridge reads, so its usage is
+			// the wall time, as the CLI executor's is for a run that failed
+			// on its own. A 4xx ran nothing and publishes nothing.
+			b.publishTurnUsage(run, &apiChatResponse{}, took)
+		}
+		// A body or error tail can carry the answer's own bytes: scrubbed as
+		// an answer is (scrubAnswer), here and in the arms below.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
-	if len(raw) > apiResponseCap {
+	if len(raw) > b.responseCap {
 		// Refused, never truncated: a cut answer would fail to parse and
 		// read as a protocol fault, and a shortened one is worse than a
 		// loud failure.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s%s; "+
 			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
-			resp.StatusCode, sessionID, turnNote(turn), apiResponseCap), nil)
+			resp.StatusCode, sessionID, turnNote(turn), b.responseCap), nil)
 		return "", false
 	}
 	var out apiChatResponse
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s%s; body tail: %s",
-			resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if apiTurnFailed(&out) {
@@ -478,8 +651,20 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		if apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
 			reason = "hermes-rate-limited"
 		}
+		// A turn that ran and failed still read tokens: its usage goes out
+		// ahead of the failed terminal, as the worker adapter's does.
+		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, out.Hermes.Error), apiBodyTailBytes)), nil)
+		return "", false
+	}
+	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {
+		// The model's reasoning, not an answer (#3206): withheld from the
+		// stream, final or turn answer alike. The turn ran and read tokens,
+		// so its usage goes out ahead of the terminal, as a failed turn's does.
+		b.withholdUnstructuredReasoning(run, sessionID, turn, answer)
+		b.publishTurnUsage(run, &out, took)
+		b.finalize(run, lib.StateFailed, unstructuredReasoningReason(sessionID, turn), nil)
 		return "", false
 	}
 	run.mu.Lock()
@@ -490,6 +675,14 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// Held until it is on the stream: shutdownTasks leaves the run to this
 	// worker from here (answerHeld).
 	run.answerHeld = true
+	// What the turn cost, ahead of its answer and under the same lock a
+	// finalizer takes, so the usage part never follows the terminal.
+	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	b.publishUsageLocked(run, u)
 	return out.Choices[0].Message.Content, true
 }
 
@@ -498,14 +691,17 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 // A response of any status is returned as it is; an error is wrapped in
 // errNeverConnected when no attempt got a connection, so no request was
 // sent.
-func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
-	var connected atomic.Bool
+func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, time.Time, error) {
+	// connectedAt is when the attempt that got a connection got it, as
+	// UnixNano, so the turn's clock starts at the request the server
+	// received rather than at the first refused dial.
+	var connectedAt atomic.Int64
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		GotConn: func(httptrace.GotConnInfo) { connectedAt.Store(time.Now().UnixNano()) },
 	})
 	req = req.WithContext(ctx)
 	neverConnected := func(err error) error {
-		if connected.Load() {
+		if connectedAt.Load() != 0 {
 			return err
 		}
 		return fmt.Errorf("%w: %w", errNeverConnected, err)
@@ -514,14 +710,14 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	for {
 		resp, err := b.apiClient.Do(req)
 		if err == nil {
-			return resp, nil
+			return resp, time.Unix(0, connectedAt.Load()), nil
 		}
 		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		case <-time.After(apiConnectRetryInterval):
 		}
 		req = req.Clone(ctx)

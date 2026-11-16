@@ -51,6 +51,10 @@ class Palette:
     flow_link: str
     marker_outline: str
     neutral: str
+    # Chart series in a fixed order, one colour per entity and never cycled.
+    # Each order passes the dataviz palette validator against this palette's
+    # background (lightness band, chroma, colour-vision separation).
+    series_colors: tuple[str, ...]
     # Keyed by the enum values in admin_console.domain and by event status.
     trigger_colors: Mapping[str, str]
     status_colors: Mapping[str, str]
@@ -94,6 +98,16 @@ DARK = Palette(
     flow_link="rgba(124,156,255,.18)",
     marker_outline="#edf3ff",
     neutral="#8FA1BD",
+    series_colors=(
+        "#3987e5",
+        "#d95926",
+        "#199e70",
+        "#c98500",
+        "#d55181",
+        "#008300",
+        "#9085e9",
+        "#e66767",
+    ),
     trigger_colors=MappingProxyType(
         {
             "human": "#7C9CFF",
@@ -156,6 +170,16 @@ GOOGLE_CLOUD = Palette(
     flow_link="rgba(26,115,232,.18)",
     marker_outline="#ffffff",
     neutral="#80868b",
+    series_colors=(
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100",
+        "#e87ba4",
+        "#008300",
+        "#6250d6",
+        "#e34948",
+    ),
     trigger_colors=MappingProxyType(
         {
             "human": "#1a73e8",

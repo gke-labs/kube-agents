@@ -40,7 +40,6 @@ MEBIBYTE = 1024 * 1024
 # (broker name, operator name, whether the figure is in MiB on both sides).
 TERMS = (
     ("BROKER_RESIDENT_RESERVE_BYTES", "credentialProxyResidentReserveBytes", True),
-    ("CONTENT_WORKSPACE_RESERVE_BYTES", "credentialProxyWorkspaceReserveBytes", True),
     ("REQUEST_CHILD_MEMORY_RESERVE_BYTES", "credentialProxyRequestReserveBytes", True),
     ("OUTPUT_COPIES_PER_COMMAND", "credentialProxyOutputCopiesPerCommand", False),
     ("BUDGET_MINIMUM_ADMITTED_REQUESTS", "credentialProxyMinimumAdmittedRequests", False),
@@ -78,6 +77,33 @@ def operator_terms() -> dict[str, int]:
     return terms
 
 
+# (broker name, operator name) of the environment variables the operator writes
+# for the broker's resource watermark gate: each scratch volume's sizeLimit in
+# bytes. The broker reads the name it declares; the operator writes the name it
+# declares; nothing but this test holds them to one spelling.
+VOLUME_LIMIT_ENV_NAMES = (
+    ("ENV_STATE_LIMIT_BYTES", "credentialProxyStateLimitEnv"),
+    ("ENV_TMP_LIMIT_BYTES", "credentialProxyTmpLimitEnv"),
+)
+
+
+def _string_constant(pattern: str, text: str, where: pathlib.Path) -> str:
+    found = re.search(pattern, text, re.MULTILINE)
+    if found is None:
+        raise AssertionError(f"{where.relative_to(REPO_ROOT)} declares nothing matching {pattern!r}")
+    return found.group(1)
+
+
+def broker_volume_limit_env_names() -> dict[str, str]:
+    text = BROKER.read_text(encoding="utf-8")
+    return {name: _string_constant(rf'^{name} = "([A-Z_]+)"$', text, BROKER) for name, _ in VOLUME_LIMIT_ENV_NAMES}
+
+
+def operator_volume_limit_env_names() -> dict[str, str]:
+    text = OPERATOR.read_text(encoding="utf-8")
+    return {name: _string_constant(rf'^\s*{name}\s*=\s*"([A-Z_]+)"', text, OPERATOR) for _, name in VOLUME_LIMIT_ENV_NAMES}
+
+
 def broker_floor_bytes() -> int:
     text = BROKER.read_text(encoding="utf-8")
     return _match(r"^CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = (\d+)$", text, BROKER)
@@ -92,6 +118,8 @@ def operator_floor_bytes() -> int:
 DEFAULTS = (
     ("requests", "cpu", "credentialProxyCPURequest"),
     ("requests", "memory", "credentialProxyMemoryRequest"),
+    ("autopilotRequests", "cpu", "credentialProxyAutopilotCPURequest"),
+    ("autopilotRequests", "memory", "credentialProxyAutopilotMemoryRequest"),
     ("limits", "cpu", "credentialProxyCPULimit"),
     ("limits", "memory", "credentialProxyMemoryLimit"),
     ("limits", "ephemeral-storage", "credentialProxyEphemeralStorageLimit"),
@@ -115,7 +143,7 @@ def chart_defaults() -> dict[tuple[str, str], str]:
     if block is None:
         raise AssertionError("_helpers.tpl declares no kube-agents.credentialProxyDefaults")
     defaults = {}
-    for side in ("requests", "limits"):
+    for side in ("requests", "autopilotRequests", "limits"):
         found = re.search(rf'"{side}" \(dict ([^)]*)\)', block.group(1))
         if found is None:
             raise AssertionError(f"kube-agents.credentialProxyDefaults carries no {side}")
@@ -137,6 +165,13 @@ def _quoted(pattern: str, text: str) -> str:
 
 
 class CredentialProxySizingParityTest(unittest.TestCase):
+    def test_the_volume_limit_variables_are_named_the_same_on_both_sides(self):
+        broker = broker_volume_limit_env_names()
+        operator = operator_volume_limit_env_names()
+        for broker_name, operator_name in VOLUME_LIMIT_ENV_NAMES:
+            with self.subTest(variable=broker[broker_name]):
+                self.assertEqual(broker[broker_name], operator[operator_name])
+
     def test_each_term_is_declared_equal_on_both_sides(self):
         broker = broker_terms()
         operator = operator_terms()

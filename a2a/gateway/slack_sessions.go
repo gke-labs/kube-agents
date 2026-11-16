@@ -306,6 +306,7 @@ func (s *SlackAdapter) noteAsk(conversation, text string) {
 // and a blocked settle suspends it.
 func (s *SlackAdapter) MarkChanged(conversation, ask, settle string) {
 	s.updateSession(conversation, func(st *slackSession) { st.ask, st.settle = ask, settle })
+	s.homeChanged(true)
 }
 
 // suggestPrompts answers assistant_thread_started and the bot's Messages tab

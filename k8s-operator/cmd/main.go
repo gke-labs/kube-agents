@@ -45,9 +45,30 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	"k8s.io/apimachinery/pkg/api/meta"
 	// +kubebuilder:scaffold:imports
+)
+
+const (
+	// operatorMemoryLimitEnv carries the manager container's memory limit in
+	// bytes. Both install paths set it through the Downward API from the
+	// container's own limits.memory (charts/kube-agents/templates/
+	// operator-deployment.yaml and config/manager/manager.yaml;
+	// tests/test_operator_memory_limit_env.py holds the three together), so
+	// the soft limit follows whatever limit the cluster admitted, an Autopilot
+	// clamp included, with no second number to keep in step with
+	// operator.resources.
+	operatorMemoryLimitEnv = "OPERATOR_MEMORY_LIMIT_BYTES"
+	// operatorMemoryLimitFraction is the share of the container limit the
+	// manager takes as its soft limit. The manager is alone in its container,
+	// so the tenth left over is headroom for what the cgroup counts and the
+	// heap does not: goroutine stacks, the runtime's own structures, and the
+	// kernel's accounting. The event watcher takes half, because it shares
+	// its container; a soft limit makes the collector work harder as the heap
+	// approaches it, it does not cap live heap.
+	operatorMemoryLimitFraction = 0.9
 )
 
 var (
@@ -115,6 +136,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Before the manager and its cache exist: the soft limit paces the
+	// collector against the container's limit from the first informer sync,
+	// which is where a cache sized for a larger cluster than the limit was
+	// previously OOM-killed with the default pacing (GOGC=100 lets the heap
+	// double between collections, whatever the cgroup says).
+	if limitBytes, applied, reason := memlimit.Apply(operatorMemoryLimitEnv, operatorMemoryLimitFraction); applied {
+		setupLog.Info("Go soft memory limit set from the container's memory limit",
+			"bytes", limitBytes, "source", operatorMemoryLimitEnv, "fraction", operatorMemoryLimitFraction)
+	} else {
+		setupLog.Info("Go soft memory limit not derived; the runtime default applies", "reason", reason)
+	}
 
 	// Reject an out-of-range --webhook-port rather than letting controller-runtime
 	// silently substitute its own default: webhook.Options.Port <= 0 falls back to 9443
@@ -205,6 +238,10 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// What this process holds in memory; controller.ManagerCacheOptions
+		// says what is in the cache, what is kept out of it, and why.
+		Cache:  controller.ManagerCacheOptions(),
+		Client: controller.ManagerClientOptions(),
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
@@ -238,11 +275,36 @@ func main() {
 	// ticker, off the reconcile worker, and the reconciler puts the last
 	// answer on every PlatformAgent's status; see
 	// internal/controller/rbac_selfcheck.go.
+	//
+	// The namespace this pod runs in is read first: the check probes the
+	// namespaced half of the role (the Secret verbs) there. It also feeds the
+	// NetworkPolicy rule that admits the operator to the gateway's and broker's
+	// metrics ports. Both install paths set it from the Downward API; off the
+	// cluster, under `make run`, it is unset, the namespaced permissions are
+	// probed cluster-wide, the rule is not rendered, and the poller is not
+	// started: no pod IP is reachable from there, and a poller that ran anyway
+	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
+	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
+	if operatorNamespace == "" {
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv)
+	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
+		// The value becomes kubernetes.io/metadata.name in the metrics rule's
+		// selector, which the API server only ever sets to a namespace's own
+		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
+		// namespace on any cluster -- and one the selector cannot even carry
+		// would have the API server reject the policy on every reconcile. Clear
+		// it either way, so the rule is not rendered and the poller, which could
+		// reach no pod without it, is not started.
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
+		operatorNamespace = ""
+	}
 	var rbacChecker *controller.RBACChecker
 	if clientset, err := kubernetes.NewForConfig(mgr.GetConfig()); err != nil {
 		setupLog.Error(err, "RBAC self-check disabled: could not build a clientset")
 	} else {
-		rbacChecker = controller.NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews())
+		rbacChecker = controller.NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews(), operatorNamespace)
 		denied, err := rbacChecker.Probe(context.Background())
 		if err != nil {
 			setupLog.Error(err, "RBAC self-check could not run; the controller retries it during reconciles")
@@ -277,29 +339,6 @@ func main() {
 		}
 	}
 
-	// The namespace this pod runs in, for the NetworkPolicy rule that admits
-	// the operator to the gateway's and broker's metrics ports. Both install
-	// paths set it from the Downward API; off the cluster, under `make run`,
-	// it is unset, the rule is not rendered, and the poller is not started:
-	// no pod IP is reachable from there, and a poller that ran anyway would
-	// record a Warning on every CR blaming a NetworkPolicy for the gap.
-	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
-	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
-			"variable", controller.OperatorNamespaceEnv)
-	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
-		// The value becomes kubernetes.io/metadata.name in the metrics rule's
-		// selector, which the API server only ever sets to a namespace's own
-		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
-		// namespace on any cluster -- and one the selector cannot even carry
-		// would have the API server reject the policy on every reconcile. Clear
-		// it either way, so the rule is not rendered and the poller, which could
-		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
-			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
-		operatorNamespace = ""
-	}
-
 	reconciler := &controller.PlatformAgentReconciler{
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),
@@ -325,6 +364,12 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// The A2A bus-stream check, read from the bus's metrics exporter on the
+	// leader; see internal/controller/platformagent_a2a_bus_streams.go.
+	if err := mgr.Add(controller.NewBusStreamPoller(reconciler)); err != nil {
+		setupLog.Error(err, "Failed to add the bus stream poller to the manager")
+		os.Exit(1)
+	}
 
 	// The AgentProfile reconciler, when the CRD is installed. An operator
 	// upgraded ahead of its CRDs keeps running everything else. Only a real
@@ -343,8 +388,12 @@ func main() {
 		setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentProfile controller. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
 	case mapErr == nil:
 		if err := (&controller.AgentProfileReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			APIReader: mgr.GetAPIReader(),
+			// A role that can't read Tiers lists none: a cached list would
+			// start an informer that never syncs (#3659, #1009's case).
+			TiersUnreadable: len(controller.TierAccessDenied(rbacChecker)) > 0,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)
@@ -353,6 +402,25 @@ func main() {
 		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
 	default:
 		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
+	}
+
+	// The Tier reconciler, gated as the AgentProfile one is (#3659).
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	_, tierMapErr := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version)
+	tierDenied := controller.TierAccessDenied(rbacChecker)
+	switch {
+	case tierMapErr == nil && len(tierDenied) > 0:
+		setupLog.Error(nil, "The operator's role cannot read Tiers; skipping the Tier controller. Restart the operator after applying the current ClusterRole.", "denied", tierDenied)
+	case tierMapErr == nil:
+		if err := (&controller.TierReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "tier")
+			os.Exit(1)
+		}
+	case meta.IsNoMatchError(tierMapErr):
+		setupLog.Info("Tier CRD is not installed on cluster; skipping the Tier controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(tierMapErr, "Failed to discover the Tier kind")
 		os.Exit(1)
 	}
 

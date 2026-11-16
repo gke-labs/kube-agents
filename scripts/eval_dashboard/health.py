@@ -63,14 +63,17 @@ import math
 import pathlib
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, ghcli, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
     import fixture_state
+    import ghcli
     import periodics
     import pool_state
     import tiers
@@ -138,6 +141,29 @@ REP_STORM = "storm"
 # scorer so the two cannot drift.
 REP_CEILING = "ceiling"
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+# The fifth kind: an `infra` repetition never run because the lease-time
+# seeded-fleet scan saw a fixture the case needs drifted; its reason carries
+# `fixture-drift:<role>` (bench/kube_agents_bench/fixture_drift.py). Not a
+# storm rep either: nothing was lost to 429s, and the fixture's drift is
+# `fixture_drift`'s to report, from the scan itself. Out of rule 2's count and
+# every pass-rate denominator.
+REP_FIXTURE = "fixture"
+# Matched with the opening parenthesis the scorer words it with
+# ("... nothing to grade (fixture-drift:<role>: ...)"), as classify.py does.
+FIXTURE_DRIFT_MARKER = "(fixture-drift:"
+# The sixth kind: an `infra` repetition whose checks errored on a forge read
+# that failed for a while during grading; the scorer leads its reason with
+# this marker (bench/kube_agents_bench/forges.py). Not a storm rep: nothing
+# was lost to the model provider's 429s, and a forge outage is not a verdict.
+# Out of rule 2's count and every pass-rate denominator, as classify.py has it.
+REP_FORGE = "forge"
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
+
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it.
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -174,6 +200,17 @@ SHARED_BREAK_MIN_RUNS = 3
 SHARED_BREAK_MIN_PRS = 3
 SHARED_BREAK_MAJORITY = 0.5
 SHARED_BREAK_MIN_RED_SHARE = 0.5
+# Rule 4 without a same-base pass: this many red runs of the one pull request
+# (a retest, or a new push) before its case is called the pull request's.
+PR_CAUSED_MIN_RUNS = 2
+# A case counts as failing on a pull request only on a record with at least
+# this many graded repetitions, all failed. One graded repetition beside two
+# infra ones (2026-10-30: a throttled run under a quota storm) is the storm's
+# shape, not a collapse the pull request owns; a record without
+# per-repetition detail grades as one and is never thick enough.
+PR_CAUSED_MIN_GRADED_REPS = 2
+PR_CAUSED_SAME_BASE = "same_base"
+PR_CAUSED_REPEATED = "repeated"
 
 # --- Rule 2: quota storm -> DEGRADED (#1225, #1097, #1214) -------------------
 # Incident: the Gemini API key's fixed token quota (#1208) saturates under a
@@ -193,6 +230,56 @@ SHARED_BREAK_MIN_RED_SHARE = 0.5
 STORM_WINDOW = timedelta(hours=2)
 STORM_MIN_REPS = 15
 STORM_MIN_PRS = 3
+# The storm's evidence line and Chat sentence end with the repetitions' own
+# words for how they died (2026-10-30: 26 reps said `hermes-rate-limited`
+# and the line said "infra deaths"). Two fixed wrappers are peeled first:
+# the scorer's (bench/kube_agents_bench/scoring.py, "the harness recorded an
+# infrastructure condition ... no answer in it to grade (<detail>)") and,
+# inside it, the harness's "task <id> ended <terminal>: " prefix
+# (bench/kube_agents_bench/harness.py; the terminal is failed, canceled or
+# rejected). What is left is the detail, cut before the harness's "(reason:"
+# echo, scrubbed like the periodics' quoted log line, and cut at a word
+# boundary at a length a Chat line can carry. Nothing maps the words to a
+# meaning: the reader does. test_eval_dashboard_health.py pins the wrapper
+# phrases against the two sources.
+SCORER_INFRA_WRAPPER_RE = re.compile(
+    r"^(?:the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
+    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade(?: \(|$))?"
+    r"|KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade \("
+    r"|KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is"
+    r" .*? because the empty report could not name them \()",
+    re.S,
+)
+# The scorer closes the detail it opened with ")"; the detail keeps its own
+# parentheses, so the wrapper's is the one unmatched close at the end.
+SCORER_WRAPPER_OPEN, SCORER_WRAPPER_CLOSE = "(", ")"
+HARNESS_TERMINAL_PREFIX_RE = re.compile(r"^task \S+ ended (?:failed|canceled|rejected): ")
+# The harness's other task phrasings keep the task id mid-sentence ("task
+# <id> on <conversation> sat queued", "no executor took task <id> on"); the id
+# is the repetition's, so it gives way to a placeholder like the run id.
+HARNESS_TASK_ID_RE = re.compile(r"\btask \S+(?= (?:on|was|did|ended) )")
+HARNESS_TASK_ID_FORM = "task [id]"
+# The board's card ids ("still waiting on: t_3f67a81e"), hermes's "t_" + 8
+# hex, are the repetition's as well.
+KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+KANBAN_CARD_ID_FORM = "[card]"
+# The agent API's session id, "a2a-" + the conversation's contextId
+# (bench/kube_agents_bench/board.py API_SESSION_PREFIX), per repetition too;
+# only where the harness writes it ("the session store for <id>"), since
+# "-a2a-" is also inside the inject Service's and Secret's names.
+HERMES_SESSION_ID_RE = re.compile(r"(?<=the session store for )a2a-[A-Za-z0-9_.:-]+")
+HERMES_SESSION_ID_FORM = "[session]"
+# The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
+# (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
+# its own phrasing on every repetition, so the run id and the repetition
+# number give way to placeholders and the case stays.
+HARNESS_CONVERSATION_KEY_RE = re.compile(r"\bdevops-bench-[0-9a-f]+/([A-Za-z0-9._-]+)/\d+\b")
+HARNESS_CONVERSATION_KEY_FORM = r"[run]/\1/[rep]"
+SCORER_NO_DETAIL = "no reason given"
+STORM_CAUSE_STOP = " (reason"
+STORM_CAUSE_MAX_CHARS = 80
+STORM_CAUSE_ELLIPSIS = "…"
+STORM_CAUSES_SHOWN = 2
 STORM_REASON_RE = re.compile(
     r"KUBE_AGENTS_INFRA_FAILURE"
     r"|no agent ever ran"
@@ -208,6 +295,33 @@ STORM_REASON_RE = re.compile(
 # "Retest after" is the end of the storm window plus this: a run started the
 # minute the last storm-hit run finished still overlaps its tail.
 STORM_COOLDOWN = timedelta(minutes=30)
+# Rule 2's evidence outside the runs (scripts/eval_dashboard/vertex_429.py):
+# the pool-wide share of Vertex AI calls that returned 429, in ten-minute
+# buckets. The reps' own phrasings cannot tell a quota storm from a batch of
+# teardown deaths. The bar is a confirmation, not a trigger: the reps must
+# fire too. Over the 42 days to 2026-10-28 the pool's hourly share cleared
+# 5 % on 25 days (a quiet afternoon peaks near 6 %), 10 % on 14 days and
+# 20 % on 6 (the 2026-10-08 storm ran 25-27 %). A storm needs the peak
+# hourly share over STORM_429_MIN_RATE in the window the hit runs spent on
+# their model calls; a reading older than VERTEX_429_MAX_AGE, one that does
+# not cover those hours (a hit run finishes up to STORM_429_LOOKBACK after
+# the burst that killed it, so the reader looks back STORM_WINDOW further
+# than that), or one with fewer than STORM_429_MIN_REQUESTS calls in its
+# best hour, confirms nothing and the rule stands as before, saying so.
+STORM_429_MIN_RATE = 0.10
+STORM_429_MIN_REQUESTS = 200
+STORM_429_HOUR = timedelta(hours=1)
+# How far before the first hit run's finish its model calls reach.
+STORM_429_LOOKBACK = timedelta(hours=3)
+# The adjudicator's clock is data.json's generated_at, and the workflow reads
+# the 429s on that same clock (vertex_429.py --now), so a fresh reading ends
+# where the runs' window does however late the step runs or however long the
+# collect has been failing. A reading kept from an earlier blind tick trails
+# it; the rule allows a kept reading this much short at either edge (a run's
+# calls end before its finish), and the reader looks back this much further.
+STORM_429_READ_SLACK = timedelta(hours=1)
+VERTEX_429_MAX_AGE = timedelta(hours=3)
+VERTEX_429_KEY = "vertex_429"
 # A finished run carrying at least this many storm repetitions is still
 # "inside the storm" for recovery purposes (rule 6): one or two infra reps
 # in a run are background noise on any day and must not hold GREEN off.
@@ -225,9 +339,10 @@ REPLAY_ERROR_RE = re.compile(
     r"|ReplayMismatch"
     r"|failure wake:"
     r"|question wake:"
+    r"|block wake:"
     r"|thread context:"
     r"|replay declares"
-    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    r"|\[bench:(?:card-failure|slack-question|card-block)-wake\]",
     re.IGNORECASE,
 )
 
@@ -344,21 +459,23 @@ NOON = 12
 # (hack/fleet-fixture-state.py) is what would have said so, and the CI health
 # workflow now runs it against every pool project once an hour and publishes
 # fixture-state.json beside health.json (scripts/eval_dashboard/
-# fixture_state.py). Nothing in the presubmit runs this check and nothing
-# acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a drifted role
-# reds the cases that depend on it on the runs that lease those projects;
-# the run-based rules above see that red as it happens, and this rule names
-# the cause and its owner (the fleet's reconcile). DEGRADED, not an OUTAGE:
+# fixture_state.py). The presubmit and the nightly run the same check on
+# their own lease and record the cases whose grade depends on a drifted role
+# as infrastructure (`fixture-drift:<role>`, REP_FIXTURE above) rather than
+# running them, which replaced the 2026-09-14 "detect, do not act" decision;
+# so a drift no longer reds those cases, and this rule is where it shows:
+# it names the cause and its owner (the fleet's reconcile). DEGRADED, not an OUTAGE:
 # it is a few cases on some projects, with the fix in someone's hands.
 #
 # The rule: the same role drifted on the same project in
-# FIXTURE_DRIFT_CONSECUTIVE_SCANS consecutive scans, or on
-# FIXTURE_DRIFT_MIN_PROJECTS projects in one scan. One scan on one project is
-# not enough: in #1278's retest sweep the crashloop fixture lagged the node
-# repair by about 40 minutes on one project (it needs its first restart
-# before OOMKilled evidence exists), and one hourly scan can land inside that
-# window; the second scan is an hour later. Three projects at once is the
-# fleet-wide shape (#1278 was all 30) and waits for nothing. A scan older than
+# FIXTURE_DRIFT_CONSECUTIVE_SCANS consecutive scans, however many projects
+# one scan covers. One scan is not enough: in #1278's retest sweep the
+# crashloop fixture lagged the node repair by about 40 minutes on one project
+# (it needs its first restart before OOMKilled evidence exists), a reconcile
+# rolling a patch holds each batch half-applied for about an hour, and one
+# hourly scan can land inside either window; the second scan is an hour
+# later. (The pool scan keeps its FIXTURE_DRIFT_MIN_PROJECTS-in-one-scan
+# shortcut: a misgrant is read correctly the first time.) A scan older than
 # FIXTURE_STATE_MAX_AGE (three missed hourly scans) is the scan job being
 # broken, not the fleet, and is ignored with a note. A scan that could check
 # no project at all (the bot's grant missing) is `unknown`: said once by the
@@ -367,9 +484,24 @@ NOON = 12
 FIXTURE_DRIFT_MIN_PROJECTS = 3
 FIXTURE_DRIFT_CONSECUTIVE_SCANS = 2
 FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
-# Rule 3e, pool drift, is the same rule over pool-state.json with the same
-# thresholds: the same finding failing on the same project in two
-# consecutive scans, or on three projects in one (#1927's shape was all 30).
+# A project the fleet reconcile holds in Boskos is being applied, and its
+# fixtures spend up to the reconcile's hold time half-applied; a scan that
+# lands inside that window reads it as drift. pool-pressure.json's `held` says
+# who holds what at its read time; a hold seen within this much of the scan
+# covers it, which is the reconcile's own hold ceiling plus the two jobs'
+# hourly cadences not lining up.
+RECONCILE_OWNER_PREFIX = "fleet-reconcile"
+RECONCILE_HOLD_WINDOW = timedelta(minutes=65)
+POOL_HELD_KEY = "held"
+POOL_HELD_OWNER_KEY = "owner"
+# health.json's memory of those holds, keyed by the scan they belong to, kept
+# across a tick that read no scan (a failed fetch publishes no fixture_state
+# block, and must not forget what the ticks before it saw).
+FIXTURE_HOLDS_KEY = "fixture_holds"
+# Rule 3e, pool drift, is the same rule over pool-state.json with one
+# threshold more: the same finding failing on the same project in two
+# consecutive scans, or on three projects in one (#1927's shape was all 30;
+# nothing applies a pool grant in batches).
 # A run that leases a drifted project fails on the missing grant with a 403
 # in the agent's transcript, not on the change; the run-based rules see that
 # red, this one names the cause and carries the repair. A finding the verifier
@@ -418,16 +550,15 @@ RECOVERY_GREEN_RUNS = 3
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
-# presubmit file lists, read from hack/eval/presubmit-cases.txt: 13 for the
-# fourteen the presubmit runs since 2026-09-29: thirteen roster cases and the
-# held-out compliance canary (#2013) since 2026-10-14, twelve and two seats
-# before that (#2016); twelve from 2026-09-22, when it became the
-# blocking roster only, #1023, having run 18-19 before); a run Prow cut short
-# at its ceiling recorded fewer and is not one; the floor was a literal 15
-# until the roster shrank under it, which would have made every run since a
-# partial one and the rule silent, so it follows the file and sits one
-# demotion below the roster on purpose, an admission or a demotion moving
-# it without an edit here) -- all of
+# presubmit runs: the cases hack/eval/presubmit-cases.txt lists, less those
+# hack/eval/inject-lane-exclusions.txt drops, since the presubmit grades
+# spec.mode next through the inject door and so runs that lane;
+# _slow_min_tasks below computes it from the two files; a run Prow
+# cut short at its ceiling recorded fewer and is not one; the floor was a
+# literal 15 until the roster shrank under it, which would have made every
+# run since a partial one and the rule silent, so it follows the files and
+# sits one demotion below the roster on purpose, an admission or a demotion
+# moving it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -443,10 +574,12 @@ SLOW_WINDOW = timedelta(hours=6)
 
 
 def _slow_min_tasks(default: int = 11) -> int:
-    """One fewer than the presubmit file's case count; `default` when the
-    file cannot be read (a checkout without hack/eval/, an old era)."""
+    """One fewer than the cases the presubmit runs: its file's, less the
+    inject lane's exclusions, the lane it grades on; `default` when the files
+    cannot be read (a checkout without hack/eval/, an old era)."""
     try:
-        cases = eval_rosters.presubmit_cases()
+        excluded = eval_rosters.inject_lane_exclusions()
+        cases = [case for case in eval_rosters.presubmit_cases() if case not in excluded]
     except (OSError, ValueError):
         return default
     return max(1, len(cases) - 1) if cases else default
@@ -530,6 +663,20 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # Cause and advice text. Plain language: the reader is whoever is deciding
 # whether to type /retest.
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
+# The same cause as the public tracking issue states it (gate_issue.py):
+# the failing cases stay on the incident brief, since the repository is
+# public.
+CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
+# The fixed text of the evidence lines that grade a case (shared_break's
+# per-case collapse line, its coverage line, and the PR-caused lines).
+# gate_issue.public_evidence drops a line carrying one of these from every
+# public issue body, so the lines below are built on them.
+EVIDENCE_CASE_COLLAPSE = " failed all graded reps on "
+EVIDENCE_CASES_EXPLAIN = "these cases explain "
+EVIDENCE_PR_CAUSED = "PR-caused: "
+# The fixed start of lost_pods' evidence line; the lost-pods issue body
+# keeps only the lines that start with it (gate_issue.public_evidence).
+EVIDENCE_LOST_PODS = "lost pods: "
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -554,6 +701,38 @@ ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
+# A role that reads seeded-a's default-pool capacity rather than a planted
+# object's shape: a re-apply changes nothing while the pool is full, so the
+# advice names the pool's size instead. post_health.py and gate_issue.py carry
+# the same split for the Chat message and the tracking issue.
+CAPACITY_ROLES = frozenset({"default-pool-headroom"})
+ADVICE_FIXTURE_CAPACITY = (
+    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool running out of room, not your change;"
+    " {roles} reads capacity: the pool is below the headroom margin the scan keeps for the next fixtures, a re-apply changes nothing,"
+    " and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix: if a size change has just merged, the postsubmit reconcile"
+    " is rolling it project by project and the scans clear as it lands."
+)
+# Appended to the re-apply advice when a capacity role drifts beside planted
+# ones, the usual shape: a pool that fills strands a fixture whose own role
+# then drifts too.
+ADVICE_FIXTURE_CAPACITY_MIXED = (
+    " {roles} beside them reads capacity: seeded-a's default pool is below the headroom margin the scan keeps for the next fixtures,"
+    " a re-apply changes nothing for it, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is its fix."
+)
+# Drift no re-apply clears (fixture_state.no_reapply_op, #4005): when it is
+# every drift line on the incident, the advice names the real remedy per kind
+# instead of the re-apply. Beside an ordinary drift the re-apply advice stands.
+ADVICE_FIXTURE_NO_REAPPLY = (
+    "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change,"
+    " and no re-apply of bench/tf/fleet clears it. {remedy}"
+)
+FIXTURE_NO_REAPPLY_REMEDY = {
+    fixture_state.OP_AGE_GATE: "{roles} reads a cluster under its age gate, which clears itself at {when}; retest after then.",
+    fixture_state.OP_AHEAD_OF_CHANNEL: (
+        "{roles} reads a master ahead of its release channel, which seeded_b_pin.py holds until the channel ships a newer patch of that minor;"
+        " retest once a scan reads it healthy, or sooner re-create seeded-b under a lease (bench/tf/fleet/README.md)."
+    ),
+}
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
     " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
@@ -621,6 +800,14 @@ UTC = timezone.utc
 # --------------------------------------------------------------------------- #
 
 
+def public_cause(health_doc: dict) -> str:
+    """``health["cause"]`` as a public text may carry it: a shared break
+    names no case (CAUSE_SHARED_BREAK_PUBLIC); every other cause as is."""
+    if health_doc.get("condition") == SHARED_BREAK:
+        return CAUSE_SHARED_BREAK_PUBLIC
+    return health_doc.get("cause") or CAUSE_SHARED_BREAK_PUBLIC
+
+
 def parse_iso(value) -> datetime | None:
     """ISO 8601 to an aware UTC datetime; None for anything unparseable."""
     if not value or not isinstance(value, str):
@@ -665,21 +852,80 @@ def rep_kind(rep: dict) -> str:
     reason = rep.get("reason") or ""
     if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result == REP_RESULT_INFRA and FIXTURE_DRIFT_MARKER in reason:
+        return REP_FIXTURE
+    if result == REP_RESULT_INFRA and reason.startswith(FORGE_UNAVAILABLE_MARKER):
+        return REP_FORGE
     if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
         return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
 
+def storm_cause(rep: dict) -> str:
+    """A storm repetition's own words for how it died: the reason with the
+    scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
+    peeled, the task, card and session ids and the conversation key reduced to
+    placeholders, cut
+    before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
+    STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
+    (no reason, or the scorer's "no reason given")."""
+    reason = str(rep.get("reason") or "")
+    wrapper = SCORER_INFRA_WRAPPER_RE.match(reason)
+    detail = reason[wrapper.end() :] if wrapper else reason
+    text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
+    text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
+    text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
+    text = HERMES_SESSION_ID_RE.sub(HERMES_SESSION_ID_FORM, text)
+    text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
+    whole = STORM_CAUSE_STOP not in text
+    text = text.split(STORM_CAUSE_STOP, 1)[0]
+    # The collector's 300-character cut can land inside the echo: a trailing
+    # " (rea" is the echo's head, not words.
+    tail = text.rfind(STORM_CAUSE_STOP[:2])
+    if tail != -1 and ")" not in text[tail:] and STORM_CAUSE_STOP[2:].startswith(text[tail + 2 :]):
+        text = text[:tail]
+        whole = False
+    text = text.strip()
+    if text.rstrip(")") == SCORER_NO_DETAIL:
+        return ""
+    # The wrapper's own close, when the wrapper opened one and the collector's
+    # cut did not take it: the one ")" more than the detail opened.
+    wrapper_closed = bool(
+        wrapper
+        and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
+        and text.endswith(SCORER_WRAPPER_CLOSE)
+        and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
+    )
+    if wrapper_closed:
+        text = text[: -len(SCORER_WRAPPER_CLOSE)]
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still carries the wrapper's close is whole.
+    cut_by_collector = len(reason) >= collect.REP_REASON_MAX_CHARS and whole and bool(text) and not wrapper_closed
+    text = periodics.quotable(text)
+    if len(text) > STORM_CAUSE_MAX_CHARS:
+        head = text[:STORM_CAUSE_MAX_CHARS]
+        text = (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CAUSE_ELLIPSIS
+    elif cut_by_collector:
+        text = (text[: text.rfind(" ")] if " " in text else text).rstrip() + STORM_CAUSE_ELLIPSIS
+    return text
+
+
 class Task:
-    __slots__ = ("ceilings", "fails", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "forges", "name", "passes", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = self.ceilings = 0
+        self.passes = self.fails = self.storms = self.ceilings = self.fixtures = self.forges = 0
+        # Each storm repetition's own words, counted (storm_cause).
+        self.storm_causes: Counter = Counter()
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -691,8 +937,15 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+                cause = storm_cause(rep)
+                if cause:
+                    self.storm_causes[cause] += 1
             elif kind == REP_CEILING:
                 self.ceilings += 1
+            elif kind == REP_FIXTURE:
+                self.fixtures += 1
+            elif kind == REP_FORGE:
+                self.forges += 1
             else:
                 self.fails += 1
 
@@ -707,11 +960,17 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The build directory the run was read from (SCHEMA.md, optional):
+        # the comment's build link follows it. Absent on older documents.
+        self.gcs_base = run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None
+        # The main commit the run was built on (SCHEMA.md, optional): rule 4
+        # compares a PR's red with passes on the same base. Absent is unknown.
+        self.base_sha = run.get("base_sha") if isinstance(run.get("base_sha"), str) else None
         self.started = parse_iso(run.get("started"))
         self.finished = parse_iso(run.get("finished"))
         # SCHEMA.md promises SUCCESS|FAILURE|ABORTED verbatim; Prow has also
@@ -759,13 +1018,22 @@ class Run:
     def storm_reps(self) -> int:
         return sum(task.storms for task in self.tasks)
 
+    def storm_causes(self) -> Counter:
+        """The run's storm repetitions' own words, counted across its cases."""
+        causes: Counter = Counter()
+        for task in self.tasks:
+            causes.update(task.storm_causes)
+        return causes
+
     @property
     def ceiling_reps(self) -> int:
         return sum(task.ceilings for task in self.tasks)
 
     @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms + task.ceilings for task in self.tasks)
+        return sum(
+            task.passes + task.fails + task.storms + task.ceilings + task.fixtures + task.forges for task in self.tasks
+        )
 
     @property
     def lost_pod(self) -> bool:
@@ -820,6 +1088,10 @@ class Run:
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
+
+    def graded_reps(self, case: str) -> int:
+        """How many of `case`'s repetitions this run graded (pass or fail)."""
+        return sum(task.graded for task in self.tasks if task.name == case)
 
     def passing_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.passes > 0}
@@ -917,34 +1189,63 @@ def _in_window(runs, now: datetime, window: timedelta):
     return [run for run in runs if now - window < run.finished <= now]
 
 
+def pr_caused_path(case: str, runs, population) -> tuple[str | None, list, list]:
+    """Rule 4 for one case: `runs` are the runs that collapsed it, all of one
+    pull request or the case is nobody's (a thin record on a second pull
+    request still makes it nobody's). It is that pull request's when the
+    evidence rules out a flake and a moving main: the case passed on another
+    pull request's run built on the same main commit (PR_CAUSED_SAME_BASE,
+    with those runs), or it failed on PR_CAUSED_MIN_RUNS of the pull request's
+    runs (a retest counts) while passing on another pull request
+    (PR_CAUSED_REPEATED, with the passing runs). Only runs whose record of the
+    case is thick enough (PR_CAUSED_MIN_GRADED_REPS) count, and they come back
+    third. One red run and no same-base pass says nothing: (None, [], [])."""
+    prs = _prs(runs)
+    if len(prs) != 1:
+        return None, [], []
+    solid = [run for run in runs if run.graded_reps(case) >= PR_CAUSED_MIN_GRADED_REPS]
+    elsewhere = [run for run in population if case in run.passing_cases() and run.pr != prs[0]]
+    if not solid or not elsewhere:
+        return None, [], []
+    bases = {run.base_sha for run in solid if run.base_sha}
+    same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
+    if same_base:
+        return PR_CAUSED_SAME_BASE, same_base, solid
+    if len({run.build_id for run in solid}) >= PR_CAUSED_MIN_RUNS:
+        return PR_CAUSED_REPEATED, elsewhere, solid
+    return None, [], []
+
+
 def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     """Rule 1. Returns {fires, cases, evidence, pr_caused, signature_runs}."""
     window = _in_window(full_runs, now, SHARED_BREAK_WINDOW)
     collapses: dict[str, list] = {}
-    passes: dict[str, set] = {}
     for run in window:
         admitted = roster.at(run.started or run.finished)
         for case in run.collapsed_cases():
             if case in admitted:
                 collapses.setdefault(case, []).append(run)
-        for case in run.passing_cases():
-            passes.setdefault(case, set()).add(run.pr)
 
     cases = sorted(
         case
         for case, runs in collapses.items()
         if len(runs) >= SHARED_BREAK_MIN_RUNS and len(_prs(runs)) >= SHARED_BREAK_MIN_PRS
     )
-    # Rule 4: a case failing on exactly one pull request while passing on
-    # others is that pull request's, and carries no state.
-    pr_caused = []
+    # Rule 4 (pr_caused_path): a case failing on exactly one pull request is
+    # that pull request's, and carries no state.
+    pr_caused, pr_caused_latest = [], []
     for case, runs in sorted(collapses.items()):
-        prs = _prs(runs)
-        elsewhere = passes.get(case, set()) - set(prs)
-        if len(prs) == 1 and elsewhere:
+        path, others, solid = pr_caused_path(case, runs, window)
+        if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{prs[0]} (passing on {len(elsewhere)} other PRs)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
             )
+        elif path == PR_CAUSED_REPEATED:
+            pr_caused.append(
+                f"{EVIDENCE_PR_CAUSED}{case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
+            )
+        if path is not None:
+            pr_caused_latest.append(max(run.finished for run in solid))
 
     concluded = [run for run in window if run.result in (RUN_SUCCESS, RUN_FAILURE)]
     reds = [run for run in concluded if run.result == RUN_FAILURE]
@@ -961,12 +1262,12 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         runs = collapses[case]
         prs = _prs(runs)
         evidence.append(
-            f"{case} failed all graded reps on {len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
+            f"{case}{EVIDENCE_CASE_COLLAPSE}{len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
         )
     if cases and reds:
         hours = int(SHARED_BREAK_WINDOW.total_seconds() // 3600)
         evidence.append(
-            f"these cases explain {len(covered)} of {len(reds)} red runs"
+            f"{EVIDENCE_CASES_EXPLAIN}{len(covered)} of {len(reds)} red runs"
             f" ({len(reds)} of {len(concluded)} concluded runs red) in the last {hours}h"
         )
     return {
@@ -974,36 +1275,112 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         "cases": cases,
         "evidence": evidence,
         "pr_caused": pr_caused,
+        # The latest finish among each line's solid runs, in the same order:
+        # assess drops the lines a storm window reaches.
+        "pr_caused_latest": pr_caused_latest,
         "signature_runs": {run.build_id for run in covered},
         "prs": _prs(covered),
         "runs": len(covered),
     }
 
 
-def storm(full_runs, now: datetime) -> dict:
-    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs}."""
+def vertex_429_rate(vertex: dict | None, now: datetime, start: datetime | None, end: datetime | None) -> dict:
+    """The pool's peak hourly 429 share over the hours the hit runs made their
+    model calls. Returns {read, peak, requests, hour_end, reason}: `read` False
+    (with the reason) when there is no fresh reading to judge on."""
+    out = {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None, "read_at": None, "projects_read": 0, "projects_failed": 0}
+    if not isinstance(vertex, dict):
+        out["reason"] = "no Vertex 429 reading"
+        return out
+    read_at = parse_iso(vertex.get("read_at"))
+    errors = vertex.get("errors") if isinstance(vertex.get("errors"), dict) else {}
+    out.update({"read_at": iso(read_at), "projects_read": len(vertex.get("read") or []), "projects_failed": len(errors)})
+    if read_at is None or now - read_at > VERTEX_429_MAX_AGE:
+        out["reason"] = f"the Vertex 429 reading is {'of unknown age' if read_at is None else 'stale'}"
+        return out
+    if not vertex.get("read"):
+        sample = next(iter(errors.values()), "")
+        out["reason"] = f"the Vertex 429 reading covered no project ({sample})" if sample else "the Vertex 429 reading covered no project"
+        return out
+    # The reading must reach the hours the hit runs spent on their calls: a
+    # run finishes hours after the burst that killed it, and a reading that
+    # starts after the burst reads its quiet aftermath as "no storm".
+    covers_from, covers_to = parse_iso(vertex.get("window_start")), parse_iso(vertex.get("window_end"))
+    short_at_start = start is not None and (covers_from is None or covers_from > start - STORM_429_LOOKBACK)
+    short_at_end = end is not None and (covers_to is None or covers_to < end - STORM_429_READ_SLACK)
+    if short_at_start or short_at_end:
+        span = f"{hhmm(covers_from) if covers_from else '?'}–{hhmm(covers_to) if covers_to else '?'} UTC"
+        out["reason"] = f"the Vertex 429 reading ({span}) does not cover the hours the hit runs spent on their calls"
+        return out
+    buckets = []
+    for bucket in vertex.get("buckets") or []:
+        at = parse_iso(bucket.get("end")) if isinstance(bucket, dict) else None
+        if at is not None and (start is None or at >= start - STORM_429_LOOKBACK) and (end is None or at <= end):
+            buckets.append((at, int(bucket.get("requests") or 0), int(bucket.get("429") or 0)))
+    best = None
+    for at, _, _ in buckets:
+        hour = [(r, h) for b_at, r, h in buckets if at - STORM_429_HOUR < b_at <= at]
+        requests, limited = sum(r for r, _ in hour), sum(h for _, h in hour)
+        if requests >= STORM_429_MIN_REQUESTS and (best is None or limited / requests > best[0]):
+            best = (limited / requests, requests, at)
+    if best is None:
+        out["reason"] = f"fewer than {STORM_429_MIN_REQUESTS} Vertex calls in any hour of the window"
+        return out
+    out.update({"read": True, "peak": best[0], "requests": best[1], "hour_end": best[2]})
+    return out
+
+
+def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
+    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs,
+    runs, rate}. With a fresh Vertex 429 reading (`vertex`), the reps alone
+    are not a storm: the pool's peak hourly 429 share must clear
+    STORM_429_MIN_RATE, else the reps are infra deaths of another kind and
+    the rule does not fire. Without one the reps decide, as before, and the
+    evidence says the storm is unconfirmed."""
     window = _in_window(full_runs, now, STORM_WINDOW)
     hit = [run for run in window if run.storm_reps > 0]
     reps = sum(run.storm_reps for run in hit)
     prs = _prs(hit)
-    fires = reps >= STORM_MIN_REPS and len(prs) >= STORM_MIN_PRS
     start = min((run.finished for run in hit), default=None)
     end = max((run.finished for run in hit), default=None)
+    reps_fire = reps >= STORM_MIN_REPS and len(prs) >= STORM_MIN_PRS
+    # Read every tick, so health.json shows whether the reading works
+    # before a storm needs it; it judges only when the reps would fire.
+    rate = vertex_429_rate(vertex, now, start, end)
+    confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
+    fires = reps_fire and (confirmed or not rate["read"])
+    causes: Counter = Counter()
+    for run in hit:
+        causes.update(run.storm_causes())
     evidence = []
     if hit:
-        evidence.append(
-            f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs"
-            f" in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
-        )
+        line = f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
+        # The repetitions' own words, commonest first, before any judgement.
+        shown = causes.most_common(STORM_CAUSES_SHOWN)
+        if shown:
+            line += "; the reps say: " + ", ".join(f"{cause} ×{n}" for cause, n in shown)
+            if len(causes) > len(shown):
+                line += f", and {len(causes) - len(shown)} other phrasing(s)"
+        if reps_fire and rate["read"]:
+            share = f"{rate['peak'] * 100:.1f} % of {rate['requests']} Vertex calls in the hour to {hhmm(rate['hour_end'])} UTC"
+            line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
+        elif reps_fire:
+            line += f"; unconfirmed: {rate['reason']}"
+        evidence.append(line)
     return {
         "fires": fires,
+        "reps_fire": reps_fire,
         "reps": reps,
         "prs": prs,
         "start": start,
         "end": end,
-        "evidence": evidence if fires else [],
+        "evidence": evidence if (fires or (reps_fire and rate["read"])) else [],
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
+        "rate": rate,
+        # Every phrasing with its count, commonest first, for the incident
+        # the Chat sentence reads (it names each one, short).
+        "causes": [[cause, n] for cause, n in causes.most_common()],
     }
 
 
@@ -1111,7 +1488,7 @@ def lost_pods(runs, now: datetime) -> dict:
     evidence = []
     if lost:
         line = (
-            f"lost pods: {len(lost)} runs on {len(prs)} PRs died with their build node"
+            f"{EVIDENCE_LOST_PODS}{len(lost)} runs on {len(prs)} PRs died with their build node"
             f" {hhmm(start)}–{hhmm(end)} UTC (nodes {node_list(nodes)}; {_pr_list(prs)})"
         )
         more = len(recent) - len(lost)
@@ -1143,18 +1520,40 @@ class ScanKind:
     (the role itself; the finding's check). Rule 6's exit asks whether a
     later scan read those same units on the incident's projects."""
 
-    def __init__(self, module, label: str, verb: str, unit_read):
+    def __init__(self, module, label: str, verb: str, unit_read, widespread_fires: bool):
         self.module = module
         self.label = label
         self.verb = verb
         self.unit_read = unit_read
+        # Whether one scan on FIXTURE_DRIFT_MIN_PROJECTS projects fires on its
+        # own. The pool scan: a grant missing on 40 projects is fleet-wide on
+        # first sight. The fleet scan: a reconcile rolling a patch in batches
+        # of four holds each batch half-applied for an hour, which one scan
+        # reads as drift, so only a reading repeated on the same project fires.
+        self.widespread_fires = widespread_fires
 
 
-FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda doc, project, role: role)
-POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of)
+FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda doc, project, role: role, widespread_fires=False)
+POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of, widespread_fires=True)
 
 
-def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
+def reconcile_held(pool_pressure: dict | None, scanned_at: datetime | None) -> list[str]:
+    """The projects the fleet reconcile held in Boskos at a pool-pressure
+    read within RECONCILE_HOLD_WINDOW of the scan: being applied, not drifted."""
+    if not isinstance(pool_pressure, dict) or scanned_at is None:
+        return []
+    measured = parse_iso(pool_pressure.get("window_end"))
+    held = pool_pressure.get(POOL_HELD_KEY)
+    if measured is None or not isinstance(held, dict) or abs(scanned_at - measured) > RECONCILE_HOLD_WINDOW:
+        return []
+    return sorted(
+        project
+        for project, entry in held.items()
+        if isinstance(entry, dict) and str(entry.get(POOL_HELD_OWNER_KEY) or "").startswith(RECONCILE_OWNER_PREFIX)
+    )
+
+
+def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind, applying=(), previously_applying=()) -> dict:
     """Rules 3c and 3e over a scan document. Returns {fires, known, stale,
     unknown, scanned_at, roles, projects, drift, repairs, reads, current,
     read, checked, total, reason, evidence}.
@@ -1231,6 +1630,15 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     current = module.drift_map(state_doc)
     previous = module.previous_drift_map(state_doc)
     out["current"] = current
+    # A project under the reconcile's hold at this scan or the one before is
+    # not read for firing: this scan's units are being applied, and last
+    # scan's cannot make this scan's a repeat.
+    out["applying"] = sorted(project for project in current if project in set(applying))
+    out["applying_previous"] = sorted(set(previously_applying))
+    for project in out["applying"]:
+        out["evidence"].append(f"{project} is being applied by the fleet reconcile (Boskos hold near the {hhmm(scanned_at)} UTC scan); its {scan.label} reading is not counted")
+    current = {project: units for project, units in current.items() if project not in set(applying)}
+    previous = {project: units for project, units in previous.items() if project not in set(previously_applying)}
     passes_leases = getattr(module, "passes_leases", None)
     out["passes_leases"] = sorted(
         {unit for units in current.values() for unit in units if passes_leases is not None and passes_leases(unit)}
@@ -1254,11 +1662,11 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         line = f"{unit} {scan.verb} {len(projs)} pool project(s) ({_project_list(projs)}) at the {hhmm(scanned_at)} UTC scan"
         if repeated:
             line += f", the {FIXTURE_DRIFT_CONSECUTIVE_SCANS}nd consecutive scan on {_project_list(repeated)}"
-        fires = len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS or bool(repeated)
+        fires = bool(repeated) or (scan.widespread_fires and len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS)
         if fires:
             firing[unit] = projs
         else:
-            line += "; not yet repeated or widespread"
+            line += "; not yet repeated or widespread" if scan.widespread_fires else "; not yet repeated"
         out["evidence"].append(line)
     if firing:
         out["fires"] = True
@@ -1281,9 +1689,11 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     return out
 
 
-def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
-    """Rule 3c over fixture-state.json (see _scan_drift)."""
-    return _scan_drift(state_doc, now, FIXTURE_SCAN)
+def fixture_drift(state_doc: dict | None, now: datetime, applying=(), previously_applying=()) -> dict:
+    """Rule 3c over fixture-state.json (see _scan_drift); `applying` are the
+    projects the reconcile holds around this scan, `previously_applying`
+    around the scan before (reconcile_held)."""
+    return _scan_drift(state_doc, now, FIXTURE_SCAN, applying, previously_applying)
 
 
 def pool_drift(state_doc: dict | None, now: datetime) -> dict:
@@ -1302,15 +1712,16 @@ def percentile(values: list[float], pct: int) -> float | None:
 
 
 def pr_caused_reds(full_runs, roster: Roster) -> int:
-    """Rule 4 over a set of runs: red runs whose every collapsed admitted case
-    collapsed on no other pull request among them. A red with no admitted
-    collapse (an absolute rung, an empty record) is not this: it is the
-    environment's, and the digest counts it on the infra side."""
-    prs_by_case: dict[str, set] = {}
+    """Rule 4 over a set of runs, by the same test the evidence applies
+    (pr_caused_path): red runs whose every collapsed admitted case is their
+    pull request's own. A red with no admitted collapse (an absolute rung, an
+    empty record) is not this: it is the environment's, and the digest counts
+    it on the infra side."""
+    collapses: dict[str, list] = {}
     for run in full_runs:
         admitted = roster.at(run.started or run.finished)
         for case in run.collapsed_cases() & admitted:
-            prs_by_case.setdefault(case, set()).add(run.pr)
+            collapses.setdefault(case, []).append(run)
     count = 0
     for run in full_runs:
         # A killed run that recorded cases (#1875) stays in the population --
@@ -1323,7 +1734,9 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
         if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
-        if mine and all(prs_by_case[case] == {run.pr} for case in mine):
+        # The run itself must be one of the case's solid runs: a thin run of
+        # a pull request that also has a real collapse is still the gate's.
+        if mine and all(run in pr_caused_path(case, collapses[case], full_runs)[2] for case in mine):
             count += 1
     return count
 
@@ -1732,11 +2145,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:
@@ -1886,9 +2313,10 @@ def tracking_issues(cases: list[str], notes: dict[str, dict]) -> list[str]:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for the {number, url} the poster filed or adopted; None otherwise."""
-    number = issue.get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag for the {number, url} the poster filed or adopted:
+    "#N" for this repository's, the URL for the issues repository's; None
+    otherwise. case-notes.yaml's issues stay the `#N` they are written as."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -1908,7 +2336,7 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     not already among them."""
     issues = tracking_issues(cases, notes)
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return issues
 
@@ -1961,13 +2389,50 @@ def advice_for(
         )
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
-        return ADVICE_FIXTURE_DRIFT.format(
-            roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
+        roles = list(incident.get("roles") or [])
+        remedy = fixture_no_reapply(incident)
+        if remedy:
+            return ADVICE_FIXTURE_NO_REAPPLY.format(
+                roles=", ".join(roles) or "the drifted fixture roles",
+                projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
+                remedy=remedy,
+            )
+        capacity = [role for role in roles if role in CAPACITY_ROLES]
+        template = ADVICE_FIXTURE_CAPACITY if roles and len(capacity) == len(roles) else ADVICE_FIXTURE_DRIFT
+        advice = template.format(
+            roles=", ".join(roles) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
+        if capacity and len(capacity) < len(roles):
+            advice += ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=", ".join(capacity))
+        return advice
     if condition == POOL_DRIFT:
         return _pool_drift_advice(incident or {})
     return ADVICE_SETUP
+
+
+def fixture_no_reapply(incident: dict) -> str | None:
+    """The remedy sentences, one per kind, when every drift line on a
+    fixture-drift incident is one no re-apply clears; None otherwise. The age
+    gate names the latest time any project's gate passes."""
+    kinds: dict[str, set[str]] = {}
+    clears_at = None
+    for roles in (incident.get("drift") or {}).values():
+        for role, lines in roles.items():
+            if not fixture_state.reapply_clears_nothing(lines):
+                return None
+            for line in lines:
+                kinds.setdefault(fixture_state.no_reapply_op(line), set()).add(role)
+                when = fixture_state.age_gate_clears_at(line)
+                if when and (clears_at is None or when > clears_at):
+                    clears_at = when
+    if not kinds:
+        return None
+    day = f"{clears_at.astimezone(READER_TZ):%a} " if clears_at else ""
+    return " ".join(
+        FIXTURE_NO_REAPPLY_REMEDY[op].format(roles=", ".join(sorted(roles)), when=day + reader_clock(clears_at))
+        for op, roles in sorted(kinds.items())
+    )
 
 
 def pool_drift_split(incident: dict) -> tuple[list[str], list[str], list[str]]:
@@ -2008,17 +2473,42 @@ def _pool_drift_advice(incident: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None = None, pool_state_doc: dict | None = None) -> dict:
+def assess(
+    runs,
+    now: datetime,
+    roster: Roster,
+    fixture_state_doc: dict | None = None,
+    pool_state_doc: dict | None = None,
+    pool_pressure: dict | None = None,
+    previously_applying=(),
+    vertex_429: dict | None = None,
+    carried_applying=(),
+) -> dict:
     """Apply rules 1-4 to the runs visible at `now`, rule 3c to the fleet
-    scan and rule 3e to the pool scan when one was given; no hysteresis yet."""
+    scan and rule 3e to the pool scan when one was given; no hysteresis yet.
+    `pool_pressure` is the periodic's artifact, read for the projects the
+    reconcile holds (reconcile_held), unioned with `carried_applying`, the
+    ones an earlier tick on this same scan saw held (a hold that ended
+    between two hourly reads is not forgotten); `previously_applying` the ones it held
+    around the previous scan, from the previous health.json; `vertex_429` is
+    vertex_429.py's reading, rule 2's evidence."""
     visible = [run for run in runs if run.finished <= now]
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
-    r2 = storm(full_runs, now)
+    r2 = storm(full_runs, now, vertex_429)
+    # While the storm's repetitions are firing (confirmed or not), a thin
+    # record on one pull request is the storm's symptom: rule 4 says nothing
+    # about a collapse the storm's reach covers (its first hit run's finish,
+    # less the calls before it). A collapse that finished before that is
+    # named as usual: it cannot be the storm's.
+    if r2["reps_fire"]:
+        reach = r2["start"] - STORM_429_LOOKBACK
+        r1["pr_caused"] = [line for line, latest in zip(r1["pr_caused"], r1["pr_caused_latest"]) if latest < reach]
     r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
-    r3c = fixture_drift(fixture_state_doc, now)
+    scanned_at = parse_iso((fixture_state_doc or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
+    r3c = fixture_drift(fixture_state_doc, now, sorted(set(reconcile_held(pool_pressure, scanned_at)) | set(carried_applying)), previously_applying)
     r3d = deadline_kills(visible, now)
     r3e = pool_drift(pool_state_doc, now)
 
@@ -2033,7 +2523,9 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
     elif r2["fires"]:
         state, condition = DEGRADED, STORM
-        cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"]))
+        cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + (
+            f" (peak 429 share {r2['rate']['peak'] * 100:.0f} %)" if r2["rate"]["read"] else " (429 rate not read)"
+        )
     elif r2b["fires"]:
         state, condition = DEGRADED, DELEGATION_CEILING
         cause = CAUSE_CEILING.format(reps=r2b["reps"], prs=len(r2b["prs"]), start=hhmm(r2b["start"]), end=hhmm(r2b["end"]))
@@ -2044,8 +2536,10 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         state, condition = DEGRADED, FIXTURE_DRIFT
         cause = CAUSE_FIXTURE_DRIFT.format(roles=", ".join(r3c["roles"]), projects=len(r3c["projects"]))
     elif r3e["fires"]:
-        # Below fixture drift: a drifted fixture reds the cases that read it,
-        # a drifted grant reds whatever the agent asks of it; both are the
+        # Below fixture drift: a drifted fixture takes the cases that read it
+        # out of the gate (they red only on a run whose own lease-time scan
+        # could not read the role), a drifted grant reds whatever the agent
+        # asks of it; both are the
         # pool's and neither is a run-based signal. A finding a leased run
         # passes with (`passes_leases`) reds nothing, and the advice says so.
         state, condition = DEGRADED, POOL_DRIFT
@@ -2079,7 +2573,7 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
-        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"]}
     elif condition == DELEGATION_CEILING:
         # `reps` beside the storm's keys: the message says how many
         # repetitions ended at the wait, not only how many runs held one.
@@ -2137,6 +2631,16 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         }
     else:
         incident = None
+    last_lost_pod = max((run.finished for run in visible if run.lost_pod), default=None)
+    last_deadline_kill = max((run.finished for run in visible if run.deadline_kill), default=None)
+    # Lost pods and deadline kills fire on a two-hour window; the gate leaves
+    # them only once RECOVERY_GREEN_RUNS runs have landed after the last loss
+    # or kill (recovered), and the list below holds them to the same bar, or
+    # a quiet night would read as the nodes healed.
+    awaiting_runs = {
+        LOST_PODS: last_lost_pod is not None and not _runs_landed_after(full_runs, last_lost_pod, verdict_only=False),
+        DEADLINE_KILL: last_deadline_kill is not None and not _runs_landed_after(full_runs, last_deadline_kill, verdict_only=True),
+    }
     return {
         "state": state,
         "condition": condition,
@@ -2148,12 +2652,48 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
-        "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
-        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
+        "last_lost_pod": last_lost_pod,
+        "last_deadline_kill": last_deadline_kill,
         "roster": roster,
         "fixture": r3c,
         "pool_state": r3e,
+        "vertex_429": r2["rate"],
+        # Every condition whose rule still fires, whose scan could not say, or
+        # whose run-based exit is not yet met, whatever condition won above:
+        # the poster closes a bot-filed tracking issue when its condition
+        # leaves this list (#3664).
+        "open_conditions": [
+            name
+            for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
+            if _unresolved(rule) or awaiting_runs.get(name, False)
+        ],
     }
+
+
+def _runs_landed_after(full_runs, after: datetime, verdict_only: bool) -> bool:
+    """recovered()'s run bar for a loss or a kill: the newest
+    RECOVERY_GREEN_RUNS full runs -- green ones for lost pods, ones with a
+    verdict either way for deadline kills -- all finished after `after`, on
+    distinct pull requests."""
+    pool = [run for run in full_runs if run.has_verdict] if verdict_only else full_runs
+    recent = pool[-RECOVERY_GREEN_RUNS:]
+    if len(recent) < RECOVERY_GREEN_RUNS or any(run.finished <= after for run in recent):
+        return False
+    if not verdict_only and any(run.result != RUN_SUCCESS for run in recent):
+        return False
+    return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
+
+
+def _unresolved(rule: dict) -> bool:
+    """A rule that fires, or a scan rule with no full reading to clear on: no
+    document, a stale one, one that could check no project or skipped some
+    (the incident's may be among them, as _scan_hold's `waiting` guards),
+    or a hand run over a few named projects."""
+    if rule["fires"] or rule.get("known") is False:
+        return True
+    if rule.get("known") and rule.get("checked", 0) < rule.get("total", 0):
+        return True
+    return any(bool(rule.get(key)) for key in ("stale", "unknown", "partial"))
 
 
 def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
@@ -2402,6 +2942,7 @@ def adjudicate(
     fixture_state_doc: dict | None = None,
     pool_state_doc: dict | None = None,
     periodics_readings: dict | None = None,
+    vertex_429: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -2427,14 +2968,36 @@ def adjudicate(
     """
     if runs is None:
         runs = load_runs(data)
-    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc)
+    # The reconcile's holds, keyed by scan, from the last tick's memory
+    # (FIXTURE_HOLDS_KEY, carried across ticks that read no scan). A tick
+    # that already read this scan carries its `applying` forward (a hold seen
+    # by an earlier tick on this scan still covers it) and its
+    # `applying_previous` is the previous scan's; a tick that read the scan
+    # this document calls `previous` gives its `applying` as the previous
+    # scan's; a tick that read any other scan (an hour of lost ticks) says
+    # nothing about either.
+    prev_fleet = (prev or {}).get(FIXTURE_HOLDS_KEY) or {}
+    prev_scan = parse_iso(prev_fleet.get("scanned_at"))
+    this_scan = parse_iso(fixture_state_doc.get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
+    last_scan = parse_iso((fixture_state_doc.get(fixture_state.KEY_PREVIOUS) or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) and isinstance(fixture_state_doc.get(fixture_state.KEY_PREVIOUS), dict) else None
+    previously_applying, carried_applying = [], []
+    if prev_scan is not None and prev_scan == this_scan:
+        previously_applying, carried_applying = prev_fleet.get("applying_previous") or [], prev_fleet.get("applying") or []
+    elif prev_scan is not None and prev_scan == last_scan:
+        previously_applying = prev_fleet.get("applying") or []
+    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying, vertex_429, carried_applying)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
         # The poster keeps the current condition's issue in `issue` and
         # every issue of the episode in `issues`; the one for the decided
         # condition is cited, wherever it sits.
-        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or []), (prev or {}).get("issue")]
+        # The previous health.json stands in only while no poster state
+        # carries `issues`: once one does it is the authority, and an issue
+        # it dropped (closed by a human) must not come back through here.
+        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or [])]
+        if not isinstance(posted, dict) or "issues" not in posted:
+            candidates.append((prev or {}).get("issue"))
         issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
@@ -2530,7 +3093,7 @@ def adjudicate(
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
     # Per job, consecutive failed checks (and per project, for the message),
-    # so a ten-minute job's single flap is not news and two in a row are. The
+    # so the hourly sweep's single flap is not news and two in a row are. The
     # counts live in the previous health.json; a tick that could not fetch it
     # starts them over, which would hide a told, still-failing job for a tick
     # or two, so on that tick the thresholds are off: a failed build is a note,
@@ -2566,8 +3129,29 @@ def adjudicate(
         "evidence": evidence,
         "advice": advice,
         "recovering": decided["recovering"],
+        "open_conditions": assessed["open_conditions"],
+        # Rule 2's evidence: how much of the pool the Vertex 429 reading
+        # covered, and its peak hourly share over the storm's hours when it
+        # can judge, else why not.
+        VERTEX_429_KEY: {
+            "read": assessed["vertex_429"]["read"],
+            "read_at": assessed["vertex_429"]["read_at"],
+            "projects_read": assessed["vertex_429"]["projects_read"],
+            "projects_failed": assessed["vertex_429"]["projects_failed"],
+            "peak": assessed["vertex_429"]["peak"],
+            "requests": assessed["vertex_429"]["requests"],
+            "hour_end": iso(assessed["vertex_429"]["hour_end"]),
+            "reason": assessed["vertex_429"]["reason"],
+        },
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
+        # The holds' memory: this scan's when one was read, else the last
+        # tick's, so a blind tick forgets nothing.
+        FIXTURE_HOLDS_KEY: (
+            {"scanned_at": iso(assessed["fixture"]["scanned_at"]), "applying": list(assessed["fixture"].get("applying") or []), "applying_previous": list(assessed["fixture"].get("applying_previous") or [])}
+            if assessed["fixture"].get("known") and "applying" in assessed["fixture"]
+            else (prev_fleet or None)
+        ),
         "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
         "near_deadline": near_deadline_note,
@@ -2580,6 +3164,10 @@ def adjudicate(
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
+        # Where the bots file their issues (ghcli.DEFAULT_REPO): informational,
+        # the pages read nothing from it; a reference above is "#N" for this
+        # repository's issue and a full URL for the issues repository's.
+        "issues_repo": ghcli.DEFAULT_REPO,
         "generated_at": iso(now),
     }
     # Beside the digest's other 24h numbers, but not derived from the runs
@@ -2620,6 +3208,9 @@ def scan_block(scan_result: dict) -> dict | None:
         "reds_runs_projects": scan_result.get("reds_runs_projects", []),
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
+        "partial": bool(scan_result.get("partial")),
+        "applying": list(scan_result.get("applying") or []),
+        "applying_previous": list(scan_result.get("applying_previous") or []),
         "reason": scan_result["reason"],
     }
 
@@ -2837,6 +3428,7 @@ def parse_args(argv):
     )
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
+    parser.add_argument("--vertex-429", type=pathlib.Path, help="vertex_429.py's reading of the pool's Vertex 429 rate, for rule 2 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--pool-state", type=pathlib.Path, help="the hourly pool scan's pool-state.json, for the pool_drift condition (missing is fine)")
     parser.add_argument("--periodics-dir", type=pathlib.Path, help="the directory periodics.py fetch wrote, one <job>.json per watched Prow periodic (missing is fine)")
@@ -2887,6 +3479,7 @@ def main(argv=None) -> int:
             wall_clock=None if args.now else wall_clock,
             posted=load_json(args.posted_state),
             pool_pressure=load_json(args.pool_pressure),
+            vertex_429=load_json(args.vertex_429),
             fixture_state_doc=load_json(args.fixture_state),
             pool_state_doc=load_json(args.pool_state),
             periodics_readings=periodics.load_readings(args.periodics_dir),

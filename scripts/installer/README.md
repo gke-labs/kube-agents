@@ -23,17 +23,21 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
+| `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`    |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
-| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)            |
+| `DEFAULT_LITELLM_BUDGET_USD` / `_PERIOD`                                  | The gateway's spend ceiling (`0`: none) and its window (`1d`); `install.env` only      |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
-| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | The minter's GCP service account id (`kubeagents-github-minter-gsa`); one per project  |
+| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below              |
+| `DEFAULT_GITHUB_MINTER_KSA_NAME`                                          | Existing installs' minter KSA (`kubeagents-github-minter`); see below                  |
 | `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project |
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
@@ -43,7 +47,11 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_table_model_provider <provider>`                                      | The providers with a menu entry (`openai_compatible` and `sap` included)               |
+| `is_valid_model_provider <provider>`                                      | Those, or any other LiteLLM provider slug (`^[a-z][a-z0-9_]*$`)                        |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
+| `validate_model_provider_inputs <provider> <model>`                       | A slug outside the menu needs `MODEL_DEFAULT_NAME`                                     |
+| `validate_litellm_env_secret_name <name>`                                 | `LITELLM_ENV_SECRET_NAME`: a Kubernetes Secret name, or empty                          |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -55,8 +63,11 @@ their own copies:
 | `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
+| `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                         |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
 | `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
+
+**The token minter's names.** A new install gets a key ring, key, GSA and KSA named after its cluster (`<cluster>-minter-keyring`, `<cluster>-minter-key`, `<cluster>-minter`, `<cluster>-github-minter`, from `minter_derived_names`). An install whose state already holds a minter keeps those names, because a KMS key can't be deleted and renaming one plans a replacement; its KSA is the one its Workload Identity binding names. A name set in `install.env` (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`, `GITHUB_MINTER_KSA_NAME`) always wins. A per-install KSA stops installs in one project acting as each other's minter by accident; the project is still the trust boundary (see the [github-minter module](../../terraform/modules/github-minter/README.md#trust-between-installs-in-one-project)). `lifecycle.sh` refuses to adopt a minter key ring or key that another install's owner labels claim, unless `MINTER_SHARED_KEY` names it as `<keyring>/<key>`. A key with no owner labels is adopted as this install's own, and labelled, only when its names were given explicitly (`KMS_KEYRING` and `KMS_KEY`, from `install.env`, the environment or the flags); labels win over a name. The project-wide default names don't count when `install.env` records them, since a file from before per-install names records them whether or not the install ran a minter. A GitHub environment's rebuild passes them in the environment (`scripts/release/minter_environment_names.sh`), so it adopts the environment's own key.
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -158,7 +169,8 @@ The chat flags are held to the file rather than overriding it for one run, becau
 `upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
 one-run override would be undone by the next full upgrade without a word. They are
 `--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
-`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--slack-home-channel-name`, `--slack-home-channel-policy`, `--google-chat-allowed-users`,
+`--google-chat-home-channel`,
 `--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
 `--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
 is not a chat key and brings no other settings with it.
@@ -184,7 +196,7 @@ nothing, since it is as often a decline as a hand-off: it prints the `KEY=value`
 record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
 first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
-`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL`, `SLACK_HOME_CHANNEL_NAME` and `SLACK_HOME_CHANNEL_POLICY` for Slack; `ALLOWED_USERS`,
 `CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
 toggle is written after them, so a record cut short leaves the settings with the integration
 off, never the integration on without its allowlist. Otherwise
@@ -204,6 +216,19 @@ variable that renders its key (the Google Chat allowlist flag also reads
 `GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
 with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
 edits the keys on its own screens.
+
+`SLACK_HOME_CHANNEL_POLICY` (`--slack-home-channel-policy`) is `auto` (the default, also empty) or
+`manual`, and renders `spec.integration.slack.homeChannelPolicy` on the PlatformAgent; the
+[CRD reference](../../docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
+describes the field. The interview does not ask for it: the field is an opt-out, set in the
+file by the few installs that want it. `write_tfvars_from_state` refuses any other spelling before
+a file is written, on every route, because the CRD accepts only those two. A shell export of the
+key, like an export of any Slack key, is read only when the file does not assign it: a first
+`install.sh` run records it in the `install.env` it writes, and `upgrade.sh` applies it for that
+run alone. A
+full or operator `upgrade.sh` applies the CRDs before the chart; a `lifecycle.sh apply` run by hand
+after `--generate-only` does not, so on an install whose CRD predates the field apply
+`charts/kube-agents/crds/` first, or the chart refuses the value with a message that says so.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.
@@ -329,7 +354,8 @@ which used to replace the Secret and restart every pod holding it.
 
 ### The GitOps forge
 
-`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+`GITOPS_FORGE` is `github` (the default), `gitlab`, `bitbucket` (Bitbucket Cloud) or
+`bitbucket-datacenter`. A github.com install records none of the
 forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
 these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
 the App on the instance:
@@ -366,6 +392,47 @@ The token, and the paths of the token file and the CA file, are never recorded.
 the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
 github.com, it refuses both.
 
+`GITLAB_READ_TOKEN_FILE`, in `install.env` or the environment, is the optional path to a file that
+holds a read-only GitLab token. The broker presents this token only to clone private context
+repositories, never on a write. `install.sh` writes it into the `GITLAB_TOKEN_SECRET` Secret under
+the key `read-token`, beside `token`, and does not record the path. Set it only for the run that
+stores or replaces the read token, then remove it: a run with it set applies the file again, over a
+token rotated since, and stops when the file is gone. A later run without the key keeps the stored
+read token: the installer writes each key with its own server-side-apply field
+manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
+token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
+(gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
+
+A Bitbucket install, Cloud or Data Center, records the same keys as a GitLab install, plus one:
+
+| Key                   | Value                                                                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GITOPS_FORGE`        | `bitbucket` or `bitbucket-datacenter`                                                                                             |
+| `GITOPS_HOST`         | The Data Center instance's hostname; empty for Cloud                                                                              |
+| `GITOPS_REPO`         | `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center)                                                             |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `bitbucket-forge-token`). The key keeps its GitLab name for every forge      |
+| `GITOPS_CA_SECRET`    | Data Center only: the name of the Secret that holds a private CA (default `bitbucket-forge-ca`); set only with `--gitops-ca-file` |
+| `GITOPS_IDENTITY`     | The account the token acts as (`--gitops-identity`): the account UUID for a Bitbucket Cloud access token. Recorded only when set  |
+
+The neutral flags `--gitops-token-file` and `--gitops-token-secret` are the GitLab flags under new
+names, and `GITOPS_TOKEN_FILE`, `GITOPS_TOKEN_SECRET` and `GITOPS_READ_TOKEN_FILE` in the
+environment are aliases of the `GITLAB_*` variables. The generator writes `gitops_forge`,
+`gitops_host`, `gitops_repo_path`, `gitops_token_secret_name`, and, when set,
+`gitops_ca_secret_name` and `gitops_identity` into `terraform.tfvars`. A switch to another forge
+drops a recorded identity, and a default token Secret name becomes the new forge's default. A
+switch between two forges with a token (GitLab, Bitbucket Cloud, Bitbucket Data Center) does not
+keep the recorded token Secret, which holds the old forge's token: the run must give
+`--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run or a run with
+no terminal stops, and an interactive run asks for the new token after the apply and stops if none
+is entered. When the run keeps the recorded Secret without naming it with `--gitops-token-secret`, and gives no read token, the installer removes
+the Secret's `read-token` key, which holds the old forge's read token. A switch to a forge with a
+token drops the recorded `GITOPS_REPO` unless `--gitops-repo` gives it: a non-interactive run then
+stops, and an interactive run asks. The installer records the old forge and its Secret as
+`GITOPS_SWITCH_FROM_FORGE` and `GITOPS_SWITCH_FROM_SECRET` with the new forge, and removes them
+only after the new token steps succeed, so a run that stops in between leaves the switch pending
+for the next run. A Data Center host is asked for in an interactive run; a non-interactive run, or
+a run with no terminal, needs `--gitops-host`.
+
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
 - A run that you decline, or that ends with `--generate-only`, does not change them in an existing
@@ -373,8 +440,13 @@ github.com, it refuses both.
 - A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
   GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
 - A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
-  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys, and drops
-  `GITHUB_PEM_PATH`.
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys. It keeps
+  `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
+  the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
+  recorded path, because it is the old App's key: give the new App's key with
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
+  version and the file is gone) records no path.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 
@@ -383,12 +455,28 @@ that goes on to the apply, or ends with the `--generate-only` handoff, records e
 the file lacks, and replaces one it records
 with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
 up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
-the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The
+minter's names are recorded the same way (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`,
+`GITHUB_MINTER_KSA_NAME`, and `MINTER_SHARED_KEY` when set), since a new install's are derived from its cluster. The PEM
 path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
 that would render GitOps off while the minter is running, and prints the lines to set with the
-live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+live values filled in. A minter that this install did not make (one made by hand, by
+`make deploy-github`, or by another Helm release: the `kube-agents` release record has
+`githubMinter.enabled` false, the Deployment carries no Helm annotations for this release, and
+the install's Terraform state holds no `module.github_minter`) is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
+minter, the run refuses when its `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not name the
+PlatformAgent's live GitOps repository, or when it cannot read the PlatformAgent or that
+repository, because the apply would take the repository out of the PlatformAgent or point it at
+another one. It also refuses to render the chart's own minter over the other one, because Helm
+does not take over objects it does not own: remove all of the other minter's objects first
+(`make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+path, and a `github-app-credentials` Secret made by hand), or set `GITHUB_APP_ID` empty (and, with
+`install.sh`, give no `--github-app-id`). With no readable release record (a first install), these
+cases get the checks above. `KUBE_AGENTS_REMOVE_GITOPS=true` skips all of these checks; the apply
+then renders the repository that `GITOPS_ORG` and `GITOPS_REPO` name, or none when `GITOPS_ORG` is
+empty. `install.sh --generate-only` is refused too, and removes the tfvars it
 wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
 Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
 in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
@@ -523,9 +611,27 @@ cannot refuse a teardown.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+renders). An `install.sh` run that chooses no mode (no `--mode`, no `PLATFORM_AGENT_MODE` in
+`install.env`, whose line `install.env.example` leaves commented out, and on a first install none
+exported) settles it from the target cluster. A cluster already running a `PlatformAgent` keeps
+its `spec.mode` (absent is `today`); one whose `PlatformAgent` was deleted while the
+`kube-agents` release is still installed keeps the mode the release records. Only a cluster with
+neither, or none yet, is a first install, which gets `next`
+(`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`), or `today` when it mirrors its third-party images
+with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
+`--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
+`--generate-only` leave the current context alone. Only gcloud's NOT_FOUND is no cluster: one
+that cannot be described or read is never taken for a first install, and over an `install.env`
+with no key the run renders `today`; with no `install.env`, `--dry-run` and `--generate-only`
+render `today` with a warning and an applying run is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
+`install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
+settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
+key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
+an existing install's mode); a full `upgrade.sh` over a file with no key applies, because
+the CRD defaults `spec.mode` to `next` and the webhook rewrites `today`, so the file cannot
+move the install back. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install. Over an existing
+takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
 with what the file resolves to (an empty key is `today`) is refused rather than applied for one
 run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the
@@ -556,8 +662,19 @@ the release rollback runbook's route, has no such refusal and drops it with its 
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
 
-When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
-`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+`PLATFORM_AGENT_STORAGE_SIZE` is the `PlatformAgent`'s `spec.storage.size`, the size of the
+agent's data claim and of the shell sandbox's. Empty takes `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`,
+which equals the operator's own default. The generator writes `platform_agent_storage_size` on
+every run, and the composition passes the chart nothing for the default, so the CR carries no
+`storage` field. A first install records a value it inherits from the shell; after that, the file
+is the only way in, because `bootstrap_install_env` and `load_install_env` drop an inherited
+value: one run at a raised size followed by a run from a clean shell would drop the field again,
+leaving the claims larger than the CR says. A value that is not a whole number of `Mi`, `Gi` or
+`Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
+regenerates.
+
+When Slack is on, the A2A gateway holds it, with Google Chat on or off (the operator's
+`a2aSlackArmed`), and `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
 three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
 
 - a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway
@@ -674,6 +791,23 @@ recorded. But each `upgrade.sh` run calls the generator before it selects the mo
 stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
 gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
+### The gateway's spend ceiling
+
+`LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` set the gateway's spend ceiling. Empty takes
+`DEFAULT_LITELLM_BUDGET_USD` (`0`, no ceiling) and `DEFAULT_LITELLM_BUDGET_PERIOD` (`1d`).
+`write_tfvars_from_state` writes `litellm_budget` only while the amount is above `0`, so an install
+without a ceiling keeps the file it had; the period is read, and checked, only then. The generator
+refuses an amount that is not a number of `0` or more, an amount above `0` and under
+`LITELLM_BUDGET_MIN_USD` (`0.01`: the chart splits the amount across the gateway replicas and renders
+each share with four decimals, so a smaller amount would fail at the Helm apply), or a period that is
+not a LiteLLM duration (a whole number and `s`, `m`, `h`, `d`, `w` or `mo`), and names the key. `install.sh` records both
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys; the operator and harness modes of `upgrade.sh` use the values that the release
+recorded, but each run calls the generator before it selects the mode, so a bad value stops the run
+in every mode. The [inference-gateway page](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)
+says how the chart splits the amount and what the gateway does when it is spent.
+
 ### Cluster adoption and component toggles
 
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a
@@ -748,11 +882,12 @@ is a hand-authored dotenv and a hand may well write `export`.
   the registry prefixes, cluster connection, the step runner. Sources
   `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
   `scripts/release/common.sh`, not this file.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `hack/ci_sweep_bench_plants.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /
   **[print_instructions_slack.sh](print_instructions_slack.sh)**: post-install manual-step
-  instructions, printed by `install.sh` when the integration is enabled.
+  instructions, printed by `install.sh` after every apply that leaves the integration on,
+  `--menu`'s Save & Apply included.
 - **[../dev/dev_rebuild_agent.sh](../dev/dev_rebuild_agent.sh)**: fast local development utility
   that builds, pushes, and redeploys agent container images.

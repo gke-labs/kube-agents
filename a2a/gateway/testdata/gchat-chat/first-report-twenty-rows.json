@@ -1,0 +1,52 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*First look at your fleet: 20 things to fix first*\n\n25 clusters scanned in full · 9 configuration checks\n\n- `critical` api-01 is in CrashLoopBackOff on cluster-01 · The service is down. Fix the crash.\n- `critical` api-02 is in CrashLoopBackOff on cluster-02 · The service is down. Fix the crash.\n- `critical` api-03 is in CrashLoopBackOff on cluster-03 · The service is down. Fix the crash.\n- `critical` api-04 is in CrashLoopBackOff on cluster-04 · The service is down. Fix the crash.\n- `critical` api-05 is in CrashLoopBackOff on cluster-05 · The service is down. Fix the crash.\n- `critical` api-06 is in CrashLoopBackOff on cluster-06 · The service is down. Fix the crash.\n- `critical` api-07 is in CrashLoopBackOff on cluster-07 · The service is down. Fix the crash.\n- `critical` api-08 is in CrashLoopBackOff on cluster-08 · The service is down. Fix the crash.\n- `critical` api-09 is in CrashLoopBackOff on cluster-09 · The service is down. Fix the crash.\n- `critical` api-10 is in CrashLoopBackOff on cluster-10 · The service is down. Fix the crash.\n- `critical` api-11 is in CrashLoopBackOff on cluster-11 · The service is down. Fix the crash.\n- `critical` api-12 is in CrashLoopBackOff on cluster-12 · The service is down. Fix the crash.\n- `critical` api-13 is in CrashLoopBackOff on cluster-13 · The service is down. Fix the crash.\n- `critical` api-14 is in CrashLoopBackOff on cluster-14 · The service is down. Fix the crash.\n- `critical` api-15 is in CrashLoopBackOff on cluster-15 · The service is down. Fix the crash.\n- `critical` api-16 is in CrashLoopBackOff on cluster-16 · The service is down. Fix the crash.\n- `critical` api-17 is in CrashLoopBackOff on cluster-17 · The service is down. Fix the crash.\n- `critical` api-18 is in CrashLoopBackOff on cluster-18 · The service is down. Fix the crash.\n- `critical` api-19 is in CrashLoopBackOff on cluster-19 · The service is down. Fix the crash.\n- `critical` api-20 is in CrashLoopBackOff on cluster-20 · The service is down. Fix the crash.\n\n5 more items are queued, 5 of them critical. I'll bring up to 2 critical a day.\n\n*What the scan checked*\nstartup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Fix the first one: api-01 is in CrashLoopBackOff on cluster-01"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "Fix the first one",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "See all 25 items"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "See all 25 items"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

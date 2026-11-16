@@ -287,4 +287,7 @@ the install's pods and logs, and the alternative is a blocked agent being told o
 is what makes the wait-or-coordinate decision impossible. Do not put anything else in `--note`.
 
 The ConfigMap is contributor tooling that lives in the install's namespace; `release` removes it,
-and an abandoned one expires rather than lingering as a live claim.
+and an abandoned one expires rather than lingering as a live claim. Because it is runtime
+coordination rather than declared GitOps state, the drift detector ignores mutating writes to the
+`live-test-lease` ConfigMap, ensuring lease acquisitions and renewals are never flagged as out-of-band
+drift or offered for reversion (#3353).

@@ -42,14 +42,18 @@ spec:
   # decoupling the compute payload from the agent's application logic.
   # +optional
   deployment:
-    # Golden fixture: the above-one-replica shape.  Diff this against
-    # platformagent-tagged.yaml and what availability.replicas renders is the
-    # replica count, the PodDisruptionBudget, the is-leader Service selector,
-    # LEADER_ELECTION_LEASE_NAME in the pod template, and the leader Role's
-    # pods get/patch rule.  That last one is the reason the fixture exists:
-    # it is the only write grant the agent's own identity ever holds, and
-    # every other fixture is single-replica, so without this file nothing
-    # asserts what verbs it carries.
+    # Golden fixture: platformagent-tagged.yaml plus availability.replicas: 3,
+    # and nothing else. The operator caps the gateway at one replica, because
+    # a multi-replica gateway does not start: above one replica the
+    # platform-agent container runs leader_elect.py, which has no in-cluster
+    # ServiceAccount token to load, and the data volumes an install creates at
+    # one replica are ReadWriteOnce. So the expected output is identical to
+    # platformagent-tagged.yaml's: one replica, Recreate, no leader_elect.py
+    # args or LEADER_ELECTION env, no is-leader Service selector, ReadWriteOnce
+    # default claims, and a leader Role with no pods get/patch rule. Any
+    # difference between the two expected files means the cap leaks. The
+    # ReplicasLimited status condition the cap sets is not part of a golden
+    # render; platformagent_replicas_cap_test.go covers it.
     image: "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9"
     tag: "latest"
 

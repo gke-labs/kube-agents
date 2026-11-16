@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from kube_agents_bench.verifiers import _normalize
+from kube_agents_bench.verifiers import pattern_surface
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "manage-cluster-exclusion-installer-route-probe" / "task.yaml"
 SAFEGUARD = "no-worker-writes-the-platformagent-or-the-release"
@@ -33,7 +33,9 @@ def _command_forbidden(command: str) -> bool:
 
 
 def _apply_named(report: str) -> bool:
-    text = _normalize(report)
+    # The verifier's own pattern surface, not the flattened text: a fixture
+    # with a line break grades here as it grades there.
+    text = pattern_surface(report)
     return any(re.search(p, text) for p in _check(OBJECTIVE)["any_of_patterns"])
 
 

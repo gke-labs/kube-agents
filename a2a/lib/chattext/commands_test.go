@@ -118,3 +118,77 @@ func TestIsSessionCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestIsFeedbackCommand(t *testing.T) {
+	yes := map[string]string{
+		"/feedback":                          "",
+		"/FEEDBACK":                          "",
+		"  /feedback  ":                      "",
+		"/feedback\n":                        "",
+		"/feedback the report posted twice":  "the report posted twice",
+		"/feedback\nthe status line stuck":   "the status line stuck",
+		"/Feedback\tbutton labels are wrong": "button labels are wrong",
+	}
+	for in, want := range yes {
+		got, ok := IsFeedbackCommand(in)
+		if !ok || got != want {
+			t.Errorf("IsFeedbackCommand(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
+		}
+	}
+	no := []string{"/feedbacks", "/feedbackform", "feedback", "/ feedback", "please /feedback", "/session feedback", "/", ""}
+	for text, want := range map[string]bool{
+		"/sethome": true, "  /sethome  ": true, "/sethome #ops": true, "/SetHome": true,
+		"/hermes sethome": true, "/HERMES SetHome": true, "/hermes sethome now": true, "/hermes\tsethome": true,
+		"/sethomes": false, "sethome": false, "please /sethome": false, "/session sethome": false,
+		"/hermes": false, "/hermes status": false, "/hermes sethomes": false, "/ sethome": false, "": false,
+	} {
+		if got := IsSetHomeCommand(text); got != want {
+			t.Errorf("IsSetHomeCommand(%q) = %v, want %v", text, got, want)
+		}
+		if want && IsCommand(text) {
+			t.Errorf("IsCommand(%q) is true: a typed /sethome is the gateway's on Slack alone, a turn elsewhere", text)
+		}
+	}
+	for _, in := range no {
+		if got, ok := IsFeedbackCommand(in); ok {
+			t.Errorf("IsFeedbackCommand(%q) = (%q, true), want false", in, got)
+		}
+	}
+}
+
+func TestIsCommandCountsOnlyTheBareFeedbackForm(t *testing.T) {
+	if !IsCommand("/feedback") {
+		t.Error("a bare /feedback is a gateway command; a button must not carry it")
+	}
+	if IsCommand("/feedback the report posted twice") {
+		t.Error("/feedback <text> is an ordinary turn; a button may carry it")
+	}
+}
+
+func TestFeedbackLinksAreTheOnesThePersonasHandOut(t *testing.T) {
+	if FeedbackTrackerURL != "https://github.com/gke-labs/kube-agents/issues" {
+		t.Errorf("tracker = %q", FeedbackTrackerURL)
+	}
+	if FeedbackFormURL != "https://gke-labs.github.io/kube-agents/feedback" {
+		t.Errorf("form short link = %q", FeedbackFormURL)
+	}
+}
+
+func TestIsFeedbackSummaryCommand(t *testing.T) {
+	for _, in := range []string{"/feedback summary", "  /FEEDBACK  Summary ", "/feedback\tsummary"} {
+		if !IsFeedbackSummaryCommand(in) {
+			t.Errorf("IsFeedbackSummaryCommand(%q) = false, want true", in)
+		}
+		if !IsCommand(in) {
+			t.Errorf("IsCommand(%q) = false: the gateway answers the summary form in place, so a button must not carry it", in)
+		}
+	}
+	for _, in := range []string{"/feedback", "/feedback summary please", "/feedback summarize", "summary", "/session summary", "/feedback the summary posted twice"} {
+		if IsFeedbackSummaryCommand(in) {
+			t.Errorf("IsFeedbackSummaryCommand(%q) = true, want false", in)
+		}
+	}
+	if IsCommand("/feedback summary please") {
+		t.Error("IsCommand(\"/feedback summary please\") = true; with more text it is the agent's turn")
+	}
+}

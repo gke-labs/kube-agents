@@ -37,6 +37,7 @@
 # on the route rather than on the clock.
 id: vcs-history-only-fact
 name: A history-only repository fact, read through the version-control verbs
+domain: source-control
 prompt: >-
   This is a question about history, not a request to change anything. In the
   GitOps repository this install manages, on branch git-access-ab/r200, why is

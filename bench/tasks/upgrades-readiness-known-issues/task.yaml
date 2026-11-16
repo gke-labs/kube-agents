@@ -1,0 +1,106 @@
+# Catalogue entry 26: a known issue in an add-on at the target version; the add-on inventory against the published known issues per GKE patch.
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (which issues the page publishes for the running patch is the provider's; the table carries the page's rows for every minor from 1.32, so a current cluster matches whatever the page lists for its version), so this case does not grade a detection: it grades the
+# rule's declared report line for every seeded cluster in its "no finding" form,
+# which is red on `main` (no rule prints such a line, and an agent cannot
+# invent the numbers it carries) and green once the rule prints it; the rule's
+# unit tests (scripts/test_readiness_rules.py) carry the positive detection on
+# recorded inputs. The prompt asks for one declared line per seeded cluster in
+# a fixed vocabulary copied from the rule's note in the report's note column
+# (`<rule id>: <the rule's text>`) and its JSON (`readiness.notes`); the
+# deterministic objectives read those lines and nothing else, the prose is the
+# judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-readiness-known-issues
+name: Upgrade readiness inventories each cluster's add-ons and reads them against the known-issues table
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, how many add-on containers the report inventoried in kube-system and gmp-system (the add-ons table after the readiness table, `addons` in the JSON), how many published known issues match its running or target GKE version with an add-on it runs, the date the known-issues table was generated, and whether the report calls the table fresh or stale (a stale table is the known-issues-matrix rule's risk), as that rule's note and its risks state them. Read only; change and upgrade nothing. A member may be blocked or carry
+  risks from other rules on the same report; the slots are about this rule
+  only. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: known-issues-matrix: <n> add-on(s) inventoried; <n> known issue(s) match; table generated <YYYY-MM-DD>; table <fresh|stale>".
+
+expected_output: >-
+  The version table, the readiness table and the add-ons table read during this run, with every seeded cluster's managed add-ons inventoried by image and tag (fluent-bit, gke-metadata-server, the PD CSI driver, the metrics agents, kube-dns, managed Prometheus's collector and operator among them), the count of published known issues the report matched to its running or target version (zero or more: the table carries the page's rows for every minor from 1.32, so a current cluster matches what the page lists for its version), and the table's generation date quoted, with whether the report found it fresh or stale. The answer says what a match means (target the patch the issue names as fixed, or hold) and names the matches it found, if any. It ends with the declared lines, each reading "known-issues-matrix: <n> add-on(s) inventoried; <n> known issue(s) match; table generated <date>; table fresh|stale" with the numbers copied from the report. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy, all four slots included.
+  # The fold spaces a separator only before a letter, so a count written right
+  # after `:` or `;` stays unspaced; the patterns admit the missing space there.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)'
+  # At least one add-on inventoried (every GKE cluster runs managed DaemonSets in kube-
+  # system), a count of matches, the table's date, and the freshness verdict as the report
+  # gave it; `fresh` or `stale` are both accepted, because the table ages by design and a
+  # stale table is a finding the judge reads, not a wrong line.
+  - name: the-declared-lines-carry-an-inventory-and-the-tables-date
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?[1-9]\d* add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix:(?! ?[1-9]\d* add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

@@ -132,7 +132,11 @@ gcloud is installed and is asked again next time:
 | `provisional`         | `True` when the own-cluster describe gave no answer and the decision fell back    |
 
 `dns_endpoint_args()` stays as the wrapper returning only `flags` as a list. Its callers,
-`platform_mcp_server.py` and `stall_watch.py`, inherit rule 3 without a signature change;
+`platform_mcp_server.py` and `stall_watch.py`, inherit rule 3 without a signature change.
+Where the shell's `kubectl` goes through the kube-api proxy (`KUBE_PROXY_URL` in the sandbox,
+`KUBE_PROXY_IN_USE_URL` in the gateway's agent container), the wrapper returns no flags and
+decides nothing: the shim answers the `get-credentials` itself, or the credential proxy's
+splice decides for a fetch that names no endpoint, and the kubeconfig names kube-proxy either way.
 `cluster_agent_profile.py` and `credential_proxy.py` call `endpoint_decision()` themselves,
 the first because it writes the decision out and the second because it reads the
 `provisional` mark. The describe widens to
@@ -183,8 +187,12 @@ rather than on kubectl's generic `Unable to connect to the server:` prefix, whic
 x509 and auth-plugin failures the list cannot fix) rather than an answer the server gave
 (anything kubectl fronts with `Error from server`, a degraded etcd's "request timed out"
 included) or a message the credential-proxy shim itself produced (its `credential proxy:`,
-`credential proxy unavailable`, `credential proxy token unavailable` and `credential proxy
-error` prefixes). When the probe itself does not finish inside its outer bound,
+`credential proxy unavailable`, `credential proxy token unavailable`, `credential proxy
+error` and `credential proxy throttled` prefixes; a connection that drops after the request was
+sent is reported under `credential proxy error`, and its `credential proxy busy … retrying` line is
+not one, since the retried attempt's kubectl writes after it). The shim's exec-tier fallback line,
+and its line for an ignored malformed exec URL, name no network cause and carry none of these
+prefixes, so a cluster failure that follows either is still classified. When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.

@@ -74,26 +74,42 @@ _PULL_ALLOWANCE_SECONDS = 480
 _DEFAULT_PROGRESS_DEADLINE_SECONDS = 600
 
 
+def _go_seconds(text, spelling):
+    """An integer the Go source spells either as a literal or as a named `int32`
+    constant declared at the top of platformagent_manifests.go, as the probe
+    timings are (`agentAPIStartupProbePeriodSeconds int32 = 10`)."""
+    if spelling.isdigit():
+        return int(spelling)
+    match = re.search(rf"^\s*{re.escape(spelling)}\s+int32 = (\d+)$", text, re.MULTILINE)
+    assert match, f"could not resolve {spelling} to an int32 constant in platformagent_manifests.go"
+    return int(match.group(1))
+
+
 def _gateway_startup_budget_seconds():
     """How long the gateway's startupProbe tolerates failure.
 
-    Both halves come from the Go source: the call site fixes periodSeconds and
-    failureThreshold, and agentAPIProbe fixes initialDelaySeconds. Counting the
-    initial delay matters -- omitting it under-reports the budget, which is the
-    direction that hides a violation.
+    Both halves come from the Go source: the call site fixes periodSeconds,
+    failureThreshold and timeoutSeconds, and agentAPIProbe fixes
+    initialDelaySeconds; each is a named constant the helper above resolves.
+    Counting the initial delay matters -- omitting it under-reports the budget,
+    which is the direction that hides a violation.
     """
     text = _MANIFESTS_GO.read_text()
 
-    call = re.search(r"StartupProbe:\s*agentAPIProbe\((\d+),\s*(\d+)\)", text)
-    assert call, "could not find the gateway StartupProbe call to agentAPIProbe"
-    period, failure_threshold = int(call.group(1)), int(call.group(2))
+    calls = list(re.finditer(r"StartupProbe:\s*agentAPIProbe\((\w+),\s*(\w+),\s*(\w+)\)", text))
+    assert len(calls) == 1, (
+        f"expected exactly one StartupProbe call to agentAPIProbe (the gateway's), found {len(calls)}"
+    )
+    call = calls[0]
+    period, failure_threshold = _go_seconds(text, call.group(1)), _go_seconds(text, call.group(2))
 
     body = re.search(r"func agentAPIProbe\([^)]*\)[^{]*\{.*?\n\}", text, re.DOTALL)
     assert body, "could not find func agentAPIProbe"
-    initial = re.search(r"InitialDelaySeconds:\s*(\d+)", body.group(0))
+    # Anchored on the comma: an expression such as `x + 600,` must fail loudly, not read as `x`.
+    initial = re.search(r"InitialDelaySeconds:\s*(\w+),", body.group(0))
     assert initial, "could not find InitialDelaySeconds in agentAPIProbe"
 
-    return int(initial.group(1)) + period * failure_threshold
+    return _go_seconds(text, initial.group(1)) + period * failure_threshold
 
 
 def _gateway_progress_deadline_seconds():
@@ -269,6 +285,9 @@ _E2E_RUNNER_SETUP_SECONDS = 300
 # 60-minute suite budget in staging-promotion-pipeline.yml).
 _E2E_RC_SUITE_ALLOWANCE_SECONDS = 1200
 _E2E_ALL_SUITES_ALLOWANCE_SECONDS = 3600
+# What the optional `slack` suite adds where a caller lists it: the Slack test's
+# reply wait, 300s on `next`.
+_E2E_SLACK_SUITE_SECONDS = 300
 # What the upgrade.sh workflows do outside the waits the floor sums. The
 # reconcile job: checkout, auth and gcloud setup, the lease and KMS checks,
 # and terraform init/plan/apply outside the Helm release wait. The rollback
@@ -534,7 +553,7 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
                         _E2E_ALL_SUITES_ALLOWANCE_SECONDS
                         if files == all_e2e_files or "stockout-full" in suites
                         else _E2E_RC_SUITE_ALLOWANCE_SECONDS
-                    )
+                    ) + (_E2E_SLACK_SUITE_SECONDS if "slack" in suites else 0)
                     # `next` adds its gate once, after the two above; `today`
                     # (the input's default) adds nothing. Anything else -- an
                     # expression forwarding a caller's own input -- may be
@@ -564,7 +583,9 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
             (
                 "e2e-manual-runner.yml:run-e2e",
                 int(manual_minutes),
-                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS,
+                # Its `mode` input can be `next`, so its gate is budgeted too.
+                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS
+                + _mode_next_gate_seconds(),
             )
         )
 

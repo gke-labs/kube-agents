@@ -24,9 +24,10 @@ import (
 // invite a supervisor retry against a capability that will refuse it again.
 //
 // Every failure is a refusal, including the ones that are not the caller's
-// fault: a malformed block, a verifier that cannot be reached, an answer that
-// does not parse. The verifier being down stops work; that is the cost of the
-// control and it is named in the deployment's runbook.
+// fault: a malformed block, a verifier that cannot be reached for the
+// client's whole reach window, an answer that does not parse. The verifier
+// being down stops work; that is the cost of the control and it is named in
+// the deployment's runbook.
 
 // capabilityRefusal returns the reason this task must be refused, or "" to
 // proceed. It is called before the prompt is looked at: an executor that
@@ -52,7 +53,20 @@ func (a *adapter) capabilityRefusal(ctx context.Context, nc *nats.Conn, origin *
 	if err != nil {
 		return "reason: capability-refused - this executor has no verify subject of its own"
 	}
+	// The client rides out a verifier it cannot reach for its reach
+	// window (capability.DefaultReachWindow) before refusing, and says so
+	// here when that wait is what let the check through.
+	client.Log = a.log.With("task", a.cfg.TaskID)
 	if err := client.Check(ctx, ref, capability.VerbTaskExecute, a.cfg.Scope); err != nil {
+		// A check ended by its caller (a SIGTERM inside the window) never
+		// heard from the verifier either way, and Check reports that as
+		// unreachable. Logged as what happened, so an eviction doesn't read
+		// as a verifier outage; the caller decides the outcome.
+		if ctx.Err() != nil {
+			a.log.Info("capability check stopped before the verifier answered",
+				"task", a.cfg.TaskID, "verb", capability.VerbTaskExecute, "cause", context.Cause(ctx))
+			return "reason: capability-refused - " + capability.Reason(err)
+		}
 		// capability.Reason carries the rule the verifier named, which
 		// never quotes anything the caller supplied.
 		a.log.Warn("capability refused this task",

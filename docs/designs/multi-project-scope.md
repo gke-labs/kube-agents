@@ -198,11 +198,23 @@ Rules:
 
 Resolution turns the declared scope into a set of `(project, cluster, location)` tuples, plus a
 per-project outcome. It runs inside the existing reconcile job under the agent's identity, through
-the credential broker, because that is the only process in the install that talks to GCP on a
-schedule and the operator deliberately holds no GCP credential.
+the credential broker, because the operator deliberately holds no GCP credential. Outside
+`spec.mode: next`, the reconcile is the only process in the install that talks to GCP on a
+schedule.
 
-**Explicit projects** use the call the script makes today, once per project:
-`gcloud container clusters list --project <P> --format=value(name,location)`.
+Under `spec.mode: next` there is a second scheduled caller, the scope publisher. The operator
+starts it as a Job every 15 minutes, and soon after the membership fields of `spec.scope` change,
+while the scope declares a folder, organisation, Shared VPC host or Metrics Scope. It resolves the
+same members through the broker's `scope` role, under a ServiceAccount of its own, and writes them
+to the `<name>-resolved-scope` ConfigMap, which the A2A gateway reads before it admits a target
+that `spec.scope.projects` does not list. The broker confers that role only where the chart
+renders the gateway pod admission policy. The operator still holds no GCP credential.
+
+**Explicit projects** are listed once per project. Since #3703 this is the GKE API's
+`projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the
+broker's Cloud API relay, with
+`gcloud container clusters list --project <P> --format=value(name,location)` as the fallback
+when the relay cannot be used. PRUNE's describes take the same path, through the relay's get route.
 
 **Folders and organisations** use Cloud Asset Inventory rather than walking the tree:
 
@@ -366,9 +378,46 @@ carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic pass
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
 
+Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+target cluster before it mints a grant, and it cannot read this volume. The design adds a
+separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
+own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
+credential broker, probes each container and selector member with `container clusters list`, and
+merge-patches the result into the `<name>-resolved-scope` ConfigMap as one compact JSON document.
+The document holds the schema version, `resolvedAt` (the last run in which at least one source
+lookup answered), a `memberHash` of the declaration's membership fields (so a reader can tell a
+document resolved for an older declaration), a `state` (`ok`; `too-large` past 900 KiB; `error`
+when the declaration cannot be read, or when every source lookup failed and no earlier run
+resolved), the members an `exclude.projects` entry dropped, and one row per container or selector
+member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in which a source
+listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
+A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
+fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
+number-to-ID memo and the members counted against the cap that have no row. A third field the
+gateway and the operator do not read, `clusters` (added 11/11, #5621), keeps what each member's
+probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`, for the
+agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
+covers member projects only, since the management project and explicit projects are never
+probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
+for a project it could not read. The `projects` rows don't change with it. The map counts toward the 900 KiB budget, but it is
+dropped first: a document whose rows fit is published without it rather than as `too-large`. The operator starts
+it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
+`scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
+own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile
+task's target against the document, as described below. The reconcile, its snapshot and today-mode
+installs do not change.
+
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
 pod has no channel to the operator today and building one for this alone is out of proportion.
+
+The A2A gateway reads the scope publisher's `<name>-resolved-scope` ConfigMap (section 4) to
+check a profile task's cluster target, with a `get` on that one name, and fails closed. It admits
+a project that only a container or selector reaches only from a document of the current
+`memberHash` and state `ok`, a row with outcome `ok`, and a `resolvedAt` and `confirmedAt` within
+two publisher cycles (2 × (15 min + 300 s × ceil(maxProjects / 100))), a stamp more than a
+minute in the future counting as stale. Explicit projects, the management project and
+`exclude.clusters` keep their direct checks from `scope.json`.
 
 ## 6. IAM
 
@@ -414,7 +463,7 @@ follow the selector type:
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
-`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer` and
+`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, `gkehub.viewer` and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
 in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
 in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
@@ -524,7 +573,7 @@ has three conditions, all required: the project is absent from this run's resolv
 because no selector produced it or because an `exclude.projects` entry removed it -- a project in
 the set is present in the snapshot with whatever outcome it read, `ok` or not, and is never pruned
 by this rule; every selector the run resolves at runtime, the declared containers and the phase 3 shared-VPC-host and metrics-scope lookups alike, resolved this run, `ok` or `over-cap` (§4), no project of any kind came back `unreachable`, the management project itself resolved and listed its own clusters, and the declaration file was read, so that the absence is the declaration speaking and not a failed lookup; and the project was present in the previous snapshot's `projects` array, as `in-scope` or
-`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and marks nothing newly `retiring`; a project an earlier present block already marked `retiring`, or a management project whose identity changed, is still pruned on a clean no-block run, because that mark came from a real declaration. A block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The rule therefore binds the renderer: once an install carries a scope value, the chart's `PlatformAgent` template emits `spec.scope` as a present block, empty lists included, rather than dropping the group the way its other optional groups are dropped when every value is empty, so that removing the last project from the tfvars and running `upgrade.sh` reads as the declaration that drops it and not as no declaration. The absent marker exists for CR writes the chart did not make. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with the `via` it had, so a later freeze still finds the member, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one and no `exclude.projects` entry matches it; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
+`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and marks nothing newly `retiring`; a project an earlier present block already marked `retiring`, or a management project whose identity changed, is still pruned on a clean no-block run, because that mark came from a real declaration. The management project stays the default on a no-block run and on a present block with empty lists (decided 2026-11-06, on a PoC report of two single-cluster installs that each adopted an out-of-region neighbour): a host-cluster-only default would change every existing install with an empty scope, so the operator surfaces the default instead, as the `ScopeUndeclared` condition on the CR, written from the event watcher's `cluster_up` series while no membership list names anything and a cluster in the management project other than `spec.harness`'s is registered (`docs/designs/usage-counters-producer.md`); the reconcile cannot write the CR itself. A block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The rule therefore binds the renderer: once an install carries a scope value, the chart's `PlatformAgent` template emits `spec.scope` as a present block, empty lists included, rather than dropping the group the way its other optional groups are dropped when every value is empty, so that removing the last project from the tfvars and running `upgrade.sh` reads as the declaration that drops it and not as no declaration. The absent marker exists for CR writes the chart did not make. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with the `via` it had, so a later freeze still finds the member, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one and no `exclude.projects` entry matches it; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
 protects profiles the scope never produced. The `manage-cluster` skill onboards a cluster with an
 explicit `--project` today, and those profiles exist on installs that will upgrade into phase 1
 with an empty scope; without it, the first tick would delete every one of them, which is the
@@ -542,9 +591,10 @@ retire it on that reading alone, because the index lags a move by minutes and a 
 would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
 its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
 two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
-the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
-meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
-classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile lookup in `<P>` (the relayed
+`clusters.get`, or `describe --project=<P>` on the gcloud fallback) meanwhile returns a 403, because
+the folder binding no longer covers it, which `_read_get` or `_cluster_exists` classifies as unknown
+and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
 placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet
@@ -572,6 +622,7 @@ works. Each is listed with whether it blocks the first phase or follows it: `1` 
 | `docs/site/src/content/docs/reference/credential-isolation.md:205`                                                                                                               | Described the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; the page now says the override is pinned empty in the managed `.env`                                                                                                                                            | done  |
 | `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:81` | Named `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; each now names `spec.scope.exclude.clusters` with the variable as the one-release fallback                                                                                                                                                  | done  |
 | `agents/platform/scripts/stall_watch.py`                                                                                                                                         | Listed one project's clusters (`STALL_WATCH_PROJECT`, else `GCP_PROJECT_ID`); it now also lists every project a Cluster Agent profile's identity names                                                                                                                                                                            | done  |
+| `agents/platform/scripts/upgrade_readiness_watch.py`                                                                                                                             | Ran the readiness report script with a bare `--project` per project, which a scoped sandbox refuses; on a declared install it now hands the script the resolved scope (`--scope-projects`, `--scope-unread`, from `fleet_scope_targets`) beside each `--project`, read inside the scope and refused outside it                    | done  |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
 profile's kubeconfig and already labels every metric with `project` and `location`, so Kubernetes

@@ -3,7 +3,8 @@
 # SSH crossing drops and then runs the command sshd would have run anyway: the
 # working directory the incoming command is about to cd into, which nothing
 # creates on this side; when that directory is a kanban workspace, the
-# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables; and HERMES_HOME
+# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables, and when it is a
+# cron run's, HERMES_CRON_RUN; and HERMES_HOME
 # with the kubeconfig pinned in it, from the profile the client named or,
 # failing that, from the directory when it is inside a profile home. All three
 # are set in the worker's process environment on the agent pod, and no part of
@@ -143,6 +144,21 @@ export_forwarded_profile_home() { # export_forwarded_profile_home <HERMES_PROFIL
   narrow_to_profile "$name"
 }
 
+# export_default_kubeconfig sets KUBECONFIG to $SANDBOX_DATA_ROOT/.kubeconfig
+# for the default root and the platform profile when no profile kubeconfig.yaml
+# was pinned. Single-cluster profiles (profiles/<cluster>) leave KUBECONFIG
+# unset when their kubeconfig.yaml is absent so cluster_preflight.sh check 2
+# reports a missing pin instead of reading the default kubeconfig.
+export_default_kubeconfig() {
+  if [ -z "${KUBECONFIG-}" ] && [ -f "$SANDBOX_DATA_ROOT/.kubeconfig" ]; then
+    case ${HERMES_HOME-} in
+    "" | "$SANDBOX_DATA_ROOT" | "$PROFILES_ROOT/platform")
+      export KUBECONFIG="$SANDBOX_DATA_ROOT/.kubeconfig"
+      ;;
+    esac
+  fi
+}
+
 # Before the working directory is looked at, and before the interactive branch:
 # the profile is the session's, whatever the session runs.
 profile_named=0
@@ -155,6 +171,7 @@ cmd=${SSH_ORIGINAL_COMMAND-}
 # No command means an interactive session. sshd would have started the login
 # shell; ForceCommand replaces that, so start it here.
 if [ -z "$cmd" ]; then
+  export_default_kubeconfig
   exec /bin/bash -l
 fi
 
@@ -213,6 +230,29 @@ export_kanban_vars() { # export_kanban_vars <resolved cwd>
   [[ $tid =~ ^t_[0-9a-f]+$ ]] || return 0
   export HERMES_KANBAN_WORKSPACE="$prefix/workspaces/$tid"
   export HERMES_KANBAN_TASK="$tid"
+}
+
+# A scheduled run's key, recovered the same way. The cron run workdir patch
+# (deploy/docker/patches/apply_cron_run_workdir.py) gives every run of a
+# cron/jobs.json job a directory of its own, `<home>/cron/runs/<job>_<execution>`,
+# and the run's commands cd into it. The name is the one thing that tells one
+# run's commands from the next's on this side of the crossing, and the
+# credential-proxy shim sends it as the exec request's `sessionId`
+# (credential_proxy_client.CALLER_LABEL_ENV), the key the broker counts a run's
+# commands on and breaks its retry loops with. Nothing else reads it. A chat
+# turn runs from no such directory and so sends no key, which is what keeps a
+# conversation out of the count. Derived from the `<...>/cron/runs/<name>`
+# prefix, so a command run from a subdirectory still reports the run, and only
+# a name in the shim's grammar is exported: the patch writes `[A-Za-z0-9._-]`
+# and nothing longer than a job id and an execution id.
+export_cron_run_var() { # export_cron_run_var <resolved cwd>
+  local path=$1 prefix rest name
+  prefix=${path%%/cron/runs/*}
+  [ "$prefix" != "$path" ] || return 0
+  rest=${path#"$prefix"/cron/runs/}
+  name=${rest%%/*}
+  [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]] || return 0
+  export HERMES_CRON_RUN="$name"
 }
 
 # HERMES_HOME, and the kubeconfig pinned inside it, recovered from the cwd the
@@ -287,6 +327,7 @@ if [ -n "$script" ]; then
     # have worked into one that does not.
     mkdir -p -- "$resolved" 2>/dev/null || warn "could not create $resolved"
     export_kanban_vars "$resolved"
+    export_cron_run_var "$resolved"
     # The client's word beats the directory's. A worker's HERMES_HOME is the
     # profile it runs as; a cwd under some other profile's home is a place it
     # is working, not who it is.
@@ -315,4 +356,5 @@ fi
 # What sshd would have done with no ForceCommand set: the login shell, -c, the
 # client's command string. Reproduced rather than approximated, so scp, tar and
 # anything else that is not a Hermes wrapper behaves exactly as before.
+export_default_kubeconfig
 exec /bin/bash -c "$cmd"

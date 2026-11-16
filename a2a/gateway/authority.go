@@ -12,8 +12,13 @@ import (
 // permitted to do.
 //
 // `requester` and `audience` are ADVISORY and stay that way. Nothing stops
-// another bus client from inventing them, so consumers MUST NOT authorize on
-// them; they are the audit trail.
+// another bus client from inventing them, so consumers MUST NOT authorize tool
+// or cluster actions on them. As an interim exception until the capability
+// grant (#1884) carries the pseudonymous subject directly, after a task's
+// capability is verified the hermes-bridge passes `requester.principal` and
+// `audience.kind` into the pod's local session-kv store so the conversational
+// memory provider can scope personal memory per speaker and fail closed in
+// shared threads.
 //
 // `grants` is not advisory, and it is not a claim either. It carries a
 // reference — a key in the `cap` bucket and the revision the write returned —
@@ -53,6 +58,14 @@ type AuthorityAudience struct {
 type AuthorityVia struct {
 	TaskID  string `json:"taskId"`
 	Session string `json:"session"`
+	// ProfileChain and Scope are set on a child whose parent is an
+	// AgentProfile task (#5686): the parent's carried chain (the waiting
+	// profile tasks above the parent, nearest last) and the parent's own
+	// scope. The dispatcher re-checks the chain and scope rules from them, and
+	// refuses a profile parent's child that lacks Scope, which is what an
+	// older gateway (one that never ran the checks) sends.
+	ProfileChain []string `json:"profileChain,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
 }
 
 // AuthorityGrants is what `grants` carries: a reference and nothing else.

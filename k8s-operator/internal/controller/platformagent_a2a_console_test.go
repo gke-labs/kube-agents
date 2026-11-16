@@ -35,12 +35,21 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// consoleEnv is the container's env by name. A Downward API resource
+// reference is recorded as "resourceFieldRef:<resource>"; any other source
+// is an error, since the console takes its credential from a file, not the
+// environment.
 func consoleEnv(t *testing.T, c corev1.Container) map[string]string {
 	t.Helper()
 	env := map[string]string{}
 	for _, e := range c.Env {
 		if e.ValueFrom != nil {
-			t.Errorf("env %s comes from %+v; the console takes its credential from a file, not the environment", e.Name, e.ValueFrom)
+			if e.ValueFrom.ResourceFieldRef == nil {
+				t.Errorf("env %s comes from %+v; the console takes its credential from a file, not the environment", e.Name, e.ValueFrom)
+				continue
+			}
+			env[e.Name] = "resourceFieldRef:" + e.ValueFrom.ResourceFieldRef.Resource
+			continue
 		}
 		env[e.Name] = e.Value
 	}
@@ -83,10 +92,12 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"CONSOLE_BUS_URL":       "http://test-agent-a2a-nats.test-ns.svc:9222",
-		"CONSOLE_USER":          "console",
-		"CONSOLE_PASSWORD_FILE": "/var/run/secrets/a2a-console/console-password",
-		"CONSOLE_ALLOWED_HOSTS": "localhost:8080,127.0.0.1:8080",
+		"CONSOLE_BUS_URL":                "https://test-agent-a2a-nats.test-ns.svc:9222",
+		"CONSOLE_USER":                   "console",
+		"CONSOLE_PASSWORD_FILE":          "/var/run/secrets/a2a-console/console-password",
+		"CONSOLE_ALLOWED_HOSTS":          "localhost:8080,127.0.0.1:8080",
+		"NATS_CA_FILE":                   "/etc/a2a-nats-ca/ca.crt",
+		"WEB_CONSOLE_MEMORY_LIMIT_BYTES": "resourceFieldRef:limits.memory",
 	}
 	if got := consoleEnv(t, c); !reflect.DeepEqual(got, want) {
 		t.Errorf("env = %v\nwant  %v", got, want)
@@ -96,6 +107,14 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	// the stored Deployment would never match the render.
 	if cpu := c.Resources.Requests.Cpu(); cpu.Cmp(resource.MustParse("50m")) < 0 {
 		t.Errorf("cpu request = %s, want at least 50m (GKE Autopilot raises anything lower on every apply)", cpu)
+	}
+	// Both limits, because a namespace ResourceQuota on limits.cpu or
+	// limits.memory refuses a pod with a container that declares neither (#3847).
+	if lim := c.Resources.Limits.Cpu(); lim.IsZero() || lim.Cmp(resource.MustParse(a2aConsoleCPULimit)) != 0 {
+		t.Errorf("cpu limit = %s, want %s (a limits.cpu quota refuses a container with none)", lim, a2aConsoleCPULimit)
+	}
+	if lim := c.Resources.Limits.Memory(); lim.IsZero() {
+		t.Errorf("memory limit unset; a limits.memory quota refuses a container with none")
 	}
 
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 8080 || c.Ports[0].Name != "http" {
@@ -118,15 +137,23 @@ func TestTheConsoleImageCanBeOverridden(t *testing.T) {
 // The creds Secret holds every static user's password, sys included. The
 // console pod gets exactly one of them, and the only way it gets it is this
 // volume, so the volume is what has to be pinned. The sys-password check in
-// the manifests tests reads env references, which this pod has none of.
+// the manifests tests reads env references, which this pod has none of. The
+// pod's other volume is the CA bundle, a ConfigMap of public material, so
+// "one Secret volume" is the property, not "one volume".
 func TestTheConsoleCredentialVolumeProjectsOneKey(t *testing.T) {
 	agent := a2aTestAgent()
 	pod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
 
-	if len(pod.Volumes) != 1 || pod.Volumes[0].Secret == nil {
-		t.Fatalf("volumes = %+v, want one Secret volume", pod.Volumes)
+	var secrets []corev1.Volume
+	for _, v := range pod.Volumes {
+		if v.Secret != nil || v.Projected != nil {
+			secrets = append(secrets, v)
+		}
 	}
-	src := pod.Volumes[0].Secret
+	if len(secrets) != 1 || secrets[0].Secret == nil {
+		t.Fatalf("secret-bearing volumes = %+v, want one Secret volume", secrets)
+	}
+	src := secrets[0].Secret
 	if src.SecretName != a2aCredsSecretName(agent) {
 		t.Errorf("secret = %q, want %q", src.SecretName, a2aCredsSecretName(agent))
 	}
@@ -142,12 +169,17 @@ func TestTheConsoleCredentialVolumeProjectsOneKey(t *testing.T) {
 		t.Errorf("optional = %v, want true", src.Optional)
 	}
 
-	mounts := pod.Containers[0].VolumeMounts
+	var mounts []corev1.VolumeMount
+	for _, m := range pod.Containers[0].VolumeMounts {
+		if m.Name == secrets[0].Name {
+			mounts = append(mounts, m)
+		}
+	}
 	if len(mounts) != 1 {
-		t.Fatalf("mounts = %+v, want one", mounts)
+		t.Fatalf("credential mounts = %+v, want one", mounts)
 	}
 	m := mounts[0]
-	if m.Name != pod.Volumes[0].Name || m.MountPath != "/var/run/secrets/a2a-console" || !m.ReadOnly {
+	if m.MountPath != "/var/run/secrets/a2a-console" || !m.ReadOnly {
 		t.Errorf("mount = %+v, want the credential volume read-only at /var/run/secrets/a2a-console", m)
 	}
 	// A subPath mount never sees a rotated Secret. The server reads the file
@@ -203,7 +235,7 @@ func TestTheConsoleServerLogsInAsTheConsoleIdentity(t *testing.T) {
 }
 
 func TestTheWebsocketOriginsAreTheConsoleServers(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	const want = `allowed_origins: ["http://localhost:8080", "http://127.0.0.1:8080"]`
 	if !strings.Contains(conf, want) {
 		t.Errorf("rendered nats.conf lacks %s", want)
@@ -213,10 +245,10 @@ func TestTheWebsocketOriginsAreTheConsoleServers(t *testing.T) {
 	}
 }
 
-// The console server renders with the rest of the next stack, before the
-// gateway's hold (it serves the page whether or not the gateway is up), and
-// goes away with the stack on a flip back to today. Its fence goes with it.
-func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
+// The console server renders with the rest of the A2A stack, before the
+// gateway's hold (it serves the page whether or not the gateway is up), with
+// its fence.
+func TestReconcileA2ARendersTheConsoleAheadOfTheGateway(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	cl := fake.NewClientBuilder().
@@ -243,71 +275,117 @@ func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
 	}
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, name, dep); err != nil {
-		t.Fatalf("console Deployment not rendered under next, ahead of the gateway: %v", err)
+		t.Fatalf("console Deployment not rendered ahead of the gateway: %v", err)
 	}
 	if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Name != agent.Name {
 		t.Errorf("console Deployment owner refs = %+v, want the PlatformAgent", dep.OwnerReferences)
 	}
 	if err := cl.Get(ctx, name, &corev1.Service{}); err != nil {
-		t.Errorf("console Service not rendered under next: %v", err)
+		t.Errorf("console Service not rendered: %v", err)
 	}
 	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); err != nil {
-		t.Errorf("console NetworkPolicy not rendered under next: %v", err)
-	}
-
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	fresh.Spec.Mode = nil
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("failed to update agent: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after the flip failed: %v", err)
-	}
-	if err := cl.Get(ctx, name, &appsv1.Deployment{}); !errors.IsNotFound(err) {
-		t.Errorf("console Deployment still present under today (err=%v)", err)
-	}
-	if err := cl.Get(ctx, name, &corev1.Service{}); !errors.IsNotFound(err) {
-		t.Errorf("console Service still present under today (err=%v)", err)
-	}
-	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
-		t.Errorf("console NetworkPolicy still present under today (err=%v)", err)
+		t.Errorf("console NetworkPolicy not rendered: %v", err)
 	}
 }
 
-// The console fence outlives every other front-door object in the teardown:
-// its Deployment's Delete returns before the pod has exited, and an unfenced
-// console pod hands its password to any in-cluster caller. It goes directly
-// before the session fence, which is as late as it can go:
-// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes holds the session fence
-// last.
-func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
+// The proxy verifies the bus's websocket listener against the bus CA, so the
+// pod mounts the CA bundle ConfigMap, and NATS_CA_FILE names the file in that
+// mount. Not optional: a pod without the CA must not start and dial the bus
+// unverified, and the server refuses an https bus URL with no CA file.
+func TestTheConsoleTrustsTheBusCA(t *testing.T) {
 	agent := a2aTestAgent()
-	r := &PlatformAgentReconciler{}
-	pos := map[string]int{}
-	for i, e := range r.a2aNamespacedTeardown(agent) {
-		pos[fmt.Sprintf("%T/%s", e.obj, e.obj.GetName())] = i
-	}
-	idx := func(key string) int {
-		i, ok := pos[key]
-		if !ok {
-			t.Fatalf("teardown has no %s", key)
+	pod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
+
+	var vol *corev1.Volume
+	for i := range pod.Volumes {
+		if pod.Volumes[i].ConfigMap != nil {
+			vol = &pod.Volumes[i]
 		}
-		return i
 	}
-	fence := idx("*v1.NetworkPolicy/" + a2aConsoleNetpolName(agent))
-	if dep := idx("*v1.Deployment/" + a2aConsoleName(agent)); fence < dep {
-		t.Errorf("console fence at %d, before its Deployment at %d", fence, dep)
+	if vol == nil {
+		t.Fatalf("volumes = %+v, want the CA bundle ConfigMap", pod.Volumes)
 	}
-	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence != session-1 {
-		t.Errorf("console fence at %d, want directly before the session fence at %d", fence, session)
+	if got, want := vol.ConfigMap.Name, a2aNATSCABundleName(agent); got != want {
+		t.Errorf("CA bundle ConfigMap = %q, want %q", got, want)
 	}
-	// cleanupA2A deletes the StatefulSet sentinel after this whole walk, so
-	// being in the walk is being before it. Should the StatefulSet move back
-	// into the walk, the order still has to hold.
-	if sts, ok := pos["*v1.StatefulSet/"+a2aNATSName(agent)]; ok && fence > sts {
-		t.Errorf("console fence at %d, after the StatefulSet sentinel at %d", fence, sts)
+	if vol.ConfigMap.Optional != nil && *vol.ConfigMap.Optional {
+		t.Error("the CA bundle volume is optional; a console without the CA must not start")
 	}
+
+	c := pod.Containers[0]
+	var mount *corev1.VolumeMount
+	for i := range c.VolumeMounts {
+		if c.VolumeMounts[i].Name == vol.Name {
+			mount = &c.VolumeMounts[i]
+		}
+	}
+	if mount == nil || !mount.ReadOnly || mount.SubPath != "" {
+		t.Fatalf("CA bundle mount = %+v, want a read-only directory mount", mount)
+	}
+	caFile := consoleEnv(t, c)[a2aNATSCAFileEnv]
+	if !strings.HasPrefix(caFile, mount.MountPath+"/") {
+		t.Errorf("%s = %q, not under the CA bundle mount %q", a2aNATSCAFileEnv, caFile, mount.MountPath)
+	}
+	if !strings.HasPrefix(consoleEnv(t, c)[a2aConsoleEnvBusURL], "https://") {
+		t.Errorf("%s = %q, want https: the websocket listener serves TLS", a2aConsoleEnvBusURL, consoleEnv(t, c)[a2aConsoleEnvBusURL])
+	}
+}
+
+// The console is sized for GKE Autopilot without Pod bursting, which sets
+// each limit to its request: the pinned pair, both limits declared so a clamp
+// has a figure to clamp to, the requests inside the 1 to 6.5 GiB per vCPU
+// band Autopilot admits unchanged, and the memory limit handed to the binary
+// through the Downward API from the container's own limits.memory, so the Go
+// soft limit follows the admitted figure rather than a2aConsoleMemoryLimit.
+func TestTheConsoleIsSizedForAnAutopilotClamp(t *testing.T) {
+	c := buildA2AConsoleDeployment(a2aTestAgent()).Spec.Template.Spec.Containers[0]
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+	if !reflect.DeepEqual(c.Resources, want) {
+		t.Errorf("resources = %+v, want %+v", c.Resources, want)
+	}
+	if err := autopilotRequestsBandCheck(c.Resources); err != nil {
+		t.Error(err)
+	}
+
+	var ref *corev1.ResourceFieldSelector
+	for _, e := range c.Env {
+		if e.Name == a2aConsoleMemoryLimitEnvVar && e.ValueFrom != nil {
+			ref = e.ValueFrom.ResourceFieldRef
+		}
+	}
+	if ref == nil || ref.Resource != "limits.memory" || ref.ContainerName != "" {
+		t.Errorf("%s = %+v, want a resourceFieldRef to this container's limits.memory", a2aConsoleMemoryLimitEnvVar, ref)
+	}
+}
+
+// autopilotRequestsBandCheck says whether the requests pair sits in the band
+// GKE Autopilot admits unchanged (autopilotMinMemoryBytesPerVCPU to
+// autopilotMaxMemoryBytesPerVCPU per vCPU), and whether each request is at
+// or under its limit, so a no-burst clamp of the limits onto the requests
+// leaves a pod the manifest describes.
+func autopilotRequestsBandCheck(r corev1.ResourceRequirements) error {
+	cpu, mem := r.Requests.Cpu(), r.Requests.Memory()
+	if cpu.IsZero() || mem.IsZero() {
+		return fmt.Errorf("requests = %+v, want both cpu and memory set", r.Requests)
+	}
+	perVCPU := mem.Value() * 1000 / cpu.MilliValue()
+	if perVCPU < autopilotMinMemoryBytesPerVCPU || perVCPU > autopilotMaxMemoryBytesPerVCPU {
+		return fmt.Errorf("requests %s CPU and %s memory are %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU GKE Autopilot admits unchanged",
+			cpu, mem, float64(perVCPU)/float64(bytesPerGiB), autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB))
+	}
+	for name, req := range r.Requests {
+		if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
+			return fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return nil
 }

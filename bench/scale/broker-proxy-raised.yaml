@@ -1,0 +1,58 @@
+# The vertical control for broker.yaml: the 8-cluster audit window with the credential proxy's CPU
+# limit at 2 cores (spec.deployment.credentialProxy.resources.limits.cpu: "2" on the experiment
+# install's PlatformAgent). The runner reads the limits from the live pods into every record; it
+# does not change them: set the field before these runs and remove it after. It refuses to run while
+# the broker's CPU limit is not 2 (`expect_proxy_limits`), and it holds the install's live-test
+# lease; `run --dry-run` shows both first. Run it while the fleet
+# has 8 clusters. One run per point fitted the 2026-10-28 run inside its time limit.
+phase: broker-proxy-raised
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 8
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+
+factors: {}
+
+settings:
+  expect_proxy_limits:
+    cpu: "2"
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  default_pool_pods: 150
+  test_cluster_machine_type: n2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  watcher_wait_seconds: 600
+
+operations:
+  audits_30m_proxy_2cpu:
+    kind: trigger_soak
+    factors: []
+    runs: 1
+    window_seconds: 1800
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - fleet-wide-cost-analysis
+      - compliance-audit
+      - obtainability-audit
+      - stockout-prevention
+      - upgrade-retrospective

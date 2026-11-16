@@ -1,0 +1,117 @@
+{
+  "commonEventObject": {
+    "userLocale": "en",
+    "hostApp": "CHAT",
+    "platform": "WEB",
+    "invokedFunction": "kage.choice",
+    "parameters": {
+      "reply": "Look at the first one: prod-eu",
+      "choice": "0"
+    }
+  },
+  "chat": {
+    "user": {
+      "name": "users/100000000000000000042",
+      "displayName": "Test Sender",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED=k-no",
+      "email": "sender@example.com",
+      "type": "HUMAN",
+      "domainId": "REDACTED"
+    },
+    "eventTime": "2026-10-29T20:01:02.000000Z",
+    "buttonClickedPayload": {
+      "space": {
+        "name": "spaces/_c2fixtureAA",
+        "type": "DM",
+        "singleUserBotDm": true,
+        "spaceThreadingState": "THREADED_MESSAGES",
+        "spaceType": "DIRECT_MESSAGE",
+        "spaceHistoryState": "HISTORY_ON",
+        "lastActiveTime": "2026-09-09T15:34:42.472303Z",
+        "membershipCount": {
+          "joinedDirectHumanUserCount": 1
+        },
+        "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls=11"
+      },
+      "message": {
+        "name": "spaces/_c2fixtureAA/messages/BOT1.BOT1",
+        "sender": {
+          "name": "users/100000000000000000099",
+          "displayName": "Kage",
+          "type": "BOT"
+        },
+        "createTime": "2026-10-29T20:00:00.000000Z",
+        "text": "*Which cluster?*\n\nTwo clusters run one.",
+        "thread": {
+          "name": "spaces/_c2fixtureAA/threads/BOT1"
+        },
+        "space": {
+          "name": "spaces/_c2fixtureAA",
+          "type": "DM",
+          "singleUserBotDm": true,
+          "spaceThreadingState": "THREADED_MESSAGES",
+          "spaceType": "DIRECT_MESSAGE",
+          "spaceHistoryState": "HISTORY_ON",
+          "lastActiveTime": "2026-09-09T15:34:42.472303Z",
+          "membershipCount": {
+            "joinedDirectHumanUserCount": 1
+          },
+          "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls=11"
+        },
+        "accessoryWidgets": [
+          {
+            "buttonList": {
+              "buttons": [
+                {
+                  "text": "Look at the first one",
+                  "type": "FILLED",
+                  "onClick": {
+                    "action": {
+                      "function": "kage.choice",
+                      "parameters": [
+                        {
+                          "key": "reply",
+                          "value": "Look at the first one: prod-eu"
+                        },
+                        {
+                          "key": "choice",
+                          "value": "0"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "text": "Skip",
+                  "onClick": {
+                    "action": {
+                      "function": "kage.choice",
+                      "parameters": [
+                        {
+                          "key": "reply",
+                          "value": "Skip"
+                        },
+                        {
+                          "key": "choice",
+                          "value": "1"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "text": "board",
+                  "onClick": {
+                    "openLink": {
+                      "url": "https://x.example/b"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

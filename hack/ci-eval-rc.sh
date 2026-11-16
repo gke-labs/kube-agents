@@ -58,12 +58,23 @@
 #                     inert wherever it runs.
 #   RC_TAG            pin a candidate instead of resolving the newest one.
 #                     Passed through to resolve-rc-target.sh.
+#   EVAL_MODE_NEXT    the Prow job config sets it to 1, so the candidate is
+#                     graded under spec.mode: next, the mode a new install
+#                     gets. Read by the candidate's ci-deploy.sh and
+#                     ci-eval-pr.sh, not here. A candidate whose ci-deploy.sh
+#                     does not list this job in EVAL_MODE_NEXT_JOB_NAMES
+#                     refuses the flag at second zero, which reports NOT RUN.
 #   PULL_NUMBER       Prow's. Set = a pull request, which never measures a
 #                     release candidate; skip.
 #   ARTIFACTS         Prow's. When set, receives rc-target.env and the
 #                     summary below alongside the verdict ci-eval-pr.sh writes.
-#   JOB_NAME/BUILD_ID Prow's. Both set, the summary carries the run's Deck URL
-#                     so the verdict is findable without a credential.
+#   JOB_NAME/BUILD_ID Prow's. Both set, the summary carries a link to the
+#                     run's build directory so the verdict is findable.
+#   JOB_SPEC          Prow's. Names the bucket the job's decoration uploads
+#                     to (JOB_SPEC_BUCKET_KEYS below); unset or without it,
+#                     the Prow cluster's default. Decides the link's form:
+#                     Deck for a bucket it can read, the Cloud Console for a
+#                     private one (PRIVATE_LOG_BUCKETS below).
 #
 # NOT a whole job: the four steps stop at the verdict, and teardown is the job
 # config's to run -- as a separate step, unconditionally, whatever this script
@@ -84,7 +95,8 @@ set -euo pipefail
 # files rather than stated here, because both move: on 2026-09-29 they are 14
 # (twelve on the roster and two held-out seats, the compliance canary, #2013,
 # and pdb-remediation-pr, #2016) and 38, so 52 cases, and at three
-# repetitions 42 units against 156.
+# repetitions 42 units against 156; both seats have taken roster lines since
+# (2026-10-14 and 2026-11-02), so the held-out section is empty today.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
@@ -95,24 +107,45 @@ set -euo pipefail
 # pool, and in the week to 2026-09-23 its two runs that finished took 357 and
 # 401 minutes while four were killed at its own 480-minute deadline.
 #
-# The 36-unit matrix does fit, and that is measured rather than derived. The
+# The 36-unit matrix does fit, and that is measured rather than derived (48
+# units since 2026-11-02; `python3 scripts/eval_rosters.py --summary`). The
 # presubmit runs it on the same pool at the same repetition count, so its
 # fan-out is the same work this lane does: three runs that reached a verdict on
 # 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
 # build and deploy this lane pays before grading starts and the poller keeps
-# real headroom under 330 even on the slow end. What that does not cover is a
+# real headroom under 330 even on the slow end. Under EVAL_MODE_NEXT=1 the
+# deploy also runs ci-deploy.sh's step 6b, the flip to next and its gates,
+# which the next-mode presubmit pays in front of the same matrix; its waits
+# are bounded there (MODE_NEXT_*_TIMEOUT), and ci-eval-pr.sh skips the
+# report-only rollback round trip on this lane so nothing runs after the
+# verdict. What that does not cover is a
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.
-# The held-out canary (#2013) adds three repetitions serialized on its task
+# The canary (#2013; held out until its roster line on 2026-11-02, blocking
+# since) adds three repetitions serialized on its task
 # lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
 # reach the 3000 s delegation ceiling, run beside the other cases; the
-# pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14) adds
-# three more on its own task lock, a ~62 minute chain at its 1250 s hint and
-# ~96 minutes at its measured maximum. A graded miss on the canary leaves the
-# verdict alone, since it is not admitted; one on pdb-remediation-pr counts as
-# any roster case's; an erroring check on either (rungs 1-3) turns the verdict
-# RED like any case's.
+# pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14)
+# added three more on its own task lock, a ~62 minute chain at its 1250 s hint
+# and ~96 minutes at its measured maximum, until its demotion to the nightly
+# on 2026-10-17 (#3120) took it out of this lane's matrix. vcs-spent-branch-reuse
+# (roster since 2026-10-23) adds three serial units in the fan-out's second
+# phase, after every other unit and each after the reset and a 120 s settle:
+# ~15 minutes at its 173 s median, ~56 at its 1000 s hint. pdb-remediation-pr,
+# back on the roster since 2026-10-26, adds three more to that phase: ~15
+# minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
+# consistency-drift-outlier (roster since 2026-10-26) adds three units in the
+# first phase, beside the other cases and serialized on its task lock: a ~10
+# minute chain at its 198 s median on the nightlies after the 2026-10-19 model change, ~30 at
+# its 600 s hint. monitoring-alert-policy-read (roster since 2026-11-02) adds
+# three more first-phase units, serialized on its task lock and on
+# lock-infra, which no other case in this matrix takes; its stack is a few
+# seconds of apply and destroy, so the chain is the agent turns, ~10 minutes
+# at its 201 s median on the main-b nightlies, ~30 at its 600 s hint.
+# A graded miss on the
+# canary leaves the verdict alone, since it is not admitted; an erroring check
+# (rungs 1-3) turns the verdict RED like any case's.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was
@@ -143,11 +176,23 @@ readonly RC_TARGET_TAG_KEY="rc_tag"
 readonly RC_SUMMARY_FILE="rc-eval-summary.md"
 readonly RC_VERDICT_FILE="eval-verdict.md"
 
-# Deck serves what raw GCS refuses anonymously, so this is the form of the
-# link a reader can actually open. Periodic build directories live under
+# Where the run's build directory is linked from. Deck serves what raw GCS
+# refuses anonymously, so for the Prow cluster's default bucket that is the
+# form a reader can open; Deck has no read on the buckets kube-agents owns
+# (PRIVATE_LOG_BUCKETS, the set scripts/eval_dashboard/links.py holds), so a
+# build there links the Cloud Console's bucket browser, which a project
+# reader opens. Postsubmit and periodic build directories live under
 # logs/<job>/<build>; a presubmit's are elsewhere, which is why the summary
-# only builds a URL when Prow supplied both halves.
-readonly PROW_DECK_BUILD_BASE="https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
+# only builds a URL when Prow supplied both halves. The bucket is read from
+# JOB_SPEC at the key path below, else the default, which keeps today's
+# output for a run outside Prow. tests/test_ci_eval_rc.py holds the bucket
+# list equal to links.PRIVATE_LOG_BUCKETS.
+readonly PROW_DECK_VIEW_BASE="https://oss.gprow.dev/view/gs"
+readonly GCS_BROWSER_BASE="https://console.cloud.google.com/storage/browser"
+readonly PROW_LOGS_DIR="logs"
+readonly PROW_LOG_BUCKET_DEFAULT="kube-agents-prow"
+readonly JOB_SPEC_BUCKET_KEYS="decoration_config gcs_configuration bucket"
+readonly PRIVATE_LOG_BUCKETS="kube-agents-evals-presubmit-logs kube-agents-evals-nightly-logs"
 
 # Grepped for in the CANDIDATE's ci-deploy.sh after the checkout. Its presence
 # is what says the candidate's tree can install published images instead of
@@ -187,7 +232,7 @@ readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
 # be in memory before it happens, and control must never return to the file.
 main() {
   local script_dir repo_root rc_commit_sha rc_tag original_ref
-  local artifacts_dir summary_path verdict_path deck_url
+  local artifacts_dir summary_path verdict_path deck_url log_bucket
   local deploy_status eval_status eval_partial verdict suite_not_evaluated
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -383,10 +428,22 @@ main() {
     fi
   fi
 
-  # ─── Reporting: make the verdict findable without a credential ────────────
+  # ─── Reporting: make the verdict findable ─────────────────────────────────
   deck_url=""
   if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
-    deck_url="${PROW_DECK_BUILD_BASE}/${JOB_NAME}/${BUILD_ID}"
+    log_bucket=""
+    if [ -n "${JOB_SPEC:-}" ]; then
+      # Best effort: a JOB_SPEC without the field, or one that is not JSON,
+      # leaves the default rather than failing the reporting step.
+      # The keys are meant to split into separate argv words.
+# shellcheck disable=SC2086
+      log_bucket="$(printf '%s' "${JOB_SPEC}" | python3 -c 'import functools, json, sys; v = functools.reduce(lambda d, k: d.get(k) if isinstance(d, dict) else None, sys.argv[1:], json.load(sys.stdin)); print(v if isinstance(v, str) else "")' ${JOB_SPEC_BUCKET_KEYS} 2>/dev/null || true)"
+    fi
+    log_bucket="${log_bucket:-${PROW_LOG_BUCKET_DEFAULT}}"
+    case " ${PRIVATE_LOG_BUCKETS} " in
+      *" ${log_bucket} "*) deck_url="${GCS_BROWSER_BASE}/${log_bucket}/${PROW_LOGS_DIR}/${JOB_NAME}/${BUILD_ID}" ;;
+      *) deck_url="${PROW_DECK_VIEW_BASE}/${log_bucket}/${PROW_LOGS_DIR}/${JOB_NAME}/${BUILD_ID}" ;;
+    esac
   fi
 
   echo "======================================================================"

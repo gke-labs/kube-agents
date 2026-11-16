@@ -117,8 +117,19 @@ contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
-`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. A name earns a
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
+cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
+roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
+idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
+catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+are rejected. One name goes to the shell Pod
+instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
+operator normalises to `true` or `false` before it reaches that Pod. The three
+earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -134,15 +145,12 @@ operator's managed values.
 
 ### Limitation
 
-The gateway Pod keeps a cloud identity. It and the broker Pod both run as
-`kubeagents-platform-agent`, whose KSA carries the `iam.gke.io/gcp-service-account`
-annotation, so anything with execution in the gateway can mint the Google service
-account's token from `169.254.169.254`. The Pod that runs code the model wrote cannot,
-which is the property this design is about; what is left is trusted code holding more
-than it needs. Two ways to close it: configure
-`spec.security.workloadIdentityFederation`, which gives the broker a credential source
-that is a file in its own Pod, or give the broker a ServiceAccount of its own and take
-the annotation off the gateway's. Neither ships today.
+Closed: the gateway Pod no longer keeps a cloud identity. The broker runs as the
+annotated ServiceAccount (`kubeagents-platform-agent` by default) and the gateway runs
+as `<agent>-gateway-agent`, which carries no annotation; its NetworkPolicy opens no
+metadata path, and everything in it that called Google goes through the broker.
+`spec.security.workloadIdentityFederation` remains optional hardening for the broker's
+own credential source.
 
 `spec.security.egressPolicy: Allowlist` renders a default-deny egress NetworkPolicy on
 the gateway Pod that leaves the metadata server's credential API off its allowlist — the
@@ -187,8 +195,6 @@ and the route table it feeds
 - Preventing an approved credentialed command from deliberately copying a
   credential into content it returns. Such credential disclosure and tool side
   effects require a separate approval/policy design.
-- Preventing the gateway Pod from reaching the Pod identity it still shares with
-  the broker, or the metadata server behind it.
 - Arbitrary user-supplied init containers, sidecars, volumes, and mounts. These
   are trusted configuration and may intentionally weaken isolation.
 - General data-exfiltration prevention.
@@ -207,9 +213,9 @@ PlatformAgent gateway Pod
 credential-proxy Pod
 
   envoy-credential-proxy
-    Envoy listener
-              |
-              | private Unix socket
+    Envoy listener :8765        Envoy health listener :8768 (readinessProbe)
+              |                             |
+              | private Unix socket         | same socket, /healthz only
               v
     credential runtime
     real CLIs, Slack/Chat clients, Minty client
@@ -218,9 +224,17 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
-listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus series whose label values are
+caller can bypass Envoy by reaching the runtime directly. The runtime opens up
+to two TCP listeners of its own. The health-only one, closed unless
+`CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
+`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
+a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
+ten-second deadline as the metrics listener, so that a probe an operator
+points at the broker directly reads it as alive while the credentialed
+listener is at its thread cap; the operator's readiness probe reads `/healthz`
+through Envoy's health listener on 8768 instead (below), and the broker's
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator) serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
@@ -228,7 +242,7 @@ process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
 pods, which read the counters into the `PlatformAgent`'s `status.usage`
-([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica.
+([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
@@ -241,11 +255,35 @@ runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLE
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
 consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
+with an `AgentProfile` bound, each profile tier's (bound to the audience
+`kubeagents-credential-proxy-profile`; see
+[spec-subagent-profiles.md](designs/spec-subagent-profiles.md)), and does not vary on
 which one presented the token — the audience and the route table it feeds do — so the
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
+
+Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
+the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
+The credentialed listener sends every path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so a probe through it is
+refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
+three refusals remove the Pod from the Service. That ceiling is declared rather than
+inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
+requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
+backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
+refuses first, and the runtime's thread cap is derived from the same thresholds at startup
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
+on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
+no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
+`start-services.sh` rebinds both listeners off loopback together, to the address the operator
+passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
+behind. There is no `livenessProbe`: the start script
+supervises both processes and restarts the runtime in place, and a probe-driven restart
+would drop every open watch. Envoy's admin interface stays
+on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
 8643 and forwards to the agent on loopback using a non-secret sentinel. It is a
@@ -262,17 +300,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                | Credential runtime          |
-| -------------------------------- | ---------------------- | --------------------------- |
-| `spec.deployment.env`            | No                     | Yes                         |
-| Slack tokens                     | No                     | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                     | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only           |
-| Automatic KSA token mount        | Disabled               | Disabled                    |
-| Explicit projected KSA token     | Broker audience only   | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                     | Private `emptyDir`          |
-| GitHub installation token/cache  | No                     | Private `emptyDir`          |
-| Agent workspace                  | Yes                    | No, the broker owns its own |
+| Data                             | Sandbox                                                    | Credential runtime          |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
+| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                        | No, the broker owns its own |
 
 ### The loopback-only exception
 
@@ -313,7 +351,8 @@ to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
-`/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
+`/var/run/secrets/kubeagents/serviceaccount/token` in the stateful broker's credential
+runtime (the exec tier does not mount it). A token
 for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
 read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
@@ -360,12 +399,39 @@ including:
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
 - background processes or commands that outlive the request;
-- commands exceeding request, output, or timeout limits; and
+- commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
   the operator's defaults); a request waits up to 60 seconds for admission and is then
-  refused with `503 CREDENTIAL_PROXY_BUSY`.
+  refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
+  cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
+  caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
+  `Retry-After`; the session role keeps one slot up to a higher ceiling; and
+- more commands in one session than its budget allows. The wrapper sends the key of
+  the run it belongs to as the request's `sessionId`: the kanban card, else the
+  scheduled run, else the session (`HERMES_KANBAN_TASK`, `HERMES_CRON_RUN`,
+  `HERMES_SESSION_ID`). No process environment crosses the SSH hop into the shell
+  sandbox, so there the ForceCommand recovers the first two from the command's working
+  directory, the card workspace or the run directory the cron workdir patch minted, and
+  a chat turn, which runs from neither, sends no key; the session id reaches the wrapper
+  where the terminal runs in its own pod, the profile and session pods. The broker counts
+  per key: a shell or profile session past `BROKER_SESSION_MAX_TOOL_CALLS`
+  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED` (the scope publisher is
+  a script whose Job sets no key, so its calls are uncounted; a busy reply the wrapper
+  re-sends is not charged, since the retries are one invocation), and any keyed session
+  is refused the same command, on the same cluster, after it failed or was blocked
+  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times with no success of the session's between
+  (counted per command over the session's last eight failing ones, so a loop over two
+  failing commands trips on each), with `403 BROKER_LOOP_BREAKER`;
+  the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
+  carry the defaults and the operator's knobs. A key's counts last as long as the broker remembers it: a
+  scheduled run's key names one execution, a card's names the card, so a card's ceiling
+  and streak span its dispatches on a replica. The key is a loop guard, never an
+  identity: it comes from the body, which the model composes, so no policy decision
+  reads it, a request with no key is uncounted, and the authenticated principal stays
+  the only input to who may do what. Each broker process counts alone, in a bounded
+  LRU of sessions, so an exec tier of N replicas admits about N times the ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -614,7 +680,7 @@ the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
 As a latent defence-in-depth layer behind `/v1/exec` (which currently refuses
 `git` at `EXEC_ROUTE_EXECUTABLES`, while broker-internal git uses
-`WORKSPACE_GIT_SUBCOMMANDS` and `VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
+`VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
 enforces an explicit allowlist of subcommands (`ALLOWED_GIT_SUBCOMMANDS`)
 alongside the denylist, failing closed on unknown or custom verbs if `git` is
 ever re-admitted to `/v1/exec`. Writing configuration via repository-local
@@ -634,84 +700,60 @@ is what makes repository-local configuration reachable at all, and it is the
 reason enumeration cannot finish — the dangerous keys carry an arbitrary name
 inside the key, so there is no finite set to deny.
 
-The alternative is to stop passing a directory. The sandbox sends `{path, bytes}`
-pairs, a branch and a message; the runtime writes them into a tree on its own
-volume, commits and pushes; the sandbox never names a path and never sees one
-come back. `CREDENTIAL_PROXY_CONTENT_WORKSPACE` arms it and it is off by default.
-While it is off the `/v1/workspace/*` routes do not exist — they answer 404, which
-is also what an older runtime answers, so a client can detect support by asking.
+The alternative is to stop passing a directory. The version-control routes
+(`/v1/vcs/*`) do that. The sandbox sends a git bundle, a branch and a message,
+or names a repository to read. The runtime runs its own git in a scratch
+directory on its own volume and deletes that directory before it answers. The
+sandbox never names a path and never sees one come back. The content workspace
+(`/v1/workspace/*`) kept `{path, bytes}` trees open across requests for the same
+purpose. It is retired (#4243): its reads go through `POST /v1/vcs/snapshot`, and
+its writes through `clone`, `publish` and `proposal-create`.
 
 Four things hold it together, and they are not equally strong:
 
-- **Disjoint roots, checked.** The tree root is under the runtime's own state
-  directory and the check that it does not overlap any other configured path runs
-  at construction. A mount rearrangement that collapses the two is a runtime that
-  refuses to start rather than one that starts without the property.
-- **One path validator.** The same function decides what a path may name on
-  reads and on writes, refuses rather than normalises, and refuses every spelling
-  of `.git` that a filesystem treats as `.git`. A checker that disagrees with
-  itself about what `manifests/../.git/config` means is the defect class this
-  document keeps describing.
+- **Disjoint roots, checked.** The scratch root is under the runtime's own state
+  directory, and `assert_disjoint_roots` checks at construction that it does not
+  overlap the agent-shared workspace root. A mount rearrangement that collapses
+  the two is a runtime that refuses to start rather than one that starts without
+  the property.
+- **One path validator.** One function (`validate_path` in
+  `agents/platform/scripts/workspace_paths.py`) decides what a path in a
+  `snapshot` request may name, refuses rather than normalises, and refuses every
+  spelling of `.git` that a filesystem treats as `.git`. A checker that disagrees
+  with itself about what `manifests/../.git/config` means is the defect class
+  this document keeps describing.
 - **A separate door for the runtime's own git.** Broker-internal git does not go
-  through `/v1/exec`. It accepts a literal allowlist of the subcommands this
-  mechanism issues (`WORKSPACE_GIT_SUBCOMMANDS` in
-  `agents/platform/scripts/content_workspace.py`), refuses `-C`, and is contained
-  to the tree root. Keeping the two apart is what lets the sandbox-facing
+  through `/v1/exec`. It accepts a literal allowlist of the subcommands the
+  version-control broker issues (`VCS_GIT_SUBCOMMANDS` in
+  `agents/platform/scripts/credential_proxy.py`), refuses `-C`, and is contained
+  to the scratch root. Keeping the two apart is what lets the sandbox-facing
   answer stay "git is not reachable" rather than "git is reachable, narrowly".
-- **Geometry, not checked here.** The tree root is on
+- **Geometry, not checked here.** The scratch root is on
   the runtime's own volume, which the sandbox container does not mount. Nothing in
   the process can verify that; it is the same argument this document already makes
   about `$HOME/.gitconfig` and `KUBECTL_KUBERC`, and it is exactly as weak. The
   structural form of it is the separate broker Pod, where there is no shared mount
   to name.
 
-Resource notes, because the trees are on the runtime's own emptyDir and that is
-node ephemeral storage rather than a disk of its own.
+The scratch trees are on the runtime's own emptyDir, which is node ephemeral
+storage rather than a disk of its own. Each tree lives for one request. A clone
+over `CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is refused, and the
+resource watermark relief step (below) removes scratch that no request of this
+process owns. [The seam](designs/version-control-support.md#3-the-seam) owns the
+ceilings.
 
-The number of open workspaces is capped, and a clone that comes in over
-`CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is removed rather than
-kept, so a repository the runtime cannot afford does not sit half-cloned on the
-node. Read those two together rather than separately: the ceiling is **per
-clone**, so the two defaults multiply out to about 2 GiB retained across eight
-open workspaces, by design. Size the node's ephemeral storage against the
-product, not against either number.
+Be precise about what this does and does not do. It does not change what `git`
+executes: a repository-local `.git/config` in the runtime's own tree would still
+run what it names. What changes is who can write that file: the sandbox sends
+file contents and names, never a `.git` path, so nothing it sends can define a
+key in the scratch repository's configuration.
 
-The cap counts a list the runtime keeps in memory, so a worker that dies without
-closing its workspace would otherwise hold a slot until the pod restarts. Two
-things bound that. A workspace no verb has named for
-`CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
-the next `open`, and every tree a previous process left under the root is removed
-when the runtime starts. A refusal at the cap logs each holder's handle prefix,
-repository, caller label (the card or session id the client sends), age and idle
-time, so a full store is diagnosable from the runtime's log.
-
-The ceiling is also measured after the clone finishes, so it bounds what is
-_retained_ and not the peak: a repository far over the limit still lands on the
-disk before it is removed, and the only thing bounding that is the runtime's
-per-invocation timeout. A shallow clone plus the ceiling would bound both and is
-the right follow-up; neither alone does.
-
-Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so
-peak heap on those routes is roughly concurrency times that figure: the bodies
-are read before any command runs, so the broker's command cap does not bound
-them, and the git these verbs run is serialised by the store's lock rather than
-counted against that cap. None of this is reachable from outside the Pod, but
-it is worth knowing before the flag is armed anywhere it matters.
-
-Every verb takes a lock for its whole duration. The handler is threaded, so two
-requests naming one handle genuinely interleave, and each verb is a read-then-act
-on a working tree the other is entitled to delete or reset underneath it. Without
-it a `close` landing inside a `commit` leaves the commit re-creating the tree the
-close just removed, with no handle pointing at it.
-
-Be precise about what arming this does and does not do. It does not change what
-`git` executes: a repository-local `.git/config` planted in the runtime's own tree
-still runs what it names, measured both ways. What changes is who can write that
-file. And `/v1/exec` is unchanged while the flag is on — both mechanisms run side
-by side deliberately, so that landing this does not have to be reverted to fix the
-migration. The finding class above therefore closes for work that goes through the
-content routes and stays open for work that does not, which today is all of it.
+The listener is threaded, one connection per thread, up to
+`CREDENTIAL_PROXY_MAX_THREADS`: by default the sum of Envoy's connection ceilings
+to the broker's socket, read from the Envoy config shipped beside the broker
+(4160 as shipped: the credentialed route's 4096 and the probe's 64, and 1024 for
+a cluster that sets none). A connection past it is answered `503` with
+`Retry-After` and closed.
 
 ### Agent-supplied kubeconfigs
 
@@ -745,7 +787,9 @@ get-credentials`, which already runs in the broker. The proxy reads exactly one
 string out of the caller's file — `current-context` — accepts it only if it is a
 well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
 kubeconfig itself into a directory backed by a broker-only `emptyDir`. That
-regenerated file is what every proxied command runs against. No field the
+regenerated file is what every proxied `kubectl` command runs against. A gcloud
+call gets an empty per-call file instead (get-credentials fetches into its own
+scratch file). No field the
 sandbox wrote is ever interpreted, and there is no check-then-open window,
 because the sandbox never had a handle on the document that is opened.
 
@@ -760,11 +804,27 @@ on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
+With the kube-api proxy in use (`KUBE_PROXY_URL` set in the shell sandbox),
+the shim answers a `get-credentials` that names its cluster, one location and
+`--project` itself (#5447). One `/v1/gcp/` read of the cluster (the relay's
+`gcp.api.container.clusters-get` route, on the broker's identity) checks that
+the cluster exists and is running. Then the shim writes the same kube-proxy
+kubeconfig it builds from a broker answer. No broker command runs, so there is
+no command audit line (the relay's line names the principal and the path) and
+no managed kubeconfig is filed for that cluster. Any other answer, any other
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
+
 Consequences:
 
 - Naming a cluster is not additional authority. `get-credentials` is bound by
   the same Workload Identity the broker already holds, so the sandbox can only
-  name clusters that identity could already reach.
+  name clusters that identity could already reach. The relay read that answers
+  a `get-credentials` in the shim runs on that identity too.
 - Only GKE contexts are supported, because the context name is what makes
   regeneration possible. A pin the proxy cannot regenerate from — no
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
@@ -840,6 +900,14 @@ Consequences:
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
   cluster from later commands.
+- A `kubectl` read that names no cluster that way and comes back empty or with
+  a server NotFound says where it looked. For `get`, `describe`, `events`,
+  `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
+  naming the host cluster and saying `--context <name>` reads another one.
+  Without it, a worker read a namespace on the host, got NotFound, and
+  reported it missing from the fleet (#3375). stdout and the exit code are
+  unchanged, any other result comes back as it was, and the line avoids the
+  words the refusal stop reads, so it's never counted as a refusal.
 - Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
   so an unreachable control plane fails in seconds rather than holding a broker
   worker for `kubectl`'s 300-second client default. Commands that are meant to
@@ -852,7 +920,17 @@ Consequences:
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. The same bound applies to the decoded
   text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
-  three-byte replacement character, cannot cost more than text does. At most
+  three-byte replacement character, cannot cost more than text does. The reply
+  says when it was cut: `truncated` is true when either stream was cut,
+  `stdoutTruncated` when the cut fell on stdout, `bytesWritten` is the stdout
+  the caller receives in UTF-8 bytes, and `limit` is the cap (all four are
+  present on every completed reply). When stdout was cut the shim exits
+  `EXIT_OUTPUT_TRUNCATED` (74, `EX_IOERR`) whatever the command exited, and
+  prints the counts after its `credential proxy output truncated` stderr
+  marker, so a cut `-o json` dump reads as a failure to the model's own
+  `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
+  cut on stderr alone keeps the command's exit code, and the marker says stdout
+  is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (8; the operator sets it, as it sets the output cap, and
   reserves the name). A slot is held from admission until the response is on
@@ -865,37 +943,74 @@ Consequences:
   the output allowance of the slots in use has to fit the budget the broker derives
   from its container's memory limit (`CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES`, a Downward
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
-  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
-  128 MiB for the content workspace's one process tree at a time. At the operator's
-  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits nine
+  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy.
+  At the operator's
+  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
   bound. The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
   defaults per key; raising it raises the admitted count. The caps stay the
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
-  requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
+  requests at once (544 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents. The operator declares that request at 1Gi, above the floor, so that the
-  budget engages there too, admitting four; the floor remains for a CR override that
-  sets a smaller request.
+  it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
+  above the floor, so that the budget engages there too, admitting ten, held to eight by
+  the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
-  The content workspace's git (serialised by the store's own lock, which is what sizes
-  the budget's fixed term) and the Cloud API relay (a bounded read of its own) take no
+  The Cloud API relay (a bounded read of its own) takes no
   slot and no reservation; the forge refresh takes no slot and reserves only when it
   will run its helper, which a coalesced refresh does not.
   A request that waits more than 60 seconds for admission is answered
   `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
   (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
   (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
+  the background share (`the credential proxy keeps … of its … admissions for interactive work …`)
+  or the interactive cap (`the credential proxy keeps one of its … admissions for background work …`),
   whichever held it, or, when the request itself fits and only requests ahead of it that
   are waiting for the budget kept it queued, the queue
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
-  The queue is in arrival order, except that a forge refresh that fits the budget passes
-  requests the slot cap alone holds, since it takes no slot.
+  The queue is in arrival order inside each admission class, with interactive requests ahead
+  of queued background ones (`designs/credential-broker-exec-tier.md` §4.2), except that a
+  forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
+  or their own class's full cap), since it takes
+  no slot.
+  Beside the static budget sits the resource watermark gate, which reads what the container
+  holds now: the working set (`memory.current` less `memory.stat`'s `inactive_file`, the
+  kubelet's eviction signal) against `memory.max` on every admission, and the state and
+  `/tmp` emptyDirs against the caps the operator passes
+  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
+  sizeLimit, or, when an override puts the container's ephemeral-storage limit under the
+  two sizeLimits together, shares of that limit in the sizeLimits' proportion, summing to
+  it, since the kubelet sums the volumes into that one limit; a volume with no cap is off,
+  since statvfs on an emptyDir reads the node, not the cap) on the memory sampler's 30 s
+  tick. From the soft watermark
+  (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
+  run one at a time and the first tick reclaims orphaned vcs
+  scratch, collects and trims the allocator. From the hard watermark
+  (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
+  caller is answered at once, before it queues, with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
+  the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
+  slot stays open to the session role, which is the one interactive class, up to a ceiling
+  of 92% memory or 90% disk, past which it is refused too. A level is left only once the
+  readings clear three points under the watermark it was entered at, so a reading that
+  hovers at a watermark is one episode: one transition line, one relief. A vcs verb
+  refused this way has its body drained before the 429, so a
+  publish still sending its bundle reads the refusal rather than a reset. Under the clamp that reserve is a
+  slot in the executor as well, one above the background commands running (those admitted
+  before the clamp arrived keep their slots) and bounded by the configured cap alone, not by
+  the interactive class cap of `designs/credential-broker-exec-tier.md` §4.2, which the
+  shell's sweep can hold when the clamp arrives: a session's command runs beside them, and
+  passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
+  `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
+  takes the hard check alone, and a
+  watch passes. A missing or `max` `memory.max` turns the
+  memory half off. The refusal counts under `bound="pressure"`, and
+  `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.
@@ -905,8 +1020,8 @@ Consequences:
   applies at the deadline. On the exec, vcs and forge refresh routes, a caller
   that disconnects while queued for admission (a slot, the child memory budget,
   or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Admission goes in arrival order, so the caller refused after the wait
-  is the one that waited longest. Disconnecting means the peer closed for good
+  unwatched. Admission goes in arrival order inside each class, so the caller refused
+  after the wait is the one of its class that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
@@ -933,7 +1048,8 @@ host, method and path against the code allowlist in
 `agents/platform/scripts/api_policy.py`, forwards it on its own identity with
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
-unchanged under a response cap and a deadline. The shell role alone may call it;
+unchanged under a response cap and a deadline (a route with a projection, the GKE
+cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -954,6 +1070,10 @@ key and replaces it with the fixed, non-secret sentinel before forwarding to por
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
 
+A proposed route allowlist for this door, owned by kube-agents and part of the
+harness contract, is in the draft
+[`designs/agent-api-door-allowlist.md`](designs/agent-api-door-allowlist.md).
+
 ### GitHub and Minty
 
 The credential broker obtains a Google OIDC identity token and calls Minty.
@@ -972,8 +1092,8 @@ file and never a `.git` it can write into.
 
 - The broker Pod uses the configured PlatformAgent KSA — `spec.security.serviceAccountName`,
   defaulting to the agent's name — for its Workload Identity. The gateway Pod
-  runs under the same one, which is the boundary's remaining gap; the sandbox Pod
-  runs under `<agent>-shell`, annotated with nothing.
+  runs under `<agent>-gateway-agent` and the sandbox Pod under `<agent>-shell`,
+  both annotated with nothing.
 - `automountServiceAccountToken: false` applies to the Pod.
 - The event watcher's projected ServiceAccount token is mounted only by
   `agent-api-auth`, and so is the watchers' broker token (audience
@@ -992,7 +1112,8 @@ file and never a `.git` it can write into.
 - Every container the operator builds — the credential-cleanup init container,
   the agent, the dashboard, `agent-api-auth`, the log shipper — has a read-only
   root filesystem;
-  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  writable state uses bounded `emptyDir` volumes, bar the log shipper's cursor
+  directory on the `system-metadata` claim, described below. The sandbox and dashboard
   share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
   invocations with `HOME=/tmp` before the agent starts, and those two
   containers already share the data PVC, so the shared volume is not a new
@@ -1000,8 +1121,8 @@ file and never a `.git` it can write into.
   container's own writable layer, discarded whenever that container restarted.
   An `emptyDir` is scoped to the Pod, so its contents now survive a container
   crash or restart and are visible to both containers' next boot. The log
-  shipper gets no `/tmp`: it buffers in memory
-  and keeps its tail database on its own volume. Containers supplied through
+  shipper gets no `/tmp`: it buffers in memory, and its one writable path is
+  the directory below. Containers supplied through
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
@@ -1012,6 +1133,22 @@ file and never a `.git` it can write into.
   that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
+- The log shipper's tail cursors, the two SQLite files that record how far it
+  has read each log, live in a per-agent directory on the namespace's
+  `system-metadata` claim, mounted into the shipper alone at a `subPath` of its
+  own. A cursor on an `emptyDir` died with the Pod, and every replacement
+  shipped each file again from its first line. The agent's data claim was not
+  used for it because the agent and the dashboard mount that claim at its root,
+  and a cursor file rewritten into something SQLite cannot open stops the
+  shipper at every start; the `system-metadata` claim is reached by those two
+  containers only through `subPath: session`, so no container the operator
+  renders for model-authored code can write the cursors. Of the rendered
+  containers the shipper is the only one with a mount under `fluent-bit-state/`;
+  a CR's `spec.deployment.extraVolumeMounts` can still name the claim without a
+  `subPath`, and the operator does not refuse it. The databases use the rollback
+  journal rather than WAL: the claim is the gofer-backed mount under a runtime
+  class, where WAL-mode SQLite corrupts, and a corrupt cursor on a claim
+  outlives the Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with
@@ -1115,7 +1252,9 @@ needs the same treatment.
 
 CI and deployment tests should assert that:
 
-1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
+1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
+   normalised to `true` or `false`, and the three earned-autonomy switches,
+   normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

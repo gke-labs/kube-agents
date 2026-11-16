@@ -1,0 +1,133 @@
+# Upgrade-failure catalogue entry 4 (data on the node is gone), in the shape
+# the seeded fleet plants it: node-local-state on seeded-a, a Deployment
+# (cache-on-emptydir, in seeded-shapes) whose queue directory is an emptyDir.
+# A node upgrade rebuilds the machine, and an emptyDir is the machine's: the
+# stamp the container writes at start is what the rebuild erases, and with
+# one replica there is no second copy to rebuild it from.
+#
+# The prompt names no workload and no namespace; it does name the volume
+# kinds it asks about (emptyDir, hostPath, local SSD), since that is the
+# question. It asks which workloads keep state on the node that a node
+# rebuild erases, and for
+# the answer to end in one declared line per such workload, in a fixed form;
+# the deterministic objectives read the planted workload's line and nothing
+# else. Other fleet workloads may mount an emptyDir for scratch; the case does
+# not grade whether the agent lists them.
+#
+# An item's parenthetical is ungraded: the judge reads it. A bare name is an
+# item (a volume name has no shape of its own), so the guard is a word
+# class: a negation word in it is refused as an item of its own (not as the
+# first segment of a name such as `no-cache`), and a word outside it is the
+# judge's. The volume's kind may stand before its name
+# (`emptyDir queue`, `emptyDir: queue`) or in its parenthetical (queue (emptyDir)).
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# A volume may carry its mount spec after it (`:/var/cache/queue`, `:rw`); the
+# spec is ungraded.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the volume. Moving the queue to a claim is the heal
+# that passes every objective and empties the fixture for every later case.
+id: upgrades-node-local-state-named
+name: The workload whose state lives on the node is named before the node is rebuilt
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project are upgraded,
+  tell me which workloads keep state on the node itself, in an emptyDir, a
+  hostPath or a local SSD, that a node rebuild erases, and what they would
+  lose. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such
+  workload in exactly this form, no other words on the line:
+  "<cluster>/<namespace>/<workload>: node-local volumes <volume names>;
+  survives a node rebuild: <yes|no>".
+
+expected_output: >-
+  It reads the workloads' volumes on each seeded cluster and names
+  cache-on-emptydir in seeded-shapes on seeded-a: one replica, its queue
+  directory an emptyDir, so the stamp it wrote at start and anything it
+  queues there is gone when the node is rebuilt, with no second replica to
+  rebuild it from. It says the fix is a PersistentVolumeClaim or object
+  storage for anything the application cannot rebuild, and performs no
+  change. It may list other workloads that use an emptyDir for scratch and
+  say they survive because they hold nothing. It cites no CVE identifiers and
+  ends with the declared line for each workload it names, the planted one
+  reading "node-local volumes queue; survives a node rebuild: no".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# The role is the planted workload's; it also stands for slot a in
+# `fixture_roles`, so a project without the slot is an environment error.
+fixtures:
+  - node-local-state
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-workload-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+
+  - name: the-declared-line-names-the-queue-volume
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?queue(?![/\w-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?)*; survives a node rebuild: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?!(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?queue(?![/\w-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s?:? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-state-does-not-survive
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: no$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?[^ :;\n][^;\n]*; survives a node rebuild: (?!no$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The queue volume is still an emptyDir: moving it to a claim keeps the
+  # name and drops this field.
+  - name: the-planted-volume-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: node-local-state
+      kind: deployment
+      resource_name: cache-on-emptydir
+      namespace: seeded-shapes
+      path: spec.template.spec.volumes[?(@.name=='queue')].emptyDir
+      op: exists

@@ -61,7 +61,7 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
 
     def test_values_yaml_carries_an_empty_default(self):
         values = yaml.safe_load(_VALUES.read_text())
-        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}})
+        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}, "exec": {"replicas": 0}})
 
     def test_credential_proxy_is_closed_and_resources_is_an_open_object(self):
         node = _schema_node(("platformAgent", "deployment", "credentialProxy"))
@@ -69,8 +69,15 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
         self.assertEqual(node["properties"]["resources"], {"type": "object"})
 
 
-@unittest.skipUnless(_HELM, "helm is not installed")
-class CredentialProxyResourcesRenderTest(unittest.TestCase):
+    def test_exec_replicas_is_a_bounded_integer_in_a_closed_block(self):
+        node = _schema_node(("platformAgent", "deployment", "credentialProxy", "exec"))
+        self.assertIs(node["additionalProperties"], False)
+        self.assertEqual(node["properties"]["replicas"], {"type": "integer", "minimum": 0, "maximum": 32})
+
+
+class _RenderCR:
+    """The CR template rendered with helm, shared by the render tests below."""
+
     def _render_cr(self, sets=(), expect_failure=False, values=None):
         args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
         for item in sets:
@@ -87,6 +94,35 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         self.assertEqual(len(docs), 1, res.stdout)
         return docs[0]
 
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyExecReplicasRenderTest(_RenderCR, unittest.TestCase):
+    """spec.deployment.credentialProxy.exec.replicas is written only above 0."""
+
+    _EXEC = "platformAgent.deployment.credentialProxy.exec.replicas"
+
+    def test_zero_writes_no_block(self):
+        cr = self._render_cr([f"{self._EXEC}=0"])
+        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
+
+    def test_a_positive_count_is_forwarded(self):
+        cr = self._render_cr([f"{self._EXEC}=2"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"], {"exec": {"replicas": 2}})
+
+    def test_a_count_beside_a_resources_override_writes_both(self):
+        cr = self._render_cr([f"{self._EXEC}=3", f"{_VALUE_PATH}.limits.memory=3Gi"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"],
+                         {"resources": {"limits": {"memory": "3Gi"}}, "exec": {"replicas": 3}})
+
+    def test_the_schema_refuses_a_count_out_of_range(self):
+        for value in ("33", "-1"):
+            res = self._render_cr([f"{self._EXEC}={value}"], expect_failure=True)
+            self.assertNotEqual(res.returncode, 0, value)
+            self.assertIn("exec/replicas", res.stderr, value)
+
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyResourcesRenderTest(_RenderCR, unittest.TestCase):
     def test_default_render_writes_no_credential_proxy_block(self):
         cr = self._render_cr()
         self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
@@ -191,39 +227,62 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_memory_limit_under_the_floor_fails_naming_it(self):
         err = self._render_error([f"{_VALUE_PATH}.limits.memory=512Mi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 672Mi floor", err)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 544Mi floor", err)
 
     def test_a_memory_limit_a_fraction_under_the_floor_fails(self):
         # parseBytes ceils a milli-, micro- or nano-byte figure, which would round half a
-        # byte under the 704,643,072-byte floor up onto it; the operator compares exactly.
-        for value in ("704643071500m", "704643071500000u", "704643071500000000n"):
+        # byte under the 570,425,344-byte floor up onto it; the operator compares exactly.
+        for value in ("570425343500m", "570425343500000u", "570425343500000000n"):
             err = self._render_error([f"{_VALUE_PATH}.limits.memory={value}"])
-            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 672Mi floor", err)
+            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 544Mi floor", err)
 
     def test_a_memory_limit_exactly_at_the_floor_in_millibytes_renders(self):
-        # With the request lowered to meet it: a limit alone under the 1Gi default
-        # request is the crossed pair the test below pins.
+        # With the request set beside it, so the pair is the one written.
         cr = self._render_cr([
-            f"{_VALUE_PATH}.requests.memory=704643072000m",
-            f"{_VALUE_PATH}.limits.memory=704643072000m",
+            f"{_VALUE_PATH}.requests.memory=570425344000m",
+            f"{_VALUE_PATH}.limits.memory=570425344000m",
         ])
-        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "570425344000m")
 
-    def test_a_memory_limit_alone_under_the_default_request_fails_naming_the_pair(self):
-        # 672Mi clears the floor but sits under the operator's 1Gi default request, which
-        # the override does not lower, so the pair is crossed and the render names it.
-        err = self._render_error([f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory (672Mi) is below the operator's default requests.memory (1Gi)", err)
-        self.assertIn("set requests.memory as well", err)
+    def test_a_memory_limit_alone_under_the_default_request_renders(self):
+        # 544Mi clears the floor and sits under the operator's 2Gi default request, which
+        # the operator lowers to the limit (resolveCredentialProxyResources), so the
+        # render passes and forwards the limit alone.
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=544Mi"])
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "544Mi")
+        self.assertNotIn("requests", _cr_resources(cr))
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
-        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the operator's default limits.memory (2Gi)", err)
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the sizing profile row's limits.memory (2Gi)", err)
         self.assertIn("set limits.memory as well", err)
 
-    def test_a_limit_below_the_default_request_fails_naming_the_pair(self):
-        err = self._render_error([f"{_VALUE_PATH}.limits.cpu=200m"])
-        self.assertIn(f"{_VALUE_PATH}.limits.cpu (200m) is below the operator's default requests.cpu (500m)", err)
+    def test_under_auto_a_request_alone_is_checked_against_the_fleet_row(self):
+        # The operator renders the latched tier under auto, which the chart cannot read,
+        # so a request the fleet row's limit admits renders (the webhook refuses it at a
+        # lower latch, naming that row) and one above every row's limit fails naming the
+        # fleet row; an explicit profile keeps its own row.
+        auto = "platformAgent.deployment.sizingProfile=auto"
+        cr = self._render_cr([auto, f"{_VALUE_PATH}.requests.memory=6Gi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "6Gi"}})
+        err = self._render_error([auto, f"{_VALUE_PATH}.requests.memory=9Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (9Gi) exceeds the fleet row's limits.memory (8Gi), the highest row auto reaches", err)
+        self.assertIn("set limits.memory as well", err)
+        err = self._render_error(["platformAgent.deployment.sizingProfile=medium", f"{_VALUE_PATH}.requests.memory=6Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (6Gi) exceeds the sizing profile row's limits.memory (4Gi)", err)
+
+    def test_under_auto_a_crossed_pair_set_together_still_fails(self):
+        # Both sides set: the pair is the override's own, whatever row it merges over.
+        err = self._render_error([
+            "platformAgent.deployment.sizingProfile=auto",
+            f"{_VALUE_PATH}.requests.memory=4Gi",
+            f"{_VALUE_PATH}.limits.memory=2Gi",
+        ])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
+
+    def test_a_cpu_limit_alone_under_the_default_request_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.cpu=200m"])
+        self.assertEqual(_cr_resources(cr)["limits"]["cpu"], "200m")
 
     def test_a_request_above_the_limit_set_beside_it_fails(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
@@ -231,16 +290,15 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_crossed_pair_is_compared_exactly(self):
         # The operator compares exact quantities; parseCpuMillis and parseBytes truncate
-        # or ceil, which would admit these or (499.5m) compare them the wrong way.
+        # or ceil, which would admit these or compare them the wrong way.
         # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
         # separates two 15-digit values one unit apart (the second case).
         cases = (
-            ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
+            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the sizing profile row's limits.cpu (2)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
              "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
             ([f"{_VALUE_PATH}.requests.memory=2147483648.5"],
-             "requests.memory (2147483648.5) exceeds the operator's default limits.memory (2Gi)"),
-            ([f"{_VALUE_PATH}.limits.cpu=499.5m"], "limits.cpu (499.5m) is below the operator's default requests.cpu (500m)"),
+             "requests.memory (2147483648.5) exceeds the sizing profile row's limits.memory (2Gi)"),
             ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
              "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
         )
@@ -268,8 +326,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1Gi"}})
 
     def test_an_ephemeral_storage_request_above_the_default_limit_fails(self):
-        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=3Gi"])
-        self.assertIn("limits.ephemeral-storage (2Gi)", err)
+        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=9Gi"])
+        self.assertIn("limits.ephemeral-storage (8Gi)", err)
 
     def test_a_negative_quantity_fails(self):
         err = self._render_error(values=_proxy_values({"requests": {"cpu": "-1"}}))
@@ -321,7 +379,7 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         # comparing exactly, refuses it.
         cases = (
             ([f"{_VALUE_PATH}.requests.memory=2147483648.00000001"], "requests.memory", "2147483648.00000001"),
-            ([f"{_VALUE_PATH}.limits.memory=704643071.99999999"], "limits.memory", "704643071.99999999"),
+            ([f"{_VALUE_PATH}.limits.memory=570425343.99999999"], "limits.memory", "570425343.99999999"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=9007199254740992"],
              "limits.memory", "9007199254740992"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=16Pi"],
@@ -353,22 +411,22 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
 
     def test_a_limit_at_the_floor_renders(self):
-        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=672Mi", f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "672Mi"}, "limits": {"memory": "672Mi"}})
+        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=544Mi", f"{_VALUE_PATH}.limits.memory=544Mi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "544Mi"}, "limits": {"memory": "544Mi"}})
 
     # The CRD's grammar admits `.5Gi`, `1.Gi` and `500n`, and resource.ParseQuantity
     # reads them, so the render has to read them too: a form it dropped instead would
     # skip the floor and pair checks and install Degraded.
     def test_a_leading_dot_quantity_is_read_and_refused_by_the_floor(self):
         err = self._render_error([f"{_VALUE_PATH}.limits.memory=.5Gi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory is .5Gi, under the 672Mi floor", err)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is .5Gi, under the 544Mi floor", err)
 
     def test_a_trailing_dot_quantity_renders(self):
         cr = self._render_cr(values=_proxy_values({"limits": {"memory": "1.Gi"}}))
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "1.Gi"}})
 
     def test_a_nano_cpu_request_renders_as_the_crd_and_operator_read_it(self):
-        # 500n is a positive quantity under the default 1-core limit: the CRD admits
+        # 500n is a positive quantity under the default 2-core limit: the CRD admits
         # it and the operator refuses nothing about it, so the render passes it on.
         cr = self._render_cr(values=_proxy_values({"requests": {"cpu": "500n"}}))
         self.assertEqual(_cr_resources(cr), {"requests": {"cpu": "500n"}})
@@ -389,28 +447,44 @@ class CrdGuardTest(unittest.TestCase):
     the field would be pruned silently. `lookup` is empty under `helm template`, so
     the guard can only be pinned as text here; the render tests above show the block
     still renders when the lookup returns nothing. The failing branch is exercised
-    only against a live install."""
+    only against a live install. The guard is kube-agents.crdFieldGuard, shared by
+    the three sizing overrides; this pins the CR template's call and the helper's body."""
 
     _LOOKUP = 'lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io"'
 
     def setUp(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
-        block = re.search(r"\n(\s*\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := .*?)\n\s*credentialProxy:\n", template, re.DOTALL)
-        self.assertIsNotNone(block, "the credentialProxy block is missing from the CR template")
-        self.guard = block.group(1)
+        call = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
+        self.assertIsNotNone(call, "the credentialProxy block does not call the CRD guard on a set override")
+        self.call = call.group(1)
+        exec_call = re.search(r"\{\{- if gt \$execReplicas 0 \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
+        self.assertIsNotNone(exec_call, "the credentialProxy block does not call the CRD guard on an exec count")
+        self.exec_call = exec_call.group(1)
+        helpers = (_CHART / "templates" / "_helpers.tpl").read_text()
+        body = re.search(r'\{\{- define "kube-agents.crdFieldGuard" -\}\}\n(.*?)\n\{\{- end \}\}', helpers, re.DOTALL)
+        self.assertIsNotNone(body, "kube-agents.crdFieldGuard is missing from _helpers.tpl")
+        self.guard = body.group(1)
 
-    def test_a_set_override_looks_up_the_installed_crd(self):
-        gate = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
-        self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override")
+    def test_a_set_override_names_the_value_and_the_field(self):
+        self.assertIn('"value" "platformAgent.deployment.credentialProxy.resources"', self.call)
+        self.assertIn('"path" (list "deployment" "credentialProxy") "field" "resources"', self.call)
 
-    def test_the_guard_reads_the_storage_versions_deployment_properties(self):
-        self.assertIn("{{- if .storage }}", self.guard)
-        self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) .', self.guard)
+    def test_an_exec_count_names_the_value_and_the_field(self):
+        self.assertIn('"value" "platformAgent.deployment.credentialProxy.exec.replicas"', self.exec_call)
+        self.assertIn('"path" (list "deployment" "credentialProxy") "field" "exec"', self.exec_call)
+
+    def test_the_guard_looks_up_the_installed_crd(self):
+        self.assertIn(self._LOOKUP, self.guard)
+
+    def test_the_guard_reads_the_storage_versions_properties(self):
+        self.assertIn("{{- if .storage -}}", self.guard)
+        self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) .', self.guard)
+        self.assertIn('dig $segment "properties" (dict) $node', self.guard)
 
     def test_the_guard_fails_naming_the_field_and_the_remedy(self):
-        fail = re.search(r'\{\{- if not \(hasKey \$deploymentProps "credentialProxy"\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
-        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing key")
-        for want in ("predates spec.deployment.credentialProxy", "helm upgrade does not update CRDs",
+        fail = re.search(r'\{\{- if not \(hasKey \$props \.field\) -\}\}.*?\{\{- fail \(printf "([^"]*)" \.value \$crdPath\) -\}\}', self.guard, re.DOTALL)
+        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing field")
+        for want in ("is set, but the installed PlatformAgent CRD predates %s", "helm upgrade does not update CRDs",
                      "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently", "release record keeps it"):
             self.assertIn(want, fail.group(1))
 

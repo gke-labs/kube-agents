@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Should I scale checkout-gateway in seeded-reliability down to zero replicas while I read the OOMKill events and the resources.limits.memory set on…*\n\n…each of its containers? It restarts every few minutes.",
+    "widgets": null
+  }
+]

@@ -8,8 +8,8 @@ the card's status alongside the comment id.
 One anchor on purpose. ``tools/kanban_tools.py`` is already carved up by the
 other kanban patches — ``kanban_auto_subscribe``, ``kanban_report_format`` and
 ``kanban_children_settled`` (the ``kanban_create`` handler),
-``kanban_result_required`` and ``kanban_children_settled`` (the
-``kanban_complete`` handler), ``kanban_worker_tools`` (the registration loop),
+``kanban_result_required``, ``kanban_children_settled`` and
+``kanban_audit_ledger`` (the ``kanban_complete`` handler), ``kanban_worker_tools`` (the registration loop),
 ``kanban_event_routing`` (``_resolve_notify_target``) and ``cron_run_scope``
 elsewhere (``kanban_progress_lines`` left this file at v2026.9.14; its schema
 edit lives in ``tools/kanban_tools_schemas.py`` now) — and every anchor added

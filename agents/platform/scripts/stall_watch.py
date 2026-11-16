@@ -23,16 +23,32 @@ no model. Each tick:
    profile, one the reconciler pruned for ``spec.scope.exclude.clusters`` or
    ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
    exclusion is the operator keeping a model turn off that cluster, and this
-   watch follows the same roster;
+   watch follows the same roster. Under ``spec.mode: next`` the scope
+   publisher's resolved scope names the fleet instead
+   (``fleet_scope_targets.list_scope_clusters``, #5621): the management and
+   explicit projects are listed as above, a member project's clusters come
+   from the publisher's list, a member it holds no list for is held as a
+   failed listing is, and a cluster in scope and not excluded is swept
+   whether or not it has a profile;
 2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
-   namespaces that are not system namespaces. The credentials behind that
+   namespaces that are not system namespaces and not excluded (see "What an
+   install can tune" below). The credentials behind that
    kubeconfig are fetched on the first tick, again after a day, and again
    when a read the kubeconfig could not serve says the file or the cluster
    changed; otherwise the kubeconfig is reused, because a ``get-credentials``
    through the shim is a real gcloud run at the credential proxy every time
    and the proxy serves kubectl from its own managed kubeconfig regardless;
-3. per namespace, runs the Cluster Agent's ``stall_report.py --json`` over a
-   bounded list of controller kinds;
+3. per cluster, runs the Cluster Agent's ``stall_report.py`` once, in its
+   cluster mode, over every namespace it reads there and a bounded list of
+   controller kinds: each kind is read once across the cluster (paged, for
+   the kinds the broker pages; one chunked ``kubectl get`` for the rest) and
+   split per namespace, so a cluster costs kinds-plus-one reads rather than
+   that many per namespace. A kind the cluster-wide read could not read whole
+   (the broker cut the reply at its output cap, or the read failed) is read
+   per namespace as before, in the namespaces that asked for it; a cluster
+   read that fails outright is read per namespace throughout. Clusters are
+   read ``SCAN_WORKERS`` at a time, the listing's width, within the broker's
+   admission cap;
 4. diffs the rows against the ledger the previous tick left, and on a new
    stall episode in a namespace hands it to the Session KV server as a
    ``controller-stall`` inject: the route ``k8s-event-watcher`` and the drift
@@ -72,12 +88,57 @@ Why a bounded kind list. ``stall_report.py`` defaults to every namespaced kind
 the API server knows, one ``kubectl get`` each, which is right for one
 namespace a user asked about and wrong for a fleet sweep every half hour.
 ``DEFAULT_KINDS`` names the controllers whose stalls this watch exists for.
-``STALL_WATCH_KINDS`` replaces it for a run started by hand in the pod, and
-``all`` restores the script's default; the operator's env allowlist does not
-carry it yet, so an install cannot set it through the CR. Pods are left out
-on purpose: a Pod that cannot start raises the Warning reasons the event
-watcher is gated on, and its owner shows here through its own condition or
-reference.
+``STALL_WATCH_KINDS`` replaces it, and ``all`` restores the script's default.
+Pods are left out on purpose: a Pod that cannot start raises the Warning
+reasons the event watcher is gated on, and its owner shows here through its
+own condition or reference.
+
+Why a group wildcard. Config Connector serves some three hundred namespaced
+kinds under groups ending in ``.cnrm.cloud.google.com``, and a managed
+resource whose reconcile fails shows it in two places only: its controller
+does not crash and logs only on the object; it records at most a Warning
+event there, which the event watcher forwards, and it sets the object's own
+``Ready`` condition, which ``stall_report.py``'s stale-condition heuristic
+reads, event or no event. Config Connector's
+``ConfigConnector`` status reports the controller's health, not the managed
+resources'. So the default list carries ``*.cnrm.cloud.google.com``, which
+stands for every served kind in such a group. Listing all of them in every
+namespace would be three hundred reads a namespace, so per cluster the watch
+discovers once which of those kinds have objects and in which namespaces
+(``discover_kinds``: batches of kinds in one ``kubectl get`` over every
+namespace), keeps that in the ledger, redoes it after
+``DISCOVERY_REFRESH_SECONDS`` or when it left kinds unknown, and reads in a
+namespace only the kinds found there, at most ``WILDCARD_KINDS_CAP``. A kind
+discovery could not read, or that appeared since, is held as unread, so its
+rows are never judged absent; a kind that gained its first object between
+refreshes is read from the next refresh. A namespace with more kinds than
+the cap is read in turns: the cap's worth this tick, the next ones the next
+tick, round and round, every kind within a few ticks and never one left out
+for good; the ledger's ``unreadable`` entry for the namespace says so while
+it lasts. The discovery lists every namespace in one request (metadata
+only), but only the namespaces the watch reads reach its record: the system
+namespaces, ``STALL_WATCH_EXCLUDE_NAMESPACES`` and the exempt annotation
+keep theirs out of it. A cluster with no namespace to watch asks for no
+kind, so it gets no discovery: its record stays as it was, and is redone
+when the cluster has a namespace to watch again and the refresh is due. An
+explicit ``STALL_WATCH_KINDS`` replaces the wildcard with the rest of the
+default list, and may name it.
+
+What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
+script as three variables the operator pins in the managed .env on every
+install, empty when unset, so the agent cannot override them through its own
+.env (a run started by hand in the pod can still set its own):
+``STALL_WATCH_EXCLUDE_NAMESPACES`` names namespaces never read,
+``STALL_WATCH_MIN_AGE_MINUTES`` holds a new alert until one of the
+namespace's stalls has lasted that long, and ``STALL_WATCH_KINDS`` is the kind
+list above. An empty or unreadable value is the default. Apart from them, the
+annotation ``kubeagents.x-k8s.io/stall-watch: exempt`` on a namespace leaves
+it unread, and on an object leaves that object's rows out of the alerts. An
+open alert that an exclusion or the annotation empties has its card closed
+with a note that says so, not one that says the stall cleared. A stall's age is the longer of what ``stall_report.py``
+measured on the object and how long ago the watch first saw the object stall; a younger
+stall stays in the ledger and is asked again on each tick, and an object that
+joins a namespace with an open alert is not held.
 
 Why a ledger. A stall lasts hours or days, and a watch that raised an alert
 for it every thirty minutes would be muted within the hour. The ledger holds
@@ -107,7 +168,10 @@ tick it falls short, and chat hears it once, on the tick the sweep first falls
 short, and once more when the fleet fits in one tick again. On a fleet the
 budget does not cover, a cluster is read across consecutive ticks, so the
 interval the operator has is the ticks a full pass takes, not the schedule;
-the budget entry is where to read it.
+the budget entry is where to read it, and the ledger's ``cluster_timings``
+and ``tick_timing`` entries say what each cluster and the tick cost, so the
+cluster that takes the time and the ticks a pass takes are read from the
+ledger rather than timed by hand.
 """
 
 from __future__ import annotations
@@ -121,6 +185,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -133,6 +198,8 @@ from pathlib import Path
 # Siblings in `$HERMES_HOME/scripts`, this script's own directory and therefore
 # already on `sys.path` when the scheduler runs it as a plain subprocess.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import credential_proxy_client  # noqa: E402
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 from gke_endpoint import dns_endpoint_args  # noqa: E402
@@ -156,10 +223,37 @@ STATE_TMP_SUFFIX = ".tmp"
 #: first, then the one the operator already sets on the agent container from
 #: spec.harness.projectID. The other projects are the Cluster Agent roster's.
 PROJECT_ENVS = ("STALL_WATCH_PROJECT", "GCP_PROJECT_ID")
+#: The CR's spec.harness.stallWatch, which the operator pins in the managed .env
+#: on every install, empty when the CR does not set it. Empty is the default.
+EXCLUDE_NAMESPACES_ENV = "STALL_WATCH_EXCLUDE_NAMESPACES"
+MIN_AGE_ENV = "STALL_WATCH_MIN_AGE_MINUTES"
 KINDS_ENV = "STALL_WATCH_KINDS"
 REPORT_SCRIPT_ENV = "STALL_WATCH_REPORT_SCRIPT"
+NAMESPACES_SEPARATOR = ","
+#: A new alert waits until one of the namespace's stalls is this old; 0 alerts
+#: on the first tick that sees it.
+DEFAULT_MIN_AGE_MINUTES = 0
+SECONDS_PER_MINUTE = 60
 #: The value of STALL_WATCH_KINDS that hands stall_report.py its own default.
 ALL_KINDS = "all"
+#: The opt-out annotation, fixed rather than configurable. On a namespace it
+#: leaves the namespace unread, as STALL_WATCH_EXCLUDE_NAMESPACES does; on any
+#: object stall_report.py reports, it leaves that object's rows out of the
+#: alerts. stall_report.py names the same key and value, since it runs alone in
+#: the sandbox and imports nothing from here, and marks such a row with
+#: EXEMPT_FIELD.
+EXEMPT_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
+EXEMPT_VALUE = "exempt"
+EXEMPT_FIELD = "exempt"
+#: The suffix every Config Connector API group ends in
+#: (`sql.cnrm.cloud.google.com`, `pubsub.cnrm.cloud.google.com`, ...).
+KCC_GROUP_SUFFIX = ".cnrm.cloud.google.com"
+#: A kind-list item of the form `*.<group suffix>` stands for every namespaced
+#: kind the cluster serves whose group ends in the suffix. It is expanded per
+#: cluster from the `kubectl api-resources` listing the list is filtered on,
+#: and read only in the namespaces discovery found its objects in.
+GROUP_WILDCARD_PREFIX = "*."
+KCC_KINDS_WILDCARD = GROUP_WILDCARD_PREFIX + KCC_GROUP_SUFFIX[1:]
 #: Controllers whose silent stalls this watch exists for. Per cluster, the
 #: list is cut to what the cluster serves before it is handed to the script.
 DEFAULT_KINDS = (
@@ -170,8 +264,36 @@ DEFAULT_KINDS = (
     "gateways.gateway.networking.k8s.io",
     "httproutes.gateway.networking.k8s.io",
     "certificates.cert-manager.io",
+    KCC_KINDS_WILDCARD,
 )
 KINDS_SEPARATOR = ","
+# Kinds the watch never asks stall_report.py to read, whatever STALL_WATCH_KINDS
+# says: the resources its whole-namespace scan skips (SCAN_EXCLUDED_RESOURCES
+# there), as plural, singular and short names, matched on the part before the
+# group so `leases` and `leases.coordination.k8s.io` are both refused. Secrets above all: a listing
+# carries every body, and the scan reports nothing from them. An explicit
+# --kind bypasses the script's own skip list, so the watch refuses them here.
+REFUSED_KINDS = frozenset(
+    {
+        "secrets",
+        "secret",
+        "configmaps",
+        "configmap",
+        "cm",
+        "events",
+        "event",
+        "ev",
+        "endpoints",
+        "endpoint",
+        "ep",
+        "endpointslices",
+        "endpointslice",
+        "controllerrevisions",
+        "controllerrevision",
+        "leases",
+        "lease",
+    }
+)
 
 #: The agent image's copy of stall_report.py, staged by the Dockerfile and not
 #: on the volume, so it is the code at this commit and nothing the model wrote.
@@ -200,14 +322,69 @@ KUBECONFIG_SLUG_REPLACEMENT = "-"
 #: every upgrade and repair window; treating it as unreadable would post a
 #: "could not read" and a "readable again" per cluster per window.
 SWEEPABLE_CLUSTER_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-#: `kubectl get namespaces -o name` prints one of these per line.
-NAMESPACE_NAME_PREFIX = "namespace/"
+# One line per namespace name, a marker line, the names whose exempt
+# annotation is exactly EXEMPT_VALUE, and the marker again: about as small as
+# `-o name`. The annotation's value is never printed, so a value with a newline
+# in it adds no line. The full JSON listing would carry every label and
+# annotation, and on a cluster with thousands of namespaces it can pass the
+# credential proxy's output cap. The closing marker shows the listing arrived
+# whole; the marker is not a valid namespace name.
+NAMESPACE_LIST_MARKER = "---"
+NAMESPACE_LIST_MARKERS = 2
+NAMESPACES_ARGV = (
+    "kubectl",
+    "get",
+    "namespaces",
+    "-o",
+    "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"
+    "{\"" + NAMESPACE_LIST_MARKER + "\\n\"}"
+    "{range .items[?(@.metadata.annotations.kubeagents\\.x-k8s\\.io/stall-watch==\"" + EXEMPT_VALUE + "\")]}"
+    "{.metadata.name}{\"\\n\"}{end}"
+    "{\"" + NAMESPACE_LIST_MARKER + "\\n\"}",
+)
+#: What the credential proxy client writes to stderr when the broker cut a
+#: reply at its output cap. The shim exits 74 with it (an older one exited as
+#: kubectl did), so the listing reads the marker before the exit code.
+PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: The kind list is filtered to what a cluster serves, from one
-#: `kubectl api-resources` per cluster, so a warning from the report script
+#: `kubectl api-resources` per cluster that has a namespace to watch, so a
+#: warning from the report script
 #: about a kind it could not scan is always a failure and never "this cluster
 #: has no cert-manager".
 API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
 API_RESOURCES_TIMEOUT_SECONDS = 60
+#: Discovery of a wildcard's objects on one cluster: `kubectl get` over a
+#: batch of served kinds and every namespace, one line per object with its
+#: namespace, Kind and apiVersion, which `resource_for` maps back to the
+#: api-resources name. A batch is one proxied command, and kubectl lists its
+#: kinds one request after another inside it. The broker ends a one-shot
+#: kubectl at 60 s (credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS, noted
+#: with the other caps below), and the fleet-audit collector measured each
+#: list request through the proxy at more than a second on a cluster with the
+#: add-on (kcc_health.py: 230 requests outran its 240 s read). Ten kinds a
+#: batch fits that bound with each request allowed up to 6 s; the add-on's
+#: 300-odd kinds are then thirty commands, DISCOVERY_WORKERS at a time. The
+#: local timeout holds one broker admission wait and one such run.
+DISCOVERY_ARGV = ("kubectl", "get")
+DISCOVERY_FLAGS = ("--all-namespaces", "--no-headers", "-o", "custom-columns=NAMESPACE:.metadata.namespace,KIND:.kind,API:.apiVersion")
+DISCOVERY_BATCH_KINDS = 10
+DISCOVERY_TIMEOUT_SECONDS = 120
+DISCOVERY_COLUMNS = 3
+#: How long a cluster's discovery stands before it is redone, how soon one
+#: that left kinds unknown (a batch that failed or was cut) is retried, and
+#: how many such redos one tick runs, so a fleet's refreshes spread over the
+#: ticks rather than all landing on one. A cluster with no record discovers
+#: at once: nothing of the wildcard's is read there until it does.
+DISCOVERY_REFRESH_SECONDS = 6 * 60 * 60
+DISCOVERY_RETRY_SECONDS = 60 * 60
+DISCOVERY_REFRESHES_PER_TICK = 2
+#: The most wildcard kinds read in one namespace on one tick, the cap the CR
+#: puts on an explicit kind list. A namespace with more is read in turns:
+#: this many this tick, the next ones the next tick, wrapping, so every kind
+#: is read within ceil(kinds / cap) ticks and none is left out by its name.
+#: The kinds not read this tick are held, and the ledger's unreadable entry
+#: for the namespace says so.
+WILDCARD_KINDS_CAP = 20
 #: stall_report.py exits 0 after skipping a kind or the events it could not
 #: read and says so on stderr, naming the resource; such a scan clears no
 #: row of that kind (or no repeating-warnings row, for the events) and every
@@ -242,6 +419,50 @@ CURSOR_KEY = "cursor"
 #: is this old, or until a read the kubeconfig could not serve, after which
 #: the tick fetches once more and retries that one call.
 CREDENTIALS_KEY = "credentials"
+#: Ledger key for each swept cluster's wildcard discovery: {cluster id:
+#: {DISCOVERY_AT_KEY: when, DISCOVERY_KINDS_KEY: {resource: [namespaces with
+#: objects]}, DISCOVERY_UNKNOWN_KEY: [resources it could not read]}}.
+DISCOVERED_KINDS_KEY = "discovered_kinds"
+DISCOVERY_AT_KEY = "at"
+DISCOVERY_KINDS_KEY = "kinds"
+DISCOVERY_UNKNOWN_KEY = "unknown"
+#: Per namespace, where the next tick's window of WILDCARD_KINDS_CAP kinds
+#: starts in that namespace's sorted kind list; absent or stale means 0.
+DISCOVERY_TURN_KEY = "turn"
+#: Ledger key for what each cluster cost to read, one record per cluster the
+#: sweep reached, kept across ticks on the credentials' terms (a cluster the
+#: budget did not reach keeps its last record; one gone from the listing
+#: loses it): {cluster id: {TIMING_AT_KEY: the tick that read it,
+#: TIMING_SECONDS_KEY: wall-clock seconds from its first call to its last,
+#: TIMING_NAMESPACES_KEY: namespaces in the watch's scope (system, excluded
+#: and exempt ones left out), TIMING_SCANS_KEY: namespaces scanned,
+#: TIMING_CUT_KEY: whether the budget stopped the sweep inside it}}. A tick
+#: that resumes a cut cluster at the cursor carries the cut record's seconds
+#: and scans forward, so the record it leaves is the whole pass over the
+#: cluster, not the tick's slice. Scans short of the namespaces without the
+#: cut is a namespace that could not be read, and the unreadable entry says
+#: which; the span from the oldest `at` to the newest, over the schedule, is
+#: how many ticks a full pass takes; the largest `seconds` is where the
+#: budget goes. The scheduler discards a script's stderr on exit 0, so the
+#: ledger is the one durable place for these figures (#5259).
+CLUSTER_TIMINGS_KEY = "cluster_timings"
+TIMING_AT_KEY = "at"
+TIMING_SECONDS_KEY = "seconds"
+TIMING_NAMESPACES_KEY = "namespaces"
+TIMING_SCANS_KEY = "scans"
+TIMING_CUT_KEY = "cut"
+#: Ledger key for the figures of the last tick whose sweep ran (a failed
+#: sweep leaves the previous entry, and `at` says which): {TIMING_AT_KEY,
+#: TIMING_SECONDS_KEY: the whole tick, the sweep and the alerts it raised or
+#: closed, TIMING_SWEEP_KEY: the sweep alone, TIMING_LISTING_KEY: the cluster
+#: listing alone, TIMING_CLUSTERS_KEY: clusters read, TIMING_SCANS_KEY:
+#: namespaces scanned}; `sweep_seconds` at the budget on every tick is the
+#: signature of a fleet the budget does not cover.
+TICK_TIMING_KEY = "tick_timing"
+TIMING_SWEEP_KEY = "sweep_seconds"
+TIMING_LISTING_KEY = "listing_seconds"
+TIMING_CLUSTERS_KEY = "clusters"
+TIMING_DECIMALS = 1
 CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: What a failed first read on a reused kubeconfig says when the kubeconfig
 #: itself is the problem, so one more fetch repairs it: the shim's refusal of
@@ -320,13 +541,53 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+# A project's cluster list is read first through the broker's read-only Cloud API
+# relay, from one sandbox process (`gke_cluster_reads.py`, the reader
+# cluster_agent_reconcile uses), which starts no `gcloud` in the broker. The relay
+# answers name, location and status, which is all this listing keeps, and its
+# `missingZones` says when a list is partial. Any other answer, a helper that is
+# missing (a sandbox image older than this script) or cannot run, or a relay this
+# caller may not use, falls back to `gcloud container clusters list` as before; a
+# helper that could not run at all turns the relay off for the rest of the process.
+# The root-owned copy the shell may run (gke_cluster_reads.SANDBOX_GKE_READS;
+# test_stall_watch holds the two equal).
+GKE_READS_HELPER = "/opt/vcs/libexec/platform/gke_cluster_reads.py"
+# The relay read gets at most this, and at most half of the listing's budget, so a
+# helper that stalls leaves gcloud the rest.
+RELAY_LIST_TIMEOUT_SECONDS = 30
+RELAY_LIST_BUDGET_SHARE = 0.5
+# What the helper's own deadline leaves for the sandbox login and the interpreter.
+RELAY_STARTUP_SECONDS = 3.0
+RELAY_INCOMPLETE_LISTING = "the cluster list did not answer for {zones}"
+# The broker's refusals that are about the relay, not one project: a caller role it
+# does not serve, a handler with no relay, a host it does not take (a broker older
+# than the routes). The relay is off for the rest of the process. The same sets as
+# cluster_agent_reconcile's (test_stall_watch holds them equal).
+RELAY_OFF_CODES = frozenset({"CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED"})
+RELAY_OFF_RULES = frozenset({"gcp.api.host", "gcp.api.host-refused"})
+# A project the helper may put in a URL path; anything else is listed with gcloud,
+# so a malformed name can never be read as some other path (the reconcile's rule).
+RELAY_SEGMENT = re.compile(r"[a-z0-9][a-z0-9.:-]*")
+#: The broker bounds one gcloud it runs at 300 s (its ``--timeout-seconds``
+#: default) and a one-shot kubectl at 60 s. No cap in this file holds more than
+#: one broker admission wait and one such run. The shim retries a refusal on
+#: its own (credential_proxy_client, keeping a retry's admission wait, not its
+#: run, inside a deadline the caller may shorten), and under these caps a retry
+#: would carry past the cap, where TimeoutExpired stands in for the broker's
+#: reason. Every hop tells the shim the longest cap less the gcloud run bound,
+#: under which no retry fits (the kubectl hops' 60 s caps less their 60 s run
+#: bound give the same), so a refused hop reads the refusal's text at once, as
+#: cluster_preflight.sh's calls do.
+BROKER_GCLOUD_RUN_SECONDS = 300
+SHIM_RETRY_DEADLINE_SECONDS = max(0, CLUSTER_LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 #: Projects are listed the way the reconciler lists them: the management
 #: project first and alone, since its ssh opens the connection the rest share,
 #: then LIST_WORKERS at a time, each gcloud timeout cut to the budget left. A
 #: listing still running at the deadline is unlisted this tick. One at a time,
 #: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
 #: outlast the whole tick.
-#: Every listing is a gcloud process the credential proxy runs. The pool was
+#: A listing the relay cannot answer (GKE_READS_HELPER) is a gcloud process the
+#: credential proxy runs; the relay's is one sandbox process and no gcloud. The pool was
 #: sized to the four requests the proxy admitted at its old 1Gi default
 #: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
 #: listing queues at the proxy and one still waiting at its 60 s admission
@@ -335,6 +596,21 @@ CLUSTER_LIST_TIMEOUT_SECONDS = 120
 #: workers' commands have four slots, and none if cluster_agent_reconcile.py's
 #: four-wide pool is listing at the same time.
 LIST_WORKERS = 4
+#: Discovery batches run this many at a time, for the same slot arithmetic.
+DISCOVERY_WORKERS = LIST_WORKERS
+#: Clusters are read this many at a time once the listing is in. The bound
+#: is the broker's: it admits CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+#: commands at once (eight as the operator deploys it), and the shell role
+#: this watch runs under is interactive there, admitted while fewer than all
+#: but one slot are taken, so seven of the eight; the eighth is the reserve
+#: for the other roles. Four of those seven keeps three for the kanban
+#: workers' commands and the reconciler, the same share LIST_WORKERS takes
+#: while the projects list. A width past seven would have the shim refused
+#: busy at admission and the cluster read unread. Every brokered hop this
+#: process makes, the discovery pool's batches included, passes through
+#: BROKER_SLOTS, so nested pools never add up past this width.
+SCAN_WORKERS = 4
+BROKER_SLOTS = threading.BoundedSemaphore(SCAN_WORKERS)
 #: 12 s per listing at four wide: the per-listing share the 150 s budget gave
 #: at eight. The listing runs inside TICK_BUDGET_SECONDS, so it leaves the
 #: scans at least 1500 - 300 - LIST_GRACE_SECONDS.
@@ -343,9 +619,58 @@ LIST_GRACE_SECONDS = 5
 GET_CREDENTIALS_TIMEOUT_SECONDS = 60
 NAMESPACE_LIST_TIMEOUT_SECONDS = 60
 NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
+#: One cluster's read in stall_report.py's cluster mode: one kubectl per
+#: kind across every namespace (pages, for the kinds the broker pages), one
+#: for the Warning events, and one per referent kind the dangling-reference
+#: heuristic resolves, at most five (a referent kind whose cluster-wide
+#: listing failed adds one listing per namespace with a reference, until
+#: one is refused too). The broker ends a one-shot kubectl at
+#: 60 s, so ten minutes holds ten such calls at the bound, past the default
+#: list's eight kinds plus events; a cluster that outruns it is read per
+#: namespace under the cursor instead, so a slow cluster is still read, a
+#: namespace at a time, across ticks. Every scan's timeout is also cut to the
+#: budget left, and a timeout at the budget is the cursor's resume point
+#: rather than a failure: with SCAN_WORKERS clusters in flight the check
+#: between scans alone would let a tick run SCAN_WORKERS reads past the
+#: budget.
+CLUSTER_SCAN_TIMEOUT_SECONDS = 600
+SCAN_TIMEOUT_FLOOR_SECONDS = 1
+#: Every hop through `run_sandbox` runs its remote command under coreutils
+#: `timeout` (in the sandbox image's base; the endpoint helper's own hop in
+#: `gke_endpoint` is not wrapped) at the hop's own bound plus this grace, TERM then KILL after
+#: REMOTE_TIMEOUT_KILL_AFTER_SECONDS. A local timeout ends the ssh and frees
+#: the broker slot, but not the `stall_report.py` or `kubectl` it started on
+#: the other side; without the wrapper a few timeouts leave more readers in
+#: the sandbox than SCAN_WORKERS admits. The grace keeps the local timeout
+#: first, so a timed-out hop still reads as one here.
+REMOTE_TIMEOUT_COMMAND = "timeout"
+REMOTE_TIMEOUT_KILL_FLAG = "-k"
+REMOTE_TIMEOUT_KILL_AFTER_SECONDS = 5
+REMOTE_TIMEOUT_GRACE_SECONDS = 2
 #: stall_report.py exits 2 when it could read no kind at all; anything else
 #: non-zero is a crash, and both leave the namespace unread this tick.
 REPORT_UNREADABLE_EXIT = 2
+#: The cluster report's shape (stall_report.py names the same keys): the
+#: per-namespace reports, the kinds no cluster-wide read could read whole,
+#: and whether the events were among them. A kind under `fallback` is read
+#: per namespace as before, in the namespaces that asked for it; events
+#: under fallback send every namespace to the per-namespace read, which reads
+#: its own events. A cluster report that cannot be had at all (the script
+#: failed, or its output could not be parsed) sends the cluster to the
+#: per-namespace read too, so the cluster-wide read never costs coverage.
+CLUSTER_NAMESPACES_FLAG = "--namespaces"
+CLUSTER_KIND_FLAG = "--kind"
+CLUSTER_EXTRA_KINDS_FLAG = "--extra-kinds"
+CLUSTER_EXTRA_KINDS_SEPARATOR = "="
+CLUSTER_REPORT_NAMESPACES_KEY = "namespaces"
+CLUSTER_REPORT_FALLBACK_KEY = "fallback"
+CLUSTER_REPORT_EVENTS_FALLBACK_KEY = "events_fallback"
+CLUSTER_REPORT_FINDINGS_KEY = "findings"
+#: How a credential record changes on a cluster's read (`ClusterPart`): a
+#: fetch this tick that stands is recorded as the tick's time, a fetch that
+#: failed or whose kubeconfig the read indicted loses the record.
+CREDENTIAL_SET = "set"
+CREDENTIAL_DROP = "drop"
 
 #: Where the ledger keeps an open alert and its card per `cluster/namespace` scope.
 EPISODES_KEY = "episodes"
@@ -426,6 +751,12 @@ TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 BOARD_DB_NAME = "kanban.db"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
 NOTICED_PREFIX = "🧭 stall noticed"
+# A stall swept under spec.mode: next on a cluster with no Cluster Agent
+# profile to assign its alert to (#5621): no alert is raised, and each such
+# namespace is said in chat once while its rows stay ledgered (UNROUTED_KEY
+# holds the ones said), until #5622 moves the alert to the cluster profile.
+UNROUTED_MARK = "with no Cluster Agent profile to alert"
+UNROUTED_KEY = "unrouted"
 CLEARED_PREFIX = "✅ stall cleared"
 DRY_RUN_PREFIX = "dry run:"
 #: A card the board no longer has, or cannot describe for this many ticks
@@ -435,6 +766,24 @@ MAX_UNKNOWN_CARD_TICKS = 3
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
 RUNNING_CARD_STATUS = "running"
+#: Why an open alert's namespace has no rows left. The tick that comments on
+#: the card stores it in the episode, so a later tick that completes the card
+#: gives the same reason whatever that tick's sweep could read.
+CLEAR_REASON_KEY = "clear_reason"
+CLEAR_REASON_ROSTER = "roster"
+CLEAR_REASON_EXCLUDED = "excluded"
+CLEAR_REASON_EXEMPT = "exempt"
+CLEAR_REASON_CLEARED = "cleared"
+#: The evidence an exempt close reason carries: the objects whose annotation
+#: emptied the alert. A later tick that read the namespace re-checks them
+#: before it repeats the reason.
+EXEMPT_OBJECTS_KEY = "exempt_objects"
+#: One `kubectl get <Kind/name> -n <namespace>` of an object's exempt
+#: annotation, for that re-check. A deleted object prints nothing.
+EXEMPT_READ_ARGV = ("kubectl", "get")
+NAMESPACE_FLAG = "-n"
+EXEMPT_READ_FLAGS = ("--ignore-not-found", "-o", "jsonpath={.metadata.annotations.kubeagents\\.x-k8s\\.io/stall-watch}")
+EXEMPT_READ_TIMEOUT_SECONDS = 30
 #: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
 #: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
 PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
@@ -442,8 +791,12 @@ PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
 #: heuristic; one for everything not named here. A repeating-warnings row
 #: exists only while its event recurred inside the report's window, and a
 #: dangling-reference row vanishes for a scan whose one referent listing
-#: failed while the object listing succeeded; both flap on one miss.
-CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
+#: failed while the object listing succeeded; both flap on one miss. A
+#: generation-lag row is reported only once the last spec write is older than
+#: the threshold, so a spec written every few ticks hides it from one scan; a
+#: row held over that scan keeps the object's first sighting for the
+#: minimum-age gate.
+CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2, "generation-lag": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `project:name@location`, the triple the scope's
@@ -465,17 +818,47 @@ STDERR_EXCERPT_CHARS = 200
 # --------------------------------------------------------------------------
 
 
+def seconds_since(start: float) -> float:
+    """Wall-clock seconds since `start`, a `time.perf_counter` reading, for
+    the ledger's timings. A clock apart from the budget's `time.monotonic`,
+    which the tests drive with fixed readings to place the budget's cut."""
+    return round(time.perf_counter() - start, TIMING_DECIMALS)
+
+
+def timing_record(now: str, start: float, namespaces: int, scans: int, cut: bool = False, carried_seconds: float = 0.0) -> dict:
+    """A cluster's CLUSTER_TIMINGS_KEY record. `carried_seconds` is what the
+    tick that the budget cut inside this cluster had already spent there, so
+    the record a resume completes is the whole pass over the cluster."""
+    seconds = round(carried_seconds + seconds_since(start), TIMING_DECIMALS)
+    return {TIMING_AT_KEY: now, TIMING_SECONDS_KEY: seconds, TIMING_NAMESPACES_KEY: namespaces, TIMING_SCANS_KEY: scans, TIMING_CUT_KEY: cut}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def run_sandbox(
-    argv: list[str], *, timeout: float, kubeconfig: str | None = None, stdin: str | None = None
+    argv: list[str], *, timeout: float, kubeconfig: str | None = None, stdin: str | None = None, deadline: float | None = None
 ) -> subprocess.CompletedProcess:
-    """One hop into the shell sandbox. Only KUBECONFIG crosses; the rest of
-    this process's environment has no business on the other side."""
-    remote_env = {"KUBECONFIG": kubeconfig} if kubeconfig else None
-    return sandbox_exec.run(argv, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
+    """One hop into the shell sandbox. Only KUBECONFIG and the shim's retry
+    deadline cross; the rest of this process's environment has no business on
+    the other side. `deadline`, a `time.monotonic` reading, is the budget's
+    end: the timeout is cut to it once the slot is held, so a wait for the
+    slot is not added on top of a timeout sized before the wait."""
+    remote_env = {credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)}
+    if kubeconfig:
+        remote_env["KUBECONFIG"] = kubeconfig
+    # One of SCAN_WORKERS brokered commands at a time, whichever pool asks.
+    with BROKER_SLOTS:
+        if deadline is not None:
+            timeout = min(timeout, max(SCAN_TIMEOUT_FLOOR_SECONDS, deadline - time.monotonic()))
+        # The remote command runs under `timeout` for the same bound plus a
+        # grace: the local side gives up first, so a timeout here still
+        # reads as one (the budget cut, the cluster's slice skipped), and
+        # the reader in the sandbox ends within the grace rather than
+        # running on past the slot it was counted against.
+        remote = [REMOTE_TIMEOUT_COMMAND, REMOTE_TIMEOUT_KILL_FLAG, str(REMOTE_TIMEOUT_KILL_AFTER_SECONDS), f"{timeout + REMOTE_TIMEOUT_GRACE_SECONDS:g}", *argv]
+        return sandbox_exec.run(remote, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
 
 
 def stderr_excerpt(text: str | None) -> str:
@@ -527,18 +910,93 @@ def report_source() -> str:
 def report_argv(namespace: str, kinds: str | None = None) -> list[str]:
     cmd = [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG, "--namespace", namespace, "--json"]
     if kinds:
-        cmd += ["--kind", kinds]
+        cmd += [CLUSTER_KIND_FLAG, kinds]
     return cmd
 
 
+def cluster_report_argv(namespaces: list[str], kinds: str | None, extra_kinds: dict[str, list[str]]) -> list[str]:
+    """stall_report.py's cluster mode over `namespaces`: `kinds` for every
+    namespace (None is every namespaced kind; an empty list is passed as
+    such, so a namespace with only its extras is asked only those), and each
+    namespace's extra kinds beside it."""
+    cmd = [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG, CLUSTER_NAMESPACES_FLAG, NAMESPACES_SEPARATOR.join(namespaces), "--json"]
+    if kinds is not None:
+        cmd += [CLUSTER_KIND_FLAG, kinds]
+    for namespace in sorted(extra_kinds):
+        if extra_kinds[namespace]:
+            cmd += [CLUSTER_EXTRA_KINDS_FLAG, f"{namespace}{CLUSTER_EXTRA_KINDS_SEPARATOR}{KINDS_SEPARATOR.join(extra_kinds[namespace])}"]
+    return cmd
+
+
+def env_list(name: str, separator: str) -> list[str]:
+    """A list from the environment: items stripped, empty items dropped."""
+    return [item.strip() for item in os.environ.get(name, "").split(separator) if item.strip()]
+
+
 def kinds_argument() -> str | None:
-    """The --kind value for stall_report.py, or None to let it scan every kind."""
+    """The --kind value for stall_report.py, or None to let it scan every kind.
+    A value with no item in it, or only refused ones, is the default list, not
+    every kind."""
     raw = os.environ.get(KINDS_ENV, "").strip()
     if raw.lower() == ALL_KINDS:
         return None
-    if raw:
-        return KINDS_SEPARATOR.join(k.strip() for k in raw.split(KINDS_SEPARATOR) if k.strip())
-    return KINDS_SEPARATOR.join(DEFAULT_KINDS)
+    configured = env_list(KINDS_ENV, KINDS_SEPARATOR)
+    refused = [k for k in configured if refused_kind(k)]
+    if refused:
+        sys.stderr.write(f"stall_watch: {KINDS_ENV} names kinds the watch never reads, ignored: {', '.join(refused)}\n")
+    kept = [k for k in configured if k not in refused]
+    return KINDS_SEPARATOR.join(kept or DEFAULT_KINDS)
+
+
+def is_wildcard(kind: str) -> bool:
+    return kind.startswith(GROUP_WILDCARD_PREFIX)
+
+
+def wildcard_kinds() -> list[str]:
+    """The group wildcards in the kind list; none when the list is `all`."""
+    configured = kinds_argument()
+    if configured is None:
+        return []
+    return [k for k in configured.split(KINDS_SEPARATOR) if is_wildcard(k)]
+
+
+def matches_wildcard(resource: str, wildcard: str) -> bool:
+    """Whether an api-resources name (`sqlinstances.sql.cnrm.cloud.google.com`)
+    is in a group the wildcard's suffix ends."""
+    return resource.endswith(wildcard[len(GROUP_WILDCARD_PREFIX) - 1 :])
+
+
+def join_kinds(base: str | None, extra: list[str] | None) -> str | None:
+    """The --kind value for one namespace: the cluster's list and the wildcard
+    kinds discovery found there. None keeps "every kind" (`all`); an empty
+    string is a namespace nothing is asked about."""
+    if base is None:
+        return None
+    # A plain kind the wildcard also found in this namespace is read once.
+    return KINDS_SEPARATOR.join(dict.fromkeys([k for k in base.split(KINDS_SEPARATOR) if k] + list(extra or [])))
+
+
+def excluded_namespaces() -> frozenset[str]:
+    """The namespaces STALL_WATCH_EXCLUDE_NAMESPACES names, matched exactly."""
+    return frozenset(env_list(EXCLUDE_NAMESPACES_ENV, NAMESPACES_SEPARATOR))
+
+
+def min_age_seconds() -> int:
+    """How old a namespace's oldest stall must be before a new alert, from
+    STALL_WATCH_MIN_AGE_MINUTES. Empty is the default; a value that is not a
+    whole number of minutes, or is negative, is the default too, and says so on
+    stderr: a typo must not stop the watch."""
+    raw = os.environ.get(MIN_AGE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MIN_AGE_MINUTES * SECONDS_PER_MINUTE
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = -1
+    if minutes < 0:
+        sys.stderr.write(f"stall_watch: {MIN_AGE_ENV}={raw!r} is not a whole number of minutes; using {DEFAULT_MIN_AGE_MINUTES}\n")
+        minutes = DEFAULT_MIN_AGE_MINUTES
+    return minutes * SECONDS_PER_MINUTE
 
 
 # --------------------------------------------------------------------------
@@ -555,10 +1013,75 @@ def project_id() -> str | None:
     return r.stdout.strip() or None
 
 
+_relay_off = False
+
+
+def list_clusters_by_relay(project: str, timeout: float) -> tuple[list[dict], str | None] | None:
+    """`list_clusters`'s answer read through the relay, or None for gcloud to read it."""
+    global _relay_off
+    if _relay_off or timeout < RELAY_STARTUP_SECONDS + 1:
+        return None
+    if not RELAY_SEGMENT.fullmatch(project) or ".." in project:
+        return None
+    request = {"projects": [project], "workers": 1, "budget_seconds": timeout - RELAY_STARTUP_SECONDS}
+    try:
+        result = run_sandbox(["python3", GKE_READS_HELPER], timeout=timeout, stdin=json.dumps(request))
+    except sandbox_exec.SandboxUnavailable:
+        raise
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        if result.returncode != 0:
+            raise ValueError(f"exit {result.returncode}")
+        row = json.loads(result.stdout or "")["lists"][project]
+    except (ValueError, KeyError, TypeError):
+        _relay_off = True
+        return None
+    if not isinstance(row, dict):
+        _relay_off = True
+        return None
+    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+    if error.get("code") in RELAY_OFF_CODES or (
+        error.get("code") == "SECURITY_POLICY_BLOCKED" and error.get("rule") in RELAY_OFF_RULES
+    ):
+        _relay_off = True
+        return None
+    names, statuses = row.get("clusters"), row.get("statuses")
+    if row.get("status") == http.client.OK and isinstance(names, list) and statuses is None:
+        # A sandbox image whose helper predates the statuses: it will not change
+        # within this process.
+        _relay_off = True
+        return None
+    if (
+        row.get("status") != http.client.OK
+        or not isinstance(names, list)
+        or not isinstance(statuses, list)
+        or len(names) != len(statuses)
+    ):
+        return None
+    clusters = [
+        {"name": pair[0], "location": pair[1], "status": status}
+        for pair, status in zip(names, statuses)
+        if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) and x for x in pair)
+        and isinstance(status, str)
+    ]
+    if len(clusters) != len(names):
+        return None
+    missing = [z for z in row.get("missingZones") or [] if isinstance(z, str)]
+    return clusters, (RELAY_INCOMPLETE_LISTING.format(zones=", ".join(missing)) if missing else None)
+
+
 def list_clusters(project: str, timeout: float = CLUSTER_LIST_TIMEOUT_SECONDS) -> tuple[list[dict], str | None]:
     """Every cluster as {name, location, status}, and why the listing is
-    incomplete when gcloud said so. Raises on a list that could not be read,
-    so the caller can tell an empty project from a failed call."""
+    incomplete when gcloud (or the relay's missingZones) said so. Raises on a
+    list that could not be read, so the caller can tell an empty project from a
+    failed call. The relay is tried first (`list_clusters_by_relay`)."""
+    if not _relay_off:
+        started = time.monotonic()
+        relayed = list_clusters_by_relay(project, min(RELAY_LIST_TIMEOUT_SECONDS, timeout * RELAY_LIST_BUDGET_SHARE))
+        if relayed is not None:
+            return relayed
+        timeout = max(1.0, timeout - (time.monotonic() - started))
     r = run_sandbox(
         ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"],
         timeout=timeout,
@@ -651,34 +1174,255 @@ def kinds_for(served: set[str] | None) -> tuple[str | None, set[str]]:
     kinds the filter removed. A removed kind is never asked for, so its rows
     are held as unread in every namespace of the cluster rather than judged
     absent: a discovery listing that dropped a served group must not close a
-    card under a live stall."""
+    card under a live stall. Group wildcards are not in the value: they are
+    expanded per namespace from what `discover_kinds` found (`wildcard_kinds_for`)."""
     configured = kinds_argument()
-    if configured is None or served is None:
-        return configured, set()
-    kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served]
-    dropped = {k for k in configured.split(KINDS_SEPARATOR) if k not in served}
+    if configured is None:
+        return None, set()
+    plain = [k for k in configured.split(KINDS_SEPARATOR) if not is_wildcard(k)]
+    if served is None:
+        return KINDS_SEPARATOR.join(plain), set()
+    kept = [k for k in plain if k in served]
+    dropped = {k for k in plain if k not in served}
     if not kept:
-        return configured, set()
+        return KINDS_SEPARATOR.join(plain), set()
     return KINDS_SEPARATOR.join(kept), dropped
+
+
+def refused_kind(kind: str) -> bool:
+    """Whether the kind list never carries this resource, by the part before
+    its group, as `kinds_argument` and the CRD's own rule read it."""
+    return kind.lower().split("/", 1)[0].split(".", 1)[0] in REFUSED_KINDS
+
+
+def wildcard_candidates(served: set[str] | None, wildcards: list[str]) -> list[str]:
+    """The served resources the wildcards stand for, by name, less the kinds
+    the watch never reads: a wildcard passes the refusal in `kinds_argument`
+    and in the CRD, so its expansion is where `leases.coordination.k8s.io`
+    under `*.k8s.io` is refused."""
+    if served is None:
+        return []
+    return sorted(r for r in served if any(matches_wildcard(r, w) for w in wildcards) and not refused_kind(r))
+
+
+def resource_group(resource: str) -> str:
+    return resource.split(".", 1)[1] if "." in resource else ""
+
+
+def lost_kinds(record: dict | None, candidates: list[str]) -> set[str]:
+    """The kinds a discovery record names whose whole group is absent from
+    the candidates this tick's api-resources listing gave. A listing gap
+    until a listing shows the group again: their rows are held, and they
+    are not read. A kind missing while its group is still served is not in
+    this set: a deleted CRD took its objects with it, and its rows clear."""
+    if not isinstance(record, dict):
+        return set()
+    known = record.get(DISCOVERY_KINDS_KEY) if isinstance(record.get(DISCOVERY_KINDS_KEY), dict) else {}
+    served_groups = {resource_group(c) for c in candidates}
+    return {r for r in set(known) | set(record.get(DISCOVERY_UNKNOWN_KEY) or []) if resource_group(r) not in served_groups}
+
+
+def discovery_due(record: dict | None, now: str, refreshed: int, candidates: list[str] = ()) -> bool:
+    """Whether a cluster's wildcard discovery runs this tick: at once with no
+    record, after DISCOVERY_RETRY_SECONDS when the record left kinds unknown
+    that a discovery could read now (their group is among the candidates; a
+    lost group's kinds wait for a listing that shows it again, not for a
+    retry that cannot list them), and after DISCOVERY_REFRESH_SECONDS
+    otherwise, the last two only while fewer than DISCOVERY_REFRESHES_PER_TICK
+    ran this tick."""
+    if not isinstance(record, dict) or not isinstance(record.get(DISCOVERY_KINDS_KEY), dict):
+        return True
+    try:
+        age = datetime.fromisoformat(now) - datetime.fromisoformat(str(record.get(DISCOVERY_AT_KEY)))
+    except (TypeError, ValueError):
+        return True
+    served_groups = {resource_group(c) for c in candidates}
+    retry = any(resource_group(u) in served_groups for u in record.get(DISCOVERY_UNKNOWN_KEY) or [])
+    wait = DISCOVERY_RETRY_SECONDS if retry else DISCOVERY_REFRESH_SECONDS
+    return not (timedelta(0) <= age < timedelta(seconds=wait)) and refreshed < DISCOVERY_REFRESHES_PER_TICK
+
+
+def resource_for(kind: str, api_version: str, batch: list[str]) -> str | None:
+    """The api-resources name in `batch` for an object's Kind and apiVersion,
+    matched by group and plural, or None when the plural rule derives none of
+    them: the record then names only resources the listing served, and the
+    object is noted on stderr rather than recorded under a name the listing
+    never showed."""
+    group = api_version.split("/", 1)[0]
+    for resource in batch:
+        if resource.endswith("." + group) and resource_names_kind(resource, kind):
+            return resource
+    return None
+
+
+def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None, namespaces: set[str] | None = None) -> dict:
+    """Which of `candidates` have objects on the cluster, and in which of
+    `namespaces` (the ones the watch reads; every namespace when None), from
+    DISCOVERY_BATCH_KINDS kinds per `kubectl get`. The listing is one request
+    over every namespace, metadata only, and an object in a namespace the
+    watch does not read (a system namespace, an excluded one, an exempt one)
+    is dropped before the record is made, so the record names no namespace
+    the operator kept the watch out of. A kind
+    the `previous` record names whose group is not among the candidates
+    (`lost_kinds`) is not listed and is carried into the new record as it
+    was, unknown if it was unknown: the api-resources listing lost the
+    group, and a listing gap must not clear a card, on a refresh tick any
+    more than on another. A known kind is carried as known, so a group gone
+    for good costs no hourly retry; `wildcard_kinds_for` holds it from the
+    listing each tick. A kind
+    that printed an object is read wherever it printed one. Every kind in a
+    batch that exited 0 and was not cut is known: empty where it printed
+    nothing. Every kind in any other batch is unknown as well, the ones that
+    printed included: kubectl lists the rest of a batch past a kind it cannot
+    read without saying which failed, and a cut listing stops mid-kind, so
+    what did not print may still exist. An unknown kind's rows are held rather
+    than cleared (`wildcard_kinds_for`). A batch that timed out or could not
+    run leaves every kind in it unknown; the sandbox being gone raises, as
+    every other hop does."""
+    batches = [candidates[i : i + DISCOVERY_BATCH_KINDS] for i in range(0, len(candidates), DISCOVERY_BATCH_KINDS)]
+
+    def run(batch: list[str]):
+        argv = [*DISCOVERY_ARGV, KINDS_SEPARATOR.join(batch), *DISCOVERY_FLAGS]
+        try:
+            return batch, run_sandbox(argv, timeout=DISCOVERY_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+        except sandbox_exec.SandboxUnavailable:
+            raise
+        except READ_FAILURES:
+            return batch, None
+
+    pool = ThreadPoolExecutor(max_workers=max(1, min(DISCOVERY_WORKERS, len(batches))))
+    try:
+        results = list(pool.map(run, batches))
+    finally:
+        pool.shutdown(wait=False)
+    kinds: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for batch, r in results:
+        seen: dict[str, set[str]] = {}
+        unmapped: set[str] = set()
+        if r is not None:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < DISCOVERY_COLUMNS:
+                    continue
+                namespace, kind, api_version = parts[:DISCOVERY_COLUMNS]
+                resource = resource_for(kind, api_version, batch)
+                if resource is None:
+                    unmapped.add(f"{kind}.{api_version.split('/', 1)[0]}")
+                    continue
+                if namespaces is not None and namespace not in namespaces:
+                    continue
+                seen.setdefault(resource, set()).add(namespace)
+        if unmapped:
+            sys.stderr.write(f"stall_watch: discovery listed objects of {', '.join(sorted(unmapped))} that match no listed resource name; not read\n")
+        complete = r is not None and r.returncode == 0 and PROXY_TRUNCATED_TEXT not in (r.stderr or "")
+        for resource, found in seen.items():
+            kinds[resource] = sorted(found)
+        for resource in batch:
+            if complete:
+                kinds.setdefault(resource, [])
+            else:
+                unknown.append(resource)
+    turns: dict = {}
+    if isinstance(previous, dict):
+        before = previous.get(DISCOVERY_KINDS_KEY) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else {}
+        before_unknown = set(previous.get(DISCOVERY_UNKNOWN_KEY) or [])
+        # Where each crowded namespace's window stands carries over: a
+        # refresh changes what is known, not which kinds were read last.
+        turns = dict(previous.get(DISCOVERY_TURN_KEY) or {}) if isinstance(previous.get(DISCOVERY_TURN_KEY), dict) else {}
+        for resource in lost_kinds(previous, candidates):
+            # Carried as it was: a kind the previous record could not read
+            # stays unknown, so its rows stay held and the hourly retry
+            # re-checks it once its group is listed again.
+            kinds.setdefault(resource, list(before.get(resource) or []))
+            if resource in before_unknown and resource not in unknown:
+                unknown.append(resource)
+    return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown), DISCOVERY_TURN_KEY: turns}
+
+
+def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: list[str], label: str) -> tuple[dict[str, list[str]], set[str], dict[str, set[str]], dict[str, int]]:
+    """From a cluster's discovery record: the wildcard kinds to read in each
+    namespace (at most WILDCARD_KINDS_CAP, by name); the kinds whose rows are
+    held as unread wherever they are not read this tick (unknown to the
+    record, served since it was made, or in a group the api-resources listing
+    no longer shows, which is a listing gap until a discovery says otherwise);
+    the kinds held in one namespace because they wait their turn there; and,
+    per crowded namespace, where the window starts once this one has been
+    read. A namespace with more kinds than WILDCARD_KINDS_CAP is read a
+    window at a time, from where DISCOVERY_TURN_KEY on the record says; the
+    caller moves that pointer only after the namespace's scan returned
+    (`sweep_fleet`), so a tick the budget ends before the namespace, or that
+    resumes past it, consumes no window, and every kind is read within a few
+    reads of the namespace and none is left out by where its name sorts. A
+    kind the record names is read where
+    the record saw it even when it is held: held stops a row clearing, not a
+    read. A kind the record names that the listing no longer serves while
+    its group is served is neither read nor held: a deleted CRD took its
+    objects with it, and its rows clear against the scan."""
+    known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
+    if not isinstance(known, dict):
+        return {}, set(candidates), {}, {}
+    stale = lost_kinds(record, candidates)
+    held = (set(candidates) - set(known)) | (set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) & set(candidates)) | stale
+    by_namespace: dict[str, list[str]] = {}
+    for resource, namespaces in sorted(known.items()):
+        if resource in stale or resource not in candidates or not any(matches_wildcard(resource, w) for w in wildcards):
+            continue
+        for namespace in namespaces or []:
+            by_namespace.setdefault(str(namespace), []).append(resource)
+    cut: dict[str, set[str]] = {}
+    turns = record.get(DISCOVERY_TURN_KEY) if isinstance(record.get(DISCOVERY_TURN_KEY), dict) else {}
+    next_turns: dict[str, int] = {}
+    for namespace, resources in by_namespace.items():
+        if len(resources) <= WILDCARD_KINDS_CAP:
+            continue
+        start = turns.get(namespace, 0)
+        start = start % len(resources) if isinstance(start, int) else 0
+        window = (resources + resources)[start : start + WILDCARD_KINDS_CAP]
+        cut[namespace] = set(resources) - set(window)
+        by_namespace[namespace] = window
+        next_turns[namespace] = (start + WILDCARD_KINDS_CAP) % len(resources)
+        sys.stderr.write(
+            f"stall_watch: {label} namespace {namespace} has objects of {len(resources)} kinds under {', '.join(wildcards)}; "
+            f"{WILDCARD_KINDS_CAP} are read this tick and the rest wait their turn\n"
+        )
+    return by_namespace, held, cut, next_turns
 
 
 def is_system_namespace(name: str) -> bool:
     return name in SYSTEM_NAMESPACES or name.startswith(SYSTEM_NAMESPACE_PREFIXES)
 
 
-def list_namespaces(kubeconfig: str) -> list[str]:
-    """Every non-system namespace, Terminating ones included: their objects
-    are still listable, and one whose content is gone is how a ledger row
-    clears while the namespace waits on a finalizer."""
-    r = run_sandbox(["kubectl", "get", "namespaces", "-o", "name"], timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+def list_namespaces(kubeconfig: str, excluded: frozenset[str]) -> tuple[list[str], set[str]]:
+    """Every non-system namespace the watch reads, Terminating ones included:
+    their objects are still listable, and one whose content is gone is how a
+    ledger row clears while the namespace waits on a finalizer. And, apart,
+    the namespaces left unread because `excluded` names them or they carry
+    the exempt annotation, so their open alerts close as excluded rather than
+    cleared."""
+    r = run_sandbox(list(NAMESPACES_ARGV), timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+    lines = r.stdout.splitlines()
+    # A cut listing would read the namespaces past the cut as deleted and
+    # close their cards as cleared. The marker before the exit code: the shim
+    # exits 74 on a cut reply, and the cut is what the ledger should name.
+    if PROXY_TRUNCATED_TEXT in (r.stderr or ""):
+        raise ReadFailed(f"kubectl get namespaces returned an incomplete listing: {stderr_excerpt(r.stderr)}", r.stderr)
     if r.returncode != 0:
         raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
-    names = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if line.startswith(NAMESPACE_NAME_PREFIX):
-            names.append(line[len(NAMESPACE_NAME_PREFIX):])
-    return sorted(n for n in names if n and not is_system_namespace(n))
+    if lines.count(NAMESPACE_LIST_MARKER) != NAMESPACE_LIST_MARKERS or lines[-1] != NAMESPACE_LIST_MARKER:
+        raise ReadFailed(f"kubectl get namespaces returned an incomplete listing: {stderr_excerpt(r.stderr)}", r.stderr)
+    cut = lines.index(NAMESPACE_LIST_MARKER)
+    exempt = set(lines[cut + 1 : -1])
+    watched, left_out = [], set()
+    for name in lines[:cut]:
+        name = name.strip()
+        if not name or is_system_namespace(name):
+            continue
+        if name in excluded or name in exempt:
+            left_out.add(name)
+        else:
+            watched.append(name)
+    return sorted(watched), left_out
 
 
 def skipped_in(stderr: str) -> set[str]:
@@ -694,26 +1438,50 @@ def resource_names_kind(resource: str, kind: str) -> bool:
     """Whether a kubectl resource name (`deployments`, `gateways.gateway...`)
     is the plural of an object's Kind (`Deployment`, `Gateway`)."""
     plural = resource.split(".", 1)[0].lower()
+    singulars = {plural, plural.rstrip("s")}
     if plural.endswith(PLURAL_IES):
-        singular = plural[: -len(PLURAL_IES)] + "y"
-    elif plural.endswith(PLURAL_ES_SUFFIXES):
-        singular = plural[: -len(PLURAL_ES)]
-    else:
-        singular = plural.rstrip("s")
-    return singular == kind.lower()
+        singulars.add(plural[: -len(PLURAL_IES)] + "y")
+    if plural.endswith(PLURAL_ES_SUFFIXES):
+        # `addresses` -> `address`; but a CRD may pluralise `cache` as
+        # `caches`, so the bare `-s` cut above stays a candidate too.
+        singulars.add(plural[: -len(PLURAL_ES)])
+    return kind.lower() in singulars
 
 
-def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], set[str]]:
+def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None, timeout: float = NAMESPACE_SCAN_TIMEOUT_SECONDS, deadline: float | None = None) -> tuple[list[dict], set[str]]:
     """The findings stall_report.py reports for one namespace, and the
     resources it could not read. Raises when the namespace could not be read
     at all, so the caller keeps its ledger rows."""
-    r = run_sandbox(report_argv(namespace, kinds), timeout=NAMESPACE_SCAN_TIMEOUT_SECONDS, kubeconfig=kubeconfig, stdin=source)
+    r = run_sandbox(report_argv(namespace, kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source, deadline=deadline)
     if r.returncode == REPORT_UNREADABLE_EXIT:
         raise RuntimeError(f"no kind could be read: {stderr_excerpt(r.stderr)}")
     if r.returncode != 0:
         raise RuntimeError(f"stall_report.py exited {r.returncode}: {stderr_excerpt(r.stderr)}")
     report = parse_json(r.stdout, "stall_report.py") or {}
-    return report.get("findings") or [], skipped_in(r.stderr)
+    return report.get(CLUSTER_REPORT_FINDINGS_KEY) or [], skipped_in(r.stderr)
+
+
+def scan_cluster(kubeconfig: str, namespaces: list[str], source: str, kinds: str | None, extra_kinds: dict[str, list[str]], timeout: float, label: str, deadline: float | None = None) -> dict | None:
+    """The cluster report stall_report.py's cluster mode gives for
+    `namespaces`: each kind read once across the cluster, the findings split
+    per namespace. None, with a note on stderr, when the report cannot be
+    had (the script failed, or printed something that is not a report), in
+    which case the caller reads the cluster per namespace as before; the
+    cluster-wide read saves calls and never costs coverage. A timeout and a
+    lost sandbox are raised, as from every other hop."""
+    r = run_sandbox(cluster_report_argv(namespaces, kinds, extra_kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source, deadline=deadline)
+    if r.returncode != 0:
+        sys.stderr.write(f"stall_watch: {label} cluster read exited {r.returncode}; reading per namespace: {stderr_excerpt(r.stderr)}\n")
+        return None
+    try:
+        report = parse_json(r.stdout, "stall_report.py --namespaces")
+    except RuntimeError as exc:
+        sys.stderr.write(f"stall_watch: {label} cluster read: {exc}; reading per namespace\n")
+        return None
+    if not isinstance(report, dict) or not isinstance(report.get(CLUSTER_REPORT_NAMESPACES_KEY), dict):
+        sys.stderr.write(f"stall_watch: {label} cluster read printed no report; reading per namespace\n")
+        return None
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -729,9 +1497,13 @@ def empty_state() -> dict:
         EPISODES_KEY: {},
         "sweep_error": None,
         INJECT_ERROR_KEY: None,
+        UNROUTED_KEY: None,
         "updated_at": None,
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
+        DISCOVERED_KINDS_KEY: {},
+        CLUSTER_TIMINGS_KEY: {},
+        TICK_TIMING_KEY: None,
         BUDGET_EXHAUSTED_KEY: False,
         BUDGET_EXHAUSTED_VIEW_KEY: None,
         BUDGET_HELD_TICKS_KEY: 0,
@@ -801,6 +1573,8 @@ def with_project(data: dict, project: str) -> dict:
         EPISODES_KEY: {prefix + k: v for k, v in (data.get(EPISODES_KEY) or {}).items()},
         CURSOR_KEY: cursor,
         CREDENTIALS_KEY: {prefix + k: v for k, v in (data.get(CREDENTIALS_KEY) or {}).items()},
+        DISCOVERED_KINDS_KEY: {prefix + k: v for k, v in (data.get(DISCOVERED_KINDS_KEY) or {}).items()},
+        CLUSTER_TIMINGS_KEY: {prefix + k: v for k, v in (data.get(CLUSTER_TIMINGS_KEY) or {}).items()},
     }
 
 
@@ -856,6 +1630,14 @@ class Sweep:
         #: Clusters whose namespace listing succeeded, and those namespaces.
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
+        #: Namespaces those listings showed and the watch left unread, excluded
+        #: by name or by the exempt annotation. Their rows go as a deleted
+        #: namespace's do, and their open alerts close as excluded.
+        self.excluded_namespaces: dict[str, set[str]] = {}
+        #: Objects whose rows carried the exempt annotation, as `object_key`
+        #: tuples. Their ledger rows go at once, and an alert they leave
+        #: empty closes as exempt.
+        self.exempt_objects: set[tuple[str, str, str]] = set()
         self.unreadable: dict[str, str] = {}
         #: Profiles whose cluster_identity could not be read this tick, so the
         #: projects only they name were not listed (`roster_projects`).
@@ -867,6 +1649,13 @@ class Sweep:
         #: ledger: the records this tick reused or renewed, less the clusters a
         #: fresh fetch did not make readable and the ones no longer listed.
         self.credentials: dict[str, str] = {}
+        #: Each listed cluster's wildcard discovery, for the ledger, kept on
+        #: the same terms as the credentials.
+        self.discovered: dict[str, dict] = {}
+        #: What each cluster the sweep reached cost (CLUSTER_TIMINGS_KEY),
+        #: kept on the same terms, and the tick's own figures (TICK_TIMING_KEY).
+        self.cluster_timings: dict[str, dict] = {}
+        self.tick_timing: dict = {}
 
     @property
     def clusters(self) -> int:
@@ -900,6 +1689,10 @@ class Sweep:
         project, name, location = split_cluster_id(cid)
         if project in self.unlisted_projects:
             return True
+        if fleet_scope_targets.UNRESOLVED_SCOPE_ROW in self.unlisted_projects and project not in self.projects:
+            # The resolved scope could not be read, so which projects are its
+            # members is unknown this tick: a project it does not name is held.
+            return True
         return project not in self.projects and cluster_agent_for(project, name, location) is not None
 
     def verdict(self, entry: dict) -> str:
@@ -929,21 +1722,68 @@ class Sweep:
         profile, rather than because the cluster or namespace was deleted."""
         return cid in self.unmanaged or split_cluster_id(cid)[0] not in self.projects
 
-    def out_of_budget(self, started: float, cid: str, namespace: str | None = None) -> bool:
+    def excluded(self, scope: str) -> bool:
+        """Whether the scope's rows went because its namespace was excluded
+        from the watch, rather than because it was deleted."""
+        cid, namespace = split_scope(scope)
+        return namespace in self.excluded_namespaces.get(cid, set())
+
+    def budget_remaining(self, started: float) -> float:
+        """Seconds of TICK_BUDGET_SECONDS left, 0 once it is spent; the one
+        reading of the clock a worker takes before a scan, so the same reading
+        both decides whether to start it and bounds its timeout. The flag is a
+        bool the workers share: a reader past the budget sets it, and every
+        later reading, on any worker, is 0."""
         if self.budget_exhausted:
-            return True
-        if time.monotonic() - started <= TICK_BUDGET_SECONDS:
-            return False
+            return 0.0
+        remaining = TICK_BUDGET_SECONDS - (time.monotonic() - started)
+        if remaining > 0:
+            return remaining
         self.budget_exhausted = True
-        self.cursor = {"cluster": cid, "namespace": namespace}
-        self.unreadable[BUDGET_SCOPE] = self.coverage_text()
-        return True
+        return 0.0
+
+    def out_of_budget(self, started: float) -> bool:
+        return self.budget_remaining(started) <= 0
+
+    def absorb(self, part: "ClusterPart") -> None:
+        """Fold what one worker brought back from one cluster into the sweep.
+        Called on the main thread, in sweep order, once every worker is done,
+        so the sweep's maps are written by one thread and in one order
+        whatever order the clusters finished in."""
+        self.unreadable.update(part.unreadable)
+        self.rows.update(part.rows)
+        self.read_scopes |= part.read_scopes
+        self.partial_scopes.update(part.partial_scopes)
+        self.exempt_objects |= part.exempt_objects
+        if part.failed:
+            self.failed_clusters.add(part.cid)
+        if part.namespaces is not None:
+            self.read_clusters.add(part.cid)
+            self.listed_namespaces[part.cid] = set(part.namespaces)
+            self.excluded_namespaces[part.cid] = set(part.excluded)
+
+    def settle_budget(self, parts: list["ClusterPart"]) -> None:
+        """Set the cursor and the budget entry from the parts in sweep order:
+        the first cluster a worker did not start, or that the budget cut
+        inside, is where the next tick resumes. Clusters after it that a
+        worker had already begun when the budget ran out were read whole and
+        are read again next tick, which is the price of reading several at
+        once. A flag raised by a reading that every worker then outran is
+        lowered: everything was read, so the fleet fit."""
+        for part in parts:
+            if part.started and not part.cut:
+                continue
+            self.cursor = {"cluster": part.cid, "namespace": part.cut_namespace}
+            self.budget_exhausted = True
+            self.unreadable[BUDGET_SCOPE] = self.coverage_text()
+            return
+        self.budget_exhausted = False
 
     def coverage_text(self) -> str:
         """What an exhausted sweep covered and where the next tick picks up:
         the clusters read of the ones it could sweep (listed, in a status it
         reads), the namespaces read, the clusters it tried and could not read,
-        and where the cursor stands. Called by `out_of_budget` once it has set
+        and where the cursor stands. Called by `settle_budget` once it has set
         the cursor. On a fleet the budget does not cover, a cluster is read
         across consecutive ticks, so this is the operator's interval, not the
         schedule."""
@@ -987,23 +1827,14 @@ def profile_identity(home: Path) -> dict[str, str] | None:
         return None
 
 
-def roster_projects() -> tuple[set[str], dict[str, str]]:
+def roster_projects(scope: fleet_scope_targets.ScopeClusters | None = None) -> tuple[set[str], dict[str, str]]:
     """The projects the Cluster Agent profiles' identities name, and a ledger
-    entry for each profile whose identity names none."""
-    from cluster_agent_profile import RESERVED_PROFILES  # lazy, as in cluster_agent_for
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return set(), {}
-    projects, unread = set(), {}
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
-            continue
-        identity = profile_identity(home)
-        if identity:
-            projects.add(identity["project"])
-        else:
-            unread[f"{PROFILE_SCOPE} {home.name}"] = NO_IDENTITY_REASON
+    entry for each profile whose identity names none: the profiles walk
+    `fleet_scope_targets.list_scope_clusters` makes outside spec.mode: next."""
+    if scope is None:
+        scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    projects = {entry.project for entry in scope.projects}
+    unread = {f"{PROFILE_SCOPE} {name}": NO_IDENTITY_REASON for name in scope.unidentified_profiles}
     return projects, unread
 
 
@@ -1038,155 +1869,438 @@ def list_projects(projects: list[str], first: str, started: float) -> dict[str, 
     return results
 
 
+class ClusterPart:
+    """What one worker brought back from one cluster. The workers write
+    nothing shared: each fills a part, and `Sweep.absorb` folds the parts in
+    sweep order on the main thread."""
+
+    def __init__(self, cid: str) -> None:
+        self.cid = cid
+        #: The worker got to the cluster before the budget ran out.
+        self.started = False
+        #: The budget stopped the sweep in this cluster: before its read
+        #: (resume at the cluster) or before a namespace's per-namespace read
+        #: (resume at that namespace).
+        self.cut = False
+        self.cut_namespace: str | None = None
+        #: The namespaces its listing showed, None when the cluster could not
+        #: be read, and the ones left unread as excluded or exempt.
+        self.namespaces: list[str] | None = None
+        self.excluded: set[str] = set()
+        self.failed = False
+        self.unreadable: dict[str, str] = {}
+        self.rows: dict[str, dict] = {}
+        self.read_scopes: set[str] = set()
+        self.partial_scopes: dict[str, set[str]] = {}
+        self.exempt_objects: set[tuple[str, str, str]] = set()
+        #: CREDENTIAL_SET, CREDENTIAL_DROP or None: how the cluster's
+        #: credential record changes.
+        self.credential: str | None = None
+        #: A discovery this tick ran or moved a window in, else None.
+        self.discovery: dict | None = None
+        #: The cluster's CLUSTER_TIMINGS_KEY record, None when not started.
+        self.timing: dict | None = None
+
+
+class SweepContext:
+    """What every worker reads and none writes: the tick's time and clock,
+    the ledger's records as the tick began, the script source, the knobs,
+    the cursor, and the sweep whose budget flag they share. The discovery
+    refresh count is the one thing they take turns on."""
+
+    def __init__(self, sweep: Sweep, now: str, started: float, source: str, cursor: dict | None, records: dict, discoveries: dict, timings: dict) -> None:
+        self.sweep = sweep
+        self.now = now
+        self.started = started
+        self.source = source
+        self.cursor = cursor
+        self.records = records
+        self.discoveries = discoveries
+        self.timings = timings
+        self.excluded = excluded_namespaces()
+        self.wildcards = wildcard_kinds()
+        self._refreshed = 0
+        self._refresh_lock = threading.Lock()
+
+    def claim_refresh(self, record: dict | None, candidates: list[str]) -> bool:
+        """Whether this cluster's discovery runs this tick (`discovery_due`),
+        counting a refresh of an existing record against
+        DISCOVERY_REFRESHES_PER_TICK under a lock, so two workers cannot both
+        take the last refresh."""
+        with self._refresh_lock:
+            if not discovery_due(record, self.now, self._refreshed, candidates):
+                return False
+            if record is not None:
+                self._refreshed += 1
+            return True
+
+
+def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
+    """One cluster's sweep, on a worker: its credentials and its namespaces,
+    then, when it has a namespace to watch, its served kinds, its wildcard
+    discovery when due, the cluster-wide read, and the per-namespace read for
+    whatever that could not read whole.
+    Returns the part; raises only for a lost sandbox, which ends the tick: the
+    raising worker lowers the budget flag itself, so every other worker stops
+    at its next check rather than when the main thread sees the exception."""
+    try:
+        return read_cluster_part(ctx, cid)
+    except BaseException:
+        ctx.sweep.budget_exhausted = True
+        raise
+
+
+def read_cluster_part(ctx: SweepContext, cid: str) -> ClusterPart:
+    part = ClusterPart(cid)
+    sweep = ctx.sweep
+    if sweep.out_of_budget(ctx.started):
+        return part
+    part.started = True
+    now = ctx.now
+    project, name, location = split_cluster_id(cid)
+    cluster_clock = time.perf_counter()
+    scans = 0  # namespaces scanned on this cluster, for its timing record
+    carried_seconds = 0.0  # what the tick the budget cut here had already spent
+    fetched = False  # a fetch was attempted this tick: at most one per cluster
+    wrote = False  # that fetch returned, so gcloud wrote the kubeconfig
+    readable = False  # the namespace read on it returned
+    try:
+        if credentials_current(ctx.records.get(cid), now):
+            kubeconfig = kubeconfig_path(project, name, location)
+        else:
+            fetched = True
+            kubeconfig = fetch_credentials(project, name, location)
+            wrote = True
+        try:
+            namespaces, left_out = list_namespaces(kubeconfig, ctx.excluded)
+        except READ_FAILURES as exc:
+            # A reused kubeconfig the shim or the cluster refused -- the
+            # sandbox restarted and the file is gone, or the cluster was
+            # recreated: fetch once more and retry this one call. A fetch
+            # this tick is not repeated for the same failure, and a failure
+            # that says nothing about the kubeconfig (a timeout, a proxy
+            # refusal, an API error) gets no fetch: it would not repair it,
+            # and on a saturated tick it would be one more gcloud per
+            # cluster at the proxy that just said it was busy.
+            if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable) or not refetch_repairs(exc):
+                raise
+            # Set before the fetch: a repair fetch that fails has not made
+            # the cluster readable either, so the record it was meant to
+            # replace goes, and the next tick fetches first rather than
+            # failing the same read on the same stub again.
+            fetched = True
+            kubeconfig = fetch_credentials(project, name, location)
+            wrote = True
+            namespaces, left_out = list_namespaces(kubeconfig, ctx.excluded)
+        # The namespace read is what proves the kubeconfig: a fetch whose
+        # kubeconfig just listed namespaces is recorded here, before the
+        # discovery call, whose failure says nothing about the kubeconfig.
+        readable = True
+        if fetched:
+            part.credential = CREDENTIAL_SET
+        kinds, dropped = None, set()
+        # The wildcard's kinds, per namespace, from this cluster's
+        # discovery record, redone when due. A discovery that fails holds
+        # the kinds it could not read; it never makes the cluster unreadable.
+        extra_kinds, held, cut, next_turns = {}, set(), {}, {}
+        record = ctx.discoveries.get(cid)
+        # A cluster with no namespace to watch asks for no kind, so the
+        # served-kinds call and the wildcard discovery are skipped. It is
+        # still read: its listing stands, with 0 namespaces. Its discovery
+        # record stays as it was until it has a namespace to watch again.
+        if namespaces:
+            served = served_kinds(kubeconfig)
+            kinds, dropped = kinds_for(served)
+            candidates = wildcard_candidates(served, ctx.wildcards)
+            if candidates and not sweep.out_of_budget(ctx.started) and ctx.claim_refresh(record, candidates):
+                record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
+                part.discovery = record
+            if ctx.wildcards and (candidates or record is not None):
+                extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, ctx.wildcards, cluster_label(cid))
+    except sandbox_exec.SandboxUnavailable:
+        raise
+    except READ_FAILURES as exc:
+        part.unreadable[scope_key(cid)] = failure_text(exc)
+        part.failed = True
+        # A fetch that failed, or whose kubeconfig the read indicted (a
+        # REFETCH_SIGNALS failure), is no record to reuse. Every other
+        # record stays, and a fetch gcloud completed whose read then failed
+        # for a reason no fetch repairs is recorded as if it had read: the
+        # kubeconfig is written, and a dark cluster on its fetch tick would
+        # otherwise pay the describe and the fetch on every tick it stays
+        # dark. The trade is a kubeconfig gcloud wrote but that is wrong
+        # without saying so, held for a day rather than re-described every
+        # tick. The next tick reads on it again, and one bad tick does not
+        # put the fleet back on the fetch-everything path.
+        if fetched and not readable:
+            part.credential = CREDENTIAL_SET if wrote and not refetch_repairs(exc) else CREDENTIAL_DROP
+        part.timing = timing_record(now, cluster_clock, 0, 0)
+        return part
+    part.namespaces = list(namespaces)
+    part.excluded = set(left_out)
+    if ctx.cursor and ctx.cursor.get("cluster") == cid:
+        # The tick the budget cut here: the timing record carries on from the
+        # cut, so what this tick adds completes the pass over the cluster
+        # and the record says what the whole pass cost rather than this
+        # tick's slice of it. The reads resume at the cursor's namespace; the
+        # namespaces before it were read then and are unknown now, not gone.
+        previous = ctx.timings.get(cid)
+        if previous and previous.get(TIMING_CUT_KEY):
+            carried_seconds = previous.get(TIMING_SECONDS_KEY) or 0.0
+            scans = previous.get(TIMING_SCANS_KEY) or 0
+        if ctx.cursor.get("namespace") in namespaces:
+            namespaces = namespaces[namespaces.index(ctx.cursor["namespace"]):]
+    # The cluster-wide read, over the namespaces that ask for a kind: one
+    # with nothing to ask (an explicit list of wildcards alone, none of whose
+    # kinds have objects there) is read without a call, as before.
+    report: dict | None = None
+    wanted = [ns for ns in namespaces if join_kinds(kinds, extra_kinds.get(ns)) != ""]
+    deadline = ctx.started + TICK_BUDGET_SECONDS
+    remaining = sweep.budget_remaining(ctx.started)
+    if remaining <= 0:
+        part.cut = True
+        namespaces = []
+    elif wanted:
+        try:
+            report = scan_cluster(kubeconfig, wanted, ctx.source, kinds, extra_kinds, min(CLUSTER_SCAN_TIMEOUT_SECONDS, remaining), cluster_label(cid), deadline)
+        except sandbox_exec.SandboxUnavailable:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            if sweep.out_of_budget(ctx.started):
+                # The budget, not the cluster: resume here next tick.
+                part.cut = True
+                namespaces = []
+            else:
+                sys.stderr.write(f"stall_watch: {cluster_label(cid)} cluster read {failure_text(exc)}; reading per namespace\n")
+    for namespace in namespaces:
+        namespace_kinds = join_kinds(kinds, extra_kinds.get(namespace))
+        findings: list[dict] = []
+        unread: set[str] = set()
+        # What the per-namespace read is still asked for: nothing when the
+        # namespace asks for no kind (an explicit list of wildcards alone,
+        # none with objects here); the kinds the cluster-wide read could not
+        # read whole, of the ones this namespace asks for, when the report
+        # covers the namespace; everything, when it does not.
+        # `needed` is the --kind value of the namespace's own read: "" when
+        # there is nothing left to read here, None for every kind (the
+        # `all` list), as join_kinds spells them.
+        covered = False  # the report has this namespace: its rows stand whatever the leftover read does
+        pending: list[str] = []
+        if namespace_kinds == "":
+            needed = ""
+        elif report is not None and not report.get(CLUSTER_REPORT_EVENTS_FALLBACK_KEY) and namespace in report[CLUSTER_REPORT_NAMESPACES_KEY]:
+            covered = True
+            findings = list((report[CLUSTER_REPORT_NAMESPACES_KEY][namespace] or {}).get(CLUSTER_REPORT_FINDINGS_KEY) or [])
+            asked = None if namespace_kinds is None else set(namespace_kinds.split(KINDS_SEPARATOR))
+            pending = [k for k in report.get(CLUSTER_REPORT_FALLBACK_KEY) or [] if asked is None or k in asked]
+            needed = KINDS_SEPARATOR.join(pending)
+        else:
+            needed = namespace_kinds
+        if needed != "":
+            remaining = sweep.budget_remaining(ctx.started)
+            if remaining <= 0:
+                part.cut = True
+                part.cut_namespace = namespace
+                break
+            try:
+                more, unread = scan_namespace(kubeconfig, namespace, ctx.source, needed, min(NAMESPACE_SCAN_TIMEOUT_SECONDS, remaining), deadline)
+            except sandbox_exec.SandboxUnavailable:
+                raise
+            except subprocess.TimeoutExpired as exc:
+                if sweep.out_of_budget(ctx.started):
+                    part.cut = True
+                    part.cut_namespace = namespace
+                    break
+                part.unreadable[scope_key(cid)] = (
+                    f"namespace {namespace} {failure_text(exc)}; the cluster's remaining namespaces were skipped this tick"
+                )
+                break
+            except READ_FAILURES as exc:
+                if not covered:
+                    part.unreadable[scope_key(cid, namespace)] = failure_text(exc)
+                    continue
+                # The leftover kinds failed here too (a kind no identity can
+                # list fails at both scopes, and a read of those kinds alone
+                # exits 2). The report's rows for the other kinds stand, the
+                # namespace was read, and the leftover kinds are held, as a
+                # kind the old single read skipped was.
+                more, unread = [], set(pending)
+            findings += more
+        scans += 1
+        part.read_scopes.add(scope_key(cid, namespace))
+        if namespace in next_turns and isinstance(record, dict):
+            # The namespace was read: its window moves on for the next
+            # tick that reads it, and only then. On a copy: the ledger's
+            # record is the main thread's to write.
+            turns = dict(record.get(DISCOVERY_TURN_KEY) or {}) if isinstance(record.get(DISCOVERY_TURN_KEY), dict) else {}
+            turns[namespace] = next_turns[namespace]
+            record = {**record, DISCOVERY_TURN_KEY: turns}
+            part.discovery = record
+        # A kind the cluster does not serve holds its rows without making
+        # the namespace unreadable: most clusters lack some optional CRD.
+        # So does a wildcard kind discovery could not read or the cap cut.
+        not_asked = unread | dropped | (held - set(extra_kinds.get(namespace, []))) | cut.get(namespace, set())
+        if not_asked:
+            part.partial_scopes[scope_key(cid, namespace)] = not_asked
+        if unread:
+            part.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
+        elif cut.get(namespace):
+            part.unreadable[scope_key(cid, namespace)] = (
+                f"partial: {len(cut[namespace])} wildcard kinds wait their turn behind the {WILDCARD_KINDS_CAP} read this tick: "
+                f"{', '.join(sorted(cut[namespace]))}"
+            )
+        for f in findings:
+            # An object with the exempt annotation: its rows are not the
+            # watch's to alert on, and its ledger rows go this tick.
+            if f.get(EXEMPT_FIELD):
+                part.exempt_objects.add((cid, f.get("namespace", namespace), f.get("object", "")))
+                continue
+            part.rows[ledger_key(cid, f)] = {
+                "cluster": cid,
+                "namespace": f.get("namespace", namespace),
+                "object": f.get("object", ""),
+                "heuristic": f.get("heuristic", ""),
+                "detail": f.get("detail", ""),
+                "stalled_for": f.get("stalled_for", ""),
+                # The object's own age, which the minimum-age gate reads.
+                "stalled_seconds": f.get("stalled_seconds", 0),
+            }
+    # Recorded whether the loop ran out or the budget cut it; the cut is
+    # its own field, because a cluster with a namespace it could not read
+    # also scans fewer than it listed.
+    part.timing = timing_record(now, cluster_clock, len(part.namespaces), scans, part.cut, carried_seconds)
+    return part
+
+
 def sweep_fleet(
     management_project: str,
     cursor: dict | None = None,
     credentials: dict[str, str] | None = None,
     now: str | None = None,
+    discovered: dict[str, dict] | None = None,
+    cluster_timings: dict[str, dict] | None = None,
 ) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
     fails the sweep. `credentials` is the ledger's record of when each
-    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY) and `now` the
-    tick's time, which a fetch this tick is recorded as."""
-    projects, unread_profiles = roster_projects()
-    sweep = Sweep({management_project} | projects)
-    sweep.unread_profiles = set(unread_profiles)
-    sweep.unreadable.update(unread_profiles)
+    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY), `discovered`
+    its record of each cluster's wildcard discovery (DISCOVERED_KINDS_KEY),
+    `cluster_timings` its record of what each cluster cost to read
+    (CLUSTER_TIMINGS_KEY), and `now` the tick's time, which a fetch, a
+    discovery or a read this tick is recorded as."""
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home(), management_project=management_project)
+    # Under spec.mode: next the resolved scope answers (#5621): the management
+    # and explicit projects are listed live, a member project's clusters come
+    # from the scope publisher's list, and a member nothing listed is held as
+    # a failed listing is. Outside it, the profiles' projects are listed live.
+    entries = scope.by_project() if scope.next_mode else {}
+    if scope.next_mode:
+        sweep = Sweep({management_project} | set(entries))
+        live = {management_project} | {p for p, e in entries.items() if e.status == fleet_scope_targets.STATUS_LIST_LIVE}
+    else:
+        projects, unread_profiles = roster_projects(scope)
+        sweep = Sweep({management_project} | projects)
+        sweep.unread_profiles = set(unread_profiles)
+        sweep.unreadable.update(unread_profiles)
+        live = sweep.projects
     records = dict(credentials or {})
+    discoveries = dict(discovered or {})
+    timings = dict(cluster_timings or {})
     now = now or now_iso()
     started = time.monotonic()
+    clock = time.perf_counter()
     source = report_source()
     failures: dict[str, Exception] = {}
-    listings = list_projects(sorted(sweep.projects), management_project, started)
+    listings = list_projects(sorted(live), management_project, started)
+    listing_seconds = seconds_since(clock)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
+    resolved_listed = False
     for project in sorted(sweep.projects):
-        listing = listings[project]
+        resolved = False
+        if project in listings:
+            listing = listings[project]
+        elif entries[project].status == fleet_scope_targets.STATUS_UNREAD:
+            sweep.unlisted_projects.add(project)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = entries[project].reason or ""
+            continue
+        else:
+            # The publisher's probe listed names and locations, not statuses:
+            # each is swept, and one that is not serving fails its read.
+            listing = ([{"name": name, "location": location, "status": ""} for _, location, name in entries[project].clusters or ()], None)
+            resolved = resolved_listed = True
         if isinstance(listing, Exception):
             failures[project] = listing
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(listing)
             continue
         clusters, incomplete = listing
+        if scope.next_mode:
+            # The reader leaves an excluded cluster out of a member's listing; it
+            # has left the roster all the same, so an alert open on it closes as
+            # the roster's, not as a stall that cleared.
+            for excluded_project, location, name in scope.excluded_clusters:
+                if excluded_project == project:
+                    sweep.unmanaged.add(cluster_id(project, name, location))
         if incomplete:
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
         for cluster in clusters:
             cid = cluster_id(project, cluster["name"], cluster["location"])
-            if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
+            if scope.next_mode:
+                # The cluster agent is one `cluster` AgentProfile with a target
+                # now (#3658): a cluster in the resolved scope and not excluded
+                # is swept, profile or none. An excluded one is not a gap.
+                if not scope.admits(project, cluster["location"], cluster["name"]):
+                    sweep.unmanaged.add(cid)
+                    continue
+            elif cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
                 sweep.unmanaged.add(cid)
                 sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
                 continue
             sweep.listed_clusters.add(cid)
-            if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
+            if resolved or cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
                 sweepable.append((cid, cluster))
                 sweep.sweepable_clusters.add(cid)
             else:
                 sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
-    if len(failures) == len(sweep.projects):
+    if len(failures) == len(live) and not resolved_listed:
         raise failures[management_project]
-    for cid, cluster in rotate_to_cursor(sweepable, cursor):
-        project, name, location = split_cluster_id(cid)
-        if sweep.out_of_budget(started, cid):
-            break
-        fetched = False  # a fetch was attempted this tick: at most one per cluster
-        wrote = False  # that fetch returned, so gcloud wrote the kubeconfig
-        readable = False  # the namespace read on it returned
+    # Clusters are read SCAN_WORKERS at a time, in cursor order. Each worker
+    # fills a ClusterPart and shares nothing but the budget flag; the parts
+    # are folded here, in sweep order, once every worker is done, so the
+    # ledger reads the same whatever order the clusters finished in. A lost
+    # sandbox on any worker ends the tick: the pending clusters are dropped
+    # and the tick reports one sweep failure, as before.
+    order = [cid for cid, _ in rotate_to_cursor(sweepable, cursor)]
+    ctx = SweepContext(sweep, now, started, source, cursor, records, discoveries, timings)
+    parts: list[ClusterPart] = []
+    if order:
+        pool = ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(order)))
+        futures = [pool.submit(read_cluster, ctx, cid) for cid in order]
         try:
-            if credentials_current(records.get(cid), now):
-                kubeconfig = kubeconfig_path(project, name, location)
-            else:
-                fetched = True
-                kubeconfig = fetch_credentials(project, name, location)
-                wrote = True
-            try:
-                namespaces = list_namespaces(kubeconfig)
-            except READ_FAILURES as exc:
-                # A reused kubeconfig the shim or the cluster refused -- the
-                # sandbox restarted and the file is gone, or the cluster was
-                # recreated: fetch once more and retry this one call. A fetch
-                # this tick is not repeated for the same failure, and a failure
-                # that says nothing about the kubeconfig (a timeout, a proxy
-                # refusal, an API error) gets no fetch: it would not repair it,
-                # and on a saturated tick it would be one more gcloud per
-                # cluster at the proxy that just said it was busy.
-                if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable) or not refetch_repairs(exc):
-                    raise
-                # Set before the fetch: a repair fetch that fails has not made
-                # the cluster readable either, so the record it was meant to
-                # replace goes, and the next tick fetches first rather than
-                # failing the same read on the same stub again.
-                fetched = True
-                kubeconfig = fetch_credentials(project, name, location)
-                wrote = True
-                namespaces = list_namespaces(kubeconfig)
-            # The namespace read is what proves the kubeconfig: a fetch whose
-            # kubeconfig just listed namespaces is recorded here, before the
-            # discovery call, whose failure says nothing about the kubeconfig.
-            readable = True
-            if fetched:
-                records[cid] = now
-            kinds, dropped = kinds_for(served_kinds(kubeconfig))
-        except sandbox_exec.SandboxUnavailable:
+            parts = [future.result() for future in futures]
+        except BaseException:
+            # A worker raised (a lost sandbox): the budget flag stops every
+            # other worker at its next check, the pending clusters are
+            # dropped, and the running ones are waited for, so no worker is
+            # still reading when the tick records the failure.
+            sweep.budget_exhausted = True
+            pool.shutdown(wait=True, cancel_futures=True)
             raise
-        except READ_FAILURES as exc:
-            sweep.unreadable[scope_key(cid)] = failure_text(exc)
-            sweep.failed_clusters.add(cid)
-            # A fetch that failed, or whose kubeconfig the read indicted (a
-            # REFETCH_SIGNALS failure), is no record to reuse. Every other
-            # record stays, and a fetch gcloud completed whose read then failed
-            # for a reason no fetch repairs is recorded as if it had read: the
-            # kubeconfig is written, and a dark cluster on its fetch tick would
-            # otherwise pay the describe and the fetch on every tick it stays
-            # dark. The trade is a kubeconfig gcloud wrote but that is wrong
-            # without saying so, held for a day rather than re-described every
-            # tick. The next tick reads on it again, and one bad tick does not
-            # put the fleet back on the fetch-everything path.
-            if fetched and not readable:
-                if wrote and not refetch_repairs(exc):
-                    records[cid] = now
-                else:
-                    records.pop(cid, None)
-            continue
-        sweep.read_clusters.add(cid)
-        sweep.listed_namespaces[cid] = set(namespaces)
-        if cursor and cursor.get("cluster") == cid and cursor.get("namespace") in namespaces:
-            # Resume inside the cluster the last tick stopped in; the namespaces
-            # before the cursor were read then and are unknown now, not gone.
-            namespaces = namespaces[namespaces.index(cursor["namespace"]):]
-        for namespace in namespaces:
-            if sweep.out_of_budget(started, cid, namespace):
-                break
-            try:
-                findings, unread = scan_namespace(kubeconfig, namespace, source, kinds)
-            except sandbox_exec.SandboxUnavailable:
-                raise
-            except subprocess.TimeoutExpired as exc:
-                sweep.unreadable[scope_key(cid)] = (
-                    f"namespace {namespace} {failure_text(exc)}; the cluster's remaining namespaces were skipped this tick"
-                )
-                break
-            except READ_FAILURES as exc:
-                sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
-                continue
-            sweep.read_scopes.add(scope_key(cid, namespace))
-            # A kind the cluster does not serve holds its rows without making
-            # the namespace unreadable: most clusters lack some optional CRD.
-            if unread | dropped:
-                sweep.partial_scopes[scope_key(cid, namespace)] = unread | dropped
-            if unread:
-                sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
-            for f in findings:
-                sweep.rows[ledger_key(cid, f)] = {
-                    "cluster": cid,
-                    "namespace": f.get("namespace", namespace),
-                    "object": f.get("object", ""),
-                    "heuristic": f.get("heuristic", ""),
-                    "detail": f.get("detail", ""),
-                    "stalled_for": f.get("stalled_for", ""),
-                }
+        pool.shutdown(wait=True)
+    for part in parts:
+        sweep.absorb(part)
+        if part.credential == CREDENTIAL_SET:
+            records[part.cid] = now
+        elif part.credential == CREDENTIAL_DROP:
+            records.pop(part.cid, None)
+        if part.discovery is not None:
+            discoveries[part.cid] = part.discovery
+        if part.timing is not None:
+            timings[part.cid] = part.timing
+    sweep.settle_budget(parts)
     # Clusters the budget never reached keep their records, and so does every
     # unlisted cluster whose rows `verdict` holds (`holds_unlisted`): a listing
     # that fails once, or an identity file unreadable for one tick, must not
@@ -1196,6 +2310,27 @@ def sweep_fleet(
         cid: at
         for cid, at in records.items()
         if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    sweep.discovered = {
+        cid: record
+        for cid, record in discoveries.items()
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    sweep.cluster_timings = {
+        cid: record
+        for cid, record in timings.items()
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    # `tick` fills TIMING_SECONDS_KEY once the alerts are raised and closed; a
+    # ledger saved before then (an alert's persist, then a tick that died)
+    # shows None there, which says the tick did not reach its end.
+    sweep.tick_timing = {
+        TIMING_AT_KEY: now,
+        TIMING_SECONDS_KEY: None,
+        TIMING_SWEEP_KEY: seconds_since(clock),
+        TIMING_LISTING_KEY: listing_seconds,
+        TIMING_CLUSTERS_KEY: sweep.clusters,
+        TIMING_SCANS_KEY: sweep.namespaces,
     }
     return sweep
 
@@ -1210,13 +2345,25 @@ def diff_and_update(state: dict, sweep: Sweep, now: str) -> tuple[dict, dict]:
     `cluster/namespace` scope."""
     previous = state["stalls"]
     current = dict(previous)
+    # The earliest sighting per object. A row's key carries its detail, so a
+    # generation-lag row gets a new key on every spec write; its new row keeps
+    # the object's first sighting, or a spec written more often than the
+    # minimum stall age would hold the stall forever.
+    first_seen_by_object: dict[tuple[str, str, str], str] = {}
+    for entry in previous.values():
+        seen = str(entry.get("first_seen") or "")
+        if seen and (object_key(entry) not in first_seen_by_object or seen < first_seen_by_object[object_key(entry)]):
+            first_seen_by_object[object_key(entry)] = seen
     for key, row in sweep.rows.items():
         entry = previous.get(key)
         if entry is None:
-            entry = {**row, "first_seen": now}
+            entry = {**row, "first_seen": first_seen_by_object.get(object_key(row), now)}
         current[key] = {**entry, **row, "last_seen": now, "missed": 0}
     for key, entry in previous.items():
         if key in sweep.rows:
+            continue
+        if object_key(entry) in sweep.exempt_objects:
+            del current[key]
             continue
         verdict = sweep.verdict(entry)
         if verdict == UNKNOWN:
@@ -1516,10 +2663,33 @@ def scope_rows(state: dict, scope: str) -> list[dict]:
     return [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
 
 
-def would_raise(state: dict, sweep: Sweep, scope: str) -> bool:
+def row_age_seconds(entry: dict, now: str) -> float:
+    """How long a ledgered row's stall has lasted: the longer of the age
+    stall_report.py measured on the object and the time since the watch first
+    saw the object stall (`diff_and_update` carries that over to the object's
+    new rows). A field that does not parse counts as no age."""
+    try:
+        reported = float(entry.get("stalled_seconds") or 0)
+    except (TypeError, ValueError):
+        reported = 0.0
+    try:
+        seen = (datetime.fromisoformat(now) - datetime.fromisoformat(str(entry.get("first_seen")))).total_seconds()
+    except (TypeError, ValueError):  # TypeError: a hand-edited time with no timezone
+        seen = 0.0
+    return max(reported, seen)
+
+
+def would_raise(state: dict, sweep: Sweep, scope: str, now: str, min_age: float) -> bool:
     """Whether a scope is a candidate for an alert this tick: read this tick,
-    with a row not on its way out."""
-    return scope in sweep.read_scopes and any(not e.get("missed") for e in scope_rows(state, scope))
+    with a row not on its way out that has lasted `min_age` seconds. A scope
+    whose rows are all younger is held, not dropped: its rows stay in the
+    ledger and it is asked again on the next tick."""
+    if scope not in sweep.read_scopes:
+        return False
+    live = [e for e in scope_rows(state, scope) if not e.get("missed")]
+    if min_age <= 0:
+        return bool(live)
+    return any(row_age_seconds(e, now) >= min_age for e in live)
 
 
 def scope_first_seen(state: dict, scope: str) -> str:
@@ -1628,6 +2798,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
     expired = set() if dry_run else adopt_cards(state, now)
+    min_age = min_age_seconds()
     # Every scope read this tick that has rows and no episode, or an episode
     # whose alert expired with no card, is a candidate, whether its objects
     # appeared now or it has waited: past the cap, after a refused alert, or
@@ -1635,7 +2806,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope):
+        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope, now, min_age):
             candidates[scope] = []
     # Objects held for a card go through the same card check as new ones, so a
     # card finished before they reach it gets a new alert, not a comment.
@@ -1644,6 +2815,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
             candidates[scope] = []
     raised = held = 0
+    unrouted: list[str] = []
+    opened: set[str] = set()
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -1660,12 +2833,19 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if dry_run:
             if episode:
                 what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
-            elif raised < MAX_ALERTS_PER_TICK:
-                what, shown = "would raise an alert for", rows
-                raised += 1
-            else:
+            elif not would_raise(state, sweep, scope, now, min_age):
+                continue
+            elif cluster_agent_for(project, name, location) is None:
+                # The same check a real alert makes, in the same place: no
+                # profile, no alert, and no promise of one at the cap.
+                unrouted.append(scope)
+                continue
+            elif raised >= MAX_ALERTS_PER_TICK:
                 held += 1
                 continue
+            else:
+                what, shown = "would raise an alert for", rows
+                raised += 1
             lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(shown))}")
             continue
         if episode:
@@ -1695,7 +2875,18 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 # keeps the scope a candidate, and a clear still finds it.
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
                 previous = episode
-        if not would_raise(state, sweep, scope):
+        if not would_raise(state, sweep, scope, now, min_age):
+            continue
+        # The profile is checked before the cap and a refusal, so a stall no
+        # alert can follow for is never counted among those held for one.
+        assignee = cluster_agent_for(project, name, location)
+        if assignee is None:
+            # Outside next mode the profile went between the sweep and the
+            # alert, and the next sweep leaves the cluster out. Under next mode
+            # the cluster is swept whether or not it has a profile, so the
+            # stall is said in chat rather than lost (below).
+            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
+            unrouted.append(scope)
             continue
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
@@ -1703,12 +2894,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         if raised >= MAX_ALERTS_PER_TICK:
             held += 1
-            continue
-        assignee = cluster_agent_for(project, name, location)
-        if assignee is None:
-            # The profile went between the sweep and the alert; the next sweep
-            # leaves the cluster out and its rows clear.
-            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
         try:
@@ -1733,6 +2918,21 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
         raised += 1
+        opened.add(scope)
+    # A namespace already said stays said while its rows stay ledgered: a tick
+    # that did not read it, held it at the cap, or saw only some of the set
+    # clear is not news. It is forgotten once its rows go or this tick's alert
+    # opens an episode for it, so a stall that comes back is said again; an
+    # older episode it still holds (an expired alert, a finished card) does
+    # not make it news again.
+    ledgered = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    said = {scope for scope in state.get(UNROUTED_KEY) or [] if scope in ledgered and scope not in opened}
+    fresh = sorted(set(unrouted) - said)
+    if fresh:
+        shown = names_text([scope_label_text(scope) for scope in fresh])
+        text = f"{NOTICED_PREFIX} in {len(fresh)} namespace{'s' if len(fresh) > 1 else ''} {UNROUTED_MARK} ({shown}); no alert was raised, and each is said once while it stays stalled"
+        lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
+    state[UNROUTED_KEY] = sorted(said | set(unrouted)) or None
     if held:
         text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
@@ -1747,12 +2947,45 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             lines.append(INJECT_RECOVERED_LINE)
         state[INJECT_ERROR_KEY] = None
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    for scope in open_scopes & set(episodes):
+        # The scope has rows again: an exclusion or exemption that emptied it
+        # was reverted, or the stall came back. Its next close is judged afresh.
+        episodes[scope].pop(CLEAR_REASON_KEY, None)
+        episodes[scope].pop(EXEMPT_OBJECTS_KEY, None)
+        episodes[scope].pop("cleared_at", None)
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
-        cleared = names_text(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
-        if sweep.left_roster(split_scope(scope)[0]):
+        leaving = cleared_by_scope.get(scope, [])
+        reason = episode.get(CLEAR_REASON_KEY)
+        if reason and clear_reason_lapsed(sweep, scope, episode):
+            # What stored the reason no longer holds: judge the close afresh,
+            # but not on a read that skipped a kind the alert's objects are,
+            # or the events, which can still hold the stall. The next tick
+            # asks again.
+            if skipped_could_hold(sweep, scope, episode.get("objects") or []):
+                continue
+            reason = None
+        if not reason:
+            reason = clear_reason(sweep, scope, leaving)
+            if not dry_run:
+                # Stored on the tick that saw the rows go: a later tick no
+                # longer holds them, so a close retried after a board error
+                # would read as a plain clearing.
+                episode[CLEAR_REASON_KEY] = reason
+                if reason == CLEAR_REASON_EXEMPT:
+                    episode[EXEMPT_OBJECTS_KEY] = object_names(leaving)
+                else:
+                    episode.pop(EXEMPT_OBJECTS_KEY, None)
+        cleared = names_text(object_names(leaving) or episode.get("objects", []))
+        if reason == CLEAR_REASON_ROSTER:
             cleared = "the cluster left the Cluster Agent roster"
             note = f"The cluster left the Cluster Agent roster; the watch no longer reads it, as of {now}."
+        elif reason == CLEAR_REASON_EXCLUDED:
+            cleared = "the namespace was excluded from the watch"
+            note = f"The namespace `{namespace_of(scope)}` was excluded from the watch; the watch no longer reads it, as of {now}."
+        elif reason == CLEAR_REASON_EXEMPT:
+            note = f"The watch no longer alerts on {cleared} in `{namespace_of(scope)}`: marked `{EXEMPT_ANNOTATION}: {EXEMPT_VALUE}`, as of {now}."
+            cleared = f"{cleared} exempted from the watch"
         else:
             note = f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."
         if dry_run:
@@ -1789,12 +3022,69 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     return lines
 
 
+def clear_reason(sweep: Sweep, scope: str, leaving: list[dict]) -> str:
+    """Why this tick's sweep left an open alert's namespace with no rows:
+    `leaving` is the rows that went this tick."""
+    if sweep.left_roster(split_scope(scope)[0]):
+        return CLEAR_REASON_ROSTER
+    if sweep.excluded(scope):
+        return CLEAR_REASON_EXCLUDED
+    if leaving and all(object_key(e) in sweep.exempt_objects for e in leaving):
+        return CLEAR_REASON_EXEMPT
+    return CLEAR_REASON_CLEARED
+
+
+def clear_reason_lapsed(sweep: Sweep, scope: str, episode: dict) -> bool:
+    """Whether the close reason an earlier tick stored for an open alert no
+    longer holds. Each reason is checked against its own evidence, and only
+    when this tick saw that evidence; otherwise the stored reason stands."""
+    reason = episode.get(CLEAR_REASON_KEY)
+    cid, namespace = split_scope(scope)
+    if reason == CLEAR_REASON_ROSTER:
+        return not sweep.left_roster(cid) and (scope in sweep.read_scopes or sweep.excluded(scope))
+    if reason == CLEAR_REASON_EXCLUDED:
+        return scope in sweep.read_scopes
+    if reason == CLEAR_REASON_EXEMPT and scope in sweep.read_scopes:
+        kubeconfig = kubeconfig_path(*split_cluster_id(cid))
+        return not all(
+            (cid, namespace, obj) in sweep.exempt_objects or object_exempt(kubeconfig, namespace or "", obj)
+            for obj in episode.get(EXEMPT_OBJECTS_KEY) or []
+        )
+    return False
+
+
+def skipped_could_hold(sweep: Sweep, scope: str, objects: list[str]) -> bool:
+    """Whether this tick's scan of the scope skipped the events, or a kind one
+    of `objects` (`Kind/name`) is. A kind the cluster does not serve is
+    skipped on every tick and holds none of them."""
+    skipped = sweep.partial_scopes.get(scope, set())
+    if EVENTS_MARKER in skipped:
+        return True
+    kinds = {str(obj).split("/", 1)[0] for obj in objects}
+    return any(resource_names_kind(r, kind) for r in skipped for kind in kinds)
+
+
+def object_exempt(kubeconfig: str, namespace: str, obj: str) -> bool:
+    """Whether an object still carries the exempt annotation. A deleted object
+    does not. A read that fails says nothing, so it keeps the reason. The
+    object is named `Kind/name`, as stall_report.py names it, so where two API
+    groups serve the same kind kubectl may read the other one and the close
+    says "cleared" rather than "exempt"."""
+    argv = [*EXEMPT_READ_ARGV, obj, NAMESPACE_FLAG, namespace, *EXEMPT_READ_FLAGS]
+    try:
+        r = run_sandbox(argv, timeout=EXEMPT_READ_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+    except READ_FAILURES:
+        return True
+    return r.returncode != 0 or r.stdout == EXEMPT_VALUE
+
+
 def namespace_of(scope: str) -> str:
     return split_scope(scope)[1] or ""
 
 
 def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     now = now_iso()
+    clock = time.perf_counter()
     lines: list[str] = []
     try:
         project = project_id()
@@ -1806,7 +3096,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     try:
         if lookup_error:
             raise lookup_error
-        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now)
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now, state.get(DISCOVERED_KINDS_KEY), state.get(CLUSTER_TIMINGS_KEY))
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -1819,6 +3109,9 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
         state[CREDENTIALS_KEY] = sweep.credentials
+        state[DISCOVERED_KINDS_KEY] = sweep.discovered
+        state[CLUSTER_TIMINGS_KEY] = sweep.cluster_timings
+        state[TICK_TIMING_KEY] = sweep.tick_timing
         view = sweep.view()
         if sweep.budget_exhausted:
             if not state.get(BUDGET_EXHAUSTED_KEY):
@@ -1853,6 +3146,8 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
                 state[BUDGET_HELD_TICKS_KEY] = 0
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
+        # The whole tick, alerts included: what the scheduler's run time shows.
+        state[TICK_TIMING_KEY][TIMING_SECONDS_KEY] = seconds_since(clock)
     if not dry_run:
         save_state(state_path, state)
     return lines

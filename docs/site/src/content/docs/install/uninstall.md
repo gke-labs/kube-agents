@@ -39,6 +39,7 @@ Several things in the stack are not symmetric — destroying them is not the inv
 | Asymmetry                                                                                                              | What `lifecycle.sh destroy` does                                                                                                                                                                                                                                             |
 | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Cloud KMS key rings and keys can never be deleted, and destroying the key resource schedules its versions' destruction | Forgets them from Terraform state so they stay usable in GCP; the next `lifecycle.sh apply` adopts them back automatically                                                                                                                                                   |
+| Installs in a project that use the same cluster key share its one grant to the GKE service agent                       | Forgets the grant from Terraform state too, so the other clusters keep their access to the key; the next `lifecycle.sh apply` puts it back in state                                                                                                                          |
 | The `PlatformAgent` CR carries a finalizer only the operator can clear                                                 | Deletes the CR up front and waits, force-clearing the finalizer (and removing the orphaned cluster-scoped RBAC and JetStream PVC) if wedged                                                                                                                                  |
 | A GKE `BackupPlan` cannot be deleted while it still owns backups                                                       | Permanently deletes every backup the plan owns first                                                                                                                                                                                                                         |
 | The cluster's `deletion_protection = true` cannot be overridden by a destroy alone                                     | Applies it as `false` first, then destroys                                                                                                                                                                                                                                   |
@@ -75,22 +76,22 @@ A workspace registered by hand in another Hermes harness ([Manual install](/kube
 
 ## What a teardown leaves
 
-On GCP the teardown keeps the Cloud KMS key rings and keys (GCP cannot delete them; the next install adopts them) and the Terraform state bucket, `gs://<project>-kube-agents-tfstate`. Delete the bucket yourself if the project will not host kube-agents again:
+On GCP the teardown keeps the Cloud KMS key rings and keys (GCP cannot delete them; the next install adopts them) and the Terraform state bucket, `gs://<project>-kube-agents-tfstate`. When the install made the cluster key's grant of `roles/cloudkms.cryptoKeyEncrypterDecrypter` to the GKE service agent, it keeps that too, even after the last install: other installs that use the key need it. Delete the bucket yourself if the project will not host kube-agents again:
 
 ```bash
 gcloud storage rm -r gs://<project>-kube-agents-tfstate
 ```
 
-The service accounts, IAM bindings, the Google Chat Pub/Sub topic and subscription, and the rest of the resources in the Terraform state are destroyed, except the project's APIs, which stay enabled. On a cluster the install did not create, the cluster-level settings it turned on stay: CMEK database encryption, the Workload Identity pool, node pools moved to the GKE metadata server, and Calico NetworkPolicy. Your `install.env` stays too, and so do the Slack app and the Google Chat app, which you configured outside the install.
+The service accounts, the other IAM bindings, the Google Chat Pub/Sub topic and subscription, and the rest of the resources in the Terraform state are destroyed, except the project's APIs, which stay enabled. On a cluster the install did not create, the cluster-level settings it turned on stay: CMEK database encryption, the Workload Identity pool, node pools moved to the GKE metadata server, and Calico NetworkPolicy. Your `install.env` stays too, and so do the Slack app and the Google Chat app, which you configured outside the install.
 
-A cluster the install created is deleted with everything in it. On a cluster it did not create, Helm removes its releases and leaves the namespaces it installed into, `kubeagents-system` and, when the install brought cert-manager, `cert-manager`, along with the kube-agents CRDs, since Helm never deletes a chart's `crds/`. Anything in `kubeagents-system` that Helm did not create is still there: the shell sandbox's two volumes, `data-platform-agent-shell-0` and `sshd-platform-agent-shell-0`, which its StatefulSet keeps on purpose; a registry pull Secret you created, the GitLab token Secret and, for a private CA, the GitLab or GitHub Enterprise Server CA Secret (`gitlab-forge-ca` or `github-forge-ca`) that the installer creates after the apply, and, on the unsupported `spec.mode: next`, the gateway's `a2a-slack-principal-map` and `discord-bot` Secrets if you created them. Once the teardown has finished, remove them with the namespace; delete the CRDs only when no other install on the cluster uses them, since that deletes every `PlatformAgent` on it:
+A cluster the install created is deleted with everything in it. On a cluster it did not create, Helm removes its releases and leaves the namespaces it installed into, `kubeagents-system` and, when the install brought cert-manager, `cert-manager`, along with the kube-agents CRDs, since Helm never deletes a chart's `crds/`. Anything in `kubeagents-system` that Helm did not create is still there: the shell sandbox's two volumes, `data-platform-agent-shell-0` and `sshd-platform-agent-shell-0`, which its StatefulSet keeps on purpose; a registry pull Secret you created, the GitLab or Bitbucket token Secret and, for a private CA, the GitLab, Bitbucket Data Center or GitHub Enterprise Server CA Secret (`gitlab-forge-ca`, `bitbucket-forge-ca` or `github-forge-ca`) that the installer creates after the apply, the gateway's credentials Secret (`LITELLM_ENV_SECRET_NAME`) and its CA Secret (`OPENAI_COMPATIBLE_CA_SECRET_NAME`) if you created them, and, on `spec.mode: next`, the gateway's `a2a-slack-principal-map` and `discord-bot` Secrets if you created them. Once the teardown has finished, remove them with the namespace; delete the CRDs only when no other install on the cluster uses them, since that deletes every `PlatformAgent` on it:
 
 ```bash
 kubectl delete namespace kubeagents-system
-kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io
+kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io tiers.kubeagents.x-k8s.io
 ```
 
-To keep the namespace and remove only the GitLab Secrets, use this command. It reads the Secret names and the namespace from the install's `install.env`, the same way the installer reads that file:
+To keep the namespace and remove only the GitLab or Bitbucket Secrets, use this command. It reads the Secret names and the namespace from the install's `install.env`, the same way the installer reads that file:
 
 ```bash
 # The install's install.env: beside install.sh for an install from an unpacked release or
@@ -104,14 +105,14 @@ ENV_FILE="$HOME/kube-agents/install.env"
 )
 ```
 
-The subshell keeps the file's variables out of your shell. After the teardown, revoke the GitLab token in GitLab.
+The subshell keeps the file's variables out of your shell. The `gitlab-forge-token` fallback applies only to a GitLab install whose `install.env` records no Secret name; `install.sh` records the name for every GitLab and Bitbucket install, so a Bitbucket install deletes its own Secret (default `bitbucket-forge-token`). After the teardown, revoke the token in GitLab or Bitbucket, and the read-only token too, if you made one.
 
 ### What `spec.mode: next` leaves behind
 
-The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`: its finalizer deletes the JetStream volume, `data-platform-agent-a2a-nats-0`, and the rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps that volume and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
+The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`. Its finalizer deletes the JetStream volumes, one per bus server (`data-platform-agent-a2a-nats-0` through `-2` on a three-server bus). The rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps those volumes and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
 
 ```bash
-kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system
+kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
 kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
 ```
 
@@ -130,8 +131,11 @@ The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.m
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do
   kubectl delete "$o"
 done
-kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
+kubectl delete statefulset platform-agent-a2a-nats -n kubeagents-system --cascade=foreground --wait=false --ignore-not-found=true
+kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
 ```
+
+The bus StatefulSet is marked for deletion before the volumes. A volume deleted while the StatefulSet still runs is recreated with its server and left behind, and a later install can then fail to place that server.
 
 ## Where to go next
 

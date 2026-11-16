@@ -25,6 +25,8 @@
 #                        already running and an apply keeps it where it is.
 #   LEASE_POLICY         defer (default) | fail | ignore — what an apply does
 #                        when somebody is live-testing against this install
+#   ALLOW_BREAKING_DOWNGRADE  `true` passes --allow-breaking-downgrade, for a
+#                        deliberate rollback across a breaking change
 #   plus every install setting render_install_env.sh maps.
 set -euo pipefail
 
@@ -150,7 +152,7 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     # every kind of breakage -- a bad kubeconfig, an API server mid-upgrade, a
     # renamed namespace -- into a green run that applied nothing. Only a lease
     # somebody genuinely holds is a deferral; anything else is a failure.
-    if ! printf '%s' "${holder}" | grep -q '"state": "held"'; then
+    if ! grep -q '"state": "held"' <<<"${holder}"; then
       echo "::error title=Live-test lease could not be read::Could not determine whether '${ENV_NAME}' is in use, so this reconcile stopped rather than assuming either answer. ${holder}"
       summary "### Reconcile failed — \`${ENV_NAME}\`"
       summary ""
@@ -233,6 +235,9 @@ elif [ "$MODE" = "apply" ]; then
   # An apply with no tag has to say so. Empty otherwise means "the caller's
   # IMAGE_TAG did not resolve", which upgrade.sh refuses on purpose.
   UPGRADE_ARGS+=(--keep-image-tag)
+fi
+if [ "${ALLOW_BREAKING_DOWNGRADE:-false}" = "true" ]; then
+  UPGRADE_ARGS+=(--allow-breaking-downgrade)
 fi
 
 # Somewhere the calling workflow can read afterwards, so the drift report can

@@ -38,7 +38,7 @@
 locals {
   # Every kubectl runs against a kubeconfig this stack fetches for itself in
   # step 0, never the ambient one: the current-context is not the host cluster
-  # by the time this apply runs. The sibling's step 0 says why at length.
+  # by the time this apply runs. drift_init in bench/tf/modules/drift-inject says why at length.
   kubectl = "kubectl"
 
   ci_labels = {
@@ -184,7 +184,7 @@ resource "null_resource" "drift_noise" {
       # Fetched rather than inherited: devops-bench moves the ambient
       # current-context after every `deployer: tofu` task in the matrix
       # (evalharness/default.py calls get_cluster_info() unconditionally after
-      # up()). The sibling's step 0 carries the full argument.
+      # up()). drift_init in bench/tf/modules/drift-inject carries the full argument.
       #
       # A directory rather than `mktemp` on its own: get-credentials refuses to
       # load an existing empty file, warns, and writes a stray .backup beside

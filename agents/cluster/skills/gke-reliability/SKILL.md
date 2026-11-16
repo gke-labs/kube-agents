@@ -1,6 +1,6 @@
 ---
 name: gke-reliability
-description: Workflows for ensuring high availability and reliability of GKE workloads.
+description: Workflows for ensuring high availability and reliability of GKE workloads. Use for PodDisruptionBudgets, replica counts, probes, zone spread and topology design reviews. For a "what is failing" or "is it healthy" question use workload-triage-scan instead.
 ---
 
 # GKE Reliability Skill
@@ -34,6 +34,17 @@ PDBs ensure that a minimum number of pods are available during voluntary disrupt
 kubectl get pdb -n <namespace>
 ```
 
+**Assess drain exposure** (a missing PDB is not, on its own, a workload that "won't survive a drain"):
+
+```bash
+kubectl get pods -n <namespace> -l <selector> -o wide
+```
+
+- State the observed placement: replica count and pods per node (`3 pods on 3 nodes`).
+- Say a single drain evicts only the pods on the drained node; replicas elsewhere keep running.
+- Frame a missing PDB as unprotected during voluntary disruptions such as node-pool upgrades and autoscaler scale-downs: back-to-back drains can evict the next replica before its replacement is Ready.
+- Flag co-location separately: with no pod anti-affinity or topology spread, a reschedule can put replicas on one node, and one drain then takes them all.
+
 **Example Manifest:**
 
 ```yaml
@@ -42,7 +53,7 @@ kind: PodDisruptionBudget
 metadata:
   name: my-app-pdb
 spec:
-  minAvailable: 2
+  maxUnavailable: 1 # never minAvailable: it can block every drain
   selector:
     matchLabels:
       app: my-app

@@ -1,6 +1,6 @@
 """The eval rosters under hack/eval/, read the way hack/ci-eval-pr.sh reads them.
 
-Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
+The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
@@ -9,7 +9,12 @@ Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
-  ``BOOTSTRAP_ADMITTED``.
+  ``BOOTSTRAP_ADMITTED``;
+- the certification suite has no file: ``EVAL_TIER=certification`` runs every
+  task file under ``bench/tasks/`` carrying the bare line ``suite: certification``,
+  in sections by its ``certification_part: N`` line, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -25,6 +30,11 @@ out of the text of ``hack/ci-eval-pr.sh`` from a commit before the move
 separate function from ``parse_blocking_roster`` on purpose: a reader always
 knows which shape it holds, and a parser that guessed would take a comment in
 the roster file that quotes the override syntax for the roster itself.
+
+``presubmit_wall_estimate`` prices the presubmit from ``unit_cost_hint`` and
+the fan-out's two phases in ``hack/ci-eval-pr.sh``, read out of the script's
+text; ``--summary`` prints it beside ``PRESUBMIT_WALL_BUDGET_MINUTES``, and
+``scripts/test_eval_rosters.py`` fails a roster that goes over (#3968, rule 5e).
 """
 
 from __future__ import annotations
@@ -40,12 +50,35 @@ BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
 # The GitLab lane's presubmit matrix (kube-agents#2394): what EVAL_FORGE=gitlab
 # runs on a pull request, a subset of presubmit-cases.txt.
 GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
+# The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
+# same rules as the GitLab lane's.
+GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
+# The certification suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: certification`, and in section N
+# (one ci-kube-agents-certification periodic each) when it carries
+# `certification_part: N`; no line is part 1. The two patterns are the
+# whole grammar, the twins of CERTIFICATION_SUITE_LINE_RE and
+# CERTIFICATION_PART_LINE_RE in hack/ci-eval-pr.sh; the validator refuses a
+# task file whose YAML says the suite or the part in any other spelling, so
+# what this module lists is what the shell runs.
+CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
+CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite: certification$", re.M)
+CERTIFICATION_PART_KEY = "certification_part"
+CERTIFICATION_PART_LINE_RE = re.compile(r"^certification_part: ([1-9][0-9]*)$", re.M)
+CERTIFICATION_DEFAULT_PART = 1
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
-# The inject lane's safeguards (#2079): the verification_spec entries the
-# script appends to every case it runs on that lane. YAML, so this
+# Its mirror (#3263): the cases every lane but the inject one drops, because
+# their premise needs the inject door. Same shape, same reason rule.
+API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
+# The lane safeguards (#2079): the verification_spec entries the script
+# appends to every case it runs, on the api and inject lanes alike (#2611;
+# the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
 INJECT_LANE_SAFEGUARDS_FILE = EVAL_DIR / "inject-lane-safeguards.yaml"
@@ -149,6 +182,60 @@ def gitlab_cases(path: pathlib.Path = GITLAB_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
+def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def certification_part(text: str) -> int:
+    """The part a task file's text puts its case in: the N of its bare
+    ``certification_part: N`` line, CERTIFICATION_DEFAULT_PART without one."""
+    match = CERTIFICATION_PART_LINE_RE.search(text)
+    return int(match.group(1)) if match else CERTIFICATION_DEFAULT_PART
+
+
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def certification_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
+    """Case ids whose task file carries the bare suite line, in case-id order
+    (the order the shell's ``LC_ALL=C sort`` gives the same names). A task
+    file that cannot be read is left out here; the validator reports it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
+    names = []
+    # Sorted by case id, the shell's `sort -t/ -k2,2`: sorting the paths
+    # would put `foo-bar` before `foo` (`-` sorts before `/`), the shell's
+    # field sort and this key agree. The text is read with newline="" so a
+    # CRLF file keeps its `\r` and the bare-line regex does not match it,
+    # as grep does not; the validator reports the spelling.
+    for task in sorted(tasks_dir.glob("*/task.yaml"), key=lambda path: path.parent.name):
+        text = _task_text(task)
+        if text is not None and CERTIFICATION_SUITE_LINE_RE.search(text):
+            names.append(task.parent.name)
+    return names
+
+
+def _task_text(task: pathlib.Path) -> str | None:
+    """A task file's text as the shell sees it (line endings kept); None when
+    it cannot be read, which the validator reports on its own."""
+    try:
+        with task.open(encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def certification_parts(tasks_dir: pathlib.Path | None = None) -> dict[int, list[str]]:
+    """Case ids of the suite by part, each list in case-id order; a part
+    nobody names is absent, since the script refuses to run it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
+    parts: dict[int, list[str]] = {}
+    for name in certification_cases(tasks_dir):
+        part = certification_part(_task_text(tasks_dir / name / "task.yaml") or "")
+        parts.setdefault(part, []).append(name)
+    return parts
+
+
 def parse_lane_exclusions(text: str) -> dict[str, str]:
     """Case ids of a lane-exclusion file, each with the reason above it.
 
@@ -179,3 +266,253 @@ def parse_lane_exclusions(text: str) -> dict[str, str]:
 
 def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
+
+
+def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
+    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
+
+
+# The nightly file's last section opens with this line (#3495). Entries above
+# it are frozen in the order they landed; entries below it are kept in case-id
+# order, each with its reason as the comment lines directly above it, so two
+# pull requests that each add a case land on different lines.
+NIGHTLY_SORTED_SECTION_MARKER = "# ── New cases, sorted by case id"
+
+
+def split_nightly(text: str) -> tuple[list[str], list[str], str]:
+    """The nightly file's case ids above and below the sorted-section marker,
+    and the text from the marker on.
+
+    Raises ValueError when the marker is missing or appears twice, because the
+    roster test's two halves (an exact pin above, order and reasons below)
+    only mean something with exactly one boundary.
+    """
+    lines = text.splitlines(keepends=True)
+    at = [i for i, line in enumerate(lines) if line.startswith(NIGHTLY_SORTED_SECTION_MARKER)]
+    if len(at) != 1:
+        raise ValueError(
+            f"expected one {NIGHTLY_SORTED_SECTION_MARKER!r} line in the nightly file, found {len(at)}")
+    head, tail = "".join(lines[:at[0]]), "".join(lines[at[0]:])
+    return case_names(head), case_names(tail), tail
+
+
+# ─── The presubmit's wall time, estimated (#3968, rule 5e) ──────────────────
+# The fan-out in hack/ci-eval-pr.sh, priced from the script's own numbers so
+# the two cannot disagree: unit_cost_hint's per-case seconds, the default
+# EVAL_TASK_PARALLELISM and the GitHub-write settle. Read out of the script's
+# text, the way parse_script_roster reads the old roster line.
+CI_EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+COST_HINT_FUNCTION_RE = re.compile(r"^unit_cost_hint\(\) \{\n(.*?)^\}$", re.MULTILINE | re.DOTALL)
+COST_HINT_ARM_RE = re.compile(r"^\s*([A-Za-z0-9_*|\s-]+?)\)\s*echo\s+(\d+)\s*;;", re.MULTILINE)
+DEFAULT_ARM = "*"
+PARALLELISM_RE = re.compile(r'^EVAL_TASK_PARALLELISM="\$\{EVAL_TASK_PARALLELISM:-(\d+)\}"', re.MULTILINE)
+SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.MULTILINE)
+REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
+# The check types that request a pull request, as
+# bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
+# case with such a leaf, or with a `requested_pull_requests:` key of its own,
+# runs in the fan-out's serial second phase.
+# scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
+REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
+# Build, deploy and lease, outside the fan-out: "~15min of build and deploy
+# outside it" in hack/ci-eval-pr.sh's 2026-09-22 note on the green presubmits.
+PRESUBMIT_FIXED_OVERHEAD_SECONDS = 15 * 60
+# The ceiling on the estimate below, in minutes. A roster edit that pushes the
+# estimate past it fails scripts/test_eval_rosters.py, and the pull request
+# either re-measures the hints it relies on or raises this number on purpose.
+# docs/eval-gate-roster.md, "The five rules a seat meets", rule (e), says why
+# it is 200. Priced at the script's default EVAL_REPETITIONS, the presubmit's.
+PRESUBMIT_WALL_BUDGET_MINUTES = 200
+
+
+def parse_cost_hints(script_text: str) -> tuple[dict[str, int], int]:
+    """unit_cost_hint's case arms as {case id: seconds}, and its default."""
+    m = COST_HINT_FUNCTION_RE.search(script_text)
+    if not m:
+        raise ValueError("no unit_cost_hint() function in the script")
+    body = "\n".join(line for line in m.group(1).splitlines() if not line.lstrip().startswith("#"))
+    hints: dict[str, int] = {}
+    default = None
+    for arm in COST_HINT_ARM_RE.finditer(body):
+        for name in (part.strip() for part in arm.group(1).split("|")):
+            if name == DEFAULT_ARM:
+                default = int(arm.group(2))
+            elif name:
+                hints.setdefault(name, int(arm.group(2)))  # first arm wins, as in `case`
+    if default is None:
+        raise ValueError("unit_cost_hint() has no default arm")
+    return hints, default
+
+
+def _script_number(pattern: re.Pattern, script_text: str, what: str) -> int:
+    m = pattern.search(script_text)
+    if not m:
+        raise ValueError(f"no {what} in the script")
+    return int(m.group(1))
+
+
+# The first prompt lines that make a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE, MID_TURN_DIRECTIVE
+# and CARD_WAIT_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
+# the serial second phase beside the requesting cases;
+# scripts/test_eval_rosters.py holds this text read to
+# stop_hook.is_stopped_ask.
+STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
+CARD_WAIT_DIRECTIVE = "[bench:stop-in-card-wait]"
+
+
+def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml carries a stop directive outside a comment."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(
+        directive in line.split("#", 1)[0]
+        for line in text.splitlines()
+        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE, CARD_WAIT_DIRECTIVE)
+    )
+
+
+# A case that declares `writes_alone: true` at its top level runs in the
+# serial second phase as well (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY;
+# unit_phase reads it through STOPPED_ASK_CASES); scripts/test_eval_rosters.py
+# holds this text read to lane.runs_alone.
+WRITES_ALONE_RE = re.compile(r"^writes_alone:\s*true\s*$")
+# The task's own total of requested pull requests (bench/kube_agents_bench/lane.py's
+# REQUESTED_KEY), for a case that opens more than its checks grade.
+REQUESTED_PULL_REQUESTS_RE = re.compile(r"^requested_pull_requests:\s*(0|[1-9][0-9]*)\s*$")
+
+
+def declares_writes_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml declares ``writes_alone: true`` at its top level."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(WRITES_ALONE_RE.match(line.split("#", 1)[0].rstrip()) for line in text.splitlines())
+
+
+def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case runs in the serial phase without requesting a pull
+    request: a stopped ask, or a ``writes_alone`` case (lane.runs_alone)."""
+    return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
+
+
+def declared_pull_requests_in(text: str) -> int:
+    """The count a task file's text declares under ``requested_pull_requests``
+    on a top-level line; 0 when no such line."""
+    for line in text.splitlines():
+        m = REQUESTED_PULL_REQUESTS_RE.match(line.split("#", 1)[0].rstrip())
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
+    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
+    return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+
+
+def requests_a_pull_request(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case requests a pull request: its own checks, or its own
+    ``requested_pull_requests`` key."""
+    if declared_pull_requests(case, tasks_dir) > 0:
+        return True
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())
+
+
+def presubmit_wall_estimate() -> dict[str, object]:
+    """The presubmit's wall time from the hints, in seconds, by phase.
+
+    Phase one runs every unit of a case that requests nothing, EVAL_TASK_PARALLELISM
+    at a time, and a case's own repetitions one after another on its task
+    lock: it takes the longer of the lane time spread over the lanes and the
+    longest case's chain. Phase two runs the units of the cases that request a
+    pull request, of the stopped asks and of the ``writes_alone`` cases
+    (unit_phase in the script), one at a
+    time after phase one has drained, each after the settle, so it adds
+    straight onto the job. Every presubmit case counts, held-out seats too,
+    because they run, and the inject lane's exclusions are not taken off.
+    Not modelled: the launch stagger, a unit holding a lane while it waits on
+    its task lock, and locks shared across cases (the infra lock a stack case
+    takes, an audit stream's lock); a seat with a stack would cost more than
+    this says. A hint is a launch-order price, not a measurement, so this is
+    the hints' answer, not a prediction of any one run. Priced at the
+    script's default EVAL_REPETITIONS, whatever ``--repetitions`` says, since
+    that is what the presubmit runs and what the budget is set against.
+    """
+    script = CI_EVAL_SCRIPT.read_text(encoding="utf-8")
+    repetitions = _script_number(REPETITIONS_RE, script, "EVAL_REPETITIONS default")
+    hints, default = parse_cost_hints(script)
+    parallelism = _script_number(PARALLELISM_RE, script, "EVAL_TASK_PARALLELISM default")
+    settle = _script_number(SETTLE_RE, script, "EVAL_GITHUB_WRITE_SETTLE_SECONDS")
+    first, second = [], []
+    for case in presubmit_cases():
+        serial = requests_a_pull_request(case) or runs_alone(case)
+        (second if serial else first).append(case)
+    chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
+    phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))
+    phase_two = sum(chain[c] + settle * repetitions for c in second)
+    return {
+        "phase one": phase_one,
+        "phase two": phase_two,
+        "overhead": PRESUBMIT_FIXED_OVERHEAD_SECONDS,
+        "total": phase_one + phase_two + PRESUBMIT_FIXED_OVERHEAD_SECONDS,
+        "requesting": second,
+        "parallelism": parallelism,
+        "repetitions": repetitions,
+    }
+
+
+def summary(repetitions: int = 3) -> dict[str, int]:
+    """Each roster file's size and the nightly matrix's, computed from the
+    files: the totals the lists' comments used to carry by hand (#3495); and
+    the presubmit's estimated wall time against its budget (#3968)."""
+    presubmit, nightly = presubmit_cases(), nightly_cases()
+    wall = presubmit_wall_estimate()
+    return {
+        "presubmit cases": len(presubmit),
+        "blocking roster": len(blocking_roster()),
+        "nightly-only cases": len(nightly),
+        "nightly matrix cases": len(presubmit) + len(nightly),
+        "nightly matrix units": (len(presubmit) + len(nightly)) * repetitions,
+        "presubmit units": len(presubmit) * repetitions,
+        "gitlab lane cases": len(gitlab_cases()),
+        "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
+        "inject lane exclusions": len(inject_lane_exclusions()),
+        "presubmit serial-phase cases": len(wall["requesting"]),
+        "presubmit wall estimate, minutes": -(-wall["total"] // 60),
+        "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
+        "api lane exclusions": len(api_lane_exclusions()),
+        "certification cases": len(certification_cases()),
+        "certification parts": len(certification_parts()),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--summary", action="store_true",
+                        help="print each roster's case count, the matrix sizes and the presubmit's estimated "
+                             "wall time against its budget")
+    def positive(value: str) -> int:
+        if not value.isdigit() or int(value) < 1:
+            raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+        return int(value)
+
+    parser.add_argument("--repetitions", type=positive, default=3,
+                        help="repetitions a unit count assumes (EVAL_REPETITIONS, default 3). The matrix "
+                             "is the default lane's whole nightly, before inject-lane exclusions or "
+                             "EVAL_NIGHTLY_PART. The presubmit wall estimate ignores it: it is priced "
+                             "at the script's default, which the presubmit runs")
+    args = parser.parse_args(argv)
+    if not args.summary:
+        parser.print_help()
+        return 2
+    for name, value in summary(args.repetitions).items():
+        print(f"{name}: {value}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

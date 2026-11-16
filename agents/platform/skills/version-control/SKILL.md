@@ -59,7 +59,7 @@ revisions go **up** the same way, as a bundle, which is why a branch of five
 commits arrives as five commits. Nothing that came out of the repository is
 ever executed beside the credential.
 
-The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
+The script is `/opt/data/profiles/platform/skills/version-control/scripts/vcs.py` (`scripts/vcs.py` inside the skill directory). Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
 forge that is. On an install that serves more than one forge, `owner/name` is
 refused: name the repository by its URL.
@@ -84,12 +84,12 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 - **A repository this install does not manage.** Every verb, `clone` and the
   list/view verbs included, is refused for a repository outside the install's
-  managed list, because the broker refuses every verb but `capabilities` for
-  one. For "how does
+  managed list. For such a repository the broker serves only `capabilities`
+  and `snapshot`, and this skill has no `snapshot` command. For "how does
   upstream implement this", use **inspect-repository**.
 - **A one-off read of a large repository.** `clone` pulls a whole branch's
-  history and there is no shallow option; **inspect-repository** pages a
-  shallow view and is cheaper.
+  history and there is no shallow option; **inspect-repository** takes one
+  revision with no history and is cheaper.
 - **The GitOps write flow that already gave you a workspace.** `fleet-audit`
   and `submit-suggestion` own theirs; do not open a second view.
 
@@ -98,7 +98,7 @@ Verb names are the version-control concept; the spelling you know is an alias.
 One remote call, then local work:
 
 ```bash
-V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+V=/opt/data/profiles/platform/skills/version-control/scripts/vcs.py
 # Remote: one call, one bundle. Its JSON carries `path` — cd there.
 python3 $V clone https://github.com/acme/infra
 
@@ -247,6 +247,10 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   the call — report or fix the argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
   `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
   this install cannot see answers the same way.
+  `LABELS_UNSUPPORTED` means this forge has no labels (`capabilities` says
+  `labels: false`): send the call again without the label option, do not call
+  `label ensure`, and find your own proposals by their branch name. `FORGE_IDENTITY_UNKNOWN` means the
+  forge cannot say which account this install is: report it.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
   credential side, so there is nothing else to release.
 - **Read `exitCode` and `stderr`.** The read verbs pass git's own exit status
@@ -254,8 +258,8 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   not the same answer as one that returned nothing because the file has no
   history.
 - **Say which repository and which branch** in anything you report.
-- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
-  GitLab on an install that has not configured it, parse their specs and then
+- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket and
+  GitLab, on an install that has not configured them, parse their specs and then
   tell you exactly what this install is missing. That is the answer, not a bug to work around.
 - **Link to a file with `capabilities`' `fileUrl`.** It is the file's web address
   on this forge, with `{ref}` and `{path}` to fill. Percent-encode each of them

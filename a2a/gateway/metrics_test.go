@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,6 +110,13 @@ func scrape(t *testing.T, method, url string) (int, string) {
 // base URL.
 func startMetricsServer(t *testing.T, m *Metrics) string {
 	t.Helper()
+	return startMetricsServerWith(t, m, nil)
+}
+
+// startMetricsServerWith is startMetricsServer answering ReadyzPath from
+// readiness (nil answers ready).
+func startMetricsServerWith(t *testing.T, m *Metrics, readiness func() (bool, string)) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +125,7 @@ func startMetricsServer(t *testing.T, m *Metrics) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	srv.SetReadiness(readiness)
 	srv.listener = ln
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -134,6 +143,7 @@ func startMetricsServer(t *testing.T, m *Metrics) string {
 // state from each source over the embedded bus, and reads each series move
 // by exactly one, then reads the same counts off /metrics.
 func TestTaskTerminalsAreCountedByStateAndSource(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	m := r.g.Metrics()
 	i := 0
@@ -210,6 +220,7 @@ const metricsSettle = 300 * time.Millisecond
 // TestRelayedTerminalIsCountedOnce: a terminal the relay delivers is counted
 // once, though it passes through both relayTerminal and observeTaskTerminal.
 func TestRelayedTerminalIsCountedOnce(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	m := r.g.Metrics()
 	conv := "discord:g1/metrics-relayed-once"
@@ -232,6 +243,7 @@ func TestRelayedTerminalIsCountedOnce(t *testing.T) {
 // delivers the final answer text but skips observeEnded so task_terminals_total
 // is incremented exactly once.
 func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	m := r.g.Metrics()
 	conv := "discord:g1/metrics-heal-queued"
@@ -300,6 +312,7 @@ func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
 // the relay's subsequent delivery must skip the redundant completedNonTextResult
 // notice on chat conversations.
 func TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/metrics-heal-no-artifact"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do task"}
@@ -346,6 +359,7 @@ func TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued(t *te
 // the session and retires the route. applyEvent must drop the post-retirement
 // straggler so the session is not woken a second time.
 func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	m := r.g.Metrics()
 	ctx := context.Background()
@@ -412,6 +426,7 @@ func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
 // bus"; the counter must read one failed task, under source gateway, or a
 // NATS outage shows zero failures.
 func TestBusUnreachableTerminalIsCounted(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	m := r.g.Metrics()
 	deleteTasksStream(t, r.url)
@@ -433,6 +448,7 @@ func TestBusUnreachableTerminalIsCounted(t *testing.T) {
 // terminal that bypasses the relay. It counts once, under
 // gateway-never-started.
 func TestNeverStartedHealIsCounted(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	m := r.g.Metrics()
 	conv := "discord:g1/metrics-never-started"
@@ -503,6 +519,37 @@ func TestInboundMessagesAreCountedByPlatform(t *testing.T) {
 	}
 }
 
+func metricsSessionsCount(t *testing.T, m *Metrics, platform string) float64 {
+	t.Helper()
+	return counterValue(t, m.sessions.WithLabelValues(platform))
+}
+
+// A session is counted once, when the gateway mints the conversation's
+// record, under the platform the first message arrived through: the second
+// message in a conversation adds nothing, a second conversation adds one, and
+// the series is pre-seeded for every platform and other.
+func TestSessionsAreCountedOncePerConversation(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-1", Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "one"}
+	waitFor(t, "the first conversation's session counted", func() bool { return metricsSessionsCount(t, m, platformDiscord) == 1 })
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-1", Kind: "group", AuthorID: "1001", MessageID: "s-2", Text: "two"}
+	waitFor(t, "the second message counted as a message", func() bool { return metricsInboundCount(t, m, platformDiscord) == 2 })
+	if got := metricsSessionsCount(t, m, platformDiscord); got != 1 {
+		t.Fatalf("a second message in the same conversation minted a session: %v, want 1", got)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-2", Kind: "group", AuthorID: "1001", MessageID: "s-3", Text: "three"}
+	waitFor(t, "the second conversation's session counted", func() bool { return metricsSessionsCount(t, m, platformDiscord) == 2 })
+	for _, platform := range []string{platformGoogleChat, platformSlack, platformConsole, metricsLabelOther} {
+		if got := metricsSessionsCount(t, m, platform); got != 0 {
+			t.Errorf("%s = %v, want 0", platform, got)
+		}
+	}
+	if got := seriesCount(t, m, "kubeagents_a2a_gateway_sessions_total"); got != len(metricsPlatforms)+1 {
+		t.Errorf("the sessions counter carries %d series, want %d: every platform and other, pre-seeded", got, len(metricsPlatforms)+1)
+	}
+}
+
 // The body carries the process start time the operator's poller reads to tell
 // an in-place restart from a counter that fell: one series, the process's own
 // clock at construction, never re-derived.
@@ -549,6 +596,7 @@ func TestInboundPlatformLabelsAreClosed(t *testing.T) {
 // TestGchatPullsAreCountedByOutcome: events, then empty pulls, then refused
 // ones, each read off the counter where the summary line counts them.
 func TestGchatPullsAreCountedByOutcome(t *testing.T) {
+	t.Parallel()
 	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
 	f := &gchatLegibilityRelay{
 		subscription: "projects/p/subscriptions/s",
@@ -595,6 +643,7 @@ func TestGchatPullsAreCountedByOutcome(t *testing.T) {
 // TestMetricsAreServedOnTheMetricsPortAlone: the listener serves MetricsPath
 // and nothing else, and neither door's listener serves the series at all.
 func TestMetricsAreServedOnTheMetricsPortAlone(t *testing.T) {
+	t.Parallel()
 	m := NewMetrics()
 	base := startMetricsServer(t, m)
 	if status, body := scrape(t, http.MethodGet, base+MetricsPath); status != http.StatusOK || !strings.Contains(body, "kubeagents_a2a_gateway_task_terminals_total") {
@@ -724,6 +773,7 @@ func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 // close it is served. The cap is what keeps a peer on the pod network from
 // spending the gateway's memory one idle connection at a time.
 func TestMetricsListenerCapsItsConnections(t *testing.T) {
+	t.Parallel()
 	base := startMetricsServer(t, NewMetrics())
 	addr := strings.TrimPrefix(base, "http://")
 	var held []net.Conn
@@ -753,4 +803,70 @@ func TestMetricsListenerCapsItsConnections(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	})
+}
+
+func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
+	var none *Metrics
+	none.setPeopleSource(func() (int, int, bool) { return 1, 2, true })
+
+	m := NewMetrics()
+	url := startMetricsServer(t, m)
+	_, body := scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "kubeagents_a2a_gateway_people_seen") {
+		t.Fatalf("a sample with no source:\n%s", body)
+	}
+	var loaded atomic.Bool
+	m.setPeopleSource(func() (int, int, bool) { return 1, 2, loaded.Load() })
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "people_seen") {
+		t.Fatalf("a sample while the map is not loaded:\n%s", body)
+	}
+	loaded.Store(true)
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	for _, want := range []string{
+		`kubeagents_a2a_gateway_people_seen{window="7d"} 1`,
+		`kubeagents_a2a_gateway_people_seen{window="30d"} 2`,
+		"# TYPE kubeagents_a2a_gateway_people_seen gauge",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q:\n%s", want, body)
+		}
+	}
+	loaded.Store(false)
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "people_seen") {
+		t.Fatalf("a sample after the map was unloaded:\n%s", body)
+	}
+}
+
+// TestAnswerFeedbackZeroSeriesCoverBothRatingBackends: both backends that
+// draw rating controls start with a zero series per rating, so a scrape
+// before the first rating reads 0 rather than no data.
+func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
+	m := NewMetrics()
+	series := make(chan prometheus.Metric, 16)
+	m.answerFeedback.Collect(series)
+	close(series)
+	if got := len(series); got != 8 {
+		t.Errorf("answer_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 answers)", got)
+	}
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp, answerReply)); got != 0 {
+		t.Errorf("answer_feedback_total{googlechat,up,reply} = %v, want 0", got)
+	}
+}
+
+// TestPostFeedbackZeroSeriesCoverBothRatingBackends: the ratings of the
+// posts the agent made on its own start at zero the same way, per kind.
+func TestPostFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
+	m := NewMetrics()
+	series := make(chan prometheus.Metric, 16)
+	m.postFeedback.Collect(series)
+	close(series)
+	if got := len(series); got != 8 {
+		t.Errorf("post_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 kinds)", got)
+	}
+	m.postRated(platformSlack, FeedbackDown, "unlisted")
+	if got := counterValue(t, m.postFeedback.WithLabelValues(platformSlack, FeedbackDown, metricsLabelOther)); got != 1 {
+		t.Errorf("post_feedback_total{slack,down,other} = %v, want an unlisted kind counted as other", got)
+	}
 }

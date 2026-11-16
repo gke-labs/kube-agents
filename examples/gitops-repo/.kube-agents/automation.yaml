@@ -1,0 +1,14 @@
+# Which kube-agents fixes your pipeline may merge without a human, and where
+# (docs: reference/automation-rules). Nothing merges unless an allow rule names
+# it, a deny rule beats every allow rule, and a file kube-agents cannot read in
+# full allows nothing. An environment is the target cluster's `environment`
+# label (else `env`, `stage`, `tier`); a cluster with none of them matches no rule.
+version: 1
+automerge:
+  allow:
+    # Add a missing PodDisruptionBudget, on dev clusters only.
+    - fix: no-pdb
+      environments: [dev]
+  deny:
+    - fix: "*"
+      environments: [prod]

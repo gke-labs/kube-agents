@@ -17,9 +17,11 @@ card's report never reaches the thread.
 
 The fix
 -------
-The operator names the platform the gateway holds in ``A2A_NOTIFY_PLATFORM``
-(the same switch ``agents/platform/scripts/chat_notify.py`` reads). For that
-platform, and only inside the notifier:
+The operator names the platforms the gateway holds in ``A2A_NOTIFY_PLATFORM``
+and ``A2A_NOTIFY_CONVERSATIONS``, comma-separated lists (the same switches
+``agents/platform/scripts/chat_notify.py`` reads); :func:`routed_platforms`
+picks the ones that get home posts. For each of those platforms, and only
+inside the notifier:
 
 1. :func:`active_platforms` counts it as served, so its subscriptions are
    collected.
@@ -47,8 +49,9 @@ session record carries that context. A subscription with no thread (a DM,
 or a space as a whole) is not delivered at all: posting it as a new thread in
 the home channel would move text meant for one space into another.
 
-When the route is not there (the gateway restarting, its route unarmed, the
-bus unreachable: ``a2a notify`` exit 4), :func:`resolve` answers no adapter,
+When the route is not there (the gateway restarting or stopping, its route
+unarmed, the bus unreachable, a record it couldn't read in time: ``a2a notify``
+exit 4), :func:`resolve` answers no adapter,
 which is upstream's disconnected-adapter path: skipped without a claim and
 without spending the failure budget. It learns this from a probe (an empty
 notify, which an armed gateway refuses at once) that the collector's pre-claim
@@ -111,19 +114,36 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 logger = logging.getLogger(__name__)
 
 # The operator's switch (written by platformagent_manifests.go, defined as
-# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go).
+# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): every armed
+# platform whose home channel the CR sets, separated by
+# PLATFORM_LIST_SEPARATOR, and absent when none is. routed_platforms() adds a
+# learned Slack channel, and falls back to every armed route (the gateway then
+# keeps a refused post for its digest).
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
-# The platform whose gateway conversations a card can report back to
-# (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
-# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
+# The platforms whose gateway conversations a card can report back to
+# (a2aNotifyConversationsEnvVar), in the same list form: every armed route,
+# home channel or not.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# What separates the platform names in either variable
+# (chat_notify.PLATFORM_LIST_SEPARATOR).
+PLATFORM_LIST_SEPARATOR = ","
+# The operator's projection of the home channel, mounted in the agent pod
+# (agents/platform/scripts/chat_notify.py keeps the same three names).
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
+HOME_FILE_PLATFORM = "slack"
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
 # request and did not answer (the post may still land, so it is not re-sent),
-# and the route is not there right now (nothing posted).
+# and the route is not there right now, including a refusal the gateway marks
+# retry (nothing posted).
 NOTIFY_OUTCOME_UNKNOWN = 3
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# The gateway refused a home post for want of a home channel and kept it for
+# the digest it posts once one is set: nothing posted now, nothing lost, so
+# the send is not retried and spends no failure budget.
+NOTIFY_KEPT = 5
 # How long `a2a notify` waits for the gateway's answer, passed explicitly so
 # the send timeout below can be derived from it.
 NOTIFY_WAIT_SECONDS = 60
@@ -161,9 +181,23 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
 # --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
-# The attribute the stand-in is cached under on the runner, which outlives the
-# per-tick collector and the per-delivery notification.
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "console:")
+# The console door's platform (lib.NotifyPlatformConsole). The gateway serves
+# its chat.notify route whenever the console runs, so it counts as served
+# with no environment variable naming it. Hermes has no console platform, and
+# its notifier turns a subscription's platform string into its Platform enum
+# before anything here runs, so the name is registered with Hermes's platform
+# registry when this module loads (_register_console_platform). Kanban-era:
+# the registration goes when kanban does.
+CONSOLE_PLATFORM = "console"
+CONSOLE_PLATFORM_LABEL = "kube-agents console (chat.notify only)"
+# Splits a console card's thread_id into the conversation key and the gateway
+# task of the turn that filed it (kanban_event_routing.CONSOLE_THREAD_TASK_SEP),
+# which the report names with --reply-to.
+CONSOLE_THREAD_TASK_SEP = "#"
+# The attribute the home stand-in is cached under on the runner, which outlives
+# the per-tick collector and the per-delivery notification; resolve suffixes
+# the platform name, one slot per platform.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
 # The Slack platform value, whose home threads go out channel-qualified
 # (ChatNotifyAdapter.notify_target).
@@ -187,6 +221,15 @@ API_SERVER_KEY_ENV = "API_SERVER_KEY"
 # send()'s metadata (see "Chat messages" above), and the route record's ask.
 CHAT_METADATA_KEY = "kage_chat"
 UPDATE_METADATA_KEY = "kage_update"
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
+ANSWER_METADATA_KEY = "kage_answer"
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
+CONVERSATION_FLAG = "--conversation"
+ANSWER_FLAG = "--answer-to"
+UPDATE_FLAG = "--update"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
 # tempfile, removed once the command returns.
@@ -205,20 +248,78 @@ def _on_event_loop() -> bool:
     return True
 
 
-def routed_platform() -> str:
-    """The platform name the gateway holds, or "" when none."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose cards the stand-in lays out (kanban_notifier.CHAT_UX_PLATFORMS).
+
+    A stand-in exists only where the gateway serves the platform, so a Google
+    Chat one is always under ``spec.mode: next``, where the gateway renders the
+    message. Read when a send runs, as the notifier module is elsewhere; an
+    image without it lays out Slack's alone, as before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return tuple(kanban_notifier.CHAT_UX_PLATFORMS)
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return (SLACK_PLATFORM,)
+
+
+def platform_list(raw: str) -> list:
+    """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order.
+
+    A copy of chat_notify.platform_list, which this patch cannot import.
+    """
+    names: list = []
+    for part in raw.split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _home_file_value() -> str:
+    """The projected Slack home channel, trimmed, or "" when there is none."""
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def routed_platforms() -> list:
+    """The platforms whose home posts the gateway holds, or [] when none.
+
+    The operator lists every armed route whose home channel the CR sets, Chat
+    first, and this adds Slack when the gateway holds it and the projected file
+    names a channel, the CR's or one it learned. With no such list, home posts
+    go to Slack alone when the file names a channel, and otherwise to every
+    armed route, whose posts the gateway keeps for its digest. The rule reads
+    only the two variables and the file, so it gives the same list as
+    chat_notify.routed_platforms, which this patch cannot import.
+    """
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    armed = conversation_platforms()
+    slack_home = HOME_FILE_PLATFORM in armed and bool(_home_file_value())
+    if listed:
+        if slack_home and HOME_FILE_PLATFORM not in listed:
+            return [*listed, HOME_FILE_PLATFORM]
+        return listed
+    if slack_home:
+        return [HOME_FILE_PLATFORM]
+    return armed
 
 
 def routes(platform: Any) -> bool:
-    """Whether ``platform`` (an enum or a string) is the one the gateway holds."""
+    """Whether ``platform`` (an enum or a string) is one whose home posts the gateway holds."""
     name = str(getattr(platform, "value", platform) or "").lower()
-    return bool(name) and name == routed_platform()
+    return bool(name) and name in routed_platforms()
 
 
-def conversation_platform() -> str:
-    """The platform whose gateway conversations cards report back to, or "" when none."""
-    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+def conversation_platforms() -> list:
+    """The platforms whose gateway conversations cards report back to, or [] when none."""
+    return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
 
 def is_conversation(sub: Optional[dict]) -> bool:
@@ -231,9 +332,37 @@ def chat_route(adapter: Any) -> bool:
     return callable(getattr(adapter, "send_chat", None))
 
 
+def served_platforms() -> set:
+    """The platforms whose deliveries go through the gateway's chat.notify route."""
+    return {*routed_platforms(), *conversation_platforms(), CONSOLE_PLATFORM}
+
+
 def active_platforms(names: set) -> set:
-    """``names`` plus the routed platforms, when there are any."""
-    return names | {p for p in (routed_platform(), conversation_platform()) if p}
+    """``names`` plus the platforms the gateway's route serves."""
+    return names | served_platforms()
+
+
+def _register_console_platform() -> None:
+    """Make ``Platform("console")`` resolve in Hermes, so a console card's subscription is read at all.
+
+    Process-global (source "builtin"), so every profile scope sees it. The
+    factory makes no adapter: nothing enables or connects a console platform,
+    and deliveries go through the conversation stand-in (resolve). Fails open,
+    logged: without it a console card's report is skipped, as it is today.
+    """
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        if not platform_registry.is_registered(CONSOLE_PLATFORM):
+            platform_registry.register(PlatformEntry(
+                name=CONSOLE_PLATFORM,
+                label=CONSOLE_PLATFORM_LABEL,
+                adapter_factory=lambda _config: None,
+                check_fn=lambda: True,
+                source="builtin",
+            ))
+    except Exception as exc:  # not inside Hermes (tests), or a registry without this shape
+        logger.warning("chat.notify: console platform not registered; console cards will not report: %s", exc)
 
 
 def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None) -> Any:
@@ -241,14 +370,15 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
 
     A subscription addressed to a gateway conversation gets the conversation
     stand-in, armed by A2A_NOTIFY_CONVERSATIONS; any other gets the home stand-in,
-    armed by A2A_NOTIFY_PLATFORM.
+    armed when :func:`routed_platforms` names the platform, which it can do with
+    A2A_NOTIFY_PLATFORM absent.
     """
     if adapter is not None:
         return adapter
     conversation = is_conversation(sub)
     name = str(getattr(platform, "value", platform) or "").lower()
     if conversation:
-        if not name or name != conversation_platform():
+        if not name or name not in (*conversation_platforms(), CONSOLE_PLATFORM):
             return None
     elif not routes(platform):
         return adapter
@@ -258,6 +388,11 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
         return None
     attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
                  else (RUNNER_ATTR, ChatNotifyAdapter))
+    # The stand-ins are kept one per platform: two routed platforms' home
+    # stand-ins, or a chat platform's conversation stand-in and the console's,
+    # are served side by side, and one shared slot would rebuild the stand-in,
+    # and re-probe the route, on every switch between them.
+    attr = f"{attr}_{name}"
     stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
         stand_in = cls(platform, runner)
@@ -522,7 +657,7 @@ def _folds_into_row(conn: Any, sub: dict) -> bool:
         except ImportError:  # Unit tests import the patch modules flat.
             import kanban_notifier
             import kanban_progress_lines
-        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+        if not kanban_notifier.chat_ux_on(sub.get("platform")):
             return False
         params = (
             sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
@@ -577,7 +712,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     if not claim:
         return claim
     sub = claim.get("sub") or {}
-    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+    if (sub.get("platform") or "").lower() not in served_platforms():
         return claim
     child = sub.get("task_id") or ""
     events = list(claim.get("events") or [])
@@ -747,7 +882,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
 
         ``update`` names the message: a later send with the same key, in the
-        same conversation, edits it in place.
+        same conversation or home-channel thread, edits it in place.
         """
         extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
         return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
@@ -761,7 +896,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         meta = metadata or {}
         chat = meta.get(CHAT_METADATA_KEY)
         update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
-        if chat is None and self.platform.value == SLACK_PLATFORM:
+        if chat is None and self.platform.value in _chat_ux_platforms():
             chat = _failure_chat(content)
         argv, path = [], ""
         if isinstance(chat, dict) and str(content or "").strip():
@@ -776,7 +911,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
                 raise
             argv += ["--chat-file", path]
         if update:
-            argv += ["--update", update]
+            argv += [UPDATE_FLAG, update]
         return argv, path
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -795,7 +930,13 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
             chat_argv, chat_file = [], ""
         argv += chat_argv
-        argv += ["--", content]
+        # Only a conversation post answers an ask; the CLI refuses the flag on
+        # a home channel post, which would lose the report.
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
+        # The chat message above was laid out from the text as written; what a person reads has no step line.
+        argv += ["--", _visible(content)]
         try:
             return await self._notify(argv, chat_id)
         finally:
@@ -825,6 +966,9 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         if proc.returncode == NOTIFY_OUTCOME_UNKNOWN:
             logger.warning("chat.notify: no answer in time for %s; treating as sent", chat_id)
             return SendResult(success=True)
+        if proc.returncode == NOTIFY_KEPT:
+            logger.warning("chat.notify: kept by the gateway for its digest (no home channel) for %s; treating as sent", chat_id)
+            return SendResult(success=True)
         if proc.returncode == NOTIFY_ROUTE_UNAVAILABLE:
             self.mark_route_down()
             logger.warning("chat.notify: route unavailable; holding deliveries for %ds", ROUTE_DOWN_BACKOFF_SECONDS)
@@ -837,6 +981,16 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         if not isinstance(answer, dict):
             answer = {}
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
+
+
+def _visible(content: str) -> str:
+    """``slack_moments.visible_text``: ``content`` without the declared step's line, which no
+    surface shows as text; ``content`` as written when nothing else is left or the module is absent."""
+    try:
+        import slack_moments
+    except ImportError:  # the scripts directory is not on PYTHONPATH
+        return content
+    return slack_moments.visible_text(content) or content
 
 
 def _failure_chat(content: str) -> Optional[dict]:
@@ -903,7 +1057,13 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         context = conversation_context(chat_id)
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
-        return ["--conversation", thread, "--context", context]
+        if not thread.startswith(CONSOLE_PLATFORM + ":"):
+            return ["--conversation", thread, "--context", context]
+        conversation, _, task = thread.partition(CONSOLE_THREAD_TASK_SEP)
+        target = ["--conversation", conversation, "--context", context]
+        if task:
+            target += ["--reply-to", task]
+        return target
 
     def ask(self, chat_id: str) -> str:
         """The kind of ask the conversation was last asked, which the plan's mark keeps while cards run."""
@@ -919,3 +1079,8 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         session = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         await _self_post_chat_completion(self, text=event.text, session_id=session)
         event._gateway_accepted = True
+
+
+# Registered at import, which the notifier's trailer triggers before it reads
+# any subscription (apply_kanban_chat_notify.TRAILER).
+_register_console_platform()

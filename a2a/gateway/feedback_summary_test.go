@@ -1,0 +1,679 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/rest"
+)
+
+var summaryNow = time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+
+func summaryCR() map[string]any {
+	return map[string]any{
+		"metadata": map[string]any{
+			"name": "platform-agent", "namespace": "kubeagents-system",
+			"creationTimestamp": "2026-10-02T12:00:00Z",
+		},
+		"spec": map[string]any{
+			"mode":        "next",
+			"deployment":  map[string]any{"tag": "0.14.0", "env": []any{map[string]any{"name": "OTEL_SDK_DISABLED", "value": "true"}}},
+			"harness":     map[string]any{"clusterName": "prod-eu-1", "projectId": "acme-platform-prod", "location": "us-central1"},
+			"scope":       map[string]any{"projects": []any{"acme-scope-dev"}, "folders": []any{"123456789"}},
+			"integration": map[string]any{"gitops": map[string]any{"repository": "acme/gitops"}},
+		},
+		"status": map[string]any{
+			"conditions": []any{map[string]any{"type": "Ready", "status": "True"}},
+			"inference":  map[string]any{"provider": "vertex_ai", "model": "claude-opus-5"},
+			"usage": map[string]any{
+				"clustersRegistered": int64(3), "clustersMonitored": int64(2),
+				"chatMessagesInboundTotal": int64(41), "sessionsTotal": int64(7),
+				"chatSessionsTotal":   int64(4),
+				"toolExecutionsTotal": int64(19127), "toolExecutionsBlockedTotal": int64(142), "brokerFailuresTotal": int64(3),
+				"eventsIngestedTotal": int64(10), "chatTurnsErroredTotal": int64(2), "backgroundTasksGaveUpTotal": int64(1), "negativeFeedbackTotal": int64(0),
+				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
+				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
+				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
+				"peopleSeen7d": int64(3), "peopleSeen30d": int64(11),
+				"proposalsFromChat": int64(3), "proposalsFromConsole": int64(0), "proposalsFromApi": int64(0),
+				"proposalsFromEvent": int64(0), "proposalsFromDrift": int64(1), "proposalsFromAudit": int64(0),
+				"proposalsFromScheduled": int64(0), "proposalsFromIssue": int64(0), "proposalsFromOther": int64(0),
+				"inputTokensTotal": int64(1200100), "outputTokensTotal": int64(34000), "spendMicrosUSDTotal": int64(3030457),
+				"lastActiveTime":      "2026-10-21T11:34:06Z",
+				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
+				"activeInterfaces":    []any{"slack", "googlechat"},
+			},
+		},
+	}
+}
+
+func summaryRecords() []*SessionRecord {
+	ago := func(d time.Duration) time.Time { return summaryNow.Add(-d) }
+	return []*SessionRecord{
+		// The ordinary relay path leaves no end marker on a TaskRef (only the
+		// heal path sets TerminalObserved): what tells a running task from an
+		// ended one is the record's ActiveTask.
+		{Key: "a", ActiveTask: &ActiveTask{TaskID: "t4"}, Tasks: []TaskRef{
+			{ID: "t1", StartedAt: ago(10 * time.Minute)},
+			{ID: "t2", StartedAt: ago(time.Hour), TerminalObserved: true}, // healed: ended all the same
+			{ID: "t3", StartedAt: ago(2 * time.Hour), Canceled: true},
+			{ID: "t4", StartedAt: ago(2 * time.Minute)},
+		}},
+		{Key: "b", Tasks: []TaskRef{
+			{ID: "t5", StartedAt: ago(3 * 24 * time.Hour)},
+			{ID: "t6", StartedAt: ago(30 * 24 * time.Hour)}, // outside the window
+			{ID: "t7"}, // never started: not counted
+		}},
+		// A stop already sent: ActiveTask stays until the executor confirms,
+		// detached, and the TaskRef carries Canceled. Cancelled, not active.
+		{Key: "c", ActiveTask: &ActiveTask{TaskID: "t8", Detached: true}, Tasks: []TaskRef{
+			{ID: "t8", StartedAt: ago(5 * time.Minute), Canceled: true},
+		}},
+	}
+}
+
+// rollup runs the shipped fold over a slice, as the gateway runs it over the
+// bucket's watch stream.
+func rollup(t *testing.T, records []*SessionRecord, now time.Time, window time.Duration) taskRollup {
+	t.Helper()
+	got, err := rollupRecords(func(fn func(*SessionRecord)) error {
+		for _, rec := range records {
+			fn(rec)
+		}
+		return nil
+	}, now, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestRollupRecordsBucketsByRecordStateWithinTheWindow(t *testing.T) {
+	got := rollup(t, summaryRecords(), summaryNow, usageSummaryWindow)
+	want := taskRollup{Total: 6, Ended: 3, Cancelled: 2, Active: 1}
+	if got != want {
+		t.Fatalf("rollupRecords = %+v, want %+v", got, want)
+	}
+}
+
+func TestUsageWindowClampsToTheSessionTTL(t *testing.T) {
+	if got := usageWindow(0); got != usageSummaryWindow {
+		t.Fatalf("usageWindow(0) = %v, want the full window", got)
+	}
+	if got := usageWindow(30 * 24 * time.Hour); got != usageSummaryWindow {
+		t.Fatalf("usageWindow(30d) = %v, want the full window", got)
+	}
+	if got := usageWindow(7 * 24 * time.Hour); got != 7*24*time.Hour {
+		t.Fatalf("usageWindow(7d) = %v, want 7d", got)
+	}
+	if got := usageWindow(6 * time.Hour); got != 24*time.Hour {
+		t.Fatalf("usageWindow(6h) = %v, want the one-day floor", got)
+	}
+	if got := usageWindow(100 * time.Hour); got != 4*24*time.Hour {
+		t.Fatalf("usageWindow(100h) = %v, want four whole days, the window the label names", got)
+	}
+	// t5 started three days ago: a two-day window drops it.
+	got := rollup(t, summaryRecords(), summaryNow, 2*24*time.Hour)
+	if want := (taskRollup{Total: 5, Ended: 2, Cancelled: 2, Active: 1}); got != want {
+		t.Fatalf("rollupRecords(2d) = %+v, want %+v", got, want)
+	}
+}
+
+func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	lines := strings.Split(text, "\n")
+	if lines[0] != "```" || lines[len(lines)-1] != "```" {
+		t.Fatalf("the block must be fenced, got first %q last %q", lines[0], lines[len(lines)-1])
+	}
+	if len(lines) > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines, cap %d", len(lines), usageSummaryMaxLines)
+	}
+	for _, want := range []string{
+		"kube-agents usage & feedback summary (2026-10-21)",
+		"  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n",
+		"  version: 0.14.0", "  mode: next", "\n  model: vertex_ai/claude-opus-5\n", "  kubernetes: v1.33.4-gke.1234000",
+		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
+		"  toolExecutionsTotal: 19127\n  toolExecutionsBlockedTotal: 142\n  brokerFailuresTotal: 3\n",
+		"  eventsIngestedTotal: 10\n  chatTurnsErroredTotal: 2\n  backgroundTasksGaveUpTotal: 1\n  negativeFeedbackTotal: 0\n",
+		"  sessionsTotal: 7\n  chatSessionsTotal: 4\n", "  remediationsProposedTotal: 4\n",
+		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
+		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
+		"  proposalHumanTouches: 5 (as the forge reports)\n",
+		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
+		"  lastActive: 2026-10-21T11:34:06Z\n  lastHumanActive: 2026-10-20T09:15:00Z",
+		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
+		"performance:\n  tokens (since install): in 1200100 / out 34000\n  spend (since install): 3.03 USD\n" + usageSummaryLatencyNote + "\n",
+		"  Rating:", "  What worked well:", "  What failed or was slow:",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	for _, forbidden := range []string{"prod-eu-1", "acme-platform-prod", "kubeagents-system", "us-central1", "acme-scope-dev", "acme/gitops", "123456789", "t1"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("block carries %q", forbidden)
+		}
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(summaryCR())); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
+	cr := summaryCR()
+	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0), "peopleSeen7d": int64(0)}
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"} {
+		if want := "  " + reading + ": no reading (as the forge reports)\n"; !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	for _, want := range []string{
+		"  remediationsOpen: 0 (as the forge reports)\n",
+		"  peopleSeen7d: 0 (as the gateway reports)\n",
+		"  peopleSeen30d: no reading (as the gateway reports)\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	for _, counter := range []string{"clustersRegistered", "chatSessionsTotal", "toolExecutionsTotal", "remediationsProposedTotal"} {
+		if want := "  " + counter + ": 0\n"; !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	for _, field := range usageSummaryCounters {
+		if field == "remediationsAppliedTotal" {
+			t.Error("usageSummaryCounters still names the retired remediationsAppliedTotal")
+		}
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+// summaryOriginCR is the fixture with every origin reading set to the given
+// values (zero for any field not named), or with none of them when origins is nil.
+func summaryOriginCR(origins map[string]int64) map[string]any {
+	cr := summaryCR()
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	for _, field := range usageSummaryOriginFields {
+		delete(usage, field)
+		if origins != nil {
+			usage[field] = origins[field]
+		}
+	}
+	return cr
+}
+
+func TestRenderUsageSummaryOriginLineListsNonZeroOriginsInTheTableOrder(t *testing.T) {
+	cr := summaryOriginCR(map[string]int64{"proposalsFromOther": 4, "proposalsFromChat": 3, "proposalsFromEvent": 1, "proposalsFromAudit": 2})
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\n  proposals by origin: chat 3, event 1, audit 2, other 4 (as the agent reports)\n"; !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+	if n := strings.Count(text, usageSummaryOriginLinePrefix); n != 1 {
+		t.Fatalf("block has %d origin lines, want 1", n)
+	}
+}
+
+func TestRenderUsageSummaryOriginLinePrintsNoneWhenEveryOriginReadsZero(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryOriginCR(map[string]int64{}), "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\n  proposals by origin: none (as the agent reports)\n"; !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+}
+
+func TestRenderUsageSummaryOriginLinePrintsNoReadingWhenTheOriginsAreAbsent(t *testing.T) {
+	want := "\n  proposals by origin: no reading (as the agent reports)\n"
+	for name, cr := range map[string]map[string]any{"absent": summaryOriginCR(nil), "empty resource": {}} {
+		if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+			t.Errorf("%s: block lacks %q:\n%s", name, want, text)
+		}
+	}
+}
+
+// TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus:
+// a status with some of the nine prints the present non-zero ones; the script
+// asserts the same lines.
+func TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus(t *testing.T) {
+	cr := summaryOriginCR(nil)
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["proposalsFromChat"] = int64(2)
+	usage["proposalsFromDrift"] = int64(0)
+	if want, text := "\n  proposals by origin: chat 2 (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+	delete(usage, "proposalsFromChat")
+	if want, text := "\n  proposals by origin: none (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+}
+
+func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testing.T) {
+	var want []string
+	for _, origin := range []string{"Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other"} {
+		want = append(want, "proposalsFrom"+origin)
+	}
+	if strings.Join(usageSummaryOriginFields, ",") != strings.Join(want, ",") {
+		t.Fatalf("usageSummaryOriginFields = %v, want %v", usageSummaryOriginFields, want)
+	}
+}
+
+func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
+	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
+	for _, want := range []string{"  version: unknown", "  mode: next", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	if len(strings.Split(text, "\n")) > usageSummaryMaxLines {
+		t.Fatal("block over the cap")
+	}
+}
+
+// TestRenderUsageSummaryModelLineReadsStatusInference: the line is the
+// status pair; a present-but-empty key and an absent key both print
+// unavailable, since the gateway reads no LiteLLM config to fall back to.
+func TestRenderUsageSummaryModelLineReadsStatusInference(t *testing.T) {
+	for name, inference := range map[string]any{
+		"empty":         map[string]any{},
+		"provider only": map[string]any{"provider": "vertex_ai"},
+		"not a map":     "vertex_ai/claude-opus-5",
+		"absent":        nil,
+	} {
+		cr := summaryCR()
+		status := cr["status"].(map[string]any)
+		if inference == nil {
+			delete(status, "inference")
+		} else {
+			status["inference"] = inference
+		}
+		text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+		if !strings.Contains(text, "\n  model: unavailable\n") {
+			t.Errorf("%s: block lacks the unavailable model line:\n%s", name, text)
+		}
+	}
+	if text := renderUsageSummary(summaryNow, map[string]any{}, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: unavailable\n") {
+		t.Errorf("an empty resource must print the unavailable model line:\n%s", text)
+	}
+}
+
+// TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys: the environment
+// block prints usageSummaryEnvironmentKeys in order, one line each, and the
+// whole block stays under the cap with the model line in it.
+func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	env := strings.SplitN(strings.SplitN(text, "environment:\n", 2)[1], "\nusage:", 2)[0]
+	var keys []string
+	for _, line := range strings.Split(env, "\n") {
+		keys = append(keys, strings.TrimSpace(strings.SplitN(line, ":", 2)[0]))
+	}
+	if strings.Join(keys, ",") != strings.Join(usageSummaryEnvironmentKeys, ",") {
+		t.Fatalf("environment keys = %v, want %v", keys, usageSummaryEnvironmentKeys)
+	}
+	if n := len(strings.Split(text, "\n")); n > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines, cap %d", n, usageSummaryMaxLines)
+	}
+}
+
+// TestUsageSummaryWithoutFixedLinesDropsTheModelLine: the audit's input is
+// the block less the model line; every other line stays audited.
+func TestUsageSummaryWithoutFixedLinesDropsTheModelLine(t *testing.T) {
+	text := "```\n  mode: next\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutFixedLines(text)
+	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 1; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped more than one line: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
+	}
+}
+
+// TestUsageSummaryWithoutFixedLinesDropsTheOriginLine: the origin line goes
+// with the model line, and exactly those two.
+func TestUsageSummaryWithoutFixedLinesDropsTheOriginLine(t *testing.T) {
+	text := "```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutFixedLines(text)
+	if strings.Contains(got, "model:") || strings.Contains(got, usageSummaryOriginLinePrefix) {
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 2; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped other than the two fixed lines: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
+	}
+}
+
+// TestAuditDoesNotRefuseAClusterNamedForAnOriginOnTheOriginLine: the origin
+// line prints origin words a cluster may be named; the line is removed before
+// the audit, and the same name anywhere else is still refused. "chat" is
+// already this block's vocabulary (the "chat turns" line), so it is never
+// refused here; "drift" shows the removal.
+func TestAuditDoesNotRefuseAClusterNamedForAnOriginOnTheOriginLine(t *testing.T) {
+	cr := summaryCR()
+	cr["spec"].(map[string]any)["scope"].(map[string]any)["clusters"] = []any{"chat", "drift"}
+	ids := usageIdentifiers(cr)
+	if !contains(ids, "chat") || !contains(ids, "drift") {
+		t.Fatalf("fixture: identifiers lack chat or drift: %v", ids)
+	}
+	text := renderUsageSummary(summaryNow, cr, "v1", usageSummaryWindow, taskRollup{}, false)
+	if !strings.Contains(text, "\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n") {
+		t.Fatalf("fixture: the origin line does not name chat and drift:\n%s", text)
+	}
+	if leaked := auditUsageSummary(text, ids); len(leaked) != 1 || leaked[0] != "drift" {
+		t.Fatalf("fixture: the unstripped block should name drift alone, audit = %v", leaked)
+	}
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), ids); len(leaked) != 0 {
+		t.Fatalf("the origin line was the reason for a refusal: %v", leaked)
+	}
+	elsewhere := strings.Replace(text, "  lastActive:", "  cluster: drift\n  lastActive:", 1)
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(elsewhere), ids); len(leaked) != 1 || leaked[0] != "drift" {
+		t.Fatalf("drift outside the origin line must be refused, audit = %v", leaked)
+	}
+}
+
+func TestUsageIdentifiersAreTheNamingSubtreesStringsButNotSettings(t *testing.T) {
+	ids := usageIdentifiers(summaryCR())
+	for _, want := range []string{"platform-agent", "kubeagents-system", "prod-eu-1", "acme-platform-prod", "us-central1", "acme-scope-dev", "acme/gitops"} {
+		if !contains(ids, want) {
+			t.Errorf("identifiers lack %q: %v", want, ids)
+		}
+	}
+	for _, unwanted := range []string{"0.14.0", "next", "true", "OTEL_SDK_DISABLED", "123456789"} {
+		if contains(ids, unwanted) {
+			t.Errorf("identifiers carry the setting %q", unwanted)
+		}
+	}
+}
+
+func TestAuditUsageSummaryMatchesWholeTokensAndSkipsTheTemplate(t *testing.T) {
+	if got := auditUsageSummary("on prod-eu-1 next", []string{"prod-eu-1", "next", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
+		t.Fatalf("audit = %v, want [prod-eu-1]", got)
+	}
+	if got := auditUsageSummary("version: 0.14.0-rc", []string{"0.14.0"}); len(got) != 0 {
+		t.Fatalf("audit matched inside a token: %v", got)
+	}
+}
+
+// TestAuditSkipsTheBlocksOwnVocabulary: a spec string spelled like a bucket,
+// an interface the operator can write, the default mode or a notice word is
+// not refused for the line the template prints anyway; a name is.
+func TestAuditSkipsTheBlocksOwnVocabulary(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, taskRollup{Total: 3, Ended: 1, Cancelled: 1, Active: 1}, true)
+	for _, word := range []string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "slack"} {
+		if !strings.Contains(text, word) {
+			t.Fatalf("fixture: %q is not in the block", word)
+		}
+	}
+	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "next", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
+	if leaked := auditUsageSummary(text, vocabulary); len(leaked) != 0 {
+		t.Fatalf("the audit refused the block's own words: %v", leaked)
+	}
+	if leaked := auditUsageSummary(text+"\ncluster: prod-eu-1", []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("a name must still be refused, got %v", leaked)
+	}
+}
+
+// TestServerVersionReadsUnderTheContext: the /version read ends at the
+// context's deadline on a server that accepts and never answers, and parses
+// the gitVersion when one does.
+func TestServerVersionReadsUnderTheContext(t *testing.T) {
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != serverVersionPath {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("X-Stall") == "" {
+			_, _ = w.Write([]byte(`{"gitVersion":"v1.33.4-gke.1234000"}`))
+			return
+		}
+		<-stall
+	}))
+	defer srv.Close()
+	defer close(stall)
+	disc, err := discovery.NewDiscoveryClientForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &k8sUsageSource{disc: disc}
+	got, err := src.ServerVersion(context.Background())
+	if err != nil || got != "v1.33.4-gke.1234000" {
+		t.Fatalf("ServerVersion = %q, %v", got, err)
+	}
+	stalled, err := discovery.NewDiscoveryClientForConfig(&rest.Config{Host: srv.URL, WrapTransport: func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			r.Header.Set("X-Stall", "1")
+			return rt.RoundTrip(r)
+		})
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := (&k8sUsageSource{disc: stalled}).ServerVersion(ctx); err == nil {
+		t.Fatal("a stalled /version must fail at the deadline, not succeed")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("the stalled read held for %v past a 200ms deadline", waited)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+type fakeUsageSource struct {
+	cr      map[string]any
+	version string
+	err     error
+}
+
+func (f fakeUsageSource) PlatformAgent(context.Context) (map[string]any, error) {
+	return f.cr, f.err
+}
+
+func (f fakeUsageSource) ServerVersion(context.Context) (string, error) { return f.version, nil }
+
+// TestFeedbackSummaryPostsTheBlockAndStartsNoTask: "/feedback summary" is the
+// gateway's own answer, like the bare form: one fenced block, no task, no
+// change to the conversation's state.
+func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.g.usage = fakeUsageSource{cr: summaryCR(), version: "v1.33.4-gke.1234000"}
+	conv := "discord:g1/thread-fbs1"
+	sessionRigTurn(r, conv, "fbs-100", "/feedback summary")
+	waitFor(t, "summary", postedContaining(r, usageSummaryTitle))
+	if !postedContaining(r, "toolExecutionsTotal: 19127")() {
+		t.Fatal("the block must carry the usage counters")
+	}
+	// The tasks line is the live scan of the rig's bucket under the rig's
+	// SessionTTL, which this turn added nothing to.
+	if line := fmt.Sprintf("chat turns (%d days): 0", windowDays(usageWindow(r.g.cfg.SessionTTL))); !postedContaining(r, line)() {
+		t.Fatalf("the block must carry %q from the record scan", line)
+	}
+	if postedContaining(r, "prod-eu-1")() || postedContaining(r, "kubeagents-system")() {
+		t.Fatal("the block named an identifier of the install")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("/feedback summary submitted %d envelope(s); it must submit none", n)
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
+		t.Fatalf("/feedback summary left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestBareFeedbackNoticeNamesTheSummary: the bare notice is the one place in
+// chat that lists what /feedback does, so it names the summary form.
+func TestBareFeedbackNoticeNamesTheSummary(t *testing.T) {
+	if !strings.Contains(feedbackCommandNotice, "/feedback summary") {
+		t.Fatalf("the bare /feedback notice does not name /feedback summary:\n%s", feedbackCommandNotice)
+	}
+}
+
+func TestFeedbackSummaryRefusesALeakAndSaysWhyWithoutNamingIt(t *testing.T) {
+	r := startRig(t)
+	cr := summaryCR()
+	// A status whose interface list carries the cluster's name: the one
+	// dynamic field a leak could ride into the block.
+	cr["status"].(map[string]any)["usage"].(map[string]any)["activeInterfaces"] = []any{"slack", "prod-eu-1"}
+	r.g.usage = fakeUsageSource{cr: cr, version: "v1"}
+	conv := "discord:g1/thread-fbs2"
+	sessionRigTurn(r, conv, "fbs-110", "/feedback summary")
+	waitFor(t, "refusal", postedContaining(r, usageSummaryRefusedNotice))
+	if postedContaining(r, usageSummaryTitle)() {
+		t.Fatal("the block was posted although it named an identifier")
+	}
+}
+
+// TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName: the
+// model line is printed by design, so a deployment name that carries a spec
+// identifier as a segment does not stop the block.
+func TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName(t *testing.T) {
+	r := startRig(t)
+	cr := summaryCR()
+	cr["status"].(map[string]any)["inference"] = map[string]any{"provider": "hosted_vllm", "model": "prod-eu-1/llama-8b"}
+	r.g.usage = fakeUsageSource{cr: cr, version: "v1"}
+	conv := "discord:g1/thread-fbs4"
+	sessionRigTurn(r, conv, "fbs-130", "/feedback summary")
+	waitFor(t, "summary", postedContaining(r, usageSummaryTitle))
+	if !postedContaining(r, "  model: hosted_vllm/prod-eu-1/llama-8b")() {
+		t.Fatal("the block must carry the model line from status.inference")
+	}
+	if postedContaining(r, usageSummaryRefusedNotice)() {
+		t.Fatal("the model line must not be the reason a block is refused")
+	}
+}
+
+func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.g.usage = fakeUsageSource{err: errors.New("platformagents.kubeagents.x-k8s.io is forbidden")}
+	conv := "discord:g1/thread-fbs3"
+	sessionRigTurn(r, conv, "fbs-120", "/feedback summary")
+	waitFor(t, "unavailable", postedContaining(r, usageSummaryUnavailableNotice))
+	if postedContaining(r, "forbidden")() {
+		t.Fatal("the error text reached chat")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("submitted %d envelope(s); it must submit none", n)
+	}
+}
+
+// topToolsFixture is the shared render fixture: status.usage.topTools as the
+// operator writes it and the lines both renderers must print for it; the
+// script's test_feedback_summary.py renders the same file through its status
+// fallback against the same lines.
+func topToolsFixture(t *testing.T) (rows []any, lines []string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "agents", "platform", "scripts", "testdata", "feedback_summary_top_tools.json"))
+	if err != nil {
+		t.Fatalf("reading the fixture: %v", err)
+	}
+	var fixture struct {
+		TopTools []any    `json:"topTools"`
+		Lines    []string `json:"lines"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("parsing the fixture: %v", err)
+	}
+	return fixture.TopTools, fixture.Lines
+}
+
+// The tools block is the script's, byte for byte, from the status: the shared
+// fixture's rows render to its lines, between lastHumanActive and performance,
+// and the block stays under its cap with the five rows and every reading.
+func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
+	rows, want := topToolsFixture(t)
+	cr := summaryCR()
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = rows
+	text := renderUsageSummary(summaryNow, cr, "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\n" + usageSummaryPerformanceHeader + "\n"
+	if !strings.Contains(text, block) {
+		t.Fatalf("block lacks the fixture's tools lines in place:\n%s", text)
+	}
+	if n := len(strings.Split(text, "\n")); n > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines with five rows, cap %d", n, usageSummaryMaxLines)
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+// An absent field prints unavailable, the script's word for a broker it could
+// not read; an empty list prints none; a list past five rows is cut to five,
+// and a row that is not an object is skipped.
+func TestRenderUsageSummaryTopToolsDegrade(t *testing.T) {
+	cr := summaryCR()
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\ntools (top 5, since broker start): unavailable\n" + usageSummaryPerformanceHeader + "\n"; !strings.Contains(text, want) {
+		t.Errorf("block lacks %q:\n%s", want, text)
+	}
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["topTools"] = []any{}
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\ntools (top 5, since broker start): none\n") {
+		t.Errorf("an empty list did not print none:\n%s", text)
+	}
+	var many []any
+	for i := 0; i < 7; i++ {
+		many = append(many, map[string]any{"tool": "git", "subcommand": "fetch", "total": int64(7 - i), "success": int64(7 - i)})
+	}
+	usage["topTools"] = append([]any{"not a row"}, many...)
+	text = renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if got := strings.Count(text, "  git/fetch: "); got != 5 {
+		t.Errorf("%d rows printed from a list of seven, want five:\n%s", got, text)
+	}
+	if strings.Contains(text, "not a row") {
+		t.Errorf("a row that is not an object reached the block:\n%s", text)
+	}
+}
+
+// A cluster named after a word the tools block can print, a gcloud group or
+// a kubectl verb, is not refused for a row that names it: the broker's
+// vocabulary is the block's own, as the script's TEMPLATE_EXTRA_TOKENS is.
+func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
+	cr := summaryCR()
+	cr["spec"].(map[string]any)["harness"].(map[string]any)["clusterName"] = "compute"
+	cr["spec"].(map[string]any)["scope"].(map[string]any)["projects"] = []any{"describe", "feedback"}
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = []any{
+		map[string]any{"tool": "gcloud", "subcommand": "compute", "total": int64(3), "success": int64(3)},
+		map[string]any{"tool": "kubectl", "subcommand": "describe", "total": int64(2), "error": int64(2)},
+		map[string]any{"tool": "feedback", "subcommand": "none", "total": int64(1), "success": int64(1)},
+	}
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Fatalf("the audit refused the block's own vocabulary: %v", leaked)
+	}
+	for _, tool := range []string{"kubectl", "gcloud", "git", "gh", "feedback"} {
+		if _, ok := usageSummaryBrokerSubcommands[tool]; !ok {
+			t.Errorf("the gateway's vocabulary lacks %s", tool)
+		}
+	}
+}

@@ -91,8 +91,9 @@ ERROR_BODY_LIMIT = 200
 
 # a2a/gateway/slack.go, slackTurnSubtypes: the subtypes inbound() takes as a user turn.
 TURN_SUBTYPES = frozenset({"", "thread_broadcast", "file_share"})
-# a2a/gateway/gateway.go, verifySender: the notice an unverified sender gets, once per
-# sender per gateway process. The text after "on slack" names the sender's id.
+# a2a/gateway/gchat.go, unverifiedNotice (posted by gateway.go's verifySender): the notice
+# an unverified sender gets, once per sender per gateway process (a message shortcut's clicker
+# gets it privately, every time). The text after "on slack" names the sender's id.
 REFUSAL_NOTICE_MARKER = "I can't verify who you are on slack"
 REFUSAL_NOTICE_PREFIX = "⛔ " + REFUSAL_NOTICE_MARKER
 # The gateway's own lines are told from the agent's answer by their whole text,
@@ -118,8 +119,10 @@ STATUS_LINE_PATTERN = re.compile(r"(\S+) \*([a-z-]+)\*(?: — .*)?", re.DOTALL)
 STATE_SUBMITTED = "submitted"
 STATE_COMPLETED = "completed"
 FAILED_STATES = frozenset({"failed", "canceled", "rejected"})
-# relay.go relayTerminal: the notices for a task that did not complete.
-FAILURE_POST_PATTERN = re.compile(r"❌ failed: .*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:: .*)?", re.DOTALL)
+# relay.go terminalNotice: the notices for a task that did not complete. The
+# reason follows " — " when the executor wrote it as `reason: <token>[ - detail]`
+# (the notice carries the detail, never the token) and ": " when it was plain text.
+FAILURE_POST_PATTERN = re.compile(r"❌ failed(?: — |: ).*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:(?: — |: ).*)?", re.DOTALL)
 # gateway.go steerTask: the steer acknowledgements, and the notice when the steer
 # could not be published. Any of them means the turn started no task.
 # ackSteerSession (steered into the running task) and, since #2634,

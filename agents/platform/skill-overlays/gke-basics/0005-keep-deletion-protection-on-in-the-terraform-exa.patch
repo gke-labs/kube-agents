@@ -1,0 +1,22 @@
+Subject: keep deletion protection on in the Terraform example
+
+Why: the Terraform example set `deletion_protection = false` "for testing", and a new cluster written on a Terraform repository came out with protection off in 4 of 5 lane runs on #3691, one of them "for easier lifecycle evaluation". gcp-terraform forbids turning it off; the example now keeps the provider default.
+Local-Issue: #3727
+Upstream-Issue: none
+Retire-When: upstream's example keeps deletion protection on
+
+diff --git a/references/iac-usage.md b/references/iac-usage.md
+--- a/references/iac-usage.md
++++ b/references/iac-usage.md
+@@ -27,8 +27,9 @@ resource "google_container_cluster" "primary" {
+   # Do NOT specify node configurations (like initial_node_count or node_config)
+   # in Autopilot mode; doing so causes a Terraform provider error.
+ 
+-  # Deletion protection should be set to false for testing
+-  deletion_protection = false
++  # Keep deletion protection on (the provider default since 5.0.0). Turning it
++  # off is a human's change, never one to make for a test (gcp-terraform).
++  deletion_protection = true
+ }
+ ```
+ 

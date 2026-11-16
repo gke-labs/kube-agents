@@ -1,0 +1,42 @@
+{
+  "_comment": "status.usage.topTools as the operator writes it, and the lines both renderers print for it: a2a/gateway/feedback_summary_test.go renders it through renderTopTools and test_feedback_summary.py through the status fallback, each against lines.",
+  "topTools": [
+    {
+      "tool": "kubectl",
+      "subcommand": "get",
+      "total": 14900,
+      "success": 14500,
+      "error": 400
+    },
+    {
+      "tool": "kubectl",
+      "subcommand": "describe",
+      "total": 3100,
+      "success": 3100
+    },
+    {
+      "tool": "gcloud",
+      "subcommand": "monitoring",
+      "total": 1000,
+      "success": 800,
+      "error": 200
+    },
+    {
+      "tool": "kubectl",
+      "subcommand": "delete",
+      "total": 15,
+      "blocked": 12,
+      "busy": 2,
+      "abandoned": 1
+    },
+    { "tool": "feedback", "subcommand": "none", "total": 5, "success": 5 }
+  ],
+  "lines": [
+    "tools (top 5, since broker start):",
+    "  kubectl/get: 14900 (success 14500, error 400)",
+    "  kubectl/describe: 3100 (success 3100)",
+    "  gcloud/monitoring: 1000 (success 800, error 200)",
+    "  kubectl/delete: 15 (blocked 12, busy 2, abandoned 1)",
+    "  feedback: 5 (success 5)"
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "payload": {
+    "number": 4188
+  },
+  "responses": [
+    [
+      {
+        "id": 17120001,
+        "actor": {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        },
+        "event": "labeled",
+        "label": {
+          "name": "automated-pr",
+          "color": "0e8a16"
+        },
+        "commit_id": null,
+        "created_at": "2026-08-20T09:00:05Z"
+      },
+      {
+        "id": 17120002,
+        "actor": {
+          "login": "example-reviewer",
+          "id": 88121,
+          "type": "User"
+        },
+        "event": "closed",
+        "commit_id": null,
+        "created_at": "2026-08-20T15:00:00Z"
+      },
+      {
+        "id": 17120003,
+        "actor": {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        },
+        "event": "reopened",
+        "commit_id": null,
+        "created_at": "2026-08-21T09:00:00Z"
+      },
+      {
+        "id": 17120004,
+        "actor": {
+          "login": "example-maintainer",
+          "id": 4401,
+          "type": "User"
+        },
+        "event": "closed",
+        "commit_id": null,
+        "created_at": "2026-08-21T11:40:03Z"
+      },
+      {
+        "id": 17120005,
+        "actor": {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        },
+        "event": "head_ref_deleted",
+        "commit_id": null,
+        "created_at": "2026-08-21T11:41:00Z"
+      }
+    ]
+  ]
+}

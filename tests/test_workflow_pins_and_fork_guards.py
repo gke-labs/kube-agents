@@ -14,8 +14,9 @@ a third:
     `if: github.repository == 'gke-labs/kube-agents'` on every job, because a
     fork inherits the triggers but none of the secrets, so an unguarded job
     fails there on every sync. A `workflow_call`- or `workflow_dispatch`-only
-    workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose so a
-    fork can publish its own Pages site.
+    workflow needs no guard, `docs-deploy.yml` is unguarded on purpose so a
+    fork can publish its own Pages site, and so is `merge-gate.yml`'s `gate`
+    job, which runs only on `merge_group`.
   - a Docker Hub image is pulled through `mirror.gcr.io`, because Docker Hub's
     anonymous limit is per source IP and GitHub-hosted runners share theirs:
     a `docker/setup-buildx-action` step takes its builder image from the
@@ -104,6 +105,11 @@ _MANUAL_ONLY = {"workflow_call", "workflow_dispatch"}
 # fails when an entry no longer exists, is no longer in scope, or has since been
 # guarded, so the exemption cannot outlive its reason.
 _UNGUARDED_BY_DESIGN = {"docs-deploy.yml": "a fork publishes its own Pages site"}
+# Single jobs allowed to run unguarded in a workflow whose other jobs carry the
+# guard, each with its reason; `test_allowlist_is_current` holds these too.
+_UNGUARDED_JOBS_BY_DESIGN = {
+    ("merge-gate.yml", "gate"): "it runs only on `merge_group`, and a skipped job passes a required check",
+}
 
 _SHA_RE = re.compile(r"@[0-9a-f]{40}$")
 _VERSION_COMMENT_RE = re.compile(r"#\s*v?\d")
@@ -387,6 +393,8 @@ def check_guards(directory: Path) -> GuardReport:
         if path.name in _UNGUARDED_BY_DESIGN:
             continue
         for job_name in unguarded:
+            if (path.name, job_name) in _UNGUARDED_JOBS_BY_DESIGN:
+                continue
             report.violations.append(
                 f"{path.name}: job {job_name!r} is auto-triggered and credentialed "
                 f"but has no `if: {_GUARD}`"
@@ -407,6 +415,16 @@ def check_allowlist(directory: Path) -> list[str]:
         elif not in_scope[name]:
             problems.append(f"{name}: allowlisted ({reason}) but every job is guarded")
     return problems
+
+
+def check_job_allowlist(directory: Path) -> list[str]:
+    """Every `_UNGUARDED_JOBS_BY_DESIGN` entry is still an unguarded job of an in-scope workflow."""
+    in_scope = check_guards(directory).in_scope
+    return [
+        f"{name}: job {job_name!r} allowlisted ({reason}) but not an unguarded job in scope"
+        for (name, job_name), reason in _UNGUARDED_JOBS_BY_DESIGN.items()
+        if job_name not in in_scope.get(name, [])
+    ]
 
 
 @dataclass
@@ -1081,6 +1099,20 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(report.in_scope, {f"{stem}.yml": ["publish"]})
         self.assertEqual(check_allowlist(self.dir), [])
 
+    def test_an_allowlisted_job_exempts_that_job_alone(self) -> None:
+        (name, job_name), _ = next(iter(_UNGUARDED_JOBS_BY_DESIGN.items()))
+        workflow = SECOND_JOB_UNGUARDED_WORKFLOW.replace("  second:", f"  {job_name}:")
+        _write_workflows(self.dir, **{name.removesuffix(".yml"): workflow})
+        self.assertEqual(check_guards(self.dir).violations, [])
+        self.assertEqual(check_job_allowlist(self.dir), [])
+        # Unguard the other job too: it is still a violation.
+        _write_workflows(self.dir, **{name.removesuffix(".yml"): workflow.replace(f"    if: {_GUARD}\n", "")})
+        self.assertEqual(len(check_guards(self.dir).violations), 1)
+        # Guard the allowlisted job: the entry is stale.
+        guarded = workflow.replace(f"  {job_name}:\n", f"  {job_name}:\n    if: {_GUARD}\n")
+        _write_workflows(self.dir, **{name.removesuffix(".yml"): guarded})
+        self.assertEqual(len(check_job_allowlist(self.dir)), 1)
+
     def test_stale_allowlist_entry_fails(self) -> None:
         stem = next(iter(_UNGUARDED_BY_DESIGN)).removesuffix(".yml")
         # Missing entirely.
@@ -1216,6 +1248,7 @@ class RealTreeTests(unittest.TestCase):
 
     def test_allowlist_is_current(self) -> None:
         self.assertEqual(check_allowlist(WORKFLOWS_DIR), [])
+        self.assertEqual(check_job_allowlist(WORKFLOWS_DIR), [])
 
     def test_every_docker_hub_pull_goes_through_the_mirror(self) -> None:
         report = check_mirror(WORKFLOWS_DIR)
