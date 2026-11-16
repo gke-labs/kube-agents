@@ -742,6 +742,14 @@ type PlatformAgentReconciler struct {
 	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
 	calloutStatus calloutStatusReader
 
+	// UniverseDomainDetector probes the GKE metadata server for the host
+	// cluster's Google Cloud API universe domain; nil in offline unit and
+	// golden tests disables the network probe.
+	UniverseDomainDetector   func(ctx context.Context) (domain string, determined bool)
+	universeDomainMu         sync.Mutex
+	universeDomainResolved   bool
+	discoveredUniverseDomain string
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -827,10 +835,9 @@ type PlatformAgentReconciler struct {
 // nothing. The writes are namespaced like every other rendered kind's. The
 // reads stay cluster-wide, like every other kind's, for the teardown walk:
 // deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
-// deletion and every flip to today, before any check that the namespace or
-// a RoleBinding in it exists, and a Helm install in mode today binds the
-// Role in the install namespace only, so a namespaced read would be a 403
-// there (the API server authorises a namespaced list before it looks for
+// deletion, without checking that the namespace or a RoleBinding in it
+// exists, so a namespaced read would be a 403 wherever that RoleBinding is
+// absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
 // namespaced Role there in the same apply (the chart under mode next,
 // config/profiles under make deploy), which is what lets the namespaced
@@ -1083,7 +1090,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// It was at the bottom, under everything, which meant a reconcile that
 	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
 	// just after the bus step fixed two of those parks and left four: the
-	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// refusals at 9b, 9c, 10 and 11e all return above the bus
 	// step, and the bus step cannot move above them because it renders on top
 	// of what they withhold. There is no position in the sequence that works,
 	// so this is not a position in the sequence.
@@ -1246,6 +1253,31 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// 9d. Refuse a CR whose explicit spec.harness.universeDomain disagrees with
+	// the host cluster's GKE metadata server: one PlatformAgent spans a single
+	// universe domain and must never send tokens across universe boundaries.
+	// When node-local 169.254.169.254 fails transiently, requeue without
+	// rendering cross-universe workloads or overwriting status.
+	reason, msg, transientUniverseProbe := r.validateUniverseDomain(ctx, instance)
+	if transientUniverseProbe {
+		log.Info("GKE metadata server universe-domain probe timed out or failed transiently; requeueing before rendering workloads")
+		if guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance); guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{RequeueAfter: universeDomainMetadataRetryWindow}, nil
+	}
+	if reason != "" {
+		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, brokerNotReconciled); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// 10. Validate RuntimeClass if specified
 	if rcName, err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
@@ -1277,15 +1309,22 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Stamp the resolved universe domain onto a render copy so every manifest
+	// builder sees metadata-discovered custom universes even when
+	// spec.harness.universeDomain is omitted, while keeping instance.Status
+	// untouched for updateStatusReady / updateStatusDegraded.
+	renderAgent := instance.DeepCopy()
+	renderAgent.Status.ResolvedUniverseDomain, renderAgent.Status.UniverseDomainSource = r.resolvedUniverseDomainPair(ctx, instance)
+
 	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
 	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
 	// CA Secret and proxy Service exist before the shell mounts and dials them.
-	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
-	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, renderAgent)
 	otlpDisabled := otlpSource == otlpSourceNone
-	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileKubeProxy(ctx, renderAgent, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1294,7 +1333,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
 	// on a first install this order means the sandbox's ServiceAccount exists
 	// before the broker starts authenticating callers against it.
-	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
+	if err := r.reconcileShellSandbox(ctx, renderAgent, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1303,17 +1342,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Whether the broker may admit the MCP pod's ServiceAccount: read here
 	// because the broker renders before the A2A stack that would otherwise
 	// answer it (a2aMCPIdentityOwned).
-	mcpIdentityOwned, err := r.a2aMCPIdentityOwned(ctx, instance)
+	mcpIdentityOwned, err := r.a2aMCPIdentityOwned(ctx, renderAgent)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// And the scope publisher's, for the same reason (scopePublisherIdentityOwned).
-	scopeIdentityOwned, err := r.scopePublisherIdentityOwned(ctx, instance)
+	scopeIdentityOwned, err := r.scopePublisherIdentityOwned(ctx, renderAgent)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	owned := brokerCallerOwnership{mcp: mcpIdentityOwned, scope: scopeIdentityOwned}
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, owned); err != nil {
+	if err := r.reconcileCredentialProxy(ctx, renderAgent, proxyPolicyHash, agentPlugins, owned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1324,7 +1363,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// agent that silently is not. Below the broker reconcile, also
 	// deliberately: this refusal is about one destination, and it should not
 	// stop the broker being reconciled the way the layout refusal at 10c must.
-	if reason, msg := validateEgressAllowlist(instance); reason != "" {
+	if reason, msg := validateEgressAllowlist(renderAgent); reason != "" {
 		log.Info(msg)
 		// Returning here withholds the workload, the Service, the
 		// PodDisruptionBudget, the legacy cleanup and updateStatusReady. What
@@ -1344,7 +1383,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// guardrails via reconcileAgentNetworkGuardrails, recording Degraded status
 		// before returning any guardrail error so neither the agent gateway policy
 		// nor the litellm policy is stranded when reconciliation pauses at Degraded.
-		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, renderAgent)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -1355,45 +1394,45 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	netpolProf := r.resolveNetpolProfile(ctx, instance)
+	netpolProf := r.resolveNetpolProfile(ctx, renderAgent)
 	// The home-channel record, read once per pass: the projection in the
 	// A2A render and both condition writers take this value, so the file
 	// and the condition never disagree within one pass.
-	homeRec, err := r.homeChannelRecordFor(ctx, instance)
+	homeRec, err := r.homeChannelRecordFor(ctx, renderAgent)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 12b. Reconcile the agent Pod's default-deny egress policy, if it has one.
-	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf), otlpEndpoint); err != nil {
+	if err := r.reconcileAgentEgressPolicy(ctx, renderAgent, r.agentEgressDNSClusterIPs(ctx, renderAgent, netpolProf), otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Reconcile Service
-	if err := r.reconcileService(ctx, instance); err != nil {
+	if err := r.reconcileService(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Reconcile PodDisruptionBudget
-	if err := r.reconcilePodDisruptionBudget(ctx, instance); err != nil {
+	if err := r.reconcilePodDisruptionBudget(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Reconcile NetworkPolicy
-	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, renderAgent, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, renderAgent, netpolProf); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// The A2A stack: NATS, the auth callout, the gateway, the capability
 	// verifier, the provisioning Job and the tiers. Every install renders it.
-	a2aState, err := r.reconcileA2A(ctx, instance, homeRec)
+	a2aState, err := r.reconcileA2A(ctx, renderAgent, homeRec)
 	// For the deferred write at 2d, failed pass or not: a step after
 	// the dispatcher's failing doesn't undo what it did to Job mode.
 	dispatcherJobMode = a2aState.dispatcherJobMode
@@ -1615,7 +1654,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // interval, the ceiling the caller already applies, so the min it feeds leaves
 // the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -3822,27 +3861,28 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 // agent's guardrails a requeue cycle. Every step runs even when an earlier one
 // fails, and the errors are joined so none of them is hidden.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
-	netpolProf := r.resolveNetpolProfile(ctx, agent)
+	guardrailAgent, skipFQDN := r.guardrailAgentForUniverse(ctx, agent)
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, guardrailAgent)
+	netpolProf := r.resolveNetpolProfile(ctx, guardrailAgent)
 	var errs []error
-	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
+	if err := r.reconcileNetworkPolicyWithFQDN(ctx, guardrailAgent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone, skipFQDN); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint); err != nil {
+	if err := r.reconcileAgentEgressPolicy(ctx, guardrailAgent, r.agentEgressDNSClusterIPs(ctx, guardrailAgent, netpolProf), otlpEndpoint); err != nil {
 		errs = append(errs, err)
 	}
 	// No server count is resolved here: this path does not reconcile the
 	// bus, so it must not write status.busReplicas or announce a
 	// conversion, and the bus fence does not depend on the count.
-	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, guardrailAgent); err != nil {
 		var pnErr *profileNamespaceError
 		if goerrors.As(err, &pnErr) {
-			r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)
+			r.profileNamespaceFailure(ctx, guardrailAgent, "fence", pnErr.err)
 		} else {
 			errs = append(errs, err)
 		}
 	}
-	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, guardrailAgent, netpolProf); err != nil {
 		errs = append(errs, err)
 	}
 	return goerrors.Join(errs...)
@@ -3999,6 +4039,10 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile, otlpEndpoint string, otlpDisabled bool) error {
+	return r.reconcileNetworkPolicyWithFQDN(ctx, agent, profile, otlpEndpoint, otlpDisabled, false)
+}
+
+func (r *PlatformAgentReconciler) reconcileNetworkPolicyWithFQDN(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile, otlpEndpoint string, otlpDisabled bool, skipFQDNReconcile bool) error {
 	if !profile.Generated {
 		var existingNetpol networkingv1.NetworkPolicy
 		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway-netpol"}, &existingNetpol); err == nil {
@@ -4047,7 +4091,30 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
-	if fqdnEnabled {
+	if skipFQDNReconcile {
+		// On a cold-start metadata timeout with no prior resolved universe, leave
+		// any existing FQDNNetworkPolicy untouched rather than rendering default
+		// commercial domains or deleting a previously applied sovereign policy.
+		// Probe CRD presence via List (not Get, because isCRDNotInstalledError treats
+		// a named-object NotFound as CRD absence): an empty list means the CRD is
+		// installed so fqdnEnabled stays true (failing closed without blanket
+		// 0.0.0.0/0:443 egress) until the universe is resolved.
+		if fqdnEnabled {
+			fqdnList := &unstructured.UnstructuredList{}
+			fqdnList.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "networking.gke.io",
+				Version: "v1alpha1",
+				Kind:    "FQDNNetworkPolicyList",
+			})
+			if err := r.List(ctx, fqdnList, client.InNamespace(agent.Namespace), client.Limit(1)); err != nil {
+				if isCRDNotInstalledError(err) {
+					fqdnEnabled = false
+				} else {
+					return fmt.Errorf("failed to check FQDNNetworkPolicy CRD in %s: %w", agent.Namespace, err)
+				}
+			}
+		}
+	} else if fqdnEnabled {
 		fqdnNetpol := buildFQDNNetworkPolicy(agent)
 		if err := ctrl.SetControllerReference(agent, fqdnNetpol, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
@@ -5221,6 +5288,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
 
+	resolvedUniverseDomain, universeDomainSource := r.resolvedUniverseDomainPair(ctx, agent)
+	universeDomainUnchanged := r.universeDomainPruned(agent) ||
+		(agent.Status.ResolvedUniverseDomain == resolvedUniverseDomain &&
+			agent.Status.UniverseDomainSource == universeDomainSource)
+	effectiveDomain := resolvedUniverseDomain
+	if effectiveDomain == "" {
+		effectiveDomain = effectiveUniverseDomain(agent)
+	}
+	externalEgressMsg := externalModelEgressMessage(effectiveDomain, newInference)
+	externalEgressUnchanged := externalModelEgressConditionCurrent(agent, externalEgressMsg)
+
 	// Check if anything actually changed. The generation is in the list so that
 	// a spec edit which changes nothing derived here still gets one write:
 	// without it the status would keep describing the previous generation and
@@ -5243,6 +5321,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		(r.usageStatusPruned(agent) || slices.Equal(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
 		inferenceUnchanged &&
+		universeDomainUnchanged &&
+		externalEgressUnchanged &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
@@ -5285,6 +5365,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// here is what keeps them intact once something does write them.
 	agent.Status.Usage.ActiveInterfaces = newActiveInterfaces
 	agent.Status.Inference = newInference
+	agent.Status.ResolvedUniverseDomain = resolvedUniverseDomain
+	agent.Status.UniverseDomainSource = universeDomainSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -5347,6 +5429,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
+	setExternalModelEgressCondition(agent, externalEgressMsg, now)
 
 	writtenBusReplicas := agent.Status.BusReplicas
 	// Copied before the write: decoding the response may reuse the pointer's target.
@@ -5360,6 +5443,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
+	r.noteUniverseDomainEcho(ctx, agent, resolvedUniverseDomain, universeDomainSource)
 	r.noteObservedVersionEcho(ctx, agent, newObservedVersion)
 	return newPhase, a2aTasksWaitRequeue, nil
 }

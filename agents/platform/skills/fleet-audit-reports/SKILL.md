@@ -1,6 +1,7 @@
 ---
 name: fleet-audit-reports
-description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
+description: >-
+  Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
 ---
 
 # fleet-audit-reports — Reading What the Audits Found

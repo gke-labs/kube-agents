@@ -444,7 +444,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		b.beginKanbanWait(sessionID)
 		defer func() {
 			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
-				b.markSessionCanceled(sessionID)
+				b.markRunCanceled(run, sessionID)
 			}
 			b.endKanbanWait(sessionID)
 		}()

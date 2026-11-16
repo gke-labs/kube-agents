@@ -3193,6 +3193,95 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
 
 
+class KubeconfigLockOwnerTest(unittest.TestCase):
+    """Only the kubeconfig's owner makes the lock beside it. A caller that does
+    not own the file cannot change it, and a lock that root made is one the
+    agent user cannot open: its later merges stopped without a word."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.PROXY_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        self.lock = self.root / "..kubeconfig.lock"
+        self.record = self.root / "..kubeconfig.contexts-registered"
+
+    def merge(self, path=None, as_uid=None):
+        """One merge of TARGET_CTX; returns what it wrote to stderr."""
+        stderr = io.StringIO()
+        uid = os.geteuid() if as_uid is None else as_uid
+        with patch.object(credential_proxy_client.os, "geteuid", return_value=uid), \
+                patch.object(credential_proxy_client.sys, "stderr", stderr):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                path or self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        return stderr.getvalue()
+
+    def test_a_caller_that_does_not_own_the_kubeconfig_makes_no_lock(self):
+        before = self.kubeconfig.read_bytes()
+        self.assertEqual("", self.merge(as_uid=os.geteuid() + 1), "refused, which is no failure to report")
+        self.assertEqual([self.kubeconfig.name], sorted(p.name for p in self.root.iterdir()))
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_the_owners_merge_after_a_run_by_another_caller_registers_and_records(self):
+        self.merge(as_uid=os.geteuid() + 1)
+        self.assertEqual("", self.merge())
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", self.kubeconfig.read_text(encoding="utf-8"))
+        self.assertEqual(os.geteuid(), self.lock.stat().st_uid)
+        self.assertEqual([self.TARGET_CTX], [line.split(" ", 1)[0] for line in self.record.read_text(encoding="utf-8").splitlines()])
+
+    def test_a_kubeconfig_that_is_not_a_regular_file_gets_no_lock(self):
+        cases = {"missing": self.root / "missing" / "config", "a folder": self.root / "folder" / "config"}
+        cases["missing"].parent.mkdir()
+        cases["a folder"].mkdir(parents=True)
+        link = self.root / "linked" / "config"
+        link.parent.mkdir()
+        link.symlink_to(self.kubeconfig)
+        cases["a symlink"] = link
+        before = self.kubeconfig.read_bytes()
+        for label, path in cases.items():
+            with self.subTest(label):
+                self.assertEqual("", self.merge(path=path))
+                self.assertEqual([], [p.name for p in path.parent.iterdir() if p.name != path.name])
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_an_owner_who_cannot_open_the_lock_is_told(self):
+        """A folder under the lock's name: no caller can open that, root included."""
+        self.lock.mkdir()
+        before = self.kubeconfig.read_bytes()
+        said = self.merge()
+        self.assertEqual(1, len(said.splitlines()), said)
+        self.assertTrue(said.startswith("credential proxy: "), said)
+        for part in (str(self.lock), f"(owned by uid {os.geteuid()})", self.TARGET_CTX, str(self.kubeconfig)):
+            with self.subTest(part):
+                self.assertIn(part, said)
+        self.assertEqual(before, self.kubeconfig.read_bytes(), "nothing is merged without the lock")
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a file whatever its mode")
+    def test_a_lock_the_owner_has_no_right_to_open_is_reported_too(self):
+        """What a root run left before the owner check came first, as near as a test gets:
+        a lock file the caller cannot open."""
+        self.lock.touch(mode=0o000)
+        self.assertIn(f"{self.lock} (owned by uid {os.geteuid()}): Permission denied", self.merge())
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes to a folder whatever its mode")
+    def test_a_lock_that_cannot_be_made_names_no_owner(self):
+        self.root.chmod(0o500)
+        self.addCleanup(self.root.chmod, 0o700)
+        self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
+
+
 class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
     """The exec body carries the card or session id the shim runs under, so the
     broker can count the run's commands; absent when there is none."""

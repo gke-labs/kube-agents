@@ -18,6 +18,7 @@
     "react-dom": "^18"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10",
     "@testing-library/react": "^14",
     "@testing-library/user-event": "^14",
     "@types/react": "^18",

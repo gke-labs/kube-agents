@@ -463,6 +463,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[11].value=true",
         ]
+        # The bus's debug logging (#5708), under the name the operator reads,
+        # which turns it on only for "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[12].name={go_constant(_A2A_MANIFESTS, 'a2aNATSDebugEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[12].value=true",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -620,7 +628,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         # The dispatcher, at the candidate's published image.
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
         self.assertEqual(values[11], "operator.extraEnv[11].value=true")
-        self.assertEqual(len(values), 12, values)
+        self.assertEqual(values[12], "operator.extraEnv[12].value=true")
+        self.assertEqual(len(values), 13, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -1039,7 +1048,7 @@ class TasksBudgetSizingTest(unittest.TestCase):
         # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
         # -> TuningSpec.MaxSessions, as the API package tags them, and the
         # chart renders the values under platformAgent at those paths
-        # (tests/test_chart_platform_agent_mode.py, CiDeployDocumentRenderTest).
+        # (tests/test_chart_platform_agent_no_mode.py, NoModeRenderTest).
         api = text(_API_TYPES)
         self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
         self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
@@ -1339,7 +1348,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         # The ordering the wait relies on: the pass rolls the agent
         # Deployment before it creates or sweeps the provision Job, and
         # nothing watches Jobs, so the Failed status arrives on a requeue.
-        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance,"))
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, renderAgent,"), controller.index("r.reconcileA2A(ctx, renderAgent,"))
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 

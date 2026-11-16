@@ -28,8 +28,11 @@ classification, a suspected pull request, an open or merged fix, a priority
 and a confidence (VERDICT_SCHEMA), checks its answer against the evidence,
 and routes (``route``):
 
-    a suspected pull request from the window, confidence not low, class
+    a suspected pull request from the window that merged between the
+    last green and the first red night, confidence not low, class
     product bug or grader/harness   -> that pull request's author
+    such a pull request that merged
+    outside those nights            -> the filer's rule
     grader/harness, no such PR      -> ``infra_owner`` in domains.yaml
     infra                           -> ``infra_owner``
     a case problem, low confidence,
@@ -572,7 +575,30 @@ RULE_WHY = {
     "no_pr": "triage named no pull request from the commit window",
     "author_bot": "the suspected pull request's author is a bot",
     "no_author": "the suspected pull request's author could not be read",
+    "outside_nights": "the suspected pull request did not merge between the last green and the first red night",
 }
+
+
+def merged_between_nights(bundle: dict | None, number: int) -> bool:
+    """Whether pull request ``number`` merged between the issue's last green
+    night and its first red one (``window``). The commit window is not
+    enough on its own: with no green night on record it is the MAX_COMMITS
+    commits up to the first red one, which reach back weeks (2026-11-16: a
+    pull request merged 12 days before its case went red was named). No
+    green night, or no merge date, is False. By UTC date, the green bound a
+    day early: a night is dated by its start plus NIGHT_START_GRACE, so a
+    green build that started late the day before carries the next day's
+    date, and a merge just after it would otherwise be lost."""
+    bundle = bundle or {}
+    green, red = bundle.get("green") or {}, bundle.get("red") or {}
+    merged = ((bundle.get("prs") or {}).get(str(number)) or {}).get("merged_at")
+    if not (isinstance(merged, str) and isinstance(green.get("date"), str) and isinstance(red.get("date"), str)):
+        return False
+    try:
+        floor = (datetime.date.fromisoformat(green["date"][:10]) - datetime.timedelta(days=1)).isoformat()
+    except ValueError:
+        return False
+    return floor <= merged[:10] <= red["date"][:10]
 
 
 def route(verdict: dict | None, failure: str | None, bundle: dict | None, chain: list[str], infra_owner: str | None) -> list[tuple[str, str]]:
@@ -585,6 +611,11 @@ def route(verdict: dict | None, failure: str | None, bundle: dict | None, chain:
         reason = RULE_WHY["low"]
     elif verdict["classification"] == "case_rework":
         reason = RULE_WHY["case_rework"]
+    elif verdict["classification"] in ("product", "grader_or_harness") and str(verdict["suspected_pr"]) in ((bundle or {}).get("prs") or {}) \
+            and not merged_between_nights(bundle, verdict["suspected_pr"]):
+        # A record that could not be read at all keeps its old routing
+        # (RULE_WHY["no_author"], or the infra owner for a grader fault).
+        reason = RULE_WHY["outside_nights"]
     elif verdict["classification"] in ("product", "grader_or_harness") and verdict["suspected_pr"] and nightly_bugs.case_owner.is_person_login(
             ((bundle or {}).get("prs") or {}).get(str(verdict["suspected_pr"]), {}).get("author")):
         author = bundle["prs"][str(verdict["suspected_pr"])]["author"]
