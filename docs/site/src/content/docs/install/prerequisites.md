@@ -144,16 +144,16 @@ These figures are rendered from the chart's quota preflight and the operator's o
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
 <!-- prettier-ignore-start -->
 
-Totals by install profile, as the chart's quota preflight sums them (the operator's pods included, the session pods not):
+Totals by install profile, as the chart's quota preflight sums them (the operator's pods included, and the session pods at the default cap of `maxSessions`):
 
 | Profile | Pods | CPU requests | Memory requests | CPU limits | Memory limits | Ephemeral storage requests / limits | Claims | `requests.storage` | Session quota `pods` |
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
-| GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
-| Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
+| GKE Standard | 31 | 5936m | 18320Mi | 43050m | 53536Mi | 26368Mi / 26368Mi | 7 | 222Gi | 39 |
+| GKE Autopilot | 31 | 8436m | 21264Mi | 25550m | 38176Mi | 26368Mi / 26368Mi | 7 | 222Gi | 39 |
+| One NATS server, GKE Standard | 29 | 5316m | 17072Mi | 39950m | 51040Mi | 26112Mi / 26112Mi | 5 | 142Gi | 37 |
+| Hindsight and the GitHub minter, GKE Standard | 35 | 6786m | 20752Mi | 49050m | 59168Mi | 27520Mi / 27520Mi | 8 | 230Gi | 45 |
 
-The session pods at the default cap of 10 add 10 pods, 1500m CPU and 3200Mi memory requested, 20 CPU and 20Gi memory in limits, and 10880Mi of ephemeral storage: one `a2a-worker` row below per session. A namespace ResourceQuota needs room for them on top of the totals, and `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting, Autopilot admits each pod at its per-Pod minimums where those exceed the request, with limits equal to requests: 2500m CPU and 5Gi memory at the same cap, the figures the quota preflight uses on Autopilot.
+Of those totals, the session pods at the default cap of 10 are 10 pods, 1500m CPU and 3200Mi memory requested, 20 CPU and 20Gi memory in limits, and 10880Mi of ephemeral storage: one `a2a-worker` row below per session. `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting, Autopilot admits each pod at its per-Pod minimums where those exceed the request, with limits equal to requests: 2500m CPU and 5Gi memory at the same cap, the figures the quota preflight uses on Autopilot (the Autopilot profile's row above carries them).
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 

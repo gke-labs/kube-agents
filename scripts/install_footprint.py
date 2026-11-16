@@ -381,16 +381,15 @@ def _session_share_sentence() -> str:
     r = run_probe(default)["requirements"]
     a = run_probe(next(p for p in PROFILES if p.autopilot))["requirements"]
     return (
-        f"The session pods at the default cap of {r['maxSessions']} add {r['sessionPods']} pods,"
+        f"Of those totals, the session pods at the default cap of {r['maxSessions']} are {r['sessionPods']} pods,"
         f" {cpu(r['sessionRequestsCpu'])} CPU and {memory(r['sessionRequestsMemory'])} memory requested,"
         f" {cpu(r['sessionLimitsCpu'])} CPU and {memory(r['sessionLimitsMemory'])} memory in limits, and"
         f" {memory(r['sessionRequestsEphemeral'])} of ephemeral storage: one `a2a-worker` row below per"
-        " session. A namespace ResourceQuota needs room for them on top of the totals, and"
-        " `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting,"
+        " session. `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting,"
         " Autopilot admits each pod at its per-Pod minimums where those exceed the request, with"
         f" limits equal to requests: {cpu(a['sessionRequestsCpu'])} CPU and"
         f" {memory(a['sessionRequestsMemory'])} memory at the same cap, the figures the quota preflight"
-        " uses on Autopilot."
+        " uses on Autopilot (the Autopilot profile's row above carries them)."
     )
 
 
@@ -399,7 +398,7 @@ def render_tables() -> str:
     constants = quota_constants()
     lines = [
         "Totals by install profile, as the chart's quota preflight sums them (the operator's"
-        " pods included, the session pods not):",
+        " pods included, and the session pods at the default cap of `maxSessions`):",
         "",
         *TOTALS_HEADER,
         *(_totals_row(p) for p in PROFILES if p.label),

@@ -6748,7 +6748,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6786,7 +6786,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

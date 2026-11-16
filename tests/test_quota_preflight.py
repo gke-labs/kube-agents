@@ -112,20 +112,28 @@ data:
 # without updating the other fails here. The A2A stack is in them: the three NATS servers,
 # two callouts, two verifiers, the console, the gateway and its standby, the profile
 # dispatcher, the provisioning Job, and the hermes-bridge container in the agent pod.
-_DEFAULT_PODS = 21
-_DEFAULT_REQUESTS_CPU_MILLIS = 4436
-_DEFAULT_LIMITS_CPU_MILLIS = 23050
+# The session pods at the default cap (#6028): maxSessions (10) times the operator's
+# DefaultSession* figures, 150m / 320Mi requested, 2 CPU / 2Gi limits, 1088Mi ephemeral.
+_DEFAULT_MAX_SESSIONS = 10
+_SESSION_REQUEST_MILLIS = 150
+_SESSION_LIMIT_MILLIS = 2000
+_SESSION_REQUEST_MEMORY_BYTES = 320 * 1024**2
+_SESSION_LIMIT_MEMORY_BYTES = 2 * 1024**3
+_SESSION_EPHEMERAL_BYTES = 1088 * 1024**2
+_DEFAULT_PODS = 21 + _DEFAULT_MAX_SESSIONS
+_DEFAULT_REQUESTS_CPU_MILLIS = 4436 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MILLIS
+_DEFAULT_LIMITS_CPU_MILLIS = 23050 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MILLIS
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 15120 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 33056 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 15120 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MEMORY_BYTES
+_DEFAULT_LIMITS_MEMORY_BYTES = 33056 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MEMORY_BYTES
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi) plus 512Mi (128Mi on each NATS server and on the provisioning Job), LiteLLM's
 # 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two replicas, and the
 # cleanup hook's 1088Mi, and the profile dispatcher's 64Mi.
 _LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 512 + 2 * 1280 + 1088 + 64) * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 512 + 2 * 1280 + 1088 + 64) * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_EPHEMERAL_BYTES
 # The same three additions, because each sets its limit equal to its request.
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -302,6 +310,12 @@ class PreflightDecisionTest(unittest.TestCase):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
                 return json.loads(doc["data"]["requirements"])
         self.fail(f"probe ConfigMap not found in output:\n{res.stdout}")
+
+    def _requirements_without_sessions(self, sets: list[str] | None = None, extra_args: list[str] | None = None) -> dict:
+        """Requirements with maxSessions 0, for a test about another workload: on Autopilot
+        the session pods' share moves too (Autopilot's per-Pod minimums), which is
+        test_on_autopilot_the_share_is_at_autopilots_per_pod_minimums's to check."""
+        return self._requirements(["platformAgent.harness.tuning.maxSessions=0", *(sets or [])], extra_args=extra_args)
 
     def test_default_totals_match_the_documented_footprint(self) -> None:
         req = self._requirements()
@@ -550,23 +564,11 @@ class PreflightDecisionTest(unittest.TestCase):
         for key in ("sessionRequestsCpu", "sessionLimitsCpu", "sessionRequestsMemory", "sessionLimitsMemory"):
             self.assertEqual(req[key], base[key], key)
 
-    def test_the_session_share_stays_out_of_the_totals_while_the_gate_is_off(self) -> None:
-        """kube-agents.quotaCountsSessions is false: the share is reported, not compared."""
-        base = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
-        req = self._requirements(["platformAgent.harness.tuning.maxSessions=20"])
-        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory", "limitsMemory",
-                    "requestsEphemeral", "limitsEphemeral"):
-            self.assertEqual(req[key], base[key], key)
-
-    def test_with_the_gate_on_the_totals_carry_the_session_share(self) -> None:
-        """Flipping kube-agents.quotaCountsSessions adds exactly the session* keys."""
-        gate = self.chart / "templates" / "_0-session-gate.tpl"
-        gate.write_text('{{- define "kube-agents.quotaCountsSessions" -}}\ntrue\n{{- end }}\n')
-        try:
-            off = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
-            on = self._requirements(["platformAgent.harness.tuning.maxSessions=6"])
-        finally:
-            gate.unlink()
+    def test_the_totals_carry_the_session_share_at_the_cap(self) -> None:
+        """kube-agents.quotaCountsSessions is true: maxSessions moves every total by the
+        session pods' share, and only by it."""
+        off = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
+        on = self._requirements(["platformAgent.harness.tuning.maxSessions=20"])
         for total, key in (("pods", "sessionPods"), ("requestsCpu", "sessionRequestsCpu"),
                            ("limitsCpu", "sessionLimitsCpu"), ("requestsMemory", "sessionRequestsMemory"),
                            ("limitsMemory", "sessionLimitsMemory"),
@@ -576,26 +578,38 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertGreater(on[key], 0)
                 self.assertEqual(on[total] - off[total], on[key])
 
-    def test_the_refusal_names_the_session_share_only_when_the_totals_carry_it(self) -> None:
+    def test_the_refusal_names_the_session_share(self) -> None:
         quota = {"probe": {"quotas": [{"metadata": {"name": "tight"}, "spec": {"hard": {"pods": "2"}}}]}}
         sets = ["platformAgent.harness.tuning.maxSessions=6"]
-        off = self._render(quota, sets)
-        self.assertNotEqual(off.returncode, 0)
-        self.assertNotIn("session pods at the cap", off.stderr)
-        gate = self.chart / "templates" / "_0-session-gate.tpl"
-        gate.write_text('{{- define "kube-agents.quotaCountsSessions" -}}\ntrue\n{{- end }}\n')
-        try:
-            on = self._render(quota, sets)
-            autopilot = self._render(quota, sets, ["--api-versions", _AUTOPILOT_API])
-        finally:
-            gate.unlink()
+        on = self._render(quota, sets)
+        autopilot = self._render(quota, sets, ["--api-versions", _AUTOPILOT_API])
+        none = self._render(quota, ["platformAgent.harness.tuning.maxSessions=0"])
         pod = self._session_pod()
+        self.assertNotEqual(on.returncode, 0)
         self.assertIn(
             f"required includes the session pods at the cap: 6 pods, {6 * pod['cpuMillisRequest']}m CPU"
             f" and {6 * pod['memoryBytesRequest'] // 1024**2}Mi memory requested", on.stderr)
         self.assertNotIn("Autopilot", on.stderr)
         self.assertIn("6 pods, 1500m CPU and 3072Mi memory requested", autopilot.stderr)
         self.assertIn("GKE Autopilot's per-Pod minimums", autopilot.stderr)
+        # With no session pods there is no share to name.
+        self.assertNotEqual(none.returncode, 0)
+        self.assertNotIn("session pods at the cap", none.stderr)
+
+    def test_the_gate_is_the_one_switch(self) -> None:
+        """kube-agents.quotaCountsSessions false keeps the share reported but out of the
+        totals, so turning the count off again is that one define."""
+        gate = self.chart / "templates" / "_0-session-gate.tpl"
+        gate.write_text('{{- define "kube-agents.quotaCountsSessions" -}}\nfalse\n{{- end }}\n')
+        try:
+            off0 = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
+            off = self._requirements(["platformAgent.harness.tuning.maxSessions=20"])
+        finally:
+            gate.unlink()
+        self.assertGreater(off["sessionRequestsCpu"], 0)
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory", "limitsMemory",
+                    "requestsEphemeral", "limitsEphemeral"):
+            self.assertEqual(off[key], off0[key], key)
 
     def test_a_footprint_without_the_session_pod_fails_the_render(self) -> None:
         footprint = self.chart / "files" / "footprint.yaml"
@@ -681,28 +695,28 @@ class PreflightDecisionTest(unittest.TestCase):
         # On Autopilot the operator requests 2 CPU and 2Gi (credentialProxyAutopilot*), and a
         # CPU request the override does not set stays at one CPU per GiB of memory or under.
         autopilot = ["--api-versions", _AUTOPILOT_API]
-        base = self._requirements()
-        on = self._requirements(extra_args=autopilot)
+        base = self._requirements_without_sessions()
+        on = self._requirements_without_sessions(extra_args=autopilot)
         self.assertEqual(on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
         self.assertEqual(on["requestsMemory"] - base["requestsMemory"], (2048 - 1024) * 1024**2)
         self.assertEqual(on["limitsCpu"], base["limitsCpu"])
-        lowered = self._requirements([f"{_PROXY_VALUE}.limits.memory=1536Mi"], extra_args=autopilot)
+        lowered = self._requirements_without_sessions([f"{_PROXY_VALUE}.limits.memory=1536Mi"], extra_args=autopilot)
         self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], (1536 - 1024) * 1024**2)
         self.assertEqual(lowered["requestsCpu"] - base["requestsCpu"], 1500 - 500)
         # Standard does not hold the CPU request to the band.
-        small = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"])
+        small = self._requirements_without_sessions([f"{_PROXY_VALUE}.requests.memory=256Mi"])
         self.assertEqual(small["requestsCpu"], base["requestsCpu"])
-        small_on = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"], extra_args=autopilot)
+        small_on = self._requirements_without_sessions([f"{_PROXY_VALUE}.requests.memory=256Mi"], extra_args=autopilot)
         self.assertEqual(small_on["requestsCpu"] - base["requestsCpu"], 250 - 500)
         # A cluster serving the resource at v1beta1 only is Autopilot to the operator too.
-        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
-        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
+        self.assertEqual(self._requirements_without_sessions(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
+        self.assertEqual(self._requirements_without_sessions(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
         # Another resource in the group is not Autopilot: Standard serves auto.gke.io too.
-        self.assertEqual(self._requirements(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
+        self.assertEqual(self._requirements_without_sessions(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
         # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
-        under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
+        under = self._requirements_without_sessions([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
         self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
-        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=544Mi"], extra_args=autopilot)
+        at_floor = self._requirements_without_sessions([f"{_PROXY_VALUE}.limits.memory=544Mi"], extra_args=autopilot)
         self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
@@ -843,18 +857,18 @@ class PreflightDecisionTest(unittest.TestCase):
         small one: medium requests 2 CPU and 4Gi (the Standard medium row requests 1 CPU),
         fleet 4 CPU and 8Gi. The limits are the row's, as on Standard."""
         autopilot = ["--api-versions", _AUTOPILOT_API]
-        base = self._requirements()
-        small_on = self._requirements(extra_args=autopilot)
-        medium = self._requirements([f"{_SIZING_VALUE}=medium"])
-        medium_on = self._requirements([f"{_SIZING_VALUE}=medium"], extra_args=autopilot)
+        base = self._requirements_without_sessions()
+        small_on = self._requirements_without_sessions(extra_args=autopilot)
+        medium = self._requirements_without_sessions([f"{_SIZING_VALUE}=medium"])
+        medium_on = self._requirements_without_sessions([f"{_SIZING_VALUE}=medium"], extra_args=autopilot)
         self.assertEqual(medium_on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
         self.assertEqual(medium_on["requestsCpu"] - medium["requestsCpu"], 2000 - 1000)
         self.assertEqual(medium_on["requestsMemory"] - base["requestsMemory"], 3 * 1024**3)
         self.assertEqual(medium_on["requestsMemory"] - small_on["requestsMemory"], 2 * 1024**3)
         self.assertEqual(medium_on["limitsCpu"], medium["limitsCpu"])
         self.assertEqual(medium_on["limitsMemory"], medium["limitsMemory"])
-        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
-        fleet_on = self._requirements([f"{_SIZING_VALUE}=fleet"], extra_args=autopilot)
+        fleet = self._requirements_without_sessions([f"{_SIZING_VALUE}=fleet"])
+        fleet_on = self._requirements_without_sessions([f"{_SIZING_VALUE}=fleet"], extra_args=autopilot)
         self.assertEqual(fleet_on["requestsCpu"] - base["requestsCpu"], 4000 - 500)
         self.assertEqual(fleet_on["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
         self.assertEqual(fleet_on["limitsCpu"], fleet["limitsCpu"])
@@ -1751,6 +1765,8 @@ class PreflightDecisionTest(unittest.TestCase):
         uninstall-only cleanup hook, and the surge pods each rollout can add (#4893, #4876)."""
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
         # Every operator-rendered pod at the footprint's count, plus the gateway's standby.
+        # The session pods at the cap are in required["pods"] too (sessionPods); they are
+        # the gateway's, not the chart's, so they come off with the operator's.
         operator_pods = op["agentPod"]["base"]["pods"] + sum(
             v["pods"] for k, v in op.items() if k not in ("agentPod", "storage")
         ) + self._gateway_pod()["pods"]
@@ -1759,7 +1775,10 @@ class PreflightDecisionTest(unittest.TestCase):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
                 self.assertGreater(required["chartSurgePods"], 0)
-                self.assertEqual(chart_pods, required["pods"] - operator_pods - hook + required["chartSurgePods"])
+                self.assertEqual(
+                    chart_pods,
+                    required["pods"] - operator_pods - required["sessionPods"] - hook + required["chartSurgePods"],
+                )
 
     def test_a_chart_count_past_the_operators_cap_fails_the_render(self) -> None:
         """The operator discards a chart-pods annotation past a2aMaxChartPods for its
@@ -2310,7 +2329,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"23550m"', res.stderr)
+        self.assertIn('"limits.cpu":"43550m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -2319,7 +2338,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"36128Mi"', res.stderr)
+        self.assertIn('"limits.memory":"56608Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -2331,7 +2350,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
         # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"limits.ephemeral-storage":"16768Mi"', res.stderr)
+        self.assertIn('"limits.ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -2341,7 +2360,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
         # The release's 2756m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"4536m"', res.stderr)
+        self.assertIn('"cpu":"6036m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -2351,7 +2370,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
         # The release's 15120Mi plus one LiteLLM surge Pod's 2Gi.
-        self.assertIn('"memory":"17168Mi"', res.stderr)
+        self.assertIn('"memory":"20368Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -2363,7 +2382,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
         # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"ephemeral-storage":"16768Mi"', res.stderr)
+        self.assertIn('"ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""

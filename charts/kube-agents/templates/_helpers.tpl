@@ -3731,7 +3731,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
        that decision: the share itself is always computed and reported (the session* keys
        of kube-agents.quotaRequirements), and the installer's summary prints it either way. */ -}}
 {{- define "kube-agents.quotaCountsSessions" -}}
-false
+true
 {{- end }}
 
 {{- /* The session pods' quota share at the cap, as JSON: maxSessions and the totals, keyed
@@ -4096,7 +4096,7 @@ us-central1
 {{- $memoryCost := mulf $memoryGiB $memoryRate $hours -}}
 {{- $diskCost := mulf $diskGiB $diskRate -}}
 {{- $total := addf $cpuCost $memoryCost $diskCost -}}
-Release footprint (pod requests, as the quota preflight sums them):
+Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):
   CPU requests:        {{ printf "%.3f" $cores }} cores
   Memory requests:     {{ printf "%.2f" $memoryGiB }} GiB
   Pods:                {{ int64 $r.pods }}
@@ -4106,7 +4106,7 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Memory:   {{ printf "%.2f" $memoryGiB }} GiB x ${{ include "kube-agents.footprintPriceMemoryPerGiBHour" . }}/GiB-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $memoryCost }}
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
-  Not counted: the session pods, one per delegation or /session conversation. At the cap of {{ int64 $r.maxSessions }} they request {{ printf "%.3f" (divf (float64 $r.sessionRequestsCpu) $millisPerCore) }} cores and {{ printf "%.2f" (divf (float64 $r.sessionRequestsMemory) $bytesPerGiB) }} GiB over {{ int64 $r.sessionPods }} pods{{ if $counted }}, which the quota preflight counts{{ else }}, which a namespace ResourceQuota needs room for too{{ end }}{{ if include "kube-agents.gkeAutopilot" . }}, at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request{{ end }}. The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+  Not in these figures or the cost: the session pods, one per delegation or /session conversation. At the cap of {{ int64 $r.maxSessions }} they request {{ printf "%.3f" (divf (float64 $r.sessionRequestsCpu) $millisPerCore) }} cores and {{ printf "%.2f" (divf (float64 $r.sessionRequestsMemory) $bytesPerGiB) }} GiB over {{ int64 $r.sessionPods }} pods{{ if $counted }}, which the quota preflight adds to the figures above{{ else }}, which a namespace ResourceQuota needs room for too{{ end }}{{ if include "kube-agents.gkeAutopilot" . }}, at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request{{ end }}. The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
 {{- end }}
 
 {{- define "kube-agents.quotaPreflight" -}}
