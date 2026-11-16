@@ -2158,3 +2158,33 @@ func TestTheLossIsKeptWhileAClientIsNotRunning(t *testing.T) {
 		t.Errorf("the loss was cleared while the bridge wasn't running")
 	}
 }
+
+// An attempt whose Job delete failed settles as restored once its own names
+// are back, even while a stop holds for another: otherwise it waits on the
+// stopped name, and the Job's next routine re-run is taken for its re-run.
+func TestAFailedDeleteSettlesUnderAStop(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"DIRECTORY"}, []string{"DIRECTORY"})
+	rig.now = rig.now.Add(busStreamsReprovisionMinGap)
+	rig.serve(1, allStreamsBut("DIRECTORY", "KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.jobDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the Job delete failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	rig.jobDeleteErr = nil
+
+	// KV_cap back by hand; DIRECTORY, stopped, still missing.
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || len(last.Missing) != 0 || !last.Settled || !last.Restored {
+		t.Fatalf("attempt for KV_cap = %+v, want settled as restored with nothing named", last)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, "DIRECTORY") || strings.Contains(c.Message, "KV_cap") {
+		t.Fatalf("condition = %+v, want the stop naming DIRECTORY alone", c)
+	}
+}
