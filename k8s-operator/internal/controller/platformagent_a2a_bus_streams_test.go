@@ -1921,3 +1921,82 @@ func TestAFailedRestartDropsTheRunInFlight(t *testing.T) {
 		t.Errorf("streak = %+v after a failed restart, want the run dropped", st)
 	}
 }
+
+// The settling poll writes the settlement and the loss's end in one patch: a
+// patch that fails leaves both as they were, so the next poll settles and
+// closes the loss together, and a second loss can't keep the first's date.
+func TestASettlementThatFailsToWriteLeavesTheLossOpenAndRetries(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	loseTasks(rig)
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.patchFailOn = busStreamsTasksLostAnnotation
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the combined patch refused")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || last.Settled {
+		t.Fatalf("attempt = %+v, want it unsettled after the refused patch", last)
+	}
+	if loss := readBusTasksLoss(rig.agent()); loss == nil || loss.Back {
+		t.Fatalf("loss = %+v, want it still open after the refused patch", loss)
+	}
+	rig.patchFailOn = ""
+	rig.poll()
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.Settled {
+		t.Errorf("attempt = %+v, want it settled on the retry", last)
+	}
+	if loss := readBusTasksLoss(rig.agent()); loss == nil || !loss.Back {
+		t.Errorf("loss = %+v, want it closed with the settlement", loss)
+	}
+}
+
+// Once TASKS is back and nothing is owed, the loss annotation is removed, so
+// later polls stop reading the clients for it.
+func TestTheLossIsClearedOnceNothingIsOwed(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobFailed))
+	loseTasks(rig)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if readBusTasksLoss(rig.agent()) == nil {
+		t.Fatalf("the loss was cleared on the poll that restarted the clients")
+	}
+	// Their replacements (none left in the fake) owe nothing.
+	rig.poll()
+	if _, set := rig.agent().Annotations[busStreamsTasksLostAnnotation]; set {
+		t.Errorf("the loss annotation is still set with nothing owed")
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent", c)
+	}
+}
+
+// A client container that isn't running yet keeps the loss: it may still
+// need judging.
+func TestTheLossIsKeptWhileAClientIsNotRunning(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobFailed))
+	ctx := context.Background()
+	pod := &corev1.Pod{}
+	if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-gateway-xyz"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	waiting := pod.DeepCopy()
+	waiting.ResourceVersion = ""
+	waiting.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: a2aBridgeContainerName, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}}}
+	if err := rig.cl.Delete(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.cl.Create(ctx, waiting); err != nil {
+		t.Fatal(err)
+	}
+	loseTasks(rig)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	rig.poll()
+	if readBusTasksLoss(rig.agent()) == nil {
+		t.Errorf("the loss was cleared while the bridge wasn't running")
+	}
+}

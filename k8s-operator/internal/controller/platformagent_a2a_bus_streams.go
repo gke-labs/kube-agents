@@ -591,22 +591,24 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	if reRan {
 		last.Restored = !overlaps(last.Missing, verdict.missing)
 		last.Settled = true
-		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+		// The re-run recreated TASKS, so an open loss of it ends here, even
+		// if no poll saw TASKS present: a client that bound to the new
+		// stream and then lost it to a second loss is covered by that
+		// loss's own date, not the first one's. Written in the same patch
+		// as the settlement, so neither can land without the other.
+		closed := readBusTasksLoss(agent)
+		if closed != nil && !closed.Back {
+			closed.Back = true
+		} else {
+			closed = nil
+		}
+		pruned := record.pruned(now)
+		if err := p.writeBusState(ctx, agent, &pruned, closed, false); err != nil {
 			return err
 		}
 		if last.Restored {
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
-		}
-		// The re-run recreated TASKS, so an open loss of it ends here, even
-		// if no poll saw TASKS present: a client that bound to the new
-		// stream and then lost it to a second loss is covered by that
-		// loss's own date, not the first one's.
-		if loss := readBusTasksLoss(agent); loss != nil && !loss.Back {
-			loss.Back = true
-			if err := p.writeTasksLoss(ctx, agent, *loss); err != nil {
-				return err
-			}
 		}
 	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
 		// An attempt whose Job delete didn't land, and the streams are back
@@ -654,7 +656,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 					return err
 				}
 			}
-			if err := p.restartTasksClients(ctx, agent, loss.At); err != nil {
+			pending, err := p.restartTasksClients(ctx, agent, loss.At)
+			if err == nil && !pending {
+				// Nothing is owed: every client container has started since
+				// the loss and is running. The loss is done with, so polls
+				// stop reading the clients for it.
+				if err := p.writeBusState(ctx, agent, nil, nil, true); err != nil {
+					return err
+				}
+			}
+			if err != nil {
 				// Warned once per loss; the condition says so in a fixed
 				// message, so a restart that keeps failing rewrites nothing,
 				// and the next poll retries it.
@@ -721,9 +732,11 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// this run's confirmed set first: the streams missing now may not be
 		// the ones missing when the delete failed, and the condition, the
 		// events and the settlement name them.
-		if !slices.Equal(last.Missing, confirmed) {
+		opened := p.lossRerunConfirms(agent, streak)
+		if !slices.Equal(last.Missing, confirmed) || opened != nil {
 			last.Missing = confirmed
-			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+			pruned := record.pruned(now)
+			if err := p.writeBusState(ctx, agent, &pruned, opened, false); err != nil {
 				return err
 			}
 		}
@@ -742,7 +755,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 
 	record = record.pruned(now)
 	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID})
-	if err := p.writeRecord(ctx, agent, record); err != nil {
+	if err := p.writeBusState(ctx, agent, &record, p.lossRerunConfirms(agent, streak), false); err != nil {
 		return err
 	}
 	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak)
@@ -756,7 +769,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 // binds (both bind Precreated, lib.SubscribeConfig), and one not running yet
 // is left to start. One delete per pod, with its UID; a pod already gone or
 // replaced is skipped.
-func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv1alpha1.PlatformAgent, lostAt time.Time) error {
+func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv1alpha1.PlatformAgent, lostAt time.Time) (pending bool, err error) {
 	clients := []struct {
 		name     string
 		isClient func(corev1.Container) bool
@@ -771,11 +784,20 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 	for _, c := range clients {
 		pods, err := p.tasksClientPods(ctx, agent, c.name, c.selector)
 		if err != nil {
-			return err
+			return true, err
 		}
 		for i := range pods {
 			pod := &pods[i]
-			if pod.DeletionTimestamp != nil || !boundBefore(pod, c.isClient, lostAt) {
+			if pod.DeletionTimestamp != nil {
+				pending = true
+				continue
+			}
+			bound, running := boundBefore(pod, c.isClient, lostAt)
+			if !running {
+				// Not running yet: it may still bind, or need judging.
+				pending = true
+			}
+			if !bound {
 				continue
 			}
 			uid := pod.UID
@@ -783,7 +805,7 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 				if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 					continue
 				}
-				return fmt.Errorf("failed to restart %s: %w", pod.Name, err)
+				return true, fmt.Errorf("failed to restart %s: %w", pod.Name, err)
 			}
 			restarted = append(restarted, pod.Name)
 		}
@@ -791,26 +813,41 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 	if len(restarted) > 0 {
 		p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsClientsRestartedEventReason,
 			fmt.Sprintf("Restarted %s: TASKS was lost and is back, so they recreate their TASKS consumers.", strings.Join(restarted, ", ")))
+		// Their replacements are judged on the next poll.
+		pending = true
 	}
-	return nil
+	return pending, nil
 }
 
 // boundBefore reports whether pod's client container, the one isClient picks
 // from its spec (a native sidecar included), has been running since before
-// at, and so may hold a consumer bound to a stream lost since.
-func boundBefore(pod *corev1.Pod, isClient func(corev1.Container) bool, at time.Time) bool {
+// at, and so may hold a consumer bound to a stream lost since; running is
+// whether it's running at all. A pod with no client container reads as
+// running and unbound: nothing of it is owed.
+func boundBefore(pod *corev1.Pod, isClient func(corev1.Container) bool, at time.Time) (bound, running bool) {
 	names := map[string]bool{}
 	for _, c := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
 		if isClient(c) {
 			names[c.Name] = true
 		}
 	}
+	if len(names) == 0 {
+		return false, true
+	}
+	running = true
 	for _, st := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
-		if names[st.Name] && st.State.Running != nil && st.State.Running.StartedAt.Time.Before(at) {
-			return true
+		if !names[st.Name] {
+			continue
+		}
+		if st.State.Running == nil {
+			running = false
+			continue
+		}
+		if st.State.Running.StartedAt.Time.Before(at) {
+			bound = true
 		}
 	}
-	return false
+	return bound, running
 }
 
 func readBusTasksLoss(agent *agentv1alpha1.PlatformAgent) *busTasksLoss {
@@ -827,18 +864,59 @@ func readBusTasksLoss(agent *agentv1alpha1.PlatformAgent) *busTasksLoss {
 	return &loss
 }
 
+// lossRerunConfirms is the TASKS loss a re-run this poll starts confirms, or
+// nil: the re-run recreates TASKS too, so a loss of it this run saw counts
+// as confirmed by the re-run itself, however few polls saw it, since after
+// the delete the polls that would confirm it are gated until the Job is
+// done. The caller writes it in the same patch as the attempt, before the
+// delete, so neither can land without the other.
+func (p *BusStreamPoller) lossRerunConfirms(agent *agentv1alpha1.PlatformAgent, streak *busStreamStreak) *busTasksLoss {
+	if streak.tasksMisses == 0 {
+		return nil
+	}
+	if loss := readBusTasksLoss(agent); loss != nil && !loss.Back {
+		return nil
+	}
+	return &busTasksLoss{At: streak.tasksFirstMissing}
+}
+
 // writeTasksLoss stores the latest loss of TASKS on its annotation.
 func (p *BusStreamPoller) writeTasksLoss(ctx context.Context, agent *agentv1alpha1.PlatformAgent, loss busTasksLoss) error {
-	raw, err := json.Marshal(loss)
-	if err != nil {
-		return err
-	}
+	return p.writeBusState(ctx, agent, nil, &loss, false)
+}
+
+// writeBusState writes the re-run record (when record is set) and the TASKS
+// loss (when loss is set, or removed when clearLoss) on the CR in one patch,
+// so a change that spans both lands whole or not at all: no write can close
+// a gate before the other half of its change is stored.
+func (p *BusStreamPoller) writeBusState(ctx context.Context, agent *agentv1alpha1.PlatformAgent, record *busReprovisionRecord, loss *busTasksLoss, clearLoss bool) error {
 	base := agent.DeepCopy()
 	if agent.Annotations == nil {
 		agent.Annotations = map[string]string{}
 	}
-	agent.Annotations[busStreamsTasksLostAnnotation] = string(raw)
-	return p.r.Patch(ctx, agent, client.MergeFrom(base))
+	if record != nil {
+		raw, err := json.Marshal(*record)
+		if err != nil {
+			return err
+		}
+		agent.Annotations[busStreamsReprovisionAnnotation] = string(raw)
+	}
+	if loss != nil {
+		raw, err := json.Marshal(*loss)
+		if err != nil {
+			return err
+		}
+		agent.Annotations[busStreamsTasksLostAnnotation] = string(raw)
+	} else if clearLoss {
+		delete(agent.Annotations, busStreamsTasksLostAnnotation)
+	}
+	if err := p.r.Patch(ctx, agent, client.MergeFrom(base)); err != nil {
+		// The in-memory copy goes back to what's stored, so nothing later
+		// in this poll reads a write that didn't land.
+		agent.Annotations = base.Annotations
+		return err
+	}
+	return nil
 }
 
 // tasksClientPods lists one TASKS client's pods: those with its app label that
@@ -906,19 +984,6 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 	if err := p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
 		fmt.Sprintf("Missing from the A2A bus: %s. The provision Job is running again to recreate them.%s", names, restart)); err != nil {
 		log.Error(err, "writing the Reprovisioning condition; deleting the provision Job anyway", "platformagent", client.ObjectKeyFromObject(agent))
-	}
-	if streak.tasksMisses > 0 {
-		// The re-run recreates TASKS too. A loss of it this run saw counts
-		// as confirmed by the re-run itself, however few polls saw it,
-		// since after the delete the polls that would confirm it are
-		// gated until the Job is done. It's written before the delete, as
-		// the re-run record is: a write that fails leaves the Job for the
-		// next poll to retry, and the loss can't be lost behind it.
-		if loss := readBusTasksLoss(agent); loss == nil || loss.Back {
-			if err := p.writeTasksLoss(ctx, agent, busTasksLoss{At: streak.tasksFirstMissing}); err != nil {
-				return err
-			}
-		}
 	}
 	uid := job.UID
 	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
@@ -1079,18 +1144,9 @@ func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha
 	return readings
 }
 
-// writeRecord stores the re-run record on the CR's annotation, on a fresh read.
+// writeRecord stores the re-run record on the CR's annotation.
 func (p *BusStreamPoller) writeRecord(ctx context.Context, agent *agentv1alpha1.PlatformAgent, record busReprovisionRecord) error {
-	raw, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	base := agent.DeepCopy()
-	if agent.Annotations == nil {
-		agent.Annotations = map[string]string{}
-	}
-	agent.Annotations[busStreamsReprovisionAnnotation] = string(raw)
-	return p.r.Patch(ctx, agent, client.MergeFrom(base))
+	return p.writeBusState(ctx, agent, &record, nil, false)
 }
 
 // writeCondition sets BusStreamsPresent, the one status field this poller
