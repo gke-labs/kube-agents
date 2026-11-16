@@ -504,10 +504,10 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. Two env vars reach that branch: A2A_NATS_RELOADER_IMAGE and
-# A2A_NATS_EXPORTER_IMAGE, which the default render carries with their digests
-# (the mirrored render drops them, since `make mirror-images` pushes by tag).
-# images.json pins four more entries as tag@digest — hindsight-api,
+# byte. Three env vars reach that branch: A2A_NATS_IMAGE, A2A_NATS_RELOADER_IMAGE
+# and A2A_NATS_EXPORTER_IMAGE, which the default render carries with their
+# digests (the mirrored render drops them, since `make mirror-images` pushes by
+# tag). images.json pins four more entries as tag@digest — hindsight-api,
 # hindsight-postgresql, busybox and, through tags.env, the Hermes base. busybox
 # and the Hermes base are build-time, and the Hindsight pair sits behind
 # hindsight.enabled, which no render below turns on.

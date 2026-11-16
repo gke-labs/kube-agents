@@ -1806,6 +1806,24 @@ class C1IsolationIsStructural(unittest.TestCase):
         adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
         self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
         self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+        # The adapter's entry point takes one task or a batch: a single task
+        # goes to validateDelegate, and so does every batch entry, with that
+        # entry's own text. A batch past this loop is published unchecked.
+        entry = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegateFor")
+        self.assertIn("return validateDelegate(req)", entry, "the worker-adapter no longer caps a single delegate request")
+        self.assertRegex(
+            entry,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+req\.Tasks\s*\{\s*if\s+why\s*:=\s*validateDelegate\(lib\.DelegateRequest\{[^}]*\bText:\s*\1\.Text\b[^}]*\}\);\s*why\s*!=\s*\"\"\s*\{\s*return\b",
+            "the worker-adapter no longer refuses a batch whose entry's own text fails validateDelegate",
+        )
+        # Read without comments, and pinned to the refusal: a non-empty answer
+        # is sent back to the caller and the request skipped, before publishing.
+        adapter_code = re.sub(r"//[^\n]*", "", h.text("a2a_worker_adapter"))
+        self.assertRegex(
+            adapter_code,
+            r"if\s+why\s*:=\s*validateDelegateFor\(ask\.req,[^)]*\);\s*why\s*!=\s*\"\"\s*\{\s*ask\.reply\s*<-[^\n]*\n\s*continue\b[\s\S]*?a\.publishDelegate\(ctx,\s*ask\.req\)",
+            "the worker-adapter no longer refuses a delegate request validateDelegateFor refuses, before publishing it",
+        )
 
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
@@ -1817,6 +1835,8 @@ class C1IsolationIsStructural(unittest.TestCase):
         # ANDed with one of them would still read "ValidateDelegateRequest(req)
         # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        # Followed only by `||` or the block: an `&&` after the call (a
+        # condition on it) would validate only some requests and mint the rest.
         self.assertRegex(
             gateway,
             r"if\s+!parsed\s*\|\|\s*lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil\s*(?:\|\||\{)",
