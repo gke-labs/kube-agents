@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
@@ -745,6 +746,11 @@ BROKER_TIMEOUT_S = 20.0
 UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
 # The ring's stamp, as the broker's route spells it (_REPORT_RUN_STAMP).
 RUN_NAME_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\.json\Z")
+# The store listener's answer for a file that is not there
+# (audit_report_store._read_at and handle), which the broker relays whole. The
+# broker's own route refusal is `{"status": "not_found"}`, and the listener's
+# unknown route `{"error": "no such route"}`: neither is a missing file.
+LISTENER_NOT_FOUND = {"error": "not found"}
 #: Left in a local stream directory once its envelopes are copied into the
 #: broker store, so the copy happens once.
 SEED_MARKER_NAME = ".seeded-to-broker"
@@ -898,7 +904,7 @@ class BrokerReportStore(str):
                 return response.read()
         except urllib.error.HTTPError as exc:
             status = exc.code
-            detail = _answer_detail(exc)
+            answer = _answer_body(exc)
             exc.close()
         except (urllib.error.URLError, OSError, ValueError) as exc:
             reason = getattr(exc, "reason", None) or exc
@@ -906,9 +912,15 @@ class BrokerReportStore(str):
                 f"the report store at {self} is unavailable: {' '.join(str(reason).split())}"
             ) from None
         where = f"{method} {urllib.parse.unquote(path[len(AUDIT_REPORTS_ROUTE):]) or '/'}"
-        if status == 404:
+        detail = _answer_detail(answer)
+        if status == 404 and answer == LISTENER_NOT_FOUND:
             raise FileNotFoundError(f"the report store has no {where}")
-        if status in UNAVAILABLE_STATUSES or 300 <= status < 400:
+        if status in UNAVAILABLE_STATUSES or 300 <= status < 400 or status == 404:
+            # Only the listener's own "not found", relayed whole, is a missing
+            # file. Any other 404 is the broker refusing the route (`not_found`,
+            # as a broker that predates the routes answers) or the listener
+            # not knowing it: a store that can't be used now, never an empty
+            # one, which would read as a first run.
             # A redirect is never followed (_NoRedirect): the store is not
             # where it should be, which is a store that can't be used now.
             raise ReportStoreUnavailable(
@@ -1021,15 +1033,23 @@ class BrokerReportStore(str):
     def _maybe_seed(self, audit_id: str, repo: str) -> None:
         """Copy this stream's local envelopes into the broker store, once.
 
-        Only when there is a local file store holding the stream, it carries no
-        SEED_MARKER_NAME, and the broker store has no such stream (no `latest`
-        and an empty ring). Ring entries go oldest first, then `latest.json`
-        only when it is a byte copy of the newest entry, which is the only
-        `latest` the listener accepts anyway. The marker is written after.
+        Only when there is a local file store holding the stream and it
+        carries no SEED_MARKER_NAME. Under an flock on the local stream
+        directory, so two seeds on this pod (and a `finish` here, whose writes
+        seed first) take turns. Then, by what the broker's ring holds:
+
+        - nothing, or only stamps the local ring holds (a seed that stopped
+          part way): the local entries it lacks, newer than its newest, go
+          oldest first, then `latest.json` (`_seed_latest`), then the marker;
+        - stamps the local ring does not hold (a run wrote there since): when
+          every local entry is already in it, the marker alone, so later runs
+          skip the reads; otherwise nothing is copied and nothing marked.
+
         Never deletes or changes a local envelope. A stream whose writes the
         broker refuses (403: a repository the install does not register) is
         skipped and logged, with no marker, so a later registration can still
-        seed it. Any other failure is logged and left for the next run.
+        seed it. Any other failure is logged and left for the next run, which
+        resumes where this one stopped.
         """
         try:
             key = (audit_id, broker_store_key(repo))
@@ -1044,6 +1064,21 @@ class BrokerReportStore(str):
         if not os.path.isdir(local) or os.path.lexists(os.path.join(local, SEED_MARKER_NAME)):
             return
         label = f"{audit_id} in {'/'.join(_store_segments(repo)).replace(STORE_PATH_SEPARATOR, '/')}"
+        try:
+            lock = os.open(local, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+        except OSError as exc:
+            self._log(f"report store: not seeding {label} into the broker: {local} could not be opened ({exc})")
+            return
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.lexists(os.path.join(local, SEED_MARKER_NAME)):
+                return
+            self._seed_locked(audit_id, repo, local, label)
+        finally:
+            os.close(lock)  # closing the descriptor drops the lock
+
+    def _seed_locked(self, audit_id: str, repo: str, local: str, label: str) -> None:
+        """`_maybe_seed`'s work, with the local stream directory locked."""
         try:
             runs = sorted(name for name in os.listdir(os.path.join(local, RUNS_DIR)) if RUN_NAME_RE.match(name))
         except FileNotFoundError:
@@ -1061,17 +1096,21 @@ class BrokerReportStore(str):
             return
         if not runs and latest is None:
             return
+        copied = 0
         try:
-            try:
-                self._request("GET", self._stream_path(audit_id, repo, "latest"))
+            remote = self._ring(audit_id, repo)
+            if not set(remote) <= set(runs):
+                # A run wrote this stream through the broker since: its ring is
+                # not a partial copy of the local one, so nothing is resumed.
+                if set(runs) <= set(remote):
+                    self._leave_marker(local, label, {"seeded_to": self.url, "runs": 0, "latest": False})
                 return
-            except FileNotFoundError:
-                pass
-            if self._ring(audit_id, repo):
+            if not remote and self._get_latest(audit_id, repo) is not None:
+                # A `latest` with no ring is no state the listener writes;
+                # leave it to a run rather than guess.
                 return
-            copied = 0
-            newest: bytes | None = None
-            for name in runs:
+            missing = [name for name in runs if name not in remote and (not remote or name > remote[-1])]
+            for name in missing:
                 with open(os.path.join(local, RUNS_DIR, name), "rb") as handle:
                     data = handle.read()
                 try:
@@ -1087,40 +1126,76 @@ class BrokerReportStore(str):
                         # This one entry: not JSON, too large, or stamped in
                         # the future. The rest of the ring still copies.
                         self._log(f"report store: seeding {label}: skipped runs/{name} ({exc})")
-                        newest = None
                         continue
                     raise
                 copied += 1
-                newest = data
-            latest_copied = latest is not None and newest is not None and latest == newest
-            if latest_copied:
-                self._request("PUT", self._stream_path(audit_id, repo, "latest"), latest)
+            latest_copied = self._seed_latest(audit_id, repo, local, runs, latest)
         except (OSError, ValueError) as exc:
-            self._log(f"report store: seeding {label} into the broker failed, to be retried by the next run: {exc}")
+            self._log(
+                f"report store: seeding {label} into the broker stopped after {copied} run(s), "
+                f"to be resumed by the next run: {exc}"
+            )
             return
         self._streams = None
+        self._leave_marker(local, label, {"seeded_to": self.url, "runs": copied, "latest": latest_copied})
+        self._log(
+            f"report store: seeded {label} into the broker from {local}: {copied} run(s), "
+            f"latest {'copied' if latest_copied else 'not copied'}"
+        )
+
+    def _get_latest(self, audit_id: str, repo: str) -> bytes | None:
+        try:
+            return self._request("GET", self._stream_path(audit_id, repo, "latest"))
+        except FileNotFoundError:
+            return None
+
+    def _seed_latest(self, audit_id: str, repo: str, local: str, runs: list[str], latest: bytes | None) -> bool:
+        """PUT the local `latest.json` when it is a byte copy of the newest local
+        entry and the broker has nothing newer; whether it was written.
+
+        Checked again just before the write: a run that landed through the
+        broker since (a ring entry newer than the newest local one, or a
+        `latest` that is not this one) keeps its own, so a seed never rolls
+        `latest` back.
+        """
+        if latest is None or not runs:
+            return False
+        with open(os.path.join(local, RUNS_DIR, runs[-1]), "rb") as handle:
+            if handle.read() != latest:
+                return False
+        remote = self._ring(audit_id, repo)
+        if not remote or remote[-1] != runs[-1]:
+            return False
+        current = self._get_latest(audit_id, repo)
+        if current is not None:
+            return current == latest
+        self._request("PUT", self._stream_path(audit_id, repo, "latest"), latest)
+        return True
+
+    def _leave_marker(self, local: str, label: str, record: dict) -> None:
         try:
             with open(os.path.join(local, SEED_MARKER_NAME), "x", encoding="utf-8") as handle:
-                handle.write(json.dumps({"seeded_to": self.url, "runs": copied, "latest": latest_copied}) + "\n")
+                handle.write(json.dumps(record) + "\n")
         except FileExistsError:
             pass
         except OSError as exc:
             self._log(f"report store: seeded {label} but could not leave {SEED_MARKER_NAME} in {local} ({exc})")
-        self._log(
-            f"report store: seeded {label} into the broker from {local}: {copied} run(s), "
-            f"latest {'copied' if latest_copied else 'not copied (not a copy of the newest run)'}"
-        )
 
 
-def _answer_detail(exc: urllib.error.HTTPError) -> str:
-    """The broker's `code` or `rule` from a refusal body, for the log line."""
+def _answer_body(exc: urllib.error.HTTPError) -> dict | None:
+    """A refusal's JSON object body, or None."""
     try:
         body = json.loads(exc.read(4096).decode("utf-8"))
     except (OSError, ValueError):
-        return ""
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _answer_detail(body: dict | None) -> str:
+    """The broker's `code`, `rule` or `status` from a refusal body, for the log line."""
     if not isinstance(body, dict):
         return ""
-    words = [str(body[key]) for key in ("code", "rule") if isinstance(body.get(key), str)]
+    words = [str(body[key]) for key in ("code", "rule", "status") if isinstance(body.get(key), str)]
     return f" ({', '.join(words)})" if words else ""
 
 

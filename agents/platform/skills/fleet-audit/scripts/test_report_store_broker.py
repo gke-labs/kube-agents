@@ -356,9 +356,34 @@ class TestTheHttpStore(BrokerTestCase):
             with self.subTest(url=url), self.assertRaises(report_status.ReportStoreUnavailable):
                 report_status.BrokerReportStore(url).read_latest(AUDIT, REPO)
 
-    def test_a_404_is_file_not_found_and_not_a_store_error(self):
+    def test_only_the_listeners_not_found_is_a_missing_file(self):
+        """The listener's `{"error": "not found"}`, relayed whole, is a missing
+        file. The broker's own codeless `not_found` (a route it does not serve,
+        as a broker from before the routes answers every one) and the
+        listener's `no such route` are a store that can't be used now."""
+        store = self.store()
+        self.assertIsNone(store.read_latest(AUDIT, REPO))
         with self.assertRaises(FileNotFoundError):
-            self.store()._request("GET", f"{PREFIX}/{AUDIT}/{KEY}/nope")
+            store._request("GET", f"{PREFIX}/{AUDIT}/{KEY}/latest")
+        for body in ({"status": "not_found"}, {"error": "no such route"}, None, b"not json"):
+            with self.subTest(body=body):
+                self.broker.answer = lambda method, path, _body, body=body: (404, body if body is not None else b"")
+                with self.assertRaises(report_status.ReportStoreUnavailable) as caught:
+                    store.read_latest(AUDIT, REPO)
+                self.assertEqual(404, caught.exception.status)
+                with self.assertRaises(report_status.ReportStoreUnavailable):
+                    store.read_run(AUDIT, REPO, stamp_name(NOW))
+                with self.assertRaises(report_status.ReportStoreUnavailable):
+                    store.delete_latest(AUDIT, REPO)
+
+    def test_a_broker_without_the_routes_is_no_first_run(self):
+        """During a rollout, a broker that predates the routes answers 404
+        `not_found` to all of them: that reads as a lost memory, never as a
+        store no run has written."""
+        self.broker.answer = lambda method, path, body: (404, {"status": "not_found"})
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(audit_report.store_never_published(audit_report.report_store_dir(AUDIT, REPO)))
+            self.assertIsNone(audit_report.newest_stored_record(AUDIT, REPO))
 
     def test_a_name_outside_the_store_is_refused_before_any_request(self):
         store = self.store()
@@ -659,6 +684,98 @@ class TestSeed(BrokerTestCase):
         self.store(str(self.local)).read_latest(AUDIT, REPO)
         self.assertEqual([], self.broker.calls("PUT"), "the broker already holds it")
         self.assertEqual(3, len(self.remote_runs()))
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+
+    def test_a_seed_that_stopped_part_way_is_resumed(self):
+        directory = self.plant_local(count=5)
+        before = self.tree_digest()
+        real = self.broker.answer
+        puts = []
+
+        def fail_the_fourth(method, path, body):
+            if method == "PUT":
+                puts.append(path)
+                if len(puts) == 4:
+                    return 503, {"code": "AUDIT_REPORT_STORE_UNAVAILABLE"}
+            return real(method, path, body)
+
+        self.broker.answer = fail_the_fourth
+        self.assertIsNone(self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual(3, len(self.remote_runs()))
+        self.assertIsNone(self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertFalse((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertIn("stopped after 3 run(s), to be resumed", self.logged[-1])
+        # The next run copies only what is missing, oldest first, then latest.
+        self.broker.answer = real
+        self.broker.requests.clear()
+        self.assertEqual(self.envelope(4), self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual(
+            [("PUT", f"{PREFIX}/{AUDIT}/{KEY}/runs/{stamp_name(NOW + timedelta(minutes=n))[:-5]}") for n in (3, 4)]
+            + [("PUT", f"{PREFIX}/{AUDIT}/{KEY}/latest")],
+            self.broker.calls("PUT"),
+        )
+        self.assertEqual(5, len(self.remote_runs()))
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertEqual(before, self.tree_digest())
+
+    def test_a_run_that_lands_mid_seed_keeps_its_latest(self):
+        """A run writing through the broker while the seed copies (a profile
+        worker, which takes no local lock) is never rolled back to the seed's
+        older latest."""
+        self.plant_local()
+        real = self.broker.answer
+        newer = self.envelope(9)
+        newer_stamp = stamp_name(NOW + timedelta(minutes=9))[:-5]
+
+        def a_run_lands_after_the_last_copy(method, path, body):
+            answer = real(method, path, body)
+            if method == "PUT" and path.endswith(stamp_name(NOW + timedelta(minutes=2))[:-5]):
+                stream = self.broker.stream(AUDIT, KEY)
+                stream["runs"][newer_stamp] = newer
+                stream["latest"] = newer
+            return answer
+
+        self.broker.answer = a_run_lands_after_the_last_copy
+        self.assertEqual(newer, self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertNotIn(("PUT", f"{PREFIX}/{AUDIT}/{KEY}/latest"), self.broker.calls("PUT"))
+        self.assertEqual(newer, self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertIn("latest not copied", self.logged[-1])
+
+    def test_a_newer_ring_entry_alone_also_holds_latest_back(self):
+        """A run whose ring entry landed and whose latest has not (or failed)."""
+        self.plant_local()
+        real = self.broker.answer
+
+        def a_ring_entry_lands(method, path, body):
+            answer = real(method, path, body)
+            if method == "PUT" and path.endswith(stamp_name(NOW + timedelta(minutes=2))[:-5]):
+                self.broker.stream(AUDIT, KEY)["runs"][stamp_name(NOW + timedelta(minutes=9))[:-5]] = self.envelope(9)
+            return answer
+
+        self.broker.answer = a_ring_entry_lands
+        self.store(str(self.local)).read_latest(AUDIT, REPO)
+        self.assertIsNone(self.broker.stream(AUDIT, KEY)["latest"])
+
+    def test_seeds_on_one_pod_take_turns(self):
+        """The seed holds an flock on the local stream directory and looks for
+        the marker again once it has it, so a second seed waits and then finds
+        the first one's work done."""
+        import fcntl  # noqa: PLC0415
+
+        directory = self.plant_local()
+        fd = os.open(directory, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        seeder = threading.Thread(target=lambda: self.store(str(self.local))._maybe_seed(AUDIT, REPO))
+        seeder.start()
+        seeder.join(0.5)
+        self.assertTrue(seeder.is_alive(), "the seed waits for the lock")
+        self.assertEqual([], self.broker.requests)
+        (directory / report_status.SEED_MARKER_NAME).write_text("{}\n")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        seeder.join(5)
+        self.assertFalse(seeder.is_alive())
+        self.assertEqual([], self.broker.requests)
 
     def remote_runs(self) -> dict:
         return self.broker.stream(AUDIT, KEY)["runs"]
