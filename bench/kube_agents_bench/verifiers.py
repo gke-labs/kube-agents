@@ -106,7 +106,6 @@ from kube_agents_bench.shell_words import (
     _INTERPRETER_RE,
     _SHELL_ARITHMETIC_OPENER,
     _SHELL_ASSIGNMENT_RE,
-    _SHELL_EVAL,
     _SHELL_LINE_END,
     _SHELL_PROGRAMS_WITH_COMMAND_STRING,
     _command_word_index,
@@ -2875,12 +2874,6 @@ def _shell_argvs_with_exit_propagation(
                     )
 
         index = _command_word_index(seg)
-        if index is not None and seg[index] == _SHELL_EVAL:
-            for inner_argv, _ in _shell_argvs_with_exit_propagation(
-                " ".join(seg[index + 1:]), outer_spans=outer_spans
-            ):
-                results.append((inner_argv, False))
-            continue
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             cmd_string, has_noexec, has_help_or_version = _extract_shell_command_string(seg, index + 1)
             if cmd_string is not None:

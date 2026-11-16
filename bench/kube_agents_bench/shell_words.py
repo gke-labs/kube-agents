@@ -30,13 +30,12 @@ _OPERATOR_MARK = "\x00O{index}\x00"
 _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # `eval` runs its words, joined by spaces, as a command line of its own (`eval "git push ..."`).
-_SHELL_EVAL = "eval"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
 # `printf` is text the command prints, wherever the `echo` stands (`nohup echo bash -c ...` is
 # the wrapper running `echo`), and the string after its `-c` is not run.
-_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
+_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
 # A wrapper that takes a positional ahead of the command it runs (`flock <lock> cmd`,
 # `chroot <root> cmd`): that one word is the wrapper's own, whatever it looks like.
 _SHELL_WRAPPER_POSITIONALS = {"flock": 1, "chroot": 1}
@@ -319,8 +318,7 @@ _GENERIC_WRAPPER_VAL_OPTS = {
     "chroot": frozenset(("--userspec", "--groups")),
     "watch": frozenset(("-n", "--interval")),
     "xargs": frozenset(("-I", "-P", "-n", "-s", "-L", "-d", "-E", "-a", "--max-procs")),
-    "flock": frozenset(("-w", "-E", "--wait", "--timeout", "--conflict-exit-code")),
-    "time": frozenset(("-o", "-f", "--output", "--format")),
+    "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
 }
 
 
@@ -480,7 +478,7 @@ def _scan_command_prefix(
         positionals = _SHELL_WRAPPER_POSITIONALS.get(wrapper_name, 0)
         duration_needed = (wrapper_name == "timeout")
         saw_w = False
-        detaches = (wrapper_name in ("watch", "xargs", "flock", "time"))
+        detaches = (wrapper_name in ("watch", "xargs", "flock"))
 
         while idx < len(argv):
             # Skip redirects
@@ -686,9 +684,6 @@ def _shell_argvs(command: str) -> list[list[str]]:
         argv.append(word)
     for argv in list(argvs):
         index = _command_word_index(argv)
-        if index is not None and argv[index] == _SHELL_EVAL:
-            argvs.extend(_shell_argvs(" ".join(argv[index + 1:])))
-            continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         cmd_string, _, _ = _extract_shell_command_string(argv, index + 1)
@@ -727,7 +722,6 @@ def _command_word_index(
         base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
         or _INTERPRETER_RE.match(base)
         or (script and base == script)
-        or word == _SHELL_EVAL
     ):
         return cmd_index
     return None

@@ -8387,9 +8387,9 @@ def _run_objective(command: str) -> str:
         (f"KUBECONFIG=/opt/data/.kubeconfigs/x python3 {_SCRIPT_PATH} --readiness", True),
         (f"env PYTHONUNBUFFERED=1 python3 {_SCRIPT_PATH} --readiness", True),
         (f"nohup python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json &", True),
-        (f"time python3 {_SCRIPT_PATH} --readiness", True),
-        (f"time -p python3 {_SCRIPT_PATH} --readiness", True),
-        (f"/usr/bin/time python3 {_SCRIPT_PATH} --readiness", True),
+        (f"time python3 {_SCRIPT_PATH} --readiness", False),
+        (f"time -p python3 {_SCRIPT_PATH} --readiness", False),
+        (f"/usr/bin/time python3 {_SCRIPT_PATH} --readiness", False),
         ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
         ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
         (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
@@ -8499,8 +8499,8 @@ def _run_objective(command: str) -> str:
         (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
         (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
         (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
-        # eval runs its words as a command line of its own, as the GitHub-write attribution reads it
-        (f'eval "python3 {_SCRIPT_PATH} --readiness"', True),
+        # eval is refused under the literal rule
+        (f'eval "python3 {_SCRIPT_PATH} --readiness"', False),
         (f'eval "echo python3 {_SCRIPT_PATH} --readiness"', False),
         (f"xargs ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is tabled, so a valueless flag like sudo -n does not eat the command
@@ -8890,13 +8890,13 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["sudo", "--version", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("time python3 f.py --readiness") == [
-        (["time", "python3", "f.py", "--readiness"], False),
+        (["time", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("time -p python3 f.py --readiness") == [
-        (["time", "-p", "python3", "f.py", "--readiness"], False),
+        (["time", "-p", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("/usr/bin/time python3 f.py --readiness") == [
-        (["/usr/bin/time", "python3", "f.py", "--readiness"], False),
+        (["/usr/bin/time", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("sudo --backg python3 f.py --readiness") == [
         (["sudo", "--backg", "python3", "f.py", "--readiness"], False),
@@ -9161,15 +9161,11 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs('bash -c 2>/dev/null "git push origin main"')[-1] == ["git", "push", "origin", "main"]
     assert _command_word_index(["flock", "-w", "10", "/tmp/lock", "kubectl", "get", "pdb", "-A"], script="kubectl") == 4
     assert _command_word_index(["flock", "-E", "0", "/tmp/lock", "python3", "f.py", "--readiness"], script="f.py") == 4
-    assert _command_word_index(["time", "-o", "/tmp/time.out", "python3", "f.py", "--readiness"], script="f.py") == 3
-    assert _command_word_index(["time", "!", "python3", "audit_report.py", "start"], script="audit_report.py") == 2
-    assert _command_word_index(["time", "-p", "!", "python3", "audit_report.py", "start"], script="audit_report.py") == 3
+    assert _command_word_index(["time", "-o", "/tmp/time.out", "python3", "f.py", "--readiness"], script="f.py") is None
+    assert _command_word_index(["time", "!", "python3", "audit_report.py", "start"], script="audit_report.py") is None
+    assert _command_word_index(["time", "-p", "!", "python3", "audit_report.py", "start"], script="audit_report.py") is None
     assert _shell_argvs_with_exit_propagation("time ! python3 audit_report.py start") == [
         (["time", "!", "python3", "audit_report.py", "start"], False),
-    ]
-    assert _shell_argvs_with_exit_propagation('eval "python3 collect.py compliance-audit"') == [
-        (["eval", "python3 collect.py compliance-audit"], True),
-        (["python3", "collect.py", "compliance-audit"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n") == [
         (["python3", "f.py", "--readiness"], True),
