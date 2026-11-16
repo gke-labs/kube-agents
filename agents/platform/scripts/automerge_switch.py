@@ -13,6 +13,10 @@ now says, and changes nothing else:
   and the customer's own allow rule stays theirs to remove.
 
 Nothing merges here: the pull request is how the customer's own review says yes.
+That holds only once the broker refuses the agent merging its own rules-file pull
+request (#5934); the dial must not offer Request auto-merge until it does.
+Turning on is limited to :data:`ON_ENVIRONMENTS`, the environments the offer
+covers; turning off works in any environment.
 A file that already says what the switch says gets no pull request. A switch
 flipped back before its pull request merged closes that pull request (only one
 this switch opened, on its own branch prefix) and, when the file already says
@@ -53,6 +57,10 @@ BRANCH = BRANCH_PREFIX + "{state}-{kind}-{environment}-{stamp}"
 # The comment above every deny rule this switch adds, which is how Request auto-merge finds
 # the rules it may take out again: a deny rule without it is a person's.
 DENY_NOTE = "Added by kube-agents: auto-merge turned off on the dial."
+
+# Where turning on may propose an allow rule: the environments the auto-merge
+# offer covers. Turning off is never limited.
+ON_ENVIRONMENTS = frozenset({"dev"})
 
 ON = "on"
 OFF = "off"
@@ -251,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if kubeagents_switches.switch("DIAL") != "on":
         print(json.dumps([{"state": BLOCKED, "reason": "KUBEAGENTS_DIAL is off"}]))
+        return 1
+    if args.state == ON and args.environment not in ON_ENVIRONMENTS:
+        reason = f"auto-merge turns on in {', '.join(sorted(ON_ENVIRONMENTS))} only"
+        print(json.dumps([{"state": BLOCKED, "reason": reason}]))
         return 1
     results = []
     for repo, pending in args.repo:

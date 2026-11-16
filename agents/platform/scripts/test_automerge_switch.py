@@ -223,6 +223,21 @@ class TestMain(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())[0]["reason"], "KUBEAGENTS_DIAL is off")
 
+    def test_turning_on_outside_the_offered_environments_is_refused(self):
+        out = io.StringIO()
+        with mock.patch("kubeagents_switches.switch", return_value="on"), mock.patch.object(sw, "toggle") as toggle, redirect_stdout(out):
+            code = sw.main(["--kind", "no-pdb", "--environment", "prod", "--state", "on", "--repo", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())[0]["reason"], "auto-merge turns on in dev only")
+        toggle.assert_not_called()
+
+    def test_turning_off_works_in_any_environment(self):
+        out = io.StringIO()
+        with mock.patch("kubeagents_switches.switch", return_value="on"), mock.patch.object(sw, "toggle", return_value={"state": "proposed"}) as toggle, redirect_stdout(out):
+            code = sw.main(["--kind", "no-pdb", "--environment", "prod", "--state", "off", "--repo", REPO])
+        self.assertEqual(code, 0)
+        toggle.assert_called_once()
+
     def test_runs_each_repository_and_reports_a_failure_without_stopping(self):
         seen = []
 
