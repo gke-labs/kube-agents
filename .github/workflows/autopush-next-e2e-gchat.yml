@@ -1,9 +1,8 @@
 name: "Autopush-Next: Google Chat E2E"
 
 # Runs tests/e2e/gchat_agent_test.py ("what is 2 + 3?") against the long-lived
-# autopush-next environment, which runs spec.mode next, so its Chat ingress is
-# the A2A gateway's Google Chat adapter rather than the Hermes platform. The
-# same forged MESSAGE event the release gate uses reaches the gateway through
+# autopush-next environment, whose Chat ingress is the A2A gateway's Google
+# Chat adapter. The same forged MESSAGE event the release gate uses reaches the gateway through
 # the install's one subscription; the reply is read back from Chat.
 #
 # Its own file rather than a schedule on e2e-gchat-test.yml: that workflow is

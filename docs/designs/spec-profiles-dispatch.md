@@ -364,7 +364,7 @@ leave open:
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
-  task, `proxyToken` also carries that `trigger` (`{name, origin, stream}`), which the verifier
+  task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
   found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than

@@ -1048,7 +1048,7 @@ class TasksBudgetSizingTest(unittest.TestCase):
         # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
         # -> TuningSpec.MaxSessions, as the API package tags them, and the
         # chart renders the values under platformAgent at those paths
-        # (tests/test_chart_platform_agent_mode.py, CiDeployDocumentRenderTest).
+        # (tests/test_chart_platform_agent_no_mode.py, NoModeRenderTest).
         api = text(_API_TYPES)
         self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
         self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
