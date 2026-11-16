@@ -534,7 +534,7 @@ func (p *BusStreamPoller) streak(agent *agentv1alpha1.PlatformAgent) *busStreamS
 // the status, re-runs the provision Job when a loss is confirmed, and
 // restarts TASKS' clients once TASKS is back after a loss (restartTasksClients).
 func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.DeletionTimestamp != nil || !a2aStackRendering(agent) || !busProvisioned(agent) {
+	if agent.DeletionTimestamp != nil || !busProvisioned(agent) {
 		delete(p.streaks, agent.UID)
 		return p.removeCondition(ctx, agent)
 	}
@@ -608,6 +608,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
 		}
+		// The re-run recreated TASKS, so an open loss of it ends here, even
+		// if no poll saw TASKS present: a client that bound to the new
+		// stream and then lost it to a second loss is covered by that
+		// loss's own date, not the first one's.
+		if loss := readBusTasksLoss(agent); loss != nil && !loss.Back {
+			loss.Back = true
+			if err := p.writeTasksLoss(ctx, agent, *loss); err != nil {
+				return err
+			}
+		}
 	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
 		// An attempt whose Job delete didn't land, and the streams are back
 		// before its retry: the Job never re-ran, so it recreated nothing.
@@ -673,6 +683,9 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 				// Warned once per loss; the condition says so in a fixed
 				// message, so a restart that keeps failing rewrites nothing,
 				// and the next poll retries it.
+				// TASKS is present on this poll, so no run in flight
+				// stands: drop it, as the polls past this branch would.
+				streak.missing, streak.misses = nil, 0
 				if !streak.restartWarnedFor.Equal(loss.At) {
 					streak.restartWarnedFor = loss.At
 					p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
@@ -1192,12 +1205,9 @@ func (p *BusStreamPoller) removeCondition(ctx context.Context, agent *agentv1alp
 	return p.r.Status().Patch(ctx, agent, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
-// busStreamsMissingCondition returns BusStreamsPresent while it is False on a
-// CR whose stack still renders, for Degraded; nil otherwise.
+// busStreamsMissingCondition returns BusStreamsPresent while it is False, for
+// Degraded; nil otherwise.
 func busStreamsMissingCondition(agent *agentv1alpha1.PlatformAgent) *metav1.Condition {
-	if !a2aStackRendering(agent) {
-		return nil
-	}
 	cond := meta.FindStatusCondition(agent.Status.Conditions, busStreamsPresentConditionType)
 	if cond == nil || cond.Status != metav1.ConditionFalse {
 		return nil

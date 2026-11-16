@@ -728,7 +728,7 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
    An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
    `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
    it to a root-owned file the script reads first): the ledger then lists what the sweep would have
-   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
+   opened as awaiting `/remediate`, and a pull request opens there only on a `/remediate` comment or a direct ask ([`remediation.md`](../../agents/platform/skills/fleet-audit/references/remediation.md)). The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.

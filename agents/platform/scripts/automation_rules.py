@@ -33,8 +33,10 @@ SCHEMA_VERSION = 1
 # costing more than a glance to refuse.
 MAX_FILE_BYTES = 64 * 1024
 # The kinds of fix kube-agents opens today, by the audit check that finds them.
-# A rule naming anything else is kept but can never match, and says so.
+# A rule naming anything else makes the file invalid.
 KNOWN_FIX_TYPES = frozenset({"no-pdb"})
+# What a person calls each of them, for text kube-agents writes; one per known type.
+FIX_TYPE_NAMES = {"no-pdb": "disruption-budget fixes"}
 WILDCARD = "*"
 # The label on a fix pull request the customer's pipeline may merge on its own
 # (`KUBEAGENTS_AUTOMERGE=on`). A merged pull request carrying it is one that
@@ -306,11 +308,32 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
 
     An edit of the text, never a re-render: the file is the customer's, and a
     pull request that rewrote every comment and quote in it to add one rule
-    would hide the rule. The rule goes at the end of `automerge.deny`, which is
-    created when absent. `note` becomes a comment above it in a block-style
+    would hide the rule. The rule goes at the end of `automerge.deny`, which
+    is created (and `automerge` with it) when absent. `note` becomes a comment above it in a block-style
     file. Raises `RulesError` for a file this cannot read or a layout it cannot
-    add to, and checks its own output: the result must parse and must deny.
+    add to, and checks its own output: the result must parse, with exactly
+    this rule added.
     """
+    return _with_rule(text, "deny", fix_type, environment, note)
+
+
+def with_allow(text: str, fix_type: str, environment: str, note: str = "") -> str:
+    """`with_deny`, for an allow rule; `automerge` is created too when absent."""
+    return _with_rule(text, "allow", fix_type, environment, note)
+
+
+def new_file(fix_type: str, environment: str) -> str:
+    """A rules file that allows exactly `fix_type` in `environment`."""
+    text = (
+        "# Which kube-agents fixes your pipeline may merge without a human review\n"
+        "# https://gke-labs.github.io/kube-agents/reference/automation-rules/\n"
+        "# Nothing else merges unattended.\n"
+        "version: 1\n"
+    )
+    return with_allow(text, fix_type, environment)
+
+
+def _with_rule(text: str, section: str, fix_type: str, environment: str, note: str) -> str:
     import yaml
 
     before = parse(text)
@@ -318,11 +341,11 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         raise RulesError(f"{RULES_FILE} does not parse; not edited")
     fix_q, env_q = json.dumps(fix_type), json.dumps(environment)
     root = yaml.compose(text, Loader=yaml.SafeLoader)
+    automerge_key = next((k for k, v in root.value if k.value == "automerge"), None)
     automerge = next((v for k, v in root.value if k.value == "automerge"), None)
-    if not isinstance(automerge, yaml.MappingNode):
-        raise RulesError("no `automerge` mapping to add a deny rule to")
-    deny = next((v for k, v in automerge.value if k.value == "deny"), None)
-    deny_key = next((k for k, v in automerge.value if k.value == "deny"), None)
+    entries = automerge.value if isinstance(automerge, yaml.MappingNode) else []
+    rules = next((v for k, v in entries if k.value == section), None)
+    rules_key = next((k for k, v in entries if k.value == section), None)
     flow_item = f"{{fix: {fix_q}, environments: [{env_q}]}}"
     nl = "\r\n" if "\r\n" in text else "\n"
     comment = f"# {' '.join(note.split())}" if note else ""
@@ -331,38 +354,60 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         head = f"{pad}{comment}{nl}" if comment else ""
         return f"{head}{pad}- fix: {fix_q}{nl}{pad}  environments: [{env_q}]{nl}"
 
-    if isinstance(deny, yaml.SequenceNode) and deny.flow_style:
-        close = deny.end_mark.index - 1
-        insert = flow_item if not deny.value or _ends_in_comma(text, close) else f", {flow_item}"
+    if automerge_key is None:
+        if root.flow_style:
+            raise RulesError(f"cannot add `automerge` to a flow-style {RULES_FILE}")
+        out = _insert_after_line(text, _exact_end(root), f"automerge:{nl}  {section}:{nl}" + block_item("    "))
+    elif not isinstance(automerge, yaml.MappingNode):
+        # `automerge:` with nothing after it; anything else fails the final check.
+        pad = " " * (automerge_key.start_mark.column + 2)
+        out = _insert_after_line(text, automerge_key.end_mark.index, f"{pad}{section}:{nl}" + block_item(pad + "  "))
+    elif isinstance(rules, yaml.SequenceNode) and rules.flow_style:
+        close = rules.end_mark.index - 1
+        insert = flow_item if not rules.value or _ends_in_comma(text, close) else f", {flow_item}"
         out = text[:close] + insert + text[close:]
-    elif isinstance(deny, yaml.SequenceNode) and deny.value:
+    elif isinstance(rules, yaml.SequenceNode) and rules.value:
         # The sequence's own mark is its first `-`; the first rule's mark is its
         # first key, which may sit on the next line after a bare `-`.
-        out = _insert_after_line(text, _exact_end(deny), block_item(" " * deny.start_mark.column))
+        out = _insert_after_line(text, _exact_end(rules), block_item(" " * rules.start_mark.column))
     elif automerge.flow_style:
-        if deny is not None:
-            raise RulesError("`automerge.deny` is not a list")
+        if rules is not None:
+            raise RulesError(f"`automerge.{section}` is not a list")
         close = automerge.end_mark.index - 1
         sep = ", " if automerge.value and not _ends_in_comma(text, close) else ""
-        out = text[:close] + f"{sep}deny: [{flow_item}]" + text[close:]
-    elif deny_key is not None:
+        out = text[:close] + f"{sep}{section}: [{flow_item}]" + text[close:]
+    elif rules_key is not None:
         # `deny:` with nothing after it. `deny: ~` or `deny: null` fall to the
         # final check: the items below them would not parse.
-        pad = " " * (deny_key.start_mark.column + 2)
-        out = _insert_after_line(text, deny_key.end_mark.index, block_item(pad))
+        pad = " " * (rules_key.start_mark.column + 2)
+        out = _insert_after_line(text, rules_key.end_mark.index, block_item(pad))
     else:
         pad = " " * automerge.value[0][0].start_mark.column
-        out = _insert_after_line(text, _exact_end(automerge), f"{pad}deny:{nl}" + block_item(pad + "  "))
+        out = _insert_after_line(text, _exact_end(automerge), f"{pad}{section}:{nl}" + block_item(pad + "  "))
     edited = parse(out)
     # Exactly one rule more, nothing moved: an alias's node carries its anchor's
     # marks, so a position found from it can land inside another list.
-    if (
-        edited.status != LOADED
-        or decide(edited, fix_type, environment).allowed
-        or edited.allow != before.allow
-        or edited.deny != before.deny + (Rule(fix_type, (environment,)),)
-    ):
-        raise RulesError(f"could not add a deny rule to this layout of {RULES_FILE}")
+    what = "an allow" if section == "allow" else "a deny"
+    try:
+        # The rule on its own: a bad fix type or environment says so, while a
+        # splice that does not re-parse is a layout this cannot add to.
+        added = _parse_rule(
+            {"fix": fix_type, "environments": [environment]},
+            f"automerge.{section}",
+            wildcard_ok=section == "deny",
+            warnings=[],
+        )
+    except RulesError as exc:
+        raise RulesError(f"could not add {what} rule to {RULES_FILE}: {exc}") from exc
+    if section == "allow":
+        expected = (before.allow + (added,), before.deny)
+    else:
+        expected = (before.allow, before.deny + (added,))
+    if edited.status != LOADED or (edited.allow, edited.deny) != expected:
+        raise RulesError(f"could not add {what} rule to this layout of {RULES_FILE}")
+    if section == "allow" and not decide(edited, fix_type, environment).allowed:
+        # A deny already covers it, so the edit would allow nothing.
+        raise RulesError(f"{RULES_FILE} already denies {fix_type} in {environment}; an allow rule would change nothing")
     return out
 
 

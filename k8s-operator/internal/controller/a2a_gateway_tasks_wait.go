@@ -222,13 +222,9 @@ func a2aGatewayLeaderTasksWait(agent *agentv1alpha1.PlatformAgent, leader *a2aGa
 	return since, true
 }
 
-// a2aGatewayProvisionedAt is BusProvisioned's transition to True on a
-// rendering stack, false when the stack does not render or the bus is not
-// recorded provisioned.
+// a2aGatewayProvisionedAt is BusProvisioned's transition to True, false when
+// the bus is not recorded provisioned.
 func a2aGatewayProvisionedAt(agent *agentv1alpha1.PlatformAgent) (time.Time, bool) {
-	if !a2aStackRendering(agent) {
-		return time.Time{}, false
-	}
 	provisioned := meta.FindStatusCondition(agent.Status.Conditions, busProvisionedConditionType)
 	if provisioned == nil || provisioned.Status != metav1.ConditionTrue {
 		return time.Time{}, false
@@ -287,7 +283,7 @@ func a2aGatewayTasksWaitDue(since, now time.Time) (bool, time.Duration) {
 // the test, but every replica ready includes the leader. Read from the
 // cache, so a settled install pays no live read for this on any pass.
 func (r *PlatformAgentReconciler) a2aGatewayTasksWaitApplies(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
-	if !a2aStackRendering(agent) || !busProvisioned(agent) {
+	if !busProvisioned(agent) {
 		return false
 	}
 	nats := &appsv1.StatefulSet{}

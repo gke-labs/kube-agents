@@ -769,9 +769,11 @@ func TestAFalseConditionMakesTheCRDegraded(t *testing.T) {
 	if c := busStreamsMissingCondition(agent); c == nil || c.Message != "Missing: TASKS" {
 		t.Errorf("busStreamsMissingCondition = %+v, want the False condition", c)
 	}
+	// A stored "today" renders the stack like any other value, so the condition
+	// still counts for Degraded.
 	agent.Spec.Mode = ptr.To("today")
-	if c := busStreamsMissingCondition(agent); c != nil {
-		t.Errorf("busStreamsMissingCondition = %+v under today, want nil", c)
+	if c := busStreamsMissingCondition(agent); c == nil {
+		t.Error("busStreamsMissingCondition = nil for a stored today, want the False condition")
 	}
 }
 
@@ -2016,5 +2018,64 @@ func TestAStoppedTasksStillRestartsItsClientsWhenBack(t *testing.T) {
 	}
 	if got := readBusReprovisionRecord(rig.agent()).Stopped; len(got) != 0 {
 		t.Errorf("Stopped = %v, want TASKS lifted once back", got)
+	}
+}
+
+// TASKS lost, re-run, a client started after the first loss binds to the
+// new stream, and TASKS is lost again before any poll sees it present. The
+// re-run closes the first loss, so the second is dated afresh and the client
+// that bound in between is restarted with the rest.
+func TestASecondLossInsideTheRerunIsDatedAfresh(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	loseTasks(rig)
+	first := readBusTasksLoss(rig.agent()).At
+	ctx := context.Background()
+	old := &corev1.Pod{}
+	if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-a2a-gateway-abc"}, old); err != nil {
+		t.Fatal(err)
+	}
+	between := clientPodStarted(agent, "test-agent-a2a-gateway-between", a2aGatewayPodSelector(agent), first.Add(10*time.Minute))
+	between.OwnerReferences = old.OwnerReferences
+	if err := rig.cl.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.cl.Create(ctx, between); err != nil {
+		t.Fatal(err)
+	}
+	rig.now = first.Add(20 * time.Minute)
+	rig.recreateJob(batchv1.JobComplete)
+	rig.deleted = nil
+	// The second loss: TASKS already gone again on the re-run's settling poll.
+	rig.serve(1, allStreamsBut("TASKS")...)
+	for i := 0; i < busStreamsConfirmPolls+1; i++ {
+		rig.poll()
+	}
+	if loss := readBusTasksLoss(rig.agent()); loss == nil || !loss.At.After(between.Status.ContainerStatuses[0].State.Running.StartedAt.Time) {
+		t.Fatalf("loss = %+v, want it dated after the client that bound in between", loss)
+	}
+	// The stop holds TASKS (the re-run didn't bring it back), so it's
+	// fixed by hand.
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-a2a-gateway-between") {
+		t.Errorf("deleted %v, want the client that bound between the losses restarted", rig.deleted)
+	}
+}
+
+// A failed restart drops the run in flight, as a poll that sees TASKS present
+// does, so no stale misses are left armed for a later misread to complete.
+func TestAFailedRestartDropsTheRunInFlight(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobFailed))
+	rig.serve(1, allStreamsBut("TASKS", "KV_cap")...)
+	for i := 0; i < busStreamsConfirmPolls; i++ {
+		rig.poll()
+	}
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.podDeleteErr = errors.New("etcdserver: request timed out")
+	rig.poll()
+	if st := rig.poller.streaks[busStreamsTestAgentUID]; st == nil || st.misses != 0 || len(st.missing) != 0 {
+		t.Errorf("streak = %+v after a failed restart, want the run dropped", st)
 	}
 }
