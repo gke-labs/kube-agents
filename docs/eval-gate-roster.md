@@ -1000,23 +1000,23 @@ appends anyway) stays unregistered, since a nightly registration would run it on
 nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
 grow a lane-only seat.
 
-## The certification suite
+## The validated-capabilities suite
 
-The certification suite, the cases behind the certified-capabilities page, has no list under
+The validated-capabilities suite, the cases behind the validated-capabilities page, has no list under
 `hack/eval/`: each case is a top-level case under `bench/tasks/` whose task file carries the
-bare line `suite: certification`, that line is its registration, and `EVAL_TIER=certification` in
-`hack/ci-eval-pr.sh` runs those cases alone, in sections by their `certification_part: N` line under `EVAL_CERTIFICATION_PART`,
+bare line `suite: validated-capabilities`, that line is its registration, and `EVAL_TIER=validated-capabilities` in
+`hack/ci-eval-pr.sh` runs those cases alone, in sections by their `suite_part: N` line under `EVAL_VALIDATED_CAPABILITIES_PART`,
 one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses a suite
 case that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
 refuses any other spelling of the two lines, so a case holds one record on one lane. The roster
 above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
 the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
 every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
-failing certification case is a record for the page rather than a red. The lane appends nothing to
-the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
+failing validated-capabilities case is a record for the page rather than a red. The lane appends nothing to
+the evidence store and publishes no dashboard; its record is its logs bucket. A validated-capabilities case never
 earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
-A case's task file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
-meets are in [`bench/README.md`](../bench/README.md#certification-suite).
+A case's task file needs the normal approvers, like `nightly-cases.txt`. The rules a validated-capabilities fixture
+meets are in [`bench/README.md`](../bench/README.md#validated-capabilities-suite).
 
 ## The replay lane
 

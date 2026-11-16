@@ -9,7 +9,7 @@
 # referenced pools lack the class label: one labelled pool satisfies it, so
 # the one-pool-of-many shape passes both. A declared gap: expected_fail until
 # the check lands; its gap issue is filed with the fixture. Parked
-# (FIXTURE_NOT_READY on gke-labs/kube-agents#5143; the bare `suite: certification`
+# (FIXTURE_NOT_READY on gke-labs/kube-agents#5143; the bare `suite: validated-capabilities`
 # line is the lane's registration, so a parked case carries none): the shape needs a
 # Standard cluster with a manual node pool under the class, which the lane's
 # Autopilot hosts refuse, so it is a seeded fleet fixture addressed by role,

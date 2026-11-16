@@ -102,7 +102,7 @@ _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
 # nightly's eight parts, the GitLab next nightly, the forge lanes' weekly
-# jobs and the certification lane's first slice; the retired today-mode GitLab
+# jobs and the validated-capabilities lane's first slice; the retired today-mode GitLab
 # nightly's name and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
@@ -118,6 +118,9 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-weekly-ghes-next",
     "ci-kube-agents-eval-weekly-gitlab-ce-next",
     "ci-kube-agents-certification-1",
+    # The same slice under the name its job takes next: a release admits the
+    # name before oss-test-infra can rename the job.
+    "ci-kube-agents-validated-capabilities-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
     # The replay lane: a periodic replaying the next-mode nightlies' recordings.

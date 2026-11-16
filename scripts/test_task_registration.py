@@ -90,7 +90,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         )
 
     def test_every_task_is_in_exactly_one_place(self):
-        # Presubmit, nightly, the certification suite line, FIXTURE_NOT_READY
+        # Presubmit, nightly, the validated-capabilities suite line, FIXTURE_NOT_READY
         # and KNOWN_UNREGISTERED are five answers to one question; a case with
         # two of them has a stale one. The shell rejects the presubmit/nightly overlap itself (it
         # would run the case twice a night); the allowlist overlaps are the
@@ -98,7 +98,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
-            "suite: certification (task files)": set(eval_rosters.certification_cases()),
+            "suite: validated-capabilities (task files)": set(eval_rosters.validated_capabilities_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -642,14 +642,14 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), validated_capabilities=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
             return validator.validate_case(
-                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+                "made-up-case", path, registered=set(registered), validated_capabilities=None if validated_capabilities is None else set(validated_capabilities)
             )
 
     def _only(self, needle, **kwargs):
@@ -666,48 +666,48 @@ class TestTheRulesReject(unittest.TestCase):
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
 
-    # -- the certification suite: the bare line is the registration --
+    # -- the validated-capabilities suite: the bare line is the registration --
 
-    def test_a_certification_case_registers_by_its_line(self):
+    def test_a_validated_capabilities_case_registers_by_its_line(self):
         # Registered nowhere else: the line is the registration, so the
         # "registered nowhere" finding stays quiet.
-        self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+        self.assertEqual(self._validate(suite="validated-capabilities", validated_capabilities=set(), registered=set()), [])
 
     def test_a_suite_spelling_the_lane_does_not_read_is_reported(self):
-        for text in ('id: made-up-case\nsuite: "certification"\n', "id: made-up-case\nsuite: certification  # the page row\n"):
+        for text in ('id: made-up-case\nsuite: "validated-capabilities"\n', "id: made-up-case\nsuite: validated-capabilities  # the page row\n"):
             with self.subTest(text=text):
                 spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
-                self._only("spelling the lane does not read", text=text + spec, certification=set())
+                self._only("spelling the lane does not read", text=text + spec, validated_capabilities=set())
 
     def test_a_crlf_suite_line_is_a_spelling_the_lane_does_not_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
-            spec = yaml.safe_dump({**self.VALID, "suite": "certification"})
+            spec = yaml.safe_dump({**self.VALID, "suite": "validated-capabilities"})
             path.write_bytes(spec.replace("\n", "\r\n").encode())
-            problems = validator.validate_case("made-up-case", path, registered=set(), certification=set())
+            problems = validator.validate_case("made-up-case", path, registered=set(), validated_capabilities=set())
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("spelling the lane does not read", problems[0])
 
     def test_a_part_line_is_accepted_bare_and_reported_otherwise(self):
-        self.assertEqual(self._validate(suite="certification", certification_part=2, certification=set()), [])
-        self._only("without 'suite: certification'", certification_part=2)
-        self._only("is not a whole number from 1", suite="certification", certification_part="2", certification=set())
-        self._only("is not a whole number from 1", suite="certification", certification_part=0, certification=set())
+        self.assertEqual(self._validate(suite="validated-capabilities", suite_part=2, validated_capabilities=set()), [])
+        self._only("without 'suite: validated-capabilities'", suite_part=2)
+        self._only("is not a whole number from 1", suite="validated-capabilities", suite_part="2", validated_capabilities=set())
+        self._only("is not a whole number from 1", suite="validated-capabilities", suite_part=0, validated_capabilities=set())
         spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
-        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: certification\ncertification_part: 2  # note\n" + spec, certification=set())
+        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: validated-capabilities\nsuite_part: 2  # note\n" + spec, validated_capabilities=set())
 
     def test_a_parked_case_may_not_carry_the_suite_line(self):
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
-            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="validated-capabilities", validated_capabilities=set(), registered=set())
         with unittest.mock.patch.dict(validator.KNOWN_UNREGISTERED, {"made-up-case": "must not run"}, clear=False):
-            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="validated-capabilities", validated_capabilities=set(), registered=set())
 
     def test_a_suite_case_in_a_roster_file_is_reported(self):
-        self._only("runs on that lane only", suite="certification", certification={"made-up-case"})
+        self._only("runs on that lane only", suite="validated-capabilities", validated_capabilities={"made-up-case"})
 
     def test_an_unknown_suite_is_reported(self):
-        self._only("the only suite is 'certification'", suite="nightly")
+        self._only("the only suite is 'validated-capabilities'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 

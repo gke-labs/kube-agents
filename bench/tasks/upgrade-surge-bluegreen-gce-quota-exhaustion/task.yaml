@@ -52,7 +52,7 @@
 # yet; the fixture that plants it, standing or per run, is the cost decision
 # above). Until it exists the case sits in FIXTURE_NOT_READY in
 # scripts/validate_bench_cases.py, registered in no roster, and the run
-# grades nothing; a parked case carries no `suite: certification` line,
+# grades nothing; a parked case carries no `suite: validated-capabilities` line,
 # since that line is the lane's registration, and the un-park pull request
 # adds it with the roster line. Nothing is planted by the run.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).

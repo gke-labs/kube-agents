@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -590,7 +590,7 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
 job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
-`EVAL_TIER=certification`, every case whose task file carries the bare line `suite: certification`. A case
+`EVAL_TIER=validated-capabilities`, every case whose task file carries the bare line `suite: validated-capabilities`. A case
 runs because a file names it or its task file carries that line; other cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
@@ -617,10 +617,10 @@ for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
-The one exception is a case with the bare line `suite: certification` in its task file: that
-line is its registration (with `certification_part: N` for a section other than 1), it runs only under `EVAL_TIER=certification`, and never
+The one exception is a case with the bare line `suite: validated-capabilities` in its task file: that
+line is its registration (with `suite_part: N` for a section other than 1), it runs only under `EVAL_TIER=validated-capabilities`, and never
 in the presubmit or nightly files
-([`bench/README.md`](../../bench/README.md#certification-suite)).
+([`bench/README.md`](../../bench/README.md#validated-capabilities-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was

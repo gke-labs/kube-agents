@@ -8,7 +8,7 @@
 id: workload-hpa-scaledown-and-missing-prestop
 name: "HPA Scale-Down With No Stabilization Window on a Workload With No preStop Hook (HPA scale-down check)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit
