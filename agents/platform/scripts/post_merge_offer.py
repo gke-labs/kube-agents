@@ -25,6 +25,9 @@ then. A run that stops between opening the draft and commenting is finished
 by the next run on the same fix: the draft's last line names the fix it was
 made on, so the comment goes there once, behind the marker check, and never
 on a later fix. A draft already closed or merged gets no late comment.
+The marker check and the comment are two calls, so two runs finishing the
+same fix at once could both comment, as with the step-down; the driver that
+wires this must run one pass per fix at a time.
 """
 
 from __future__ import annotations
@@ -184,21 +187,17 @@ def _finish(forge: Forge, number: int, existing: dict, fix_url: str, name: str, 
     fork the repository can open a pull request from a same-named branch whose
     body ends with the fix's URL, and commenting would then present theirs as
     the offer. Such a draft only ends the offer, as before.
-
-    The marker check and the comment are two calls, so two runs finishing the
-    same fix at once could both comment, as with the step-down; the driver
-    that wires this must run one pass per fix at a time.
     """
     url = str(existing.get("url") or "")
     already = {"action": "none", "reason": "already offered", "offer": url}
+    viewer = str((forge("identity", {}).get("identity") or {}).get("login") or "")
+    if not viewer:
+        # Without it neither the draft's author nor the marker can be told from someone else's.
+        return {"action": "retry", "reason": "the forge did not say who this install is", "offer": url}
     body = str(existing.get("body") or "").rstrip().splitlines()
     # The whole last line, so the offer made on .../pull/12 is not finished on .../pull/123.
     if existing.get("state") != "open" or not body or body[-1].strip() != f"{OFFERED_ON}{fix_url}":
         return already
-    viewer = str((forge("identity", {}).get("identity") or {}).get("login") or "")
-    if not viewer:
-        # Without it the marker cannot be told from a copy someone else wrote.
-        return {"action": "retry", "reason": "the forge did not say who this install is", "offer": url}
     author = existing.get("author")
     author = author.get("login") if isinstance(author, dict) else author
     source_repo = str(existing.get("sourceRepo") or "").casefold()
