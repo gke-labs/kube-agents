@@ -21,8 +21,10 @@ the kind there gets no offer either.
 
 Nothing calls this yet: the post-merge driver wires it, and the reference page
 (`docs/site/src/content/docs/reference/automation-rules.md`) gains its section
-then. A run that stops between opening the draft and commenting leaves the
-draft without the comment; the next run reads that as already offered.
+then. A run that stops between opening the draft and commenting is finished
+by the next run on the same fix: the draft's last line names the fix it was
+made on, so the comment goes there once, behind the marker check, and never
+on a later fix. A draft already closed or merged gets no late comment.
 """
 
 from __future__ import annotations
@@ -128,8 +130,9 @@ def offer(
     name = automation_rules.FIX_TYPE_NAMES.get(kind, f"{kind} fixes")
     bar = f"{clean_merges.CLEAN_MERGES_NEEDED} {name} have merged on {clean_merges.DAYS_NEEDED} or more days"
 
-    if post_merge_stepdown._existing_proposal(forge, branch):
-        return {"action": "none", "reason": "already offered"}
+    existing = post_merge_stepdown._existing_proposal(forge, branch)
+    if existing:
+        return _finish(forge, number, existing, fix_url, name, environment, repo)
     if fix.get("state") != "merged":
         return {"action": "none", "reason": f"#{number} is {fix.get('state') or 'unknown'}, not merged"}
     if (forge("branch-view", {"branch": branch}).get("branch") or {}).get("exists"):
@@ -157,6 +160,10 @@ def offer(
         if post_merge_stepdown._existing_proposal(forge, branch):
             return {"action": "none", "reason": "already offered"}
         raise
+    return _comment(forge, number, url, name, environment, repo)
+
+
+def _comment(forge: Forge, number: int, url: str, name: str, environment: str, repo: str) -> dict:
     line = (
         f"{name[0].upper()}{name[1:]}: at least {clean_merges.CLEAN_MERGES_NEEDED} merged in {repo_name(repo)}, "
         "none changed or undone. "
@@ -166,6 +173,43 @@ def offer(
     )
     answer = forge("proposal-comment", {"number": number, "body": f"{line}\n\n{MARKER}"})
     return {"action": "offered", "offer": url, "comment": (answer.get("comment") or {}).get("url")}
+
+
+def _finish(forge: Forge, number: int, existing: dict, fix_url: str, name: str, environment: str, repo: str) -> dict:
+    """Post the comment a run left undone, when ``existing`` is a still-open
+    offer this install opened, from a branch in ``repo`` itself, on this very
+    fix, and the fix carries no offer comment from it yet.
+
+    The branch name and the body are no proof of who opened it: anyone who can
+    fork the repository can open a pull request from a same-named branch whose
+    body ends with the fix's URL, and commenting would then present theirs as
+    the offer. Such a draft only ends the offer, as before.
+
+    The marker check and the comment are two calls, so two runs finishing the
+    same fix at once could both comment, as with the step-down; the driver
+    that wires this must run one pass per fix at a time.
+    """
+    url = str(existing.get("url") or "")
+    already = {"action": "none", "reason": "already offered", "offer": url}
+    body = str(existing.get("body") or "").rstrip().splitlines()
+    # The whole last line, so the offer made on .../pull/12 is not finished on .../pull/123.
+    if existing.get("state") != "open" or not body or body[-1].strip() != f"{OFFERED_ON}{fix_url}":
+        return already
+    viewer = str((forge("identity", {}).get("identity") or {}).get("login") or "")
+    if not viewer:
+        # Without it the marker cannot be told from a copy someone else wrote.
+        return {"action": "retry", "reason": "the forge did not say who this install is", "offer": url}
+    author = existing.get("author")
+    author = author.get("login") if isinstance(author, dict) else author
+    source_repo = str(existing.get("sourceRepo") or "").casefold()
+    if post_merge_stepdown._login(author) != post_merge_stepdown._login(viewer) or source_repo != repo_name(repo).casefold():
+        return already
+    found = post_merge_stepdown._marker_comment(forge, number, viewer, MARKER)
+    if found == post_merge_stepdown._TRUNCATED:
+        return {"action": "none", "reason": f"#{number} has more comments than one read returns; not commenting twice", "offer": url}
+    if found is not None:
+        return already
+    return _comment(forge, number, url, name, environment, repo)
 
 
 def main(argv: list[str] | None = None) -> int:
