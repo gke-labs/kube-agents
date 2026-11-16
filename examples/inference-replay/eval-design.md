@@ -381,7 +381,7 @@ requests of one conversation served through the second key described under "Diff
 same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
 it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
 offline against the trial's saved requests, with each recorded answer noted and checked the way the
-proxy now does).
+proxy did before it timed that check by the whole prefix rather than its last message).
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the

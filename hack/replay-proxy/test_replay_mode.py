@@ -347,6 +347,16 @@ class VariantContextTest(AnalyzeCase):
         other = {"model": "m", "messages": [{"role": "user", "content": "card t_cccccccc opened"}, skill]}
         self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
 
+    def test_the_same_messages_under_other_settings_earlier(self):
+        # Another conversation sent these very messages ten minutes before, with
+        # another model. A prefix is the settings and the messages, so its time
+        # is this conversation's own; keyed by the messages alone, the card's
+        # timestamp would read as a future one and the answer as never recorded.
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
+        other = {"model": "another-model", "messages": opening}
+        self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
+
     def test_a_cidr_only_in_a_later_message(self):
         opening = [{"role": "user", "content": "node 10.1.2.3 is cordoned"}]
         self.assert_served(self.fork(opening, "allowed 10.0.0.0/8"))

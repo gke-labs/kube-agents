@@ -20,7 +20,8 @@ fresh mapping, IPs kept literal only for a CIDR in the settings themselves,
 and the conversation's first-seen time (its first message's) as "now". This
 runs on the proxy's background analysis thread, off the agent's path.
 
-Replay mode keeps a second kind of first-seen time to decide a match: when
+Record and replay mode keep a second kind of first-seen time (replay mode to
+decide a match, record mode for a request's prior answer): when
 it first saw each whole prefix of a request (the settings and every message
 up to a point, note()), and checks a slot's recorded answer against the
 slot's prefix normalized as of then, as record mode normalized that request
