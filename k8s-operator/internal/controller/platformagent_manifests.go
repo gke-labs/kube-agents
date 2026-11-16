@@ -5317,7 +5317,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's four, in every mode (auditReportStoreEnvNames).
+	// The audit-report store's names, in every mode (auditReportStoreEnvNames).
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}

@@ -97,6 +97,7 @@ func testAuditReportStoreEnvIsReservedIn(t *testing.T, mode string) {
 		{Name: "FLEET_AUDIT_REPORTS_DIR", Value: "/etc"},
 		{Name: "AUDIT_REPORT_STORE_API_SERVER", Value: "https://attacker.example"},
 		{Name: "AUDIT_REPORT_STORE_SA_DIR", Value: "/tmp/sa"},
+		{Name: auditReportProfilesEnv, Value: "attacker-profile"},
 	}}
 	for _, env := range [][]corev1.EnvVar{buildAgentAPIAuthEnv(agent), buildCredentialProxyContainer(agent).Env} {
 		for _, e := range env {
@@ -104,7 +105,7 @@ func testAuditReportStoreEnvIsReservedIn(t *testing.T, mode string) {
 				if e.Name != name {
 					continue
 				}
-				if e.Value == "/etc" || e.Value == "https://attacker.example" || e.Value == "/tmp/sa" ||
+				if e.Value == "/etc" || e.Value == "https://attacker.example" || e.Value == "/tmp/sa" || e.Value == "attacker-profile" ||
 					e.Value == "http://elsewhere" || e.Value == "/tmp/x" || e.Value == "test-agent-credential-proxy-exec-" ||
 					e.Value == "system:serviceaccount:test-ns:attacker" || (mode == "today" && name == auditReportStoreEnabledEnv) {
 					t.Errorf("mode %s: spec.deployment.env set %s=%q", mode, name, e.Value)
@@ -129,9 +130,10 @@ func TestAuditReportStoreBrokerTokenAndExecTierDrop(t *testing.T) {
 		}
 		_, hasURL := storeEnvValue(spec.Containers[0].Env, auditReportStoreURLEnv)
 		tokenFile, hasFile := storeEnvValue(spec.Containers[0].Env, auditReportStoreTokenFileEnv)
+		profiles, hasProfiles := storeEnvValue(spec.Containers[0].Env, auditReportProfilesEnv)
 		want := mode == "next"
-		if (volume != nil) != want || hasURL != want || hasFile != want {
-			t.Fatalf("mode %s: volume=%v url=%v file=%v, want %v", mode, volume != nil, hasURL, hasFile, want)
+		if (volume != nil) != want || hasURL != want || hasFile != want || hasProfiles != want {
+			t.Fatalf("mode %s: volume=%v url=%v file=%v profiles=%v, want %v", mode, volume != nil, hasURL, hasFile, hasProfiles, want)
 		}
 		if !want {
 			continue
@@ -139,6 +141,9 @@ func TestAuditReportStoreBrokerTokenAndExecTierDrop(t *testing.T) {
 		token := volume.Projected.Sources[0].ServiceAccountToken
 		if token == nil || token.Audience != auditReportStoreAudience {
 			t.Errorf("the store token is not bound to %s: %+v", auditReportStoreAudience, token)
+		}
+		if profiles != "fleet-audit,platform" {
+			t.Errorf("profiles %q", profiles)
 		}
 		if tokenFile != auditReportStoreTokenMountPath+"/token" {
 			t.Errorf("token file %q", tokenFile)
@@ -158,7 +163,7 @@ func TestAuditReportStoreBrokerTokenAndExecTierDrop(t *testing.T) {
 					t.Errorf("the exec tier mounts the store token")
 				}
 			}
-			for _, name := range []string{auditReportStoreURLEnv, auditReportStoreTokenFileEnv} {
+			for _, name := range []string{auditReportStoreURLEnv, auditReportStoreTokenFileEnv, auditReportProfilesEnv} {
 				if _, ok := storeEnvValue(c.Env, name); ok {
 					t.Errorf("the exec tier keeps %s", name)
 				}

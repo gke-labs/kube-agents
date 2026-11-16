@@ -165,10 +165,11 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
-	// The audit-report store's address and token file (audit_report_store.go):
-	// the store routes are the stateful broker's.
+	// The audit-report store's address, token file and profiles
+	// (audit_report_store.go): the store routes are the stateful broker's.
 	auditReportStoreURLEnv:       true,
 	auditReportStoreTokenFileEnv: true,
+	auditReportProfilesEnv:       true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {
