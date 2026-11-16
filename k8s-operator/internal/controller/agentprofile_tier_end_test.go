@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -248,5 +250,65 @@ func TestTheEndingFieldIsAbsentUntilUsed(t *testing.T) {
 	var old a2aDrainingTier
 	if err := json.Unmarshal([]byte(`{"tier":"oncall","mode":"interactive","until":"2023-11-14T22:13:20Z"}`), &old); err != nil || old.Ending {
 		t.Errorf("an older config decodes as %+v (err %v); want not ending", old, err)
+	}
+}
+
+// The PlatformAgent pass is asked back at the earliest drain's end, so an
+// ended drain's teardown follows its shortened end, not the next resync.
+func TestThePassComesBackAtTheEarliestDrainEnd(t *testing.T) {
+	now := time.Now()
+	mk := func(ends string) agentv1alpha1.AgentProfile {
+		return agentv1alpha1.AgentProfile{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{drainingTiersAnnotation: ends}}}
+	}
+	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	got := earliestDrainEnd([]agentv1alpha1.AgentProfile{mk("oncall=" + unix(time.Hour)), mk("nightly=" + unix(90*time.Second) + ",x=" + unix(2*time.Hour))}, now)
+	if got < 80*time.Second || got > 100*time.Second {
+		t.Errorf("earliestDrainEnd = %s, want about the 90s drain", got)
+	}
+	if got := earliestDrainEnd([]agentv1alpha1.AgentProfile{mk("")}, now); got != 0 {
+		t.Errorf("no drain: %s, want 0", got)
+	}
+	if got := earliestDrainEnd([]agentv1alpha1.AgentProfile{mk("old=" + unix(-time.Minute))}, now); got != time.Second {
+		t.Errorf("a passed end: %s, want the floor", got)
+	}
+}
+
+// Setting or changing end-tier-drain enqueues the PlatformAgent, which a
+// generation-only watch wouldn't: the annotation changes no generation.
+func TestTheLeverEnqueuesThePlatformAgent(t *testing.T) {
+	old := &agentv1alpha1.AgentProfile{ObjectMeta: metav1.ObjectMeta{Name: "tse", Generation: 3}}
+	set := old.DeepCopy()
+	set.Annotations = map[string]string{endTierDrainAnnotation: "oncall"}
+	other := old.DeepCopy()
+	other.Annotations = map[string]string{"unrelated": "x"}
+	p := endTierDrainChanged()
+	if !p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: set}) {
+		t.Error("setting the lever didn't pass the predicate")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: other}) {
+		t.Error("an unrelated annotation passed the predicate")
+	}
+}
+
+// While the lever is set the AgentProfile pass comes back within
+// endTierDrainRecheck, to consume it inside the drain's grace.
+func TestTheProfilePassComesBackSoonWhileTheLeverIsSet(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	cat := catalogWith(map[string]string{"oncall": tierModeInteractive})
+	oncall := &agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: "oncall", Namespace: agent.Namespace}, Spec: agentv1alpha1.TierSpec{Mode: tierModeInteractive}}
+	was := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "oncall"} })
+	cm := appliedConfig(t, agent, cat, nil, &was)
+	is := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} }, withEndTierDrain("oncall"))
+	// The tier's own ServiceAccount, which a drain requires.
+	ownSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: "agentprofile-tse-oncall", Namespace: profileNamespaceName(agent),
+		Labels:      map[string]string{agentProfileNameLabel: "tse", agentProfileTierLabel: "oncall", agentProfileTierModeLabel: tierModeInteractive},
+		Annotations: map[string]string{agentProfileUIDAnnotation: string(is.UID)},
+	}}
+	h := newProfileHarness(t, agent, &is, oncall, cm, ownSA)
+	res := h.reconcile(agent.Namespace, "tse")
+	if res.RequeueAfter == 0 || res.RequeueAfter > endTierDrainRecheck {
+		t.Errorf("RequeueAfter %s with the lever set, want at most %s", res.RequeueAfter, endTierDrainRecheck)
 	}
 }

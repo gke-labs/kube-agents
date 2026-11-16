@@ -6984,6 +6984,11 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// drainEndRequeue is when the earliest tier drain ends (#3659, #5850):
+	// the tier's teardown is that pass's, and nothing watched moves when a
+	// drain's end passes, so the pass has to be asked for. An ended drain
+	// (end-tier-drain) is minutes away, not hours.
+	drainEndRequeue time.Duration
 	// profileHoldRequeue is when to check again on a newly bound profile
 	// held until every bus server has loaded its config
 	// (a2aDispatchableProfiles). Zero when none is held.
@@ -7218,6 +7223,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
+	state.drainEndRequeue = earliestDrainEnd(profiles, time.Now())
 	// The profiles still draining (#5074), read once from the applied
 	// dispatch config for both renders: the identity map keeps their
 	// .supervisor grant exactly as long as the dispatch config lists them.

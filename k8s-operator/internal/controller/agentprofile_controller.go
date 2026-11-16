@@ -147,6 +147,25 @@ type AgentProfileReconciler struct {
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.reconcile(ctx, req)
+	if err != nil {
+		return res, err
+	}
+	// The end-tier-drain lever is consumed once the applied dispatch config
+	// carries it (consumeEndTierDrain), and nothing this controller watches
+	// moves when that config is written. Come back soon while it is set, so
+	// the entry is consumed within the drain's grace rather than at the next
+	// resync, after the tier has gone (#5850).
+	var p agentv1alpha1.AgentProfile
+	if r.Get(ctx, req.NamespacedName, &p) == nil && p.DeletionTimestamp == nil && p.Annotations[endTierDrainAnnotation] != "" {
+		if res.RequeueAfter == 0 || res.RequeueAfter > endTierDrainRecheck {
+			res.RequeueAfter = endTierDrainRecheck
+		}
+	}
+	return res, nil
+}
+
+func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// The namespace-only request SetupWithManager sends when a PlatformAgent

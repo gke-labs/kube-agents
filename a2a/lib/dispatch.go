@@ -468,17 +468,6 @@ type DrainingTier struct {
 	Ending bool `json:"ending,omitempty"`
 }
 
-// EndsTier reports whether p's drain of tier is being ended now
-// (DrainingTier.Ending).
-func (p DispatchProfile) EndsTier(tier string) bool {
-	for _, d := range p.DrainingTiers {
-		if d.Tier == tier && d.Ending {
-			return true
-		}
-	}
-	return false
-}
-
 // DrainsTier reports whether tier is one p drains (DrainingTiers).
 func (p DispatchProfile) DrainsTier(tier string) bool {
 	for _, d := range p.DrainingTiers {

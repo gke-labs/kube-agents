@@ -105,10 +105,12 @@ The operator decides what each listed name renders, and reports it in the `Tiers
   **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. To end a drain now, annotate the profile:
 
   ```sh
-  kubectl -n kubeagents-system annotate agentprofile <name> kubeagents.x-k8s.io/end-tier-drain=<tier>[,<tier>]
+  kubectl -n <namespace> annotate agentprofile <name> kubeagents.x-k8s.io/end-tier-drain=<tier>[,<tier>]
   ```
 
-  The dispatcher ends each task it holds at a listed tier: the task ends `canceled` with reason `tier-ended`, and its worker drops it. The tier is then removed within two minutes, with its ServiceAccount, pool and Jobs. The annotation acts only on a tier the profile is draining. The operator removes each tier from the annotation once it has acted, and removes a listed tier that the profile runs or isn't draining, with a Warning event, so a leftover entry never ends a later drain. Anyone who can update the AgentProfile can set it.
+  The dispatcher ends each task it holds at a listed tier: the task ends `canceled` with reason `tier-ended`, and its worker drops it. The tier is then removed within two minutes, with its ServiceAccount, pool and Jobs.
+
+  The annotation acts only on a tier the profile is draining. The operator removes each tier from the annotation once it has acted, and removes a listed tier that the profile runs or isn't draining, with a Warning event, so a leftover entry never ends a later drain. Anyone who can update the AgentProfile can set it. It ends one tier's drain on a profile that still runs another tier; a profile left with no tier drains as a whole, which this annotation doesn't end. A task still being handed to a worker when you set it is ended once it starts.
 
 `status.renderedTiers` records what the last pass rendered. The operator uses it to tell the tier a profile already serves from a newcomer. If status is lost (a restore, a GitOps apply), it reads the profile's own ServiceAccounts once instead.
 

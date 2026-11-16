@@ -12,6 +12,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -74,8 +76,14 @@ const endingTiersAnnotation = "kubeagents.x-k8s.io/internal-ending-tiers"
 const endTierDrainAnnotation = "kubeagents.x-k8s.io/end-tier-drain"
 
 // endTierDrainGrace is how long after the lever a tier's drain ends at the
-// latest: the dispatcher's refresh and its abandon, with room to spare.
+// latest: the dispatcher's refresh and its abandon, with room to spare. The
+// PlatformAgent pass is requeued at the drain's end (earliestDrainEnd), so
+// the teardown follows it closely.
 const endTierDrainGrace = 2 * time.Minute
+
+// endTierDrainRecheck is how soon the AgentProfile pass looks again while
+// the lever is set, to consume it inside endTierDrainGrace.
+const endTierDrainRecheck = 15 * time.Second
 
 // endTierDrainRequested is the tier names p's endTierDrainAnnotation lists.
 func endTierDrainRequested(p *agentv1alpha1.AgentProfile) map[string]bool {
@@ -313,7 +321,7 @@ func (r *AgentProfileReconciler) consumeEndTierDrain(ctx context.Context, p *age
 		}
 		if len(notDraining) > 0 {
 			r.Recorder.Eventf(p, corev1.EventTypeWarning, "EndTierDrainIgnored",
-				"%s lists tier(s) %s, which this profile isn't draining; removed from the annotation, nothing ended", endTierDrainAnnotation, strings.Join(notDraining, ", "))
+				"%s lists tier(s) %s, which this profile isn't draining (or whose drain has already ended); removed from the annotation. It ends one tier's drain on a profile that still runs another tier; a profile left with no tier drains whole and isn't covered", endTierDrainAnnotation, strings.Join(notDraining, ", "))
 		}
 	}
 	return nil
@@ -326,4 +334,39 @@ func endTierDrainSorted(m map[string]bool) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// earliestDrainEnd is how long until the first draining tier among the
+// rendered profiles ends, plus a second so the pass lands after it; zero when
+// none drains.
+func earliestDrainEnd(profiles []agentv1alpha1.AgentProfile, now time.Time) time.Duration {
+	var soonest time.Duration
+	for i := range profiles {
+		for _, until := range drainingTiersOf(&profiles[i]) {
+			d := until.Sub(now) + time.Second
+			if d < time.Second {
+				d = time.Second
+			}
+			if soonest == 0 || d < soonest {
+				soonest = d
+			}
+		}
+	}
+	return soonest
+}
+
+// endTierDrainChanged passes an AgentProfile update whose endTierDrainAnnotation
+// changed (#5850), which GenerationChangedPredicate doesn't.
+func endTierDrainChanged() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return false
+			}
+			return e.ObjectOld.GetAnnotations()[endTierDrainAnnotation] != e.ObjectNew.GetAnnotations()[endTierDrainAnnotation]
+		},
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
 }
