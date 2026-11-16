@@ -89,7 +89,7 @@ def _marker_comment(forge: Forge, number: int, viewer: str) -> str | None:
 
 
 def _open(forge: Forge, repo: str, branch: str, base: str, title: str, body: str,
-          write: Callable[[Path, Any, str, str], None]) -> str:
+          write: Callable[[Path, Any, str, str], None], *, draft: bool = False) -> str:
     """Cut `branch` from `base`, let `write` change the copy, publish, and open the pull request."""
     import vcs_client
 
@@ -97,7 +97,7 @@ def _open(forge: Forge, repo: str, branch: str, base: str, title: str, body: str
     if held.get("exists"):
         # An earlier run published the branch and stopped before the pull
         # request; open it from what is there rather than refuse forever.
-        answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base})
+        answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base, "draft": draft or None})
         return str(answer["proposal"]["url"])
     try:
         # Of `base`, the branch the fix merged into, which need not be the default.
@@ -113,7 +113,7 @@ def _open(forge: Forge, repo: str, branch: str, base: str, title: str, body: str
             vcs_client.discard(repo, key=branch)
         except vcs_client.VcsError:
             pass
-    answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base})
+    answer = forge("proposal-create", {"title": title, "body": body, "source": branch, "target": base, "draft": draft or None})
     return str(answer["proposal"]["url"])
 
 

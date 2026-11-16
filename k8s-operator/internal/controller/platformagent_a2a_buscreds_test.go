@@ -284,9 +284,8 @@ func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testi
 
 // The two above were only two of the parks, and moving the write up the
 // sequence fixed those two rather than the class. Four refusals return above
-// the bus step and cannot be moved below it -- they are refusals of today's
-// stack, and the bus step is at the end because it renders on top of what they
-// withhold. So the condition cannot be written in sequence at all: it has to be
+// the bus step and cannot be moved below it, and the bus step is at the end
+// because it renders on top of what they withhold. So the condition cannot be written in sequence at all: it has to be
 // written on the way out, whichever exit the reconcile takes.
 //
 // ShellSandboxCannotBeDisabled stands for all four here. It is a hard refusal:
@@ -295,8 +294,8 @@ func TestBusCredentialsReadyIsWrittenEvenWhenAnEarlierStepParksDegraded(t *testi
 
 // First direction: a next CR refused before the bus step ever runs. The callout
 // does not exist because nothing rendered it, and saying so is the whole point
-// -- a CR with no BusCredentialsReady at all is indistinguishable from a today
-// install to anything reading conditions.
+// -- a CR with no BusCredentialsReady at all is indistinguishable from one the
+// operator never reconciled, to anything reading conditions.
 func TestBusCredentialsReadyIsWrittenWhenARefusalReturnsAboveTheBusStep(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()

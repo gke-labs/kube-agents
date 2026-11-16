@@ -8,8 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
-# shellcheck source=scripts/release/platform_agent_mode.sh
-source "${SCRIPT_DIR}/platform_agent_mode.sh"
+# shellcheck source=scripts/release/a2a_readiness.sh
+source "${SCRIPT_DIR}/a2a_readiness.sh"
 
 # Per-Deployment, because the two have different ceilings and one number cannot
 # respect both. The rule test_gateway_rollout_budgets.py enforces is
@@ -34,12 +34,6 @@ source "${SCRIPT_DIR}/platform_agent_mode.sh"
 readonly LITELLM_READINESS_TIMEOUT="420s"
 readonly GATEWAY_READINESS_TIMEOUT="1500s"
 
-# PLATFORM_AGENT_MODE, refused before anything connects when it is not a mode.
-# Once connected, it is checked against the installed CR's spec.mode (one
-# read, whatever the mode); beyond that, unset and `today` add nothing below
-# and `next` adds the gate at the end.
-platform_agent_mode_resolve
-
 release_resolve_target
 
 COMMIT_SHA="${1:-${COMMIT_SHA:-}}"
@@ -55,9 +49,6 @@ echo "Readiness Timeouts: litellm ${LITELLM_READINESS_TIMEOUT}, gateway ${GATEWA
 echo "======================================================================"
 
 release_connect_kubectl
-
-# Before any gate, so a run given the wrong mode stops at once and says so.
-platform_agent_mode_check_installed "${AGENT_NAMESPACE}"
 
 echo "🔑 Configuring Docker authentication for Artifact Registry (${REGION}-docker.pkg.dev)..."
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
@@ -82,10 +73,8 @@ echo "Waiting for platform-agent-gateway deployment readiness..."
 kubectl rollout status deployment/platform-agent-gateway -n "${AGENT_NAMESPACE}" --timeout="${GATEWAY_READINESS_TIMEOUT}"
 kubectl wait --for=condition=Available deployment/platform-agent-gateway -n "${AGENT_NAMESPACE}" --timeout="${GATEWAY_READINESS_TIMEOUT}"
 
-# Under spec.mode: next, what the mode renders as well, so the suites do not
-# start on a bus still coming up or mid-way through a roll. The deploy job ran
-# the same gate after it switched the mode; this one holds the line for
-# anything the operator rolls after that job ended.
-if [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ]; then
-  platform_agent_mode_wait_next "${AGENT_NAMESPACE}"
-fi
+# The A2A stack as well, so the suites do not start on a bus still coming up
+# or mid-way through a roll. The deploy job ran the same gate after the
+# install; this one holds the line for anything the operator rolls after that
+# job ended.
+a2a_readiness_wait "${AGENT_NAMESPACE}"

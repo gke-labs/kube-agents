@@ -350,6 +350,21 @@ class TestOpen(unittest.TestCase):
         self.assertEqual(url, "P")
         self.assertEqual(calls, ["branch-view", "proposal-create"])
 
+    def test_draft_reaches_the_forge(self):
+        created = []
+
+        def forge(verb, payload):
+            if verb == "branch-view":
+                return {"branch": {"exists": True}}
+            created.append(payload)
+            return {"proposal": {"url": "P"}}
+
+        fake = types.ModuleType("vcs_client")
+        with unittest.mock.patch.dict("sys.modules", {"vcs_client": fake}):
+            pms._open(forge, REPO, "b", "main", "t", "b", lambda *a: None, draft=True)
+            pms._open(forge, REPO, "b", "main", "t", "b", lambda *a: None)
+        self.assertEqual([c["draft"] for c in created], [True, None])
+
 
 if __name__ == "__main__":
     unittest.main()

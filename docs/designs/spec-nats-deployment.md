@@ -34,6 +34,15 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
+bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
+server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
+payloads and CI logs are public; debug names connections and the public keys they
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the
@@ -487,7 +496,9 @@ Layout:
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
   static render cannot express. The render subtracts each bound or draining profile by name
-  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny; #5301 moves profile
+  supervisors to the six-token `a2a.tasks.p.<profile>.*.supervisor`, which the gateway
+  subscribes to read only and can never publish), so the gateway cannot
   publish directly to a profile's supervisor subject. The deny covers direct publishes
   only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`

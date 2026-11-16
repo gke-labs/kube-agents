@@ -1034,6 +1034,25 @@ class SourceRefDispatchTest(unittest.TestCase):
         self.assertIsNotNone(log, combined)
         self.assertEqual(log.split(), ["--non-interactive"])
 
+    def test_source_ref_hands_over_with_no_argument_to_forward(self):
+        """An interactive run that names no coordinates forwards nothing at all.
+
+        The list of forwarded arguments is then empty, and bash 3.2 (macOS's
+        /bin/bash) reads the expansion of an empty array as an unbound
+        variable under `set -u`: the run ended there, after the clone and
+        before the hand-over.
+        """
+        proc, log = self._run(
+            ref_carries_uninstall=True,
+            ref_speaks_domain_scoped=True,
+            args=["--source-ref=v0.3.0"],
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("unbound variable", combined)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIsNotNone(log, combined)
+        self.assertEqual(log.split(), [])
+
     def test_source_ref_stays_quiet_about_coordinates_it_was_given(self):
         """Flags are a complete answer, so the second half of that warning is
         only printed when nothing named the install at all."""
@@ -1178,11 +1197,6 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
         self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
         self.assertLess(budget_at, call_at)
-        # And the mode: the generator refuses a value outside the CRD's enum,
-        # and a teardown must not stop on a typo in install.env.
-        mode_at = text.find('export PLATFORM_AGENT_MODE=""')
-        self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
-        self.assertLess(mode_at, call_at)
         # And the Slack home channel policy, refused outside the same kind of enum.
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
