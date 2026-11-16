@@ -149,10 +149,14 @@ func TestTheProxyTokenCarriesTheAdmittedTrigger(t *testing.T) {
 func triggeredRun(t *testing.T, tier, trigger string, params map[string]string) (lib.DispatchMessage, string, string) {
 	t.Helper()
 	b := newBus(t, "tse-1")
-	b.ensure("tse", 2, 0, "read", "unattended")
+	tiers := []string{"read", "unattended"}
+	if tier != "read" && tier != "unattended" {
+		tiers = append(tiers, tier)
+	}
+	b.ensure("tse", 2, 0, tiers...)
 	w := b.worker("tse", tier, "tse-1", answerAccept, time.Second)
 	ti := oneProfile("tse", 2)
-	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0] = testProfile("tse", 2, "read", "unattended") })
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0] = testProfile("tse", 2, tiers...) })
 	ti.pool.Set("tse", tier, "tse-1")
 	ti.pool.SetUID("tse", tier, "tse-1", "uid-tse-1")
 	kp, pub := signingKey(t)
@@ -236,6 +240,21 @@ func TestAReadTaskWithNoClusterGetsNoProxyToken(t *testing.T) {
 	}
 	checkBusCredentialIsBare(t, confirm, pub)
 	if !strings.Contains(logs, "trigger dropped") || !strings.Contains(logs, scheduleTrigger.Name) {
+		t.Errorf("no log line for the dropped trigger in:\n%s", logs)
+	}
+}
+
+// A task at a custom tier, even one in unattended mode, gets no report
+// credential: only the tier named unattended binds a trigger today (#6091),
+// so the mint keys on the name, and a trigger that reached a custom tier
+// anyway is dropped, not minted.
+func TestACustomTierWithATriggerAndNoClusterGetsNoProxyToken(t *testing.T) {
+	confirm, pub, logs := triggeredRun(t, "nightly", scheduleTriggerJSON, nil)
+	if confirm.ProxyToken != "" {
+		t.Errorf("a task at a custom tier got a proxy token with no cluster")
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+	if !strings.Contains(logs, "trigger dropped") {
 		t.Errorf("no log line for the dropped trigger in:\n%s", logs)
 	}
 }
