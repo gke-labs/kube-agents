@@ -1,12 +1,16 @@
 package memory
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -215,7 +219,9 @@ func startEmbeddedJetStream(t *testing.T) string {
 
 func commitRecordInGit(t *testing.T, repoDir string, rec Record) {
 	t.Helper()
-	rec.Meta.Status = StatusActive
+	if rec.Meta.Status != StatusRetired {
+		rec.Meta.Status = StatusActive
+	}
 	if len(rec.Meta.Scope.Paths) == 0 && len(rec.Meta.Scope.Resources) == 0 && len(rec.Meta.Scope.Checks) == 0 {
 		rec.Meta.Scope.Paths = []string{"**"}
 	}
@@ -225,7 +231,8 @@ func commitRecordInGit(t *testing.T, repoDir string, rec Record) {
 	if strings.TrimSpace(rec.Body) == "" {
 		rec.Body = "## Context\n\nMerged in Git.\n"
 	}
-	if err := SaveRecord(repoDir, &rec); err != nil {
+	vDir := filepath.Join(repoDir, verifiedGitSubdir)
+	if err := SaveRecord(vDir, &rec); err != nil {
 		t.Fatalf("SaveRecord for git commit: %v", err)
 	}
 }
@@ -2001,7 +2008,15 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	// 5. High 2: Unverified OutcomeApproved / OutcomeModifiedMerged (not committed in Git HEAD)
 	// stays StatusProposed and cannot supersede, reject, or retire an existing Git-verified active record.
 	gitRepo := t.TempDir()
-	commitRecordInGit(t, gitRepo, Record{
+	// Write a valid manifest so a publisher-supplied Guard.Expect would pass GuardPassesOnHead
+	// if buildApprovedRecord / buildModifiedMergedRecord failed to ignore publisher-supplied guards.
+	if err := os.MkdirAll(filepath.Join(gitRepo, "clusters"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitRepo, "clusters", "deploy.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommitted001 := Record{
 		Meta: RecordMeta{
 			ID:     "DEC-2026-001",
 			Type:   RecordTypeDecision,
@@ -2009,10 +2024,31 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 			Title:  "Human-merged active rule",
 			Date:   "2026-11-12",
 			Scope:  RecordScope{Paths: []string{"clusters/**"}},
-			Guard:  &RecordGuard{Rule: "Require 2 replicas.", Severity: "block"},
+			Guard:  &RecordGuard{Rule: "Require 2 replicas.", Severity: "warn"},
 		},
 		Body: "## Context\n\nMerged by human.\n",
-	})
+	}
+	// Seed DEC-2026-001 in both RepoDir and .git-verified so it is active from the start.
+	if err := SaveRecord(gitRepo, &gitCommitted001); err != nil {
+		t.Fatal(err)
+	}
+	commitRecordInGit(t, gitRepo, gitCommitted001)
+
+	// Also commit a guardless active record DEC-2026-010 (Guard == nil) in Git to verify
+	// that neither OutcomeApproved nor OutcomeModifiedMerged adopts ev.Guard when gitRec.Meta.Guard is nil.
+	gitCommitted010 := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-010",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Guardless human-merged rule",
+			Date:   "2026-11-12",
+			Scope:  RecordScope{Paths: []string{"clusters/**"}},
+			Guard:  nil,
+		},
+		Body: "## Context\n\nGuardless rule merged by human.\n",
+	}
+	commitRecordInGit(t, gitRepo, gitCommitted010)
 
 	cur, err := NewCurator(CuratorConfig{
 		RepoDir:   gitRepo,
@@ -2074,37 +2110,76 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 		t.Fatalf("unverified OutcomeModifiedMerged with KnowledgePR=true must stay status=proposed, got %s", unverifiedModRes.Status)
 	}
 
-	// Verify that on a Git-verified active record (DEC-2026-001), OutcomeApproved takes Title, Scope, Guard,
-	// Supersedes, and Body strictly from gitRec and ignores publisher-supplied Guard/Summary/Title overrides.
-	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
-		Kind:       OutcomeApproved,
-		RecordID:   "DEC-2026-001",
-		RecordType: RecordTypeDecision,
-		Title:      "Injected Publisher Title",
-		Summary:    "Injected publisher summary body section",
-		Guard: &RecordGuard{
-			Rule:     "Injected publisher guard",
-			Severity: "block",
-			Expect:   &GuardExpect{File: "clusters/**", Path: "spec.replicas", Op: ">=", Value: 99},
-		},
-	}, ""); err != nil {
-		t.Fatal(err)
-	}
-	recsAfterVerify, err := LoadRecords(gitRepo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, r := range recsAfterVerify {
-		if r.Meta.ID == "DEC-2026-001" {
-			if r.Meta.Title != "Human-merged active rule" {
-				t.Fatalf("expected Git-verified Title to be preserved, got %q", r.Meta.Title)
+	// Verify all 5 targeted mutants on BOTH OutcomeApproved and OutcomeModifiedMerged:
+	// - Git record with no guard (DEC-2026-010) keeps Guard == nil even when ev.Guard / ev.Rule is supplied
+	// - Git record with a guard (DEC-2026-001) keeps its own Guard ("Require 2 replicas.", severity "warn")
+	// - Git record keeps its own Scope ({Paths: ["clusters/**"]}), ignoring ev.Scope
+	// - Git record keeps its own Title, ignoring ev.Title
+	// - Git record keeps its own Body, ignoring ev.Summary and ev.ReviewerReason
+	for _, kind := range []OutcomeKind{OutcomeApproved, OutcomeModifiedMerged} {
+		for _, targetID := range []string{"DEC-2026-001", "DEC-2026-010"} {
+			if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+				Kind:           kind,
+				RecordID:       targetID,
+				RecordType:     RecordTypeDecision,
+				KnowledgePR:    true,
+				Title:          "Injected Publisher Title",
+				Summary:        "Injected publisher summary body section",
+				ReviewerReason: "Injected reviewer reason body section",
+				Rule:           "Injected publisher rule text",
+				Cluster:        "injected-cluster",
+				CheckID:        "injected-check",
+				Scope: &RecordScope{
+					Paths:     []string{"injected/**"},
+					Clusters:  []string{"injected-cluster"},
+					Resources: []string{"Deployment/injected"},
+					Checks:    []string{"injected-check"},
+				},
+				Guard: &RecordGuard{
+					Rule:     "Injected publisher guard",
+					Severity: "block",
+					Expect:   &GuardExpect{File: "clusters/*.yaml", Path: "spec.replicas", Op: ">=", Value: 99},
+				},
+			}, ""); err != nil {
+				t.Fatalf("ProcessOutcome(%s, %s): %v", kind, targetID, err)
 			}
-			if r.Meta.Guard == nil || r.Meta.Guard.Expect != nil || r.Meta.Guard.Rule != "Require 2 replicas." {
-				t.Fatalf("expected Git-verified Guard without publisher-injected Expect, got %+v", r.Meta.Guard)
-			}
-			if strings.Contains(r.Body, "Injected publisher summary") {
-				t.Fatalf("expected Git-verified Body to ignore publisher Summary, got:\n%s", r.Body)
-			}
+		}
+
+		recsAfterVerify, err := LoadRecords(gitRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotByID := map[string]Record{}
+		for _, r := range recsAfterVerify {
+			gotByID[r.Meta.ID] = r
+		}
+
+		r001 := gotByID["DEC-2026-001"]
+		if r001.Meta.Title != "Human-merged active rule" {
+			t.Fatalf("%s on DEC-2026-001: expected Title=%q, got %q", kind, "Human-merged active rule", r001.Meta.Title)
+		}
+		if !reflect.DeepEqual(r001.Meta.Scope, RecordScope{Paths: []string{"clusters/**"}}) {
+			t.Fatalf("%s on DEC-2026-001: expected Git Scope only, got %+v", kind, r001.Meta.Scope)
+		}
+		if r001.Meta.Guard == nil || r001.Meta.Guard.Expect != nil || r001.Meta.Guard.Rule != "Require 2 replicas." || r001.Meta.Guard.Severity != "warn" {
+			t.Fatalf("%s on DEC-2026-001: expected Git Guard {Rule: Require 2 replicas., Severity: warn, Expect: nil}, got %+v", kind, r001.Meta.Guard)
+		}
+		if strings.TrimSpace(r001.Body) != "## Context\n\nMerged by human." {
+			t.Fatalf("%s on DEC-2026-001: expected exact Git Body with no publisher text, got:\n%s", kind, r001.Body)
+		}
+
+		r010 := gotByID["DEC-2026-010"]
+		if r010.Meta.Title != "Guardless human-merged rule" {
+			t.Fatalf("%s on DEC-2026-010: expected Title=%q, got %q", kind, "Guardless human-merged rule", r010.Meta.Title)
+		}
+		if !reflect.DeepEqual(r010.Meta.Scope, RecordScope{Paths: []string{"clusters/**"}}) {
+			t.Fatalf("%s on DEC-2026-010: expected Git Scope only, got %+v", kind, r010.Meta.Scope)
+		}
+		if r010.Meta.Guard != nil {
+			t.Fatalf("%s on DEC-2026-010: expected nil Guard on guardless Git record, got %+v", kind, r010.Meta.Guard)
+		}
+		if strings.TrimSpace(r010.Body) != "## Context\n\nGuardless rule merged by human." {
+			t.Fatalf("%s on DEC-2026-010: expected exact Git Body with no publisher text, got:\n%s", kind, r010.Body)
 		}
 	}
 
@@ -2130,15 +2205,122 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterRestartRes.RecordID != "DEC-2026-003" {
-		t.Fatalf("expected post-restart allocation to skip DEC-2026-001..002 and allocate DEC-2026-003, got %s", afterRestartRes.RecordID)
+	if afterRestartRes.RecordID != "DEC-2026-011" {
+		t.Fatalf("expected post-restart allocation to skip DEC-2026-001..010 and allocate DEC-2026-011, got %s", afterRestartRes.RecordID)
 	}
 	mockHS.mu.Lock()
 	_, has002 := mockHS.docs["okf:acme/gitops:DEC-2026-002"]
-	_, has003 := mockHS.docs["okf:acme/gitops:DEC-2026-003"]
+	_, has011 := mockHS.docs["okf:acme/gitops:DEC-2026-011"]
 	mockHS.mu.Unlock()
-	if !has002 || !has003 {
-		t.Fatalf("expected Hindsight to retain both DEC-2026-002 and DEC-2026-003 without collision")
+	if !has002 || !has011 {
+		t.Fatalf("expected Hindsight to retain both DEC-2026-002 and DEC-2026-011 without collision")
+	}
+
+	// 7. VCS Broker /v1/vcs/snapshot sync into an isolated emptyDir RepoDir:
+	// Verify that a Curator with BrokerURL + BrokerTokenFile pulls the verified knowledge/
+	// tar archive from credential-proxy, promotes a proposed record to StatusActive,
+	// supersedes listed records, and retires a record whose status is retired in Git.
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("test-curator-broker-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	tarFiles := map[string]string{
+		"knowledge/decision/DEC-2026-020-broker.md": "---\ntype: decision\nid: DEC-2026-020\ntitle: Broker-verified active rule\nstatus: active\ndate: \"2026-11-16\"\nscope:\n  paths:\n    - clusters/**\nguard:\n  rule: Keep broker-verified replicas >= 3.\n  severity: block\nsupersedes:\n  - DEC-2026-011\n---\n\n## Context\n\nVerified via broker snapshot.\n",
+		"knowledge/decision/DEC-2026-021-retired.md": "---\ntype: decision\nid: DEC-2026-021\ntitle: Broker-retired rule\nstatus: retired\ndate: \"2026-11-16\"\nscope:\n  paths:\n    - clusters/**\n---\n\n## Context\n\nRetired in Git.\n",
+	}
+	for name, content := range tarFiles {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o600,
+			Size: int64(len(content)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tarB64 := base64.StdEncoding.EncodeToString(tarBuf.Bytes())
+
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/vcs/snapshot" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-curator-broker-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tar":      tarB64,
+			"revision": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		})
+	}))
+	defer brokerSrv.Close()
+
+	brokerCur, err := NewCurator(CuratorConfig{
+		RepoDir:         freshEmptyDir,
+		BrokerURL:       brokerSrv.URL,
+		BrokerTokenFile: tokenFile,
+		RepoID:          "acme/gitops",
+		Client:          client,
+		Hindsight:       NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed DEC-2026-021 as active in RepoDir first, then verify OutcomeRetired transitions it
+	// to StatusRetired once the broker snapshot reports status: retired in Git.
+	active021 := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-021",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Broker-retired rule",
+			Date:   "2026-11-16",
+			Scope:  RecordScope{Paths: []string{"clusters/**"}},
+		},
+		Body: "## Context\n\nActive before retirement.\n",
+	}
+	if err := SaveRecord(freshEmptyDir, &active021); err != nil {
+		t.Fatal(err)
+	}
+	brokerApproveRes, err := brokerCur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeApproved,
+		RecordID:   "DEC-2026-020",
+		RecordType: RecordTypeDecision,
+		Title:      "Ignored publisher title",
+	}, "")
+	if err != nil {
+		t.Fatalf("broker ProcessOutcome approved: %v", err)
+	}
+	if brokerApproveRes.Status != StatusActive || brokerApproveRes.Title != "Broker-verified active rule" {
+		t.Fatalf("expected broker snapshot to verify DEC-2026-020 as active with Git title, got %+v", brokerApproveRes)
+	}
+	brokerRetireRes, err := brokerCur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:     OutcomeRetired,
+		RecordID: "DEC-2026-021",
+	}, "")
+	if err != nil {
+		t.Fatalf("broker ProcessOutcome retired: %v", err)
+	}
+	if brokerRetireRes.Status != StatusRetired {
+		t.Fatalf("expected broker snapshot to allow retiring DEC-2026-021, got %s", brokerRetireRes.Status)
+	}
+	finalRecs, err := LoadRecords(freshEmptyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range finalRecs {
+		if r.Meta.ID == "DEC-2026-011" && r.Meta.Status != StatusSuperseded {
+			t.Fatalf("expected DEC-2026-011 to be superseded by broker-verified DEC-2026-020, got %s", r.Meta.Status)
+		}
 	}
 }
 

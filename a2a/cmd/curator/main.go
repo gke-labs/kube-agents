@@ -319,6 +319,9 @@ func runDaemonContext(ctx context.Context, args []string) error {
 
 	cur, err := memory.NewCurator(memory.CuratorConfig{
 		RepoDir:             *repoDir,
+		VerifiedRepoDir:     strings.TrimSpace(os.Getenv("CURATOR_VERIFIED_REPO_DIR")),
+		BrokerURL:           strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_URL")),
+		BrokerTokenFile:     strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_TOKEN_FILE")),
 		RepoID:              *repoID,
 		Session:             busUser(),
 		Profile:             os.Getenv("A2A_PROFILE"),
@@ -753,6 +756,9 @@ func runDream(args []string) error {
 	}
 	cur, err := memory.NewCurator(memory.CuratorConfig{
 		RepoDir:             *repoDir,
+		VerifiedRepoDir:     strings.TrimSpace(os.Getenv("CURATOR_VERIFIED_REPO_DIR")),
+		BrokerURL:           strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_URL")),
+		BrokerTokenFile:     strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_TOKEN_FILE")),
 		RepoID:              *repoID,
 		Session:             busUser(),
 		Profile:             os.Getenv("A2A_PROFILE"),

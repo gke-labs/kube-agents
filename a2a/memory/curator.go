@@ -1,12 +1,17 @@
 package memory
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,6 +27,10 @@ import (
 const (
 	defaultCuratorRepoDir      = "/opt/data/memory/knowledge-store"
 	defaultCuratorSession      = "agent"
+	verifiedGitSubdir          = ".git-verified"
+	brokerSnapshotPath         = "/v1/vcs/snapshot"
+	brokerSnapshotTimeout      = 25 * time.Second
+	maxBrokerSnapshotBytes     = 32 << 20
 	minRecurrenceThreshold     = 2
 	maxSeenEnvelopes           = 4096
 	maxQueryCacheEntries       = 256
@@ -63,6 +72,9 @@ var queryStopwords = map[string]bool{
 // CuratorConfig configures the Go Curator/Dreamer service.
 type CuratorConfig struct {
 	RepoDir             string
+	VerifiedRepoDir     string
+	BrokerURL           string
+	BrokerTokenFile     string
 	RepoID              string
 	Session             string
 	Profile             string
@@ -676,24 +688,189 @@ func scopesOverlapPaths(a, b []string) bool {
 	return false
 }
 
-// verifiedGitRecordByStatus checks whether record id has already been synced
-// from the Git repository into byID with wantStatus and valid OKF frontmatter.
-// The Curator Pod runs credential-free without a git binary or repo clone;
-// deterministic Git verification is performed by the repo-holding component
-// (VCS broker or repository sync), and unverified NATS outcomes stay proposed.
-func verifiedGitRecordByStatus(byID map[string]Record, id string, wantStatus RecordStatus) (Record, bool) {
-	if !reRecordID.MatchString(id) {
+// verifiedRepoDir returns the directory holding Git-verified OKF records
+// (distinct from the Curator's mutable working RepoDir). When BrokerURL is
+// configured, syncVerifiedSnapshotFromBrokerLocked unpacks the broker's
+// /v1/vcs/snapshot tar archive into this directory. In the standalone Curator
+// Pod, active, retired, and supersede transitions stay fail-closed (proposed)
+// until #5588 (#5567) wires the kubeagents-credential-proxy-curator token
+// audience and /v1/vcs/snapshot route grant on credential-proxy.
+func (c *Curator) verifiedRepoDir() string {
+	if v := strings.TrimSpace(c.cfg.VerifiedRepoDir); v != "" {
+		return v
+	}
+	cand := filepath.Join(c.cfg.RepoDir, verifiedGitSubdir)
+	if strings.TrimSpace(c.cfg.BrokerURL) != "" {
+		return cand
+	}
+	if st, err := os.Stat(cand); err == nil && st.IsDir() {
+		return cand
+	}
+	return ""
+}
+
+func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repoID string) error {
+	rawURL := strings.TrimSpace(c.cfg.BrokerURL)
+	if rawURL == "" || strings.TrimSpace(repoID) == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("invalid broker URL %q", rawURL)
+	}
+	endpoint := u.Scheme + "://" + u.Host + brokerSnapshotPath
+	reqBody, err := json.Marshal(map[string]any{
+		"repository": repoID,
+		"paths":      []string{"knowledge", ".kube-agents"},
+	})
+	if err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, brokerSnapshotTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tf := strings.TrimSpace(c.cfg.BrokerTokenFile); tf != "" {
+		cleanTF := filepath.Clean(tf)
+		tokRoot, rErr := os.OpenRoot(filepath.Dir(cleanTF))
+		if rErr != nil {
+			return rErr
+		}
+		tokBytes, readErr := tokRoot.ReadFile(filepath.Base(cleanTF))
+		_ = tokRoot.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if tok := strings.TrimSpace(string(tokBytes)); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	httpClient := &http.Client{
+		Timeout:   brokerSnapshotTimeout,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("broker snapshot status %d", resp.StatusCode)
+	}
+	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, maxBrokerSnapshotBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(rawResp) > maxBrokerSnapshotBytes {
+		return errors.New("broker snapshot response exceeds size limit")
+	}
+	var snap struct {
+		Tar string `json:"tar"`
+	}
+	if err := json.Unmarshal(rawResp, &snap); err != nil || snap.Tar == "" {
+		return errors.New("broker snapshot missing tar payload")
+	}
+	tarBytes, err := base64.StdEncoding.DecodeString(snap.Tar)
+	if err != nil {
+		return err
+	}
+	vDir := c.verifiedRepoDir()
+	if vDir == "" {
+		return nil
+	}
+	_ = os.RemoveAll(vDir)
+	if err := os.MkdirAll(vDir, recordDirPerm); err != nil {
+		return err
+	}
+	vRoot, err := os.OpenRoot(vDir)
+	if err != nil {
+		return err
+	}
+	defer vRoot.Close()
+
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	for {
+		hdr, tErr := tr.Next()
+		if errors.Is(tErr, io.EOF) {
+			break
+		}
+		if tErr != nil {
+			return tErr
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		if hdr.Size < 0 || hdr.Size > maxRecordFileBytes {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(strings.TrimLeft(hdr.Name, "/")))
+		if rel == "." || rel == "" || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") {
+			continue
+		}
+		if !strings.HasPrefix(rel, "knowledge/") && rel != ".kube-agents/intent.yaml" {
+			continue
+		}
+		data, rErr := io.ReadAll(io.LimitReader(tr, maxRecordFileBytes+1))
+		if rErr != nil || int64(len(data)) > maxRecordFileBytes {
+			continue
+		}
+		dirPart := filepath.Dir(filepath.FromSlash(rel))
+		if dirPart != "." && dirPart != "" {
+			if err := vRoot.MkdirAll(dirPart, recordDirPerm); err != nil {
+				return err
+			}
+		}
+		if err := vRoot.WriteFile(filepath.FromSlash(rel), data, recordFilePerm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Curator) loadGitVerifiedByIDLocked(ctx context.Context, repoID string) map[string]Record {
+	if err := c.syncVerifiedSnapshotFromBrokerLocked(ctx, repoID); err != nil {
+		c.log.Debug("curator: broker snapshot sync skipped", "err", err)
+	}
+	vDir := c.verifiedRepoDir()
+	if vDir == "" {
+		return nil
+	}
+	recs, err := LoadRecords(vDir)
+	if err != nil {
+		return nil
+	}
+	gitByID := make(map[string]Record, len(recs))
+	for _, r := range recs {
+		gitByID[r.Meta.ID] = r
+	}
+	return gitByID
+}
+
+// verifiedGitRecordByStatus checks whether record id is present in the
+// Git-verified record map (gitByID, loaded from VerifiedRepoDir / the VCS
+// broker snapshot and separate from the Curator's mutable working RepoDir) with
+// wantStatus and valid OKF frontmatter.
+func verifiedGitRecordByStatus(gitByID map[string]Record, id string, wantStatus RecordStatus) (Record, bool) {
+	if !reRecordID.MatchString(id) || len(gitByID) == 0 {
 		return Record{}, false
 	}
-	rec, ok := byID[id]
+	rec, ok := gitByID[id]
 	if !ok || rec.Meta.Status != wantStatus || len(ValidateRecord(rec)) != 0 {
 		return Record{}, false
 	}
 	return rec, true
 }
 
-func verifiedGitActiveRecord(byID map[string]Record, id string) (Record, bool) {
-	return verifiedGitRecordByStatus(byID, id, StatusActive)
+func verifiedGitActiveRecord(gitByID map[string]Record, id string) (Record, bool) {
+	return verifiedGitRecordByStatus(gitByID, id, StatusActive)
 }
 
 func rejectedGovernedSameSubject(oldRec, activeRec Record) bool {
@@ -752,6 +929,10 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	byID := map[string]Record{}
 	for _, r := range records {
 		byID[r.Meta.ID] = r
+	}
+	var gitByID map[string]Record
+	if ev.Kind == OutcomeApproved || ev.Kind == OutcomeModifiedMerged || ev.Kind == OutcomeRetired || ev.Kind == OutcomeRefused {
+		gitByID = c.loadGitVerifiedByIDLocked(ctx, repoID)
 	}
 
 	var targetRec Record
@@ -822,17 +1003,17 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		}
 		targetRec = c.buildProposedRecord(ctx, ev, byID, year, dateStr)
 	case OutcomeApproved:
-		targetRec = c.buildApprovedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildApprovedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeModifiedMerged:
-		targetRec = c.buildModifiedMergedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildModifiedMergedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeResolvedMerged:
 		targetRec = c.buildResolvedMergedRecord(ctx, ev, byID, year, dateStr)
 	case OutcomePRMergedPersists:
 		targetRec = c.buildPersistsRecord(ctx, ev, byID, year, dateStr)
 	case OutcomeRefused:
-		targetRec = c.buildRefusedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildRefusedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeRetired:
-		targetRec = c.buildRetiredRecord(ev, byID, year, dateStr)
+		targetRec = c.buildRetiredRecord(ev, byID, gitByID, year, dateStr)
 	default:
 		return OutcomeProcessResult{}, fmt.Errorf("unsupported outcome kind %q", ev.Kind)
 	}
@@ -857,7 +1038,7 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	// lessons graduated into a fleet-wide DEC-*), and (2) Precedence Rule 3
 	// ("Merged outranks rejected") when governing the same check or field.
 	if targetRec.Meta.Status == StatusActive {
-		gitRec, gitOK := verifiedGitActiveRecord(byID, targetRec.Meta.ID)
+		gitRec, gitOK := verifiedGitActiveRecord(gitByID, targetRec.Meta.ID)
 		supTargets := map[string]bool{}
 		if gitOK {
 			for _, sid := range gitRec.Meta.Supersedes {
@@ -1028,7 +1209,7 @@ func matchRecordIDByPR(ev OutcomeEvent, byID map[string]Record) string {
 	return ""
 }
 
-func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
 	if rid == "" {
 		rid = matchRecordIDByPR(ev, byID)
@@ -1041,7 +1222,7 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
-	gitRec, gitVerified := verifiedGitActiveRecord(byID, rid)
+	gitRec, gitVerified := verifiedGitActiveRecord(gitByID, rid)
 	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
 		return existing
 	}
@@ -1107,7 +1288,7 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 }
 
-func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
 	if rid == "" {
 		rid = matchRecordIDByPR(ev, byID)
@@ -1120,7 +1301,7 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
-	gitRec, gitVerified := verifiedGitActiveRecord(byID, rid)
+	gitRec, gitVerified := verifiedGitActiveRecord(gitByID, rid)
 	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
 		return existing
 	}
@@ -1358,7 +1539,7 @@ func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 }
 
-func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
 	if rid == "" {
 		rid = matchRecordIDByPR(ev, byID)
@@ -1366,6 +1547,9 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 	existing, hasExisting := byID[rid]
 	if hasExisting && existing.Meta.Status == StatusActive {
 		return existing
+	}
+	if gitRec, gitActive := verifiedGitActiveRecord(gitByID, rid); gitActive && !gitopsPRsDisabled() {
+		return gitRec
 	}
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	reason := firstNonEmpty(ev.ReviewerReason, ev.Summary, "Proposal closed unmerged by reviewer.")
@@ -1434,7 +1618,7 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 	}
 }
 
-func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
 	if rid == "" {
 		rid = matchRecordIDByPR(ev, byID)
@@ -1442,7 +1626,7 @@ func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, ye
 	existing, hasExisting := byID[rid]
 	if hasExisting {
 		if existing.Meta.Status == StatusActive {
-			if _, gitRetired := verifiedGitRecordByStatus(byID, rid, StatusRetired); !gitRetired {
+			if _, gitRetired := verifiedGitRecordByStatus(gitByID, rid, StatusRetired); !gitRetired {
 				return existing
 			}
 		}
