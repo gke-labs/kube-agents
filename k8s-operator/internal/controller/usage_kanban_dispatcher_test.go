@@ -210,8 +210,8 @@ func TestKanbanDispatcher_AStuckTickSetsItBeforeAnyFailure(t *testing.T) {
 	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 400}})
 	h.poll(5)
 	cond := dispatcherCondition(h)
-	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing {
-		t.Fatalf("stuck at 400 s: condition %+v, want True", cond)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTickStuck {
+		t.Fatalf("stuck at 400 s: condition %+v, want True with reason %s", cond, kanbanDispatcherReasonTickStuck)
 	}
 	if !strings.Contains(cond.Message, `tick on board "default" waited on its database (it ran past 5m0s, or failed on a lock after a busy timeout)`) || !strings.Contains(cond.Message, "6m40s since it began") {
 		t.Fatalf("message = %q", cond.Message)
@@ -230,15 +230,66 @@ func TestKanbanDispatcher_AStuckTickSetsItBeforeAnyFailure(t *testing.T) {
 	}
 }
 
-// A board failing by the streak rules names its streak, also when another
-// board is stuck, and both count.
-func TestKanbanDispatcher_AStreakIsNamedBeforeAStuckBoard(t *testing.T) {
+// A stuck board is named before a board in a streak, under its own reason,
+// and both count.
+func TestKanbanDispatcher_AStuckBoardIsNamedBeforeAStreak(t *testing.T) {
 	h := dispatcherHarness(t)
 	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "locked", Seconds: 600}},
 		usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks})
 	h.poll(5)
 	cond := dispatcherCondition(h)
-	if cond == nil || !strings.Contains(cond.Message, `failed 60 ticks in a row on board "default"`) || !strings.Contains(cond.Message, "2 boards are failing") {
-		t.Fatalf("condition %+v, want the streak named and two boards counted", cond)
+	if cond == nil || cond.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(cond.Message, `tick on board "locked" waited on its database`) ||
+		!strings.Contains(cond.Message, "2 boards are failing") {
+		t.Fatalf("condition %+v, want the stuck board named under %s and two boards counted", cond, kanbanDispatcherReasonTickStuck)
+	}
+}
+
+// A board that is stuck and also meets a streak rule, as a locked board does
+// after about an hour, stays under the stuck reason with the lock hint, and
+// counts once.
+func TestKanbanDispatcher_ABoardBothStuckAndInAStreakCountsOnce(t *testing.T) {
+	h := dispatcherHarness(t)
+	locked := usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: kanbanDispatcherMinFailingTicks, Seconds: 2900, HasAge: true}
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 3100}}, locked)
+	h.poll(5)
+	cond := dispatcherCondition(h)
+	if cond == nil || cond.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(cond.Message, "Look for another process") {
+		t.Fatalf("condition %+v, want %s with the lock hint", cond, kanbanDispatcherReasonTickStuck)
+	}
+	if strings.Contains(cond.Message, "boards are failing") {
+		t.Fatalf("message = %q, want one board counted once", cond.Message)
+	}
+	// With a second board in a streak, the count is two, not three.
+	h2 := dispatcherHarness(t)
+	h2.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 3100}}, locked,
+		usageDispatcherFailure{Board: "other", Error: "OSError", Ticks: kanbanDispatcherFailingTicks})
+	h2.poll(5)
+	if cond := dispatcherCondition(h2); cond == nil || !strings.Contains(cond.Message, "2 boards are failing") {
+		t.Fatalf("condition %+v, want two boards counted", cond)
+	}
+}
+
+// The message and its hint follow the cause: a streak, then a lock on the same
+// board, then a streak again. Each change of reason rewrites the condition.
+func TestKanbanDispatcher_TheMessageFollowsTheCause(t *testing.T) {
+	h := dispatcherHarness(t)
+	streak := usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks}
+	h.stub.setDispatcher(chatAddr(), streak)
+	h.poll(5)
+	cond := dispatcherCondition(h)
+	if cond == nil || cond.Reason != kanbanDispatcherReasonTicksFailing || !strings.Contains(cond.Message, "tick failed") {
+		t.Fatalf("a streak: condition %+v, want %s with the log hint", cond, kanbanDispatcherReasonTicksFailing)
+	}
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 400}}, streak)
+	h.poll(10)
+	cond = dispatcherCondition(h)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(cond.Message, "Look for another process") {
+		t.Fatalf("then a lock: condition %+v, want %s with the lock hint", cond, kanbanDispatcherReasonTickStuck)
+	}
+	h.stub.setDispatcher(chatAddr(), streak)
+	h.poll(15)
+	cond = dispatcherCondition(h)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing || strings.Contains(cond.Message, "Look for another process") {
+		t.Fatalf("then a streak again: condition %+v, want %s without the lock hint", cond, kanbanDispatcherReasonTicksFailing)
 	}
 }
