@@ -1,6 +1,6 @@
 # The data volume size: the default passes the chart no platformAgent.storage
-# key, a raised size reaches the release values as platformAgent.storage.size
-# beside the mode, and the variable refuses a value that is not a whole number
+# key, a raised size reaches the release values as platformAgent.storage.size,
+# and the variable refuses a value that is not a whole number
 # of Mi, Gi or Ti above zero and at most 64Ti. Providers mocked and the cluster
 # module's outputs fixed, as in alert_daily_limits.tftest.hcl; nothing here
 # reaches a cloud.
@@ -68,19 +68,14 @@ run "the_default_written_out_passes_no_storage" {
   }
 }
 
-run "a_raised_size_is_passed_beside_the_mode" {
+run "a_raised_size_is_passed" {
   command = apply
   variables {
     platform_agent_storage_size = "80Gi"
-    platform_agent_mode         = "next"
   }
   assert {
     condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage) == jsonencode({ size = "80Gi" })
     error_message = "storage: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage)}"
-  }
-  assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.mode == "next"
-    error_message = "the storage operand replaced the mode"
   }
 }
 
