@@ -13,8 +13,8 @@ owns both ends of that lifecycle.
 ## The store
 
 `/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
-repository. With `FLEET_AUDIT_REPORT_STORE=broker`, which the shell sandbox and profile workers
-have, the same store is read through the credential broker instead, and the local directory holds
+repository. With `FLEET_AUDIT_REPORT_STORE=broker` (not set on any install yet), the same store is
+read through the credential broker instead, and the local directory holds
 only what was there before the switch; `report_query.py` reads whichever is in use and says which
 on stderr. A run publishes to the `role: gitops` repository, or to the repository a person gave
 with `--repo`, so a stream can have more than one directory. A run with no repository to publish

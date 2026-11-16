@@ -226,10 +226,11 @@ every install.
 The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker's own store credential refused, which the broker's log says) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the repository `finish` publishes to (or `no_forge%2Flocal` when that rule yields none); the platform agent's shell reads every stream and writes that key or any repository `managed_repos` registers; the A2A gateway's relay, under the `a2a-reports` role its own `kubeagents-credential-proxy-a2a-reports` audience confers to the gateway's ServiceAccount alone, reads one finished report (`GET` latest or one run) of any audit on that publish key alone and writes nothing (#5618); the role may read any audit's report on the publish key, so the gateway's relay decides which conversation sees which report; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, answers 504 when the listener doesn't answer whole within 15 seconds, and logs the method, path, caller and status of each request, never a token or a body. One known window: the broker reads `managed_repos` through its 30-second managed-repository cache and `gitops_repo` fresh, so for up to that long after a ConfigMap edit a write can be checked against a key neither the old nor the new state alone gives. The key is still one a state registers, or `no_forge%2Flocal`. The exec tier doesn't serve these routes.
 
 The fleet-audit scripts use that broker store when `FLEET_AUDIT_REPORT_STORE` is `broker`, and the
-file store above otherwise, as before the switch existed. The operator renders `broker` on the shell
-sandbox's `shell` container and on every profile worker, on every install, and reserves the name
-against `spec.deployment.env`. It never renders it on the gateway's `platform-agent` container,
-whose shell writes the file store on the volume the listener serves. `audit_report.py`,
+file store above otherwise, as before the switch existed. No install sets it yet: the operator change
+that renders `broker` on the shell sandbox's `shell` container and on every profile worker, never on
+the gateway's `platform-agent` container (whose shell writes the file store on the volume the
+listener serves), is a separate change (#6110), which also moves the evaluation cases that plant
+into the sandbox's local store. `audit_report.py`,
 `report_status.py` and `report_query.py` read and write the same names (`latest.json` and the ring's
 `<stamp>.json`) by the key `report_store_key` gives, which a test holds equal to the scripts' own.
 The client is `report_status.py`'s, standard library only, so the status view can still stream it
