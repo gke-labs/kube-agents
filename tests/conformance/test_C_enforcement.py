@@ -2960,7 +2960,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("rbac.authorization.k8s.io", "roles"),
     })
     OPERATOR_NAMESPACED_READ_KINDS = frozenset()
-    # The two namespaces the chart binds the Role in under mode next: the
+    # The two namespaces the chart binds the Role in, in every mode: the
     # release namespace and its profile namespace.
     OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
     HELM_MODE_NEXT = "platformAgent.mode=next"

@@ -44,8 +44,8 @@ Every other namespaced kind the operator renders is split the same way
 ClusterRole for the informers and for escalation prevention, the writes are the
 Role document, and the Role document names exactly that set. The Role is bound
 in the install namespace on both delivery paths and in the profile namespace
-(`<install namespace>-profiles`) as well: by the chart under `mode: next`, and
-by `k8s-operator/config/profiles` on the kustomize path, whose `role.yaml` is a
+(`<install namespace>-profiles`) as well: by the chart whenever it renders that
+namespace, and by `k8s-operator/config/profiles` on the kustomize path, whose `role.yaml` is a
 copy of the Role document that `make chart-sync` writes and this file holds to
 the source.
 
