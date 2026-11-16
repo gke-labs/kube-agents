@@ -233,10 +233,11 @@ caveat beside it:
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it. Process tunables such
-as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
-allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
-`kubectl` run, and an agent container that does not. The example leaves them out. The
+containers. The name in the example reaches the container that reads it. A process tunable such
+as `MALLOC_ARENA_MAX` is not on the agent container's allowlist: a values file that sets it
+renders a proxy pod that carries it, where `gcloud` and `kubectl` run, and an agent container
+that does not. The example leaves it out. Setting `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` has no
+effect on `gcloud`: the credential proxy does not pass the pod's value to its commands. The
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#sizing-for-a-fleet-examplesvalues-fleetyaml)
 has the chart-side detail.
 

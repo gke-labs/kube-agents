@@ -189,7 +189,8 @@ func TestCancelSessionCards_CallsSessionKVCardStopEndpoint(t *testing.T) {
 	}
 }
 
-// A cancel's own card stop (markSessionCanceled) reads session-kv's answer
+// A cancel's own card stop (markRunCanceled; markSessionCanceled is its
+// run-less form) reads session-kv's answer
 // and logs it, as the card-stop control does (#5407): a card stopped
 // mid-claim, an archive still running at the deadline, a card it could not
 // stop, and a refusal all reach the log rather than being dropped.
