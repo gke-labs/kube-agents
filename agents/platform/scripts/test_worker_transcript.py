@@ -915,6 +915,169 @@ class TestScrubStepText(unittest.TestCase):
         self.assertTrue(worker_transcript.named_value_is_sensitive(REDACTOR, "client-key-data"))
 
 
+class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
+    """Three patterns were quadratic on a long run (#5901). Their linear forms
+    must give the same output as the old forms: the same key, scheme and
+    value, the same `user:pass` groups, the same blanked text."""
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+
+        mark = worker_transcript.SHELL_ESCAPED_SPACE_FOLD
+        # The forms before #5901, kept here ONLY as the reference for equal
+        # output. They cost quadratic time; nothing but these tests uses them.
+        cls.old_auth = re.compile(
+            r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
+            r"(?P<scheme>bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
+            + re.escape(MARKER)
+            + r")[ \t]+)"
+            r"(?P<val>[^\s\"',}{\[\]\\&|;]+)"
+        )
+        cls.old_userpass = re.compile(
+            r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
+            r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+            r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+        )
+        cls.old_userpass_at_fold = re.compile(
+            r"(?P<prefix>" + mark + r"(?:-u|--user)[ \t=]*)"
+            r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + mark + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+            r"|(?P<user>[^:\s\"'" + mark + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+        )
+        cls.old_quoted_span = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
+
+    @staticmethod
+    def _strings(units, short, count, seed, parts=()):
+        """Every string of up to `short` units, every string made of one
+        choice from each of `parts`, then `count` longer random ones."""
+        import itertools
+        import random
+
+        for length in range(short + 1):
+            for combo in itertools.product(units, repeat=length):
+                yield "".join(combo)
+        if parts:
+            for combo in itertools.product(*parts):
+                yield "".join(combo)
+        rng = random.Random(seed)
+        for _ in range(count):
+            yield "".join(rng.choice(units) for _ in range(rng.randint(short + 1, 40)))
+
+    @staticmethod
+    def _auth_read(pattern, text):
+        # What the rule's callback writes (the prefix) and what it reads.
+        def show(match):
+            return "%s<%s|%s|%s|%d>" % (
+                match.group("prefix"), match.group("key"), match.group("scheme"), match.group("val"), match.start("scheme"),
+            )
+
+        return pattern.sub(show, text)
+
+    @staticmethod
+    def _userpass_read(pattern, text):
+        groups = ("prefix", "quote", "quser", "qval", "user", "val")
+        return pattern.sub(lambda match: "<%s>" % "|".join(str(match.group(name)) for name in groups), text)
+
+    def _old_blank(self, text):
+        return self.old_quoted_span.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[-1], text)
+
+    def test_the_auth_scheme_rule_reads_what_the_old_form_read(self):
+        # Word starts, runs of dots and hyphens, both quotes, tabs, each line
+        # end, and word characters outside ASCII (`\w` and `\b` take them).
+        units = ["a", "-", ".", "_", "=", ":", " ", "\t", "token", "Bearer", "x", '"', "'", MARKER, ";", "\n", "\r", "\r\n", "é", "名"]
+        # A key after each lead, in runs short and long, so that each string
+        # can match: a bound on the key or on the lead would show here.
+        parts = (
+            ["", "x ", '"', "-", "--", ".-", '"--', "'.", "é-", "-" * 70, "\r"],
+            ["auth", "a.b-c", "é", "X_Y", "k" * 300, "a-" * 40 + "b"],
+            ["", '"', "'"],
+            [":", "=", " = ", ""],
+            ["Bearer", MARKER, "x"],
+            [" ", "\t", ""],
+            ["abc~123", "", "&"],
+        )
+        for text in self._strings(units, 3, 20000, 5901, parts):
+            self.assertEqual(
+                self._auth_read(worker_transcript.AUTH_SCHEME_HEADER_RE, text), self._auth_read(self.old_auth, text), repr(text)
+            )
+
+    def test_the_user_pass_rules_read_what_the_old_forms_read(self):
+        mark = worker_transcript.SHELL_ESCAPED_SPACE_FOLD
+        cases = (
+            (worker_transcript.CLI_USERPASS_ARG_RE, self.old_userpass, [" -u", " --user", "\t-u", "\n-u", "\r-u"]),
+            (worker_transcript.CLI_USERPASS_ARG_AT_FOLD_RE, self.old_userpass_at_fold, [mark + "-u", mark + "--user", mark]),
+        )
+        tail = ["=", " ", "\t", ":", "a", "é", '"', "'", "\\", "\n", "\r", "\r\n", "S", "@", "-", ";"]
+        for new_re, old_re, flags in cases:
+            # A flag, each separator, a user (also `=` and none), a colon, a
+            # value, so that each string can match.
+            parts = (
+                flags,
+                ["", " ", "=", "==", "= ", " =", "\t=", "=" * 40, "= =", "  "],
+                ["", '"', "'"],
+                ["admin", "", "=", "==", "a=b", "=a", "é", mark + "a", "a" * 300],
+                [":", "", "::"],
+                ["S3cret", '"S 3"', "'S 3'", '"S', "", "-x", "a:b"],
+                ["", '"', "'", " "],
+            )
+            for text in self._strings(flags + tail, 3, 20000, 5901, parts):
+                self.assertEqual(self._userpass_read(new_re, text), self._userpass_read(old_re, text), repr(text))
+
+    def test_blank_quoted_spans_blanks_what_the_old_form_blanked(self):
+        units = ['"', "'", "\\", "a", " ", "\t", "\n", "\r", "\r\n", ";", '\\"', "\\\\", "é"]
+        for text in self._strings(units, 4, 20000, 5901):
+            self.assertEqual(worker_transcript.blank_quoted_spans(text), self._old_blank(text), repr(text))
+
+    def test_the_forms_keep_the_cases_that_shaped_them(self):
+        # The user `=` (`-u=:pass`), a key after hyphens, dots or a quote (the
+        # redactor masks the scheme word after a key its own rule knows, and
+        # the marker then stands for the scheme), a long key and a long run
+        # of hyphens in front of a key (no bound on either), and a
+        # single-quoted span after a double quote that does not close.
+        for cmd, want in (
+            ("curl -u=:S3cretValue9 https://x", "curl -u=:" + MARKER + " https://x"),
+            ("curl -u== =:S3cretValue9 https://x", "curl -u== =:" + MARKER + " https://x"),
+            ("curl x --auth=Bearer abc~123", "curl x --auth=" + MARKER + " " + MARKER),
+            ("curl x --x-auth-header: Basic abc~123 y", "curl x --x-auth-header: Basic " + MARKER + " y"),
+            ("curl x -.-AUTH_HEADER=Bearer abc~123", "curl x -.-AUTH_HEADER=" + MARKER + " " + MARKER),
+            ("curl x a.b.auth-key: token abc~123 y", "curl x a.b.auth-key: token " + MARKER + " y"),
+            ("curl x .-auth: Digest abc~123", "curl x .-auth: Digest " + MARKER),
+            ('curl x "auth": bearer abc~123', 'curl x "auth": ' + MARKER + " " + MARKER),
+            ("curl x " + "a" * 300 + "-auth: Basic abc~123 y", "curl x " + "a" * 300 + "-auth: Basic " + MARKER + " y"),
+            ("curl x " + "-" * 70 + "x-auth: Basic abc~123 y", "curl x " + "-" * 70 + "x-auth: Basic " + MARKER + " y"),
+            (
+                "mysql -e \"select 1 -u root:S3cretValue9 -e 'a | b' -pS3cretValue9",
+                "mysql -e \"select 1 -u root:" + MARKER + " -e 'a | b' -p" + MARKER,
+            ),
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(_scrub("tool_call", cmd), want)
+
+    def test_a_long_run_scrubs_in_linear_time(self):
+        # Each command took seconds to minutes before #5901. The runs of key
+        # characters are 12000 units long, not longer: past that, most of the
+        # time that is left is in the shared redactor's key-value rule, which
+        # is linear but slow on such a run and is not this module's.
+        import time
+
+        for cmd, want in (
+            ("echo " + "-u" * 12000, None),
+            ("kubectl get secret -o yaml " + "a." * 12000, None),
+            ("kubectl get secret -o yaml " + "é." * 12000, None),
+            ("curl x -u" + "=" * 300000 + " y", None),
+            ("curl x\\ -u" + "=" * 300000 + " y", None),
+            ("curl DB_PASSWORD=x\\ -u" + "=" * 300000 + " y", "curl DB_PASSWORD=" + MARKER + " y"),
+            ('curl x "' + '\\"' * 150000 + " y", None),
+            ('curl x "' + "'\\\"" * 12000 + " y", None),
+        ):
+            with self.subTest(cmd=cmd[:30]):
+                start = time.monotonic()
+                out = _scrub("tool_call", cmd)
+                self.assertLess(time.monotonic() - start, 1.0)
+                # Nothing to mask in most of them: the text comes back as written.
+                self.assertEqual(out, cmd if want is None else want)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",

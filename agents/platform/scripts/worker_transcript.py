@@ -240,10 +240,14 @@ CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
 CLI_USERPASS_FLAG_RE = re.compile(
     r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
 )
+# The user part does not start with `=`, but for the user `=` itself
+# (`-u=:pass`): the separator before it takes every `=`, and a user that
+# could start at each of them would read the rest of a run of `=` again from
+# each one, which costs quadratic time.
 CLI_USERPASS_ARG_RE = re.compile(
     r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
     r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+    r"|(?P<user>(?:=|[^:\s\"'=][^:\s\"']*):)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
 )
 CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
@@ -260,7 +264,8 @@ CLI_LONG_FLAG_AT_FOLD_RE = re.compile(
 CLI_USERPASS_ARG_AT_FOLD_RE = re.compile(
     r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"(?:-u|--user)[ \t=]*)"
     r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+    r"|(?P<user>(?:=|[^:\s\"'=" + SHELL_ESCAPED_SPACE_FOLD + r"][^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]*):)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
 )
 CLI_SHORT_P_AT_FOLD_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
@@ -274,9 +279,21 @@ CLI_SHORT_P_AT_FOLD_RE = re.compile(
 # (same length, so every offset holds) and reads the flag and its value out
 # of the original at that span. A quote that does not close on its own line
 # is left as written, which is how a shell would reject it.
-SHELL_QUOTE_CHARS = ("'", '"')
+SHELL_SINGLE_QUOTE = "'"
+SHELL_QUOTE_CHARS = (SHELL_SINGLE_QUOTE, '"')
 SHELL_QUOTE_BLANK_CHAR = " "
-SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
+SHELL_SINGLE_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'")
+# A quoted span, or a double quote that does not close on its line with the
+# rest of that line (group `open`). No later double quote on that line can
+# close either: each one is the second character of an escape pair in the
+# walk from the first. Taking the rest of the line once keeps the scan
+# linear; tried again from each later quote, it costs quadratic time. The
+# single-quoted spans in that rest are still blanked (`blank_quoted_spans`).
+# So a match is not always a span to blank: read the group.
+SHELL_OPEN_QUOTE_GROUP = "open"
+SHELL_QUOTED_SPAN_RE = re.compile(
+    r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"|(?P<" + SHELL_OPEN_QUOTE_GROUP + r">\"[^\r\n]*)"
+)
 # A scheme-led value (`Bearer <token>`) after any credential-named key, with
 # `:` or `=` as the separator: the redactor's own bearer rule needs twelve
 # token characters from its alphabet, so a short or `~`-bearing token after
@@ -285,8 +302,16 @@ SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
 # masks the scheme word as the value; the marker it leaves there counts as
 # the scheme so the token after it is still taken. A shell operator is not a
 # token: `GH_TOKEN=[REDACTED_SECRET] && gh auth status` keeps its tail.
+# The key is read only from the first word character of its run of key
+# characters (once, or twice when a quote stands in front of the run): a key
+# always ends where its run ends, so a later start in the same run meets the
+# same text after it. Read again from each word start of a run (`-u-u-u`,
+# `a.b.c`), a long run costs quadratic time. The match now starts at the
+# run's start: the dots and hyphens in front of the first word character,
+# and a quote in front of them, are part of the prefix, which the rule
+# writes back unchanged. The key, the scheme and the value are the same.
 AUTH_SCHEME_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
+    r"(?i)(?P<prefix>[\"']?(?<![\w.\-])[.\-]*\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
     r"(?P<scheme>bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
     + re.escape(REDACTED_SECRET_MARKER)
     + r")[ \t]+)"
@@ -654,9 +679,25 @@ def blank_quoted_spans(text: str) -> str:
     replaced by spaces, keeping the quotes and the length."""
     if not any(q in text for q in SHELL_QUOTE_CHARS):
         return text
-    return SHELL_QUOTED_SPAN_RE.sub(
-        lambda m: m.group(0)[0] + SHELL_QUOTE_BLANK_CHAR * (len(m.group(0)) - 2) + m.group(0)[-1], text
-    )
+
+    def blank(match: "re.Match[str]") -> str:
+        # One Python frame per span, and no call below it: a deeper call here
+        # would make a deeply nested command reach the recursion limit sooner.
+        span = match.group(0)
+        if match.group(SHELL_OPEN_QUOTE_GROUP) is None:
+            return span[0] + SHELL_QUOTE_BLANK_CHAR * len(span[1:-1]) + span[-1]
+        if SHELL_SINGLE_QUOTE not in span:
+            return span
+        pieces: list[str] = []
+        done = 0
+        for single in SHELL_SINGLE_QUOTED_SPAN_RE.finditer(span, len(SHELL_DOUBLE_QUOTE)):
+            pieces.append(span[done : single.start()])
+            pieces.append(SHELL_SINGLE_QUOTE + SHELL_QUOTE_BLANK_CHAR * len(single.group(0)[1:-1]) + SHELL_SINGLE_QUOTE)
+            done = single.end()
+        pieces.append(span[done:])
+        return "".join(pieces)
+
+    return SHELL_QUOTED_SPAN_RE.sub(blank, text)
 
 
 def sub_shell_segments(
