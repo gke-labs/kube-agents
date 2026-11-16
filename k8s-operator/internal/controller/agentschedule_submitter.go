@@ -285,3 +285,6 @@ func scheduleOutcomeFor(state string) string {
 		return agentv1alpha1.AgentScheduleOutcomeFailed
 	}
 }
+
+// forget closes the bus connection held for namespace's PlatformAgent.
+func (s *natsScheduleSubmitter) forget(namespace string) { s.bus.forget(namespace) }

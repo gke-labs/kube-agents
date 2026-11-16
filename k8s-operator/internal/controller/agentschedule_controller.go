@@ -238,7 +238,13 @@ func runNowKey(sched *agentv1alpha1.AgentSchedule, token string) string {
 func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var sched agentv1alpha1.AgentSchedule
 	if err := r.Get(ctx, req.NamespacedName, &sched); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// A deleted PlatformAgent's built-in schedules are collected
+			// with it; the last one gone is the cue to close its bus
+			// connection, which reconnects forever otherwise.
+			return ctrl.Result{}, r.forgetIfNoAgent(ctx, req.Namespace)
+		}
+		return ctrl.Result{}, err
 	}
 	pass := &schedulePass{stored: *sched.Status.DeepCopy()}
 	cronSched, agent, accepted, err := r.accept(ctx, &sched, pass)
@@ -260,6 +266,27 @@ func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	sched.Status.Schedule = sched.Spec.Schedule
 	return r.fire(ctx, &sched, cronSched, agent, pass)
+}
+
+// forgetIfNoAgent closes the submitter's bus connection for namespace when no
+// PlatformAgent is left there.
+func (r *AgentScheduleReconciler) forgetIfNoAgent(ctx context.Context, namespace string) error {
+	var agents agentv1alpha1.PlatformAgentList
+	if err := r.List(ctx, &agents, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	if len(agents.Items) == 0 {
+		r.forgetNamespace(namespace)
+	}
+	return nil
+}
+
+// forgetNamespace closes the submitter's bus connection for namespace, when
+// the submitter holds one (the bus submitter does; a test's fake doesn't).
+func (r *AgentScheduleReconciler) forgetNamespace(namespace string) {
+	if f, ok := r.Submitter.(interface{ forget(namespace string) }); ok {
+		f.forget(namespace)
+	}
 }
 
 // accept sets the Accepted condition: the schedule parses, and its profile
@@ -289,6 +316,7 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, err
 	}
 	if len(agents.Items) == 0 {
+		r.forgetNamespace(sched.Namespace)
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonNoPlatformAgent
 		cond.Message = "no PlatformAgent in this namespace: schedules run only in an install's namespace"
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)

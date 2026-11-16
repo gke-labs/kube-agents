@@ -13,7 +13,9 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -345,5 +347,19 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 		if !strings.Contains(joined, s) {
 			t.Errorf("the operator was not refused on %q; got:\n%s", s, joined)
 		}
+	}
+}
+
+// A namespace whose PlatformAgent is gone has its bus connection closed when
+// its last schedule goes, rather than reconnecting forever.
+func TestTheSubmittersConnectionClosesWithItsPlatformAgent(t *testing.T) {
+	sub, _ := submitterRig(t, func(string, []byte) any { return triggerSubmitReplyWire{TaskID: "task-1"} })
+	nc := sub.bus.conns["kubeagents-system/platform-agent"]
+	r := &AgentScheduleReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).Build(), Submitter: sub}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "kubeagents-system", Name: "gone"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !nc.IsClosed() || len(sub.bus.conns) != 0 {
+		t.Fatalf("closed %v, conns %v; want the agent's connection closed and dropped", nc.IsClosed(), sub.bus.conns)
 	}
 }

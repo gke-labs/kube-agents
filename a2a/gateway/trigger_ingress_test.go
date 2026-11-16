@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -540,5 +541,47 @@ func TestATriggersStatusIsAnsweredForItsOwnTasksOnly(t *testing.T) {
 	other.Schedule.Name = "stockout-prevention"
 	if got := tr.status(t, other, reply.TaskID); got.Found {
 		t.Fatalf("another schedule read this run: %+v", got)
+	}
+}
+
+// The ingress resubscribes on the server's refusal of its own subjects only:
+// the error text nats.go hands for a refused SUB names the subject, and
+// nothing else (another subscription's refusal, a publish refusal, a
+// disconnect) restarts it.
+func TestTheIngressResubscribesOnlyOnItsOwnSubscriptionsRefusal(t *testing.T) {
+	for text, want := range map[string]bool{
+		`nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.submit"`:    true,
+		`nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.status"`:    true,
+		`nats: permissions violation: Permissions Violation for Subscription to "chat.console.*.in"`:       false,
+		`nats: permissions violation: Permissions Violation for Publish to "a2a.trigger.reply.schedule.x"`: false,
+		`nats: connection closed`: false,
+	} {
+		if got := isTriggerSubscriptionRefusal(errors.New(text)); got != want {
+			t.Errorf("%q: %v, want %v", text, got, want)
+		}
+	}
+	if isTriggerSubscriptionRefusal(nil) {
+		t.Error("nil is a refusal")
+	}
+}
+
+// A status query whose reply names anything but the source's own reply
+// namespace is dropped, as a submission's is.
+func TestATriggerStatusWithAReplyOutsideItsNamespaceIsNotAnswered(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	data, err := json.Marshal(lib.TriggerStatus{Schedule: lib.ScheduleRef{Namespace: "kubeagents-system", Name: "compliance-audit"}, TaskID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Request(lib.TriggerStatusSubject("schedule"), data, 500*time.Millisecond); err == nil {
+		t.Fatal("a status query with an inbox reply was answered")
+	}
+}
+
+// Every trigger run the record keeps still has its task in the record's
+// Tasks, where a status query reads its addressee.
+func TestATriggersKeptRunsNeverOutliveTheirTasks(t *testing.T) {
+	if triggerRunsKept > taskHistoryCap {
+		t.Fatalf("triggerRunsKept %d > taskHistoryCap %d: a kept run could lose its task and answer submitted forever", triggerRunsKept, taskHistoryCap)
 	}
 }

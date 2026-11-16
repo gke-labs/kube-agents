@@ -68,8 +68,23 @@ const (
 // submission subject, retrying a failed subscribe as the directory does, for
 // as long as the term's ctx lives.
 func (g *Gateway) startTriggerIngress(ctx context.Context) {
+	denied := make(chan struct{}, 1)
+	remove := g.client.OnAsyncError(func(err error) {
+		if isTriggerSubscriptionRefusal(err) {
+			select {
+			case denied <- struct{}{}:
+			default:
+			}
+		}
+	})
 	go func() {
+		defer remove()
 		for {
+			// A refusal from a previous attempt's subscriptions is spent.
+			select {
+			case <-denied:
+			default:
+			}
 			sub, err := g.client.SubscribeCore(triggerSubmitWildcard, func(m *nats.Msg) {
 				// Answered only on the source's own reply namespace
 				// (lib.TriggerReplySubject): a submission naming any other
@@ -104,10 +119,22 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 					sub.Stop()
 					err = serr
 				} else {
-					<-ctx.Done()
-					sub.Stop()
-					status.Stop()
-					return
+					// A refused SUB arrives after the flush, as an async
+					// permissions violation (the bus hasn't loaded the
+					// gateway's trigger grants yet, say, on an upgrade that
+					// rolled the gateway first). A server reload doesn't
+					// revive a refused subscription, so drop both and
+					// subscribe again after the retry wait.
+					select {
+					case <-ctx.Done():
+						sub.Stop()
+						status.Stop()
+						return
+					case <-denied:
+						sub.Stop()
+						status.Stop()
+						err = errTriggerSubscriptionRefused
+					}
 				}
 			}
 			g.log.Warn("trigger ingress subscription failed; retrying", "err", err, "in", triggerIngressRetry)
@@ -118,6 +145,22 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// errTriggerSubscriptionRefused is the retry's reason when the server refused
+// a trigger subscription after accepting the SUB.
+var errTriggerSubscriptionRefused = errors.New("the server refused a trigger subscription (permissions violation)")
+
+// isTriggerSubscriptionRefusal reports whether err is the server refusing a
+// subscription on the trigger subjects. nats.go hands these with a nil
+// subscription, so the subject comes from the error text.
+func isTriggerSubscriptionRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
+		strings.Contains(text, "Subscription to \"a2a.trigger.")
 }
 
 // triggerRefused is a refusal reply, logged with the trigger it was for.
@@ -413,8 +456,11 @@ func (g *Gateway) unpostableTrigger(conversation string) bool {
 }
 
 // triggerRunsKept bounds SessionRecord.TriggerRuns: a reconciler retries a
-// slot only inside its starting deadline, so the recent runs are enough.
-const triggerRunsKept = 64
+// slot only inside its starting deadline, so the recent runs are enough. It
+// is taskHistoryCap, never more: a status query reads a run's addressee from
+// the record's Tasks, which keeps that many, and a run kept here but trimmed
+// there would answer "submitted" until the reconciler gave it up as lost.
+const triggerRunsKept = taskHistoryCap
 
 // triggerMintAttempts bounds the task ids one run may try when an earlier,
 // unrecorded attempt left its grant key taken.
