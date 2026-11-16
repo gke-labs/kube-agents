@@ -11150,6 +11150,53 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
                     "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
                 )
 
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
+        # The proxy gives the commands it runs a fixed list of names from its
+        # own environment. These two, which an operator can set on the pod
+        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # sets the gcloud name itself, to its own value. This keeps both in the
+        # proxy's environment from the start of `serve` to the end of each
+        # command, and reads what a gcloud and a kubectl command were given.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # A stand-in prints these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log. Each has the tool's
+        # file name, in a directory of its own: the proxy reads that name.
+        script = "#!/bin/bash\n" + "".join(
+            f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\"\n" for name in pod_environment
+        )
+        commands = (["gcloud", "config", "list"], ["kubectl", "get", "pods"])
+        stand_ins = {}
+        for argv in commands:
+            stand_in = Path(self.tmp.name) / f"fake-{argv[0]}-bin" / argv[0]
+            stand_in.parent.mkdir()
+            stand_in.write_text(script, encoding="utf-8")
+            stand_in.chmod(0o755)
+            stand_ins[argv[0]] = str(stand_in)
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", unset),
+            ("combined", unset),
+        ):
+            self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
+            executor = CredentialProxyHandler.executor
+            executor.executables.update(stand_ins)
+            for argv in commands:
+                with self.subTest(role=role, command=argv[0]):
+                    with mock.patch.dict(os.environ, pod_environment):
+                        result = executor.execute(argv)
+                    self.assertEqual(0, result.exit_code, result.stderr)
+                    self.assertEqual(
+                        {
+                            "MALLOC_ARENA_MAX": unset,
+                            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                        },
+                        dict(line.split("=", 1) for line in result.stdout.splitlines()),
+                    )
+
     def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
         for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
             with self.subTest(role=role):
