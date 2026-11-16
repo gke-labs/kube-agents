@@ -112,6 +112,13 @@ func publishSubmissionCorr(t *testing.T, js jetstream.JetStream, addressee, task
 // account does. A core publish, as JetStream here holds TASKS alone.
 func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conversation, text, viaTask string) {
 	t.Helper()
+	publishProfileSubmissionOf(t, nc, lib.SubmitKindChild, profile, taskID, conversation, text, viaTask)
+}
+
+// publishProfileSubmissionOf is publishProfileSubmission for a submission of
+// kind: a child, or a top-level task a turn addressed to the profile.
+func publishProfileSubmissionOf(t *testing.T, nc *nats.Conn, kind, profile, taskID, conversation, text, viaTask string) {
+	t.Helper()
 	msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}}, MessageID: "m-" + taskID})
 	env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, "corr-"+taskID, msg, lib.WithAuthority(authorityFor(t, conversation, viaTask)))
 	if err != nil {
@@ -121,7 +128,7 @@ func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conv
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := nc.Publish(lib.TaskSubmitSubject(profile, "unattended", lib.SubmitKindChild, taskID), data); err != nil {
+	if err := nc.Publish(lib.TaskSubmitSubject(profile, "unattended", kind, taskID), data); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -265,6 +272,17 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		_ = json.Unmarshal(m.Data, &addressed)
 		if why, ok := sc.refuseProfiles[addressed.Addressee]; ok && addressed.Addressee != "" {
 			notice("⚠️ not started: " + why)
+			return
+		}
+		if addressed.Addressee != "" {
+			// A profile turn, as the gateway routes one: the submission goes
+			// on a2a.submit, which the console account can't see, and the
+			// status line names the task and its profile.
+			i := n.Add(1)
+			root := fmt.Sprintf("task-root%d", i)
+			publishProfileSubmissionOf(t, nc, lib.SubmitKindTop, addressed.Addressee, root, conv, f.Text, "")
+			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: root}))
+			publishRun(t, js, addressed.Addressee, root, answerText, sc.finish)
 			return
 		}
 		switch f.Text {
@@ -2927,4 +2945,66 @@ func TestSendMessageAdvertisesAddressing(t *testing.T) {
 		t.Errorf("parameters.additionalProperties = %#v; want string values", params["additionalProperties"])
 	}
 	mustContain(t, def.Description, "addressee", "parameters", "read_topics", "cards", "unknown profile", "tier", "scope")
+}
+
+// An addressed turn's task is the one the gateway's status line names, since
+// its submission is on a2a.submit, out of the console's sight; the turn is
+// answered from that task, under its profile, well within the wait.
+func TestAnAddressedTurnIsAnsweredFromTheProfileTask(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true})
+	start := time.Now()
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text": "why is checkout crash-looping?", "addressee": "cluster",
+		"parameters": map[string]any{"project": "p1", "location": "us-central1", "cluster": "c1"},
+	})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	if elapsed := time.Since(start); elapsed > noticeGrace {
+		t.Errorf("the answer took %s; it must not wait out the notice grace", elapsed)
+	}
+}
+
+// An addressed turn still running when the wait ends returns its task, under
+// its profile, for task_control, as a plain turn does.
+func TestARunningAddressedTurnReturnsItsTaskForTaskControl(t *testing.T) {
+	s, js, _, _ := turnServer(t, gatewayScenario{})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "long job", "addressee": "cluster", "wait_seconds": 3})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "cluster/task-root1", "still running")
+	publishResult(t, js, "cluster", "task-root1", answerText)
+	publishStatus(t, js, "cluster", "task-root1", lib.StateCompleted, true)
+	got := callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": "cluster/task-root1", "wait_seconds": 10})
+	if got.IsError || !strings.Contains(got.Content[0].Text, answerText) {
+		t.Errorf("get after finish = %+v", got)
+	}
+}
+
+// A plain turn does not take a task from a notice: its own submission names
+// it, and a notice naming another task (a profile turn's line, say) is shown
+// as a notice and nothing more.
+func TestAPlainTurnTakesNoTaskFromANotice(t *testing.T) {
+	w := &turnWatch{known: map[string]bool{}}
+	m := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: "cluster", TaskID: "task-x"})}
+	if _, ok := w.noticedTask(m); ok {
+		t.Error("an unaddressed turn took the task a notice named")
+	}
+	w.addressed = true
+	if ref, ok := w.noticedTask(m); !ok || ref != (TaskRef{Addressee: "cluster", TaskID: "task-x"}) {
+		t.Errorf("an addressed turn's noticed task = %v, %v; want cluster/task-x", ref, ok)
+	}
+	for name, f := range map[string]ConsoleOutFrame{
+		"a result frame":       {MessageID: "r", Text: "x", Kind: "result", Addressee: "cluster", TaskID: "task-x"},
+		"an edit":              {MessageID: "s1", Text: "x", Edit: true, Addressee: "cluster", TaskID: "task-x"},
+		"no addressee":         {MessageID: "s1", Text: "x", TaskID: "task-x"},
+		"a wildcard addressee": {MessageID: "s1", Text: "x", Addressee: "*", TaskID: "task-x"},
+		"a dotted task id":     {MessageID: "s1", Text: "x", Addressee: "cluster", TaskID: "a.b"},
+	} {
+		if _, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, f)}); ok {
+			t.Errorf("%s named the turn's task", name)
+		}
+	}
 }

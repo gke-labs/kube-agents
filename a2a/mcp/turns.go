@@ -1238,8 +1238,12 @@ func turnFate(text string) (settled bool, texts []string) {
 // turn's own task once it appears, then the tasks delegated from it.
 type turnWatch struct {
 	conversation string
-	token        string
-	texts        []string
+	// addressed is set on a turn sent to an AgentProfile, whose submission
+	// is on a2a.submit, out of this server's sight: its task is the one the
+	// gateway's status line names (noticedTask).
+	addressed bool
+	token     string
+	texts     []string
 	// since is the event cursor before the turn was sent: a card's report
 	// on this turn comes after it.
 	since       uint64
@@ -1465,6 +1469,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	}
 	w.unpin = unpin
 	w.since = b.events.Cursor()
+	w.addressed = to.Addressee != ""
 	// From here the watch holds the lock, and closing it releases it.
 	var once sync.Once
 	w.release = func() { once.Do(unlock) }
@@ -1489,6 +1494,13 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		case m := <-w.notices:
 			if n := noticeText(m); n != "" {
 				res.Notices = append(res.Notices, n)
+				if ref, ok := w.noticedTask(m); ok {
+					res.Task = &ref
+					convs.setRunning(token, &ref)
+					go w.follow()
+					res.Notices = w.settleNotices(ctx, res.Notices)
+					return res, w, nil
+				}
 				if grace == nil {
 					grace = time.After(noticeGrace)
 				}
@@ -1725,6 +1737,26 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 // conversation, not delegated from another task, with this turn's text. A
 // message for a task already running is the gateway sending the text into
 // it, and that task is where the turn's answer is.
+// noticedTask is the task an addressed turn's status line names: a fresh
+// notice (no kind, not an edit) carrying the task's id and the profile it was
+// published to. Only the gateway publishes on the conversation's .out, and
+// only a profile task's line names one. A plain turn takes its task from its
+// own submission alone.
+func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
+	if !w.addressed {
+		return TaskRef{}, false
+	}
+	var f ConsoleOutFrame
+	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" || f.Edit ||
+		!lib.ValidSubjectToken(f.Addressee) || !lib.ValidSubjectToken(f.TaskID) {
+		return TaskRef{}, false
+	}
+	w.mu.Lock()
+	w.known[f.TaskID] = true
+	w.mu.Unlock()
+	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}, true
+}
+
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
 	ref, a, text, corr, ok := submissionWithCorrelation(m)
 	if !ok || a.Audience.Conversation != w.conversation || a.Via != nil || !slices.Contains(w.texts, text) {

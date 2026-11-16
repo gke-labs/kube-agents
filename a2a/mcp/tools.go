@@ -122,7 +122,8 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 				"(for example cluster) and pass its task parameters in parameters (for cluster: project, location and cluster); " +
 				"read_topics with action cards lists the agent cards on DIRECTORY, by profile. " +
 				"The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, " +
-				"and its notice is the answer.",
+				"and its notice is the answer. An addressed turn still running when the wait ends returns its task as <profile>/<task-id>; " +
+				"read it with task_control under that reference, not a bare id.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
