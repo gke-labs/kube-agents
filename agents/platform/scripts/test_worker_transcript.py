@@ -23,6 +23,7 @@ REDACTOR_PATH = (
 REDACTOR_MODULE_NAME = "kube_agents_test_worker_transcript_redactor"
 WITHHELD = "[withheld: for the test]"
 MARKER = worker_transcript.REDACTED_SECRET_MARKER
+LINEAR_SCRUB_BUDGET_SECONDS = 5.0
 
 
 def _load_redactor():
@@ -617,7 +618,10 @@ class TestScrubStepText(unittest.TestCase):
             with self.subTest(cmd=cmd[:40]):
                 start = time.monotonic()
                 out = _scrub("tool_call", cmd)
-                self.assertLess(time.monotonic() - start, 1.0)
+                # Wall-clock budget: a quadratic scrub of these 100k+ character
+                # inputs takes tens of seconds, while a linear one finishes near a
+                # second on a loaded CI runner, so 1.0 s flaked and 5.0 s does not.
+                self.assertLess(time.monotonic() - start, LINEAR_SCRUB_BUDGET_SECONDS)
                 self.assertNotIn("S3cretValue9", out)
 
     def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
