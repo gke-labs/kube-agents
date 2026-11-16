@@ -441,7 +441,9 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
-	"7": {"account", "denyPublish", "denySubscribe", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	// 7 and 8 are taken by #4488 (notAfter) and #5937 (held); gaps are
+	// allowed, and a later lander rebuilds its row on the newest landed one.
+	"9": {"account", "denyPublish", "denySubscribe", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
