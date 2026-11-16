@@ -1178,6 +1178,23 @@ class KanbanCreateQueueTest(unittest.TestCase):
                             fp(create_conversation(created(True) + "\n\nanother notice")))
         self.assertTrue(self.mapping(created(True) + self.NOTICE).create_queued)
 
+    def test_a_later_create_with_a_free_slot_leaves_the_earlier_wait_on_record(self):
+        # The first card waited, the second didn't: an answer about the first card's wait must still not be saved.
+        first = {"id": "call_1", "type": "function",
+                 "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-a"})}}
+        second = {"id": "call_2", "type": "function",
+                  "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-b"})}}
+        body = {"model": "m", "messages": [
+            {"role": "user", "content": "triage seeded-a and seeded-b"},
+            {"role": "assistant", "content": "", "tool_calls": [first]},
+            {"role": "tool", "tool_call_id": "call_1", "content": created(True)},
+            {"role": "assistant", "content": "", "tool_calls": [second]},
+            {"role": "tool", "tool_call_id": "call_2", "content": created(None, task_id="t_e18619d6")},
+        ]}
+        mapping = normalizer.normalize_request(body, NOW).mapping
+        self.assertTrue(mapping.create_queued)
+        self.assertTrue(mapping.answer_talks_about_dropped_queue("seeded-a is queued and starts when a worker frees up."))
+
     def test_another_tools_result_keeps_its_fields(self):
         self.assertNotEqual(fp(create_conversation(created(True), tool_name="kanban_show")),
                             fp(create_conversation(created(None), tool_name="kanban_show")))

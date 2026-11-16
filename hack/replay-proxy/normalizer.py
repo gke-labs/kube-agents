@@ -482,7 +482,8 @@ DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
 DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
 # The front door's kanban_create result carries `"queued": true, "queue":
 # {"running": N, "limit": M}` when the new card's class has no free dispatcher
-# slot at that moment, and neither key otherwise; the card is `ready` either way
+# slot at that moment, and neither key otherwise; being queued doesn't change the
+# card's status, and only a `ready` card can carry the fields
 # (deploy/docker/patches/kanban_priority.py `queue_fields`, empty inside a
 # worker). Whether a slot was free is what else was running, so the key drops
 # both (without_queue_fields): only from a JSON object holding `task_id` and
@@ -742,7 +743,7 @@ def without_queue_fields(text: str) -> Tuple[str, bool, Any]:
     """A kanban_create result without its `queued` and `queue`, whether it was queued, and the dropped `queue`.
 
     Any other text comes back as it is, unqueued. Returns `text` itself when it
-    holds neither key. Queued means a `queued` that is present and not `false`,
+    holds neither key and has no appended notice. Queued means a `queued` that is present and not `false`,
     or a `queue` block at all: queue_fields writes only `true`, and anything
     else it might write is read as a wait. A result Hermes appended a notice to
     is written in canonical form and the notice kept, as without_similar_files does.
