@@ -14,8 +14,8 @@ const platformTargetDescription = "the platform agent, which can read and act ac
 // profileLister is what delegateTargets reads the profiles from: every card
 // the gateway holds, in name order. The profile directory serves it from the
 // cards it keeps off DIRECTORY (profiledir.go), so building the list costs no
-// bus read. A cache with its own refresh, or a per-requester view once the
-// PlatformAgent's membership mapping lands, would slot in behind this.
+// bus read. A cache with its own refresh, or a per-requester view by tier
+// (tierOf), would slot in behind this.
 type profileLister interface {
 	sortedCards() []lib.AgentCard
 }
