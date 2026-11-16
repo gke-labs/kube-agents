@@ -131,7 +131,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -439,7 +439,7 @@ to is the judge's to grade. `oobe_audits_started`, in its own module
 `cron/executions.db` in the agent pod (with no state file, the install's own first run when the stack
 chose it, which it records in `.bench-oobe-own.json`; with neither, an error), and passes when the stage's `.oobe_audits_fired` lists each
 of the five first-run audits as marked due and each has a run claimed since the stage marked it
-that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended. `oobe_audits_ended`, beside it, reads the same records and fails when a run the stage marked due ended in a state other than completed.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
 workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
 `min_folded` of them were folded into its newest admitted incident, which must be newer than the
