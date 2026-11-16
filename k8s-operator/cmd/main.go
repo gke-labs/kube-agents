@@ -430,7 +430,12 @@ func main() {
 			name      string
 			setupFunc func(ctrl.Manager) error
 		}{
-			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
+			// The validator holds a PlatformAgent to operatorNamespace, the
+			// namespace the write Role is bound in; empty (off the cluster)
+			// skips that rule.
+			{"PlatformAgent", func(mgr ctrl.Manager) error {
+				return agentwebhook.SetupPlatformAgentWebhookWithManager(mgr, operatorNamespace)
+			}},
 		}
 
 		for _, wh := range webhooks {
