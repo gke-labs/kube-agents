@@ -199,6 +199,12 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertEqual(req["sessionRequestsCpu"], 4 * 150)
         self.assertIn("At the cap of 4 they request 0.600 cores and 1.25 GiB over 4 pods", notes)
 
+    def test_an_install_with_no_session_pods_prints_no_session_line(self) -> None:
+        notes, req = self._render(["platformAgent.enabled=false", "hindsight.enabled=true"])
+        self.assertEqual(req["sessionPods"], 0)
+        self.assertNotIn("Not in these figures or the cost", notes)
+        self.assertIn("are in the figures above", notes)
+
     def test_the_summary_names_what_it_leaves_out(self) -> None:
         notes, req = self._render()
         self._assert_summary_matches(notes, req)

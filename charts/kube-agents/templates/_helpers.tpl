@@ -3523,7 +3523,10 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          replaces the default, as the operator's resolver does; ephemeral storage is fixed.
          The share is kube-agents.quotaSessionShare's, computed always and reported apart
          in the requirements (the session* keys); kube-agents.quotaCountsSessions decides whether it is in the
-         totals the hard check compares. No surge term: a session pod is not rolled. */ -}}
+         totals the hard check compares. No surge term: a session pod is not rolled. Exactly
+         maxSessions: the gateway can briefly run one more while it replaces a session at the
+         cap, or overshoot in its count-then-create race; the operator's own session quota
+         has a margin for that, and this check does not. */ -}}
   {{- $session = include "kube-agents.quotaSessionShare" . | fromJson -}}
   {{- if eq (include "kube-agents.quotaCountsSessions" .) "true" -}}
     {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" ($session.pods | int64)) | int64 -}}
@@ -3801,17 +3804,27 @@ true
 {{- $ephReq := $pod.ephemeralStorageBytesRequest | int64 -}}
 {{- $ephLim := $pod.ephemeralStorageBytesLimit | int64 -}}
 {{- /* On GKE Autopilot the pod is admitted at Autopilot's figures, not the gateway's, and
-       a namespace ResourceQuota counts what is admitted. Modeled as the rest of this file
-       models Autopilot, without Pod bursting: each CPU request rounds up to a multiple of
-       250m, 250m at least; a memory request is 512Mi at least; and the limits are set to
-       the requests. On a cluster with bursting the minimums are lower, so this over-counts
-       there, in the safe direction. Autopilot's CPU-to-memory ratio adjustment is not
-       modeled: the defaults sit inside it. */ -}}
+       a namespace ResourceQuota counts what is admitted. The requests are modeled as the
+       rest of this file models Autopilot, without Pod bursting: each CPU request rounds up
+       to a multiple of 250m, 250m at least; a memory request is 512Mi at least; and the
+       pair is held inside Autopilot's 1 to 6.5 GiB per vCPU, memory raised for a large CPU
+       request and CPU raised for a large memory request, as Autopilot raises them. With
+       bursting the minimums are lower, so the requests over-count there. The limits are
+       the resolved limits, each raised to its request: without bursting Autopilot sets them
+       equal to the requests, below this, and with bursting it keeps them, so counting the
+       larger is the safe side either way, as the credential proxy's limits are counted. */ -}}
 {{- if include "kube-agents.gkeAutopilot" . -}}
+  {{- $gib := 1073741824 -}}
   {{- $cpuReq = max (mul (div (add $cpuReq 249) 250) 250) 250 | int64 -}}
   {{- $memReq = max $memReq 536870912 | int64 -}}
-  {{- $cpuLim = $cpuReq -}}
-  {{- $memLim = $memReq -}}
+  {{- /* At least 1 GiB per vCPU: millicores x 2^30 / 1000, split so it cannot overflow. */ -}}
+  {{- $memFloor := add (mul (div $cpuReq 1000) $gib) (div (mul (mod $cpuReq 1000) $gib) 1000) | int64 -}}
+  {{- $memReq = max $memReq $memFloor | int64 -}}
+  {{- /* At most 6.5 GiB per vCPU: CPU of at least memory / 6.5 GiB, rounded up to 250m. */ -}}
+  {{- $cpuFloor := div (add (div (mul (div $memReq 1048576) 2000) 13312) 249) 250 | mul 250 | int64 -}}
+  {{- $cpuReq = max $cpuReq $cpuFloor | int64 -}}
+  {{- $cpuLim = max $cpuLim $cpuReq | int64 -}}
+  {{- $memLim = max $memLim $memReq | int64 -}}
 {{- end -}}
 {{- $perPod := dict "pods" ($pod.pods | default 1 | int64) "requestsCpu" $cpuReq "limitsCpu" $cpuLim "requestsMemory" $memReq "limitsMemory" $memLim "requestsEphemeral" $ephReq "limitsEphemeral" $ephLim -}}
 {{- $out := dict "maxSessions" $count -}}
@@ -4106,7 +4119,11 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Memory:   {{ printf "%.2f" $memoryGiB }} GiB x ${{ include "kube-agents.footprintPriceMemoryPerGiBHour" . }}/GiB-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $memoryCost }}
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
+{{- if gt (int64 $r.sessionPods) 0 }}
   Not in these figures or the cost: the session pods, one per delegation or /session conversation. At the cap of {{ int64 $r.maxSessions }} they request {{ printf "%.3f" (divf (float64 $r.sessionRequestsCpu) $millisPerCore) }} cores and {{ printf "%.2f" (divf (float64 $r.sessionRequestsMemory) $bytesPerGiB) }} GiB over {{ int64 $r.sessionPods }} pods{{ if $counted }}, which the quota preflight adds to the figures above{{ else }}, which a namespace ResourceQuota needs room for too{{ end }}{{ if include "kube-agents.gkeAutopilot" . }}, at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request{{ end }}. The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+{{- else }}
+  The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+{{- end }}
 {{- end }}
 
 {{- define "kube-agents.quotaPreflight" -}}

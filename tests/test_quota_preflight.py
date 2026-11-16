@@ -534,14 +534,25 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["sessionRequestsCpu"], 2 * 100)
 
     def test_on_autopilot_the_share_is_at_autopilots_per_pod_minimums(self) -> None:
-        """Autopilot admits the pod at 250m and 512Mi at least, limits equal to requests,
-        and the quota counts what it admits."""
+        """Autopilot admits the pod at 250m and 512Mi at least, and the quota counts what it
+        admits. The limits stay the resolved ones, raised to the requests: with bursting
+        Autopilot keeps them, so counting them is the safe side."""
         autopilot = ["--api-versions", _AUTOPILOT_API]
         req = self._requirements(["platformAgent.harness.tuning.maxSessions=2"], extra_args=autopilot)
         self.assertEqual(req["sessionRequestsCpu"], 2 * 250)
         self.assertEqual(req["sessionRequestsMemory"], 2 * 512 * 1024**2)
-        self.assertEqual(req["sessionLimitsCpu"], req["sessionRequestsCpu"])
-        self.assertEqual(req["sessionLimitsMemory"], req["sessionRequestsMemory"])
+        self.assertEqual(req["sessionLimitsCpu"], 2 * 2000)
+        self.assertEqual(req["sessionLimitsMemory"], 2 * 2 * 1024**3)
+        # Autopilot's 1 to 6.5 GiB per vCPU: 4 CPU asks 4Gi at least, 13Gi asks 2 CPU.
+        for override, key, want in (
+            ({"requests": {"cpu": "4"}}, "sessionRequestsMemory", 4 * 1024**3),
+            ({"requests": {"memory": "13Gi"}}, "sessionRequestsCpu", 2000),
+            ({"requests": {"memory": "13Gi"}}, "sessionLimitsMemory", 13 * 1024**3),
+        ):
+            with self.subTest(override=override, key=key):
+                ratio = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+                    "maxSessions": 1, "sessionResources": override}}}}, extra_args=autopilot)
+                self.assertEqual(ratio[key], want)
         # A request above the minimums rounds up to a multiple of 250m and keeps its memory.
         big = self._requirements(values={"platformAgent": {"harness": {"tuning": {
             "maxSessions": 2,
