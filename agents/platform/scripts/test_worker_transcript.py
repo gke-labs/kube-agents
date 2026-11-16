@@ -1054,28 +1054,65 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
                 self.assertEqual(_scrub("tool_call", cmd), want)
 
     def test_a_long_run_scrubs_in_linear_time(self):
-        # Each command took seconds to minutes before #5901. The runs of key
-        # characters are 12000 units long, not longer: past that, most of the
-        # time that is left is in the shared redactor's key-value rule, which
-        # is linear but slow on such a run and is not this module's.
+        # The whole scrub. Each command took seconds on the old forms (1.6 s
+        # to 19 s) and takes at most 0.04 s of CPU time on the new ones. The
+        # bound is on CPU time, so that a busy runner's scheduler does not
+        # count against it, and the inputs are no larger than this on
+        # purpose: the coverage job in CI ran this file about 5 times slower
+        # than a developer's machine, which leaves the 1 s bound a margin of
+        # about 5. Longer runs of key characters would also spend most of
+        # their time in the shared redactor's key-value rule, which is linear
+        # but slow on such a run and is not this module's. At this size the
+        # old key rule is only a little over the bound, and a milder wrong
+        # form is under it: the next test, on the patterns alone, holds those.
         import time
 
         for cmd, want in (
-            ("echo " + "-u" * 12000, None),
-            ("kubectl get secret -o yaml " + "a." * 12000, None),
-            ("kubectl get secret -o yaml " + "é." * 12000, None),
-            ("curl x -u" + "=" * 300000 + " y", None),
-            ("curl x\\ -u" + "=" * 300000 + " y", None),
-            ("curl DB_PASSWORD=x\\ -u" + "=" * 300000 + " y", "curl DB_PASSWORD=" + MARKER + " y"),
-            ('curl x "' + '\\"' * 150000 + " y", None),
+            ("echo " + "-u" * 6000, None),
+            ("kubectl get secret -o yaml " + "a." * 6000, None),
+            ("kubectl get secret -o yaml " + "é." * 6000, None),
+            ("curl x -u" + "=" * 60000 + " y", None),
+            ("curl x\\ -u" + "=" * 60000 + " y", None),
+            ("curl DB_PASSWORD=x\\ -u" + "=" * 60000 + " y", "curl DB_PASSWORD=" + MARKER + " y"),
+            ('curl x "' + '\\"' * 20000 + " y", None),
             ('curl x "' + "'\\\"" * 12000 + " y", None),
         ):
             with self.subTest(cmd=cmd[:30]):
-                start = time.monotonic()
+                start = time.process_time()
                 out = _scrub("tool_call", cmd)
-                self.assertLess(time.monotonic() - start, 1.0)
+                self.assertLess(time.process_time() - start, 1.0)
                 # Nothing to mask in most of them: the text comes back as written.
                 self.assertEqual(out, cmd if want is None else want)
+
+    def test_a_long_run_costs_each_pattern_linear_time(self):
+        # The three patterns alone, on runs of 36 KB to 90 KB. Each new form
+        # needs a few milliseconds of CPU time. An old form needs 7 s or more,
+        # and so does a form that is wrong on one kind of run only (a
+        # lookbehind on ASCII only, an open quote that stops at a single
+        # quote) or quadratic with a smaller constant (a lookbehind on word
+        # characters only). So the 1 s bound has a wide margin on a slow
+        # runner, and a quadratic form fails on a fast one. The runs are no
+        # longer than this, so that a failing run ends in minutes.
+        import time
+
+        mark = worker_transcript.SHELL_ESCAPED_SPACE_FOLD
+        for name, read, text in (
+            ("auth, a run of -u", worker_transcript.AUTH_SCHEME_HEADER_RE.search, "echo " + "-u" * 18000),
+            ("auth, a run of a.", worker_transcript.AUTH_SCHEME_HEADER_RE.search, "x " + "a." * 18000),
+            ("auth, a run outside ASCII", worker_transcript.AUTH_SCHEME_HEADER_RE.search, "x " + "é." * 18000),
+            ("user:pass, a run of =", worker_transcript.CLI_USERPASS_ARG_RE.search, "curl x -u" + "=" * 60000 + " y"),
+            (
+                "user:pass at the mark, a run of =",
+                worker_transcript.CLI_USERPASS_ARG_AT_FOLD_RE.search,
+                "curl x" + mark + "-u" + "=" * 60000 + " y",
+            ),
+            ("quoted spans, escaped quotes", worker_transcript.blank_quoted_spans, 'curl x "' + '\\"' * 30000 + " y"),
+            ("quoted spans, a quote mix", worker_transcript.blank_quoted_spans, 'curl x "' + "'\\\"" * 30000 + " y"),
+        ):
+            with self.subTest(cmd=name):
+                start = time.process_time()
+                read(text)
+                self.assertLess(time.process_time() - start, 1.0)
 
 
 class TestSecretReadDetector(unittest.TestCase):
