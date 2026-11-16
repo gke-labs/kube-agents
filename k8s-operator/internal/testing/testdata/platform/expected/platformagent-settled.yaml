@@ -1762,6 +1762,7 @@ spec:
   template:
     metadata:
       annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
         kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
