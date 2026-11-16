@@ -154,7 +154,10 @@ func ValidateTriggerSubmit(source string, s TriggerSubmit) error {
 	if source != TriggerSourceSchedule {
 		return fmt.Errorf("trigger source %q is not %q, the one source that submits", source, TriggerSourceSchedule)
 	}
-	if err := ValidateTrigger(s.Trigger.Name, s.Trigger.Origin, s.Trigger.Stream); err != nil {
+	// No script yet: a submission carries none until TriggerSubmit gains it
+	// (the script-run work, after this ingress), so the claim is checked as
+	// a prompt run's.
+	if err := ValidateTrigger(s.Trigger.Name, s.Trigger.Origin, s.Trigger.Stream, ""); err != nil {
 		return err
 	}
 	src, name, _ := strings.Cut(s.Trigger.Name, "/")
