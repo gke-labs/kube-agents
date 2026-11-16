@@ -335,6 +335,9 @@ type A2ADoor struct {
 	// notify is closed and replaced whenever anything changes; see the
 	// inject door for why one channel serves the whole adapter.
 	notify chan struct{}
+	// claimWaiting counts the calls asleep in claimTurnIf waiting for a
+	// slot, under mu; tests poll it to know a call has queued.
+	claimWaiting int
 
 	handlerMu sync.RWMutex
 	handler   func(InboundMessage)
@@ -908,9 +911,32 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	// still runs has still asked for the stop, and a cancel never handed
 	// over leaves the stray running with nobody to stop it. The bound alone
 	// ends the claim; the wait below stays on the request's context.
-	prior, ok := d.claimTurn(context.WithoutCancel(r.Context()), key, caller, contextID, user, deadline)
-	if !ok {
+	//
+	// A call queued behind another cancel for this task (a client that timed
+	// out and retried, #5777) looks again on every pass of its wait, in the
+	// claim's critical section: the first may have put the cancel on the bus, or
+	// the task may have ended, and a second stop would be answered without a
+	// publish and read as a refusal.
+	var gone, done, ended bool
+	var state lib.TaskState
+	prior, got := d.claimTurnIf(context.WithoutCancel(r.Context()), key, caller, contextID, user, deadline, func() bool {
+		t := d.tasks[params.ID]
+		gone = t == nil
+		if !gone {
+			done, ended, state = t.cancelPublished, t.terminal, t.state
+		}
+		return !gone && !done && !ended
+	})
+	switch {
+	case got == turnRefused:
 		return rpcFail(req.ID, rpcInternalError, earlierTurnNote(), nil)
+	case got == turnNotNeeded && gone:
+		// Evicted while the call waited: no longer held, as tasks/get says.
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
+	case got == turnNotNeeded && done:
+		return rpcOK(req.ID, d.taskObject(params.ID))
+	case got == turnNotNeeded:
+		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(state), nil)
 	}
 	handler(InboundMessage{
 		Conversation: key,
@@ -934,8 +960,38 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 // against. It also mints the conversation, so Roster answers inside the
 // turn.
 func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, user lib.Message, deadline time.Time) (a2aPrior, bool) {
+	prior, got := d.claimTurnIf(ctx, key, caller, contextID, user, deadline, nil)
+	return prior, got == turnClaimed
+}
+
+// turnClaim is how claimTurnIf ended.
+type turnClaim int
+
+const (
+	// turnRefused: no slot, by the deadline or the context.
+	turnRefused turnClaim = iota
+	// turnClaimed: the slot is this caller's, until TurnFinished.
+	turnClaimed
+	// turnNotNeeded: stillWanted said the turn was no longer needed, on some
+	// pass of the wait, so nothing was claimed.
+	turnNotNeeded
+)
+
+// claimTurnIf is claimTurn with a check: on every pass, before the slot
+// is looked at, stillWanted (if set) runs under d.mu, and a false answer
+// returns without claiming. A cancel queued behind the first cancel for the
+// same task uses it (#5777): it answers as soon as the first puts the
+// cancel on the bus (CancelPublished wakes the waiters), even while that
+// turn still holds the slot, and the check is in the same critical section
+// as a claim, so nothing slips between them. Waiters are woken together
+// (wakeLocked), so one that claims nothing strands no other.
+func (d *A2ADoor) claimTurnIf(ctx context.Context, key, caller, contextID string, user lib.Message, deadline time.Time, stillWanted func() bool) (a2aPrior, turnClaim) {
 	for {
 		d.mu.Lock()
+		if stillWanted != nil && !stillWanted() {
+			d.mu.Unlock()
+			return a2aPrior{}, turnNotNeeded
+		}
 		conv := d.conversationLocked(key)
 		conv.caller = caller
 		conv.contextID = contextID
@@ -951,18 +1007,30 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 				// message is not handed over at all (the inject door's
 				// claimTurn, which handleInbound's routing relies on).
 				d.mu.Unlock()
-				return a2aPrior{}, false
+				return a2aPrior{}, turnRefused
 			}
 			conv.busy = true
 			conv.pending = user
 			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: conv.tasks.total, posts: conv.turnPosts.total}
 			d.mu.Unlock()
-			return prior, true
+			return prior, turnClaimed
 		}
 		wait := d.notify
+		d.claimWaiting++
 		d.mu.Unlock()
-		if !d.sleep(ctx, wait, deadline) {
-			return a2aPrior{}, false
+		awake := d.sleep(ctx, wait, deadline)
+		d.mu.Lock()
+		d.claimWaiting--
+		// A last look at the deadline: what stillWanted waits on may have
+		// landed with it, and a refusal then would be for a turn that
+		// wasn't needed.
+		notNeeded := !awake && stillWanted != nil && !stillWanted()
+		d.mu.Unlock()
+		if notNeeded {
+			return a2aPrior{}, turnNotNeeded
+		}
+		if !awake {
+			return a2aPrior{}, turnRefused
 		}
 	}
 }
