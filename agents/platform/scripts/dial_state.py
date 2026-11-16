@@ -319,7 +319,7 @@ def report_level(level: str) -> bool:
     except Exception as exc:  # noqa: BLE001 — reported again on the next pick
         logger.warning("dial: could not report the level %s to the broker: %s", level, exc)
         return False
-    return answer.get("level") == level
+    return isinstance(answer, dict) and answer.get("level") == level
 
 
 #: sandbox_exec logs in as hermes, which cannot write the agent's own VCS

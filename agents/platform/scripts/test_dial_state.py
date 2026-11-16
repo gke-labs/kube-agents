@@ -359,13 +359,13 @@ class ReporterTest(DialCase):
         import http.server
         import threading
 
-        seen = []
+        seen, answers = [], []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 seen.append((self.path, self.headers.get("Authorization"), body))
-                payload = json.dumps({"level": body["level"]}).encode()
+                payload = json.dumps(answers.pop(0) if answers else {"level": body["level"]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -386,6 +386,10 @@ class ReporterTest(DialCase):
         self.assertEqual(seen, [("/v1/dial", "Bearer chat-token", {"level": "automerge"})])
         with mock.patch.dict(os.environ, {**env, "CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}):
             self.assertFalse(real("explain"))
+        for answer in (None, [], "ok"):
+            answers.append(answer)
+            with mock.patch.dict(os.environ, env):
+                self.assertFalse(real("explain"))
 
 
 if __name__ == "__main__":
