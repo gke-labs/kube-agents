@@ -13,6 +13,8 @@ import re
 import unittest
 from pathlib import Path
 
+from markdown_it import MarkdownIt
+
 SKILL_MD = (
     Path(__file__).resolve().parents[1]
     / "files/skills/gke-stockout-investigator/SKILL.md"
@@ -122,6 +124,109 @@ class SkillCommandsTest(unittest.TestCase):
         )
         self.assertIn("- **Checks Performed**:", text)
         self.assertIn("platform-agent/remediate-stockout-<workload_name>", text)
+
+    def _section_text(self, text: str, level: str, prefix: str) -> str:
+        """Return raw markdown lines from a heading matching ``level`` and ``prefix`` to the next sibling heading."""
+        tokens = MarkdownIt("commonmark").parse(text)
+        lines = text.splitlines(keepends=True)
+        level_num = int(level.lstrip("h"))
+        start_line = None
+        end_line = len(lines)
+        for idx, token in enumerate(tokens):
+            if token.type != "heading_open":
+                continue
+            token_level = int(token.tag.lstrip("h"))
+            heading_text = tokens[idx + 1].content if idx + 1 < len(tokens) else ""
+            line = token.map[0] if token.map else 0
+            if start_line is None:
+                if token_level == level_num and heading_text.startswith(prefix):
+                    start_line = line
+            elif token_level <= level_num:
+                end_line = line
+                break
+        if start_line is None:
+            self.fail(f"Heading {level} {prefix!r} not found in {SKILL_MD}")
+        return "".join(lines[start_line:end_line])
+
+    def test_chat_only_diagnostic_mode_contract(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("MODE=chat-only", text)
+        self.assertIn("Chat-Only Diagnostic Mode", text)
+
+        step2a = self._section_text(
+            text, "h4", "A. Check Operating Mode & Existing Pull Requests"
+        )
+        step2b = self._section_text(
+            text, "h4", "B. Determine if the Alert is a Real Issue or a False Signal"
+        )
+        self.assertIn("gitops_preflight.py --list", step2a)
+        self.assertIn("/etc/gitops/managed_repos", step2a)
+        self.assertIn("context_repos", step2a)
+        self.assertNotIn("/etc/gitops/gitops_repo", step2a)
+        self.assertNotIn("[ -s /etc/gitops/", step2a)
+        self.assertIn("<host>/<path>", step2a)
+        self.assertIn("NO_REGISTERED_REPO", step2a)
+        self.assertNotIn("platform-agent-gitops-state", step2a)
+        self.assertNotIn("GITOPS_STATE_CONFIGMAP", step2a)
+        self.assertIn("MODE=chat-only", step2a)
+        self.assertIn("strictly read-only", step2a.lower())
+        self.assertIn("proceed directly to **Step 2 §B**", step2a)
+        self.assertIn("interactive requester explicitly asked to open a PR", step2a)
+        self.assertIn('kanban_block(kind="needs_input")', step2a)
+        self.assertIn("false signal", step2b)
+        self.assertIn("fleet_scope()", step2b)
+        self.assertIn("unread", step2b)
+        self.assertIn("gcloud projects list", step2b)
+        self.assertIn("excluded_clusters", step2b)
+        self.assertIn("kubectl config get-contexts -o name", step2b)
+        self.assertIn("gcloud container clusters list --project=", step2b)
+        self.assertIn('CLUSTER_CONTEXT="<resolved_context>"', step2b)
+        self.assertNotIn("| grep -q", step2b)
+        self.assertIn('kanban_block(kind="capability")', step2b)
+        self.assertIn("--context=\"$CLUSTER_CONTEXT\"", step2b)
+        self.assertIn("Do **NOT** call `kanban_block`", step2b)
+        self.assertIn("was not found across verified clusters", step2b)
+        self.assertIn("omit `(<cluster_name>)` if unresolved", step2b)
+
+        step3_chat = self._section_text(text, "h4", "Option B: Chat-Only Diagnostic Mode")
+        for required_cmd in (
+            'kubectl --context="$CLUSTER_CONTEXT" get replicaset <replicaset_name> -n <namespace> --ignore-not-found',
+            'kubectl --context="$CLUSTER_CONTEXT" get deployment,statefulset,daemonset,job,replicaset -n <namespace> -o yaml',
+            'kubectl --context="$CLUSTER_CONTEXT" get computeclasses -o yaml',
+            'kubectl --context="$CLUSTER_CONTEXT" get storageclass -o yaml',
+            'kubectl --context="$CLUSTER_CONTEXT" get events -n <namespace>',
+            'gcloud container node-pools list --cluster="<cluster_name>" --location="<location>" --project="<project_id>"',
+        ):
+            self.assertIn(required_cmd, step3_chat)
+        self.assertIn("Do **NOT** call `submit_suggestion.py`", step3_chat)
+        self.assertIn("do **NOT** call `vcs.py`", step3_chat)
+
+        step4 = self._section_text(text, "h3", "4. Diagnose Capacity")
+        self.assertIn("MODE=chat-only", step4)
+        self.assertIn("In `MODE=gitops`", step4)
+        self.assertIn('kubectl --context="$CLUSTER_CONTEXT" get configmap cluster-autoscaler-status', step4)
+        self.assertIn('gcloud compute regions describe "<region>" --project="<project_id>"', step4)
+        self.assertIn('--region="<region>"', step4)
+        self.assertIn("kanban_complete", step4)
+
+        step6_chat = self._section_text(text, "h3", "6-Chat. Chat-Only Diagnostic Report")
+        self.assertIn("skip **Steps 6 and 7** completely", step6_chat)
+        self.assertIn("send_notification", step6_chat)
+        self.assertIn("kanban_complete", step6_chat)
+        self.assertIn("Avoid duplicate chat posts", step6_chat)
+        self.assertIn("no GitOps repository is configured, so no pull request was opened", step6_chat)
+        self.assertIn('"capacity constraint"` or `"scale-up failure"`', step6_chat)
+        self.assertIn("## What's wrong", step6_chat)
+        self.assertIn("## Why", step6_chat)
+        self.assertIn("## What to do", step6_chat)
+        self.assertIn(
+            "https://console.cloud.google.com/kubernetes/workload/overview?project=<project_id>",
+            step6_chat,
+        )
+        self.assertNotIn("<workload_console_url>", step6_chat)
+        self.assertNotIn("<cluster_console_url>", step6_chat)
+        self.assertNotIn("Checks Performed:", step6_chat)
+        self.assertNotRegex(step6_chat, r"\bRule [A-H]\b")
 
 
 if __name__ == "__main__":

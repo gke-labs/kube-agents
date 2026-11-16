@@ -72,7 +72,7 @@ spec:
               prompt: 'GKE Scale-up Failure Alert.
 
                 Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,
-                and if it is real, diagnose it and propose a GitOps remediation PR.
+                and if it is real, diagnose it and propose a GitOps remediation PR (or post a chat-only diagnostic report if no GitOps repository is configured).
 
                 Alert Details:
                 {__raw__}'

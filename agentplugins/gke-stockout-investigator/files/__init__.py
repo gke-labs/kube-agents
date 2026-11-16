@@ -17,5 +17,9 @@ def register(ctx):
     ctx.register_skill(
         SKILL_NAME,
         skill_path,
-        description="Diagnose GKE scale-up stockout failures and propose a GitOps remediation.",
+        description=(
+            "Platform-only skill (run on platform via skill_view; Cluster Agents lack this plugin): "
+            "diagnose GKE scale-up capacity failures and propose a GitOps remediation PR "
+            "(or a chat-only diagnostic report when no GitOps repository is configured)."
+        ),
     )

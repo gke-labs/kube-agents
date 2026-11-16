@@ -458,6 +458,14 @@ FIXTURE_NOT_READY = {
         "registers one, so no CI tier can run it; run it by hand against such an "
         "install"
     ),
+    # Also blocked on an eval install with no usable GitOps repository (#3313)
+    # and with enable_stockout_investigator = true; hack/ci-deploy.sh requires
+    # a registered GitOps repository.
+    "stockout-investigator-chat-only-no-gitops": (
+        "#3313: needs an install with enable_stockout_investigator = true and "
+        "empty spec.integration.repositories; hack/ci-deploy.sh requires a "
+        "registered GitOps repository, so no CI tier can run it yet"
+    ),
     "fleet-cost-without-forge-keeps-the-report": (
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "

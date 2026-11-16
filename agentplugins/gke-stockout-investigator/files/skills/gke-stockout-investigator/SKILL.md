@@ -1,23 +1,25 @@
 ---
 name: gke-stockout-investigator
-description: Act upon GKE cluster-autoscaler scale-up failure and capacity constraint alerts, diagnose them using ComputeClass debugging guidelines, and submit a remediation Pull Request.
+description: Act upon GKE cluster-autoscaler scale-up failure and capacity constraint alerts, diagnose them using ComputeClass debugging guidelines, and submit a remediation Pull Request (or post a read-only chat diagnostic report when no GitOps repository is configured).
 ---
 
-# GKE Capacity Constraint Diagnosis & GitOps Remediation Skill
+# GKE Capacity Constraint Diagnosis & Remediation Skill
 
-This skill guides the Platform Agent on how to handle, diagnose, and remediate GKE capacity constraint and scale-up failure alerts (`scale.up.error.out.of.resources` or equivalent) received via Google Cloud Pub/Sub.
+This skill guides the Platform Agent on how to handle, diagnose, and remediate (or report, in chat-only mode) GKE capacity constraint and scale-up failure alerts (`scale.up.error.out.of.resources` or equivalent) received via Google Cloud Pub/Sub.
 
 ## Workflow
 
-### 1. Notify User of Investigation Start (MANDATORY FIRST STEP)
+### 1. Notify User of Background Investigation Start
 
-Before executing ANY terminal commands, scripts, or diagnostics, you MUST immediately call the `send_notification` tool (or `mcp_platform_control_send_notification`) to announce that the scale-up failure alert was received and investigation is starting:
+When investigating a **background Pub/Sub alert** (no interactive chat requester subscribed), call `send_notification` (or `mcp_platform_control_send_notification`) once before starting diagnostics as one short lowercase line ending with a period (include `(<cluster_name>)` before the period only if `<cluster_name>` was supplied in the alert):
 
 ```json
-send_notification(message="🚨 GKE Capacity Investigation Started\nWorkload: <workload_name>\nCluster: <cluster_name>\nDetails: A GKE capacity or scale-up failure alert is confirmed. I am starting an investigation and diagnosis.")
+send_notification(message="checking <workload_name> in <namespace>.")
 ```
 
-**CRITICAL**: You MUST invoke `send_notification` (or `mcp_platform_control_send_notification`) as an actual tool call. Do NOT output this notification as plain markdown text. After calling the tool, proceed immediately to Step 2 in your next tool turn without stopping.
+Skip `send_notification` when responding to an interactive chat ask (the requester's thread receives live progress and `kanban_complete.result` automatically, so calling `send_notification` without `session_id` would duplicate into the home channel).
+
+**CRITICAL**: For background Pub/Sub alerts, invoke `send_notification` (or `mcp_platform_control_send_notification`) as an actual tool call if an outbound channel is configured (do NOT output this notification only as plain markdown text), then proceed immediately to Step 2 in your next tool turn without stopping.
 
 > [!IMPORTANT]
 > When running in a background or PubSub context, NEVER use the `execute_code` tool or write Python scripts/subshells, as they trigger command approval safeguards and block indefinitely waiting for human approval. Only execute standard command-line tools directly (`kubectl`, `gh`, `gcloud`) or dedicated tools like `send_notification`.
@@ -26,120 +28,158 @@ send_notification(message="🚨 GKE Capacity Investigation Started\nWorkload: <w
 
 After sending the initial notification, perform two critical safety checks to see if you should stop immediately:
 
-#### A. Check for Existing Relevant Pull Requests (Duplicate Prevention)
+#### A. Check Operating Mode & Existing Pull Requests (Duplicate Prevention)
 
-To prevent duplicate effort and redundant PRs, inspect currently open Pull Requests in the repository:
+Determine whether this install has a usable GitOps repository configured (`MODE=gitops`) or is running without one (`MODE=chat-only`), and in GitOps mode inspect currently open Pull Requests in the repository:
 
-1. Resolve the GitOps repository as `<owner>/<repo>`, and pass it as `--repo` on every call from here on. The pod is not a working copy (Step 3 explains why), so there is no local repository for a command to infer one from, and a call that omits it fails on repository resolution rather than returning a list — which is the duplicate check silently never happening. Query the `$GITOPS_STATE_CONFIGMAP` ConfigMap:
+1. Check registered GitOps repositories using `gitops_preflight.py` (which evaluates `/etc/gitops/managed_repos` and `context_repos` inside the sandbox; do **not** check again via shell file tests or `kubectl get configmap` on the GitOps state ConfigMap, because empty JSON arrays like `[]` or unusable entries are only diagnosed accurately by `gitops_preflight.py`, and `<agent>-shell` has no permission to read the ConfigMap):
 
    ```bash
-   kubectl get configmap "${GITOPS_STATE_CONFIGMAP:-platform-agent-gitops-state}" -n "${KUBE_DEFAULT_NAMESPACE:-kubeagents-system}" -o jsonpath='{.data.managed_repos}'
+   python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list
    ```
 
-   If multiple repositories are returned, choose the target repository. Step 3 prints the same value as `repo`.
+   - **Exception to `SOUL.md` `NO_REGISTERED_REPO` stop**: For `gke-stockout-investigator` on background alerts or diagnostic/read-only asks (where the requester did not demand opening a PR), if `gitops_preflight.py --list` exits `3` (`NO_REGISTERED_REPO`, `MANAGED: none`, or no usable repository in `/etc/gitops/managed_repos`), do **NOT** call `kanban_block` and do **NOT** stop. Enter **Chat-Only Diagnostic Mode (`MODE=chat-only`)** instead: skip `vcs.py` and `submit_suggestion.py`, proceed directly to **Step 2 §B**, and stay strictly read-only — never modify, patch, apply, or delete cluster resources. If an interactive requester explicitly asked to open a PR, follow `SOUL.md`'s `NO_REGISTERED_REPO` rule (`kanban_block(kind="needs_input")`); on other preflight errors such as `STATE_UNREADABLE`, report via `kanban_block(kind="needs_input")`.
+   - **If `MANAGED:` lists one or more repositories (exit `0`)**: stay in **GitOps Mode (`MODE=gitops`)**. Accept either `<owner>/<repo>` (GitHub) or `<host>/<path>` (self-managed GitHub Enterprise, GitLab, or Bitbucket — passing the exact value from `MANAGED:` as `--repo` on every `vcs.py` and `submit_suggestion.py` call; choose the target repository if multiple are returned). The pod is not a working copy (Step 3 explains why), so there is no local repository for a command to infer one from, and a call that omits `--repo` fails on repository resolution rather than returning a list — which is the duplicate check silently never happening.
 
-2. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`), and ask the forge for the open PRs on that workload's branch alone:
+2. _(GitOps Mode only)_ Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`), and ask the forge for the open PRs on that workload's branch alone:
 
    ```bash
    V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
-   python3 "$V" proposal list --repo <owner>/<repo> --state open \
+   python3 "$V" proposal list --repo "<repo>" --state open \
      --source "platform-agent/remediate-stockout-<exact_workload_name>"
    ```
 
    `--source` is what makes this a duplicate check rather than a guess. Listing every open PR and matching names here reads only the newest page, so on a busy repository the one you are looking for is not in the answer and the check passes when it should have stopped you. **CRITICAL**: do not widen the query and match branch names yourself. A PR for a DIFFERENT workload is on a different branch and will not come back — it is not a duplicate, and it is not a reason to stop.
 
-3. **If that list is non-empty — a PR is already open for THIS SPECIFIC workload**:
-   - Immediately STOP processing.
+3. _(GitOps Mode only)_ **If that list is non-empty — a PR is already open for THIS SPECIFIC workload**:
+   - Immediately STOP further diagnostic, workspace, branch, and PR work.
    - Do NOT update, edit, modify, or rewrite the existing open PR description or contents.
    - Do NOT run any further diagnostics, do NOT search the workspace, do NOT create a new branch, and do NOT submit another PR.
-   - Output a clear message to the user explaining that a relevant PR is already in place, referencing the `number` and `url` the listing returned (e.g. `Deduplicated: An open PR is already active for this workload: PR #123 - https://github.com/<org>/<repo>/pull/123`).
+   - For a background Pub/Sub alert where Step 1 posted a start notice and an outbound chat channel is enabled, send a brief plain-language stand-down via `send_notification` (`"**<workload_name> in <namespace> (<cluster_name>) already has an open [remediation PR #<number>](<url>); no new PR opened.**"` — omit `(<cluster_name>)` if unresolved; skip `send_notification` for interactive chat asks). Then call `kanban_complete` passing BOTH a short `summary` and a user-facing `result` opening with one bold sentence linking the PR: `"**<workload_name> in <namespace> (<cluster_name>) already has an open [remediation PR #<number>](<url>).**"` (omit `(<cluster_name>)` if unresolved).
 
 #### B. Determine if the Alert is a Real Issue or a False Signal
 
 A scale-up alert is a "false signal" if the cluster has already recovered (e.g. the unschedulable pods have been scheduled, deleted, or the issue was transient).
 
-1. Identify the workload name and namespace from the alert payload (e.g., look at `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups` or the log text).
-2. Check the current status of the pods for this workload in the namespace:
+1. **Resolve the target `<cluster_context>` first**: Identify `<workload_name>`, `<namespace>`, and any `<cluster_name>`, `<location>`, or `<project_id>` from the alert payload or ask (e.g. `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups` or `resource.labels.cluster_name`). Never check only the default management context when the fleet has multiple clusters:
+   - Call `fleet_scope()` first (plus `list_cluster_profiles()` if available) to determine the allowed `projects` and any `excluded_clusters`; never probe clusters listed in `excluded_clusters`.
+   - Inspect already-configured kubeconfig contexts in its own single command:
+     ```bash
+     kubectl config get-contexts -o name
+     ```
+   - If `<cluster_name>` is known (from the alert or user ask) and is not in `excluded_clusters`, ensure its context (`gke_<project_id>_<location>_<cluster_name>`) is loaded if missing from `get-contexts` (run `gcloud container clusters get-credentials "<cluster_name>" --location="<location>" --project="<project_id>"` if needed).
+   - If `<cluster_name>` is omitted or unknown, check `fleet_scope()`; if `declared` is `false` (`projects` is `[]`), first enumerate accessible projects via `gcloud projects list --format="value(projectId)"` (or fall back to the active project). If `fleet_scope()` reports non-empty `unread` projects or an `ERROR:` refusing project enumeration, note that unverified scope rather than claiming an unfound workload is healthy. List non-excluded clusters per project and load credentials before probing:
+     ```bash
+     gcloud container clusters list --project="<project_id>" --format="table(name,location,status)"
+     ```
+   - Probe each candidate context one command at a time (never combine `kubectl` context enumeration and `kubectl --context=...` in the same shell command, and never pipe `kubectl` into `grep -q`):
+     ```bash
+     CLUSTER_CONTEXT="<resolved_context>"
+     kubectl --context="$CLUSTER_CONTEXT" get deployment,statefulset,daemonset,job,replicaset,pods -n <namespace> --ignore-not-found
+     ```
+2. Once `<workload_name>` is located (or `<cluster_name>` is resolved), set `CLUSTER_CONTEXT="<resolved_context>"` in the same terminal call whenever passing `--context="$CLUSTER_CONTEXT"` (each `terminal` call starts a fresh shell), and check the workload pods:
    ```bash
-   kubectl get pods -n <namespace>
+   CLUSTER_CONTEXT="<resolved_context>"
+   kubectl --context="$CLUSTER_CONTEXT" get pods -n <namespace> -o wide
    ```
 3. Check if there are any pods for this workload currently in `Pending` state with scheduling errors.
-4. If there are pending pods, describe them to verify the event log:
+4. If there are pending pods, describe them on `<cluster_context>` to verify the event log:
    ```bash
-   kubectl describe pod <pod_name> -n <namespace>
+   CLUSTER_CONTEXT="<resolved_context>"
+   kubectl --context="$CLUSTER_CONTEXT" describe pod <pod_name> -n <namespace>
    ```
    Check if the events contain `FailedScheduling` with messages indicating lack of resources (e.g., "0/N nodes are available", "out of resources", "quota exceeded", "didn't match Pod's node affinity/selector") or `NotTriggerScaleUp` events. When pods use a custom `ComputeClass` or request GPUs, affinity/selector mismatches indicate that GKE cannot provision nodes matching the compute class due to zonal quota or capacity limits, and this MUST be treated as an active quota or capacity constraint issue (not a false signal).
-5. **If the workload pods do not exist in the namespace, OR if there are no pods for this workload currently in `Pending` state with scheduling errors (e.g. all pods are successfully `Running` or the workload is absent)**:
-   - Identify this as a **false signal** or a transient issue that has already resolved.
-   - Immediately STOP processing.
-   - Do NOT run any further commands, do NOT search the workspace, and do NOT propose any configuration changes.
-   - Output a clear message to the user explaining that the alert is a false signal and the workload pods are currently healthy and running.
+5. **If and only if** the workload is confirmed healthy on `<cluster_context>` (zero `Pending` pods, all desired replicas `Running` and `Ready`) OR an alerted workload is absent across **every** non-excluded cluster with `fleet_scope().unread` empty and no `fleet_scope()` error:
+   - If an interactive ask cannot locate the requested cluster/workload in scope — or if `fleet_scope().unread` is non-empty or returned an `ERROR:` leaving scope unverified — stop and call `kanban_block(kind="capability")` naming what could not be verified.
+   - Otherwise (a recovered or absent background alert with verified scope): immediately STOP remediation. Do **NOT** call `kanban_block`, do not search a GitOps workspace, and do not propose changes.
+   - For a background alert where Step 1 notified and outbound chat is enabled, call `send_notification`, then finish via `kanban_complete(summary=..., result=...)` (omit `(<cluster_name>)` if unresolved; never write `"false signal"` in `result`): for a healthy running workload, `"**<workload_name> in <namespace> (<cluster_name>) is healthy; no capacity remediation is needed.**\n\nAll desired pods are Running and Ready with zero Pending pods."`; for a workload absent across verified clusters, `"**<workload_name> in <namespace> was not found across verified clusters; no capacity remediation is needed.**"` (skip `send_notification` on interactive asks).
 
-### 3. Parse Alert Details & Take a Working Copy
+### 3. Parse Alert Details & Gather Manifests (`MODE=gitops` or `MODE=chat-only`)
 
-If the pre-diagnosis checks pass (no duplicate PRs and it is a real active capacity or scale-up issue):
+If Step 2 checks pass (real active capacity constraint or scale-up failure, and no duplicate PR in GitOps mode):
 
 1. **Parse details**: Extract the GKE cluster name and location (region/zone) from the alert details.
-2. **Get a working copy.** The pod is not a git checkout. `submit_suggestion.py prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
+2. **Gather manifests based on your operating mode** (choose **Option A** in `MODE=gitops` or **Option B** in `MODE=chat-only`).
 
-   ```bash
-   python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
-     --repo "<owner>/<repo>" \
-     --branch "platform-agent/remediate-stockout-<workload_name>"
-   ```
+#### Option A: GitOps Mode (non-empty `MANAGED:` repository list)
 
-   ```json
-   {
-     "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app",
-     "repo": "acme/fleet",
-     "branch": "platform-agent/remediate-stockout-frontend-web-app",
-     "base": "main",
-     "started_from": "main",
-     "proposal": ""
-   }
-   ```
+Take a working copy using `submit_suggestion.py prepare`. The pod is not a git checkout; `prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
 
-   **Keep that whole line — every step from here works inside `workspace`.**
+```bash
+python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+  --repo "<repo>" \
+  --branch "platform-agent/remediate-stockout-<workload_name>"
+```
 
-   **A repeat alert reuses the name.** It is one per workload, so an earlier
-   remediation pull request for this workload that was closed or squash-merged
-   left its branch behind. `prepare` deletes that spent branch itself and says
-   so in its log; nothing is needed from you.
+```json
+{
+  "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app",
+  "repo": "acme/fleet",
+  "branch": "platform-agent/remediate-stockout-frontend-web-app",
+  "base": "main",
+  "started_from": "main",
+  "proposal": ""
+}
+```
 
-   **If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
-   the old branch holds revisions no closed pull request carried.
-   `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
-   it has carried a full page of pull requests, too many to read, or an open
-   pull request targets it. Treat those
-   revisions as somebody's. Report the refusal, its code and the branch,
-   and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
-   request was opened on it just now; the next run adds to it), and
-   `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
-   not complete) all mean run `prepare` once more before reporting.
-   `FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
-   away for now) means wait a few minutes, then run `prepare` once more.
-   Any other refusal: report it and stop. The helper's own message may suggest
-   another name; for this skill the name is fixed.
+**Keep that whole line — every step from here works inside `workspace`.**
 
-   **Do not put a suffix on the name to get past the refusal.** The duplicate
-   check in Step 2 §A asks the forge about
-   `platform-agent/remediate-stockout-<workload>` and nothing else, so a pull request opened on any other name is invisible to the next
-   alert for this workload: that alert finds nothing open, reaches this same
-   refusal, suffixes again, and opens a second pull request for one incident.
-   One name per workload is what makes the duplicate check a check.
+**A repeat alert reuses the name.** It is one per workload, so an earlier
+remediation pull request for this workload that was closed or squash-merged
+left its branch behind. `prepare` deletes that spent branch itself and says
+so in its log; nothing is needed from you.
 
-   > [!CAUTION]
-   > **Every version-control command from here on runs inside the printed `workspace`, and through plain `git`.** The `git` on this machine holds no credential and cannot reach the network; use it for `add`, `commit`, `diff` and every other local verb. Do not call `/opt/vcs/libexec/git` directly — it is internal to that `git`. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
+**If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
+the old branch holds revisions no closed pull request carried.
+`BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
+it has carried a full page of pull requests, too many to read, or an open
+pull request targets it. Treat those
+revisions as somebody's. Report the refusal, its code and the branch,
+and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
+request was opened on it just now; the next run adds to it), and
+`FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
+not complete) all mean run `prepare` once more before reporting.
+`FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
+away for now) means wait a few minutes, then run `prepare` once more.
+Any other refusal: report it and stop. The helper's own message may suggest
+another name; for this skill the name is fixed.
 
-   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `git checkout main`, `git pull` or `git checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
+**Do not put a suffix on the name to get past the refusal.** The duplicate
+check in Step 2 §A asks the forge about
+`platform-agent/remediate-stockout-<workload>` and nothing else, so a pull request opened on any other name is invisible to the next
+alert for this workload: that alert finds nothing open, reaches this same
+refusal, suffixes again, and opens a second pull request for one incident.
+One name per workload is what makes the duplicate check a check.
+
+> [!CAUTION]
+> **Every version-control command from here on runs inside the printed `workspace`, and through plain `git`.** The `git` on this machine holds no credential and cannot reach the network; use it for `add`, `commit`, `diff` and every other local verb. Do not call `/opt/vcs/libexec/git` directly — it is internal to that `git`. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
+
+`prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `git checkout main`, `git pull` or `git checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
 
 3. **Search the workspace**: Locate the YAML manifests **inside the printed `workspace`** using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
    - For ComputeClass definitions, check `<workspace>/agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
    - For workload deployments, check `<workspace>/deployment/` or use `search_files(pattern="deployment")`.
 
+#### Option B: Chat-Only Diagnostic Mode (no usable GitOps repository configured)
+
+Do **NOT** call `submit_suggestion.py` (`prepare` or `submit`), do **NOT** call `vcs.py`, and do **NOT** modify, patch, or delete cluster resources (`zero-write`). Instead, inspect the live workload (resolving a `ReplicaSet` pod owner back to its owning `Deployment` when an alert carries a `ReplicaSet` name), scheduling events, storage classes, `ComputeClass` manifests, and (when node-pool autoscaler bounds block scaling) GKE node-pool configuration directly on `<cluster_context>` with read-only commands:
+
+```bash
+CLUSTER_CONTEXT="<resolved_context>"
+# If the pending pod owner is a ReplicaSet, inspect its parent controller:
+kubectl --context="$CLUSTER_CONTEXT" get replicaset <replicaset_name> -n <namespace> --ignore-not-found -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}'
+kubectl --context="$CLUSTER_CONTEXT" get deployment,statefulset,daemonset,job,replicaset -n <namespace> -o yaml
+kubectl --context="$CLUSTER_CONTEXT" get computeclasses -o yaml
+kubectl --context="$CLUSTER_CONTEXT" get storageclass -o yaml
+kubectl --context="$CLUSTER_CONTEXT" get events -n <namespace> --sort-by='.lastTimestamp'
+gcloud container node-pools list --cluster="<cluster_name>" --location="<location>" --project="<project_id>" --format=yaml
+```
+
+_(If `kubectl --context="$CLUSTER_CONTEXT" get computeclasses` or `kubectl --context="$CLUSTER_CONTEXT" get storageclass` returns `NotFound` or `Forbidden`, continue diagnosing from the pod, ReplicaSet/controller, event, and node-pool outputs.)_
+
 ### 4. Diagnose Capacity, Quotas, and Resource Usage
 
-**Efficiency Directive**: Execute diagnostic commands efficiently. Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed immediately to self-review and PR creation using `submit_suggestion.py`.
+**Efficiency Directive**: Execute diagnostic commands efficiently (in both `MODE=gitops` and `MODE=chat-only`). Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed to Step 5 and then either Step 6–7 (`MODE=gitops`) or Step 6-Chat (`MODE=chat-only`).
 
 Before proposing any configuration changes (e.g., adding fallbacks, shrinking VM shapes, or reserving resources), execute the following diagnostic commands to check GCP quotas, reservations, actual workload resource utilization, and Spot VM availability advice.
 
@@ -148,8 +188,8 @@ Before proposing any configuration changes (e.g., adding fallbacks, shrinking VM
 Verify that the proposed machine families, CPU, or GPU metric counts are within the region's quota limits:
 
 ```bash
-gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=CPUS))"
-gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
+gcloud compute regions describe "<region>" --project="<project_id>" --format="json(quotas.filter(metric=CPUS))"
+gcloud compute regions describe "<region>" --project="<project_id>" --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
 ```
 
 _Note: Filter by other metric names (e.g., `N4_CPUS`, `C4_CPUS`, `NVIDIA_T4_GPUS`, `NVIDIA_A100_GPUS`) to inspect specific hardware._
@@ -159,7 +199,7 @@ _Note: Filter by other metric names (e.g., `N4_CPUS`, `C4_CPUS`, `NVIDIA_T4_GPUS
 Check if any zonal reservations are available for the target workload's machine type to guarantee compute capacity:
 
 ```bash
-gcloud compute reservations list --format="json"
+gcloud compute reservations list --project="<project_id>" --format="json"
 ```
 
 #### C. Actual Workload Resource Usage
@@ -167,14 +207,15 @@ gcloud compute reservations list --format="json"
 Before proposing resource reservations or changing VM shapes, analyze actual usage and account for potential spikes. Use:
 
 ```bash
+CLUSTER_CONTEXT="<resolved_context>"
 # Get node CPU/memory utilization summary
-kubectl top node
+kubectl --context="$CLUSTER_CONTEXT" top node
 
 # Fetch raw metrics from the metrics API server
-kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes"
+kubectl --context="$CLUSTER_CONTEXT" get --raw "/apis/metrics.k8s.io/v1beta1/nodes"
 
 # Get pod CPU/memory utilization summary
-kubectl top pod -n <namespace>
+kubectl --context="$CLUSTER_CONTEXT" top pod -n <namespace>
 ```
 
 #### D. Spot VM Availability and Pricing Advice
@@ -188,7 +229,8 @@ If configuring fallback Spot instances or diagnosing GPU capacity constraints, u
        --instance-selection-machine-types="g2-standard-4,g2-standard-12,n1-standard-4" \
        --target-distribution-shape=ANY \
        --size=1 \
-       --region=us-central1 \
+       --region="<region>" \
+       --project="<project_id>" \
        --format="json"
    ```
 2. **Preemption Rate and Price History**:
@@ -197,7 +239,8 @@ If configuring fallback Spot instances or diagnosing GPU capacity constraints, u
        --provisioning-model=SPOT \
        --machine-type=g2-standard-4 \
        --types=PREEMPTION,PRICE \
-       --region=us-central1 \
+       --region="<region>" \
+       --project="<project_id>" \
        --format="json"
    ```
 
@@ -206,18 +249,19 @@ If configuring fallback Spot instances or diagnosing GPU capacity constraints, u
 To check if the cluster autoscaler is actively scaling, stalled, or stuck in a priority backoff reset loop:
 
 ```bash
-kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
+CLUSTER_CONTEXT="<resolved_context>"
+kubectl --context="$CLUSTER_CONTEXT" get configmap cluster-autoscaler-status -n kube-system -o yaml
 ```
 
 _Note: The `.data.status` field in this ConfigMap is a multi-line text block. Parse it as text, locate the `NodeGroups` section, and check if any groups show `BackoffInfo` with `BackoffUntil` timestamps._
 
 **RBAC Fallback:** If this command returns `Forbidden` or is otherwise unavailable, do not fail. Fall back to analyzing pod events for `NotTriggerScaleUp` or `FailedScheduling` events, and rely on `gcloud compute regions describe` and Spot capacity advice.
 
-_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), and attempt the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`), and report ALL executed `gcloud` and `kubectl` diagnostic commands (including failed/denied attempts) in BOTH the chat notification (`send_notification`) and the Pull Request description.
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), and attempt the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`). In `MODE=gitops`, report ALL executed `gcloud` and `kubectl` diagnostic commands (including failed/denied attempts) in the Pull Request description (`- **Checks Performed**:`). In `MODE=chat-only`, do NOT paste raw `bash` blocks or CLI flags into `send_notification` or `kanban_complete` `result`; summarize the observed quota, capacity, and autoscaler facts in plain language instead.
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
-Inspect the target `ComputeClass` and workload manifests in the printed `workspace`, checking against the following debugging rules:
+Inspect the target `ComputeClass` and workload manifests (in the printed `workspace` for `MODE=gitops`, or in the live `kubectl get ... -o yaml` output from Step 3 for `MODE=chat-only`), checking against the following debugging rules:
 
 #### Rule A: Lack of Zone/Family Fallbacks
 
@@ -270,7 +314,23 @@ Inspect the target `ComputeClass` and workload manifests in the printed `workspa
   2. **Incompatible fallback check:** Inspect the `ComputeClass` `priorities` list. If the workload uses Hyperdisk and the `priorities` list contains Gen 2 machine families (like `c2`, `n2`, or `e2`) as fallbacks, flag this as a Rule H violation.
 - **Fix**: Increase CCC fallback options to other machine families compatible with Hyperdisk (e.g. `c3`, `c4`, `n4`, `c3d`), and remove fallbacks which do not work with Hyperdisk (`c2`, `n2`, `e2`).
 
-### 6. Create GitOps Remediation Proposal
+### 6-Chat. Chat-Only Diagnostic Report (`MODE=chat-only` — No PR, Zero Writes)
+
+If `MODE=chat-only` (because no usable GitOps repository is configured in `/etc/gitops/managed_repos`):
+
+- **STOP before file edits, commits, or PR creation**: skip **Steps 6 and 7** completely. Do **NOT** invoke `submit_suggestion.py`, `vcs.py`, `git`, or any mutating `kubectl` / `gcloud` commands.
+- **Terminology & Chat formatting (applies to `kanban_complete` `result` and `send_notification`)**: Use `"capacity constraint"` or `"scale-up failure"` in both `kanban_complete(result=...)` and any chat notification — do NOT call the diagnosis a `"stockout"`. Follow `SOUL.md` §7: open Line 1 with one concise bold sentence (~150 chars or fewer; omit location details if unknown) naming what failed on `<workload_name>` (`<cluster_name>`) and the action needed, keep notifications under 2,000 chars using `## What's wrong`, `## Why`, and `## What to do`, name the blocking node pool or `ComputeClass` plainly, optionally link `[GKE Workloads Console](https://console.cloud.google.com/kubernetes/workload/overview?project=<project_id>)` (from `SOUL.md` §5 when `<project_id>` is resolved; never guess other URLs), explain quota/capacity evidence in plain English (no rule codes or CLI dumps), state in prose outside code comments that no GitOps repository is configured, so no pull request was opened, and include valid declarative Kubernetes, Config Connector, or `ComputeClass` YAML (never CLI commands inside a `yaml` block).
+- **Avoid duplicate chat posts**:
+  - When investigating a background Pub/Sub alert (where no interactive chat user is waiting in a task thread), call `send_notification` (or `mcp_platform_control_send_notification`) if an outbound chat channel is enabled; if none is enabled or delivery is unavailable, proceed directly to `kanban_complete` without calling `kanban_block`:
+
+````json
+send_notification(message="**<workload_name> in <namespace> (<cluster_name>) cannot scale up; <recommended operator action>.**\n\n## What's wrong\n<pending pod impact, cluster/namespace, blocking node pool or ComputeClass>.\n\n## Why\n<plain-English autoscaler, quota, and capacity evidence without rule codes or CLI dumps> ([GKE Workloads Console](https://console.cloud.google.com/kubernetes/workload/overview?project=<project_id>)).\n\n## What to do\nNo GitOps repository is configured, so no pull request was opened. Apply this declarative configuration:\n```yaml\n# Remediation: <how this manifest change resolves the capacity constraint>\n<concrete declarative ComputeClass, ContainerNodePool, or workload YAML manifest>\n```")
+````
+
+- When responding to an interactive chat ask (where the requester's thread receives `kanban_complete.result` automatically), skip `send_notification` so you do not duplicate the report into the home channel.
+- In both cases, finish by calling `kanban_complete` with BOTH a one-line `summary` AND the full formatted chat-only diagnostic report in `result` (matching every formatting requirement above: bold Line 1, plain-English quota/capacity evidence, blocking node pool or `ComputeClass`, declarative YAML fix, and explicit prose stating no GitOps repository is configured, so no pull request was opened), then end your turn without calling `kanban_block`.
+
+### 6. Create GitOps Remediation Proposal (`MODE=gitops` only)
 
 > [!CAUTION]
 > **CRITICAL MANDATE: NEVER USE THE `execute_code` TOOL OR PYTHON SUBSHELLS.**
@@ -294,7 +354,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `git add .`, `git add -A`, or `git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
 5. Commit using a Conventional Commit message (e.g., `cd <workspace> && git commit -m "fix(compute-class): add fallback machine families to remediate capacity constraint"`).
 
-### 7. Submit Suggestion & Open PR
+### 7. Submit Suggestion & Open PR (`MODE=gitops` only)
 
 **CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT reach for a forge CLI. Do NOT write your own python script to create the PR.
 
@@ -346,7 +406,7 @@ cat > "$EVIDENCE" <<'EOF'
 EOF
 
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
-  --repo "<owner>/<repo>" \
+  --repo "<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE capacity constraint for <workload_name>" \
   --body-file "$BODY" \
@@ -360,10 +420,10 @@ The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc exp
 
 `submit` finds the working copy `prepare` made, so there is nothing else from Step 3 to hand back — but `--branch` must be the branch you are standing on, and it refuses rather than guessing if the copy is on another one. Anything still uncommitted is recorded as one revision under `--title`. The script returns the live PR URL on stdout.
 
-When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
+When running on a **background Pub/Sub alert** (skip `send_notification` on interactive chat asks, because `kanban_complete.result` already posts to the requester's thread), before finishing, call `send_notification` (or `mcp_platform_control_send_notification`) if an outbound chat channel is enabled to post a concise plain-English remediation summary linking `<PR_URL>` (do not paste raw CLI blocks):
 
-````json
-send_notification(message="🛠️ GKE Capacity Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
-````
+```json
+send_notification(message="**<workload_name> in <namespace> (<cluster_name>): opened [remediation PR](<PR_URL>).**\n\n- **Summary**: <plain-English capacity constraint and manifest fix summary without CLI dumps>.")
+```
 
-After calling the tool, provide the user with the generated PR URL and a summary of your findings.
+After sending the notification (or skipping it on an interactive chat ask), return the generated PR URL and a plain-English summary of your findings via `kanban_complete`.

@@ -5,10 +5,10 @@ plugin: a Helm chart that creates an `AgentPlugin` custom resource, and an OCI i
 holding the code the agent loads. The operator mounts the image and enables the plugin in
 the profile the CR names; nothing in `deploy/` or `agents/` has to change to add one.
 
-| Plugin                                                    | What it adds                                                                      |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| [`pubsub-platform`](pubsub-platform/)                     | A Pub/Sub ingress adapter: turns filtered Cloud Logging alerts into agent work    |
-| [`gke-stockout-investigator`](gke-stockout-investigator/) | A skill that diagnoses GKE scale-up failures and proposes a GitOps remediation PR |
+| Plugin                                                    | What it adds                                                                                                     |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| [`pubsub-platform`](pubsub-platform/)                     | A Pub/Sub ingress adapter: turns filtered Cloud Logging alerts into agent work                                   |
+| [`gke-stockout-investigator`](gke-stockout-investigator/) | A skill that diagnoses GKE scale-up failures and proposes a GitOps remediation PR or chat-only diagnostic report |
 
 The two are usually installed together — the investigator's alerts arrive through the
 adapter — but neither requires the other.

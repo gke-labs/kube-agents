@@ -488,5 +488,32 @@ class KccCollectorSoulRoutingTest(unittest.TestCase):
         self.assertIn("could not be read or is unserved/unestablished", cluster_soul)
 
 
+class PlatformPluginSkillRoutingTest(unittest.TestCase):
+    @staticmethod
+    def _h2_section(markdown: str, heading: str) -> str:
+        marker = f"\n## {heading}\n"
+        start = markdown.index(marker) + 1
+        next_heading = markdown.find("\n## ", start + len(marker))
+        return markdown[start:] if next_heading == -1 else markdown[start:next_heading]
+
+    def test_platform_soul_loads_plugin_skills_before_delegating(self):
+        soul_text = (REPO_ROOT / "agents/platform/SOUL.md").read_text(encoding="utf-8")
+        agents_text = (REPO_ROOT / "agents/platform/AGENTS.md").read_text(encoding="utf-8")
+        chat_soul_text = (REPO_ROOT / "agents/chat/SOUL.md").read_text(encoding="utf-8")
+
+        soul_delegation = self._h2_section(soul_text, "6. Delegation & Cluster-Agent Lifecycle")
+        agents_delegation = self._h2_section(agents_text, "Delegation")
+        chat_routing = self._h2_section(chat_soul_text, "3. What Lives Behind You")
+
+        self.assertNotIn("the exception is a cluster that has no Cluster Agent", soul_delegation)
+        for section in (soul_delegation, agents_delegation):
+            self.assertIn("skill_view", section)
+            self.assertIn("platform-scoped plugin skill", section)
+            self.assertIn("Cluster Agents lack platform-scoped plugins", section)
+        self.assertIn("GKE Scale-up Failure Alert", chat_routing)
+        self.assertIn("gke-stockout-investigator", chat_routing)
+        self.assertIn("Cluster Agents do not have platform-scoped plugins", chat_routing)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2024,7 +2024,7 @@ plugins:
       tag: "" # defaults to Chart.appVersion
       pullPolicy: IfNotPresent
 
-  # GKE Stockout Investigator AgentPlugin: diagnoses autoscaler scale-up failures and opens GitOps PRs.
+  # GKE Stockout Investigator AgentPlugin: diagnoses autoscaler scale-up failures and opens GitOps PRs (or posts chat-only diagnostic reports without a GitOps repo).
   # Requires plugins.pubsubPlatform.enabled=true for alert ingress.
   stockoutInvestigator:
     enabled: false
