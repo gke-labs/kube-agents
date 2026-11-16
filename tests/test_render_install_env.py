@@ -150,8 +150,10 @@ class MinterGuardTest(unittest.TestCase):
             strict=True)
         self.assertEqual(rc, 0, log)
         got = parse(text)
-        self.assertEqual((got["KMS_KEYRING"], got["KMS_KEY"], got["GITHUB_MINTER_GSA_NAME"]),
-                         ("github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"))
+        self.assertEqual((got["KMS_KEYRING"], got["KMS_KEY"], got["GITHUB_MINTER_GSA_NAME"],
+                          got["GITHUB_MINTER_KSA_NAME"]),
+                         ("github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa",
+                          "kubeagents-github-minter"))
         # Names the environment sets are kept, and an install without a minter gets none.
         _, _, text = render(
             {**_COORDS, **_STRICT_OK, "GITHUB_APP_ID": "12345", "GITOPS_ORG": "o", "GITOPS_REPO": "r",
@@ -159,6 +161,7 @@ class MinterGuardTest(unittest.TestCase):
         self.assertEqual((parse(text)["KMS_KEYRING"], parse(text)["KMS_KEY"]), ("env-ring", "env-key"))
         _, _, text = render({**_COORDS, **_STRICT_OK}, strict=True)
         self.assertNotIn("KMS_KEYRING", parse(text))
+        self.assertNotIn("GITHUB_MINTER_KSA_NAME", parse(text))
 
     def test_none_of_the_three_is_an_install_without_a_minter(self):
         rc, log, _ = render({**_COORDS, **_STRICT_OK}, strict=True)

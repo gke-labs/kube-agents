@@ -2,12 +2,7 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"reflect"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -180,8 +175,8 @@ func TestBuildProfileNetworkPolicy(t *testing.T) {
 	}
 }
 
-// LiteLLM admits profile pods on a next install and not otherwise.
-func TestLiteLLMAdmitsProfilePodsOnNextOnly(t *testing.T) {
+// LiteLLM admits profile pods on every install, whatever spec.mode says.
+func TestLiteLLMAdmitsProfilePods(t *testing.T) {
 	profile := netpolProfile{Generated: true, DNSClusterIPs: []string{"10.96.0.10"}}
 	admits := func(agent *agentv1alpha1.PlatformAgent) bool {
 		for _, rule := range buildLiteLLMNetworkPolicy(agent, profile).Spec.Ingress {
@@ -193,24 +188,12 @@ func TestLiteLLMAdmitsProfilePodsOnNextOnly(t *testing.T) {
 		}
 		return false
 	}
-	next := a2aTestAgent()
-	if !a2aStackRendering(next) {
-		t.Fatal("the next fixture doesn't render the A2A stack, so the first assertion would be vacuous")
-	}
-	if !admits(next) {
-		t.Error("LiteLLM's policy does not admit the profile namespace on a next install")
-	}
-	today := a2aTestAgent()
-	today.Spec.Mode = ptr.To("today")
-	if admits(today) {
-		t.Error("LiteLLM's policy admits the profile namespace on a today install, where no profile pods exist")
-	}
-	// Version skew freezes the bus fence with its profile peer; LiteLLM's
-	// policy must not narrow under it (a2aAgentSurface).
-	skew := a2aTestAgent()
-	skew.Spec.Mode = ptr.To("later")
-	if !admits(skew) {
-		t.Error("LiteLLM's policy drops the profile namespace on a skew pass while the bus fence keeps it")
+	for name, mode := range map[string]*string{"next": ptr.To("next"), "no mode": nil, "a stored today": ptr.To("today")} {
+		agent := a2aTestAgent()
+		agent.Spec.Mode = mode
+		if !admits(agent) {
+			t.Errorf("LiteLLM's policy does not admit the profile namespace on an install with %s", name)
+		}
 	}
 }
 
@@ -233,32 +216,6 @@ func TestAgentOfProfileFence(t *testing.T) {
 		if got, ok := agentOfProfileFence(np); ok {
 			t.Errorf("%s maps to %v, want nothing", name, got)
 		}
-	}
-}
-
-// A today install whose only A2A residue is the profile fence (a guardrail
-// pass that died after it and before the NATS fence) still runs the
-// teardown, and cleanupA2A removes the fence and the quota.
-func TestTheProfileFenceAloneDrivesTheTeardown(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	fence := buildProfileNetworkPolicy(agent, nil)
-	withCommonLabels(fence, agent)
-	quota := buildProfileQuota(agent, nil)
-	withCommonLabels(quota, agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence, quota).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.cleanupA2A(context.Background(), agent); err != nil {
-		t.Fatalf("cleanupA2A: %v", err)
-	}
-	var np networkingv1.NetworkPolicy
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile fence survived a teardown it was the only residue of (err %v)", err)
-	}
-	var q corev1.ResourceQuota
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: quota.Name}, &q); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile quota survived the flip to today (err %v)", err)
 	}
 }
 
@@ -318,94 +275,6 @@ func TestWithoutProfilePeer(t *testing.T) {
 	withoutProfilePeer(open, agent)
 	if len(open.Spec.Ingress) != 1 {
 		t.Error("a rule with no peers (allow from anywhere) was dropped; only one the profile peer emptied may be")
-	}
-}
-
-// The flip deletes the profile fence after the bus fence that admits the
-// namespace, so no pass leaves the bus admitting a namespace nothing
-// confines; and a pass whose quota delete fails keeps the fence, the
-// sentinel that brings the teardown back for the quota.
-func TestTheFlipDeletesTheProfileFenceAfterTheBusFence(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	agent.UID = "agent-uid"
-	nats := buildA2ANATSNetworkPolicy(agent)
-	if err := ctrl.SetControllerReference(agent, nats, scheme); err != nil {
-		t.Fatal(err)
-	}
-	fence := buildProfileNetworkPolicy(agent, nil)
-	withCommonLabels(fence, agent)
-	quota := buildProfileQuota(agent, nil)
-	withCommonLabels(quota, agent)
-	var order []string
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, nats, fence, quota).WithInterceptorFuncs(interceptor.Funcs{
-		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			order = append(order, obj.GetNamespace()+"/"+obj.GetName())
-			return c.Delete(ctx, obj, opts...)
-		},
-	}).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.cleanupA2A(context.Background(), agent); err != nil {
-		t.Fatalf("cleanupA2A: %v", err)
-	}
-	at := func(name string) int {
-		for i, o := range order {
-			if o == name {
-				return i
-			}
-		}
-		return -1
-	}
-	busAt, fenceAt := at("test-ns/"+nats.Name), at("test-ns-profiles/"+fence.Name)
-	if busAt < 0 || fenceAt < 0 || fenceAt < busAt {
-		t.Errorf("delete order %v: the profile fence (at %d) must go after the bus fence (at %d)", order, fenceAt, busAt)
-	}
-
-	// A transient failure on the quota keeps the fence for the retry.
-	fence2 := buildProfileNetworkPolicy(agent, nil)
-	withCommonLabels(fence2, agent)
-	quota2 := buildProfileQuota(agent, nil)
-	withCommonLabels(quota2, agent)
-	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence2, quota2).WithInterceptorFuncs(interceptor.Funcs{
-		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if obj.GetName() == quota2.Name {
-				return apierrors.NewTooManyRequests("throttled", 1)
-			}
-			return c.Delete(ctx, obj, opts...)
-		},
-	}).Build()
-	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.cleanupA2A(context.Background(), agent); err != nil {
-		t.Fatalf("cleanupA2A with a throttled quota delete: %v", err)
-	}
-	var np networkingv1.NetworkPolicy
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence2.Name}, &np); err != nil {
-		t.Errorf("the profile fence was deleted on a pass whose quota delete failed, so nothing brings the teardown back for the quota (err %v)", err)
-	}
-}
-
-// A refused delete in the profile namespace doesn't hold the flip's
-// teardown: it carries on and logs it.
-func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
-	scheme := setupScheme()
-	refuse := interceptor.Funcs{
-		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if obj.GetNamespace() == "test-ns-profiles" {
-				return apierrors.NewForbidden(schema.GroupResource{Resource: "resourcequotas"}, obj.GetName(), fmt.Errorf("refused by a policy in the profile namespace"))
-			}
-			return c.Delete(ctx, obj, opts...)
-		},
-	}
-	// The flip to today: cleanupA2A returns nothing for it.
-	today := a2aTestAgent()
-	today.Spec.Mode = ptr.To("today")
-	fence := buildProfileNetworkPolicy(today, nil)
-	withCommonLabels(fence, today)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(today, fence).WithInterceptorFuncs(refuse).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.cleanupA2A(context.Background(), today); err != nil {
-		t.Errorf("cleanupA2A with a refused profile delete = %v, want it logged", err)
 	}
 }
 

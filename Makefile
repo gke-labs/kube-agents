@@ -394,6 +394,13 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # ever produce files that exist; a hand-typed PYTHON_TEST_FILES=tests/, the
 # old per-directory habit on the new variable, is how such a path arrives.
 #
+# Each file runs with KUBECONFIG set to an empty file of its own. A kubectl or
+# helm call that a test leaves unstubbed, and that inherits the file's
+# environment, then finds no cluster, on a developer's machine as in CI. A call
+# a test starts with an environment of its own is outside this.
+# One file per test file, not one for the sweep, so a test that writes a
+# context into its KUBECONFIG cannot hand it to a file running beside it.
+#
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
@@ -411,6 +418,7 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	name="$$(basename "$$file")"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
 	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     : >"$$stem.kubeconfig" && export KUBECONFIG="$$stem.kubeconfig" && \
 	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
 		rc=0; printf "    ok  %s\n" "$$file"; \
 	else \
@@ -910,10 +918,10 @@ docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged re
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
 	@python3 scripts/check_pr_template.py
 
-chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
+chart-sync: ## Sync the chart's CRD, RBAC-rule and admission-policy copies from k8s-operator/config, write config/profiles/role.yaml (the Role document's copy for the profile namespace), and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).

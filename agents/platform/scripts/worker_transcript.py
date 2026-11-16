@@ -91,9 +91,21 @@ VALUE_SPAN_LINE = "line"
 VALUE_SPAN_TOKEN = "token"
 TEXT_ARG_KEYS = ("content",)
 # A backslash-escaped space continues a shell word (`password=my\ secret\
-# phrase` is one value). `scrub_step_text` folds each to a character no rule
-# reads as whitespace before the redactor runs, so the redactor and the
-# supplement see one token, and the supplement unfolds what survives.
+# phrase` is one value). `scrub_step_text` folds each to a character the
+# value rules do not read as whitespace before the redactor runs, so the
+# redactor and the supplement see one token, and the supplement unfolds what
+# survives.
+# Every `\ ` folds, also after an even backslash run, where bash ends the word
+# (`a\\ b` is `a\` and `b`): `eval`, `ssh host …`, `watch` and a nested
+# `bash -c "…"` read the words again and halve the run, so there the space
+# does not split, and a value rule reading one word masks the value either
+# way. The CLI flag rules also read a flag right after the mark as a new
+# word, in a second pass after every other supplement rule (the
+# `*_AT_FOLD_RE` rules), which covers the plain reading. A last pass, not a
+# wider first one: a match that started at the mark could take the text a
+# real flag's match needs (`my\ -prod.cnf -p S`), or a command word a later
+# rule reads. Masking a value too many is harmless, and
+# missing one is not.
 SHELL_ESCAPED_SPACE = "\\ "
 SHELL_ESCAPED_SPACE_FOLD = "\ue000"
 # A line that opens a JSON document; the manifest marker that licenses the
@@ -200,6 +212,23 @@ CLI_USERPASS_ARG_RE = re.compile(
 CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
     r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
+)
+# The three rules above, for a flag that starts right after the escaped-space
+# mark, run as a second pass (see `SHELL_ESCAPED_SPACE`). The user part of
+# `user:pass` stops at the mark, so a run of `\ -u` costs linear time.
+CLI_LONG_FLAG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
+)
+CLI_USERPASS_ARG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"(?:-u|--user)[ \t=]*)"
+    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+    r"|(?P<user>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+)
+CLI_SHORT_P_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
+    r"[^\r\n;|&]{0,512}?" + SHELL_ESCAPED_SPACE_FOLD + r"-(?:p|a)[ \t=]*)"
     r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
 )
 # The two rules above end a command's segment at `;`, `|` or `&`, but a
@@ -819,6 +848,9 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
         return CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
 
+    def _mask_userpass_segment_at_fold(match: "re.Match[str]", source: str) -> str:
+        return CLI_USERPASS_ARG_AT_FOLD_RE.sub(_mask_userpass, source[match.start() : match.end()])
+
     def _mask_userpass(match: "re.Match[str]") -> str:
         quote = match.group("quote") or ""
         user = match.group("quser") if quote else match.group("user")
@@ -850,6 +882,11 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv, extend)
     text = QUOTED_COLON_KV_RE.sub(_mask_quoted_colon_kv, text)
     text = sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv, extend)
+    # The second pass, last: every rule above has read the text as before, so
+    # these only add masks (`SHELL_ESCAPED_SPACE`).
+    text = CLI_LONG_FLAG_AT_FOLD_RE.sub(_mask_long_flag, text)
+    text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment_at_fold)
+    text = sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, text, _mask_short_p)
     return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
 
 
@@ -1050,8 +1087,10 @@ def fold_shell_continuations(command: str) -> str:
 def fold_shell_command(command: str) -> str:
     """A command as the credential rules read it: a backslash-newline
     continuation joined to its line (an even run or a CRLF joined with a space,
-    see `_fold_line_breaks`), and an escaped space folded to one token
-    character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
+    see `_fold_line_breaks`), and every escaped space folded to one token
+    character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`),
+    also after an even backslash run; the CLI flag rules read a flag after
+    the mark as a new word in a second pass (`SHELL_ESCAPED_SPACE`)."""
     return _fold_line_breaks(command, masking=True).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 

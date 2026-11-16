@@ -294,6 +294,19 @@ type TaskRef struct {
 	// runs at its tier, and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
+	// Scope is a profile task's scope, recorded at mint: its target's
+	// cluster path, or the install's namespace scope for a task with no
+	// target. Never empty on a profile task this gateway minted, so an
+	// empty one on a profile parent means the scope and chain weren't
+	// recorded, and its delegation is refused (#5686).
+	Scope string `json:"scope,omitempty"`
+	// ProfileChain is the profiles of the waiting profile tasks above a
+	// profile task, nearest last, recorded at mint. A top submission, and
+	// a profile task delegated from a session turn or a wake, heads its
+	// chain and has none: neither a session nor a wake's ended child is a
+	// profile task waiting open. Carried rather than walked, because the
+	// bounded history can evict an ancestor and a walk would then miss it.
+	ProfileChain []string `json:"profileChain,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.

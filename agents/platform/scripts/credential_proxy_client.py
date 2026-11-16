@@ -2425,7 +2425,11 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
+    """The command line: the names the shim is linked as, the explicit
+    form, and `--ensure-kubectl-context`. Ends with SystemExit. The
+    images' launcher imports this module, so its precompiled bytecode
+    is used, and calls this."""
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
         try:
             ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
@@ -2462,3 +2466,7 @@ if __name__ == "__main__":
             fallback=fallback,
         )
     )
+
+
+if __name__ == "__main__":
+    main()
