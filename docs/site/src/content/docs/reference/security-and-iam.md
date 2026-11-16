@@ -453,8 +453,11 @@ Any other value is treated as `none`.
 With `KUBEAGENTS_DIAL` set to `on`, the broker also reads the autonomy dial's level, and the stricter
 of the two applies: at Explain the broker refuses what `none` refuses, and the refusal's detail names
 the dial. The broker keeps the last level it was given for as long as its Pod lives; a new broker Pod,
-which every operator roll makes, reads Explain until it is given one. Nothing sets the level yet, so
-turning `KUBEAGENTS_DIAL` on today makes the install explain-only.
+which every operator roll makes, reads Explain until it is given one. The level is set through the
+broker's `POST /v1/dial` route, which only the agent Pod's chat role may call, so no command the agent
+runs in the sandbox can move it. Below Auto-merge proven fixes the broker also refuses any write that
+adds the `kube-agents:auto-merge` label, with the code `DIAL_AUTOMERGE_OFF`. Nothing calls the route
+yet, so turning `KUBEAGENTS_DIAL` on today makes the install explain-only.
 
 ## Change control & safety
 

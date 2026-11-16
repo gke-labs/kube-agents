@@ -1441,6 +1441,9 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
+# The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
+DIAL_PATH = "/v1/dial"
+DIAL_MAX_REQUEST_BYTES = 1024
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -2592,6 +2595,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The MCP pod reaches this family and no other; which verbs within it is
     # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
     ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
+    # The autonomy dial's level (vcs_broker.dial_level), reported from the agent
+    # pod after an install admin's pick. The chat role alone: the agent pod holds
+    # that token and the sandbox the model drives does not, so no command the
+    # model runs can move the dial, in either direction.
+    (DIAL_PATH, (CALLER_ROLE_CHAT,)),
 )
 
 # The failure kind a 5xx on a route family counts under, keyed by the family
@@ -13699,6 +13707,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.path == feedback_broker.ROUTE:
             self._handle_feedback_post()
             return
+        if self.path == DIAL_PATH:
+            self._handle_dial_post(principal)
+            return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
@@ -15211,6 +15222,52 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
+
+    def _handle_dial_post(self, principal: Principal | None) -> None:
+        """`POST /v1/dial` — the agent pod reports the autonomy dial's level.
+
+        The body is `{"level": "explain" | "propose" | "automerge"}`. With
+        `KUBEAGENTS_DIAL` not `on` the dial is no source and nothing is stored
+        (409 DIAL_OFF), so a stale report cannot outlive the switch.
+
+        The chat role, named: ROUTE_ROLES admits a principal with no role
+        everywhere (a broker no operator has given a second audience), and on
+        such a broker the sandbox's token would carry no role either. A dial the
+        model could move is no dial, so that caller is refused here.
+        """
+        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:
+            LOGGER.warning(
+                "refused a dial report from role=%s", _sanitize_for_logging(getattr(principal, "role", "") or "none")
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "only the agent pod's chat role may report the dial", "code": "CALLER_ROLE_FORBIDDEN"},
+            )
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > DIAL_MAX_REQUEST_BYTES:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            level = payload.get("level")
+            if not isinstance(level, str) or level not in vcs_broker.DIAL_LEVELS:
+                raise ValueError(f"level must be one of {', '.join(vcs_broker.DIAL_LEVELS)}")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if not vcs_broker.dial_enabled():
+            self._json(HTTPStatus.CONFLICT, {"error": "KUBEAGENTS_DIAL is not on", "code": "DIAL_OFF"})
+            return
+        before = vcs_broker.dial_level()
+        vcs_broker.set_dial_level(level)
+        if before != level:
+            LOGGER.info("dial level set from=%s to=%s", before, level)
+        self._json(
+            HTTPStatus.OK,
+            {"level": level, "writeMode": vcs_broker.write_mode()[0], "automerge": vcs_broker.dial_allows_automerge()},
+        )
 
     def _handle_forge_refresh(self, provider: str = "") -> None:
         """`POST /v1/forge/refresh` — make a credential current before it is spent.
