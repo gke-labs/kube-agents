@@ -402,7 +402,8 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			ImagePullSecrets: sessionImagePullRefs(s.cfg.ImagePullRefs),
+			RestartPolicy:    corev1.RestartPolicyNever,
 			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
 			// asked as written first: 2 DNS queries, not up to 14 (#5590).
 			DNSConfig: &corev1.PodDNSConfig{
@@ -600,6 +601,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		if s.cfg.CredentialProxyExecURL != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
 		}
+		if s.cfg.UniverseDomain != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: envGoogleCloudUniverseDomain, Value: s.cfg.UniverseDomain})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,
@@ -638,6 +642,17 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		return "", err
 	}
 	return created.Name, nil
+}
+
+func sessionImagePullRefs(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return refs
 }
 
 func (s *podSpawner) Delete(ctx context.Context, podName string) error {
