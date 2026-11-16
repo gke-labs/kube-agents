@@ -742,9 +742,10 @@ spec:
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
-    {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
+    {{- $saAnnotations := include "kube-agents.nonEmptyStringMap" .Values.platformAgent.security.serviceAccountAnnotations }}
+    {{- if $saAnnotations }}
     serviceAccountAnnotations:
-      {{- toYaml . | nindent 6 }}
+      {{- $saAnnotations | nindent 6 }}
     {{- end }}
     {{- /*
       Rendered when the pool is armed or carries members, and omitted otherwise, so
