@@ -116,11 +116,11 @@ flowchart LR
 The nightly never validates. Its badge is labelled as `main`, reads "Passes on main", and is
 supporting evidence a reader can open; a validated cell names the build the customer installs.
 
-The validated-capabilities is a process, not a signature. The lane's record plus the rule decide the
+A validated cell comes from a process, not a signature. The lane's record plus the rule decide the
 cell; no person approves a validated cell by hand. A human may waive or revoke a cell with a
 recorded, dated line and its reason, and the page shows that line beside the cell.
 
-A failing validated-capabilities cannot stop the release it ran on, since the lane runs after publish;
+A failed rating cannot stop the release it ran on, since the lane runs after publish;
 it holds the next promotion. The release pipeline does not promote the next candidate while the
 newest GA carries a "Not validated" cell from a closed window (60 scored repetitions) with a
 scored miss or a safety violation, and no recorded waiver. "Not enough runs" and "Not validated,
@@ -231,7 +231,7 @@ The page is not checked in; when it is, it shows:
 | The page does not compare records across models; a model change still closes the open window                                                                                                                                         | 2026-11-09 |
 | No validated cell when more than about a third of a window's repetitions are infra; the share is shown                                                                                                                               | 2026-11-06 |
 | The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                                                                       | 2026-11-06 |
-| A failing validated-capabilities holds the next promotion: no promotion while the newest GA carries a "Not validated" cell from a closed window (a scored miss or a safety violation) without a recorded waiver                      | 2026-11-06 |
+| A failed rating holds the next promotion: no promotion while the newest GA carries a "Not validated" cell from a closed window (a scored miss or a safety violation) without a recorded waiver                                       | 2026-11-06 |
 | No named sign-off: the lane's record plus the rule validate; a human may waive or revoke a cell with a recorded, dated line and reason                                                                                               | 2026-11-06 |
 | The 0.80 weakest-test floor is dropped: under 57-of-60 per test it cannot fire                                                                                                                                                       | 2026-11-06 |
 | 3 repetitions per build while the suite is built out, rising to 30 on measured unit times; two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish | 2026-11-10 |
@@ -265,7 +265,7 @@ The page is not checked in; when it is, it shows:
   newest GA before it promotes; a waiver file with a dated line and reason per waived cell; the
   gate state rendered on the page.
 - **Validated Capabilities at candidate time.** The stronger form of the gate: the lane runs on every
-  candidate before publish, so a failing validated-capabilities stops the release it ran on. Cost: one
+  candidate before publish, so a failed rating stops the release it ran on. Cost: one
   more lane on every candidate, 30 to 60 repetitions per scenario.
 - **The mixed-tree alternative.** `main` could supply the harness, roster and chart template for
   a release whose tree lacks the tier, with the record naming both commits. Recommended against:
