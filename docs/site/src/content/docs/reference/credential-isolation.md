@@ -237,8 +237,8 @@ None is mounted in the dashboard.
   - for a ReplicaSet, the `pod-template-hash` label, and only when the ReplicaSet's name ends in `-<hash>`. For any other ReplicaSet, neither the ownerReference nor the label is relayed;
   - never the Pod's name, namespace or UID, another owner, an annotation, another label, `managedFields`, the spec or the environment.
 - **Audit-report store** — under `mode: next`, seven routes under `/v1/audit-reports`, relayed to the store listener in the gateway Pod's `agent-api-auth` container. The broker presents its `kubeagents-audit-report-store` token, read fresh on each call. A body over 1 MiB is refused, no token or body is logged, and the exec tier doesn't serve these routes. Two roles reach them:
-  - a profile worker reads when its task credential's profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` (`fleet-audit,platform`). It writes only with a builtin trigger named `schedule/<audit>` whose stream is the audit it writes, and only to the install's GitOps repository key, or `no_forge%2Flocal` on an install with none. One with no task credential is refused;
-  - the sandbox's shell reads every stream and writes to those keys alone, as it writes today's file store directly.
+  - a profile worker reads when its task credential's profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` (`fleet-audit,platform`). It writes only with a builtin trigger named `schedule/<audit>` whose stream is the audit it writes, and only to the repository the audit publishes to, or `no_forge%2Flocal` when there is none. One with no task credential is refused;
+  - the sandbox's shell reads every stream and writes that key or any repository registered in `managed_repos`, as it writes today's file store directly.
 - **Pub/Sub platform adapter** — four subscription calls (read, pull, acknowledge, modifyAckDeadline) under `/v1/pubsub/gcp/`, presented with the gateway's `kubeagents-credential-proxy-chat` audience and confined to the subscriptions the operator renders from the AgentPlugin configs.
 
 ## Guarantee and limitation
