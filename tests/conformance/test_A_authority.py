@@ -519,9 +519,23 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         # Each refusal names its own rule; a missing trigger is not read as a
         # trigger of the wrong origin.
         self.assertEqual(cp.RULE_REPORT_NO_TRIGGER, write(grant=None))
-        # The shell writes any audit, but only to the install's own key.
-        self.assertIsNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None))
-        self.assertIsNotNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None, request_key="acme%2Fterraform"))
+        # The shell writes any audit, to the install's publish key or a key of a
+        # repository the broker's own managed_repos registers; never another.
+        shell = cp.CALLER_ROLE_SHELL
+        registered = frozenset({key, "acme%2Fterraform"})
+
+        def shell_write(request_key: str) -> str | None:
+            return cp.report_write_permitted(shell, None, None, audit, request_key, key, allowlist, registered)
+
+        self.assertIsNone(shell_write(key))
+        self.assertIsNone(shell_write("acme%2Fterraform"))
+        for request_key in ("acme%2Fremoved", "ACME%2Fterraform", "github.com%2Facme%252Fterraform", "no_forge%2Flocal"):
+            with self.subTest(shell_key=request_key):
+                self.assertIsNotNone(shell_write(request_key))
+        # A profile task gets the publish key alone, whatever is registered.
+        self.assertIsNotNone(cp.report_write_permitted(
+            cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
+        ))
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no

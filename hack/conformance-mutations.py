@@ -146,12 +146,32 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-write-any-key",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if not isinstance(key, str) or not isinstance(writable, str) or not writable or key != writable:\n",
-         "    if not isinstance(key, str):\n"),
+        ("    if key == writable:\n        return None\n",
+         "    if True:\n        return None\n"),
         "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
         "trust the request's repository key, since the listener validates its "
         "shape -- a task then writes a baseline under a repository this install "
         "does not manage, which the next run reads as its own",
+    ),
+    Mutation(
+        "A3-report-shell-any-key",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:\n",
+         "    if role == CALLER_ROLE_SHELL:\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "let the shell write any repository key, since it writes the file store "
+        "directly anyway -- through the broker it then plants a baseline under a "
+        "repository this install never registered",
+    ),
+    Mutation(
+        "A3-report-profile-any-registered-key",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:\n",
+         "    if key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "let a profile task write any registered repository, as the shell may -- a "
+        "scheduled audit's model output then rewrites the baseline of a repository "
+        "its schedule never publishes to",
     ),
     Mutation(
         "A3-report-no-role-is-shell",
