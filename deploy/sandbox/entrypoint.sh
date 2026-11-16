@@ -16,6 +16,9 @@ DATA="${SANDBOX_DATA:-/opt/data}"
 SSHD_STATE="${SANDBOX_SSHD_STATE:-/var/lib/sandbox-sshd}"
 AUTHORIZED_KEYS_SRC="${SANDBOX_AUTHORIZED_KEYS:-/etc/ssh-authorized/authorized_keys}"
 DEFAULTS="${SANDBOX_DEFAULTS:-/opt/defaults}"
+# The lock credential_proxy_client.py takes beside $DATA/.kubeconfig before it merges a context
+# into it (KUBECONFIG_LOCK_NAME there, for a kubeconfig named `.kubeconfig`).
+readonly KUBECONFIG_LOCK_NAME="..kubeconfig.lock"
 
 # Which Hermes homes get a copy of the image's trees, as paths under $DATA with
 # `.` meaning $DATA itself. The agent pod keeps one home per profile and its
@@ -66,12 +69,19 @@ SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 # automatic remediation pull requests (off when "false"), read by audit_report.py
 # from the root-owned file below first, then from the session's environment.
 SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
+# KUBEAGENTS_POST_MERGE_CHECK, KUBEAGENTS_AUTOMERGE, KUBEAGENTS_DIAL: the
+# earned-autonomy switches, normalised by the operator and "off" when unset,
+# read by kubeagents_switches.py from the root-owned files below first, then
+# from the session's environment.
+SANDBOX_POST_MERGE_CHECK_FILE="/run/kube-agents-sandbox/post-merge-check"
+SANDBOX_AUTOMERGE_FILE="/run/kube-agents-sandbox/automerge"
+SANDBOX_DIAL_FILE="/run/kube-agents-sandbox/dial"
 # CREDENTIAL_PROXY_EXEC_URL: the exec tier's URL, which the shim sends kubectl,
 # gcloud and Cloud API relay calls to when the operator set it, falling back on
 # CREDENTIAL_PROXY_URL when no connection can be made or the URL is malformed.
 # Unforwarded, a session would always take the fallback and nothing would say
 # so.
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE KUBEAGENTS_POST_MERGE_CHECK KUBEAGENTS_AUTOMERGE KUBEAGENTS_DIAL"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -595,6 +605,15 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     fi
   done
   write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx" ${discovered_ctxs[@]+"${discovered_ctxs[@]}"}
+  # The client's lock beside that kubeconfig is on the volume, so it outlives the pod. A client
+  # from before only the kubeconfig's owner made the lock left one owned by whoever called first:
+  # after a root `kubectl --context`, one the agent user cannot open, and its merges then stopped.
+  # No session runs yet, so nothing holds the lock: remove it, and the agent's next merge makes its
+  # own. Only a file or a link under that name; `rm` unlinks the name and follows no link.
+  kubeconfig_lock="$DATA/$KUBECONFIG_LOCK_NAME"
+  if [ -L "$kubeconfig_lock" ] || [ -f "$kubeconfig_lock" ]; then
+    rm -f -- "$kubeconfig_lock" || log "WARNING: could not remove the kubeconfig lock $kubeconfig_lock"
+  fi
 fi
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd
@@ -750,6 +769,11 @@ chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"
 # operator who turned the sweep off must not have a session turn it back on.
 printf '%s\n' "${KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true}" >"$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
 chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
+# And the earned-autonomy switches, so a session cannot turn one on.
+printf '%s\n' "${KUBEAGENTS_POST_MERGE_CHECK:-off}" >"$SANDBOX_POST_MERGE_CHECK_FILE"
+printf '%s\n' "${KUBEAGENTS_AUTOMERGE:-off}" >"$SANDBOX_AUTOMERGE_FILE"
+printf '%s\n' "${KUBEAGENTS_DIAL:-off}" >"$SANDBOX_DIAL_FILE"
+chmod 0644 "$SANDBOX_POST_MERGE_CHECK_FILE" "$SANDBOX_AUTOMERGE_FILE" "$SANDBOX_DIAL_FILE"
 # Fail here rather than in sshd. An invalid drop-in makes sshd exit during
 # startup with a message about /etc/ssh/sshd_config.d/10-sandbox-env.conf, a
 # file that exists in no source tree; `-t` names it while the entrypoint is

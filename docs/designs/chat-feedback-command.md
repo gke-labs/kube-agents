@@ -130,13 +130,15 @@ reworded: `/feedback <text>`, and any ask in words to file a kube-agents report,
    environment. Cluster names, project ids, resource names, log excerpts and anything read
    from a Secret stay out unless the person typed them.
 2. It shows the submission as it will be filed, says that it becomes a public issue on
-   `gke-labs/kube-agents`, asks for a yes, and ends the turn. This is the one place the
-   front door replies with more than an ack: the text is the person's own words arranged
-   for the form, not knowledge, and §1.6 already requires a confirmation before anything
-   destructive. The person's next message is the answer.
+   `gke-labs/kube-agents`, offers in one line to add the install's usage summary (§8), asks
+   for a yes, and ends the turn. This is the one place the front door replies with more than
+   an ack: the text is the person's own words arranged for the form, not knowledge, and §1.6
+   already requires a confirmation before anything destructive. The person's next message is
+   the answer.
 3. On a yes it files one card for `platform` whose body carries the confirmed text verbatim
    and the line `user-confirmed: yes`, and acks as for any card. On a change it shows the new
-   text and asks again. On a no it files nothing.
+   text and asks again. On a no it files nothing. On the opt-in it takes the detour in §8 and
+   comes back to this step with the block inside the draft.
 4. The platform worker runs the skill with the card's text. `agents/platform/SOUL.md`'s
    "Reporting a Problem with kube-agents Itself" bullet keeps its answer for the question
    "how do I report"; its last sentence changes from "you do not submit the form by hand" to
@@ -212,6 +214,11 @@ Constants at the top of the file per `.agents/rules/core_engineering.md`. Client
 `scripts/test_file_feedback.py` (the marker, the single call, the output shape, the
 unreachable broker); the existing Makefile glob runs them.
 
+Since 2026-11-05 the script has a second subcommand, `summary` (§8), which files nothing:
+it renders and audits the usage summary a person can opt to attach. `submit` is unchanged
+and takes no flag for it; the block a report carries is the one the person saw, copied into
+`environment` by the front door with the rest of the confirmed text.
+
 ### 5. The case
 
 `bench/tasks/chat-feedback-composes-and-asks-first/task.yaml`, domain `chat-and-routing`,
@@ -255,15 +262,17 @@ is true when the text after the word is exactly `summary`, and `IsCommand` repor
 chat message's button may not carry it either. The dispatch case sits beside the bare form,
 ahead of `/session`, status, stop and steer, and changes nothing about the record's task
 state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
-deterministically, with the environment, usage and feedback sections `scripts/feedback-summary.sh`
+deterministically, with the environment, usage, performance and feedback sections `scripts/feedback-summary.sh`
 prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
-counts, the performance figures and recent task rows): environment (tag, mode, model from
+counts, LiteLLM's live figures and recent task rows): environment (tag, mode, model from
 `status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
 interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
 pairs from `status.usage.topTools` (the operator's reading of the broker's counter,
 [`usage-counters-producer.md`](usage-counters-producer.md); the script reads the broker's
 metrics directly when it can and falls back to the same status list), a roll-up of the
-gateway's own task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
+gateway's own task records, the token and spend totals since install (`status.usage.inputTokensTotal`,
+`outputTokensTotal` and `spendMicrosUSDTotal`, the last in micro-dollars printed as USD), and
+the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
 the script's `tasks` line counts kanban cards, and two pastes from one install must not
 disagree under one label. The roll-up splits by what a `TaskRef` holds: the
 record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the
@@ -276,8 +285,8 @@ KV watch stream rather than a Get per record, under a ten-second budget inside t
 that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
-needs no grant. Tokens, spend and latency are not the gateway's to see and the block says
-where they are. Before posting, the block less its model line is audited as the script audits its own: every
+needs no grant. The token and spend totals are the operator's, on the resource, so the block
+prints them; latency is not the gateway's to see and the block says where it is. Before posting, the block less its model line is audited as the script audits its own: every
 string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
 tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
 hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
@@ -287,12 +296,63 @@ a `copy` button on any gateway notice that holds a fenced block, so the block re
 clipboard in one click (the third surface #3428 asks for). No model is in the loop, so the eval
 loop does not apply.
 
+### 8. The usage summary in a report (added 2026-11-05, issue #4723)
+
+A report filed from chat arrived without the block `/feedback summary` prints, so support
+asked for it in a second round trip. The draft now offers it, and the exact block is shown
+before the yes, which the confirmation contract requires: nothing reaches the form that the
+person did not see word for word, and the filing script appends nothing after the yes.
+
+The front door writes the draft and runs no script, and the gateway's block never enters its
+session, so the block is fetched by a card. The person says `add the usage summary` to the
+draft; the Planning Agent files one `platform` card that asks for the summary and nothing
+else, acks with a line saying the block will post into the thread and that their next message, a yes included, brings the draft back with it, and ends the turn. The worker runs `file_feedback.py summary`, which imports
+`feedback_summary.py` (staged on the sandbox image's script allowlist for it) and runs
+`collect` with the in-pod sources off: the sandbox's `kubectl` is the broker's shim, a
+context-less read of the host cluster, and the agent's local Role grants `get` on the
+`PlatformAgent`, while `exec` is a write verb to the broker's command policy. The block therefore carries the environment
+and usage sections and prints `unavailable` for tokens, spend, latency and the task roll-up;
+those stay with `scripts/feedback-summary.sh`. The block less its model and origin lines is audited as
+the script audits its own; a clean block, less the rating form the pasted block ends with (an empty form in an issue reads as a rating nobody gave), is the card's `result`, verbatim, and a hit is a
+`BLOCKED` line that says how many identifiers were found and never which. The worker files
+nothing on this card.
+
+The card's completion posts the block into the thread, and on the person's next message,
+whatever it says, the Planning Agent reads the card with `kanban_show`: a `done` card with a
+block has the draft shown again with that block as its environment, fences included, and the
+yes asked for again; a card not done, or one whose result is the refusal, has the draft
+offered without it. Only a yes to a shown draft files, and the filing card carries the text
+and the block exactly as shown under `user-confirmed: yes`. The skill copies the card's
+environment into `payload.json` unchanged; its never-add-environment rule stands. Each step
+of the opt-in is one more reply, so attaching the block costs two replies beyond the plain
+flow: the front door reads a card only on the next message.
+
+Why not a flag on `submit` that collects at filing time: the block sent would not be the block
+shown. Why not the gateway: it already renders and audits the block for `/feedback summary`,
+but handing it to the agent beside a typed report departs from the line above that the
+gateway passes the text through as typed, and is a Go change in a component that holds no
+part of the filing today.
+
+Two cases, both registered in `hack/eval/nightly-cases.txt`.
+`bench/tasks/chat-feedback-offers-usage-summary/task.yaml` grades the first reply: the composed
+submission as the earlier case does, plus the offer of the usage summary, under the same no-card
+and nothing-filed safeguards. `bench/tasks/platform-feedback-usage-summary-card/task.yaml`
+grades the summary card: a plain ask for the block reaches the worker as a card, and its result
+carries the script's block (the title, a counter, the `unavailable` line only the resource-only
+render prints) with no rating form and no filing. The opt-in turn and the re-shown draft are not
+in a case: a run that reads a card's result is a second turn, and the filing turn stays out for
+the reason §5 gives. The case for the opt-in turn needs a harness directive that sends the
+`/feedback <text>` opening and `add the usage summary` as the second turn, waits for the card that
+turn files, and grades the reply to a third message; the directive and the case are issue #5187.
+
 ## Calls made in the build
 
 - `/feedback summary` is answered by the gateway rather than by a platform card: a block a
   customer pastes must be a function of the sources alone, which a model-composed answer
-  cannot promise, and the gateway is the one component that both sees the resource and
-  posts into the conversation.
+  cannot promise, and, when the command was built, the gateway was the one component that
+  both saw the resource and posted into the conversation. §8 (2026-11-05) adds a card path
+  for the block a report attaches: a script renders it and the model copies it verbatim, and
+  the yes is to the text shown, the contract the typed text already has.
 - The bare-`/feedback` branch is the first case of the gateway's dispatch switch, ahead of
   `/session`, status, stop and steer, gated on a message with no programmatic intent.
 - The sandbox client keeps one marker per payload hash in the task workspace. A broker that
@@ -303,7 +363,7 @@ loop does not apply.
   `/session` forms, so the page does not wait on a task the gateway never submits.
 - The sandbox image's script allowlist (`deploy/sandbox/Dockerfile`) stages
   `feedback_broker.py` beside the client that imports it; `test_sandbox_delivery.py` is the
-  gate that found the omission.
+  gate that found the omission. `feedback_summary.py` joined it with §8, for the same reason.
 
 ## Live validation
 

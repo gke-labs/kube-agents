@@ -206,6 +206,11 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
+#: `revision-contains`'s ancestor: a full or abbreviated SHA-1 commit id (the scratch repository is SHA-1).
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: git's words, across server versions, for a fetch of a revision the remote does not have.
+MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
+                            "did not send all necessary objects")
 # A path entry, and all of them joined: well under the kernel's limits on one
 # argument (128 KiB) and on a command line, so git always starts.
 MAX_SNAPSHOT_PATH_BYTES = 4096
@@ -260,6 +265,15 @@ TAR_RECORD_BYTES = 20 * TAR_BLOCK_BYTES
 MAX_SNAPSHOT_ENTRIES = 4096
 SNAPSHOT_ENTRY_TREE = "tree"
 SNAPSHOT_ENTRY_BLOB = "blob"
+# The git runner decodes `ls-tree` with replacement, so a name that is not
+# UTF-8 is listed with U+FFFD and names nothing when a caller asks for it.
+# Such an entry carries SNAPSHOT_ENTRY_UNNAMED, saying why, so a caller lists
+# it as not read and does not ask for it; its directory, asked for, still
+# holds it. A name that holds U+FFFD itself is marked too: it is then not
+# read, never read as something else.
+SNAPSHOT_ENTRY_UNNAMED = "unnamed"
+SNAPSHOT_UNNAMED_REASON = "its name is not UTF-8, so the broker's listing could not name it to ask for"
+REPLACEMENT_CHARACTER = "\ufffd"
 # Each entry also counts the files under it a manifest reader reads, so a
 # caller can leave out a part of vendored archives or images without asking
 # for it. A link with such a name counts too, so the caller still sees it (and
@@ -481,7 +495,8 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
     `*.yaml`, `*.yml` or `*.json`, and ``bytes``: what `_tar_bytes` measures for a
     snapshot of that entry alone, its parent directories included, as `ls-tree`
     lists them and `archive` writes them. So a snapshot of the entry is refused
-    exactly when ``bytes`` is over the ceiling. None past `MAX_SNAPSHOT_ENTRIES`.
+    exactly when ``bytes`` is over the ceiling. An entry whose own name did not
+    decode also carries `SNAPSHOT_ENTRY_UNNAMED`. None past `MAX_SNAPSHOT_ENTRIES`.
     """
     entries = [entry for entry in listing.split("\0") if entry]
     directories = {
@@ -519,12 +534,15 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
         parts = child.split("/")
         parents = [directories["/".join(parts[:depth])] for depth in range(1, len(parts))
                    if "/".join(parts[:depth]) in directories]
-        answer.append({
+        listed = {
             "path": child,
             "type": SNAPSHOT_ENTRY_TREE if child in trees else SNAPSHOT_ENTRY_BLOB,
             "manifests": manifests[child],
             "bytes": _tar_bytes("\0".join(parents + own)),
-        })
+        }
+        if REPLACEMENT_CHARACTER in child.rpartition("/")[2]:
+            listed[SNAPSHOT_ENTRY_UNNAMED] = SNAPSHOT_UNNAMED_REASON
+        answer.append(listed)
     return answer
 
 
@@ -1066,7 +1084,14 @@ class VcsBroker:
         `baseBranch` is the repository's pinned base, or None when this install
         pins none for it. It is the read a caller with no clone uses to learn
         which branch its proposals must target.
+
+        `writeMode` is the install's write mode (:func:`write_mode`), so a caller
+        learns that branch and proposal writes are refused before it clones.
+        `writeModeDetail` says why when that `none` comes from a value that is
+        neither mode, as the broker's refusal does.
         """
+        mode, raw = write_mode()
+        detail = write_mode_detail(raw)
         try:
             forge, repo = self.registry.resolve(payload.get("repository"))
         except ForgeUnsupported as exc:
@@ -1077,9 +1102,14 @@ class VcsBroker:
                 "verbs": [],
                 "missing": [str(exc)],
                 "baseBranch": None,
+                "writeMode": mode,
+                **({"writeModeDetail": detail} if detail else {}),
             }
         answer = forge.capabilities(repo)
         answer["baseBranch"] = self._pinned_base(forge, repo)
+        answer["writeMode"] = mode
+        if detail:
+            answer["writeModeDetail"] = detail
         return answer
 
     def clone(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1756,6 +1786,76 @@ class VcsBroker:
         return bound.stamp(
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
+
+    def revision_contains(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Whether `revision` contains `ancestor` on the remote: `{"contains": bool}`.
+
+        The post-merge check's question when a GitOps tool applied a commit
+        other than the merge commit: reconcilers track a branch, so a later
+        merge carries this one. git against the remote, like `branch-view`:
+        `revision`'s commits are fetched into a scratch repository, never
+        checked out, and the fetch is stopped at the clone's size ceiling
+        (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
+        fetched; `ancestor` may be abbreviated (a forge can report a
+        merge commit by a short id) and is resolved after the fetch. A
+        revision the remote does not have is `REVISION_NOT_FOUND`; an
+        untrusted certificate or a refused credential is answered by its
+        cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
+        A revision that starts with `ancestor` contains it without a fetch.
+        """
+        bound = self._bind(payload)
+        ancestor = payload.get("ancestor")
+        ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
+        if not ANCESTOR_RE.match(ancestor):
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 40 characters")
+        revision = validate_revision(payload.get("revision"), "revision")
+        if revision.lower().startswith(ancestor):
+            return bound.stamp({"contains": True})
+        bound.ensure()
+        git = bound.git
+        root = self._scratch("contains")
+        try:
+            git(root, "init", "--quiet", "--bare")
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
+            fetched = git(
+                root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
+                check=False, stop=over_ceiling,
+            )
+            remedy = "The history of this one revision is over it; nothing in the request makes the fetch smaller."
+            if stopped[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            if fetched.returncode != 0:
+                stderr = fetched.stderr or ""
+                refusal = self._tls_refusal(stderr) or _git_refusal(bound.forge, bound.repo, stderr, "fetch")
+                if refusal is not None:
+                    raise refusal
+                if any(marker in stderr for marker in MISSING_REVISION_MARKERS):
+                    raise WorkspaceError(
+                        f"{bound.repo} has no revision {revision}",
+                        status=404,
+                        code="REVISION_NOT_FOUND",
+                    )
+                raise WorkspaceError(
+                    f"could not fetch {revision} from {bound.repo}: git exited {fetched.returncode}",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            self._enforce_ceiling(root, bound.repo, remedy=remedy)
+            present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            full = (present.stdout or "").strip()
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(git, root, full, revision)
+        finally:
+            self._discard_scratch(root)
+        return bound.stamp({"contains": contains})
 
     def branch_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Delete a spent branch: one whose proposal is done with and whose tip it carried.
@@ -2448,6 +2548,57 @@ WRITE_VERBS = frozenset(
 )
 
 
+# The install's write mode: `writeMode` from the tier CR of #3659, as one
+# install-level setting the broker alone enforces until tiers take it over
+# (same field name and values, so that needs no migration). `propose`, the
+# default, is today's behaviour. `none` is explain-only: the broker refuses
+# PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
+# and labels stay open to it, because an issue is how an audit reports.
+# Read on every request through write_mode(), the one place a second source
+# (a runtime setting) can be added. Today its only source is the broker's env,
+# so on a pod a change applies once the operator has rolled the broker.
+WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
+WRITE_MODE_PROPOSE = "propose"
+WRITE_MODE_NONE = "none"
+WRITE_MODES = (WRITE_MODE_NONE, WRITE_MODE_PROPOSE)
+PROPOSE_VERBS = frozenset(
+    {
+        "publish",
+        "branch-delete",
+        "proposal-create",
+        "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
+    }
+)
+
+
+def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """The install's write mode and the raw value it was read from.
+
+    Unset or empty is `propose`. A value that is neither mode is `none`: a
+    setting someone wrote to restrict the agent must not lift the restriction
+    because it was misspelt.
+    """
+    raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
+    value = raw.strip().lower()
+    if not value:
+        return WRITE_MODE_PROPOSE, raw
+    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+
+
+def write_mode_detail(raw: str) -> str:
+    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    value = raw.strip().lower()
+    if not value or value in WRITE_MODES:
+        return ""
+    return (
+        f"{WRITE_MODE_ENV} is set to a value that is neither "
+        f"{' nor '.join(WRITE_MODES)}, so the broker treats it as none"
+    )
+
+
 # The verbs the HTTP layer answers for a repository this install does not
 # manage. `capabilities` reports what a forge serves and spends no credential.
 # Every other verb, read or write, is refused at the route first: reads used to
@@ -2497,6 +2648,7 @@ VCS_VERBS = frozenset(
         "identity",
         "branch-view",
         "branch-delete",
+        "revision-contains",
     }
 )
 
@@ -2532,6 +2684,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "identity": broker.identity,
         "branch-view": broker.branch_view,
         "branch-delete": broker.branch_delete,
+        "revision-contains": broker.revision_contains,
     }
 
 
@@ -2545,7 +2698,14 @@ __all__ = [
     "ROLE_SELECTED_VERBS",
     "ROLE_UNREGISTERED",
     "UNGATED_VERBS",
+    "PROPOSE_VERBS",
+    "WRITE_MODE_ENV",
+    "WRITE_MODE_NONE",
+    "WRITE_MODE_PROPOSE",
+    "WRITE_MODES",
     "WRITE_VERBS",
+    "write_mode",
+    "write_mode_detail",
     "max_bundle_bytes",
     "route_table",
 ]

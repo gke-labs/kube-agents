@@ -119,8 +119,10 @@ STATUS_LINE_PATTERN = re.compile(r"(\S+) \*([a-z-]+)\*(?: — .*)?", re.DOTALL)
 STATE_SUBMITTED = "submitted"
 STATE_COMPLETED = "completed"
 FAILED_STATES = frozenset({"failed", "canceled", "rejected"})
-# relay.go relayTerminal: the notices for a task that did not complete.
-FAILURE_POST_PATTERN = re.compile(r"❌ failed: .*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:: .*)?", re.DOTALL)
+# relay.go terminalNotice: the notices for a task that did not complete. The
+# reason follows " — " when the executor wrote it as `reason: <token>[ - detail]`
+# (the notice carries the detail, never the token) and ": " when it was plain text.
+FAILURE_POST_PATTERN = re.compile(r"❌ failed(?: — |: ).*|❌ the task failed|🛑 canceled|🚫 the executor rejected the task(?:(?: — |: ).*)?", re.DOTALL)
 # gateway.go steerTask: the steer acknowledgements, and the notice when the steer
 # could not be published. Any of them means the turn started no task.
 # ackSteerSession (steered into the running task) and, since #2634,

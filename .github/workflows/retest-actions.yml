@@ -1,6 +1,7 @@
 name: Retest Actions Checks
 
-# `/retest` on a pull request re-runs its failed GitHub Actions checks. GitHub
+# `/retest` on a pull request re-runs its failed GitHub Actions checks, and
+# cancels and re-runs the runs GitHub left stuck in `queued`. GitHub
 # lets Write and above re-run a workflow and most collaborators here hold
 # Triage, so a flaked check on someone else's pull request waited for an admin;
 # Prow's `/retest` re-runs only Prow jobs. The same comment still reaches Prow,
@@ -33,7 +34,7 @@ jobs:
     name: Re-run failed checks on /retest
     permissions:
       contents: read # check out the default branch: the script
-      actions: write # re-run the workflow runs
+      actions: write # cancel stuck workflow runs and re-run workflow runs
       # Write, not read: the reaction goes on a comment that belongs to a pull
       # request. GitHub's fine-grained-token table lists that endpoint under
       # Issues alone, but the job token with `issues: write` and

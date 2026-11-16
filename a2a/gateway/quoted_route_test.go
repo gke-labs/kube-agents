@@ -88,6 +88,7 @@ func startQuotedRouteTask(t *testing.T, r *rig, conv string) *lib.Envelope {
 // A quote-reply "stop" on a running task is the stop: the task is cancelled
 // and nothing of the quote reaches it.
 func TestQuotedStopOnARunningTaskStopsIt(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	origin := startQuotedRouteTask(t, r, quotedRouteSpace)
 	r.adapter.inbox <- quotedOntoAlert(t, "stop", "spaces/S1/messages/M1", false)
@@ -107,6 +108,7 @@ func TestQuotedStopOnARunningTaskStopsIt(t *testing.T) {
 // it; a quoted question gets the line in its conversation, then the task on
 // the words alone.
 func TestUnreadQuoteLinePostsOnlyForATurnAnAgentReads(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	startQuotedRouteTask(t, r, quotedRouteSpace)
 	r.adapter.inbox <- quotedOntoUnread(t, "status", "spaces/S1/messages/M1")
@@ -129,6 +131,7 @@ func TestUnreadQuoteLinePostsOnlyForATurnAnAgentReads(t *testing.T) {
 // A quote-reply status phrase on a running task is answered as a status ask,
 // from the stream, and reaches no agent.
 func TestQuotedStatusOnARunningTaskIsAnsweredAsStatus(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	startQuotedRouteTask(t, r, quotedRouteSpace)
 	r.adapter.inbox <- quotedOntoAlert(t, "status", "spaces/S1/messages/M1", false)
@@ -143,6 +146,7 @@ func TestQuotedStatusOnARunningTaskIsAnsweredAsStatus(t *testing.T) {
 // one: the words are what the matcher sees, and the quote reaches no agent
 // (spec-chatops-gateway.md, "The quote travels beside the words").
 func TestQuotedWideStatusOnARefusingAddresseeIsAnsweredAsStatus(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	r.g.mu.Lock()
 	r.g.steersRefusedBy["platform"] = true
@@ -159,6 +163,7 @@ func TestQuotedWideStatusOnARefusingAddresseeIsAnsweredAsStatus(t *testing.T) {
 // answers, so it reaches the agent as a task, and the task carries the quote
 // rather than reading "status".
 func TestQuotedStatusInASpaceWithNothingRunningKeepsItsQuote(t *testing.T) {
+	t.Parallel()
 	for i, words := range []string{"status", "any update?"} {
 		t.Run(words, func(t *testing.T) {
 			r := startGchatRig(t, []string{quotedRouteUser}, false)
@@ -173,6 +178,7 @@ func TestQuotedStatusInASpaceWithNothingRunningKeepsItsQuote(t *testing.T) {
 // At the top of a DM with nothing running the phrase is answered as a status
 // ask, with the redirect, and starts no task.
 func TestQuotedStatusAtADMTopLevelIsAnsweredAsStatus(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	msg := quotedOntoAlert(t, "status", "spaces/D1/messages/M1", true)
 	if !msg.TopLevel || msg.Conversation != quotedRouteDM {
@@ -189,6 +195,7 @@ func TestQuotedStatusAtADMTopLevelIsAnsweredAsStatus(t *testing.T) {
 // on the way: with nothing running it is a task that reads the quoted ask,
 // and on a running task a steer that does.
 func TestBareQuoteReachesTheAgentWhole(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{quotedRouteUser}, false)
 	r.adapter.inbox <- quotedOntoAlert(t, "", "spaces/S1/messages/M1", false)
 	origin := awaitSubmission(t, r, "platform", 0)
@@ -212,6 +219,7 @@ func TestBareQuoteReachesTheAgentWhole(t *testing.T) {
 // quote: the session's first turn reads the text with the quote, the command
 // word off its head; the feedback text goes over as typed, quote and all.
 func TestQuotedSessionAndFeedbackTextReachTheAgentWithTheQuote(t *testing.T) {
+	t.Parallel()
 	spawn := &fakeSpawner{}
 	r := startGchatRigWith(t, spawn, []string{quotedRouteUser}, false)
 	r.adapter.inbox <- quotedOntoAlert(t, "/session what is this alert?", "spaces/S1/messages/M1", false)
@@ -238,6 +246,7 @@ func TestQuotedSessionAndFeedbackTextReachTheAgentWithTheQuote(t *testing.T) {
 // refuses it) and is a task like any other words, so it keeps its quote
 // rather than reaching the agent as the one word.
 func TestQuotedDelegateKeepsItsTaskAndABareDelegateItsQuote(t *testing.T) {
+	t.Parallel()
 	spawn := &fakeSpawner{}
 	r := startGchatRigWith(t, spawn, []string{quotedRouteUser}, false)
 	r.adapter.inbox <- quotedOntoAlert(t, "delegate check node-3", "spaces/S1/messages/M1", false)

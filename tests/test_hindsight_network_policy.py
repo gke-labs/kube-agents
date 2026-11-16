@@ -43,7 +43,7 @@ _HINDSIGHT_POSTGRESQL_POLICY = "hindsight-postgresql"
 # The template block the kustomize copy is compared against: from the guard on
 # the hindsight-api policy to the PodMonitoring guard that follows the pair.
 _CHART_NETPOL_BLOCK_START = "{{- if $apiNetworkPolicy }}"
-_CHART_NETPOL_BLOCK_END = "{{- if .Values.hindsight.podMonitoring }}"
+_CHART_NETPOL_BLOCK_END = '{{- if include "kube-agents.hindsightPodMonitoring" . }}'
 _ADDITIONAL_EGRESS = "hindsight.api.networkPolicy.additionalEgress"
 _NOTES_WARNING = "WARNING: hindsight-postgresql renders with no NetworkPolicy"
 _HELM_REQUIRED = [

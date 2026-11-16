@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"reflect"
 	"slices"
 	"strings"
@@ -904,6 +905,28 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 			t.Errorf("expected ImagePullPolicy IfNotPresent, got %v", agent.Spec.Deployment.ImagePullPolicy)
 		}
 	})
+
+	// spec.mode is deprecated: "today" named a stack no release renders any
+	// more, so the defaulter moves it, and an absent field, to "next" rather
+	// than refusing the apply; a "next" stays as it is.
+	t.Run("rewrites the retired spec.mode to next", func(t *testing.T) {
+		for name, mode := range map[string]*string{
+			"absent": nil,
+			"today":  ptr.To("today"),
+			"next":   ptr.To("next"),
+		} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Mode: mode},
+			}
+			if err := defaulter.Default(ctx, agent); err != nil {
+				t.Fatalf("%s: unexpected defaulting error: %v", name, err)
+			}
+			if agent.Spec.Mode == nil || *agent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+				t.Errorf("%s: spec.mode = %v after defaulting, want %q", name, agent.Spec.Mode, agentv1alpha1.PlatformAgentModeNext)
+			}
+		}
+	})
 }
 
 func TestPlatformAgentValidateDelete(t *testing.T) {
@@ -1284,5 +1307,53 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 			_, err := val.ValidateCreate(ctx, agent)
 			assertFieldError(t, err, tc.path)
 		})
+	}
+}
+
+// An edit asking an existing bus for another server count is refused at
+// apply time with the operator's message, in both directions; an edit that
+// leaves the field as it was, a bus with no recorded count, and a create
+// pass, because the operator is the enforcement and this only refuses early.
+// spec.mode plays no part: every install runs the bus.
+func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
+	agent := func(spec *int, running int32) *agentv1alpha1.PlatformAgent {
+		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		if spec != nil {
+			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
+		}
+		pa.Status.BusReplicas = running
+		return pa
+	}
+	for _, tc := range []struct {
+		name     string
+		old, new *agentv1alpha1.PlatformAgent
+		refused  bool
+	}{
+		{"one to three", agent(nil, 1), agent(ptr.To(3), 1), true},
+		{"three to one", agent(nil, 3), agent(ptr.To(1), 3), true},
+		{"three to one, changing a set field", agent(ptr.To(3), 3), agent(ptr.To(1), 3), true},
+		{"the count it runs", agent(nil, 3), agent(ptr.To(3), 3), false},
+		{"removing the field", agent(ptr.To(3), 1), agent(nil, 1), false},
+		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
+		{"no recorded count (pruned by an older CRD)", agent(nil, 0), agent(ptr.To(1), 0), false},
+		{"a create", nil, agent(ptr.To(1), 0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateBusReplicas(tc.old, tc.new)
+			if tc.refused != (len(errs) == 1) {
+				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
+			}
+			if tc.refused {
+				want := controller.BusConversionRefusedMessage(int32(*tc.new.Spec.Harness.Tuning.BusReplicas), tc.old.Status.BusReplicas)
+				if !strings.Contains(errs[0].Detail, want) || errs[0].Field != "spec.harness.tuning.busReplicas" {
+					t.Errorf("refusal %s: %q, want the operator's message %q", errs[0].Field, errs[0].Detail, want)
+				}
+			}
+		})
+	}
+	// Wired into the update path.
+	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 3), agent(ptr.To(1), 3))
+	if err == nil || !strings.Contains(err.Error(), "#4225") {
+		t.Errorf("ValidateUpdate of a 3 to 1 edit: %v, want the refusal", err)
 	}
 }

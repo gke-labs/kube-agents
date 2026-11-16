@@ -48,6 +48,19 @@ Runner = Callable[[list[str]], "tuple[int, str]"]
 
 DNS_ENDPOINT_FLAG = "--dns-endpoint"
 INTERNAL_IP_FLAG = "--internal-ip"
+# Set when the shell's kubectl goes through the install's kube-api proxy:
+# KUBE_PROXY_URL in the shell sandbox itself, and the same URL as
+# KUBE_PROXY_IN_USE_URL in the gateway's platform-agent container, which runs
+# the callers that hop into the sandbox (stall_watch, and platform_mcp_server
+# through its env block in config.yaml). There the caller's flags never reach
+# the kubeconfig: the shim answers a get-credentials itself and ignores them,
+# or, when it cannot, the broker runs it and the shim rewrites the file to
+# kube-proxy, which picks the cluster's endpoint itself. On that broker path a
+# fetch that names no endpoint flag gets the broker's own decision
+# (credential_proxy `_decision_for_callers_fetch`), so the probe and describes
+# here would only repeat it. Without either variable, as with an operator
+# older than the second, the flags are chosen here as before.
+KUBE_PROXY_ENVS = ("KUBE_PROXY_URL", "KUBE_PROXY_IN_USE_URL")
 
 # What `EndpointDecision.kind` says the kubeconfig will name.
 KIND_DNS = "dns"
@@ -600,6 +613,13 @@ def endpoint_decision(
     return decision
 
 
+def _kube_proxy_in_use(env) -> bool:
+    """Whether a KUBE_PROXY_ENVS variable names the proxy: set, and not the
+    literal `${...}` Hermes hands an MCP server for a variable that is unset."""
+    values = (env.get(name, "").strip() for name in KUBE_PROXY_ENVS)
+    return any(value and not value.startswith(_UNEXPANDED_PLACEHOLDER_PREFIX) for value in values)
+
+
 def dns_endpoint_args(
     project: str,
     cluster: str,
@@ -614,8 +634,12 @@ def dns_endpoint_args(
     `["--internal-ip"]` or `[]`. Splice it into the argv rather than branching
     at each call site. Never raises; a cluster we cannot decide for falls back
     to the empty list, which is exactly the command every caller ran before
-    this module existed.
+    this module existed. Under the kube-api proxy (`KUBE_PROXY_ENVS`) it is the
+    empty list with no probe and no describe: the flags would not reach the
+    kubeconfig.
     """
+    if _kube_proxy_in_use(env if env is not None else os.environ):
+        return []
     decision = endpoint_decision(project, cluster, location, env=env, run=run)
     return list(decision.flags) if decision is not None else []
 

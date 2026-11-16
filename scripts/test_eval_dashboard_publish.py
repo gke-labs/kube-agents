@@ -24,11 +24,18 @@ import json
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# The repository root, for `tests.testing`: a direct run has only this directory on the path.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.testing import no_live_gcloud  # noqa: E402
+
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 SKIP = "eval-dashboard publish skipped:"
 
@@ -103,6 +110,15 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> pathlib.Path:
     return stub
 
 
+def failing_gcloud(root: pathlib.Path) -> str:
+    """A PATH entry whose gcloud fails: what a gcloud with no login answers the
+    hook's download of the published health files."""
+    stubs_dir = root / "gcloud-stub"
+    stubs_dir.mkdir()
+    write_stub(stubs_dir, "gcloud", "exit 1\n")
+    return str(stubs_dir)
+
+
 def dashboard_stubs(root: pathlib.Path, collect_body: str) -> pathlib.Path:
     """A fake repo layout: hack/ beside scripts/eval_dashboard/ stubs.
 
@@ -119,6 +135,22 @@ def dashboard_stubs(root: pathlib.Path, collect_body: str) -> pathlib.Path:
             f"pathlib.Path(sys.path[0], '{name}.ran').touch()\n"
         )
     return root / "hack"
+
+
+def setUpModule():
+    # No test here runs the real gcloud: a gcloud call that a test leaves
+    # unstubbed goes to a stand-in, and the stand-in fails the module.
+    global _NO_GCLOUD
+    _NO_GCLOUD = no_live_gcloud.install()
+
+
+def tearDownModule():
+    _NO_GCLOUD.uninstall()
+
+
+class TestNoLiveGcloud(unittest.TestCase):
+    def test_no_test_in_this_module_can_run_the_real_gcloud(self):
+        no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
 
 
 class PublishHookFailSafeTest(unittest.TestCase):
@@ -246,6 +278,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             result = run_hook(
                 0, fake_hack, target="gs://kube-agents-dashboards/evals/",
                 job_type="periodic", mode_next="1",
+                path_prepend=failing_gcloud(pathlib.Path(tmp)),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("eval-dashboard: published to gs://kube-agents-dashboards/evals/", result.stdout)
@@ -307,9 +340,11 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
                 """,
             )
+            gcloud_dir = failing_gcloud(pathlib.Path(tmp))
             for code in (0, 7):
                 result = run_hook(
-                    code, fake_hack, target="gs://kube-agents-dashboards/evals/"
+                    code, fake_hack, target="gs://kube-agents-dashboards/evals/",
+                    path_prepend=gcloud_dir,
                 )
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertIn(
@@ -508,6 +543,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     fake_hack,
                     target="gs://kube-agents-dashboards/evals/",
                     artifacts=str(artifacts),
+                    path_prepend=failing_gcloud(pathlib.Path(tmp)),
                 )
                 log = artifacts / "eval-dashboard-publish.log"
                 self.assertTrue(log.is_file(), list(artifacts.iterdir()))

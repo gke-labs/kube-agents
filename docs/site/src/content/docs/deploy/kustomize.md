@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-The operator lays down every concrete Kubernetes object for the Platform Agent — the `Deployment`, `ConfigMap`s, RBAC, the `Service` and the `NetworkPolicy` — when it reconciles a `PlatformAgent` CR. The objects over those Pods it does not render are the `PodMonitoring`s, which the chart renders behind `platformAgent.podMonitoring` ([Telemetry](/kube-agents/deploy/telemetry/#gke-managed-prometheus)). Two select `<name>-gateway`, for the event watcher's metrics on `9095` and the leader's chat metrics on `9097`; one selects the credential broker's metrics-only port `8766`; one the A2A gateway's `9096`. No static copy of the Service or the network policies ships in the repository: the objects below exist only as the operator renders them, and each carries an owner reference to the CR that produced it. The remote Kustomize base that used to ship at `deploy/kustomize/platform` is gone; an overlay that still lists it as a resource fails to build, and the fix is to drop that resource, because the gateway policy and Service the operator renders already cover what it applied. This page keeps the `kustomize` address it had when it described that base, so existing links still resolve; the Kustomize copies it still covers are the operator integrations at the end.
+The operator lays down every concrete Kubernetes object for the Platform Agent — the `Deployment`, `ConfigMap`s, RBAC, the `Service` and the `NetworkPolicy` — when it reconciles a `PlatformAgent` CR. The objects over those Pods it does not render are the `PodMonitoring`s, which the chart renders behind `platformAgent.podMonitoring` ([Telemetry](/kube-agents/deploy/telemetry/#gke-managed-prometheus)). Two select `<name>-gateway`, for the event watcher's metrics on `9095` and the leader's chat metrics on `9097`; one selects the credential broker's metrics-only port `8766`; one the A2A gateway's `9096`; and one the A2A bus's NATS exporter on `7777`. No static copy of the Service or the network policies ships in the repository: the objects below exist only as the operator renders them, and each carries an owner reference to the CR that produced it. The remote Kustomize base that used to ship at `deploy/kustomize/platform` is gone; an overlay that still lists it as a resource fails to build, and the fix is to drop that resource, because the gateway policy and Service the operator renders already cover what it applied. This page keeps the `kustomize` address it had when it described that base, so existing links still resolve; the Kustomize copies it still covers are the operator integrations at the end.
 
 ## The gateway NetworkPolicy
 
@@ -51,8 +51,9 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent`, `AgentPlugin` and `AgentProfile` CRDs.
-- `config/rbac/` — ClusterRoles + bindings for the manager.
+- `config/crd/` — the `PlatformAgent`, `AgentPlugin`, `AgentProfile` and `Tier` CRDs.
+- `config/rbac/` — the manager's ClusterRole and its binding, and the namespaced Role (the write verbs on every kind the operator renders) with its binding in the install namespace.
+- `config/profiles/` — the profile namespace (`kubeagents-system-profiles`) with the operator's namespaced Role (a generated copy of the Role document in `config/rbac/role.yaml`) and its RoleBinding; `make deploy` applies it after `config/default`, and `make undeploy` deletes the namespace.
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
 - `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
@@ -74,7 +75,7 @@ that). Deploy the dev copies via `make deploy-*`
 from `k8s-operator/`:
 
 ```bash
-make deploy IMG=<registry>/k8s-operator:$(git rev-parse HEAD)   # operator; refuses a floating tag
+make deploy IMG=<registry>/k8s-operator:$(git rev-parse HEAD)   # operator; refuses a floating tag; also applies config/profiles
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy

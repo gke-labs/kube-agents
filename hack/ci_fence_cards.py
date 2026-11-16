@@ -27,9 +27,11 @@ that kept going after it could archive the card of the unit launched next. An ar
 only while ARCHIVE_FLOOR_SECONDS are left, and each archive and board read is bounded by what
 is left. A budget that runs out ends the helper, naming the cards it did not reach.
 
-Prints one line. Exits 0 when nothing live is left (none found, or every one archived), 1
-when the board could not be read, the budget ran out, or a card is still live after the last
-pass.
+Prints one line. Exits 0 when nothing live is left (none found, or every one archived), and
+EXIT_LEFT_LIVE (3) when the board could not be read, the budget ran out, or a card is still
+live after the last pass. That code is the helper's own verdict, told apart from kubectl's exit
+1 for an exec that never reached the container, or for a helper that did not run to its verdict:
+the runner retries those and not this (EVAL_FENCE_DECIDED_EXIT in hack/ci-eval-pr.sh).
 """
 
 import os
@@ -54,7 +56,7 @@ ARCHIVE_FLOOR_SECONDS = 5
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 # How much of a refused archive's reply the line quotes.
 EXCERPT_CHARS = 200
-EXIT_LEFT_LIVE = 1
+EXIT_LEFT_LIVE = 3
 STARTED = time.monotonic()
 
 

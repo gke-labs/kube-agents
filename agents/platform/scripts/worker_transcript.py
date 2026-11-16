@@ -91,11 +91,59 @@ VALUE_SPAN_LINE = "line"
 VALUE_SPAN_TOKEN = "token"
 TEXT_ARG_KEYS = ("content",)
 # A backslash-escaped space continues a shell word (`password=my\ secret\
-# phrase` is one value). `scrub_step_text` folds each to a character no rule
-# reads as whitespace before the redactor runs, so the redactor and the
-# supplement see one token, and the supplement unfolds what survives.
+# phrase` is one value). `scrub_step_text` folds each to a character the
+# value rules do not read as whitespace before the redactor runs, so the
+# redactor and the supplement see one token, and the supplement unfolds what
+# survives.
+# Every `\ ` folds, also after an even backslash run, where bash ends the word
+# (`a\\ b` is `a\` and `b`): `eval`, `ssh host …`, `watch` and a nested
+# `bash -c "…"` read the words again and halve the run, so there the space
+# does not split, and a value rule reading one word masks the value either
+# way. The CLI flag rules also read a flag right after the mark as a new
+# word, in a second pass after every other supplement rule (the
+# `*_AT_FOLD_RE` rules), which covers the plain reading; the values they would
+# mask are also read before the redactor runs (`at_fold_flag_secrets`), since
+# its key-value rule can take the flag word first. A last pass, not a
+# wider first one: a match that started at the mark could take the text a
+# real flag's match needs (`my\ -prod.cnf -p S`), or a command word a later
+# rule reads. Masking a value too many is harmless, and
+# missing one is not.
 SHELL_ESCAPED_SPACE = "\\ "
 SHELL_ESCAPED_SPACE_FOLD = "\ue000"
+# A served value ends a word: the next character is whitespace, a quote, a
+# shell operator, a closing parenthesis or the end. A value that ends with
+# its own closing quote has ended there (`mask_served_values`).
+SERVED_VALUE_END_RE = re.compile(r"[\s\"';|&)]|\Z")
+# A spelling can be found again inside its own last place (`-ua:S-ua:S` in a
+# run of `-ua:S`), and each such place costs a new search of about the
+# spelling's length. `mask_served_values` follows such places for this many
+# spelling characters per character of the text, and for the fixed count
+# below in a short text; past that it looks for the spelling only after the
+# end of its last place.
+SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR = 4
+SERVED_OVERLAP_SEARCH_MIN_CHARS = 65536
+# The length of a short credential flag word (`-p`, `-a`).
+SHORT_P_FLAG_WORD_LEN = 2
+# Where the redactor's bare key-value value ends (the `bare` branch of
+# `SECRET_KV_PATTERN` in `agents/chat/defaults/plugins/common/redactor.py`):
+# whitespace, a quote, one of `,{}]`, or a backslash escape. A value that
+# took a flag word runs on through `=` and `user:` up to the first of these,
+# and its marker stands in front of what follows (`at_fold_flag_secrets`).
+REDACTOR_BARE_VALUE_END_RE = re.compile(r"[\s\"',{}\]]|\\[nrt\"/]")
+# The longest text one end of that rule spans, a backslash escape.
+REDACTOR_BARE_VALUE_END_MAX_LEN = 2
+# Closing punctuation: the ends above, a closing parenthesis and `;`. The
+# spelling after the redactor's marker is kept only for a value with some
+# other character in it: a value made of closing punctuation alone (`",`,
+# `}`, `")`, `\n'`) would match what follows other markers in the command.
+VALUE_CLOSING_PUNCTUATION_RE = re.compile(r"[\s\"',{}\]);]|\\[nrt\"/]")
+# Words a flag rule may read as a value that are shell operators, not
+# values; the after-pipeline mask leaves them alone.
+SHELL_OPERATOR_WORDS = frozenset({"&&", "||", "&", "|", ";"})
+# The most values one step's command keeps for the after-pipeline mask: past
+# it, a command full of escaped flags would cost time quadratic in its length,
+# and a value left out is served as it was before #5535.
+MAX_AT_FOLD_FLAG_VALUES = 32
 # A line that opens a JSON document; the manifest marker that licenses the
 # text-form `data` rule is looked for from the nearest such line before the
 # object, so a `"kind":` on an earlier log line says nothing about a later one.
@@ -115,11 +163,11 @@ BASE64_QUANTUM_CHARS = 4
 BASE64_PADDING_CHAR = "="
 BASE64_DECODED_TEXT_WHITESPACE = "\n\r\t"
 BASE64_DECODED_TEXT_ENCODING = "utf-8"
-# The separator a `NAME=value` token is rescanned on, the character the
-# shell continuation folds to, and the whitespace an indent or a line's tail
-# is made of.
+# The separator a `NAME=value` token is rescanned on, the blank the masking
+# fold joins an even backslash run's lines with, and the whitespace an indent
+# or a line's tail is made of.
 EQUALS_SEPARATOR = "="
-SHELL_CONTINUATION_FOLD = " "
+SHELL_MASK_JOIN = " "
 INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
@@ -200,6 +248,23 @@ CLI_USERPASS_ARG_RE = re.compile(
 CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
     r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
+)
+# The three rules above, for a flag that starts right after the escaped-space
+# mark, run as a second pass (see `SHELL_ESCAPED_SPACE`). The user part of
+# `user:pass` stops at the mark, so a run of `\ -u` costs linear time.
+CLI_LONG_FLAG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
+)
+CLI_USERPASS_ARG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"(?:-u|--user)[ \t=]*)"
+    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+    r"|(?P<user>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+)
+CLI_SHORT_P_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
+    r"[^\r\n;|&]{0,512}?" + SHELL_ESCAPED_SPACE_FOLD + r"-(?:p|a)[ \t=]*)"
     r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
 )
 # The two rules above end a command's segment at `;`, `|` or `&`, but a
@@ -287,10 +352,21 @@ SENSITIVE_KEY_SUFFIXES = (
 )
 BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A shell joins a backslash-newline before it parses, so the detector folds
-# the continuation (and the indentation after it) to one space first; every
-# rule below is segment-bounded and would otherwise see two commands.
-SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+# A shell removes a backslash-newline before it parses, joining the two lines
+# with nothing between them, so the detector removes it first; every rule below
+# is segment-bounded and would otherwise see two commands. Only an odd run of
+# backslashes ends in a continuation: in an even run each pair is one literal
+# backslash, and the newline still ends the command. A backslash before a CR
+# escapes the CR, and the LF after it still ends the command, so CRLF is no
+# continuation either. The masking path (`fold_shell_command`) also joins an
+# even run, or a run before CRLF, as this file did before it counted
+# backslashes: the last backslash, the break and the indentation become a
+# space. Bash ends the command there, but a nested `bash -c "…"` halves the
+# run inside double quotes and continues the line, so the credential rules
+# read it joined: masking a value too many is harmless, and missing one is not.
+# Both folds are one pass over the command (`_fold_line_breaks`).
+SHELL_CRLF = "\r\n"
+SHELL_INDENT_CHARS = " \t"
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -808,6 +884,9 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
         return CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
 
+    def _mask_userpass_segment_at_fold(match: "re.Match[str]", source: str) -> str:
+        return CLI_USERPASS_ARG_AT_FOLD_RE.sub(_mask_userpass, source[match.start() : match.end()])
+
     def _mask_userpass(match: "re.Match[str]") -> str:
         quote = match.group("quote") or ""
         user = match.group("quser") if quote else match.group("user")
@@ -839,7 +918,144 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv, extend)
     text = QUOTED_COLON_KV_RE.sub(_mask_quoted_colon_kv, text)
     text = sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv, extend)
+    # The second pass, last: every rule above has read the text as before, so
+    # these only add masks (`SHELL_ESCAPED_SPACE`).
+    text = CLI_LONG_FLAG_AT_FOLD_RE.sub(_mask_long_flag, text)
+    text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment_at_fold)
+    text = sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, text, _mask_short_p)
     return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
+
+
+def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[tuple[str, int], ...]]:
+    """The values the CLI flag rules would mask after the escaped-space mark
+    in `folded`, one entry per value: the spellings it may have in the served
+    text, each with the offset where the value starts in it. A spelling is a
+    lead and the value: the value's own flag and separator (`--password `,
+    `-p`, `-u admin:`), or the secret marker in front of what the redactor
+    left of them, for when the redactor masked the flag word with the value
+    before it. Spelled as the served text spells them (the mark given back
+    as `\\ `).
+
+    The redactor runs before the flag rules and its key-value rule reads a
+    bare value up to whitespace, which the mark is not: in
+    `DB_PASSWORD=x\\ --password S` it masks `x\\<mark>--password` and leaves
+    `S`; in `--password="S"` and `--user=admin:"S"` it runs on to the quote
+    (`REDACTOR_BARE_VALUE_END_RE`) and leaves `"S"`. Read before the
+    redactor, these values are masked after the whole pipeline where they
+    still follow one of their leads, in each command argument they were read
+    from (`mask_served_values`). Nothing here changes the text the redactor
+    and the other rules read, so no mask is lost.
+    """
+    found: list[tuple[tuple[str, int], ...]] = []
+    if SHELL_ESCAPED_SPACE_FOLD not in folded:
+        # Each rule below needs the mark: a command without an escaped space
+        # costs nothing here.
+        return found
+
+    def unfold(text: str) -> str:
+        return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
+
+    def keep(value: str, lead: str, after_flag: str, raw: str = "") -> None:
+        # `value` is the value as its rule reads it; `raw` is the value as the
+        # command spells it, given where the rule read it without its quotes.
+        if len(found) >= MAX_AT_FOLD_FLAG_VALUES:
+            return
+        read = unfold(value)
+        if not read or read.startswith(REDACTED_MARKER_PREFIX) or read in SHELL_OPERATOR_WORDS:
+            return
+        raw = raw or value
+        leads = (unfold(lead), REDACTED_SECRET_MARKER + unfold(after_flag))
+        spellings = [(one + spelled, len(one)) for spelled in dict.fromkeys((read, unfold(raw))) for one in leads]
+        # The redactor's value ends at the first such place in the lead, or
+        # where the value starts with one; its marker stands in front of the rest.
+        end = REDACTOR_BARE_VALUE_END_RE.search(lead + raw[:REDACTOR_BARE_VALUE_END_MAX_LEN])
+        if end and end.start() <= len(lead) and VALUE_CLOSING_PUNCTUATION_RE.sub("", raw):
+            rest = REDACTED_SECRET_MARKER + unfold(lead[end.start() :])
+            spellings.append((rest + unfold(raw), len(rest)))
+        found.append(tuple(spellings))
+
+    for match in CLI_LONG_FLAG_AT_FOLD_RE.finditer(folded):
+        unquoted = unquote_token(match.group("val"))
+        if (
+            not unquoted.startswith(CLI_FLAG_LEAD_CHAR)
+            and cli_flag_is_sensitive(redactor, match.group("flag"))
+            and redactor._is_credential_value(unquoted)
+        ):
+            flag_word = match.group("prefix")[len(SHELL_ESCAPED_SPACE_FOLD) :] + match.group("flag")
+            keep(match.group("val"), flag_word + match.group("sep"), match.group("sep"))
+
+    def read_userpass(segment: "re.Match[str]", source: str) -> str:
+        for match in CLI_USERPASS_ARG_AT_FOLD_RE.finditer(source[segment.start() : segment.end()]):
+            quote = match.group("quote") or ""
+            raw = match.group("qval") if quote else match.group("val")
+            val = raw if quote else unquote_token(raw)
+            if not val.startswith(CLI_FLAG_LEAD_CHAR) and redactor._is_credential_value(val):
+                prefix = match.group("prefix")[len(SHELL_ESCAPED_SPACE_FOLD) :]
+                flag_word = prefix.rstrip(INLINE_WHITESPACE + EQUALS_SEPARATOR)
+                user = quote + (match.group("quser") if quote else match.group("user"))
+                keep(val, prefix + user, prefix[len(flag_word) :] + user, raw)
+        return source[segment.start() : segment.end()]
+
+    def read_short_p(match: "re.Match[str]", source: str) -> str:
+        raw = source[match.start("val") : match.end("val")]
+        unquoted = unquote_token(raw)
+        if not unquoted.startswith(CLI_FLAG_LEAD_CHAR) and redactor._is_credential_value(unquoted):
+            mark = source.rfind(SHELL_ESCAPED_SPACE_FOLD, match.start(), match.start("val"))
+            lead = source[mark + len(SHELL_ESCAPED_SPACE_FOLD) : match.start("val")]
+            keep(raw, lead, lead[SHORT_P_FLAG_WORD_LEN:])
+        return source[match.start() : match.end()]
+
+    sub_shell_segments(CLI_USERPASS_FLAG_RE, folded, read_userpass)
+    sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, folded, read_short_p)
+    return found
+
+
+def mask_served_values(text: str, values: Sequence[tuple[tuple[str, int], ...]]) -> str:
+    """`text` with the value of each spelling in `values` (see
+    `at_fold_flag_secrets`) replaced by the secret marker where the spelling
+    ends a word: the value after its flag, not the same string elsewhere in
+    the command; more masks only. Where places overlap (a value that holds
+    the flag word of the next value), one marker stands for all of them,
+    from the first value's start to the last place's end. Each spelling is
+    searched for as plain text, in one pass, so the cost is linear in
+    `text` (see `SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR`)."""
+    value_at_by_spelling: dict[str, int] = {}
+    for spellings in values[:MAX_AT_FOLD_FLAG_VALUES]:
+        for served, value_at in spellings:
+            # Two values with one served spelling: the one that masks more.
+            value_at_by_spelling[served] = min(value_at, value_at_by_spelling.get(served, value_at))
+    places: list[tuple[int, int, int]] = []
+    overlap_chars = SERVED_OVERLAP_SEARCH_MIN_CHARS + SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR * len(text)
+    for served, value_at in value_at_by_spelling.items():
+        quoted = served.endswith(SHELL_QUOTE_CHARS)
+        start = text.find(served)
+        while start >= 0:
+            end = start + len(served)
+            if quoted or SERVED_VALUE_END_RE.match(text, end):
+                places.append((start, end, start + value_at))
+            following = text.find(served, start + 1)
+            if 0 <= following < end:
+                if overlap_chars >= len(served):
+                    overlap_chars -= len(served)
+                else:
+                    following = text.find(served, end)
+            start = following
+    if not places:
+        return text
+    places.sort()
+    pieces: list[str] = []
+    done = 0
+    _, end, value_at = places[0]
+    for next_start, next_end, next_value_at in places[1:]:
+        if next_start < end:
+            end = max(end, next_end)
+            value_at = min(value_at, next_value_at)
+            continue
+        pieces += (text[done:value_at], REDACTED_SECRET_MARKER)
+        done = end
+        end, value_at = next_end, next_value_at
+    pieces += (text[done:value_at], REDACTED_SECRET_MARKER, text[end:])
+    return "".join(pieces)
 
 
 def as_json_structure(text: str) -> Any:
@@ -997,17 +1213,58 @@ def supplement_redact(
     return value
 
 
+def _fold_line_breaks(command: str, masking: bool) -> str:
+    """``command`` with each backslash run before a line break folded, in one pass: an odd run
+    before an LF loses its last backslash and the LF, and the indentation after it stays as the
+    blank between words; with ``masking``, an even run or a run before CRLF also loses its last
+    backslash, the break and the indentation, which become ``SHELL_MASK_JOIN``."""
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        if command[i] != SHELL_ESCAPE:
+            out.append(command[i])
+            i += 1
+            continue
+        j = i
+        while j < n and command[j] == SHELL_ESCAPE:
+            j += 1
+        run = j - i
+        if command.startswith(LINE_BREAK, j) and run % 2:
+            out.append(SHELL_ESCAPE * (run - 1))
+            i = j + len(LINE_BREAK)
+        elif masking and (command.startswith(LINE_BREAK, j) or command.startswith(SHELL_CRLF, j)):
+            k = j + (len(LINE_BREAK) if command.startswith(LINE_BREAK, j) else len(SHELL_CRLF))
+            while k < n and command[k] in SHELL_INDENT_CHARS:
+                k += 1
+            out.append(SHELL_ESCAPE * (run - 1) + SHELL_MASK_JOIN)
+            i = k
+        else:
+            out.append(SHELL_ESCAPE * run)
+            i = j
+    return "".join(out)
+
+
+def fold_shell_continuations(command: str) -> str:
+    """``command`` with each backslash-newline continuation removed, as the shell
+    removes it: ``kube\\<newline>ctl`` is one word, and the indentation after a
+    continuation stays as the blank between words. An escaped backslash before
+    a newline is not a continuation."""
+    return _fold_line_breaks(command, masking=False)
+
+
 def fold_shell_command(command: str) -> str:
-    """A command as the shell would read it: a backslash-newline continuation
-    joined to its line, and an escaped space folded to one token character
-    (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
-    return SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command).replace(
-        SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD
-    )
+    """A command as the credential rules read it: a backslash-newline
+    continuation joined to its line (an even run or a CRLF joined with a space,
+    see `_fold_line_breaks`), and every escaped space folded to one token
+    character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`),
+    also after an even backslash run; the CLI flag rules read a flag after
+    the mark as a new word in a second pass (`SHELL_ESCAPED_SPACE`)."""
+    return _fold_line_breaks(command, masking=True).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
-    """Scrub one worker step's text: `redactor.redact` first, then the supplement.
+    """Scrub one worker step's text: `redactor.redact` first, then the supplement
+    (and, for a tool call, the flag values read before the redactor, masked last).
 
     `kind` is the step kind (`thinking`, `tool_call`, `tool_result`, `reply`);
     a `tool_call` has its command's shell continuations and escaped spaces
@@ -1026,6 +1283,7 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     value_span = VALUE_SPAN_LINE if is_result else VALUE_SPAN_TOKEN
     shell_keys = COMMAND_ARG_KEYS if is_call else ()
     line_keys = TEXT_ARG_KEYS if is_call else ()
+    flag_secrets: list[tuple[tuple[str, int], ...]] = []
     try:
         parsed = as_json_structure(text)
         if is_call:
@@ -1034,31 +1292,43 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
             # `--password pass`) reads the command the shell would run and an
             # escaped-space value is one token; `as_json_structure` returns a
             # fresh object, so the fold does not touch the row.
+            # The values a flag after the escaped-space mark carries are
+            # read here (`at_fold_flag_secrets`), before the redactor can take
+            # the flag into a key-value value, and masked after the pipeline
+            # where they still follow their flag (`mask_served_values`).
             if isinstance(parsed, dict):
                 for arg_key in COMMAND_ARG_KEYS:
                     if isinstance(parsed.get(arg_key), str):
                         parsed[arg_key] = fold_shell_command(parsed[arg_key])
+                        flag_secrets += at_fold_flag_secrets(redactor, parsed[arg_key])
             elif parsed is None:
                 text = fold_shell_command(text)
+                flag_secrets += at_fold_flag_secrets(redactor, text)
         if parsed is not None:
-            return json.dumps(
+            served = supplement_redact(
+                redactor,
+                redactor.redact(parsed),
+                is_tool_result=is_result,
+                value_span=value_span,
+                shell_keys=shell_keys,
+                line_keys=line_keys,
+            )
+            if flag_secrets and isinstance(served, dict):
+                for arg_key in COMMAND_ARG_KEYS:
+                    if isinstance(served.get(arg_key), str):
+                        served[arg_key] = mask_served_values(served[arg_key], flag_secrets)
+            return json.dumps(served)
+        # A bare-string tool call is the shell line itself.
+        return mask_served_values(
+            str(
                 supplement_redact(
                     redactor,
-                    redactor.redact(parsed),
+                    redactor.redact(text),
                     is_tool_result=is_result,
-                    value_span=value_span,
-                    shell_keys=shell_keys,
-                    line_keys=line_keys,
+                    value_span=VALUE_SPAN_SHELL if is_call else value_span,
                 )
-            )
-        # A bare-string tool call is the shell line itself.
-        return str(
-            supplement_redact(
-                redactor,
-                redactor.redact(text),
-                is_tool_result=is_result,
-                value_span=VALUE_SPAN_SHELL if is_call else value_span,
-            )
+            ),
+            flag_secrets,
         )
     except RecursionError:
         return withheld
@@ -1319,7 +1589,7 @@ def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
 
 
 def _command_reads_a_secret(command: str, depth: int) -> bool:
-    folded = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command)
+    folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))

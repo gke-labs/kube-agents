@@ -531,7 +531,7 @@ spec:
         - port: 5432
           protocol: TCP
 {{- end }}
-{{- if .Values.hindsight.podMonitoring }}
+{{- if include "kube-agents.hindsightPodMonitoring" . }}
 ---
 # Scraped by GKE Managed Prometheus, the same way the LiteLLM gateway is. The
 # API serves Prometheus text on its ordinary HTTP port, so the selector pins
