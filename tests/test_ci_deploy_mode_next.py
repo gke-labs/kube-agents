@@ -1348,7 +1348,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         # The ordering the wait relies on: the pass rolls the agent
         # Deployment before it creates or sweeps the provision Job, and
         # nothing watches Jobs, so the Failed status arrives on a requeue.
-        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance,"))
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, renderAgent,"), controller.index("r.reconcileA2A(ctx, renderAgent,"))
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 

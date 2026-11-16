@@ -1,0 +1,128 @@
+name: Installer tests on bash 3.2
+
+# install.sh, upgrade.sh, uninstall.sh, scripts/installer/*.sh and
+# terraform/examples/full-install/lifecycle.sh are written to run on macOS's
+# /bin/bash 3.2. The Linux unit-test job runs their tests with bash 5, which
+# differs from bash 3.2 in two ways the installer met: bash 3.2 reads a bare
+# expansion of an empty array under `set -u` as an unbound variable, and it
+# runs an inherited ERR trap inside a `$(...)` whose failure the caller
+# handles. Such a change can pass every other check and then fail for each
+# contributor and operator on a stock Mac. This job runs the installer test
+# files on the macOS runner with a directory holding `bash -> /bin/bash` first
+# on PATH, as step0-bash-floor.yml does for one file.
+#
+# NOT a required check. A red run here does not block a merge; it tells the
+# author that the change breaks the installer on bash 3.2. Whether the job
+# becomes required is the question of #6078.
+#
+# The paths are the files that the job needs, measured, not guessed: the test
+# files pass in a tree that holds the listed test inputs and nothing else, and
+# the files that `make` and the install step read are added to them. A test in
+# the job that starts to read a new file must add the file here.
+# Nothing here needs a credential, so the job runs on forks too.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: &installer-test-inputs
+      - "install.sh"
+      - "upgrade.sh"
+      - "uninstall.sh"
+      - "install.defaults.env"
+      - "install.env.example"
+      - "INSTALL.md"
+      - "scripts/installer/**"
+      - "scripts/release/common.sh"
+      - "scripts/confirm_agent_image.sh"
+      - "terraform/examples/full-install/**"
+      - "terraform/modules/kube-agents-scope-resolver/**"
+      - "charts/kube-agents/**"
+      - "a2a/cmd/web-console/models.go"
+      - "a2a/gateway/gchat.go"
+      - "a2a/gateway/slack.go"
+      - "k8s-operator/config/integrations/litellm/providers.json"
+      - "k8s-operator/internal/controller/platformagent_a2a_manifests.go"
+      - "tests/test_install_script.py"
+      - "tests/test_uninstall_script.py"
+      - "tests/test_upgrade_script.py"
+      - "tests/test_installer_common.py"
+      - "tests/test_installer_bitbucket.py"
+      - "tests/test_installer_confirm_action.py"
+      - "tests/test_installer_ghes.py"
+      - "tests/test_installer_gitlab.py"
+      - "tests/test_installer_gitops_record.py"
+      - "tests/test_lifecycle_script.py"
+      - "tests/testing/**"
+      - "tests/testdata/**"
+      - "tests/data/**"
+      - "Makefile"
+      - "tags.env"
+      - "requirements-test.txt"
+      - "admin_console/requirements.txt"
+      - ".python-version"
+      - ".github/workflows/installer-tests-bash-floor.yml"
+  push:
+    branches: [main]
+    paths: *installer-test-inputs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  INSTALLER_TEST_FILES: >-
+    tests/test_install_script.py
+    tests/test_uninstall_script.py
+    tests/test_upgrade_script.py
+    tests/test_installer_common.py
+    tests/test_installer_bitbucket.py
+    tests/test_installer_confirm_action.py
+    tests/test_installer_ghes.py
+    tests/test_installer_gitlab.py
+    tests/test_installer_gitops_record.py
+    tests/test_lifecycle_script.py
+
+jobs:
+  installer-tests-on-bash-3-2:
+    name: Installer test files under /bin/bash 3.2 (not required)
+    runs-on: macos-latest
+    # The first run took under five minutes.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: ".python-version"
+
+      # tests/test_upgrade_script.py has chart tests that are `skipUnless(helm)`;
+      # the same version as the Linux unit-test job.
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      - name: Install the third-party imports the modules under test need
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      - name: Put the system bash first on PATH and show its version
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash-3-2"
+          ln -s /bin/bash "$RUNNER_TEMP/bash-3-2/bash"
+          echo "$RUNNER_TEMP/bash-3-2" >> "$GITHUB_PATH"
+          /bin/bash --version | head -n 1
+
+      - name: Run the installer test files with bash 3.2 first on PATH
+        run: |
+          command -v bash
+          bash --version | head -n 1
+          make test-python PYTHON_TEST_FILES="$INSTALLER_TEST_FILES"
