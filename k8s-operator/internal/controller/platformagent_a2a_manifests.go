@@ -3466,8 +3466,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// whose own fence keeps them to the bus, LiteLLM and
 					// DNS (agentprofile_namespace.go).
 					profileNamespacePeer(agent),
-					// The MCP server, under its flag (a2aMCPNATSPeers).
-				}, append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...)...),
+					// The MCP server and OKF curator, under their flags.
+				}, append(append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...), a2aCuratorNATSPeers(agent)...)...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -7081,6 +7081,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	if a2aMCPDoorEnabled() {
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
 	}
+	if a2aCuratorEnabled() {
+		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
+	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
 	// the refusal-path rescue, so it is applied over a gateway that exists.
@@ -7425,6 +7428,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
+	}
+
+	// The OKF memory curator, under A2A_CURATOR, after the fences and ahead of
+	// the gateway hold.
+	if err := r.reconcileA2ACurator(ctx, agent, state.busHeld); err != nil {
+		return state, err
 	}
 
 	// The scope publisher: its static objects, its Job on schedule, and the
