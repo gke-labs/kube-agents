@@ -1385,10 +1385,10 @@
                       "additionalProperties": false,
                       "properties": {
                         "cpu": {
-                          "type": ["string", "number"]
+                          "type": ["string", "number", "null"]
                         },
                         "memory": {
-                          "type": ["string", "number"]
+                          "type": ["string", "number", "null"]
                         }
                       }
                     },
@@ -1397,10 +1397,10 @@
                       "additionalProperties": false,
                       "properties": {
                         "cpu": {
-                          "type": ["string", "number"]
+                          "type": ["string", "number", "null"]
                         },
                         "memory": {
-                          "type": ["string", "number"]
+                          "type": ["string", "number", "null"]
                         }
                       }
                     }

@@ -270,7 +270,11 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") (hasKey $tuning "sessionResources") (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
+    {{- /* The session pods' requests and limits go through the sizing overrides' helpers, so a
+      values file's `cpu: 0.5` reaches the CRD as a quoted quantity and a null or empty leaf is
+      dropped (kube-agents.resourcesOverrideQuantities). */}}
+    {{- $sessionQuantities := include "kube-agents.resourcesOverrideQuantities" $tuning.sessionResources | fromJson }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -278,7 +282,7 @@ spec:
       {{- if hasKey $tuning "maxSessions" }}
       maxSessions: {{ $tuning.maxSessions }}
       {{- end }}
-      {{- if hasKey $tuning "sessionResources" }}
+      {{- if $sessionQuantities }}
       {{- /*
         A CRD that predates the field prunes it on write, and the release
         record keeps it, so Helm never re-sends it: the session pods would
@@ -297,7 +301,7 @@ spec:
       {{- end }}
       {{- end }}
       sessionResources:
-        {{- toYaml $tuning.sessionResources | nindent 8 }}
+        {{- include "kube-agents.resourcesOverrideBlock" $sessionQuantities | nindent 8 }}
       {{- end }}
       {{- if hasKey $tuning "busReplicas" }}
       {{- /*

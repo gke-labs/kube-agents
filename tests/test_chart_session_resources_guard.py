@@ -7,6 +7,9 @@ the release record says otherwise. `lookup` is empty under `helm template`, so t
 guard can only be pinned as text."""
 
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,7 +25,7 @@ class SessionResourcesGuardTest(unittest.TestCase):
         self.template = _TEMPLATE.read_text(encoding="utf-8")
 
     def _block(self):
-        block = re.search(r'\{\{- if hasKey \$tuning "sessionResources" \}\}\n(.*?)sessionResources:\n',
+        block = re.search(r'\{\{- if \$sessionQuantities \}\}\n(.*?)sessionResources:\n',
                           self.template, re.DOTALL)
         self.assertIsNotNone(block, "the sessionResources block is missing from the CR template")
         return block.group(1)
@@ -39,6 +42,39 @@ class SessionResourcesGuardTest(unittest.TestCase):
         self.assertIn("platformAgent.harness.tuning.sessionResources", fail.group(1))
         self.assertIn(_FAIL_MESSAGE, fail.group(1))
         self.assertIn("charts/kube-agents/crds/", fail.group(1))
+
+
+_CHART = _REPO_ROOT / "charts" / "kube-agents"
+_REQUIRED = ["--set", "platformAgent.harness.clusterName=x", "--set", "platformAgent.harness.location=x",
+             "--set", "platformAgent.harness.projectId=x"]
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class SessionResourcesRenderTest(unittest.TestCase):
+    """The value renders through the sizing overrides' helpers: every quantity quoted, so a
+    values file's float reaches the CRD's int-or-string quantity as a string, and a null leaf
+    dropped (Helm's way to unset a key)."""
+
+    def _render(self, values: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(values)
+        proc = subprocess.run(["helm", "template", "t", str(_CHART), *_REQUIRED, "-f", f.name],
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_a_float_is_quoted_and_a_null_leaf_dropped(self):
+        out = self._render("platformAgent:\n  harness:\n    tuning:\n      sessionResources:\n"
+                           "        requests:\n          cpu: 0.5\n          memory: null\n"
+                           "        limits:\n          memory: 1Gi\n")
+        block = out[out.index("sessionResources:"):].split("\n")[:5]
+        self.assertEqual([line.strip() for line in block],
+                         ["sessionResources:", "limits:", 'memory: "1Gi"', "requests:", 'cpu: "0.5"'])
+
+    def test_an_override_of_only_nulls_renders_nothing(self):
+        out = self._render("platformAgent:\n  harness:\n    tuning:\n      sessionResources:\n"
+                           "        requests:\n          memory: null\n")
+        self.assertNotIn("sessionResources:", out)
 
 
 if __name__ == "__main__":
