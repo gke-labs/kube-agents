@@ -429,6 +429,25 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         code_body = markdown_to_adaptive_card("```\n| a | b |\n```")["body"]
         self.assertEqual([b["type"] for b in code_body], ["TextBlock"])
 
+    def test_split_marker_after_a_table_row_is_not_a_cell(self):
+        # Hermes appends " (i/n)" to each piece of a split reply; when the piece
+        # ends on a table row the marker must not become an extra column.
+        text = "| Pod | Image |\n|---|---|\n| a | x |\n| b | y | (5/5)"
+        body = markdown_to_adaptive_card(text)["body"]
+        table = [block for block in body if block["type"] == "Table"][0]
+        self.assertEqual(len(table["columns"]), 2)
+        self.assertEqual(len(table["rows"]), 3)
+        self.assertEqual(table["rows"][2]["cells"][1]["items"][0]["text"], "y")
+        texts = [block["text"] for block in body if block["type"] == "TextBlock"]
+        self.assertEqual(texts, ["(5/5)"])
+        # A marker after ordinary text stays where Hermes put it.
+        plain = markdown_to_adaptive_card("all good (1/2)")["body"]
+        self.assertEqual([b["text"] for b in plain], ["all good (1/2)"])
+        # A table with no marker is untouched.
+        self.assertEqual(
+            len(markdown_to_adaptive_card("| a | b |\n|---|---|\n| 1 | 2 |")["body"]), 1
+        )
+
     def test_card_activity_carries_a_plain_summary(self):
         payload = format_teams_activity_payload(
             "# Report\n\n| a | b |\n|---|---|\n| **1** | `2` |",

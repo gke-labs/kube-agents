@@ -201,8 +201,28 @@ def strip_bot_mentions(text: str, activity: dict[str, Any]) -> str:
     return " ".join(text.split()).strip()
 
 
+# Hermes' splitter (gateway/platforms/base.py) appends " (i/n)" to every piece of
+# a long reply. The marker is text, so a piece that ends on a pipe-table row
+# would carry it inside the row, where the table parser reads it as one more
+# cell (seen live 2026-11-15: an empty third column with "(5/5)" in the last row).
+_PART_MARKER_RE = re.compile(r"\s\((\d+)/(\d+)\)\s*$")
+
+
+def _detach_part_marker(text: str) -> str:
+    """Move a trailing split marker off a table row onto its own line."""
+    match = _PART_MARKER_RE.search(text)
+    if not match:
+        return text
+    body = text[: match.start()]
+    last_line = body.rstrip("\n").rsplit("\n", 1)[-1].strip()
+    if not _is_table_row(last_line):
+        return text
+    return f"{body.rstrip()}\n\n({match.group(1)}/{match.group(2)})"
+
+
 def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, Any]:
     """Convert Markdown text into a Microsoft Teams Adaptive Card v1.5 schema."""
+    text = _detach_part_marker(text)
     body_elements: list[dict[str, Any]] = []
 
     if title:
