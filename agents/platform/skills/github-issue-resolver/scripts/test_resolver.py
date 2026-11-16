@@ -895,6 +895,24 @@ class NoIssueTrackerForge(FakeForge):
         return dict(self.answer) if repo in self.untracked else {"verbs": ["issue-list", "issue-view", "issue-comment", "issue-update"], "labels": True}
 
 
+class SkipLabelsTest(unittest.TestCase):
+    def test_the_onboarding_report_label_is_skipped(self):
+        """bootstrap_delivery.py files the first-run report under REPORT_ISSUE_LABEL; the poll
+        must not take that issue. Read from the source: the two scripts share no import path."""
+        import ast
+
+        source = Path(resolver.__file__).resolve().parents[4] / "chat" / "scripts" / "bootstrap_delivery.py"
+        self.assertTrue(source.is_file(), f"expected the delivery stage at {source}")
+        label = None
+        for node in ast.parse(source.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "REPORT_ISSUE_LABEL" for t in node.targets
+            ):
+                label = ast.literal_eval(node.value)
+        self.assertIsInstance(label, str, f"no REPORT_ISSUE_LABEL assignment in {source}")
+        self.assertIn(label, resolver.SKIP_LABELS)
+
+
 class UntrackedRepositoryTest(ResolverTest):
     """A forge with no issue tracker has nothing to poll, and that is not a fault."""
 

@@ -1,11 +1,17 @@
 package memory
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,15 +25,20 @@ import (
 )
 
 const (
-	defaultCuratorRepoDir  = "/opt/data/memory/knowledge-store"
-	defaultCuratorSession  = "agent"
-	minRecurrenceThreshold = 2
-	maxSeenEnvelopes       = 4096
-	maxQueryCacheEntries   = 256
-	defaultMaxQueryResults = 8
-	queryHandlerTimeout    = 30 * time.Second
-	hindsightRecallTimeout = 4 * time.Second
-	stateSnapshotFile      = "decisions_state.json"
+	defaultCuratorRepoDir      = "/opt/data/memory/knowledge-store"
+	defaultCuratorSession      = "agent"
+	verifiedGitSubdir          = ".git-verified"
+	brokerSnapshotPath         = "/v1/vcs/snapshot"
+	brokerSnapshotTimeout      = 25 * time.Second
+	maxBrokerSnapshotBytes     = 32 << 20
+	minRecurrenceThreshold     = 2
+	maxSeenEnvelopes           = 4096
+	maxQueryCacheEntries       = 256
+	defaultMaxQueryResults     = 8
+	queryHandlerTimeout        = 30 * time.Second
+	defaultRequestReplyTimeout = 10 * time.Second
+	hindsightRecallTimeout     = 4 * time.Second
+	stateSnapshotFile          = "decisions_state.json"
 )
 
 var queryStopwords = map[string]bool{
@@ -61,6 +72,9 @@ var queryStopwords = map[string]bool{
 // CuratorConfig configures the Go Curator/Dreamer service.
 type CuratorConfig struct {
 	RepoDir             string
+	VerifiedRepoDir     string
+	BrokerURL           string
+	BrokerTokenFile     string
 	RepoID              string
 	Session             string
 	Profile             string
@@ -80,16 +94,19 @@ type CuratorConfig struct {
 // request-reply (SubjectMemoryQuery) with automatic cache invalidation on
 // outcome updates.
 type Curator struct {
-	cfg           CuratorConfig
-	log           *slog.Logger
-	mu            sync.Mutex
-	bankEnsured   bool
-	seenEnvelopes map[string]bool
-	graduatedIDs  []string
-	queryCache    map[string]MemoryQueryResponse
-	sub           lib.Subscription
-	outcomeSubs   []lib.Subscription
-	querySubs     []lib.Subscription
+	cfg               CuratorConfig
+	log               *slog.Logger
+	mu                sync.Mutex
+	bankEnsured       bool
+	knownIDsLoaded    bool
+	knownIDs          map[string]bool
+	outcomesProcessed uint64
+	seenEnvelopes     map[string]bool
+	graduatedIDs      []string
+	queryCache        map[string]MemoryQueryResponse
+	sub               lib.Subscription
+	outcomeSubs       []lib.Subscription
+	querySubs         []lib.Subscription
 }
 
 // OutcomeProcessResult reports what the Curator changed when handling an OutcomeEvent.
@@ -141,9 +158,108 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	return &Curator{
 		cfg:           cfg,
 		log:           log,
+		knownIDs:      map[string]bool{},
 		seenEnvelopes: map[string]bool{},
 		queryCache:    map[string]MemoryQueryResponse{},
 	}, nil
+}
+
+func recordIDFromDoc(doc HindsightDocument) string {
+	if doc.DocumentMetadata != nil {
+		if id := strings.TrimSpace(doc.DocumentMetadata["id"]); reRecordID.MatchString(id) {
+			return id
+		}
+	}
+	if idx := strings.LastIndex(doc.ID, ":"); idx >= 0 && idx+1 < len(doc.ID) {
+		if id := strings.TrimSpace(doc.ID[idx+1:]); reRecordID.MatchString(id) {
+			return id
+		}
+	}
+	for _, t := range doc.Tags {
+		if strings.HasPrefix(t, "id:") {
+			if id := strings.TrimSpace(strings.TrimPrefix(t, "id:")); reRecordID.MatchString(id) {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func (c *Curator) ensureKnownIDsLocked(ctx context.Context) {
+	if c.knownIDs == nil {
+		c.knownIDs = map[string]bool{}
+	}
+	if records, err := LoadRecords(c.cfg.RepoDir); err == nil {
+		for _, r := range records {
+			if reRecordID.MatchString(r.Meta.ID) {
+				c.knownIDs[r.Meta.ID] = true
+			}
+		}
+	}
+	if c.knownIDsLoaded {
+		return
+	}
+	loadedAny := false
+	if c.cfg.Hindsight != nil {
+		hsCtx, cancel := context.WithTimeout(ctx, hindsightRecallTimeout)
+		docs, err := c.cfg.Hindsight.ListDocuments(hsCtx)
+		cancel()
+		if err == nil {
+			loadedAny = true
+			for _, doc := range docs {
+				if id := recordIDFromDoc(doc); id != "" {
+					c.knownIDs[id] = true
+				}
+			}
+		}
+	}
+	if c.cfg.Client != nil {
+		if env, err := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsState, SubjectBlueprint); err == nil && env != nil {
+			loadedAny = true
+			var art lib.Artifact
+			if json.Unmarshal(env.Payload, &art) == nil {
+				for _, p := range art.Parts {
+					if p.Kind == "data" && len(p.Data) > 0 {
+						var digest BlueprintDigest
+						if json.Unmarshal(p.Data, &digest) == nil {
+							for _, id := range digest.ActiveIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.ProposedIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.RejectedIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.SupersededIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.GraduatedDecisions {
+								c.knownIDs[id] = true
+							}
+							for _, rec := range digest.Records {
+								if reRecordID.MatchString(rec.ID) {
+									c.knownIDs[rec.ID] = true
+								}
+							}
+						}
+					}
+				}
+			}
+		} else if errors.Is(err, lib.ErrTopicEmpty) {
+			loadedAny = true
+		}
+	}
+	if loadedAny || (c.cfg.Hindsight == nil && c.cfg.Client == nil) {
+		c.knownIDsLoaded = true
+	}
+}
+
+func (c *Curator) nextRecordIDLocked(ctx context.Context, rtype RecordType, year int) string {
+	c.ensureKnownIDsLocked(ctx)
+	id := NextRecordIDWithKnown(c.cfg.RepoDir, rtype, year, c.knownIDs)
+	c.knownIDs[id] = true
+	return id
 }
 
 func (c *Curator) ensureBankOnceLocked(ctx context.Context) {
@@ -179,7 +295,7 @@ func isRedirectedJetStreamDelivery(msg *nats.Msg) bool {
 		return true
 	}
 	if msg.Header != nil {
-		if msg.Header.Get("Nats-Stream") != "" || msg.Header.Get("Nats-Subject") != "" {
+		if msg.Header.Get("Nats-Stream") != "" || msg.Header.Get("Nats-Subject") != "" || msg.Header.Get("Nats-Sequence") != "" {
 			return true
 		}
 	}
@@ -192,6 +308,7 @@ func isRedirectedJetStreamDelivery(msg *nats.Msg) bool {
 func (c *Curator) Start(ctx context.Context) error {
 	c.mu.Lock()
 	c.ensureBankOnceLocked(ctx)
+	c.ensureKnownIDsLocked(ctx)
 	c.mu.Unlock()
 
 	if c.cfg.Client == nil {
@@ -251,21 +368,30 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 
 	// Catch up with the latest entry on TOPICS-JOURNAL if present and not yet processed.
-	records, err := LoadRecords(c.cfg.RepoDir)
+	c.mu.Lock()
+	initialRecords, _ := LoadRecords(c.cfg.RepoDir)
+	c.mu.Unlock()
+
 	latestEnv, latestErr := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectAnnotations)
 	if latestErr == nil && latestEnv != nil {
-		if !shouldSkipStartupEnvelope(latestEnv, records) {
+		if !shouldSkipStartupEnvelope(latestEnv, initialRecords) {
 			c.handleAnnotationEnvelope(ctx, latestEnv)
-			records, err = LoadRecords(c.cfg.RepoDir)
 		}
 	} else if latestErr != nil && !errors.Is(latestErr, lib.ErrTopicEmpty) {
 		c.log.Debug("curator: initial journal read skipped", "err", latestErr)
 	}
 
-	// Publish initial blueprint state if records exist on disk.
-	if err == nil && len(records) > 0 {
-		_ = c.publishBlueprint(ctx, records, "startup-sync", "")
+	// Publish initial blueprint state under c.mu only if no live outcome callback
+	// has already published a newer digest since subscriptions started.
+	c.mu.Lock()
+	if c.outcomesProcessed == 0 {
+		if records, err := LoadRecords(c.cfg.RepoDir); err == nil && len(records) > 0 {
+			gradCopy := append([]string(nil), c.graduatedIDs...)
+			digest := BuildBlueprintDigest(c.cfg.RepoID, records, "startup-sync", gradCopy)
+			_ = c.publishBlueprintDigest(ctx, digest, "")
+		}
 	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -425,6 +551,9 @@ func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, ex
 			c.log.Warn("curator: ignored malformed payload on curator outcomes subject")
 			return
 		}
+		if msg.Header != nil {
+			corrID = strings.TrimSpace(msg.Header.Get("Nats-Correlation-Id"))
+		}
 	}
 
 	res, err := c.ProcessOutcome(ctx, ev, corrID)
@@ -559,6 +688,197 @@ func scopesOverlapPaths(a, b []string) bool {
 	return false
 }
 
+// verifiedRepoDir returns the directory holding Git-verified OKF records
+// (distinct from the Curator's mutable working RepoDir). When BrokerURL is
+// configured, syncVerifiedSnapshotFromBrokerLocked unpacks the broker's
+// /v1/vcs/snapshot tar archive into this directory. In the standalone Curator
+// Pod, active, retired, and supersede transitions stay fail-closed (proposed)
+// until #5588 (#5567) wires the kubeagents-credential-proxy-curator token
+// audience and /v1/vcs/snapshot route grant on credential-proxy.
+func (c *Curator) verifiedRepoDir() string {
+	if v := strings.TrimSpace(c.cfg.VerifiedRepoDir); v != "" {
+		return v
+	}
+	if strings.TrimSpace(c.cfg.BrokerURL) != "" {
+		return filepath.Join(c.cfg.RepoDir, verifiedGitSubdir)
+	}
+	return ""
+}
+
+func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repoID string) error {
+	rawURL := strings.TrimSpace(c.cfg.BrokerURL)
+	if rawURL == "" || strings.TrimSpace(repoID) == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("invalid broker URL %q", rawURL)
+	}
+	endpoint := u.Scheme + "://" + u.Host + brokerSnapshotPath
+	reqBody, err := json.Marshal(map[string]any{
+		"repository": repoID,
+		"paths":      []string{"knowledge", ".kube-agents"},
+	})
+	if err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, brokerSnapshotTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tf := strings.TrimSpace(c.cfg.BrokerTokenFile); tf != "" {
+		cleanTF := filepath.Clean(tf)
+		tokRoot, rErr := os.OpenRoot(filepath.Dir(cleanTF))
+		if rErr != nil {
+			return rErr
+		}
+		tokBytes, readErr := tokRoot.ReadFile(filepath.Base(cleanTF))
+		_ = tokRoot.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if tok := strings.TrimSpace(string(tokBytes)); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	httpClient := &http.Client{
+		Timeout:   brokerSnapshotTimeout,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("broker snapshot status %d", resp.StatusCode)
+	}
+	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, maxBrokerSnapshotBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(rawResp) > maxBrokerSnapshotBytes {
+		return errors.New("broker snapshot response exceeds size limit")
+	}
+	var snap struct {
+		ArchiveBase64 string `json:"archiveBase64"`
+	}
+	if err := json.Unmarshal(rawResp, &snap); err != nil || snap.ArchiveBase64 == "" {
+		return errors.New("broker snapshot missing archiveBase64 payload")
+	}
+	tarBytes, err := base64.StdEncoding.DecodeString(snap.ArchiveBase64)
+	if err != nil {
+		return err
+	}
+	vDir := c.verifiedRepoDir()
+	if vDir == "" {
+		return nil
+	}
+	stagingDir := vDir + ".staging"
+	_ = os.RemoveAll(stagingDir)
+	if err := os.MkdirAll(stagingDir, recordDirPerm); err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.RemoveAll(stagingDir)
+	}()
+	vRoot, err := os.OpenRoot(stagingDir)
+	if err != nil {
+		return err
+	}
+
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	for {
+		hdr, tErr := tr.Next()
+		if errors.Is(tErr, io.EOF) {
+			break
+		}
+		if tErr != nil {
+			_ = vRoot.Close()
+			return tErr
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		if hdr.Size < 0 || hdr.Size > maxRecordFileBytes {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(strings.TrimLeft(hdr.Name, "/")))
+		if rel == "." || rel == "" || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") {
+			continue
+		}
+		if !strings.HasPrefix(rel, "knowledge/") && rel != ".kube-agents/intent.yaml" {
+			continue
+		}
+		data, rErr := io.ReadAll(io.LimitReader(tr, maxRecordFileBytes+1))
+		if rErr != nil || int64(len(data)) > maxRecordFileBytes {
+			continue
+		}
+		dirPart := filepath.Dir(filepath.FromSlash(rel))
+		if dirPart != "." && dirPart != "" {
+			if err := vRoot.MkdirAll(dirPart, recordDirPerm); err != nil {
+				_ = vRoot.Close()
+				return err
+			}
+		}
+		if err := vRoot.WriteFile(filepath.FromSlash(rel), data, recordFilePerm); err != nil {
+			_ = vRoot.Close()
+			return err
+		}
+	}
+	if err := vRoot.Close(); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(vDir)
+	return os.Rename(stagingDir, vDir)
+}
+
+func (c *Curator) loadGitVerifiedByIDLocked(ctx context.Context, repoID string) map[string]Record {
+	if err := c.syncVerifiedSnapshotFromBrokerLocked(ctx, repoID); err != nil {
+		c.log.Debug("curator: broker snapshot sync skipped", "err", err)
+	}
+	vDir := c.verifiedRepoDir()
+	if vDir == "" {
+		return nil
+	}
+	recs, err := LoadRecords(vDir)
+	if err != nil {
+		return nil
+	}
+	gitByID := make(map[string]Record, len(recs))
+	for _, r := range recs {
+		gitByID[r.Meta.ID] = r
+	}
+	return gitByID
+}
+
+// verifiedGitRecordByStatus checks whether record id is present in the
+// Git-verified record map (gitByID, loaded from VerifiedRepoDir / the VCS
+// broker snapshot and separate from the Curator's mutable working RepoDir) with
+// wantStatus and valid OKF frontmatter.
+func verifiedGitRecordByStatus(gitByID map[string]Record, id string, wantStatus RecordStatus) (Record, bool) {
+	if !reRecordID.MatchString(id) || len(gitByID) == 0 {
+		return Record{}, false
+	}
+	rec, ok := gitByID[id]
+	if !ok || rec.Meta.Status != wantStatus || len(ValidateRecord(rec)) != 0 {
+		return Record{}, false
+	}
+	return rec, true
+}
+
+func verifiedGitActiveRecord(gitByID map[string]Record, id string) (Record, bool) {
+	return verifiedGitRecordByStatus(gitByID, id, StatusActive)
+}
+
 func rejectedGovernedSameSubject(oldRec, activeRec Record) bool {
 	if !scopesOverlapPaths(oldRec.Meta.Scope.Paths, activeRec.Meta.Scope.Paths) {
 		return false
@@ -616,10 +936,15 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	for _, r := range records {
 		byID[r.Meta.ID] = r
 	}
+	var gitByID map[string]Record
+	if ev.Kind == OutcomeApproved || ev.Kind == OutcomeModifiedMerged || ev.Kind == OutcomeRetired || ev.Kind == OutcomeRefused {
+		gitByID = c.loadGitVerifiedByIDLocked(ctx, repoID)
+	}
 
 	var targetRec Record
 	switch ev.Kind {
 	case OutcomeProposed:
+		origRecordID := strings.TrimSpace(ev.RecordID)
 		if ev.RecordID == "" {
 			if dupID := matchExistingProposedOrActive(ev, records); dupID != "" {
 				ev.RecordID = dupID
@@ -628,13 +953,14 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		if ev.RecordID != "" {
 			if existing, ok := byID[ev.RecordID]; ok && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusActive) {
 				prRef := formatPRRef(ev)
-				if existing.Meta.Status == StatusActive || prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+				noopResult := func() OutcomeProcessResult {
 					var branch, prMarkdown string
 					if existing.Meta.Status == StatusProposed {
 						branch = existing.ProposalBranch()
 						prMarkdown = existing.RenderForPR()
 					}
-					digest := BuildBlueprintDigest(repoID, records, "noop:"+existing.Meta.ID, c.graduatedIDs)
+					gradCopy := append([]string(nil), c.graduatedIDs...)
+					digest := BuildBlueprintDigest(repoID, records, "noop:"+existing.Meta.ID, gradCopy)
 					return OutcomeProcessResult{
 						RecordID:           existing.Meta.ID,
 						Status:             existing.Meta.Status,
@@ -643,25 +969,57 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 						Title:              existing.Meta.Title,
 						PRMarkdown:         prMarkdown,
 						DocumentID:         existing.DocumentID(repoID),
-						GraduatedDecisions: c.graduatedIDs,
+						GraduatedDecisions: gradCopy,
 						Blueprint:          digest,
-					}, nil
+					}
+				}
+				// Never allow an OutcomeProposed event to demote or overwrite an active record.
+				// If matched fuzzily (no explicit RecordID) for a new PR, allocate a fresh ID.
+				if existing.Meta.Status == StatusActive {
+					if origRecordID != "" || prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						return noopResult(), nil
+					}
+					ev.RecordID = ""
+				} else {
+					// Same PR (or no new PR): idempotent no-op.
+					if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						return noopResult(), nil
+					}
+					// Attaching a newly opened PR reference to a PR-less proposed record:
+					// update only missing evidence links without overwriting title, guard, or body.
+					if existing.Meta.Evidence.PullRequest == "" && prRef != "" {
+						existing.Meta.Evidence.PullRequest = prRef
+						existing.Meta.Evidence.BreakingPR = firstNonEmpty(existing.Meta.Evidence.BreakingPR, ev.BreakingPR)
+						existing.Meta.Evidence.Incident = firstNonEmpty(existing.Meta.Evidence.Incident, ev.Incident)
+						existing.Meta.Evidence.Commit = firstNonEmpty(existing.Meta.Evidence.Commit, ev.Commit)
+						existing.Meta.Evidence.FindingID = firstNonEmpty(existing.Meta.Evidence.FindingID, ev.FindingID)
+						existing.Meta.Evidence.SoakWindow = firstNonEmpty(existing.Meta.Evidence.SoakWindow, ev.SoakWindow)
+						targetRec = existing
+						break
+					}
+					// Conflicting PR on an already-PR-linked proposed record:
+					// if the caller explicitly named RecordID, refuse to clobber it;
+					// if matched fuzzily by title/rule, allocate a new ID for the new PR.
+					if origRecordID != "" {
+						return noopResult(), nil
+					}
+					ev.RecordID = ""
 				}
 			}
 		}
 		targetRec = c.buildProposedRecord(ctx, ev, byID, year, dateStr)
 	case OutcomeApproved:
-		targetRec = c.buildApprovedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildApprovedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeModifiedMerged:
-		targetRec = c.buildModifiedMergedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildModifiedMergedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeResolvedMerged:
 		targetRec = c.buildResolvedMergedRecord(ctx, ev, byID, year, dateStr)
 	case OutcomePRMergedPersists:
 		targetRec = c.buildPersistsRecord(ctx, ev, byID, year, dateStr)
 	case OutcomeRefused:
-		targetRec = c.buildRefusedRecord(ctx, ev, byID, year, dateStr)
+		targetRec = c.buildRefusedRecord(ctx, ev, byID, gitByID, year, dateStr)
 	case OutcomeRetired:
-		targetRec = c.buildRetiredRecord(ev, byID, year, dateStr)
+		targetRec = c.buildRetiredRecord(ev, byID, gitByID, year, dateStr)
 	default:
 		return OutcomeProcessResult{}, fmt.Errorf("unsupported outcome kind %q", ev.Kind)
 	}
@@ -669,6 +1027,10 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	if err := SaveRecord(c.cfg.RepoDir, &targetRec); err != nil {
 		return OutcomeProcessResult{}, fmt.Errorf("save record %s: %w", targetRec.Meta.ID, err)
 	}
+	if c.knownIDs == nil {
+		c.knownIDs = map[string]bool{}
+	}
+	c.knownIDs[targetRec.Meta.ID] = true
 	if c.cfg.Hindsight != nil {
 		c.ensureBankOnceLocked(ctx)
 		if err := c.cfg.Hindsight.RetainRecord(ctx, repoID, targetRec); err != nil {
@@ -676,22 +1038,26 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		}
 	}
 
-	// When a record transitions to status:active via a merged knowledge/ PR,
-	// reconcile superseded records: (1) explicit Supersedes IDs (including
-	// cluster lessons graduated into a fleet-wide DEC-*), and (2) Precedence
-	// Rule 3 ("Merged outranks rejected") when governing the same check or field.
+	// When a record transitions to status:active via a merged knowledge/ PR
+	// verified against Git HEAD, reconcile superseded records: (1) explicit
+	// Supersedes IDs committed in the Git-merged record (including cluster
+	// lessons graduated into a fleet-wide DEC-*), and (2) Precedence Rule 3
+	// ("Merged outranks rejected") when governing the same check or field.
 	if targetRec.Meta.Status == StatusActive {
+		gitRec, gitOK := verifiedGitActiveRecord(gitByID, targetRec.Meta.ID)
 		supTargets := map[string]bool{}
-		for _, sid := range targetRec.Meta.Supersedes {
-			if sid != "" && sid != targetRec.Meta.ID {
-				supTargets[sid] = true
+		if gitOK {
+			for _, sid := range gitRec.Meta.Supersedes {
+				if sid != "" && sid != targetRec.Meta.ID {
+					supTargets[sid] = true
+				}
 			}
 		}
 		for oid, oldRec := range byID {
 			if oid == targetRec.Meta.ID || oldRec.Meta.Status != StatusRejected {
 				continue
 			}
-			if rejectedGovernedSameSubject(oldRec, targetRec) {
+			if gitOK && rejectedGovernedSameSubject(oldRec, targetRec) {
 				supTargets[oid] = true
 			}
 		}
@@ -730,8 +1096,10 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		}
 	}
 
+	c.outcomesProcessed++
 	lastDesc := fmt.Sprintf("%s:%s->%s", ev.Kind, targetRec.Meta.ID, targetRec.Meta.Status)
-	digest := BuildBlueprintDigest(repoID, records, lastDesc, c.graduatedIDs)
+	gradCopy := append([]string(nil), c.graduatedIDs...)
+	digest := BuildBlueprintDigest(repoID, records, lastDesc, gradCopy)
 	_ = persistLocalStateSnapshot(c.cfg.RepoDir, digest)
 	// Invalidate cached query responses whenever an outcome updates memory state.
 	c.queryCache = map[string]MemoryQueryResponse{}
@@ -771,7 +1139,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 	rid := ev.RecordID
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
 
@@ -824,24 +1192,52 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 }
 
-func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
-	rid := ev.RecordID
-	if rid == "" && ev.PullRequest != "" {
-		for _, r := range byID {
-			if r.Meta.Evidence.PullRequest == ev.PullRequest {
-				rid = r.Meta.ID
-				break
-			}
+func matchRecordIDByPR(ev OutcomeEvent, byID map[string]Record) string {
+	prRef := formatPRRef(ev)
+	rawPR := strings.TrimSpace(ev.PullRequest)
+	if prRef == "" && rawPR == "" {
+		return ""
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		have := strings.TrimSpace(byID[id].Meta.Evidence.PullRequest)
+		if have == "" {
+			continue
 		}
+		if (prRef != "" && have == prRef) || (rawPR != "" && have == rawPR) {
+			return id
+		}
+	}
+	return ""
+}
+
+func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
+	rid := ev.RecordID
+	if rid == "" {
+		rid = matchRecordIDByPR(ev, byID)
 	}
 	if rid == "" {
 		rtype := ev.RecordType
 		if rtype == "" {
 			rtype = RecordTypeDecision
 		}
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
+	gitRec, gitVerified := verifiedGitActiveRecord(gitByID, rid)
+	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
+		return existing
+	}
+	// Once a record is verified against Git, its title, scope, guard, supersedes,
+	// and body come strictly from the Git-verified record alone, never from
+	// publisher-supplied event fields.
+	if gitVerified && !gitopsPRsDisabled() {
+		return gitRec
+	}
 	rtype := existing.Meta.Type
 	if rtype == "" {
 		if ev.RecordType != "" {
@@ -862,10 +1258,8 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 		g.Severity = inferDefaultGuardSeverity(ev)
 		guard = &g
 	}
-	status := StatusActive
-	if gitopsPRsDisabled() {
-		status = StatusProposed
-	}
+	status := StatusProposed
+	supersedes := firstSlice(ev.Supersedes, existing.Meta.Supersedes)
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	meta := RecordMeta{
 		Type:   rtype,
@@ -885,12 +1279,12 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 			Outcome:       existing.Meta.Evidence.Outcome,
 			SoakWindow:    firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
 		},
-		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
+		Supersedes: supersedes,
 	}
 	body := existing.Body
-	if !hasExisting || strings.TrimSpace(body) == "" {
+	if strings.TrimSpace(body) == "" {
 		body = buildRecordBody(rtype, ev, synth, "", status, "")
-	} else if ev.Summary != "" {
+	} else if ev.Summary != "" && !strings.Contains(body, "## Approval") {
 		body = strings.TrimSpace(body) + "\n\n## Approval\n\n" + strings.TrimSpace(ev.Summary)
 	}
 	return Record{
@@ -900,24 +1294,43 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 }
 
-func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
-	if rid == "" && ev.PullRequest != "" {
-		for _, r := range byID {
-			if r.Meta.Evidence.PullRequest == ev.PullRequest {
-				rid = r.Meta.ID
-				break
-			}
-		}
+	if rid == "" {
+		rid = matchRecordIDByPR(ev, byID)
 	}
 	if rid == "" {
 		rtype := ev.RecordType
 		if rtype == "" {
 			rtype = RecordTypeDecision
 		}
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
+	gitRec, gitVerified := verifiedGitActiveRecord(gitByID, rid)
+	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
+		return existing
+	}
+
+	var initialProposal string
+	if ev.InitialProposal != "" {
+		initialProposal = ev.InitialProposal
+	} else if hasExisting && existing.Meta.Guard != nil && existing.Meta.Guard.Rule != "" {
+		initialProposal = "initial-proposal: " + existing.Meta.Guard.Rule
+	}
+
+	isKnowledgePR := ev.KnowledgePR || ((gitVerified || (hasExisting && existing.Meta.Status == StatusProposed)) && existing.Meta.Evidence.FindingID == "" && ev.RemediationPR == "")
+	// Once a knowledge/ record is verified against Git, its title, scope, guard,
+	// supersedes, and body come strictly from Git alone.
+	if isKnowledgePR && gitVerified && !gitopsPRsDisabled() {
+		out := gitRec
+		out.Meta.Evidence.Outcome = string(OutcomeModifiedMerged)
+		if initialProposal != "" {
+			out.Meta.Evidence.RejectedProposals = appendUniqueStr(out.Meta.Evidence.RejectedProposals, initialProposal)
+		}
+		return out
+	}
+
 	rtype := existing.Meta.Type
 	if rtype == "" {
 		if ev.RecordType != "" {
@@ -929,20 +1342,10 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		}
 	}
 
-	var initialProposal string
-	if ev.InitialProposal != "" {
-		initialProposal = ev.InitialProposal
-	} else if hasExisting && existing.Meta.Guard != nil && existing.Meta.Guard.Rule != "" {
-		initialProposal = "initial-proposal: " + existing.Meta.Guard.Rule
-	}
-
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
 	title := firstNonEmpty(ev.Title, synthTitle(synth), existing.Meta.Title, "Modified and merged "+rid)
 	scope := mergeScope(existing.Meta.Scope, ev)
 
-	// When a human edits a proposal before merging, prefer the new guard from ev/synth
-	// over the superseded existing.Meta.Guard. Default severity to "warn" unless
-	// explicitly classified as "block".
 	var guard *RecordGuard
 	if ev.Guard != nil {
 		guard = ev.Guard
@@ -974,19 +1377,13 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		guard = &g
 	}
 
-	// Only a human edit on the knowledge/ PR itself transitions directly to
-	// status:active. An edit-before-merge on an operational remediation PR
-	// synthesizes a status:proposed record so a separate knowledge/ PR is opened.
-	isKnowledgePR := ev.KnowledgePR || (hasExisting && existing.Meta.Status == StatusProposed && existing.Meta.Evidence.FindingID == "" && ev.RemediationPR == "")
 	status := StatusProposed
-	if isKnowledgePR && !gitopsPRsDisabled() {
-		status = StatusActive
-	}
+	supersedes := firstSlice(ev.Supersedes, existing.Meta.Supersedes)
 
 	rawPR := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	pullReq := rawPR
 	remediationPR := firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
-	if status == StatusProposed && !isKnowledgePR && !gitopsPRsDisabled() {
+	if !isKnowledgePR && !gitopsPRsDisabled() {
 		remediationPR = firstNonEmpty(remediationPR, rawPR)
 		pullReq = ""
 	}
@@ -1013,7 +1410,7 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 			ReviewerReason:    reason,
 			RejectedProposals: rejected,
 		},
-		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
+		Supersedes: supersedes,
 	}
 	body := buildRecordBody(rtype, ev, synth, existing.Body, status, reason)
 	modSection := "## Reviewer Modification Before Merge\n\n" + reason
@@ -1040,8 +1437,13 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 		}
 	}
 	rid := ev.RecordID
+	if rid != "" {
+		if ex, ok := byID[rid]; ok && ex.Meta.Status == StatusActive {
+			return ex
+		}
+	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing := byID[rid]
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
@@ -1095,8 +1497,13 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 
 func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
+	if rid != "" {
+		if ex, ok := byID[rid]; ok && ex.Meta.Status == StatusActive {
+			return ex
+		}
+	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, RecordTypeLesson, year)
+		rid = c.nextRecordIDLocked(ctx, RecordTypeLesson, year)
 	}
 	existing := byID[rid]
 	synth := c.cfg.LLM.Synthesize(ctx, RecordTypeLesson, ev)
@@ -1138,24 +1545,25 @@ func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 }
 
-func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
-	if rid == "" && ev.PullRequest != "" {
-		for _, r := range byID {
-			if r.Meta.Evidence.PullRequest == ev.PullRequest {
-				rid = r.Meta.ID
-				break
-			}
-		}
+	if rid == "" {
+		rid = matchRecordIDByPR(ev, byID)
 	}
 	existing, hasExisting := byID[rid]
+	if hasExisting && existing.Meta.Status == StatusActive {
+		return existing
+	}
+	if gitRec, gitActive := verifiedGitActiveRecord(gitByID, rid); gitActive && !gitopsPRsDisabled() {
+		return gitRec
+	}
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	reason := firstNonEmpty(ev.ReviewerReason, ev.Summary, "Proposal closed unmerged by reviewer.")
 
 	// If an existing proposed record (such as a proposed chat rule DEC-*) is refused,
 	// transition that exact record in-place to status:rejected so update_mode:replace
 	// overwrites the proposed entry in Hindsight and leaves no stale rule behind.
-	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusRejected || existing.Meta.Type == RecordTypeDecision) {
+	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusRejected) {
 		existing.Meta.Status = StatusRejected
 		if existing.Meta.Guard != nil && existing.Meta.Guard.Severity == "block" {
 			g := *existing.Meta.Guard
@@ -1186,7 +1594,7 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 		}
 	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	status := StatusRejected
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
@@ -1216,18 +1624,18 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 	}
 }
 
-func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
+func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID, gitByID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
-	if rid == "" && ev.PullRequest != "" {
-		for _, r := range byID {
-			if r.Meta.Evidence.PullRequest == ev.PullRequest {
-				rid = r.Meta.ID
-				break
-			}
-		}
+	if rid == "" {
+		rid = matchRecordIDByPR(ev, byID)
 	}
 	existing, hasExisting := byID[rid]
 	if hasExisting {
+		if existing.Meta.Status == StatusActive {
+			if _, gitRetired := verifiedGitRecordByStatus(gitByID, rid, StatusRetired); !gitRetired {
+				return existing
+			}
+		}
 		existing.Meta.Status = StatusRetired
 		existing.Meta.Evidence.Outcome = string(OutcomeRetired)
 		if ev.ReviewerReason != "" {
@@ -1240,7 +1648,7 @@ func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, ye
 		rtype = RecordTypeLesson
 	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(context.Background(), rtype, year)
 	}
 	return Record{
 		Meta: RecordMeta{
@@ -1272,7 +1680,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 
 	var graduated []string
 	for _, cand := range candidates {
-		decID := NextRecordID(c.cfg.RepoDir, RecordTypeDecision, year)
+		decID := c.nextRecordIDLocked(ctx, RecordTypeDecision, year)
 		synth := c.cfg.LLM.Synthesize(ctx, RecordTypeDecision, cand)
 		title := synthTitle(synth)
 		if title == "" {
@@ -1284,26 +1692,30 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 					cand.CheckID, strings.Join(cand.Clusters, ", "))
 			}
 		}
+		sev := "warn"
+		for _, lid := range cand.Lessons {
+			if l, ok := byID[lid]; ok && l.Meta.Guard != nil && l.Meta.Guard.Severity == "block" {
+				sev = "block"
+				break
+			}
+		}
+		if synth != nil && synth.Guard != nil && synth.Guard.Severity == "block" {
+			sev = "block"
+		}
+		var synthRule string
+		if synth != nil && synth.Guard != nil {
+			synthRule = synth.Guard.Rule
+		}
 		var guard *RecordGuard
 		if cand.YAMLPath != "" && cand.Op != "" {
 			fileGlob := cand.FileGlob
 			if fileGlob == "" && len(cand.Paths) > 0 {
 				fileGlob = cand.Paths[0]
 			}
-			ruleText := cand.Rule
+			ruleText := firstNonEmpty(cand.Rule, synthRule)
 			if ruleText == "" {
 				ruleText = fmt.Sprintf("Enforce %s %s %v across all clusters (graduated from %s).",
 					cand.YAMLPath, cand.Op, cand.Value, strings.Join(cand.Lessons, ", "))
-			}
-			sev := "warn"
-			for _, lid := range cand.Lessons {
-				if l, ok := byID[lid]; ok && l.Meta.Guard != nil && l.Meta.Guard.Severity == "block" {
-					sev = "block"
-					break
-				}
-			}
-			if synth != nil && synth.Guard != nil && synth.Guard.Severity == "block" {
-				sev = "block"
 			}
 			candidateGuard := &RecordGuard{
 				Rule:     ruleText,
@@ -1318,6 +1730,29 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 			if GuardPassesOnHead(c.cfg.RepoDir, candidateGuard, cand.Resources) {
 				guard = candidateGuard
 			} else {
+				guard = &RecordGuard{
+					Rule:     ruleText,
+					Severity: sev,
+				}
+			}
+		} else {
+			ruleText := firstNonEmpty(cand.Rule, synthRule)
+			if ruleText == "" && cand.CheckID != "" {
+				ruleText = fmt.Sprintf("Enforce fleet-wide policy for check %s across all clusters (graduated from %s).",
+					cand.CheckID, strings.Join(cand.Lessons, ", "))
+			}
+			if synth != nil && synth.Guard != nil && synth.Guard.Expect != nil &&
+				synth.Guard.Expect.Path != "" && synth.Guard.Expect.Op != "" {
+				candidateGuard := &RecordGuard{
+					Rule:     firstNonEmpty(ruleText, synth.Guard.Rule),
+					Severity: sev,
+					Expect:   synth.Guard.Expect,
+				}
+				if GuardPassesOnHead(c.cfg.RepoDir, candidateGuard, cand.Resources) {
+					guard = candidateGuard
+				}
+			}
+			if guard == nil && ruleText != "" {
 				guard = &RecordGuard{
 					Rule:     ruleText,
 					Severity: sev,
@@ -1375,7 +1810,10 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 }
 
 func (c *Curator) publishBlueprint(ctx context.Context, records []Record, lastEvent, corrID string) error {
-	digest := BuildBlueprintDigest(c.cfg.RepoID, records, lastEvent, c.graduatedIDs)
+	c.mu.Lock()
+	gradCopy := append([]string(nil), c.graduatedIDs...)
+	c.mu.Unlock()
+	digest := BuildBlueprintDigest(c.cfg.RepoID, records, lastEvent, gradCopy)
 	return c.publishBlueprintDigest(ctx, digest, corrID)
 }
 
@@ -1590,7 +2028,7 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 				Error:  "outcome payload is required for action " + req.Action,
 			}
 		}
-		res, err := c.ProcessOutcome(ctx, *req.Outcome, "")
+		res, err := c.ProcessOutcome(ctx, *req.Outcome, req.CorrelationID)
 		if err != nil {
 			return MemoryQueryResponse{
 				Schema: MemoryQueryReplySchema,
@@ -1630,6 +2068,34 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		}
 	}
 
+	allowedBank := DefaultBankID
+	if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
+		allowedBank = c.cfg.Hindsight.bankID
+	}
+	bank := strings.TrimSpace(req.Bank)
+	if bank == "" {
+		bank = allowedBank
+	}
+	if bank != DefaultBankID && bank != allowedBank {
+		return MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Bank:   bank,
+			Query:  req.Query,
+			Error:  fmt.Sprintf("bank %q is not allowed; curator only serves %q", bank, allowedBank),
+		}
+	}
+	for _, rawTag := range req.Tags {
+		trimmed := strings.TrimSpace(rawTag)
+		if strings.HasPrefix(strings.ToLower(trimmed), "user:") {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Bank:   bank,
+				Query:  req.Query,
+				Error:  fmt.Sprintf("tag %q is not allowed on shared decision memory queries", trimmed),
+			}
+		}
+	}
+
 	tags := append([]string(nil), req.Tags...)
 	if len(tags) == 0 {
 		tags = []string{SharedTag}
@@ -1639,15 +2105,12 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	if tagsMatch == "" {
 		tagsMatch = "all_strict"
 	}
-	bank := req.Bank
-	if bank == "" {
-		bank = DefaultBankID
-		if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
-			bank = c.cfg.Hindsight.bankID
-		}
+	maxRecs := req.MaxResults
+	if maxRecs <= 0 {
+		maxRecs = defaultMaxQueryResults
 	}
-	cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-		bank, strings.TrimSpace(req.Query), strings.Join(tags, ","), tagsMatch, req.Path, req.Cluster)
+	cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d",
+		bank, strings.TrimSpace(req.Query), strings.Join(tags, ","), tagsMatch, req.Path, req.Cluster, maxRecs)
 
 	c.mu.Lock()
 	if cached, ok := c.queryCache[cacheKey]; ok {
@@ -1668,6 +2131,13 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	}
 	repoID := c.cfg.RepoID
 	c.mu.Unlock()
+
+	byID := make(map[string]Record, len(records))
+	byDocID := make(map[string]Record, len(records))
+	for _, r := range records {
+		byID[r.Meta.ID] = r
+		byDocID[r.DocumentID(repoID)] = r
+	}
 
 	type scoredMatch struct {
 		score  int
@@ -1743,10 +2213,6 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		return scored[i].digest.ID < scored[j].digest.ID
 	})
 
-	maxRecs := req.MaxResults
-	if maxRecs <= 0 {
-		maxRecs = defaultMaxQueryResults
-	}
 	if len(scored) > maxRecs {
 		scored = scored[:maxRecs]
 	}
@@ -1758,12 +2224,18 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		fallbackResults = append(fallbackResults, s.result)
 	}
 
-	if c.cfg.Hindsight != nil && strings.TrimSpace(req.Query) != "" {
+	hsQuery := strings.TrimSpace(req.Query)
+	if hsQuery == "" {
+		hsQuery = firstNonEmpty(req.Path, req.Cluster)
+	}
+	if c.cfg.Hindsight != nil && hsQuery != "" {
 		hsCtx, hsCancel := context.WithTimeout(ctx, hindsightRecallTimeout)
-		results, hsErr = c.cfg.Hindsight.Recall(hsCtx, req.Query, tags, tagsMatch)
+		rawResults, err := c.cfg.Hindsight.RecallBank(hsCtx, bank, hsQuery, tags, tagsMatch)
 		hsCancel()
+		hsErr = err
 		if hsErr == nil {
 			backend = "hindsight"
+			results = FilterRecallResults(rawResults, byID, byDocID, req.Cluster, req.Path)
 		}
 	}
 
@@ -1784,6 +2256,9 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 			merged = append(merged, hr)
 		}
 		results = merged
+	}
+	if len(results) > maxRecs {
+		results = results[:maxRecs]
 	}
 	if results == nil {
 		results = []HindsightRecallResult{}
@@ -1820,89 +2295,254 @@ func (c *Curator) InvalidateCache() {
 	c.mu.Unlock()
 }
 
+// FilterRecallResults enforces optional cluster and path scope filters on
+// Hindsight recall hits using local OKF metadata, chunk tags, or embedded YAML frontmatter.
+func FilterRecallResults(results []HindsightRecallResult, byID, byDocID map[string]Record, cluster, pathFilter string) []HindsightRecallResult {
+	cluster = strings.TrimSpace(cluster)
+	pathFilter = strings.TrimSpace(pathFilter)
+	if cluster == "" && pathFilter == "" {
+		return results
+	}
+	filtered := make([]HindsightRecallResult, 0, len(results))
+	for _, hr := range results {
+		rec, found := lookupRecordForRecallResult(hr, byID, byDocID)
+		if !found && strings.Contains(hr.Text, "---\n") {
+			if parsed, err := ParseRecord(hr.Text, ""); err == nil {
+				rec = parsed
+				found = true
+			}
+		}
+		if cluster != "" {
+			if found {
+				if !matchesClusterScope(rec.Meta.Scope.Clusters, cluster) {
+					continue
+				}
+			} else if !recallTagsMatchCluster(hr.Tags, cluster) {
+				continue
+			}
+		}
+		if pathFilter != "" {
+			if !found || !matchesAnyPathGlob(rec.Meta.Scope.Paths, pathFilter) {
+				continue
+			}
+		}
+		filtered = append(filtered, hr)
+	}
+	return filtered
+}
+
+func lookupRecordForRecallResult(hr HindsightRecallResult, byID, byDocID map[string]Record) (Record, bool) {
+	if hr.DocumentID != "" {
+		if r, ok := byDocID[hr.DocumentID]; ok {
+			return r, true
+		}
+		if idx := strings.LastIndex(hr.DocumentID, ":"); idx >= 0 && idx+1 < len(hr.DocumentID) {
+			if r, ok := byID[hr.DocumentID[idx+1:]]; ok {
+				return r, true
+			}
+		}
+	}
+	if hr.ID != "" {
+		if r, ok := byID[hr.ID]; ok {
+			return r, true
+		}
+	}
+	for _, t := range hr.Tags {
+		if strings.HasPrefix(t, "id:") {
+			if r, ok := byID[strings.TrimPrefix(t, "id:")]; ok {
+				return r, true
+			}
+		}
+	}
+	return Record{}, false
+}
+
+func recallTagsMatchCluster(tags []string, cluster string) bool {
+	hasClusterTag := false
+	for _, t := range tags {
+		if !strings.HasPrefix(t, "cluster:") {
+			continue
+		}
+		hasClusterTag = true
+		val := strings.TrimPrefix(t, "cluster:")
+		if val == "*" || val == cluster {
+			return true
+		}
+	}
+	// Conversational or external chunks without cluster:* tags cannot satisfy an explicit --cluster filter.
+	return hasClusterTag && false
+}
+
+func curatorQuerySubject() string {
+	if extra := strings.TrimSpace(os.Getenv("CURATOR_QUERY_SUBJECT")); extra != "" {
+		return extra
+	}
+	return SubjectMemoryQuery
+}
+
+func memoryReplyCaller() string {
+	for _, k := range []string{lib.EnvBusUser, "NATS_USER"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return defaultCuratorSession
+}
+
+func newMemoryReplySubject() string {
+	nonce := strings.TrimPrefix(nats.NewInbox(), "_INBOX.")
+	return fmt.Sprintf("%s%s.%s", SubjectMemoryReplyPrefix, memoryReplyCaller(), nonce)
+}
+
+func requestOnMemoryReplyInbox(ctx context.Context, nc *nats.Conn, outMsg *nats.Msg) (*nats.Msg, error) {
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		reqCtx, cancel = context.WithTimeout(ctx, defaultRequestReplyTimeout)
+		defer cancel()
+	}
+	replySubj := newMemoryReplySubject()
+	sub, err := nc.SubscribeSync(replySubj)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	outMsg.Reply = replySubj
+	if err := nc.PublishMsg(outMsg); err != nil {
+		return nil, err
+	}
+	for {
+		replyMsg, err := sub.NextMsgWithContext(reqCtx)
+		if err != nil {
+			return nil, err
+		}
+		if replyMsg.Header != nil && replyMsg.Header.Get("Status") == "503" {
+			return nil, nats.ErrNoResponders
+		}
+		// When outMsg.Subject is captured by a JetStream stream (such as TOPICS-JOURNAL
+		// on SubjectCuratorOutcomes), JetStream emits a PubAck JSON ({"stream":...})
+		// on outMsg.Reply before the Curator daemon sends its MemoryQueryResponse.
+		if bytes.Contains(replyMsg.Data, []byte(`"stream"`)) && !bytes.Contains(replyMsg.Data, []byte(MemoryQueryReplySchema)) {
+			continue
+		}
+		return replyMsg, nil
+	}
+}
+
 // PublishOutcome sends an OutcomeEvent to the Curator on its dedicated NATS
-// subjects (SubjectMemoryQuery request-reply, falling back to
-// SubjectCuratorOutcomes), never publishing privileged transitions onto
-// SubjectAnnotations.
+// subjects (curatorQuerySubject request-reply, falling back to
+// SubjectCuratorOutcomes only when no responder is listening on the query subject).
 func PublishOutcome(ctx context.Context, client *lib.Client, ev OutcomeEvent) (OutcomeProcessResult, error) {
+	res, _, err := PublishOutcomeWithMeta(ctx, client, ev, "")
+	return res, err
+}
+
+// PublishOutcomeWithMeta sends an OutcomeEvent with an explicit correlation ID
+// and returns both the OutcomeProcessResult and the NATS subject that handled it.
+// Application errors returned by the Curator are surfaced directly without
+// retrying on a second subject.
+func PublishOutcomeWithMeta(ctx context.Context, client *lib.Client, ev OutcomeEvent, correlationID string) (OutcomeProcessResult, string, error) {
 	if client == nil {
-		return OutcomeProcessResult{}, errors.New("NATS client is nil")
+		return OutcomeProcessResult{}, "", errors.New("NATS client is nil")
 	}
 	if ev.Schema == "" {
 		ev.Schema = OutcomeSchema
+	}
+	if correlationID == "" {
+		correlationID = lib.NewCorrelationID()
 	}
 	action := "resolve"
 	if ev.Kind == OutcomeProposed {
 		action = "propose"
 	}
-	if qResp, qErr := querySubjectViaNATS(ctx, client, SubjectMemoryQuery, MemoryQueryRequest{
-		Schema:  MemoryQuerySchema,
-		Action:  action,
-		Outcome: &ev,
-	}); qErr == nil && qResp.Outcome != nil {
-		return *qResp.Outcome, nil
+	qSubj := curatorQuerySubject()
+	// Only SubjectMemoryQuery accepts propose/resolve actions on handleQueryMsg;
+	// when CURATOR_QUERY_SUBJECT points at a public read-only query subject, send
+	// outcomes directly to SubjectCuratorOutcomes unless qSubj == SubjectMemoryQuery.
+	if qSubj == SubjectMemoryQuery {
+		qResp, replied, qErr := requestMemoryQuerySubject(ctx, client, qSubj, MemoryQueryRequest{
+			Schema:        MemoryQuerySchema,
+			Action:        action,
+			CorrelationID: correlationID,
+			Outcome:       &ev,
+		})
+		if replied {
+			if qErr != nil {
+				return OutcomeProcessResult{}, qSubj, qErr
+			}
+			if qResp.Outcome != nil {
+				return *qResp.Outcome, qSubj, nil
+			}
+			return OutcomeProcessResult{RecordID: ev.RecordID}, qSubj, nil
+		}
+		if qErr != nil && !errors.Is(qErr, nats.ErrNoResponders) {
+			return OutcomeProcessResult{}, qSubj, qErr
+		}
 	}
+
 	raw, err := json.Marshal(ev)
 	if err != nil {
-		return OutcomeProcessResult{}, fmt.Errorf("marshal outcome event: %w", err)
+		return OutcomeProcessResult{}, "", fmt.Errorf("marshal outcome event: %w", err)
 	}
 	outSubj := SubjectCuratorOutcomes
 	if extraOut := strings.TrimSpace(os.Getenv("CURATOR_OUTCOMES_SUBJECT")); extraOut != "" {
 		outSubj = extraOut
 	}
 	nc := client.Conn()
-	msg, reqErr := nc.RequestWithContext(ctx, outSubj, raw)
+	outMsg := nats.NewMsg(outSubj)
+	outMsg.Data = raw
+	outMsg.Header.Set("Nats-Correlation-Id", correlationID)
+	msg, reqErr := requestOnMemoryReplyInbox(ctx, nc, outMsg)
 	if reqErr != nil {
-		return OutcomeProcessResult{}, fmt.Errorf("curator outcome request on %s: %w", outSubj, reqErr)
+		return OutcomeProcessResult{}, outSubj, fmt.Errorf("curator outcome request on %s: %w", outSubj, reqErr)
 	}
 	var resp MemoryQueryResponse
 	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return OutcomeProcessResult{}, fmt.Errorf("decode curator outcome reply: %w", err)
+		return OutcomeProcessResult{}, outSubj, fmt.Errorf("decode curator outcome reply: %w", err)
 	}
 	if resp.Error != "" {
-		return OutcomeProcessResult{}, errors.New(resp.Error)
+		return OutcomeProcessResult{}, outSubj, errors.New(resp.Error)
 	}
 	if resp.Outcome != nil {
-		return *resp.Outcome, nil
+		return *resp.Outcome, outSubj, nil
 	}
-	return OutcomeProcessResult{RecordID: ev.RecordID}, nil
+	return OutcomeProcessResult{RecordID: ev.RecordID}, outSubj, nil
 }
 
 // QueryViaNATS sends a MemoryQueryRequest over NATS to the Curator's memory
 // responder on SubjectMemoryQuery (or CURATOR_QUERY_SUBJECT when configured)
 // and returns the decoded MemoryQueryResponse.
 func QueryViaNATS(ctx context.Context, client *lib.Client, req MemoryQueryRequest) (MemoryQueryResponse, error) {
-	subj := SubjectMemoryQuery
-	if extra := strings.TrimSpace(os.Getenv("CURATOR_QUERY_SUBJECT")); extra != "" {
-		subj = extra
-	}
-	return querySubjectViaNATS(ctx, client, subj, req)
+	resp, _, err := requestMemoryQuerySubject(ctx, client, curatorQuerySubject(), req)
+	return resp, err
 }
 
-func querySubjectViaNATS(ctx context.Context, client *lib.Client, subj string, req MemoryQueryRequest) (MemoryQueryResponse, error) {
+func requestMemoryQuerySubject(ctx context.Context, client *lib.Client, subj string, req MemoryQueryRequest) (resp MemoryQueryResponse, replied bool, err error) {
 	if client == nil {
-		return MemoryQueryResponse{}, errors.New("NATS client is nil")
+		return MemoryQueryResponse{}, false, errors.New("NATS client is nil")
 	}
 	if req.Schema == "" {
 		req.Schema = MemoryQuerySchema
 	}
 	rawReq, err := json.Marshal(req)
 	if err != nil {
-		return MemoryQueryResponse{}, fmt.Errorf("marshal memory query: %w", err)
+		return MemoryQueryResponse{}, false, fmt.Errorf("marshal memory query: %w", err)
 	}
 	nc := client.Conn()
-	msg, err := nc.RequestWithContext(ctx, subj, rawReq)
+	outMsg := nats.NewMsg(subj)
+	outMsg.Data = rawReq
+	msg, err := requestOnMemoryReplyInbox(ctx, nc, outMsg)
 	if err != nil {
-		return MemoryQueryResponse{}, fmt.Errorf("nats memory query on %s: %w", subj, err)
+		return MemoryQueryResponse{}, false, fmt.Errorf("nats memory query on %s: %w", subj, err)
 	}
-	var resp MemoryQueryResponse
 	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return MemoryQueryResponse{}, fmt.Errorf("decode memory query reply: %w", err)
+		return MemoryQueryResponse{}, true, fmt.Errorf("decode memory query reply: %w", err)
 	}
 	if resp.Error != "" {
-		return resp, errors.New(resp.Error)
+		return resp, true, errors.New(resp.Error)
 	}
-	return resp, nil
+	return resp, true, nil
 }
 
 func matchTagSlice(have, want []string, mode string) bool {
@@ -2118,4 +2758,93 @@ func SyncRecordsToHindsight(ctx context.Context, hs *HindsightClient, repoID, re
 		deleted = append(deleted, doc.ID)
 	}
 	return upserted, deleted, nil
+}
+
+// DreamReport summarizes a Dreamer consolidation and guard verification pass.
+type DreamReport struct {
+	Repo               string   `json:"repo"`
+	VerifiedActive     []string `json:"verified_active"`
+	DemotedDrifted     []string `json:"demoted_drifted,omitempty"`
+	GraduatedDecisions []string `json:"graduated_decisions,omitempty"`
+	Upserted           []string `json:"upserted,omitempty"`
+	Deleted            []string `json:"deleted,omitempty"`
+}
+
+// RunDream executes a Dreamer consolidation pass: it audits active guards against
+// the current HEAD worktree (downgrading drifted "block" guards to "warn"),
+// graduates cross-cluster recurring lessons into fleet-wide proposed decisions,
+// and syncs all valid OKF records to Hindsight.
+func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ensureKnownIDsLocked(ctx)
+	records, err := LoadRecords(c.cfg.RepoDir)
+	if err != nil {
+		return DreamReport{}, err
+	}
+	report := DreamReport{
+		Repo:           c.cfg.RepoID,
+		VerifiedActive: []string{},
+	}
+	now := time.Now().UTC()
+	dateStr := now.Format("2006-01-02")
+	year := now.Year()
+
+	for _, r := range records {
+		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
+			continue
+		}
+		if GuardPassesOnHead(c.cfg.RepoDir, r.Meta.Guard, r.Meta.Scope.Resources) {
+			report.VerifiedActive = append(report.VerifiedActive, r.Meta.ID)
+			continue
+		}
+		if r.Meta.Guard.Severity == "block" {
+			g := *r.Meta.Guard
+			g.Severity = "warn"
+			r.Meta.Guard = &g
+			if sErr := SaveRecord(c.cfg.RepoDir, &r); sErr != nil {
+				return report, sErr
+			}
+		}
+		report.DemotedDrifted = append(report.DemotedDrifted, r.Meta.ID)
+	}
+
+	records, err = LoadRecords(c.cfg.RepoDir)
+	if err != nil {
+		return report, err
+	}
+	graduated, err := c.graduateRecurrencesLocked(ctx, c.cfg.RepoID, records, year, dateStr)
+	if err != nil {
+		return report, err
+	}
+	if len(graduated) > 0 {
+		report.GraduatedDecisions = graduated
+		c.graduatedIDs = append(c.graduatedIDs, graduated...)
+		records, _ = LoadRecords(c.cfg.RepoDir)
+	}
+
+	if c.cfg.Hindsight != nil {
+		upserted, deleted, syncErr := SyncRecordsToHindsight(ctx, c.cfg.Hindsight, c.cfg.RepoID, c.cfg.RepoDir)
+		if syncErr != nil {
+			return report, syncErr
+		}
+		report.Upserted = upserted
+		report.Deleted = deleted
+	} else {
+		for _, r := range records {
+			if len(ValidateRecord(r)) == 0 {
+				report.Upserted = append(report.Upserted, r.Meta.ID)
+			}
+		}
+	}
+
+	c.queryCache = map[string]MemoryQueryResponse{}
+	gradCopy := append([]string(nil), c.graduatedIDs...)
+	digest := BuildBlueprintDigest(c.cfg.RepoID, records, "dream-pass", gradCopy)
+	_ = persistLocalStateSnapshot(c.cfg.RepoDir, digest)
+	if c.cfg.Client != nil {
+		_ = c.publishBlueprintDigest(ctx, digest, "")
+	}
+	return report, nil
 }

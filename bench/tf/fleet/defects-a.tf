@@ -16,12 +16,25 @@
 # that asserts on it; change a name here and that scenario's exact check
 # goes red, which is the intended failure mode -- the names are the test.
 
-data "google_client_config" "default" {}
+# The Kubernetes providers (this one and seeded_b, seeded_c, seeded_d)
+# authenticate through gke-gcloud-auth-plugin, run on every API call, not
+# with a token read at plan time. hack/fleet_reconcile.py saves the plan and
+# applies it, and a Google access token lives one hour: a token baked into
+# the plan expired on the projects whose apply crossed that boundary, and the
+# in-cluster fixtures failed with Unauthorized after the node pools had
+# updated (#5684). The plugin uses gcloud's credential, which in the
+# reconcile jobs is the Workload Identity the google provider also reads, so
+# whoever runs the stack needs the plugin on PATH and gcloud signed in as the
+# identity the apply should run as.
 
 provider "kubernetes" {
   host                   = "https://${google_container_cluster.seeded_a.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_a.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 resource "kubernetes_namespace_v1" "seeded_reliability" {

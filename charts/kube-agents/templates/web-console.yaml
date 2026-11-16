@@ -14,15 +14,19 @@ port cannot be reached through a rebinding DNS name in the operator's browser.
 One replica on purpose: a port-forward lands on one pod, and the console keeps
 which sessions have a turn in flight in memory.
 
-The metrics banner reads LiteLLM's Prometheus counters from every replica. The
-headless Service below gives the console their pod IPs through DNS.
+The metrics banner shows the operator's token and spend totals off the
+PlatformAgent status when the console can read it, and reads LiteLLM's
+Prometheus counters from every replica for the live figure beside them (the
+headline when the status carries no totals). The headless Service below gives
+the console their pod IPs through DNS.
 litellm-policy (this chart's copy, and the operator's) admits every pod in the
 namespace on 8080, and the console's own NetworkPolicy governs ingress only, so
 the fetch is allowed both ways. Install-time model and agent identity defaults
 are passed in as env; when `webConsole.environment.enabled` is true, the
 console also reads and patches the `PlatformAgent` resource (for repository
-topology, preferred model annotations, and applied PR annotations). The console
-has no credentials to read cloud IAM.
+topology, preferred model annotations, applied PR annotations, and the
+status.usage block behind the banner's totals and the feedback attachment).
+The console has no credentials to read cloud IAM.
 */ -}}
 {{- if .Values.webConsole.enabled }}
 {{- if not .Values.platformAgent.enabled }}
@@ -286,7 +290,8 @@ Kubernetes API access for GET /api/environment and PlatformAgent state: the
 ClusterRole counts nodes, namespaces, pods and controllers with list calls and
 discards the items; the namespaced Role lists ReplicaSets for the last rollout
 and gets/patches the named PlatformAgent resource (recording repository
-topology, preferred model annotations, and applied PR annotations). No secrets
+topology, preferred model annotations, and applied PR annotations; reading
+status.usage for the banner's totals and the feedback attachment). No secrets
 or configmaps are read or modified.
 */}}
 apiVersion: v1

@@ -2406,6 +2406,54 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("proposal-claim", vcs_broker.VCS_VERBS)
         self.assertNotIn("proposal-claim", vcs_broker.WRITE_VERBS)
 
+    def test_write_mode_reads_the_two_tier_values_and_fails_closed(self):
+        env = vcs_broker.WRITE_MODE_ENV
+        self.assertEqual("KUBEAGENTS_WRITE_MODE", env)
+        for raw, mode in (
+            (None, "propose"), ("", "propose"), ("  ", "propose"), ("propose", "propose"),
+            ("NONE", "none"), (" none\n", "none"), ("off", "none"), ("read-only", "none"),
+        ):
+            with self.subTest(raw=raw):
+                environ = {} if raw is None else {env: raw}
+                self.assertEqual(mode, vcs_broker.write_mode(environ)[0])
+
+    def test_capabilities_reports_the_write_mode_for_a_served_and_an_unserved_host(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(
+            Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda provider, repo: None
+        )
+        for repository in ("acme/infra", "https://git.example.invalid/a/b"):
+            with self.subTest(repository=repository):
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}):
+                    self.assertEqual("none", broker.capabilities({"repository": repository})["writeMode"])
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: ""}):
+                    self.assertEqual("propose", broker.capabilities({"repository": repository})["writeMode"])
+
+    def test_capabilities_says_why_a_misspelt_write_mode_reads_none(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(
+            Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda provider, repo: None
+        )
+        for repository in ("acme/infra", "https://git.example.invalid/a/b"):
+            with self.subTest(repository=repository):
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "read-only"}):
+                    answer = broker.capabilities({"repository": repository})
+                self.assertEqual("none", answer["writeMode"])
+                self.assertIn("neither none nor propose", answer["writeModeDetail"])
+                for value in ("none", "propose", ""):
+                    with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: value}):
+                        self.assertNotIn("writeModeDetail", broker.capabilities({"repository": repository}))
+
+    def test_propose_verbs_are_writes_that_move_a_branch_or_touch_a_proposal(self):
+        self.assertLess(vcs_broker.PROPOSE_VERBS, vcs_broker.WRITE_VERBS)
+        self.assertEqual(
+            {"issue-create", "issue-comment", "issue-update", "issue-close", "label-ensure"},
+            set(vcs_broker.WRITE_VERBS - vcs_broker.PROPOSE_VERBS),
+            "a new write verb must be classified for writeMode: none",
+        )
+
     def test_proposal_claim_refuses_each_failed_forge_check_with_409(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=vcs_broker.CLAIM_WINDOW_SECONDS + 120))
         ahead = (datetime.now(timezone.utc) + timedelta(seconds=vcs_broker.CLAIM_CLOCK_SKEW_SECONDS + 120))
@@ -4023,6 +4071,21 @@ class SnapshotTest(unittest.TestCase):
         for entry in entries:
             with self.subTest(entry=entry["path"]):
                 self.assertEqual(vcs_broker._tar_bytes(self._listing_for([entry["path"]])), entry["bytes"])
+
+    def test_an_entry_whose_name_did_not_decode_is_marked_unnamed(self):
+        # The runner decodes `ls-tree` with replacement: b"caf\xe9" arrives as "caf\ufffd".
+        listing = "\0".join([
+            "040000 - caf\ufffd", "100644 8 caf\ufffd/a.yaml",
+            "040000 - ok", "100644 8 ok/caf\ufffd.yaml",
+            "100644 8 top.yaml",
+        ]) + "\0"
+        entries = {entry["path"]: entry for entry in vcs_broker._snapshot_entries(listing, [])}
+        self.assertEqual(vcs_broker.SNAPSHOT_UNNAMED_REASON, entries["caf\ufffd"][vcs_broker.SNAPSHOT_ENTRY_UNNAMED])
+        # A name below an entry does not mark it: asking for the entry reads it.
+        self.assertNotIn(vcs_broker.SNAPSHOT_ENTRY_UNNAMED, entries["ok"])
+        self.assertNotIn(vcs_broker.SNAPSHOT_ENTRY_UNNAMED, entries["top.yaml"])
+        asked = vcs_broker._snapshot_entries(listing, ["ok"])
+        self.assertEqual(vcs_broker.SNAPSHOT_UNNAMED_REASON, asked[0][vcs_broker.SNAPSHOT_ENTRY_UNNAMED])
 
     def test_past_the_entry_cap_the_refusal_carries_no_entries(self):
         self.broker.max_snapshot_bytes = 1

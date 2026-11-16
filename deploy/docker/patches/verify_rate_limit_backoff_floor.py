@@ -15,7 +15,7 @@ Four things are checked:
    that consumes ``_retry_after``, is gated on ``_retry_after is None`` so
    any named wait still wins, and touches neither the retry count nor
    ``wait_time`` itself.
-2. **Composition.** The error shape the worker receives from gemini-4-argon
+2. **Composition.** The error shape the worker receives from a Vertex model
    on dynamic shared quota, an ``openai.RateLimitError`` whose message is
    LiteLLM's pass-through of the "TPM quota exhausted" body with no
    ``Retry-After`` header and no ``RetryInfo``, is classified ``rate_limit``
@@ -62,9 +62,9 @@ DRAWS = 20
 BASE_URL = "http://inference-gateway/v1"
 MODEL = "gemini"
 
-#: gemini-4-argon's dynamic-shared-quota 429 as LiteLLM passes it through:
+#: Vertex's dynamic-shared-quota 429 as LiteLLM passes it through:
 #: no RetryInfo, no retry_after field, and (below) no Retry-After header.
-ARGON_429_BODY = {
+DSQ_429_BODY = {
     "error": {
         "message": (
             "litellm.RateLimitError: VertexAIException - "
@@ -201,14 +201,14 @@ def sdk_error(body, headers=None):
     return openai.RateLimitError(f"Error code: 429 - {body}", response=response, body=body.get("error"))
 
 
-argon = sdk_error(ARGON_429_BODY)
-argon_headers = getattr(getattr(argon, "response", None), "headers", None)
+dsq = sdk_error(DSQ_429_BODY)
+dsq_headers = getattr(getattr(dsq, "response", None), "headers", None)
 check(
-    "the Argon error carries no Retry-After header",
-    argon_headers is not None and not argon_headers.get("retry-after") and not argon_headers.get("Retry-After"),
+    "the dynamic-shared-quota error carries no Retry-After header",
+    dsq_headers is not None and not dsq_headers.get("retry-after") and not dsq_headers.get("Retry-After"),
     "then the header path already covered it and this patch is moot",
 )
-classified = classify_api_error(argon, provider="openai", model=MODEL)
+classified = classify_api_error(dsq, provider="openai", model=MODEL)
 check(
     "the real classifier calls it a rate limit",
     classified.reason == FailoverReason.rate_limit,
@@ -216,8 +216,8 @@ check(
 )
 check(
     "the retryDelay parser finds nothing in it",
-    retry_delay_from_error(argon) is None,
-    f"got {retry_delay_from_error(argon)!r}; then the retryDelay patch, not the floor, decides this wait",
+    retry_delay_from_error(dsq) is None,
+    f"got {retry_delay_from_error(dsq)!r}; then the retryDelay patch, not the floor, decides this wait",
 )
 draws = [rate_limit_floor_seconds() for _ in range(DRAWS)]
 check(
@@ -227,7 +227,7 @@ check(
 )
 
 # --- 3. The real backoff, end to end ----------------------------------------
-print("the real compute_error_backoff with the Argon error:")
+print("the real compute_error_backoff with the dynamic-shared-quota error:")
 
 from agent.turn_recovery import compute_error_backoff  # noqa: E402
 
@@ -260,9 +260,9 @@ def _wait_for(error, *, is_rate_limited):
     )
 
 
-waits = [_wait_for(argon, is_rate_limited=True) for _ in range(DRAWS)]
+waits = [_wait_for(dsq, is_rate_limited=True) for _ in range(DRAWS)]
 check(
-    "the patched backoff waits the floor on the Argon 429",
+    "the patched backoff waits the floor on the dynamic-shared-quota 429",
     all(FLOOR_MIN_SECONDS <= w <= FLOOR_MAX_SECONDS for w in waits),
     f"waits: {waits}",
 )
@@ -272,13 +272,13 @@ check(
 )
 check(
     "a Retry-After header still wins",
-    _wait_for(sdk_error(ARGON_429_BODY, headers={"retry-after": str(HEADER_RETRY_AFTER_SECONDS)}), is_rate_limited=True)
+    _wait_for(sdk_error(DSQ_429_BODY, headers={"retry-after": str(HEADER_RETRY_AFTER_SECONDS)}), is_rate_limited=True)
     == HEADER_RETRY_AFTER_SECONDS,
 )
 check(
     "a non-rate-limit error keeps the stock jittered backoff",
-    _wait_for(argon, is_rate_limited=False) < FLOOR_MIN_SECONDS,
-    f"got {_wait_for(argon, is_rate_limited=False)!r}",
+    _wait_for(dsq, is_rate_limited=False) < FLOOR_MIN_SECONDS,
+    f"got {_wait_for(dsq, is_rate_limited=False)!r}",
 )
 
 # --- 4. Bounds --------------------------------------------------------------

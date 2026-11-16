@@ -64,7 +64,9 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// `verifier` is the one entry here whose grants include a read that no
 	// other principal on the bus holds, so its arrival or departure from this
 	// list is worth a deliberate edit rather than a fixture regeneration.
-	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true}
+	// `dispatcher`, the AgentProfile dispatcher, which the operator renders by
+	// default: its grants name each profile durable it reads on PROFILE_SUBMITS.
+	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true, "dispatcher": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)
@@ -114,6 +116,17 @@ func TestEveryRenderedPrincipalIsUsable(t *testing.T) {
 			t.Errorf("%q resolves to %q", id.ServiceAccount, found.User)
 		}
 
+		if id.Narrowing == NarrowingDispatcher {
+			// The dispatcher's entry keeps its control connection's
+			// grants as written, inbox included; its per-profile grants
+			// are derived per bucket connection (dispatcherBucketGrants),
+			// each of which holds its own inbox.
+			inbox := "_INBOX." + id.User + ".>"
+			if !contains(id.Grants.Subscribe, inbox) {
+				t.Errorf("%q cannot subscribe to %s on its control connection", id.User, inbox)
+			}
+			continue
+		}
 		if id.Narrowing != "" {
 			// A narrowed entry is usable by construction rather than by
 			// its rendered lists: it has none, and the callout builds
@@ -161,7 +174,7 @@ func TestEveryRenderedNarrowingIsOneThisCalloutImplements(t *testing.T) {
 			continue
 		}
 		found = true
-		if id.Narrowing != NarrowingPod {
+		if id.Narrowing != NarrowingPod && id.Narrowing != NarrowingDispatcher {
 			t.Errorf("%q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 		}
 	}

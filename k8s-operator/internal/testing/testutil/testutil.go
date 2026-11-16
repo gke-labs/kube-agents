@@ -336,9 +336,13 @@ const hashPlaceholder = "<SHA256_FOR_TESTS>"
 // sha256Hex matches the hex encoding of a SHA-256 digest.
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// a2aConfigHashKey is the one hash annotation cut short: next mode's
-// a2aConfigHashLength is 16 characters, and a2aConfigHex is its shape.
-const a2aConfigHashKey = "kubeagents.x-k8s.io/a2a-config-hash"
+// a2aConfigHashKey and a2aTaskSigningKeyHashKey are the hash annotations cut
+// short: next mode's a2aConfigHashLength, and the dispatcher's
+// a2aTaskSigningKeyHash, are 16 characters, and a2aConfigHex is their shape.
+const (
+	a2aConfigHashKey         = "kubeagents.x-k8s.io/a2a-config-hash"
+	a2aTaskSigningKeyHashKey = "kubeagents.x-k8s.io/task-signing-key-hash"
+)
 
 var a2aConfigHex = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
@@ -352,7 +356,7 @@ func redactHashAnnotations(t *testing.T, annotations map[string]string) {
 			continue
 		}
 		want := sha256Hex
-		if key == a2aConfigHashKey {
+		if key == a2aConfigHashKey || key == a2aTaskSigningKeyHashKey {
 			want = a2aConfigHex
 		}
 		if !want.MatchString(value) {

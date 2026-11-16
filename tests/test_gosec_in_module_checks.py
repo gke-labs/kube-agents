@@ -1,26 +1,25 @@
-"""gosec scans the a2a and hack/ghes-proxy modules in the check that tests them.
+"""gosec scans every Go module in the check that tests it, and runs nowhere else.
 
 The Go modules in this tree are k8s-operator/, k8s-api-proxy/, a2a/ and
-hack/ghes-proxy/. Until this test's change, the first two were scanned and the
-other two never had been; a finding in either could sit on `main` with nothing
-to show it. The scan now runs as a step of each module's own test workflow,
-under the gate its test step runs under (a2a-test.yml filters in the step,
-ghes-proxy-test.yml at the trigger), built from k8s-operator/go.mod's pin, the
-one gosec this repository declares, so that go.mod and go.sum are inputs of
-both workflows: a pin bump runs the scan where its new findings would land.
-`make gosec` runs the same scan over every module locally. Held here: the step
-leaving either workflow, a gate or `continue-on-error` of its own (a red that
-fails nothing), a pin input missing from the trigger, a second pin, a Go
-module `make gosec` does not reach, and an operator `-exclude=` list that
-differs between the Makefile and the workflow that scans the operator.
+hack/ghes-proxy/. The scan runs as a step of each module's own test workflow,
+under the gate its test step runs under (three filter in a step, ghes-proxy-test.yml
+at the trigger), built from k8s-operator/go.mod's pin, the one gosec this
+repository declares, so that go.mod and go.sum are inputs of every scan: a pin
+bump runs it where its new findings would land. `make gosec` runs the same
+scan over every module locally.
 
-tests/test_gosec_in_required_checks.py holds the operator and proxy halves of
-the same rule from a sibling change (gke-labs/kube-agents#5382). Its
-`test_gosec_runs_in_no_other_workflow` asserts no gosec step outside its two
-workflows, which the two steps held here fail, and its gate test asserts every
-gosec step has an `if:`, which the ghes-proxy step has not, since its trigger
-gates it. Whichever of the two lands second widens that module map to these
-two workflows, allows a trigger-gated row, and folds this file into that one.
+Why the step sits inside each module's check and not in a workflow of its own:
+`main`'s required checks are the `main-merge-queue` ruleset on GitHub, not a
+file here (docs/pull-request-workflow.md, "How a change merges"), and `Security
+Scanning` is not in it. When its gosec job went red on a merge on 2026-11-10,
+the merge queue merged anyway and every pull request rebased onto `main` carried
+the red for four and a half hours (gke-labs/kube-agents#5228, #5345). Held here:
+the step leaving a module's workflow, a gate or `continue-on-error` of its own
+(a red that fails nothing), a pin input missing from the trigger, a second pin,
+a Go module `make gosec` does not reach, an operator `-exclude=` list that
+differs between the Makefile and the workflow that scans the operator, and a
+gosec step in any other workflow, which is the shape that misled the reader of
+#5228's checks.
 """
 
 import re
@@ -40,11 +39,19 @@ _GOSEC_MODULE_PATH = "github.com/securego/gosec"
 _PIN_INPUTS = (f"{_PIN_MODULE}/go.mod", f"{_PIN_MODULE}/go.sum")
 #: Go module -> (its test workflow, the step that runs its tests, where the
 #: workflow gates: the `paths-filter` step's output key, or None when the
-#: trigger's `paths:` lists gate it and the steps carry no `if:`).
+#: trigger's `paths:` lists gate it and the steps carry no `if:`). The pin
+#: module runs the scanner with `go run` from its own module; the rest build
+#: it from there first.
 _MODULE_CHECKS = {
+    "k8s-operator": ("k8s-operator-test.yml", "Run Tests", "operator"),
+    "k8s-api-proxy": ("k8sapiproxy-test.yml", "Test", "k8sapiproxy"),
     "a2a": ("a2a-test.yml", "Run Tests", "a2a"),
     "hack/ghes-proxy": ("ghes-proxy-test.yml", "Test", None),
 }
+#: How the pin module's own step runs the scanner, with no build step.
+_PIN_MODULE_RUN = re.compile(r"^go run github\.com/securego/gosec/v2/cmd/gosec ")
+#: The glob a module's own workflow lists, which covers the pin inputs for it.
+_PIN_MODULE_GLOB = f"{_PIN_MODULE}/**"
 _CONTINUE_ON_ERROR = "continue-on-error"
 #: Directories a go.mod under them is not a module of this tree.
 _FOREIGN_MODULE_DIRS = ("node_modules", ".claude", "testdata")
@@ -115,11 +122,20 @@ class GosecInModuleChecksTest(unittest.TestCase):
                     gosec[0],
                     f"{name}: a gosec step with {_CONTINUE_ON_ERROR} is a red that fails nothing",
                 )
-                self.assertRegex(
-                    str(gosec[0].get("run", "")),
-                    rf"go -C (\.\./)*{re.escape(_PIN_MODULE)} build ",
-                    f"{name}: the scanner is not built from {_PIN_MODULE}/go.mod's pin",
-                )
+                run = str(gosec[0].get("run", ""))
+                if module == _PIN_MODULE:
+                    self.assertRegex(run, _PIN_MODULE_RUN, f"{name}: the pin module's step does not `go run` its own gosec")
+                    self.assertEqual(
+                        _PIN_MODULE,
+                        gosec[0].get("working-directory"),
+                        f"{name}: the pin module's step does not run inside {_PIN_MODULE}/",
+                    )
+                else:
+                    self.assertRegex(
+                        run,
+                        rf"go -C (\.\./)*{re.escape(_PIN_MODULE)} build ",
+                        f"{name}: the scanner is not built from {_PIN_MODULE}/go.mod's pin",
+                    )
 
     def test_a_pin_bump_runs_each_scan(self) -> None:
         for module, (name, _test_step, key) in _MODULE_CHECKS.items():
@@ -131,13 +147,28 @@ class GosecInModuleChecksTest(unittest.TestCase):
                     lists["paths-filter"] = _filter_paths(_steps(doc), key)
                 for where, paths in lists.items():
                     for pin_input in _PIN_INPUTS:
-                        self.assertIn(
-                            pin_input,
-                            paths,
-                            f"{name}: {where} does not list {pin_input}; a gosec bump there "
-                            "would not run this scan, and the next pull request would inherit "
-                            "its findings",
+                        self.assertTrue(
+                            pin_input in paths or _PIN_MODULE_GLOB in paths,
+                            f"{name}: {where} lists neither {pin_input} nor {_PIN_MODULE_GLOB}; a gosec "
+                            "bump there would not run this scan, and the next pull request would "
+                            "inherit its findings",
                         )
+
+    def test_gosec_runs_in_no_other_workflow(self) -> None:
+        module_workflows = {name for name, _step, _key in _MODULE_CHECKS.values()}
+        for path in _workflow_files(WORKFLOWS_DIR):
+            if path.name in module_workflows:
+                continue
+            with self.subTest(workflow=path.name):
+                _text, doc = _load(path)
+                self.assertEqual(
+                    [],
+                    [s.get("name") for s in _steps(doc) if _is_gosec(s)],
+                    f"{path.name}: runs gosec outside the module checks, where a red may block no merge",
+                )
+
+    def test_every_go_module_has_a_row(self) -> None:
+        self.assertEqual(_go_modules(), set(_MODULE_CHECKS), "a Go module in the tree has no scanning workflow listed here")
 
     def test_make_gosec_reaches_every_go_module(self) -> None:
         text = _MAKEFILE.read_text(encoding="utf-8")

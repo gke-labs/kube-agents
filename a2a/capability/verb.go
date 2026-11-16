@@ -104,7 +104,7 @@ func (s verbSet) subsetOf(other verbSet) bool {
 
 // knownVerb reports whether any tier's set names v.
 func knownVerb(v Verb) bool {
-	for _, set := range tierVerbs {
+	for _, set := range tiers().verbs {
 		if set.has(v) {
 			return true
 		}
@@ -120,7 +120,7 @@ func Permits(e Entry, v Verb, r Scope) error {
 	if !knownVerb(v) {
 		return refuse("verb is not in the table")
 	}
-	set, ok := tierVerbs[e.Tier]
+	set, ok := tiers().verbs[e.Tier]
 	if !ok {
 		return refuse("capability carries a tier that is not a known tier")
 	}
@@ -139,14 +139,15 @@ func Permits(e Entry, v Verb, r Scope) error {
 // PermitsProfile answers profile.run: does grant e permit running profile at
 // tier for target r. On top of Permits (the verb is in the tier's set and the
 // target is in scope), the request's tier must be the grant's own tier and the
-// request's profile the one the grant was minted for. The dispatcher never
-// reads either out of the grant; it states what it means to run, and the
-// verifier says yes or no.
-func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
+// request's profile the one the grant was minted for, and the request's
+// trigger the grant's (nil only against a grant that binds none, #4685). The
+// dispatcher never reads any of them out of the grant; it states what it
+// means to run, and the verifier says yes or no.
+func PermitsProfile(e Entry, profile string, tier Tier, r Scope, trigger *Trigger) error {
 	if err := Permits(e, VerbProfileRun, r); err != nil {
 		return err
 	}
-	if _, ok := tierVerbs[tier]; !ok {
+	if _, ok := tiers().verbs[tier]; !ok {
 		return refuse("the request names a tier that is not a known tier")
 	}
 	if tier != e.Tier {
@@ -161,6 +162,14 @@ func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
 	if profile != e.Profile {
 		return refuse("the grant was minted for another profile")
 	}
+	switch {
+	case trigger == nil && e.Trigger != nil:
+		return refuse("the request names no trigger and the grant binds one")
+	case trigger != nil && e.Trigger == nil:
+		return refuse("the request names a trigger and the grant binds no trigger")
+	case !trigger.equal(e.Trigger):
+		return refuse("the request's trigger is not the grant's")
+	}
 	return nil
 }
 
@@ -169,7 +178,7 @@ func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
 // rank knew.
 func Verbs() []Verb {
 	all := verbSet{}
-	for _, set := range tierVerbs {
+	for _, set := range tiers().verbs {
 		for v := range set {
 			all[v] = struct{}{}
 		}

@@ -182,20 +182,20 @@ user" clauses here. Agents with a user in the loop follow this file.
   assistance in the PR description instead.
 - **Write PR titles, bodies, commits, and review replies straight:** plain declaratives leading with
   the outcome, without self-grading (`comprehensive`, `production-ready`).
-- **Adversarial and docs-drift self-review before opening a PR:** run `review-adversarial`
-  (`.agents/skills/review-adversarial/SKILL.md`) and `review-docs-drift`
-  (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff **in a clean context that
-  did not write the change** (`/pr-preflight` spawns one). Fix confirmed findings and record one
-  merged disposition list under **Self-Review**: what you looked for, what was found, the context
-  used. Mechanics: [`pre_pr_review.md`](.agents/rules/pre_pr_review.md).
+- **Self-review before opening a PR:** run `review-adversarial`, `review-docs-drift` and, when chat
+  output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
+  (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
+  disposition, what you looked for and the context ([mechanics](.agents/rules/pre_pr_review.md)).
+- **Show a user-facing change:** a PR changing what a user sees carries a screenshot under **UX
+  change**; CI checks it ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how it
   ran against a running installation, the eval loop or exemption record for agent
   behaviour changes, or "Not live-tested" and why. Mechanics:
   [`pre_pr_review.md`](.agents/rules/pre_pr_review.md); what the section may carry:
   [`public_surfaces.md`](.agents/rules/public_surfaces.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
-  fixes into the sections rather than appending rounds; round-by-round history belongs in the
-  review threads ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
+  fixes into the sections, not appended rounds; per-round history goes in review threads
+  ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install` (via
   `lifecycle.sh`) owns every GCP resource and the chart every Kubernetes resource;
   `install.sh` / `uninstall.sh` / `upgrade.sh` only generate `terraform.tfvars` and drive it. Do not

@@ -22,9 +22,9 @@ ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 class HomeFileTest(unittest.TestCase):
     """The home channel the operator projects into the pod as a file.
 
-    A learned channel is never rendered into the pod env; ``routed_platform``
-    and ``home_file_value`` take it from the file after a non-empty env, and
-    read it on every call because the kubelet refreshes it in place.
+    A learned channel is never rendered into the pod env; ``routed_platforms``
+    and ``home_file_value`` take it from the file, and read it on every call
+    because the kubelet refreshes it in place.
     """
 
     def setUp(self):
@@ -47,33 +47,34 @@ class HomeFileTest(unittest.TestCase):
     def test_a_projected_channel_routes_slack_and_names_the_home(self):
         self._write("C0FILE\n")
         self.assertEqual(chat_notify.home_file_value(), "C0FILE")
-        self.assertEqual(chat_notify.routed_platform(), "slack")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
         self.assertTrue(chat_notify.routes("slack"))
 
-    def test_a_non_empty_env_wins_over_the_file(self):
+    def test_the_file_adds_slack_to_a_non_empty_env(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
-            self.assertEqual(chat_notify.routed_platform(), "google_chat")
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
 
-    def test_an_empty_or_absent_file_routes_nothing(self):
+    def test_an_empty_or_absent_file_leaves_the_armed_route(self):
         # The directory is mounted and empty: the Optional volume before the
-        # operator writes the ConfigMap. Mounted, no home.
+        # operator writes the ConfigMap. Mounted, no home: the armed route
+        # keeps its posts for the gateway's digest.
         self.assertEqual(chat_notify.home_file(), ("", True))
         self.assertEqual(chat_notify.home_file_value(), "")
         self._write("")
         self.assertEqual(chat_notify.home_file(), ("", True))
-        self.assertEqual(chat_notify.routed_platform(), "")
-        self._write("")
-        self.assertEqual(chat_notify.routed_platform(), "")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertEqual(chat_notify.routed_platforms(), [])
         self._write("   \n")
         self.assertEqual(chat_notify.home_file_value(), "")
 
     def test_the_file_routes_only_the_platform_the_gateway_holds(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), [])
 
     def test_the_file_is_read_on_every_call(self):
         self._write("C0ONE\n")
@@ -87,13 +88,133 @@ class HomeFileTest(unittest.TestCase):
         with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "wb") as handle:
             handle.write(b"\xff\xfe\x00C0")
         self.assertEqual(chat_notify.home_file(), ("", True))
-        self.assertEqual(chat_notify.routed_platform(), "")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
 
     def test_a_missing_directory_reads_as_nothing(self):
         with mock.patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
             self.assertEqual(chat_notify.home_file(), ("", False))
             self.assertEqual(chat_notify.home_file_value(), "")
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+
+class HomePostPlatformsTest(unittest.TestCase):
+    """The operator lists the armed routes with a CR home channel; the agent
+    adds Slack when the projected file names a channel, and with no list at
+    all sends home posts to Slack's file channel or else to every armed route.
+    The home-channel variables count for nothing: Hermes strips them from the
+    processes it spawns, so every process must compute the same list without
+    them."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_chat_home_alone_takes_the_home_posts(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat"
+        self._write("")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
+        self.assertFalse(chat_notify.routes("slack"))
+
+    def test_a_learned_slack_channel_joins_a_chat_home(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat"
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_with_no_cr_home_a_slack_file_channel_takes_the_home_posts(self):
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_with_no_home_anywhere_every_armed_route_keeps_its_posts(self):
+        self._write("   \n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_a_home_less_chat_only_install_stays_routed(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
+
+    def test_slack_is_not_added_twice(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_both_cr_homes_are_the_list(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_no_armed_route_routes_nothing(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = ""
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), [])
+
+    def test_the_home_channel_variables_count_for_nothing(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = ""
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+
+    def test_home_platforms_names_only_a_platform_with_a_home_channel(self):
+        # (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, projected file or None, expected)
+        rows = (
+            (None, "google_chat,slack", None, []),
+            ("google_chat", "google_chat,slack", None, ["google_chat"]),
+            (None, "google_chat,slack", "C0BUCG2F43E", ["slack"]),
+            ("google_chat", "google_chat,slack", "C0BUCG2F43E", ["google_chat", "slack"]),
+            (None, "google_chat", "C0BUCG2F43E", []),
+        )
+        path = os.path.join(self.dir, chat_notify.HOME_FILE_KEY)
+        for platform, conversations, file_value, expected in rows:
+            with self.subTest(platform=platform, conversations=conversations, file=file_value):
+                os.environ.pop(chat_notify.NOTIFY_PLATFORM_ENV, None)
+                if platform is not None:
+                    os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = platform
+                os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = conversations
+                if file_value is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    self._write(file_value)
+                self.assertEqual(chat_notify.home_platforms(), expected)
+
+class PlatformListTest(unittest.TestCase):
+    """Both env vars carry a comma-separated list of platforms; one value is a list of one."""
+
+    def test_a_list_parses_stripped_deduped_in_order(self):
+        self.assertEqual(chat_notify.platform_list("google_chat, slack,,slack"), ["google_chat", "slack"])
+        self.assertEqual(chat_notify.platform_list("  "), [])
+        self.assertEqual(chat_notify.platform_list(" slack "), ["slack"])
+
+    def test_both_env_vars_read_as_lists(self):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+                                          chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack, google_chat"}, clear=False):
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+            self.assertEqual(chat_notify.gateway_platforms(), ["slack", "google_chat"])
+            self.assertTrue(chat_notify.routes("slack"))
+            self.assertTrue(chat_notify.routes("google_chat"))
+            self.assertFalse(chat_notify.routes("discord"))
+
+    def test_a_single_value_is_a_list_of_one(self):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}, clear=False):
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
 
 
 class CommandTest(unittest.TestCase):
@@ -549,7 +670,7 @@ class ConversationRouteTest(unittest.TestCase):
     def test_the_bus_and_the_served_platform_come_from_the_env(self):
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: " slack ", "NATS_URL": "nats://n:4222",
                                           "A2A_BUS_USER": "agent", "NATS_USER": ""}):
-            self.assertEqual(chat_notify.gateway_platform(), "slack")
+            self.assertEqual(chat_notify.gateway_platforms(), ["slack"])
             self.assertEqual(chat_notify.bus_unreachable_reason(), "")
             with mock.patch.dict(os.environ, {"A2A_BUS_USER": "", "NATS_USER": "legacy"}):
                 self.assertEqual(chat_notify.bus_unreachable_reason(), "")

@@ -34,7 +34,7 @@ by key means a prefix stops growing the moment the key changes: a model bump
 freezes the old directory forever and starts a new one, so no single prefix
 grows without bound while the software moves. It also makes the store
 navigable, which a hash would not: listing a case shows which setups have been
-screened, and ``*/gemini-3.1-pro-preview/**`` finds every case a given judge
+screened, and ``*/<judge-model>/**`` finds every case a given judge
 scored.
 
 THE PATH IS AN INDEX, NEVER THE TRUTH. Every record carries its own ``key`` and

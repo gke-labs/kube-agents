@@ -124,6 +124,9 @@ var usageExportFields = []usageExportField{
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
 	{name: "positiveFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.PositiveFeedbackTotal })},
+	{name: usageCounterInputTokens, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.InputTokensTotal })},
+	{name: usageCounterOutputTokens, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.OutputTokensTotal })},
+	{name: usageCounterSpendMicros, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.SpendMicrosUSDTotal })},
 	usageGaugeField(usageExportClustersRegistered, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersRegistered }),
 	usageGaugeField(usageExportClustersMonitored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersMonitored }),
 	usageGaugeField(usageExportRemediationsMerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsMergedTotal }),
@@ -269,9 +272,12 @@ func usageExportFieldSet(extra []string) map[string]bool {
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
 // to the exported fields it covers: the cluster gauges share one record, the
 // six proposal readings another, the two people readings a third, the nine
-// origin readings a fourth, and every other record is named for its field.
+// origin readings a fourth, the three inference totals a fifth, and every
+// other record is named for its field.
 func usageExportFieldsOfRecord(record string) []string {
 	switch record {
+	case usageNewerFieldInference:
+		return append([]string(nil), usageLiteLLMCounters...)
 	case usageNewerFieldGauges:
 		return []string{usageExportClustersRegistered, usageExportClustersMonitored}
 	case usageNewerFieldReadings:

@@ -66,12 +66,19 @@ SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 # automatic remediation pull requests (off when "false"), read by audit_report.py
 # from the root-owned file below first, then from the session's environment.
 SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
+# KUBEAGENTS_POST_MERGE_CHECK, KUBEAGENTS_AUTOMERGE, KUBEAGENTS_DIAL: the
+# earned-autonomy switches, normalised by the operator and "off" when unset,
+# read by kubeagents_switches.py from the root-owned files below first, then
+# from the session's environment.
+SANDBOX_POST_MERGE_CHECK_FILE="/run/kube-agents-sandbox/post-merge-check"
+SANDBOX_AUTOMERGE_FILE="/run/kube-agents-sandbox/automerge"
+SANDBOX_DIAL_FILE="/run/kube-agents-sandbox/dial"
 # CREDENTIAL_PROXY_EXEC_URL: the exec tier's URL, which the shim sends kubectl,
 # gcloud and Cloud API relay calls to when the operator set it, falling back on
 # CREDENTIAL_PROXY_URL when no connection can be made or the URL is malformed.
 # Unforwarded, a session would always take the fallback and nothing would say
 # so.
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE KUBEAGENTS_POST_MERGE_CHECK KUBEAGENTS_AUTOMERGE KUBEAGENTS_DIAL"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -750,6 +757,11 @@ chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"
 # operator who turned the sweep off must not have a session turn it back on.
 printf '%s\n' "${KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true}" >"$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
 chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
+# And the earned-autonomy switches, so a session cannot turn one on.
+printf '%s\n' "${KUBEAGENTS_POST_MERGE_CHECK:-off}" >"$SANDBOX_POST_MERGE_CHECK_FILE"
+printf '%s\n' "${KUBEAGENTS_AUTOMERGE:-off}" >"$SANDBOX_AUTOMERGE_FILE"
+printf '%s\n' "${KUBEAGENTS_DIAL:-off}" >"$SANDBOX_DIAL_FILE"
+chmod 0644 "$SANDBOX_POST_MERGE_CHECK_FILE" "$SANDBOX_AUTOMERGE_FILE" "$SANDBOX_DIAL_FILE"
 # Fail here rather than in sshd. An invalid drop-in makes sshd exit during
 # startup with a message about /etc/ssh/sshd_config.d/10-sandbox-env.conf, a
 # file that exists in no source tree; `-t` names it while the entrypoint is

@@ -1056,7 +1056,8 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
 `BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
 refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
 level below what was asked, with its `path`, its `type`, its count of `manifests`, and
-the `bytes` a snapshot of it alone measures; past 4096 entries it carries none; a request's
+the `bytes` a snapshot of it alone measures, and `unnamed`, with the reason, on an entry
+whose name is not UTF-8 and so cannot be asked for; past 4096 entries it carries none; a request's
 `maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
 way, with the install's `ceiling`),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal

@@ -27,7 +27,10 @@ import (
 // markers, the bullet on a row, the Stop button the gateway asks for under
 // a running task's line (gchat_stop.go), and, where a row carries Retry and
 // Drop, the row's number in the bullet's place and the "Retry n" and "Drop
-// n" labels on its buttons (gchat_board.go).
+// n" labels on its buttons (gchat_board.go). The one thing it leaves out is
+// a running or failed plan item's last step when the item's title already
+// holds that step whole, since Chat draws the steps in the open
+// (gchatChatPlan); a step the title clipped is kept.
 const (
 	// gchatChatTextMax bounds the laid-out text: the adapter's one bound on
 	// a posted text (gchatTextMax). A message past it posts as its
@@ -59,7 +62,8 @@ const (
 	gchatChatRowDetailSep = " · "
 	// gchatChatStepDone and gchatChatStepOpen mark a plan item's steps, as
 	// the Slack renderer does: the last step of a running item is the open
-	// one.
+	// one, unless the item's title already holds it and it is not drawn
+	// (gchatChatPlan).
 	gchatChatStepDone = "✓"
 	gchatChatStepOpen = "◌"
 	// gchatChatSectionGap separates the layout's sections.
@@ -268,8 +272,15 @@ func gchatChatTableCells(cells []string) []string {
 
 // gchatChatPlan is the plan, one line per item led by its status glyph, its
 // steps under it marked done but the last of a running item, which is the
-// open one. The plan's title is the fallback text's, and draws nothing, as
-// on Slack.
+// open one. A running or failed item's title already shows its latest note
+// (the emitter folds the item's note into its title), and that note is also
+// its last step. Slack keeps the steps behind the task card's arrow; Chat
+// draws them in the open, so a last step the title holds whole
+// (gchatStepIsTheNote) is left out and the title alone says where the card
+// is, with the steps before it as history; a step the title clipped stays,
+// so the note's tail is not lost. A complete item is drawn whole: its title
+// is its result, and its steps are history. The plan's title is the fallback
+// text's, and draws nothing, as on Slack.
 func gchatChatPlan(p *chatmsg.Plan) string {
 	var lines []string
 	for _, item := range p.Items {
@@ -279,15 +290,49 @@ func gchatChatPlan(p *chatmsg.Plan) string {
 			title = glyph + " " + title
 		}
 		lines = append(lines, strings.TrimSpace(title))
-		for i, step := range item.Steps {
+		steps := item.Steps
+		open := item.Status == chatmsg.StatusInProgress
+		if (open || item.Status == chatmsg.StatusError) && gchatStepIsTheNote(item) {
+			steps = steps[:len(steps)-1]
+			open = false
+		}
+		for i, step := range steps {
 			mark := gchatChatStepDone
-			if item.Status == chatmsg.StatusInProgress && i == len(item.Steps)-1 {
+			if open && i == len(steps)-1 {
 				mark = gchatChatStepOpen
 			}
 			lines = append(lines, gchatChatIndent+mark+" "+defangGchatControls(step))
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// gchatStepIsTheNote reports whether an item's last step is the note its
+// title shows whole: the step equals the item's note as the emitter sent it
+// beside the title (or the title itself, from an emitter that sent no note),
+// and the title contains the step. The emitter clips a title shorter than a
+// step (256, less the card's name in a plan of several), so a long note's
+// title is a prefix of it; the step is then the only whole copy and stays.
+// A note past the step's own clip (300) is cut by two different helpers for
+// the step and for the note, which can differ by a trailing comma or space;
+// the two then compare unequal and both lines draw, which the title check
+// would decide the same way, so the emitter is left alone. All compared as
+// sent, before the layout's defang.
+func gchatStepIsTheNote(item chatmsg.PlanItem) bool {
+	if len(item.Steps) == 0 {
+		return false
+	}
+	last := item.Steps[len(item.Steps)-1]
+	// The title as drawn: the emitter folds the note into the title with its
+	// raw whitespace (a newline, a run of spaces) while it collapses the step
+	// and the note to one line, so the comparison reads the one-line title the
+	// member sees, not the raw field.
+	title := gchatOneLine(item.Title)
+	shown := title
+	if item.Note != "" {
+		shown = item.Note
+	}
+	return last == shown && strings.Contains(title, last)
 }
 
 // gchatChatWidgets is the buttons as one accessory button list, choices

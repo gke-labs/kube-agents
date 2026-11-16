@@ -59,14 +59,15 @@ poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
 """
 
 from collections import defaultdict
+from contextlib import closing
 import json
 import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,8 +75,11 @@ from urllib.parse import urlsplit
 
 # Siblings in `$HERMES_HOME/scripts`, which is this script's own directory and
 # therefore already `sys.path[0]` when the scheduler runs it.
+import clean_merges
 import forge
 import gitops_workspace
+import post_merge_check
+import post_merge_stepdown
 import pr_triggers
 import repo_ref
 import script_log
@@ -226,16 +230,27 @@ MIN_CODE_FENCE_TICKS = 4
 SOAK_WINDOWS_SECONDS = {
     "10m": 10 * 60,
     "24h": 24 * 3600,
-    "7d": 7 * 24 * 3600,
+    "7d": int(clean_merges.REVERT_WINDOW.total_seconds()),
 }
-SOAK_CHECKPOINTS_SECONDS = (10 * 60, 24 * 3600, 7 * 24 * 3600)
-INTERCEPTED_EVENTS_PATH: Path | str = ""
-INTERCEPTED_EVENTS_PATH_ENV = "INTERCEPTED_EVENTS_PATH"
-SESSION_KV_URL = "http://127.0.0.1:8699"
-SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
-SESSION_KV_EVENTS_PATH = "/v1/intercepted-events"
-SESSION_KV_EVENTS_LIMIT = 200
-SESSION_KV_EVENTS_TIMEOUT_S = 3.0
+_POST_MERGE_COLUMNS = (
+    "url",
+    "repo",
+    "number",
+    "kind",
+    "finding_id",
+    "environment",
+    "merged_at",
+    "merge_commit",
+    "closed_at",
+    "sync_state",
+    "health_result",
+    "health_detail",
+    "human_edited",
+    "reverted_at",
+    "outcome",
+    "outcome_at",
+    "outcome_detail",
+)
 _SITUATIONAL_CLOSE_RE = re.compile(
     r"\b(?:"
     r"closing\s+(?:stale|old|duplicate|superseded|obsolete)|"
@@ -1154,21 +1169,6 @@ def _is_situational_close_reason(reason: str | None) -> bool:
     return bool(_SITUATIONAL_CLOSE_RE.search(reason))
 
 
-def _parse_iso_timestamp(raw: str) -> datetime | None:
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def _extract_rule_from_markdown(md: str) -> str:
     for line in str(md or "").splitlines():
         stripped = line.strip()
@@ -1299,129 +1299,137 @@ def _detect_human_modification(
     }
 
 
-def _load_intercepted_soak_events() -> list[dict]:
-    """Load recent cluster events from Session KV `/v1/intercepted-events` and optional local JSONL."""
-    collected: list[dict] = []
-    token = os.environ.get(SESSION_KV_KEY_ENV, "").strip()
-    if token:
-        url = f"{SESSION_KV_URL}{SESSION_KV_EVENTS_PATH}?limit={SESSION_KV_EVENTS_LIMIT}"
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=SESSION_KV_EVENTS_TIMEOUT_S) as resp:
-                payload = json.loads(resp.read() or b"{}")
-                if isinstance(payload, dict) and isinstance(payload.get("events"), list):
-                    collected.extend(e for e in payload["events"] if isinstance(e, dict))
-        except Exception:  # noqa: BLE001 — best-effort loopback feed read
-            pass
+def _read_post_merge_record(
+    repo: str, pr_num: int | None, finding_id: str = ""
+) -> dict | None:
+    """Read the matching ``post_merge_records`` row from Session KV (#5054)."""
+    db_path = (
+        os.environ.get(post_merge_check.SESSION_KV_DB_ENV)
+        or post_merge_check.SESSION_KV_DB_DEFAULT
+    )
+    if not db_path or not os.path.isfile(db_path):
+        return None
+    target_key = clean_merges.repo_key(repo) or repo.strip().lower()
+    try:
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            present = {
+                row[1]
+                for row in conn.execute(
+                    f"PRAGMA table_info({clean_merges.RECORDS_TABLE})"
+                )
+            }
+            if not present:
+                return None
+            cols = [c for c in _POST_MERGE_COLUMNS if c in present]
+            cursor = conn.execute(
+                f"SELECT {', '.join(cols)} FROM {clean_merges.RECORDS_TABLE}"
+            )
+            rows = [dict(zip(cols, values)) for values in cursor.fetchall()]
+    except sqlite3.Error:
+        return None
 
-    events_path = str(
-        INTERCEPTED_EVENTS_PATH or os.environ.get(INTERCEPTED_EVENTS_PATH_ENV, "")
-    ).strip()
-    if events_path and Path(events_path).is_file():
-        try:
-            for line in Path(events_path).read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                ev = json.loads(line)
-                if isinstance(ev, dict):
-                    collected.append(ev)
-        except Exception:  # noqa: BLE001
-            pass
-    return collected
-
-
-def _event_matches_finding(ev: dict, finding_id: str) -> bool:
-    explicit = str(ev.get("finding_id") or "").strip()
-    if explicit and explicit == finding_id:
-        return True
-    ns = str(ev.get("namespace") or "").strip()
-    kind = str(ev.get("kind") or ev.get("object_kind") or "").strip()
-    name = str(ev.get("name") or ev.get("workload") or "").strip()
-    reason = str(ev.get("reason") or "").strip()
-    composed = f"{ns}/{kind}/{name}:{reason}"
-    return composed == finding_id or composed.casefold() == finding_id.casefold()
+    for row in rows:
+        row_repo = str(row.get("repo") or "").strip()
+        row_key = clean_merges.repo_key(row_repo) or row_repo.lower()
+        if pr_num is not None and row.get("number") == pr_num and row_key == target_key:
+            return row
+    if finding_id:
+        for row in rows:
+            if str(row.get("finding_id") or "").strip() == finding_id:
+                return row
+    return None
 
 
-def _evaluate_post_merge_soak(
-    rec: dict, prop: dict, view_ans: dict, *, now: datetime | None = None
+def _evaluate_remediation_from_post_merge_record(
+    rec: dict, pm_row: dict | None, *, now: datetime | None = None
 ) -> tuple[str, str]:
-    """Evaluate post-merge soak checkpoints (`T+10m`, `T+24h`, `T+7d`) for a merged remediation PR.
+    """Evaluate a merged remediation PR from Session KV's ``post_merge_records`` (#5054).
+
+    Reuses ``post_merge_records`` (``outcome``, ``human_edited``, ``reverted_at``,
+    ``merged_at``) and ``clean_merges`` (``VERIFIED_FIXED``, ``REVERT_WINDOW``,
+    ``is_clean``, ``_parse_time``) so there is a single post-merge outcome tracker.
 
     Returns ``(state, reason)`` where ``state`` is one of:
-    - ``"soaking"``: merged recently (or merge timestamp unavailable); keep ``status:proposed``.
-    - ``"persists"``: failure recurred or GitOps sync degraded after merge (emit ``pr-merged-persists``).
-    - ``"resolved"``: soak window completed with healthy sync and zero recurrences (emit ``resolved-merged``).
+    - ``"soaking"``: ``post_merge_check.py`` has not recorded a terminal outcome yet,
+      or the soak / ``T+7d`` window is still in progress.
+    - ``"persists"``: ``outcome`` is ``still_broken`` / ``not_applied``, or the fix
+      was reverted within ``clean_merges.REVERT_WINDOW`` (emit ``pr-merged-persists``).
+    - ``"modified"``: ``outcome`` is ``verified_fixed`` and ``human_edited`` is 1
+      (emit ``modified-merged``).
+    - ``"resolved"``: ``clean_merges.is_clean`` holds and the soak window has elapsed
+      (emit ``resolved-merged``).
     """
-    post_status = str(
-        prop.get("post_merge_status") or rec.get("post_merge_status") or ""
-    ).strip().lower()
-    if post_status in ("persists", "pr-merged-persists", "failed"):
-        reason = str(
-            prop.get("persistence_reason")
-            or rec.get("reviewer_reason")
-            or "Finding recurred during post-merge soak verification."
-        ).strip()
-        return "persists", reason
+    if not isinstance(pm_row, dict):
+        return (
+            "soaking",
+            "Waiting for post_merge_records entry in Session KV.",
+        )
 
-    sync_status = str(prop.get("sync_status") or rec.get("sync_status") or "").strip().lower()
-    if sync_status in ("degraded", "outofsync", "unhealthy"):
+    outcome = str(pm_row.get("outcome") or "").strip().lower()
+    merged = clean_merges._parse_time(pm_row.get("merged_at"))
+    reverted = pm_row.get("reverted_at")
+    detail = str(
+        pm_row.get("outcome_detail") or pm_row.get("health_detail") or ""
+    ).strip()
+
+    if reverted not in (None, ""):
+        reverted_at = clean_merges._parse_time(reverted)
+        if (
+            merged is None
+            or reverted_at is None
+            or reverted_at - merged <= clean_merges.REVERT_WINDOW
+        ):
+            return (
+                "persists",
+                detail
+                or f"Fix pull request was reverted at {reverted} within the {clean_merges.REVERT_WINDOW.days}d post-merge window.",
+            )
+
+    if outcome in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed"):
         return (
             "persists",
-            f"GitOps sync reported {sync_status} during post-merge soak verification.",
+            detail or f"Post-merge check reported outcome={outcome}.",
         )
 
-    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
-    merged_at = _parse_iso_timestamp(
-        str(
-            prop.get("merged_at")
-            or prop.get("closed")
-            or prop.get("updated")
-            or rec.get("merged_at")
-            or ""
+    if outcome != clean_merges.VERIFIED_FIXED:
+        return (
+            "soaking",
+            detail or "Waiting for post_merge_check verification in post_merge_records.",
         )
+
+    if merged is None:
+        return (
+            "soaking",
+            "Merge timestamp unavailable in post_merge_records; holding in soak.",
+        )
+
+    soak_key = str(rec.get("soak_window") or DEFAULT_SOAK_WINDOW).strip().lower()
+    required_sec = SOAK_WINDOWS_SECONDS.get(
+        soak_key, SOAK_WINDOWS_SECONDS[DEFAULT_SOAK_WINDOW]
     )
-    if finding_id:
-        for ev in _load_intercepted_soak_events():
-            if not _event_matches_finding(ev, finding_id):
-                continue
-            ev_ts = _parse_iso_timestamp(str(ev.get("timestamp") or ev.get("at") or ""))
-            if merged_at is None or (ev_ts is not None and ev_ts > merged_at):
-                ev_reason = str(ev.get("message") or ev.get("reason") or "").strip()
-                suffix = f": {ev_reason}" if ev_reason else "."
-                return (
-                    "persists",
-                    f"Finding {finding_id} recurred in cluster events after PR merge{suffix}",
-                )
-
-    if merged_at is None:
-        return (
-            "soaking",
-            "Merge timestamp unavailable on proposal; holding in post-merge soak.",
-        )
-
-    soak_key = str(
-        rec.get("soak_window") or prop.get("soak_window") or DEFAULT_SOAK_WINDOW
-    ).strip().lower()
-    required_sec = SOAK_WINDOWS_SECONDS.get(soak_key, SOAK_WINDOWS_SECONDS[DEFAULT_SOAK_WINDOW])
     cur_now = now or datetime.now(timezone.utc)
-    elapsed_sec = (cur_now - merged_at).total_seconds()
+    elapsed_sec = (cur_now - merged).total_seconds()
     if elapsed_sec < required_sec:
-        next_cp = next(
-            (cp for cp in SOAK_CHECKPOINTS_SECONDS if cp > max(0.0, elapsed_sec)),
-            required_sec,
-        )
         return (
             "soaking",
-            f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s; next checkpoint {next_cp}s).",
+            f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s).",
+        )
+
+    if pm_row.get("human_edited") in (1, "1", True):
+        return (
+            "modified",
+            detail or "Reviewer modified remediation pull request before merging.",
+        )
+
+    if clean_merges.is_clean(pm_row, cur_now):
+        return (
+            "resolved",
+            detail or f"Verified fixed in post_merge_records across {soak_key} window.",
         )
 
     return (
-        "resolved",
-        f"Verified healthy across {soak_key} post-merge soak window.",
+        "soaking",
+        "Waiting for clean_merges verification in post_merge_records.",
     )
 
 
@@ -1571,6 +1579,87 @@ def sweep_memory_proposals(
         if pr_num is None:
             continue
 
+        already_soaked = str(rec.get("outcome") or "").strip().lower() in (
+            "resolved-merged",
+            "pr-merged-persists",
+            "modified-merged",
+        )
+        finding_id = str(rec.get("finding_id") or "").strip()
+        pm_row = (
+            None
+            if already_soaked
+            else _read_post_merge_record(repo, pr_num, finding_id=finding_id)
+        )
+
+        # When post_merge_check.py (#5054) already tracks this remediation PR in
+        # Session KV's post_merge_records and has recorded its merge without a
+        # human edit requiring diff inspection, evaluate directly from
+        # post_merge_records without a duplicate proposal-view forge call.
+        if (
+            pm_row is not None
+            and pm_row.get("merged_at")
+            and pm_row.get("human_edited") not in (1, "1", True)
+        ):
+            pm_url = str(pm_row.get("url") or "").strip()
+            if pm_url:
+                pr_ref = f"{pm_url} (#{pr_num})"
+            soak_state, soak_reason = _evaluate_remediation_from_post_merge_record(
+                rec, pm_row, now=now
+            )
+            if soak_state == "soaking":
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: {rec_id} soaking after merge of {pr_ref}: {soak_reason}\n"
+                    )
+                continue
+            if soak_state == "persists":
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would emit pr-merged-persists for {rec_id} from {pr_ref}: {soak_reason}\n"
+                    )
+                    continue
+                persists_args = [
+                    "--kind",
+                    "pr-merged-persists",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    soak_reason,
+                ]
+                eff_finding = finding_id or str(pm_row.get("finding_id") or "").strip()
+                if eff_finding:
+                    persists_args.extend(["--finding-id", eff_finding])
+                _run_curator_emit(curator_bin, persists_args, rec_id)
+                continue
+            if soak_state == "resolved":
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would emit resolved-merged for {rec_id} from merged {pr_ref}\n"
+                    )
+                    continue
+                soak_key = str(rec.get("soak_window") or DEFAULT_SOAK_WINDOW).strip()
+                emit_args = [
+                    "--kind",
+                    "resolved-merged",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--soak-window",
+                    soak_key,
+                ]
+                eff_finding = finding_id or str(pm_row.get("finding_id") or "").strip()
+                if eff_finding:
+                    emit_args.extend(["--finding-id", eff_finding])
+                _run_curator_emit(curator_bin, emit_args, rec_id)
+                continue
+
         try:
             view_ans = forge.call(
                 "proposal-view",
@@ -1589,11 +1678,6 @@ def sweep_memory_proposals(
             pr_ref = f"{pr_url} (#{pr_num})"
 
         if state == "merged":
-            already_soaked = str(rec.get("outcome") or "").strip().lower() in (
-                "resolved-merged",
-                "pr-merged-persists",
-                "modified-merged",
-            )
             prop_source = str(
                 prop.get("source")
                 or prop.get("source_branch")
@@ -1601,10 +1685,10 @@ def sweep_memory_proposals(
                 or ""
             ).strip()
             has_soak_signal = bool(
-                rec.get("finding_id")
+                finding_id
                 or rec.get("soak_window")
                 or prop.get("soak_window")
-                or prop.get("post_merge_status")
+                or pm_row is not None
             )
             is_knowledge_pr = bool(
                 prop.get("knowledge_pr")
@@ -1622,8 +1706,8 @@ def sweep_memory_proposals(
                 or rec_id.startswith("LES-")
             )
             if is_remediation_soak:
-                soak_state, soak_reason = _evaluate_post_merge_soak(
-                    rec, prop, view_ans, now=now
+                soak_state, soak_reason = _evaluate_remediation_from_post_merge_record(
+                    rec, pm_row, now=now
                 )
                 if soak_state == "soaking":
                     if dry_run:
@@ -1649,15 +1733,27 @@ def sweep_memory_proposals(
                         "--reason",
                         soak_reason,
                     ]
-                    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
-                    if finding_id:
-                        persists_args.extend(["--finding-id", finding_id])
+                    eff_finding = (
+                        finding_id
+                        or str((pm_row or {}).get("finding_id") or prop.get("finding_id") or "").strip()
+                    )
+                    if eff_finding:
+                        persists_args.extend(["--finding-id", eff_finding])
                     _run_curator_emit(curator_bin, persists_args, rec_id)
                     continue
 
             mod = _detect_human_modification(
                 rec, prop, view_ans, viewer, provider=provider, repo=repo, pr_num=pr_num
             )
+            if mod is None and is_remediation_soak and (pm_row or {}).get("human_edited") in (1, "1", True):
+                mod = {
+                    "initial_proposal": str(rec.get("guard_rule") or rec.get("title") or "").strip(),
+                    "rule": "",
+                    "reason": str(
+                        (pm_row or {}).get("outcome_detail")
+                        or "Reviewer modified remediation pull request before merging."
+                    )[:MAX_REASON_CHARS],
+                }
             if mod is not None:
                 if dry_run:
                     sys.stderr.write(

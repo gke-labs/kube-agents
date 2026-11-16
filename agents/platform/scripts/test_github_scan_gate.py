@@ -1812,6 +1812,35 @@ class PrCommentsSweepOnGiteaTest(unittest.TestCase):
 class MemoryProposalsSweepTest(unittest.TestCase):
     """Tests for ``sweep_memory_proposals`` (PR filing, merge approval, and close refusal)."""
 
+    @staticmethod
+    def _seed_post_merge_db(db_path: Path, **columns) -> None:
+        import re
+        import sqlite3
+
+        source = (
+            Path(__file__).resolve().parent / "session_kv_server.py"
+        ).read_text(encoding="utf-8")
+        ddl = re.search(
+            r"CREATE TABLE IF NOT EXISTS post_merge_records \((.*?)\)\s*\"\"\"",
+            source,
+            re.DOTALL,
+        ).group(0)[:-3]
+        row = {
+            "url": f"https://github.com/acme/infra/pull/{columns.get('number', 297)}",
+            "repo": "https://github.com/acme/infra",
+            "number": 297,
+            "kind": "no-pdb",
+            "human_edited": 0,
+            **columns,
+        }
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(ddl)
+            names = ", ".join(row)
+            conn.execute(
+                f"INSERT OR REPLACE INTO post_merge_records ({names}) VALUES ({', '.join('?' * len(row))})",
+                tuple(row.values()),
+            )
+
     def test_pending_record_without_pr_files_card_for_platform_agent(self):
         pending_json = json.dumps({
             "repo": "acme/infra",
@@ -2045,21 +2074,31 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as td:
-            events_path = Path(td) / "events.jsonl"
-            events_path.write_text("", encoding="utf-8")
-            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=297,
+                finding_id="checkout/Deployment/checkout-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
-                 mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
                  mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
                  mock.patch.object(forge, "BrokerProvider") as bp_cls, \
-                 mock.patch.object(forge, "call", return_value=merged_view):
+                 mock.patch.object(forge, "call", return_value=merged_view) as forge_call:
                 bp_cls.return_value.viewer_login.return_value = "kage-bot"
-                # At T+10m (12:10 UTC), the 24h soak is still in progress: no emit call.
+                # At T+10m (12:10 UTC), the 24h soak is still in progress: no emit call and no forge call.
                 t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
                 result_early = gate.sweep_memory_proposals(now=t_10m)
                 self.assertEqual(result_early.cards, [])
                 self.assertEqual(len(calls), 1)  # only `curator pending`
+                forge_call.assert_not_called()
 
                 # At T+25h (next day 13:00 UTC), the 24h soak window is complete: emits resolved-merged.
                 calls.clear()
@@ -2067,13 +2106,14 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 result_ready = gate.sweep_memory_proposals(now=t_25h)
                 self.assertEqual(result_ready.cards, [])
                 self.assertEqual(len(calls), 2)
+                forge_call.assert_not_called()
                 emit_cmd = calls[1]
                 self.assertIn("resolved-merged", emit_cmd)
                 self.assertIn("LES-2026-012", emit_cmd)
                 self.assertIn("--soak-window", emit_cmd)
                 self.assertIn("24h", emit_cmd)
 
-    def test_merged_lesson_pr_emits_pr_merged_persists_when_finding_recurs_in_events(self):
+    def test_merged_lesson_pr_emits_pr_merged_persists_when_still_broken_in_post_merge_records(self):
         pending_json = json.dumps({
             "repo": "acme/infra",
             "records": [
@@ -2098,37 +2138,30 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        merged_view = {
-            "proposal": {
-                "number": 298,
-                "state": "merged",
-                "merged_at": "2026-11-01T12:00:00Z",
-                "url": "https://github.com/acme/infra/pull/298",
-                "sync_status": "Synced",
-                "health_status": "Healthy",
-            }
-        }
-
         with tempfile.TemporaryDirectory() as td:
-            events_path = Path(td) / "events.jsonl"
-            events_path.write_text(
-                json.dumps({
-                    "timestamp": "2026-11-01T12:08:00Z",
-                    "finding_id": "payments/Deployment/payment-worker:OOMKilled",
-                    "reason": "OOMKilled (exit 137) under peak traffic",
-                }) + "\n",
-                encoding="utf-8",
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=298,
+                finding_id="payments/Deployment/payment-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="still_broken",
+                outcome_detail="OOMKilled (exit 137) under peak traffic",
+                human_edited=0,
             )
-            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
-                 mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
                  mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
                  mock.patch.object(forge, "BrokerProvider") as bp_cls, \
-                 mock.patch.object(forge, "call", return_value=merged_view):
+                 mock.patch.object(forge, "call") as forge_call:
                 bp_cls.return_value.viewer_login.return_value = "kage-bot"
                 t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
                 result = gate.sweep_memory_proposals(now=t_10m)
+                forge_call.assert_not_called()
 
         self.assertEqual(result.cards, [])
         self.assertEqual(len(calls), 2)
@@ -2338,7 +2371,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         self.assertIn("LES-2026-012", emit_cmd)
         self.assertIn("--knowledge-pr", emit_cmd)
 
-    def test_merged_lesson_pr_uses_broker_normalized_closed_timestamp_for_soak(self):
+    def test_merged_lesson_pr_respects_7d_revert_window_in_post_merge_records(self):
         pending_json = json.dumps({
             "repo": "acme/infra",
             "records": [
@@ -2351,7 +2384,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "branch": "platform-agent/memory/LES-2026-030",
                     "pull_request": "https://github.com/acme/infra/pull/310 (#310)",
                     "finding_id": "api/Deployment/api-worker:OOMKilled",
-                    "soak_window": "24h",
+                    "soak_window": "7d",
                 }
             ],
         })
@@ -2363,29 +2396,36 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        merged_view = {
-            "proposal": {
-                "number": 310,
-                "state": "merged",
-                "closed": "2026-11-01T12:00:00Z",
-                "url": "https://github.com/acme/infra/pull/310",
-            }
-        }
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
-             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
-             mock.patch("subprocess.run", side_effect=fake_run), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
-             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
-             mock.patch.object(forge, "call", return_value=merged_view):
-            bp_cls.return_value.viewer_login.return_value = "kage-bot"
-            t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
-            self.assertEqual(gate.sweep_memory_proposals(now=t_10m).cards, [])
-            self.assertEqual(len(calls), 1)
-            calls.clear()
-            t_25h = datetime(2026, 11, 2, 13, 0, 0, tzinfo=timezone.utc)
-            gate.sweep_memory_proposals(now=t_25h)
-            self.assertEqual(len(calls), 2)
-            self.assertIn("resolved-merged", calls[1])
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=310,
+                finding_id="api/Deployment/api-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                # At T+2d, 7d soak is still in progress.
+                t_2d = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+                self.assertEqual(gate.sweep_memory_proposals(now=t_2d).cards, [])
+                self.assertEqual(len(calls), 1)
+                calls.clear()
+                # At T+8d, 7d soak is complete -> emits resolved-merged.
+                t_8d = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+                gate.sweep_memory_proposals(now=t_8d)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+                self.assertIn("7d", calls[1])
 
     def test_memory_pr_card_preserves_valid_shell_quoting_and_escapes_nested_fences(self):
         import shlex
@@ -2492,44 +2532,35 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 gate.sweep_memory_proposals()
             self.assertEqual(len(calls), 1, "indeterminate/truncated close must hold, never retire")
 
-    def test_session_kv_events_detect_recurrence_and_missing_merge_time_holds_soak(self):
+    def test_post_merge_records_reverted_and_human_edited_outcomes(self):
         rec = {"id": "LES-2026-033", "type": "lesson", "finding_id": "payments/Deployment/pay-api:OOMKilled"}
-        state_no_ts, _ = gate._evaluate_post_merge_soak(rec, {"state": "merged"}, {})
-        self.assertEqual(state_no_ts, "soaking")
+        state_no_row, _ = gate._evaluate_remediation_from_post_merge_record(rec, None)
+        self.assertEqual(state_no_row, "soaking")
 
-        kv_body = json.dumps({
-            "events": [
-                {
-                    "timestamp": "2026-11-01T12:15:00Z",
-                    "namespace": "payments",
-                    "kind": "Deployment",
-                    "name": "pay-api",
-                    "reason": "OOMKilled",
-                    "message": "Container killed with exit 137",
-                }
-            ]
-        }).encode("utf-8")
+        state_reverted, why_rev = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            {
+                "outcome": "verified_fixed",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "reverted_at": "2026-11-02T12:00:00Z",
+                "human_edited": 0,
+            },
+            now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_reverted, "persists")
+        self.assertIn("reverted", why_rev)
 
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return kv_body
-
-        with mock.patch.dict("os.environ", {"SESSION_KV_API_KEY": "test-key"}), \
-             mock.patch("urllib.request.urlopen", return_value=_Resp()):
-            st, why = gate._evaluate_post_merge_soak(
-                rec,
-                {"state": "merged", "closed": "2026-11-01T12:00:00Z"},
-                {},
-                now=datetime(2026, 11, 1, 12, 20, tzinfo=timezone.utc),
-            )
-        self.assertEqual(st, "persists")
-        self.assertIn("Container killed with exit 137", why)
+        state_edited, _ = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            {
+                "outcome": "verified_fixed",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "reverted_at": None,
+                "human_edited": 1,
+            },
+            now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_edited, "modified")
 
     def test_emit_timeout_does_not_discard_earlier_cards_and_multi_repo_routes_per_record(self):
         pending_json = json.dumps({

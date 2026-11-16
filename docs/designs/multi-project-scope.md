@@ -393,17 +393,31 @@ member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in w
 listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
 A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
 fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
-number-to-ID memo and the members counted against the cap that have no row. The operator starts
+number-to-ID memo and the members counted against the cap that have no row. A third field the
+gateway and the operator do not read, `clusters` (added 11/11, #5621), keeps what each member's
+probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`, for the
+agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
+covers member projects only, since the management project and explicit projects are never
+probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
+for a project it could not read. The `projects` rows don't change with it. The map counts toward the 900 KiB budget, but it is
+dropped first: a document whose rows fit is published without it rather than as `too-large`. The operator starts
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
-own copy of `scope.json` declares or an earlier lookup returned. The gateway's check of the
-document does not ship yet; it admits explicit projects and the management project from the
-declaration and its own environment. The reconcile, its snapshot and today-mode installs do not
-change.
+own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile
+task's target against the document, as described below. The reconcile, its snapshot and today-mode
+installs do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
 pod has no channel to the operator today and building one for this alone is out of proportion.
+
+The A2A gateway reads the scope publisher's `<name>-resolved-scope` ConfigMap (section 4) to
+check a profile task's cluster target, with a `get` on that one name, and fails closed. It admits
+a project that only a container or selector reaches only from a document of the current
+`memberHash` and state `ok`, a row with outcome `ok`, and a `resolvedAt` and `confirmedAt` within
+two publisher cycles (2 × (15 min + 300 s × ceil(maxProjects / 100))), a stamp more than a
+minute in the future counting as stale. Explicit projects, the management project and
+`exclude.clusters` keep their direct checks from `scope.json`.
 
 ## 6. IAM
 

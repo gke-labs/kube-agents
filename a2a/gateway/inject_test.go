@@ -372,6 +372,7 @@ func entryTexts(entries []InjectEntry, kind string) []string {
 // every other backend's message carries, and the POST learns the task id --
 // which is what makes "await terminal of task id X" expressible at all.
 func TestInjectSubmitsThroughHandleInbound(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 
 	reply := r.inject(t, "case-1", injectTestAuthor, "how is the fleet?")
@@ -410,6 +411,7 @@ func TestInjectSubmitsThroughHandleInbound(t *testing.T) {
 // eval submission for a Chat message. The identifiers are pseudonymized
 // exactly as every other backend's are.
 func TestInjectAuthorityNamesTheBearerDoor(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	r.inject(t, "case-authority", injectTestAuthor, "audit me")
 
@@ -454,6 +456,7 @@ func TestInjectAuthorityNamesTheBearerDoor(t *testing.T) {
 // the eval transport reads -- the deliverable is a chat post, because that is
 // what a customer receives.
 func TestInjectConversationCarriesTheReplyAndTheTerminal(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-reply", injectTestAuthor, "do the thing")
 
@@ -503,6 +506,7 @@ func TestInjectConversationCarriesTheReplyAndTheTerminal(t *testing.T) {
 // harness whose poll lost a race does not wait out its deadline for an event
 // that has already happened.
 func TestInjectTerminalIsAnsweredAfterTheFact(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-late", injectTestAuthor, "answer then leave")
 
@@ -539,6 +543,7 @@ func TestInjectTerminalIsAnsweredAfterTheFact(t *testing.T) {
 // ended `failed` is an outcome, not an infrastructure fault, and both the
 // reason and the terminal state have to reach the caller.
 func TestInjectGradesAFailedTask(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-failed", injectTestAuthor, "break")
 
@@ -585,6 +590,7 @@ func TestInjectGradesAFailedTask(t *testing.T) {
 // started and carries the drop notice, so a misconfigured harness sees the
 // reason rather than a silent empty conversation.
 func TestInjectDropsAnUnmappedAuthor(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 
 	reply := r.inject(t, "case-unmapped", injectTestUnknownAuthor, "let me in")
@@ -611,6 +617,7 @@ func TestInjectDropsAnUnmappedAuthor(t *testing.T) {
 // must get every later entry exactly once -- a gap loses the deliverable and a
 // repeat double-counts it.
 func TestInjectEntriesArePollableWithoutGapsOrRepeats(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-seq", injectTestAuthor, "narrate")
 
@@ -659,6 +666,7 @@ func TestInjectEntriesArePollableWithoutGapsOrRepeats(t *testing.T) {
 // are two turns of one conversation, which is what lets the case runner send a
 // follow-up the way a second chat message would arrive.
 func TestInjectFollowUpReachesTheSameSession(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	first := r.inject(t, "case-followup", injectTestAuthor, "first ask")
 
@@ -845,6 +853,7 @@ func TestInjectNamesWhoDeclaredATerminal(t *testing.T) {
 // grades a long report on its closing fragment. The transport reassembles
 // them, so the adapter has to record every chunk rather than collapsing them.
 func TestInjectPostsTheWholeOfALongAnswer(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-long", injectTestAuthor, "write it all down")
 
@@ -986,6 +995,7 @@ func TestInjectBoundsWhatItRetains(t *testing.T) {
 // door with one unauthenticated endpoint is an unauthenticated door: the GET
 // alone would read every reply on every conversation.
 func TestInjectRefusesEveryRequestWithoutTheToken(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	accepted := r.inject(t, "case-auth", injectTestAuthor, "something to read back")
 
@@ -1285,6 +1295,7 @@ func TestInjectImplementsAllFiveAdapterOperations(t *testing.T) {
 // and what goes on the bus must be identical to what the text route puts
 // there -- the executor cannot tell which door the cancel came through.
 func TestInjectCancelRouteLandsAsKindCancel(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-cancel", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -1356,6 +1367,7 @@ func (r *injectRig) waitForTerminal(t *testing.T, key, taskID string) InjectEntr
 // happened to be the word "stop" would be indistinguishable from a control
 // action.
 func TestInjectCancelDoesNotGoThroughTheStopText(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-cancel-text", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -1413,6 +1425,7 @@ func TestInjectReportsTheGatewaysFirstEventGrace(t *testing.T) {
 // inbound message. The classification is the caller's; the gateway's own
 // verdict still lands on the next turn, which the second half shows.
 func TestInjectReadRouteIsAPureRead(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	// Nothing ever consumes this addressee, which is an install with no
 	// executor -- the state an eval install has before its bridge is
@@ -1488,6 +1501,7 @@ func TestInjectReadRouteIsAPureRead(t *testing.T) {
 // task is no longer active and the terminal sits beside the read. None of
 // the reads reaches the bus or starts anything.
 func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-read", injectTestAuthor, "take your time")
 	r.awaitRecordedTask(t, reply.Conversation)
@@ -1584,6 +1598,7 @@ func TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay(t *testing.T) 
 // record is detached, and the read says so rather than leaving the caller to
 // send a second cancel.
 func TestInjectReadRouteReportsADetachedTask(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-stopping", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -1655,6 +1670,7 @@ func TestInjectReadRouteAnswersForAnUnknownConversation(t *testing.T) {
 // backend message id says it is the same message: the retry is answered with
 // the first task id, and nothing is routed for it.
 func TestInjectDedupesAPostOnItsMessageID(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	const messageID = "run-1/case-dedupe/1"
 	first := r.injectWithID(t, "case-dedupe", injectTestAuthor, "how is the fleet?", messageID)
@@ -1848,6 +1864,7 @@ func TestInjectDedupesAPostWhoseCallerDisconnected(t *testing.T) {
 // -- the persona's failure, or the executor's own -- needs the token. The
 // terminal entry carries the message verbatim.
 func TestInjectTerminalCarriesTheExecutorsReason(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-reason", injectTestAuthor, "break")
 	origin := r.awaitTask(t, "platform")
@@ -1955,6 +1972,7 @@ func (r *injectRig) restoreActiveTask(t *testing.T, key string, origin *lib.Enve
 // fold of the task's stream: the terminal, whose word it is, the result text
 // and the reason. A caller grades from it and sends no cancel.
 func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-lost-write", injectTestAuthor, "answer me")
 	origin := r.awaitTask(t, "platform")
@@ -2054,6 +2072,7 @@ func (r *injectRig) appendArtifact(t *testing.T, origin *lib.Envelope, addressee
 // has called so far, not only what it called by the end -- and the relay's
 // transcript still never shows the trace.
 func TestInjectReadRouteCarriesTheToolCallTraceAndProgressLine(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-trace", injectTestAuthor, "list the clusters")
 	origin := r.awaitTask(t, "platform")
@@ -2116,6 +2135,7 @@ func TestInjectReadRouteCarriesTheToolCallTraceAndProgressLine(t *testing.T) {
 // rather than nothing -- "called nothing" is a fact about the executor, and
 // an absent key would read as a door that cannot say.
 func TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-no-trace", injectTestAuthor, "think quietly")
 	origin := r.awaitTask(t, "platform")
@@ -2142,6 +2162,7 @@ func TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing(t *testing.T)
 // turn's part; the key is absent while the executor has published none, and
 // on every read that did not ask.
 func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-usage", injectTestAuthor, "list the clusters")
 	origin := r.awaitTask(t, "platform")
@@ -2267,6 +2288,7 @@ func TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead(t *testing.T) {
 // Without task= the released conversation still reads as no stream (the
 // activity key absent), so "absent = not read" keeps holding.
 func TestInjectReadRouteReadsAFinishedTasksTraceByTaskID(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-trace-after-release", injectTestAuthor, "list the clusters")
 	origin := r.awaitTask(t, "platform")
@@ -2355,6 +2377,7 @@ func TestInjectReadRouteReadsAFinishedTasksTraceByTaskID(t *testing.T) {
 // released conversation, whose history knows no such task, and on one that
 // never had a turn, whose record does not exist.
 func TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-unknown-task", injectTestAuthor, "think quietly")
 	origin := r.awaitTask(t, "platform")
@@ -2384,6 +2407,7 @@ func TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID(t *testing.T) {
 // never ran, not an executor's answer. The fold says whose it is, so a caller
 // grading off the read does not score an outage as the agent's failure.
 func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-supervised", injectTestAuthor, "answer me")
 	origin := r.awaitTask(t, "platform")
@@ -2438,6 +2462,7 @@ func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
 // to the terminal. Checked for an executor's terminal off `…events` and the
 // supervisor's off `…supervisor`.
 func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		from    lib.Party
@@ -2511,6 +2536,7 @@ func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
 // reordered to lock-then-mint, the turn runs a fresh budget after the
 // release and its submission reaches the bus, which is the failure.
 func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	key := injectKeyPrefix + "held-lock"
 	msg := InboundMessage{
@@ -2561,6 +2587,7 @@ func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 // submission is still on the in subject for a bridge that binds later. The
 // named cancel reaches the bus regardless, on the task's own chain.
 func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-nobody", injectTestAuthor, "into the void")
 	origin := r.awaitTask(t, "platform")
@@ -2625,6 +2652,7 @@ func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
 // TestInjectCancelRefusesATaskTheConversationNeverHeld: naming a task is not
 // a way to publish cancels for tasks this conversation did not start.
 func TestInjectCancelRefusesATaskTheConversationNeverHeld(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-stranger", injectTestAuthor, "hello")
 	origin := r.awaitTask(t, "platform")
@@ -2657,6 +2685,7 @@ func TestInjectCancelRefusesATaskTheConversationNeverHeld(t *testing.T) {
 // terminal that cannot come. The stream is taken away here so the publish
 // fails for real.
 func TestInjectRefusesAPostWhoseSubmissionCannotReachTheBus(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	deleteTasksStream(t, r.url)
 
@@ -2705,6 +2734,7 @@ func TestInjectRefusesAPostWhoseSubmissionCannotReachTheBus(t *testing.T) {
 // retry of a POST the gateway could not publish would be routed as a fresh
 // message and mint a second doomed task.
 func TestInjectAnswersARetriedPostWithTheSameRefusal(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	deleteTasksStream(t, r.url)
 	const messageID = "run-1/case-no-bus/1"
@@ -2728,6 +2758,7 @@ func TestInjectAnswersARetriedPostWithTheSameRefusal(t *testing.T) {
 // states it saw would file a run that happened as one that never started, so
 // the read also says whether working was ever on the stream.
 func TestInjectReadRouteRemembersWorkingBehindALaterState(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-parked-after-working", injectTestAuthor, "take your time")
 	r.awaitRecordedTask(t, reply.Conversation)
@@ -2757,6 +2788,7 @@ func TestInjectReadRouteRemembersWorkingBehindALaterState(t *testing.T) {
 // POST until its accept bound and then answer "nothing visible happened",
 // which reads as a stuck gateway rather than as the answer it already gave.
 func TestInjectRefusesASecondDropWithoutWaitingForTheBound(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 
 	first := r.inject(t, "case-twice-unmapped", injectTestUnknownAuthor, "let me in")
@@ -2803,6 +2835,7 @@ func TestInjectRefusesASecondDropWithoutWaitingForTheBound(t *testing.T) {
 // run infrastructure. The handler here is deliberately slow between
 // the two halves; the real one is fast, which is why nothing else catches it.
 func TestInjectWaitsThroughThePlaceholderForTheAccept(t *testing.T) {
+	t.Parallel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -2905,6 +2938,7 @@ func TestInjectCancelFromAnUnknownAuthorDoesNotHoldTheConnection(t *testing.T) {
 // off an undetached record, and the next message would steer a cancelled
 // task.
 func TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-named-active", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -2949,6 +2983,7 @@ func TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord(t *testing.T) {
 // terminal lands in the window between its last read and the turn it sends
 // next.
 func TestInjectHealedTerminalCarriesTheExecutorsReason(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-healed-reason", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -3004,6 +3039,7 @@ func TestInjectHealedTerminalCarriesTheExecutorsReason(t *testing.T) {
 // the door as `source: executor`, and a caller that adopts a healed terminal
 // on its settle read would grade an outage as the agent failing.
 func TestInjectHealedTerminalNamesTheSupervisorsAsItsOwn(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-healed-supervisor", injectTestAuthor, "long job")
 	origin := r.awaitTask(t, "platform")
@@ -3058,6 +3094,7 @@ func TestInjectHealedTerminalNamesTheSupervisorsAsItsOwn(t *testing.T) {
 // caller that recorded one as published would tell its reader a stray run
 // was bounded while it runs. The door answers the publish itself.
 func TestInjectCancelSaysWhetherItReachedTheBus(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-cancel-code", injectTestAuthor, "long job")
 	r.awaitTask(t, "platform")
@@ -3304,6 +3341,7 @@ func TestInjectRefusesAnUnboundedKeyOnTheReadAndCancelRoutes(t *testing.T) {
 // the wait -- one that nobody took, and cancel it. The probe is taken again
 // after a wait that blocked.
 func TestInjectProbeDescribesTheInstantTheWaitEnded(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-probe-instant", injectTestAuthor, "answer me")
 	origin := r.awaitTask(t, "platform")
@@ -3352,6 +3390,7 @@ func TestInjectProbeDescribesTheInstantTheWaitEnded(t *testing.T) {
 // filed) without a turn. A conversation with no record has no contextId and
 // the key is absent rather than empty.
 func TestInjectProbeCarriesTheConversationsContextID(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-probe-context", injectTestAuthor, "answer me")
 	origin := r.awaitTask(t, "platform")
@@ -3375,6 +3414,7 @@ func TestInjectProbeCarriesTheConversationsContextID(t *testing.T) {
 // message's own task then ran with nobody waiting on it. The door now hands
 // a message over only once the earlier turn has ended.
 func TestInjectASecondPostWaitsForTheEarlierTurnToEnd(t *testing.T) {
+	t.Parallel()
 	var f *fakeDoor
 	ready := make(chan struct{})
 	var turnMu sync.Mutex
@@ -3420,6 +3460,7 @@ func TestInjectASecondPostWaitsForTheEarlierTurnToEnd(t *testing.T) {
 // it. So the claim is taken on a context the client cannot end and only the
 // bound ends it; the cancel reaches the gateway once the turn ends.
 func TestInjectACancelIsHandedOverAfterItsClientLeft(t *testing.T) {
+	t.Parallel()
 	var f *fakeDoor
 	ready := make(chan struct{})
 	var cancels atomic.Int32
@@ -3553,6 +3594,7 @@ func TestInjectAReMintedConversationContinuesItsSequence(t *testing.T) {
 // every retry of the message id, and the turn would go on to mint a task
 // nobody was told about -- the outcome a refusal exists to rule out.
 func TestInjectAClaimWithLessThanATurnLeftIsRefusedNotHandedOver(t *testing.T) {
+	t.Parallel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -3605,6 +3647,7 @@ func TestInjectAClaimWithLessThanATurnLeftIsRefusedNotHandedOver(t *testing.T) {
 // messages would both be handed over, the second answered with the first's
 // task and routed as a steer onto it.
 func TestInjectAReMintedConversationKeepsItsOutstandingTurn(t *testing.T) {
+	t.Parallel()
 	f := startFakeDoor(t, func(InboundMessage) {})
 	const key = injectKeyPrefix + "evicted-mid-turn"
 	ctx := context.Background()
@@ -3649,6 +3692,7 @@ func TestInjectAReMintedConversationKeepsItsOutstandingTurn(t *testing.T) {
 // deadline at its arrival and both take it. Pinned at the seam, with a short
 // deadline: the bound itself is seventy seconds.
 func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
+	t.Parallel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -3698,6 +3742,7 @@ func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
 // and activityDropped counts what the cap cut, rather than the body growing
 // with the run.
 func TestInjectReadRouteCapsTheTraceAndSaysSo(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-long-trace", injectTestAuthor, "call many tools")
 	origin := r.awaitTask(t, "platform")
@@ -3735,6 +3780,7 @@ func TestInjectReadRouteCapsTheTraceAndSaysSo(t *testing.T) {
 // another, is a miss -- no trace, no result, no error naming it -- and a
 // wildcard is a miss the same way, never a replay of the whole addressee.
 func TestInjectReadRouteRefusesAnotherConversationsTaskID(t *testing.T) {
+	t.Parallel()
 	r := startInjectRig(t)
 	theirs := r.inject(t, "case-theirs", injectTestAuthor, "their prompt")
 	theirOrigin := r.awaitTask(t, "platform")

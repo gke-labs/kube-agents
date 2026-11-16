@@ -162,6 +162,8 @@ REPORT_CHECK_TIMEOUT_SECONDS = 5
 # and knows which platform's conversations the gateway serves.
 CHAT_NOTIFY_PATH = Path("/opt/defaults/scripts/chat_notify.py")
 CHAT_NOTIFY_MODULE = "_kube_agents_chat_notify"
+# What a log line prints for an empty served-platform list.
+UNSET_LABEL = "<unset>"
 # The image's hand-off module, whose read_scan_marker is the one reader of the
 # sweep marker's filing time that oobe and the hand-off share.
 BOOTSTRAP_HANDOFF_PATH = Path("/opt/defaults/scripts/bootstrap_handoff.py")
@@ -566,19 +568,20 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
     try:
         chat_notify = _load_chat_notify()
         route = chat_notify.conversation_route(session_id)
-        served = chat_notify.gateway_platform()
+        served = chat_notify.gateway_platforms()
     except Exception as e:
         logger.warning("Could not read the conversation route for %s: %s", session_id, e)
         return None
     if not route or route["platform"] not in DURABLE_CHAT_PLATFORMS:
         return None
-    if served != route["platform"]:
+    if route["platform"] not in served:
         if route["platform"] in _unserved_warned:
             return None
         _unserved_warned.add(route["platform"])
         logger.warning(
-            "The gateway does not serve %s conversations here (%s=%r); leaving onboarding unprimed.",
-            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, served,
+            "The gateway does not serve %s conversations here (%s=%s); leaving onboarding unprimed.",
+            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV,
+            chat_notify.PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL,
         )
         return None
     if _scan_too_old(data_dir):

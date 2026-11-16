@@ -29,6 +29,7 @@ const (
 
 // HindsightClient manages the kube-agents-decisions bank over Hindsight's REST API.
 type HindsightClient struct {
+	apiRoot    string
 	baseURL    string
 	bankID     string
 	httpClient *http.Client
@@ -55,16 +56,28 @@ func NewHindsightClient(apiURL, bankID string) *HindsightClient {
 	if bankID == "" {
 		bankID = DefaultBankID
 	}
+	root := strings.TrimRight(apiURL, "/")
 	return &HindsightClient{
-		baseURL: strings.TrimRight(apiURL, "/") + "/v1/default/banks/" + url.PathEscape(bankID),
+		apiRoot: root,
+		baseURL: root + "/v1/default/banks/" + url.PathEscape(bankID),
 		bankID:  bankID,
 		httpClient: &http.Client{
 			Timeout: defaultHindsightTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
 
-func (h *HindsightClient) doJSON(ctx context.Context, method, path string, reqBody, respBody any) error {
+func (h *HindsightClient) bankURL(bankID string) string {
+	if bankID == "" || bankID == h.bankID || h.apiRoot == "" {
+		return h.baseURL
+	}
+	return h.apiRoot + "/v1/default/banks/" + url.PathEscape(bankID)
+}
+
+func (h *HindsightClient) doBankJSON(ctx context.Context, bankID, method, path string, reqBody, respBody any) error {
 	var bodyReader io.Reader
 	if reqBody != nil {
 		raw, err := json.Marshal(reqBody)
@@ -73,7 +86,7 @@ func (h *HindsightClient) doJSON(ctx context.Context, method, path string, reqBo
 		}
 		bodyReader = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, h.baseURL+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, h.bankURL(bankID)+path, bodyReader)
 	if err != nil {
 		return err
 	}
@@ -98,6 +111,10 @@ func (h *HindsightClient) doJSON(ctx context.Context, method, path string, reqBo
 		}
 	}
 	return nil
+}
+
+func (h *HindsightClient) doJSON(ctx context.Context, method, path string, reqBody, respBody any) error {
+	return h.doBankJSON(ctx, h.bankID, method, path, reqBody, respBody)
 }
 
 // EnsureBank idempotently creates and configures the Hindsight bank with
@@ -184,8 +201,13 @@ func (h *HindsightClient) DeleteDocument(ctx context.Context, docID string) erro
 	return h.doJSON(ctx, http.MethodDelete, "/documents/"+url.PathEscape(docID), nil, nil)
 }
 
-// Recall queries Hindsight for records matching query and tag groups.
+// Recall queries the client's configured Hindsight bank for records matching query and tag groups.
 func (h *HindsightClient) Recall(ctx context.Context, query string, tags []string, tagsMatch string) ([]HindsightRecallResult, error) {
+	return h.RecallBank(ctx, h.bankID, query, tags, tagsMatch)
+}
+
+// RecallBank queries the specified Hindsight bank for records matching query and tag groups.
+func (h *HindsightClient) RecallBank(ctx context.Context, bankID, query string, tags []string, tagsMatch string) ([]HindsightRecallResult, error) {
 	if len(tags) == 0 {
 		tags = []string{SharedTag}
 	}
@@ -203,7 +225,7 @@ func (h *HindsightClient) Recall(ctx context.Context, query string, tags []strin
 	var resp struct {
 		Results []HindsightRecallResult `json:"results"`
 	}
-	if err := h.doJSON(ctx, http.MethodPost, "/memories/recall", body, &resp); err != nil {
+	if err := h.doBankJSON(ctx, bankID, http.MethodPost, "/memories/recall", body, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Results, nil
