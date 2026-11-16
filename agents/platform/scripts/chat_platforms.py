@@ -78,8 +78,8 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
 # in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
 # the variable is not set here, so this list does not count it; the platforms
-# `chat_notify.routed_platforms()` names, from `A2A_NOTIFY_PLATFORM` or the projected
-# home-channel file, are counted through the gateway's notify route.
+# `chat_notify.routed_platforms()` names, from the two notify variables and the
+# projected home-channel file, are counted through the gateway's notify route.
 #
 # In a deployed pod the relay URL is not merely first, it is the only one of these
 # that arrives. A bot token is a credential, so it lives in the credential-proxy
@@ -198,11 +198,11 @@ def enabled_chat_platforms() -> list[str]:
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
     statement. The one exception is each platform `chat_notify.routed_platforms()`
-    names, from `A2A_NOTIFY_PLATFORM` or the projected home-channel file: under
+    names, from the two notify variables and the projected home-channel file: under
     `next` the managed scope turns that platform's Hermes consumer off because the
     A2A gateway holds the backend, and posts reach it through the gateway, so it
-    counts as enabled whatever the files say. The operator renders the variable
-    and the file only then, and reserves the variable.
+    counts as enabled whatever the files say. The operator renders the variables
+    and the file only then, and reserves the variables.
 
     Never returns an empty list: an install that resolves to nothing gets
     DEFAULT_PLATFORM, which is what every caller did unconditionally before.

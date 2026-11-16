@@ -11,9 +11,10 @@ for the CLI from the first routed resolve on.
 1. Resolution: with ``A2A_NOTIFY_PLATFORM`` set and no Google Chat adapter
    connected, a collector counts ``google_chat`` as served and
    ``_adapter_for_subscription`` returns the stand-in, reused across
-   deliveries and never registered in ``runner.adapters``; with it unset,
-   neither happens. A threadless subscription and ``multiplex_profiles`` get
-   none, and the collector's claim is wrapped by the stale filter.
+   deliveries and never registered in ``runner.adapters``; with it and
+   ``A2A_NOTIFY_CONVERSATIONS`` both unset, neither happens. A threadless
+   subscription and ``multiplex_profiles`` get none, and the collector's
+   claim is wrapped by the stale filter.
 2. Send: ``a2a notify`` with the thread and a ``--`` before the text; exit 0
    is sent, exit 1 failed, exit 3 (outcome unknown) not a failure, and exit 4
    a failure that holds the route down.

@@ -11039,10 +11039,9 @@ spec:
                         homeChannelPolicy:
                           description: |-
                             HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-                            A2A gateway may learn the Slack home channel with
-                            Slack on the gateway (Google Chat not enabled) when HomeChannel is
-                            empty. Under "auto" the channel of the first top-level
-                            mention of the agent in a channel becomes the home channel: the gateway
+                            A2A gateway may learn the Slack home channel when HomeChannel is
+                            empty. Under "auto" the channel of the first top-level mention of the
+                            agent in a channel becomes the home channel: the gateway
                             records it in the <agent>-home-channel ConfigMap, the operator projects
                             it into the <agent>-chat-home ConfigMap it mounts as a directory in the
                             agent pod and the gateway pod, both read the file within about a minute
@@ -12649,13 +12648,13 @@ spec:
                     peopleSeen7d:
                       description: |-
                         PeopleSeen7d is the A2A gateway's count now of the distinct people who
-                        wrote on the chat platform it serves within the last 7 days:
+                        wrote on the chat platforms it serves within the last 7 days:
                         kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
                         across gateway pods. A reading, not an accumulation: it falls as a
                         person's last message ages out of the window. A 0 is a reading. Absent
                         until the first reading, after two polls in a row without one, while a
-                        chat platform the install enables is served through Hermes (Google Chat
-                        or Slack on their legacy consumers, or Teams), and while the served CRD
+                        chat platform the install enables is served through Hermes (Microsoft
+                        Teams), and while the served CRD
                         predates the field. Moves neither LastActiveTime nor
                         LastHumanActiveTime.
                       format: int64

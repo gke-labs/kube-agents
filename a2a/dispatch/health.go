@@ -139,7 +139,7 @@ func (d *Dispatcher) Health() Health {
 	}
 	sort.Strings(h.Stalled)
 	h.OpenBreakers, h.HalfOpenBreakers = d.breakers.open(now)
-	h.StopStream = d.stopStreamErr
+	h.StopStream = d.stopStreamReport()
 	h.JobAdmission = d.jobAdmissionErr
 	return h
 }
