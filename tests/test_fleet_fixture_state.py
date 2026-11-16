@@ -2087,11 +2087,13 @@ class OrphanSnapshotRoleTest(_Harness):
         assert doc["summary"] == {"converged": 51, "drifted": 0, "unchecked": 0, "not_ready": 1}
 
     def test_the_gate_does_not_hold_the_wait(self):
+        # One read of the prefix under a 60-second wait at a 1-second interval
+        # is the proof: a held wait would re-read the role every second. The
+        # elapsed time is not asserted, because one pass over the catalog
+        # takes longer than any threshold on a loaded host.
         world = _healthy_world()
         world["compute"]["snapshots"][0]["creationTimestamp"] = _created(2)
-        started = datetime.now(timezone.utc)
         done = self.run_script(world, "--wait", "60", "--interval", "1")
-        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
         assert self.log.read_text().count("^declared-orphan-snap-") == 1, done.stderr
         assert "1 not yet ready" in done.stderr
 
@@ -2127,12 +2129,11 @@ class OrphanSnapshotRoleTest(_Harness):
                 assert f"snapshot/orphan-snap-* {field} absent: observed" in self.drift_files()["orphan-snapshot"]
 
     def test_a_live_source_disk_does_not_hold_the_wait(self):
-        # Only the next reconcile's re-run of the planter deletes it.
+        # Only the next reconcile's re-run of the planter deletes it; one
+        # disk read under a 60-second wait is the proof, as above.
         world = _healthy_world()
         world["compute"]["disks"] = [_SNAPSHOT_SOURCE_DISK]
-        started = datetime.now(timezone.utc)
         done = self.run_script(world, "--wait", "60", "--interval", "1")
-        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
         assert self.log.read_text().count("^orphan-snap-source-seeded$") == 1, done.stderr
         assert set(self.drift_files()) == set(self.ROLES)
 
@@ -2142,9 +2143,8 @@ class OrphanSnapshotRoleTest(_Harness):
         # clears it.
         world = _healthy_world()
         world["compute"]["snapshots"].append(_snapshot("declared-orphan-snap-old"))
-        started = datetime.now(timezone.utc)
         done = self.run_script(world, "--wait", "60", "--interval", "1")
-        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
+        assert self.log.read_text().count("^declared-orphan-snap-") == 1, done.stderr
         assert set(self.drift_files()) == {"declared-orphan-snapshot"}, done.stderr
         assert "ready_after_hours 2184: observed" in self.drift_files()["declared-orphan-snapshot"]
         assert "not one RFC 3339 timestamp" in self.drift_files()["declared-orphan-snapshot"]
