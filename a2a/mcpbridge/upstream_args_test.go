@@ -41,13 +41,13 @@ func TestSendMessageForwardsTheServersArgumentNames(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
 	res := srv.CallTool(context.Background(), ToolSendMessage,
-		json.RawMessage(`{"message":"hello","wait_timeout_seconds":30,"conversation":"c1"}`))
+		json.RawMessage(`{"message":"hello","wait_timeout_seconds":30,"conversation":"c1","reply_to":"task-7"}`))
 	if res.IsError {
 		t.Fatalf("send_message: %+v", res)
 	}
 	args := nextCallNamed(t, gw, ToolSendMessage)
-	if args["text"] != "hello" || args["wait_seconds"] != float64(30) || args["conversation"] != "c1" {
-		t.Fatalf("forwarded send_message arguments %v; want text, wait_seconds and conversation", args)
+	if args["text"] != "hello" || args["wait_seconds"] != float64(30) || args["conversation"] != "c1" || args["reply_to"] != "task-7" {
+		t.Fatalf("forwarded send_message arguments %v; want text, wait_seconds, conversation and reply_to", args)
 	}
 	for _, bridgeName := range []string{"message", "wait_timeout_seconds"} {
 		if _, ok := args[bridgeName]; ok {
