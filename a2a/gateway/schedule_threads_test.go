@@ -251,8 +251,7 @@ func TestAThreadLookupFailureStillPostsTheReport(t *testing.T) {
 
 // TestAFailedFirstPostReleasesTheDaysClaim: a first post that fails gives
 // the day back, so the next report opens the thread rather than waiting on
-// a claim nobody will fill; and a claim left by a post that died is taken
-// over once it is older than a post can be.
+// a claim nobody will fill.
 func TestAFailedFirstPostReleasesTheDaysClaim(t *testing.T) {
 	t.Parallel()
 	r, home, clock, _ := threadRig(t)
@@ -261,7 +260,7 @@ func TestAFailedFirstPostReleasesTheDaysClaim(t *testing.T) {
 	if !r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "First.", terminalTry{redeliverable: true, delivery: 1}) {
 		t.Fatal("a failed post was not handed back")
 	}
-	if got, _, err := getScheduleThread(r.g.threadStore(context.Background()), scheduleThreadKey("compliance-audit", clock.now())); err != nil || got != nil {
+	if got, _, _, err := getScheduleThread(r.g.threadStore(context.Background()), scheduleThreadKey("compliance-audit", clock.now())); err != nil || got != nil {
 		t.Fatalf("the day's claim was kept after a failed post: %+v (%v)", got, err)
 	}
 	next := deliverRun(t, r, r.g, "task-0000000000000052", "Second.")
@@ -269,20 +268,6 @@ func TestAFailedFirstPostReleasesTheDaysClaim(t *testing.T) {
 		t.Fatalf("record = %+v", next)
 	}
 
-	// A dead post's claim on the next day, older than any post.
-	clock.set(time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC))
-	key := scheduleThreadKey("compliance-audit", clock.now())
-	if _, err := putScheduleThread(r.g.threadStore(context.Background()), key,
-		ScheduleThread{Claim: "task-dead", CreatedAt: clock.now().Add(-2 * scheduledPostTimeout)}, 0); err != nil {
-		t.Fatal(err)
-	}
-	taken := deliverRun(t, r, r.g, "task-0000000000000053", "Third.")
-	if taken.Status != scheduledPosted || taken.ThreadID != "t2" {
-		t.Fatalf("record = %+v, want the day's thread opened as t2", taken)
-	}
-	if got, _, err := getScheduleThread(r.g.threadStore(context.Background()), key); err != nil || got == nil || got.ThreadID != "t2" {
-		t.Fatalf("the day's thread = %+v (%v)", got, err)
-	}
 }
 
 // TestPostHomeReportRepliesOnlyOnAHomeThread: the route replies on a thread
@@ -306,5 +291,199 @@ func TestPostHomeReportRepliesOnlyOnAHomeThread(t *testing.T) {
 	}
 	if got := p.all(); len(got) != 1 || got[0].thread != testHome+"/threads/t9" {
 		t.Fatalf("posts = %+v", got)
+	}
+}
+
+// shortPostCtx is a relay batch's context with postTime left for the post
+// once the outcome's reserve is set aside.
+func shortPostCtx(t *testing.T, postTime time.Duration) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), scheduledKVReserve+postTime)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// dayThreadOf reads the day's entry for the run's finish day on clock.
+func dayThreadOf(t *testing.T, r *rig, at time.Time) *ScheduleThread {
+	t.Helper()
+	got, _, _, err := getScheduleThread(r.g.threadStore(context.Background()), scheduleThreadKey("compliance-audit", at))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestALiveDayClaimIsWaitedOnAndNotTakenOver: a day whose first post is
+// still in flight on another run is waited on for the thread's share of
+// this post's time, then handed back as a failed post with nothing posted;
+// the claim is taken over only once the server has held it past a post's
+// life, with this clock's skew allowed for.
+func TestALiveDayClaimIsWaitedOnAndNotTakenOver(t *testing.T) {
+	t.Parallel()
+	r, home, clock, _ := threadRig(t)
+	key := scheduleThreadKey("compliance-audit", clock.now())
+	if _, err := putScheduleThread(r.g.threadStore(context.Background()), key,
+		ScheduleThread{Claim: "task-other", CreatedAt: clock.now()}, 0); err != nil {
+		t.Fatal(err)
+	}
+	rec, ref, s := scheduledChatRun("task-0000000000000061")
+	try := terminalTry{redeliverable: true, delivery: 1}
+	start := time.Now()
+	if !r.g.deliverScheduledReport(shortPostCtx(t, 1500*time.Millisecond), rec, ref, ref.ID, s, "Waiting.", try) {
+		t.Fatal("a post behind a live claim was not handed back")
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("waited %s on the claim, past the thread's share of a 1.5s post", waited)
+	}
+	if rep := readScheduledReport(t, r, "compliance-audit", ref.ID); rep.Status != scheduledPosting || rep.LastError == "" {
+		t.Fatalf("record = %+v, want posting with the wait as its error", rep)
+	}
+	if got := dayThreadOf(t, r, clock.now()); got == nil || got.Claim != "task-other" {
+		t.Fatalf("the live claim was disturbed: %+v", got)
+	}
+
+	// A clock ahead of the server by less than the skew allowed: still live.
+	r.g.claimClock = func() time.Time { return time.Now().Add(scheduledPostStale + scheduleClaimSkew - 5*time.Second) }
+	try.delivery = 2
+	if !r.g.deliverScheduledReport(shortPostCtx(t, 1500*time.Millisecond), rec, ref, ref.ID, s, "Waiting.", try) {
+		t.Fatal("a claim inside the skew allowance was taken over")
+	}
+	if posts := home.all(); len(posts) != 0 {
+		t.Fatalf("posted %+v behind a live claim", posts)
+	}
+
+	// Held past a post's life and the skew: taken over, and the day opened.
+	r.g.claimClock = func() time.Time { return time.Now().Add(scheduledPostStale + scheduleClaimSkew + 5*time.Second) }
+	try.delivery = 3
+	if r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "Waiting.", try) {
+		t.Fatal("a post after a stale claim's takeover was handed back")
+	}
+	if rep := readScheduledReport(t, r, "compliance-audit", ref.ID); rep.Status != scheduledPosted || rep.ThreadID != "t1" {
+		t.Fatalf("record = %+v", rep)
+	}
+	if got := dayThreadOf(t, r, clock.now()); got == nil || got.ThreadID != "t1" {
+		t.Fatalf("the day's thread = %+v", got)
+	}
+}
+
+// TestASlowThreadStoreStillPostsTheReport: a thread store that is up but
+// slower than the thread's share of the post's time costs the thread, not
+// the report: the post goes out as a new message inside the post's time and
+// is recorded posted, not post_unknown.
+func TestASlowThreadStoreStillPostsTheReport(t *testing.T) {
+	t.Parallel()
+	r, home, _, _ := threadRig(t)
+	r.g.scheduledKVHook = func(bucket string) {
+		if bucket == lib.ScheduleThreadsBucket {
+			time.Sleep(1200 * time.Millisecond)
+		}
+	}
+	rec, ref, s := scheduledChatRun("task-0000000000000071")
+	if r.g.deliverScheduledReport(shortPostCtx(t, 3*time.Second), rec, ref, ref.ID, s, "Slow day.", terminalTry{redeliverable: true, delivery: 1}) {
+		t.Fatal("handed back")
+	}
+	if rep := readScheduledReport(t, r, "compliance-audit", ref.ID); rep.Status != scheduledPosted {
+		t.Fatalf("record = %+v, want posted", rep)
+	}
+	if posts := home.all(); len(posts) != 1 || posts[0].thread != "" {
+		t.Fatalf("posts = %+v, want one new message", posts)
+	}
+}
+
+// TestARefusedThreadReplyOpensANewThread: a reply the day's thread refuses
+// posts once as a new message, which becomes the day's thread.
+func TestARefusedThreadReplyOpensANewThread(t *testing.T) {
+	t.Parallel()
+	r, home, clock, _ := threadRig(t)
+	home.fail = func(call int) bool { return call == 2 }
+	deliverRun(t, r, r.g, "task-0000000000000081", "Opens t1.")
+	second := deliverRun(t, r, r.g, "task-0000000000000082", "Refused in t1.")
+	third := deliverRun(t, r, r.g, "task-0000000000000083", "Into t2.")
+	if second.Status != scheduledPosted || second.ThreadID != "t2" || third.ThreadID != "t2" {
+		t.Fatalf("records = %+v / %+v, want both in t2", second, third)
+	}
+	want := []threadPost{{"", "Opens t1."}, {"t1", "Refused in t1."}, {"", "Refused in t1."}, {"t2", "Into t2."}}
+	if posts := home.all(); fmt.Sprint(posts) != fmt.Sprint(want) {
+		t.Fatalf("posts = %+v, want %+v", posts, want)
+	}
+	if got := dayThreadOf(t, r, clock.now()); got == nil || got.ThreadID != "t2" {
+		t.Fatalf("the day's thread = %+v", got)
+	}
+}
+
+// unknownFirstPost is a home channel whose new-message post never answers in
+// time.
+type unknownFirstPost struct{ threadedReporter }
+
+func (u *unknownFirstPost) postHomeReport(ctx context.Context, home, thread, text string) (homePost, error) {
+	if thread == "" {
+		return homePost{}, fmt.Errorf("%w: test", errPostOutcomeUnknown)
+	}
+	return u.threadedReporter.postHomeReport(ctx, home, thread, text)
+}
+
+// TestAFirstPostWithAnUnknownOutcomeKeepsTheClaim: a first post that may
+// yet land leaves the day's claim in place, to go stale, rather than give
+// the day to a second thread.
+func TestAFirstPostWithAnUnknownOutcomeKeepsTheClaim(t *testing.T) {
+	t.Parallel()
+	r, _, clock, _ := threadRig(t)
+	r.g.setHomeReporters(&unknownFirstPost{})
+	rep := deliverRun(t, r, r.g, "task-0000000000000091", "Maybe posted.")
+	if rep.Status != scheduledPostUnknown {
+		t.Fatalf("record = %+v, want post_unknown", rep)
+	}
+	if got := dayThreadOf(t, r, clock.now()); got == nil || got.Claim != "task-0000000000000091" || got.ThreadID != "" {
+		t.Fatalf("the day's entry = %+v, want the run's claim kept", got)
+	}
+}
+
+// TestARetryAfterMidnightStaysInItsRunsDay: a run that finished before UTC
+// midnight and posts after it goes into its own day's thread, not the new
+// day's.
+func TestARetryAfterMidnightStaysInItsRunsDay(t *testing.T) {
+	t.Parallel()
+	r, home, clock, _ := threadRig(t)
+	day1 := time.Date(2026, 11, 16, 23, 59, 0, 0, time.UTC)
+	clock.set(day1)
+	home.fail = func(call int) bool { return call == 1 }
+	rec, ref, s := scheduledChatRun("task-00000000000000a1")
+	if !r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "Late.", terminalTry{redeliverable: true, delivery: 1}) {
+		t.Fatal("a failed post was not handed back")
+	}
+	day2 := time.Date(2026, 11, 17, 0, 1, 0, 0, time.UTC)
+	clock.set(day2)
+	if r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "Late.", terminalTry{redeliverable: true, delivery: 2}) {
+		t.Fatal("the retry was handed back")
+	}
+	next := deliverRun(t, r, r.g, "task-00000000000000a2", "Early.")
+	if got := dayThreadOf(t, r, day1); got == nil || got.ThreadID != "t1" {
+		t.Fatalf("day one's thread = %+v, want the retried run's t1", got)
+	}
+	if got := dayThreadOf(t, r, day2); got == nil || got.ThreadID != "t2" || next.ThreadID != "t2" {
+		t.Fatalf("day two's thread = %+v, record %+v; want t2", got, next)
+	}
+}
+
+// TestAHomeChannelChangedTodayPostsANewMessage: a day's thread in a channel
+// that is no longer the home channel is left as it is, and the report posts
+// as a new message in the new home channel.
+func TestAHomeChannelChangedTodayPostsANewMessage(t *testing.T) {
+	t.Parallel()
+	r, home, clock, _ := threadRig(t)
+	key := scheduleThreadKey("compliance-audit", clock.now())
+	if _, err := putScheduleThread(r.g.threadStore(context.Background()), key,
+		ScheduleThread{Platform: lib.NotifyPlatformSlack, ChatID: "C0OLD", ThreadID: "told", CreatedAt: clock.now()}, 0); err != nil {
+		t.Fatal(err)
+	}
+	rep := deliverRun(t, r, r.g, "task-00000000000000b1", "New home.")
+	if rep.Status != scheduledPosted || rep.ChatID != "C0HOME" || rep.ThreadID != "t1" {
+		t.Fatalf("record = %+v", rep)
+	}
+	if posts := home.all(); len(posts) != 1 || posts[0].thread != "" {
+		t.Fatalf("posts = %+v, want one new message", posts)
+	}
+	if got := dayThreadOf(t, r, clock.now()); got == nil || got.ChatID != "C0OLD" || got.ThreadID != "told" {
+		t.Fatalf("the day's entry = %+v, want it left as it was", got)
 	}
 }

@@ -243,9 +243,15 @@ type Gateway struct {
 	// to post waits before it is redelivered: scheduledPostRetryDelay, per
 	// gateway so a test can shorten it on its own.
 	scheduledRetry time.Duration
-	// scheduleClock is what a schedule's thread day is read from
-	// (schedule_threads.go): time.Now, unless a test steps it.
+	// scheduleClock is a scheduled run's finish time, which names its
+	// thread's day (schedule_threads.go): time.Now, unless a test steps it.
 	scheduleClock func() time.Time
+	// claimClock is what a day's thread claim is aged by against the time
+	// the server stored it: time.Now, unless a test skews it.
+	claimClock func() time.Time
+	// scheduledKVHook, when a test sets it, runs before each scheduled
+	// record or thread operation, with the bucket's name: a slow store.
+	scheduledKVHook func(bucket string)
 	// reportIncidents keeps each posted report against the thread it
 	// landed in, for a reply there to be answered with it
 	// (schedule_threads.go); nil keeps nothing.
@@ -626,6 +632,7 @@ func New(o Options) (*Gateway, error) {
 		feedbackRetry:    feedbackRetryInterval,
 		scheduledRetry:   scheduledPostRetryDelay,
 		scheduleClock:    time.Now,
+		claimClock:       time.Now,
 		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,

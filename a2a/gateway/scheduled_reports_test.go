@@ -469,16 +469,24 @@ func TestAScheduledPostThatOutlastsItsTimeIsUnknownAndNotRetried(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), scheduledKVReserve+500*time.Millisecond)
 	defer cancel()
 	try := terminalTry{redeliverable: true, delivery: 1}
-	for _, taskID := range []string{"task-00000000000000a1", "task-00000000000000a2"} {
+	// Two schedules, so the second's post doesn't wait behind the first's
+	// thread claim for the day (schedule_threads.go).
+	for i, taskID := range []string{"task-00000000000000a1", "task-00000000000000a2"} {
 		rec, ref, s := scheduledChatRun(taskID)
+		jobKey := "compliance-audit"
+		if i == 1 {
+			jobKey = "drift-audit"
+			ref.Delivery = &lib.ScheduleDelivery{Mode: lib.ScheduleDeliveryChat, JobKey: jobKey}
+			rec.Delivery = ref.Delivery
+		}
 		start := time.Now()
 		if r.g.deliverScheduledReport(ctx, rec, ref, taskID, s, "Two findings.", try) {
-			t.Fatalf("%s: a post whose outcome is unknown was handed back", taskID)
+			t.Fatalf("%s: a post whose outcome is unknown was handed back: %+v", taskID, readScheduledReport(t, r, jobKey, taskID))
 		}
 		if waited := time.Since(start); waited > 5*time.Second {
 			t.Fatalf("%s: the post waited %s, past its own timeout", taskID, waited)
 		}
-		rep := readScheduledReport(t, r, "compliance-audit", taskID)
+		rep := readScheduledReport(t, r, jobKey, taskID)
 		if rep == nil || rep.Status != scheduledPostUnknown || rep.Attempts != 1 || !rep.PostStartedAt.IsZero() {
 			t.Fatalf("%s: record = %+v, want post_unknown after one attempt", taskID, rep)
 		}

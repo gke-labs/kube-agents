@@ -81,6 +81,11 @@ const (
 	// batch's own budget (turnTimeout) has less left, less
 	// scheduledKVReserve for the outcome's write.
 	scheduledPostTimeout = 20 * time.Second
+	// scheduledPostStale is the age past which a post started with no
+	// outcome recorded, or a day's thread claim never filled in, is read
+	// as dead: the post's own time, plus the reserve its thread and
+	// outcome writes run in.
+	scheduledPostStale = scheduledPostTimeout + scheduledKVReserve
 	// scheduledKVReserve is what a post leaves of the batch's budget for
 	// the record writes after it.
 	scheduledKVReserve = 10 * time.Second
@@ -124,7 +129,7 @@ type ScheduledReport struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	// PostStartedAt is when the post in flight began, written before it
 	// and cleared with its outcome: a record still posting with one older
-	// than scheduledPostTimeout lost its outcome, and is post_unknown.
+	// than scheduledPostStale lost its outcome, and is post_unknown.
 	PostStartedAt time.Time `json:"postStartedAt,omitzero"`
 }
 
@@ -266,7 +271,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	}
 	text, silent := scheduledReportFrom(s.Status.State, result, reason)
 	report := ScheduledReport{
-		TaskID: taskID, Profile: ref.Addressee, FinishedAt: time.Now().UTC(),
+		TaskID: taskID, Profile: ref.Addressee, FinishedAt: g.scheduleClock().UTC(),
 		State: s.Status.State, Silent: silent, Text: truncateReport(text),
 	}
 	if ref.Requester != nil {
@@ -310,7 +315,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		report = *have
 		if !report.PostStartedAt.IsZero() {
 			// A post began and its outcome never came back.
-			if time.Since(report.PostStartedAt) < scheduledPostTimeout && try.redeliverable {
+			if g.scheduleClock().Sub(report.PostStartedAt) < scheduledPostStale && try.redeliverable {
 				// It may still be in flight: look again later.
 				return true
 			}
@@ -350,7 +355,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		return try.redeliverable
 	}
 	// The record first, saying a post is starting.
-	report.PostStartedAt = time.Now().UTC()
+	report.PostStartedAt = g.scheduleClock().UTC()
 	if rev, err = store.put(key, report, rev); err != nil {
 		return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
 	}
@@ -383,7 +388,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	}
 	if _, err := store.put(key, report, rev); err != nil {
 		// The record still says a post started: a redelivery reads it as
-		// post_unknown once scheduledPostTimeout has passed, and posts
+		// post_unknown once scheduledPostStale has passed, and posts
 		// nothing.
 		g.log.Error("scheduled report outcome not recorded", append(logArgs, "status", report.Status, "err", err)...)
 	}
@@ -416,9 +421,11 @@ func (g *Gateway) scheduledRecordFailed(store scheduledStore, key string, try te
 	return false
 }
 
-// scheduledStore reads and writes SCHEDULED_REPORTS records, each operation
-// on its own scheduledKVTimeout off ctx's values but not its cancellation,
-// retried as the relay's record writes are.
+// scheduledStore reads and writes a bucket's records, each operation on its
+// own scheduledKVTimeout inside ctx, retried as the relay's record writes
+// are while ctx lasts. The records' store takes ctx's values without its
+// cancellation, so an outcome is written after the post used the batch's
+// time; a thread store's ctx is the slice of the post's budget it may spend.
 type scheduledStore struct {
 	g      *Gateway
 	ctx    context.Context
@@ -433,7 +440,16 @@ func (st scheduledStore) do(f func(ctx context.Context, kv jetstream.KeyValue) e
 	var err error
 	for attempt := 0; attempt < kvRetryAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(kvRetryPause)
+			// withRetry's linear backoff, cut short by the store's own
+			// deadline when it has one.
+			select {
+			case <-st.ctx.Done():
+				return err
+			case <-time.After(time.Duration(attempt) * kvRetryPause):
+			}
+		}
+		if st.g.scheduledKVHook != nil {
+			st.g.scheduledKVHook(st.bucket)
 		}
 		ctx, cancel := context.WithTimeout(st.ctx, scheduledKVTimeout)
 		var kv jetstream.KeyValue
@@ -442,8 +458,12 @@ func (st scheduledStore) do(f func(ctx context.Context, kv jetstream.KeyValue) e
 		}
 		cancel()
 		// A create on a key that exists and an update of a revision that
-		// moved are answers, not outages: trying again changes nothing.
-		if err == nil || errors.Is(err, jetstream.ErrKeyExists) || isMintedAlready(err) {
+		// moved are answers, not outages: trying again changes nothing. A
+		// fenced write is withRetry's one stop, kept here.
+		if err == nil || errors.Is(err, ErrFenced) || errors.Is(err, jetstream.ErrKeyExists) || isMintedAlready(err) {
+			return err
+		}
+		if st.ctx.Err() != nil {
 			return err
 		}
 	}

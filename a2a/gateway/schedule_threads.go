@@ -12,7 +12,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// One thread per schedule per UTC day (docs/designs/scheduling-on-profiles.md
+// One thread per schedule per UTC day of the run's finish (docs/designs/scheduling-on-profiles.md
 // section 4, item 3): the first report of a job key on a UTC day opens a new
 // home-channel message, and the day's later reports reply under it. Which
 // thread is the day's lives in SCHEDULE_THREADS, keyed <jobKey>.<YYYY-MM-DD>,
@@ -27,6 +27,12 @@ const (
 	// scheduleThreadWait is how often a post that lost the day's claim reads
 	// the key again for the winner's thread, while its own post's time lasts.
 	scheduleThreadWait = 200 * time.Millisecond
+	// scheduleThreadShare divides a post's time: the day's thread is read
+	// in at most a third of it, and the post keeps the rest.
+	scheduleThreadShare = 3
+	// scheduleClaimSkew is how far this gateway's clock may run ahead of
+	// the server's before a live claim reads as stale.
+	scheduleClaimSkew = 30 * time.Second
 )
 
 // ScheduleThread is a day's thread in SCHEDULE_THREADS. A claim (Claim set,
@@ -53,20 +59,44 @@ func scheduleThreadKey(jobKey string, at time.Time) string {
 	return jobKey + scheduledKeySeparator + at.UTC().Format(scheduleThreadDay)
 }
 
+// threadStore is the SCHEDULE_THREADS store, every operation inside ctx.
 func (g *Gateway) threadStore(ctx context.Context) scheduledStore {
-	return scheduledStore{g: g, ctx: context.WithoutCancel(ctx), bucket: lib.ScheduleThreadsBucket}
+	return scheduledStore{g: g, ctx: ctx, bucket: lib.ScheduleThreadsBucket}
 }
+
+// errThreadClaimBusy is a day's first post still in flight on another run:
+// this post waits, as a failed post, for the redelivery that finds the
+// thread, rather than open a second one.
+var errThreadClaimBusy = errors.New("the day's first post is still opening its thread")
 
 // postScheduledReport posts report through reporter into the day's thread of
 // its job key, opening the thread when the day has none, then keeps the
-// report against the thread it landed in. A thread that can't be read or
-// kept costs the thread, never the report: it posts as a new message.
+// report against the thread it landed in. The day is the run's finish time
+// in UTC, so a retry after midnight stays in its own day. A thread that
+// can't be read or kept costs the thread, never the report: it posts as a
+// new message. The thread's reads spend at most scheduleThreadShare of the
+// post's time, and its writes after the post run in scheduledKVReserve.
 func (g *Gateway) postScheduledReport(ctx context.Context, reporter homeReporter, home string, report ScheduledReport) (homePost, error) {
-	key := scheduleThreadKey(report.JobKey, g.scheduleClock())
+	key := scheduleThreadKey(report.JobKey, report.FinishedAt)
 	logArgs := []any{"jobKey", report.JobKey, "taskId", report.TaskID, "threadKey", key}
-	threads := g.threadStore(ctx)
 
-	thread, rev, owned, err := g.dayThread(ctx, threads, key, report.TaskID)
+	lookupCtx, cancel := context.WithTimeout(ctx, threadLookupBudget(ctx))
+	thread, rev, owned, err := g.dayThread(lookupCtx, g.threadStore(lookupCtx), key, report.TaskID)
+	cancel()
+	if errors.Is(err, errThreadClaimBusy) {
+		return homePost{}, fmt.Errorf("%s: %w", key, err)
+	}
+	if ctx.Err() != nil {
+		// The thread's reads used the post's time and nothing was queued:
+		// a failed post, tried again, and never one whose outcome is unknown.
+		return homePost{}, fmt.Errorf("the day's thread on %s was not read in time: %w", key, ctx.Err())
+	}
+	// The writes after the post, bounded so the post's outcome is still
+	// recorded inside scheduledPostStale.
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), scheduledKVReserve/2)
+	defer cancelWrite()
+	threads := g.threadStore(writeCtx)
+
 	var post homePost
 	switch {
 	case err != nil:
@@ -74,34 +104,34 @@ func (g *Gateway) postScheduledReport(ctx context.Context, reporter homeReporter
 		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
 	case thread != nil && thread.ThreadID != "" && thread.ChatID == home:
 		post, err = reporter.postHomeReport(ctx, home, thread.ThreadID, report.Text)
+		if err != nil && !errors.Is(err, errPostOutcomeUnknown) && ctx.Err() == nil {
+			// The thread refused (no longer a thread of the channel, or
+			// the platform turned the reply down): once as a new message,
+			// which becomes the day's thread.
+			g.log.Warn("schedule thread refused the reply; opening a new one", append(logArgs, "thread", thread.ThreadID, "err", err)...)
+			if post, err = reporter.postHomeReport(ctx, home, "", report.Text); err == nil {
+				g.keepDayThread(threads, key, post, rev, logArgs)
+			}
+		}
 	case owned:
 		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
-		if err != nil {
+		switch {
+		case errors.Is(err, errPostOutcomeUnknown):
+			// It may yet land: the claim stays, and goes stale.
+		case err != nil:
 			// Unclaimed, so the day's next report opens the thread.
 			if derr := threads.do(func(ctx context.Context, kv jetstream.KeyValue) error {
 				return kv.Delete(ctx, key, jetstream.LastRevision(rev))
 			}); derr != nil {
 				g.log.Warn("schedule thread claim not released", append(logArgs, "err", derr)...)
 			}
-			break
-		}
-		landed := post.ThreadID
-		if landed == "" {
-			landed = post.MessageID
-		}
-		day := ScheduleThread{Platform: post.Platform, ChatID: post.ChatID, ThreadID: landed, CreatedAt: g.scheduleClock().UTC()}
-		if _, perr := putScheduleThread(threads, key, day, rev); perr != nil {
-			g.log.Warn("schedule thread not kept; the day's next report opens another", append(logArgs, "err", perr)...)
+		default:
+			g.keepDayThread(threads, key, post, rev, logArgs)
 		}
 	default:
-		// A thread in another channel (the home channel changed today), or
-		// a claim whose post never finished: a new message, kept nowhere.
-		if ctx.Err() != nil {
-			// The wait for another post's thread used this post's time;
-			// nothing was queued, so this is a failed post, tried again.
-			return homePost{}, fmt.Errorf("waited out the day's thread claim on %s: %w", key, ctx.Err())
-		}
-		g.log.Info("schedule thread not usable; posting as a new message", logArgs...)
+		// A thread in another channel: the home channel changed today. A
+		// new message, kept nowhere, so the day's thread stays as it was.
+		g.log.Info("schedule thread is in another channel; posting as a new message", append(logArgs, "threadChat", thread.ChatID)...)
 		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
 	}
 	if err != nil {
@@ -111,13 +141,37 @@ func (g *Gateway) postScheduledReport(ctx context.Context, reporter homeReporter
 	return post, nil
 }
 
+// threadLookupBudget is the share of ctx's time the day's thread may be read
+// in: scheduleThreadShare of what is left, so the post keeps the rest.
+func threadLookupBudget(ctx context.Context) time.Duration {
+	left := scheduledPostTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		left = time.Until(dl)
+	}
+	return left / scheduleThreadShare
+}
+
+// keepDayThread writes post's thread as the day's, over revision rev.
+func (g *Gateway) keepDayThread(threads scheduledStore, key string, post homePost, rev uint64, logArgs []any) {
+	landed := post.ThreadID
+	if landed == "" {
+		landed = post.MessageID
+	}
+	day := ScheduleThread{Platform: post.Platform, ChatID: post.ChatID, ThreadID: landed, CreatedAt: g.scheduleClock().UTC()}
+	if _, err := putScheduleThread(threads, key, day, rev); err != nil {
+		g.log.Warn("schedule thread not kept; the day's next report opens another", append(logArgs, "err", err)...)
+	}
+}
+
 // dayThread reads key's thread, or claims key for taskID when it has none
 // (owned true, rev the claim's revision). A key another post has claimed is
-// read again until that post records its thread, for as long as ctx lasts;
-// a claim older than a post's timeout is taken over.
+// read again until that post records its thread, for as long as ctx lasts,
+// and is errThreadClaimBusy after. A claim the server stored longer ago than
+// scheduledPostStale plus scheduleClaimSkew is taken over.
 func (g *Gateway) dayThread(ctx context.Context, threads scheduledStore, key, taskID string) (thread *ScheduleThread, rev uint64, owned bool, err error) {
 	for {
-		thread, rev, err = getScheduleThread(threads, key)
+		var stored time.Time
+		thread, rev, stored, err = getScheduleThread(threads, key)
 		if err != nil {
 			return nil, 0, false, err
 		}
@@ -140,10 +194,10 @@ func (g *Gateway) dayThread(ctx context.Context, threads scheduledStore, key, ta
 			// a redelivery of a post that failed before releasing it.
 			return thread, rev, true, nil
 		}
-		if g.scheduleClock().Sub(thread.CreatedAt) > scheduledPostTimeout {
-			// A claim older than any post: its post died without
-			// recording a thread or releasing the claim. Taken over, by
-			// revision, so two posts can't both take it.
+		if g.claimClock().Sub(stored) > scheduledPostStale+scheduleClaimSkew {
+			// A claim older than any post, by the time the server stored
+			// it: its post died without recording a thread or releasing
+			// the claim. Taken over, by revision, so two posts can't both.
 			claim := ScheduleThread{Claim: taskID, CreatedAt: g.scheduleClock().UTC()}
 			if next, err := putScheduleThread(threads, key, claim, rev); err == nil {
 				return &claim, next, true, nil
@@ -154,7 +208,7 @@ func (g *Gateway) dayThread(ctx context.Context, threads scheduledStore, key, ta
 		}
 		select {
 		case <-ctx.Done():
-			return thread, rev, false, nil
+			return thread, rev, false, errThreadClaimBusy
 		case <-time.After(scheduleThreadWait):
 		}
 	}
@@ -176,12 +230,13 @@ func (g *Gateway) keepIncident(ctx context.Context, post homePost, report Schedu
 	}
 }
 
-// getScheduleThread reads key's thread and its revision, nil when none.
-func getScheduleThread(threads scheduledStore, key string) (t *ScheduleThread, rev uint64, err error) {
+// getScheduleThread reads key's thread, its revision and when the server
+// stored it, nil when none.
+func getScheduleThread(threads scheduledStore, key string) (t *ScheduleThread, rev uint64, stored time.Time, err error) {
 	err = threads.do(func(ctx context.Context, kv jetstream.KeyValue) error {
 		e, err := kv.Get(ctx, key)
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			t, rev = nil, 0
+			t, rev, stored = nil, 0, time.Time{}
 			return nil
 		}
 		if err != nil {
@@ -191,10 +246,10 @@ func getScheduleThread(threads scheduledStore, key string) (t *ScheduleThread, r
 		if err := json.Unmarshal(e.Value(), &v); err != nil {
 			return fmt.Errorf("schedule thread %s does not decode: %w", key, err)
 		}
-		t, rev = &v, e.Revision()
+		t, rev, stored = &v, e.Revision(), e.Created()
 		return nil
 	})
-	return t, rev, err
+	return t, rev, stored, err
 }
 
 // putScheduleThread writes t at key: a create when rev is 0, else an update
