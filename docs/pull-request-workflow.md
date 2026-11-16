@@ -256,10 +256,12 @@ bases against their Dockerfile `ARG` defaults; the Go builder pin against the `g
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
 worker repository; the example manifests; the kustomize integrations, which it requires to name a variable the file owns
-rather than a literal; and `cert_manager_version` in `terraform/examples/full-install/`, against
-the cert-manager pins. Copies it does not reach, where a stale pin passes every check: the example
-fluent-bit tags in `INSTALL.md` and the commented example in
-`k8s-operator/config/manager/manager.yaml` are prose. So: bump the pin in
+rather than a literal; and the `cert_manager_version` default in
+`terraform/examples/full-install/variables.tf`, with its commented copy in the tfvars example,
+against the cert-manager pins. Copies it does not reach, where a stale pin passes every check: the
+example fluent-bit tags in `INSTALL.md`, the commented example in
+`k8s-operator/config/manager/manager.yaml`, and the cert-manager example in the header comment of
+`scripts/mirror_images.sh` are prose. So: bump the pin in
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
