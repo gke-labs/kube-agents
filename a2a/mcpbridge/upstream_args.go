@@ -111,7 +111,8 @@ const (
 // An omitted or non-positive wait is the bridge's default, and one above the server's ceiling
 // is that ceiling; a numeric string is read as its number, and any other value is an error
 // rather than a silent default. mode is dropped (auto is the only mode the server has). The
-// rest (conversation) keep their names; debug, which the server lacks, is dropped (upstreamDebug).
+// rest (conversation, addressee, parameters) keep their names; debug, which the server lacks, is
+// dropped (upstreamDebug).
 func serverSendMessageArgs(args map[string]any) (map[string]any, error) {
 	moveArg(args, "message", "text")
 	delete(args, "mode")
