@@ -91,8 +91,8 @@ if __name__ == "__main__":
 
 @unittest.skipIf(shutil.which("helm") is None, "helm is required for chart rendering tests")
 class TseWarningInNotesTest(unittest.TestCase):
-    """NOTES.txt warns when tse is enabled on a next install with the dispatcher
-    on: tse has no persona image yet, so its warm worker crash-loops (#3842)."""
+    """NOTES.txt warns when tse is enabled with the dispatcher on: tse has no
+    persona image yet, so its warm worker crash-loops (#3842)."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -123,17 +123,15 @@ class TseWarningInNotesTest(unittest.TestCase):
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return yaml.safe_load(proc.stdout)["data"]["notes"]
 
-    def test_tse_on_next_with_the_dispatcher_warns(self):
-        out = self.notes("--set", "platformAgent.mode=next", "--set", "profiles.tse.enabled=true")
-        self.assertIn("profiles.tse.enabled is true on a next install", out)
+    def test_tse_with_the_dispatcher_warns(self):
+        out = self.notes("--set", "profiles.tse.enabled=true")
+        self.assertIn("profiles.tse.enabled is true on an install", out)
         self.assertIn("operator.profileDispatcher.enabled=false", out)
 
     def test_no_warning_without_the_combination(self):
         for args in (
-            ["--set", "platformAgent.mode=next"],
-            ["--set", "platformAgent.mode=today", "--set", "profiles.tse.enabled=true"],
-            ["--set", "platformAgent.mode=next", "--set", "profiles.tse.enabled=true",
-             "--set", "operator.profileDispatcher.enabled=false"],
+            [],
+            ["--set", "profiles.tse.enabled=true", "--set", "operator.profileDispatcher.enabled=false"],
         ):
             with self.subTest(args=args):
                 self.assertNotIn("profiles.tse.enabled is true", self.notes(*args))

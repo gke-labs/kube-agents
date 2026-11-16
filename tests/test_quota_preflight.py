@@ -109,20 +109,23 @@ data:
 
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
-# without updating the other fails here.
-_DEFAULT_PODS = 9
-_DEFAULT_REQUESTS_CPU_MILLIS = 2756
-_DEFAULT_LIMITS_CPU_MILLIS = 13200
+# without updating the other fails here. The A2A stack is in them: the three NATS servers,
+# two callouts, two verifiers, the console, the gateway and its standby, the profile
+# dispatcher, the provisioning Job, and the hermes-bridge container in the agent pod.
+_DEFAULT_PODS = 21
+_DEFAULT_REQUESTS_CPU_MILLIS = 4436
+_DEFAULT_LIMITS_CPU_MILLIS = 23050
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 12096 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 25472 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 15120 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 33056 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
-# proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
-# replicas, and the cleanup hook's 1088Mi.
+# proxy's 8Gi) plus 512Mi (128Mi on each NATS server and on the provisioning Job), LiteLLM's
+# 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two replicas, and the
+# cleanup hook's 1088Mi, and the profile dispatcher's 64Mi.
 _LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 2 * 1280 + 1088) * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 512 + 2 * 1280 + 1088 + 64) * 1024**2
 # The same three additions, because each sets its limit equal to its request.
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -134,8 +137,8 @@ _CLEANUP_HOOK_PODS = 1
 # Dashboard container: 256m requested, 1 core limit, inside the agent pod.
 _DASHBOARD_REQUEST_MILLIS = 256
 _DASHBOARD_LIMIT_MILLIS = 1000
-# One agent pod (base + dashboard) as requested.
-_AGENT_POD_REQUEST_MILLIS = 1506
+# One agent pod (base + dashboard + hermes-bridge) as requested.
+_AGENT_POD_REQUEST_MILLIS = 1756
 # The agent pod's ephemeral-storage request, the only one among the operator-rendered
 # workloads that ever sizes a surge.
 _AGENT_POD_EPHEMERAL_REQUEST_BYTES = 3 * 1024**3
@@ -153,9 +156,10 @@ _OPERATOR_REQUEST_MILLIS = 100
 # Autopilot cluster without bursting clamps to.
 _WEB_CONSOLE_REQUEST_MILLIS = 100
 _WEB_CONSOLE_REQUEST_MEMORY_BYTES = 128 * 1024**2
-# Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
-_OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 102 * 1024**3
+# Two operator-rendered claims, two from the shell StatefulSet's volumeClaimTemplates and
+# one 40Gi JetStream claim per NATS server, three by default.
+_OPERATOR_PVC_COUNT = 7
+_OPERATOR_STORAGE_BYTES = 222 * 1024**3
 # The two claims platformAgent.storage.size sizes (the agent's data claim and the shell
 # sandbox's), at the operator default each.
 _DATA_CLAIMS = 2
@@ -312,7 +316,7 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_a_data_volume_size_moves_both_data_claims(self) -> None:
         """platformAgent.storage.size resizes two claims, so each GiB counts twice.
 
-        80Gi is 30Gi over the default on each claim: 102Gi + 2 x 30Gi = 162Gi. A size
+        80Gi is 30Gi over the default on each claim: 222Gi + 2 x 30Gi = 282Gi. A size
         below the default lowers the total the same way, and no claim is added.
         """
         base = self._requirements()
@@ -328,21 +332,21 @@ class PreflightDecisionTest(unittest.TestCase):
                     _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (size_bytes - _DATA_CLAIM_DEFAULT_BYTES),
                 )
                 self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
-        self.assertEqual(totals["80Gi"], 162 * 1024**3)
+        self.assertEqual(totals["80Gi"], 282 * 1024**3)
 
     def test_an_expected_profile_count_raises_the_agent_claim_alone(self) -> None:
         """expectedClusterProfiles raises the agent's data claim to 8Gi + N x 400Mi, rounded
         up to whole GiB, and only when that is above the size; the sandbox claim stays.
 
-        200 profiles is 87Gi: 102Gi + (87 - 50)Gi = 139Gi. 10 profiles is under the
+        200 profiles is 87Gi: 222Gi + (87 - 50)Gi = 259Gi. 10 profiles is under the
         default and adds nothing. With size 20Gi, both claims drop 30Gi and the agent's
-        rises back to 87Gi: 102 - 60 + 67 = 109Gi.
+        rises back to 87Gi: 222 - 60 + 67 = 229Gi.
         """
         gib = 1024**3
         for sets, want in (
-            (["platformAgent.storage.expectedClusterProfiles=200"], 139 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200"], 259 * gib),
             (["platformAgent.storage.expectedClusterProfiles=10"], _OPERATOR_STORAGE_BYTES),
-            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 109 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 229 * gib),
             (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=500Gi"],
              _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (500 - 50) * gib),
         ):
@@ -352,11 +356,11 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)
 
     def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
-        # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
+        # The default fits a 222Gi requests.storage quota exactly; 80Gi does not.
         quota = [{
             "metadata": {"name": "storage-quota"},
-            "spec": {"hard": {"requests.storage": "102Gi"}},
-            "status": {"hard": {"requests.storage": "102Gi"}, "used": {"requests.storage": "0"}},
+            "spec": {"hard": {"requests.storage": "222Gi"}},
+            "status": {"hard": {"requests.storage": "222Gi"}, "used": {"requests.storage": "0"}},
         }]
         fits = self._render({"probe": {"quotas": quota}})
         self.assertEqual(fits.returncode, 0, fits.stderr)
@@ -1007,25 +1011,23 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             footprint_path.write_text(original_footprint)
 
-    def _next_mode_delta(self, agent_replicas: int = 1, gateway_standby: bool = True) -> dict:
-        """What footprint.yaml's nextMode adds, summed independently of the template.
+    def _a2a_stack(self, agent_replicas: int = 1, gateway_standby: bool = True) -> dict:
+        """What footprint.yaml's A2A entries add, summed independently of the template.
 
         `gateway_standby` adds the A2A gateway's second pod, which the operator runs once a
         gateway holds the election's Lease and no golden renders (the election on, its
         default), at the footprint's per-pod figures.
         """
-        following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
-        bridge = following["agentPod"]["hermesBridge"]
-        workloads = [v for k, v in following.items() if k not in ("agentPod", "storage")]
-        self.assertTrue(workloads, "footprint.yaml has no nextMode workloads")
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        bridge = op["agentPod"]["hermesBridge"]
+        workloads = [v for k, v in op.items() if k.startswith("a2a")]
+        self.assertTrue(workloads, "footprint.yaml has no A2A workloads")
         if gateway_standby:
-            gateway = following["a2aGateway"]
-            workloads.append({k: (v // gateway["pods"] if isinstance(v, int) and k != "pods" else v)
-                              for k, v in gateway.items() if k not in ("requests", "limits", "surges")} | {"pods": 1})
+            workloads.append(self._gateway_pod())
         delta = {
             "pods": sum(w["pods"] for w in workloads),
-            "persistentVolumeClaims": following["storage"]["persistentVolumeClaims"],
-            "requestsStorage": following["storage"]["storageBytesRequest"],
+            "persistentVolumeClaims": op["storage"]["busClaims"],
+            "requestsStorage": op["storage"]["busClaimBytesRequest"],
         }
         for out, key in (
             ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
@@ -1036,97 +1038,112 @@ class PreflightDecisionTest(unittest.TestCase):
             delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
         return delta
 
+    def _gateway_pod(self) -> dict:
+        """One A2A gateway pod, at the footprint's per-pod figures."""
+        gateway = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["a2aGateway"]
+        return {k: (v // gateway["pods"] if isinstance(v, int) and k != "pods" else v)
+                for k, v in gateway.items() if k not in ("requests", "limits", "surges")} | {"pods": 1}
+
     def test_a_single_server_bus_is_counted_as_one_server(self) -> None:
         """footprint.yaml counts the bus at three NATS servers; with
         platformAgent.harness.tuning.busReplicas: 1 the preflight counts one, so a
         one-server install is not asked for two more pods' and claims' room."""
-        nats = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aNats"]
-        claims = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["storage"]
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        nats = op["a2aNats"]
         n = int(nats["pods"])
         self.assertEqual(n, 3)
-        three = self._requirements(["platformAgent.mode=next"])
-        one = self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=1"])
+        self.assertEqual(int(op["storage"]["busClaims"]), n)
+        three = self._requirements()
+        one = self._requirements(["platformAgent.harness.tuning.busReplicas=1"])
         self.assertEqual(three["pods"] - one["pods"], n - 1)
-        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], int(claims["persistentVolumeClaims"]) - 1)
-        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(claims["storageBytesRequest"]) * (n - 1) // n)
+        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], n - 1)
+        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(op["storage"]["busClaimBytesRequest"]) * (n - 1) // n)
         self.assertEqual(three["requestsCpu"] - one["requestsCpu"], int(nats["cpuMillisRequest"]) * (n - 1) // n)
         self.assertEqual(three["requestsMemory"] - one["requestsMemory"], int(nats["memoryBytesRequest"]) * (n - 1) // n)
         # Set to 3, or unset, it counts three.
-        self.assertEqual(self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=3"]), three)
+        self.assertEqual(self._requirements(["platformAgent.harness.tuning.busReplicas=3"]), three)
 
-    def test_mode_next_adds_the_next_mode_footprint(self) -> None:
-        """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
+    def test_the_default_totals_carry_the_a2a_stack(self) -> None:
+        """Every install runs the A2A stack, so the default totals are the chart's own
+        workloads, the operator's, and the stack (#3753): a quota sized without the stack
+        refuses the install."""
+        delta = self._a2a_stack()
+        # Not a vacuous zero: the stack is several pods and a JetStream claim per server.
+        self.assertGreaterEqual(delta["pods"], 7)
+        self.assertEqual(delta["persistentVolumeClaims"], 3)
+        req = self._requirements()
+        self.assertGreater(req["pods"], delta["pods"])
+        values = {"probe": {"quotas": [self._quota({"pods": str(req["pods"] - delta["pods"])})]}}
+        res = self._render(values)
+        self.assertNotEqual(res.returncode, 0, "a quota without room for the A2A stack passed")
+        self.assertIn("pods", res.stderr)
+        self.assertEqual(self._render({"probe": {"quotas": [self._quota({"pods": str(req["pods"])})]}}).returncode, 0)
+
+    def test_a_leftover_platform_agent_mode_value_changes_nothing(self) -> None:
+        """platformAgent.mode once chose the stack; the schema still admits it for a values
+        file that sets it, and the preflight ignores it."""
         base = self._requirements()
-        following = self._requirements(["platformAgent.mode=next"])
-        for key, value in self._next_mode_delta().items():
-            with self.subTest(key=key):
-                self.assertEqual(following[key] - base[key], value)
-        # Not a vacuous zero: the stack is several pods and a JetStream claim.
-        self.assertGreaterEqual(following["pods"] - base["pods"], 7)
-        # One JetStream claim per NATS server, three by default.
-        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
+        for spelling in ("platformAgent.mode=today", "platformAgent.mode=next", "platformAgent.mode=", "platformAgent.mode=null"):
+            with self.subTest(spelling):
+                self.assertEqual(self._requirements([spelling]), base)
 
-    def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
+    def test_no_gateway_standby_is_counted_with_the_election_off(self) -> None:
         """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
         preflight counts the footprint's one gateway pod and nothing more."""
         base = self._requirements()
-        following = self._requirements(
-            ["platformAgent.mode=next"],
+        unelected = self._requirements(
             values={"operator": {"extraEnv": [{"name": "A2A_GATEWAY_ELECTION", "value": "false"}]}},
         )
-        for key, value in self._next_mode_delta(gateway_standby=False).items():
-            with self.subTest(key=key):
-                self.assertEqual(following[key] - base[key], value)
+        standby = self._gateway_pod()
+        self.assertEqual(base["pods"] - unelected["pods"], 1)
+        for out, key in (
+            ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+            ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+        ):
+            with self.subTest(key=out):
+                self.assertEqual(base[out] - unelected[out], standby[key])
+        self.assertEqual(self._a2a_stack()["pods"] - self._a2a_stack(gateway_standby=False)["pods"], 1)
 
-    def test_mode_today_counts_what_an_unset_mode_does(self) -> None:
-        self.assertEqual(self._requirements(["platformAgent.mode=today"]), self._requirements())
-
-    def test_mode_next_bridge_scales_with_the_agent_replicas(self) -> None:
+    def test_the_bridge_scales_with_the_agent_replicas(self) -> None:
         """hermes-bridge is a container of the agent pod, so each agent replica carries one."""
-        replicas = 2
-        base = self._requirements([f"platformAgent.deployment.availability.replicas={replicas}"])
-        following = self._requirements(
-            ["platformAgent.mode=next", f"platformAgent.deployment.availability.replicas={replicas}"]
-        )
+        agent_pod = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["agentPod"]
+        bridge = agent_pod["hermesBridge"]
+        self.assertGreater(bridge["cpuMillisRequest"], 0)
         self.assertEqual(
-            following["requestsCpu"] - base["requestsCpu"],
-            self._next_mode_delta(agent_replicas=replicas)["requestsCpu"],
+            _AGENT_POD_REQUEST_MILLIS,
+            agent_pod["base"]["cpuMillisRequest"] + agent_pod["dashboard"]["cpuMillisRequest"] + bridge["cpuMillisRequest"],
+        )
+        replicas = 2
+        base = self._requirements()
+        ha = self._requirements([f"platformAgent.deployment.availability.replicas={replicas}"])
+        self.assertEqual(ha["requestsCpu"] - base["requestsCpu"], _AGENT_POD_REQUEST_MILLIS)
+        self.assertEqual(
+            self._a2a_stack(agent_replicas=replicas)["requestsCpu"] - self._a2a_stack()["requestsCpu"],
+            bridge["cpuMillisRequest"],
         )
 
-    def test_a_quota_that_fits_today_refuses_a_next_mode_install(self) -> None:
-        pods = self._requirements()["pods"]
-        values = {"probe": {"quotas": [self._quota({"pods": str(pods)})]}}
-        self.assertEqual(self._render(values).returncode, 0)
-        res = self._render(values, ["platformAgent.mode=next"])
-        self.assertNotEqual(res.returncode, 0, "a next-mode render should have failed")
-        self.assertIn("pods", res.stderr)
-
-    def test_mode_next_surge_room_fits_a_callout_with_litellm_off(self) -> None:
+    def test_surge_room_fits_a_callout_with_litellm_off(self) -> None:
         """The callouts and verifiers roll surge-first, so the patch leaves room for one."""
-        following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
-        surging = [w for w in following.values() if isinstance(w, dict) and w.get("surges")]
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        surging = [w for w in op.values() if isinstance(w, dict) and w.get("surges")]
         self.assertGreaterEqual(len(surging), 2, "the callouts and verifiers should surge")
         widest = max(w["cpuMillisRequest"] // w["pods"] for w in surging)
         # LiteLLM and the operator also roll surge-first; shrink both below the widest.
         quiet = ["litellm.enabled=false", "operator.resources.requests.cpu=10m"]
-        today = self._requirements(quiet)
-        self.assertLess(today["surgeRequestsCpu"], widest, "the test needs the chart's own surges out of the way")
-        req = self._requirements([*quiet, "platformAgent.mode=next"])
+        req = self._requirements(quiet)
         self.assertGreaterEqual(req["surgeRequestsCpu"], widest)
 
     def _bridge_delta(self, extra_env: list[dict]) -> int:
-        """The next-mode CPU request with operator.extraEnv set, less the api-bridge one."""
-        base = self._requirements(["platformAgent.mode=next"])
-        req = self._requirements(
-            ["platformAgent.mode=next"], values={"operator": {"extraEnv": extra_env}}
-        )
+        """The CPU request with operator.extraEnv set, less the api-bridge one."""
+        base = self._requirements()
+        req = self._requirements(values={"operator": {"extraEnv": extra_env}})
         return req["requestsCpu"] - base["requestsCpu"]
 
-    def test_mode_next_counts_an_overridden_bridge_at_least_at_the_agent_containers_size(self) -> None:
+    def test_an_overridden_bridge_is_counted_at_least_at_the_agent_containers_size(self) -> None:
         """The chart does not re-implement the operator's reader of A2A_BRIDGE_EXECUTOR and
         A2A_BRIDGE_RESOURCES; with either set, in any form, the bridge is counted at no less
         than the agent container's size, the operator's fallback under cli."""
-        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["agentPod"]
         cli = bridge["hermesBridgeCli"]["cpuMillisRequest"] - bridge["hermesBridge"]["cpuMillisRequest"]
         self.assertGreater(cli, 0)
         zero_cpu_limit = (
@@ -1159,8 +1176,8 @@ class PreflightDecisionTest(unittest.TestCase):
         return {p["name"]: p for p in yaml.safe_load(_FLAGGED_PODS.read_text())["pods"]}
 
     def _flagged_delta(self, env: list) -> dict:
-        base = self._requirements(["platformAgent.mode=next"])
-        req = self._requirements(["platformAgent.mode=next"], values={"operator": {"extraEnv": env}})
+        base = self._requirements()
+        req = self._requirements(values={"operator": {"extraEnv": env}})
         return {key: req[key] - base[key] for key in base}
 
     def _assert_counts(self, delta: dict, *pods: dict) -> None:
@@ -1174,7 +1191,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(delta["pods"], sum(p["replicas"] for p in pods))
         self.assertEqual(delta["surgeRequestsCpu"], 0, "each rolls Recreate")
 
-    def test_mode_next_counts_the_mcp_server_when_its_flag_is_on(self) -> None:
+    def test_the_mcp_server_is_counted_when_its_flag_is_on(self) -> None:
         """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), so no
         golden carries it and the chart adds it from files/flagged-pods.yaml."""
         mcp = self._flagged()["mcp"]
@@ -1203,28 +1220,25 @@ class PreflightDecisionTest(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertEqual(set(self._flagged_delta(env).values()), {0})
-        # And never under today, where the operator renders no MCP server.
-        door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
-        self.assertEqual(self._requirements(values=door), self._requirements())
 
-    def test_mode_next_counts_the_profile_dispatcher_by_default(self) -> None:
-        """The operator renders the dispatcher by default under next, so the next-mode golden
-        carries it, footprint.yaml counts it, and files/flagged-pods.yaml no longer lists it."""
+    def test_the_profile_dispatcher_is_counted_by_default(self) -> None:
+        """The operator renders the dispatcher by default, so the goldens carry it,
+        footprint.yaml counts it, and files/flagged-pods.yaml no longer lists it."""
         footprint = yaml.safe_load((_CHART / "files" / "footprint.yaml").read_text())
-        self.assertIn("a2aDispatcher", footprint["nextMode"])
+        self.assertIn("a2aDispatcher", footprint["operatorRendered"])
         self.assertNotIn("dispatcher", self._flagged())
 
     def test_the_profile_dispatcher_count_does_not_follow_its_image_or_its_switch(self) -> None:
         """An image override changes nothing it counts, and switching the dispatcher off
         (operator.profileDispatcher.enabled=false) still counts its one pod: an over-count, in the
         safe direction, which the chart's values comment states."""
-        base = self._requirements(["platformAgent.mode=next"])
+        base = self._requirements([])
         image = {"operator": {"extraEnv": [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]}}
-        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=image), base)
+        self.assertEqual(self._requirements([], values=image), base)
         off = {"operator": {"profileDispatcher": {"enabled": False}}}
-        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=off), base)
+        self.assertEqual(self._requirements([], values=off), base)
 
-    def test_mode_next_counts_the_mcp_server_beside_the_dispatcher(self) -> None:
+    def test_the_mcp_server_is_counted_beside_the_dispatcher(self) -> None:
         pods = self._flagged()
         env = [{"name": "A2A_MCP_DOOR", "value": "true"}]
         self._assert_counts(self._flagged_delta(env), pods["mcp"])
@@ -1235,11 +1249,11 @@ class PreflightDecisionTest(unittest.TestCase):
         return {**sp, "replicas": sp["pods"]}  # the shape _assert_counts reads
 
     def _scope_delta(self, values: dict, extra_args: list[str] | None = None) -> dict:
-        base = self._requirements(["platformAgent.mode=next"], extra_args=extra_args)
-        req = self._requirements(["platformAgent.mode=next"], values=values, extra_args=extra_args)
+        base = self._requirements(extra_args=extra_args)
+        req = self._requirements(values=values, extra_args=extra_args)
         return {key: req[key] - base[key] for key in base}
 
-    def test_mode_next_counts_the_scope_publishers_job_pod_for_a_scope_with_members(self) -> None:
+    def test_the_scope_publishers_job_pod_is_counted_for_a_scope_with_members(self) -> None:
         """The operator starts the scope publisher's Job, one pod at a time, where the gateway
         pod policy is on and the scope names something to resolve (#4816)."""
         sp = self._scope_publisher()
@@ -1273,12 +1287,9 @@ class PreflightDecisionTest(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertEqual(set(self._scope_delta(values, extra).values()), {0})
-        # And never under today, where the operator runs no publisher.
-        scope = {"platformAgent": {"scope": {"folders": ["x"]}}}
-        self.assertEqual(self._requirements(values=scope), self._requirements())
 
     @unittest.skipUnless(_HELM, "helm is not installed")
-    def test_a_missing_or_unreadable_transient_pods_file_fails_a_next_render(self) -> None:
+    def test_a_missing_or_unreadable_transient_pods_file_fails_the_render(self) -> None:
         """Like footprint.yaml: without transient-pods.yaml the publisher would count as nothing."""
         for name, damage in (
             ("missing", lambda f: f.unlink()),
@@ -1302,8 +1313,7 @@ class PreflightDecisionTest(unittest.TestCase):
                     values_path = fh.name
                 self.addCleanup(lambda p=values_path: pathlib.Path(p).unlink(missing_ok=True))
                 res = subprocess.run(
-                    [_HELM, "template", "test-release", str(chart), "-f", values_path,
-                     "--set", "platformAgent.mode=next"] + _REQUIRED_HARNESS,
+                    [_HELM, "template", "test-release", str(chart), "-f", values_path] + _REQUIRED_HARNESS,
                     capture_output=True,
                     text=True,
                 )
@@ -1311,12 +1321,11 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertIn("transient-pods.yaml is missing or unreadable", res.stderr)
 
     def _mcp_server_delta(self, env: list) -> dict:
-        base = self._requirements(["platformAgent.mode=next"])
-        req = self._requirements(["platformAgent.mode=next"],
-                                 values={"operator": {"mcpServer": {"enabled": True}, "extraEnv": env}})
+        base = self._requirements()
+        req = self._requirements(values={"operator": {"mcpServer": {"enabled": True}, "extraEnv": env}})
         return {key: req[key] - base[key] for key in base}
 
-    def test_mode_next_counts_the_mcp_server_when_operator_mcp_server_enabled_is_true(self) -> None:
+    def test_the_mcp_server_is_counted_when_operator_mcp_server_enabled_is_true(self) -> None:
         """operator.mcpServer.enabled sets A2A_MCP_DOOR=true, so the count follows it, and an
         extraEnv entry that does not turn the flag off leaves it counted."""
         mcp = self._flagged()["mcp"]
@@ -1327,8 +1336,6 @@ class PreflightDecisionTest(unittest.TestCase):
         ):
             with self.subTest(name):
                 self._assert_counts(self._mcp_server_delta(env), mcp)
-        self.assertEqual(self._requirements(values={"operator": {"mcpServer": {"enabled": True}}}),
-                         self._requirements(), "under today the operator renders no MCP server")
 
     def test_an_extra_env_false_turns_off_the_mcp_server_the_value_turned_on(self) -> None:
         """extraEnv is rendered after the value and wins, in the Deployment and in the count."""
@@ -1339,9 +1346,9 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(set(self._mcp_server_delta(env).values()), {0})
 
-    def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
+    def test_a_larger_a2a_bridge_resources_is_counted_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
-        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["agentPod"]["hermesBridge"]
         self.assertEqual(
             self._bridge_delta(
                 [{"name": "A2A_BRIDGE_RESOURCES", "value": '{"requests": {"cpu": "3500m", "memory": "1Gi"}}'}]
@@ -1356,10 +1363,10 @@ class PreflightDecisionTest(unittest.TestCase):
         # Every spelling the Kubernetes quantity grammar admits raises it, not only the
         # common suffixes: a JSON number (a float that prints with an exponent), a leading
         # "+", an exponent and a Pi suffix, each above the agent container's 4Gi memory.
-        cli_mem = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridgeCli"][
+        cli_mem = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["agentPod"]["hermesBridgeCli"][
             "memoryBytesRequest"
         ]
-        base = self._requirements(["platformAgent.mode=next"])
+        base = self._requirements()
         for written, want in (
             ('{"requests": {"memory": 6442450944}}', 6442450944),
             ('{"requests": {"memory": "+6Gi"}}', 6 * 1024**3),
@@ -1368,26 +1375,22 @@ class PreflightDecisionTest(unittest.TestCase):
         ):
             with self.subTest(written):
                 req = self._requirements(
-                    ["platformAgent.mode=next"],
                     values={"operator": {"extraEnv": [{"name": "A2A_BRIDGE_RESOURCES", "value": written}]}},
                 )
                 self.assertGreater(want, cli_mem)
-                self.assertEqual(
-                    req["requestsMemory"] - base["requestsMemory"],
-                    want - yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]["memoryBytesRequest"],
-                )
+                self.assertEqual(req["requestsMemory"] - base["requestsMemory"], want - bridge["memoryBytesRequest"])
 
     def test_an_operator_owned_quota_is_left_to_the_operator(self) -> None:
-        """The next-mode session quota a PlatformAgent owns is not a quota this check can fix:
+        """The session quota a PlatformAgent owns is not a quota this check can fix:
         the operator reapplies it, so a patch would be reverted; its size is maxSessions's
         and the headroom's (#3848)."""
         owned = self._quota({"pods": "2"})
         owned["metadata"]["ownerReferences"] = [
             {"apiVersion": "kubeagents.x-k8s.io/v1alpha1", "kind": "PlatformAgent", "name": "platformagent"}
         ]
-        res = self._render({"probe": {"quotas": [owned]}}, ["platformAgent.mode=next"])
+        res = self._render({"probe": {"quotas": [owned]}})
         self.assertEqual(res.returncode, 0, f"an operator-owned quota should be skipped:\n{res.stderr}")
-        res = self._render({"probe": {"quotas": [self._quota({"pods": "2"})]}}, ["platformAgent.mode=next"])
+        res = self._render({"probe": {"quotas": [self._quota({"pods": "2"})]}})
         self.assertNotEqual(res.returncode, 0, "the same quota, unowned, must still be checked")
     def _chart_pods_and_requirements(self, sets: list[str]) -> tuple[int, dict]:
         """The chart-pods annotation on the PlatformAgent, and the preflight's totals."""
@@ -1465,7 +1468,7 @@ class PreflightDecisionTest(unittest.TestCase):
         runs elsewhere, and neither counts it."""
         for sets in _ORACLE_CASES:
             with self.subTest(sets=sets):
-                chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
+                chart_pods, rendered, names = self._rendered_chart_pods([*sets])
                 self.assertEqual(chart_pods, rendered, names)
 
     def test_the_operator_counts_the_chart_workloads_as_the_chart_does(self) -> None:
@@ -1480,7 +1483,7 @@ class PreflightDecisionTest(unittest.TestCase):
             self.skipTest("go is not installed")
         with tempfile.TemporaryDirectory() as renders:
             for i, sets in enumerate(_ORACLE_CASES):
-                res = self._render({"probe": {}}, ["platformAgent.mode=next", *sets])
+                res = self._render({"probe": {}}, [*sets])
                 self.assertEqual(res.returncode, 0, f"render failed for {sets}:\n{res.stderr}")
                 stamped = None
                 for doc in yaml.safe_load_all(res.stdout):
@@ -1506,21 +1509,19 @@ class PreflightDecisionTest(unittest.TestCase):
 
     def test_an_operator_only_release_refuses_a_count_past_the_cap(self) -> None:
         """The ConfigMap carries the annotation's 64-pod cap check (#4883): an operator-only
-        next-mode release past it fails the render rather than stamp a count the operator
-        discards."""
-        sets = ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=61"]
+        release past it fails the render rather than stamp a count the operator discards."""
+        sets = ["platformAgent.enabled=false", "operator.replicaCount=61"]
         res = self._render({"probe": {}}, sets)
         self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
         self.assertIn("past the operator's cap of 64", res.stderr)
-        ok = self._render({"probe": {}}, ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=60"])
+        ok = self._render({"probe": {}}, ["platformAgent.enabled=false", "operator.replicaCount=60"])
         self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_the_session_quota_counts_every_surge_pod_and_the_patch_room_stays_one(self) -> None:
         """chartSurgePods totals each rollout's surge pods (#4876), and the patch's surge room
         stays one pod of the largest surging workload, enough for a rollout to progress."""
-        base = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4"])
-        three = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4",
-                                    "litellm.rollingUpdate.maxSurge=3"])
+        base = self._requirements(["litellm.replicaCount=4"])
+        three = self._requirements(["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=3"])
         self.assertEqual(three["chartSurgePods"], base["chartSurgePods"] + 2)
         for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
             self.assertEqual(three[key], base[key], key)
@@ -1533,7 +1534,7 @@ class PreflightDecisionTest(unittest.TestCase):
         or wraps; and a 23-digit percentage. Leading zeros don't count as digits."""
         # maxUnavailable 1: main's both-zero guard (rollingUpdateFenceposts) reads a 309-digit
         # value as 0 and would refuse the render before the count is reached.
-        sets = ["platformAgent.mode=next", "operator.replicaCount=3", "operator.rollingUpdate.maxUnavailable=1"]
+        sets = ["operator.replicaCount=3", "operator.rollingUpdate.maxUnavailable=1"]
         base = self._requirements(sets)
         for huge in ("99999999999999999999", "1000000000000000000000%", "1" + "0" * 309 + "%",
                      "1" + "0" * 309, "1000%", "10000000000"):
@@ -1554,7 +1555,7 @@ class PreflightDecisionTest(unittest.TestCase):
         """The chart-pods sums saturate rather than wrap (#4876's review): a replica count of
         2^62 at maxSurge 100% would carry a plain int64 add past 2^63 and stamp a negative
         count, which skips the 64-pod cap. Saturated, it stays past the cap and is refused."""
-        res = self._render({"probe": {}}, ["platformAgent.mode=next", "operator.replicaCount=4611686018427387904",
+        res = self._render({"probe": {}}, ["operator.replicaCount=4611686018427387904",
                                            "operator.rollingUpdate.maxSurge=100%"])
         self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
         self.assertIn("past the operator's cap of 64", res.stderr)
@@ -1563,21 +1564,20 @@ class PreflightDecisionTest(unittest.TestCase):
         """The schema admits any string, and validate.yml requires such a value to render
         (it must not be refused), so the count bounds it from above: as many surge pods as
         the workload has replicas, the most a rollout can add."""
-        base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
+        base = self._requirements(["operator.replicaCount=3"])
         for bad in ("abc", "1.5", "50 %", "-1", "%"):
             with self.subTest(bad=bad):
-                req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3",
-                                          f"operator.rollingUpdate.maxSurge={bad}"])
+                req = self._requirements(["operator.replicaCount=3", f"operator.rollingUpdate.maxSurge={bad}"])
                 self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
 
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
         uninstall-only cleanup hook, and the surge pods each rollout can add (#4893, #4876)."""
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
-        operator_pods = (
-            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
-            + op["kubeProxy"]["pods"]
-        )
+        # Every operator-rendered pod at the footprint's count, plus the gateway's standby.
+        operator_pods = op["agentPod"]["base"]["pods"] + sum(
+            v["pods"] for k, v in op.items() if k not in ("agentPod", "storage")
+        ) + self._gateway_pod()["pods"]
         for sets in ([], ["platformAgent.cleanupHook.enabled=false"], ["litellm.replayShadow.enabled=true"]):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
@@ -1592,15 +1592,11 @@ class PreflightDecisionTest(unittest.TestCase):
         and a surge pod for each), 65 fails naming the cap."""
         cap = int(re.search(r"a2aMaxChartPods\s*=\s*(\d+)", _A2A_MANIFESTS.read_text()).group(1))
         self.assertEqual(cap, 64)
-        ok = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 4}"])
+        ok = self._render({"probe": {}}, [f"operator.replicaCount={cap - 4}"])
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        refused = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 3}"])
+        refused = self._render({"probe": {}}, [f"operator.replicaCount={cap - 3}"])
         self.assertNotEqual(refused.returncode, 0, "a chart count past the cap rendered")
         self.assertIn("past the operator's cap of 64", refused.stderr)
-        # The quota renders only in next mode, so a today-mode render at the same size
-        # stamps its figure and passes.
-        today = self._render({"probe": {}}, [f"operator.replicaCount={cap - 3}"])
-        self.assertEqual(today.returncode, 0, today.stderr)
 
     def test_the_operators_fallback_is_the_charts_default(self) -> None:
         """An install without the chart gets a2aDefaultChartPods, which must be what a
@@ -1612,19 +1608,29 @@ class PreflightDecisionTest(unittest.TestCase):
         assert m is not None
         self.assertEqual(int(m.group(1)), chart_pods)
 
-    def test_mode_next_without_a_next_mode_footprint_fails_loudly(self) -> None:
-        """A footprint without nextMode must not count the A2A stack as zero."""
+    def test_a_footprint_missing_an_a2a_entry_fails_loudly(self) -> None:
+        """A footprint without one of the A2A stack's entries must not count it as zero."""
         footprint_path = self.chart / "files" / "footprint.yaml"
         original = footprint_path.read_text()
-        data = yaml.safe_load(original)
-        del data["nextMode"]
-        try:
-            footprint_path.write_text(yaml.safe_dump(data))
-            res = self._render({"probe": {"emitRequirements": True}}, ["platformAgent.mode=next"])
-        finally:
-            footprint_path.write_text(original)
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("no nextMode section", res.stderr)
+        for path, message in (
+            (("a2aGateway",), "no operatorRendered.a2aGateway entry"),
+            (("a2aNats",), "no operatorRendered.a2aNats entry"),
+            (("agentPod", "hermesBridge"), "no operatorRendered.agentPod.hermesBridge entry"),
+            (("storage", "busClaims"), "no operatorRendered.storage.busClaims entry"),
+        ):
+            with self.subTest(".".join(path)):
+                data = yaml.safe_load(original)
+                parent = data["operatorRendered"]
+                for key in path[:-1]:
+                    parent = parent[key]
+                del parent[path[-1]]
+                try:
+                    footprint_path.write_text(yaml.safe_dump(data))
+                    res = self._render({"probe": {"emitRequirements": True}})
+                finally:
+                    footprint_path.write_text(original)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn(message, res.stderr)
 
     def test_a_scoped_quota_is_skipped(self) -> None:
         """A scoped quota covers a subset of pods this template cannot identify."""
@@ -2128,7 +2134,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"13700m"', res.stderr)
+        self.assertIn('"limits.cpu":"23550m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -2137,7 +2143,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"28544Mi"', res.stderr)
+        self.assertIn('"limits.memory":"36128Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -2149,7 +2155,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
         # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"limits.ephemeral-storage":"16192Mi"', res.stderr)
+        self.assertIn('"limits.ephemeral-storage":"16768Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -2159,7 +2165,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
         # The release's 2756m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2856m"', res.stderr)
+        self.assertIn('"cpu":"4536m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -2168,8 +2174,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        # The release's 12096Mi plus one LiteLLM surge Pod's 2Gi.
-        self.assertIn('"memory":"14144Mi"', res.stderr)
+        # The release's 15120Mi plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"17168Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -2181,7 +2187,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
         # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"ephemeral-storage":"16192Mi"', res.stderr)
+        self.assertIn('"ephemeral-storage":"16768Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -2190,7 +2196,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"102Gi"', res.stderr)
+        self.assertIn('"storage":"222Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""
@@ -2343,7 +2349,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertIn("footprint.yaml is missing or unreadable", res.stderr)
 
     @unittest.skipUnless(_HELM, "helm is not installed")
-    def test_a_missing_or_unreadable_flagged_pods_file_fails_a_next_render(self) -> None:
+    def test_a_missing_or_unreadable_flagged_pods_file_fails_the_render(self) -> None:
         """Like footprint.yaml: without flagged-pods.yaml the flagged pods would count as none."""
         for name, damage in (
             ("missing", lambda f: f.unlink()),
@@ -2365,8 +2371,7 @@ class QuotaPreflightTest(unittest.TestCase):
                     values_path = fh.name
                 self.addCleanup(lambda p=values_path: pathlib.Path(p).unlink(missing_ok=True))
                 res = subprocess.run(
-                    [_HELM, "template", "test-release", str(chart), "-f", values_path,
-                     "--set", "platformAgent.mode=next"] + _REQUIRED_HARNESS,
+                    [_HELM, "template", "test-release", str(chart), "-f", values_path] + _REQUIRED_HARNESS,
                     capture_output=True,
                     text=True,
                 )

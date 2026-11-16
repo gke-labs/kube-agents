@@ -5,13 +5,12 @@ slot. The chart creates it, not the operator: creating and deleting Namespaces
 is a cluster-scoped grant that can't be narrowed by name on create, and the
 operator only needs rights inside this one, which its namespaced grants
 already give it. It renders the namespace's quota and network policy
-(k8s-operator/internal/controller/agentprofile_namespace.go). Rendered only
-for mode next, the only mode that runs profiles. Uninstalling the release
-deletes it and everything in it. The operator only trusts a namespace of this
+(k8s-operator/internal/controller/agentprofile_namespace.go). Uninstalling
+the release deletes it and everything in it. The operator only trusts a namespace of this
 name that carries the component label and the release-namespace annotation
 below, so a namespace that merely shares the name is not admitted to the bus.
 */}}
-{{- if and .Values.platformAgent.enabled (eq (toString .Values.platformAgent.mode) "next") }}
+{{- if .Values.platformAgent.enabled }}
 {{- $name := printf "%s-profiles" .Release.Namespace }}
 {{- if gt (len $name) 63 }}
 {{- fail (printf "the profile namespace %q is longer than 63 characters; install into a release namespace of 54 characters or fewer" $name) }}
