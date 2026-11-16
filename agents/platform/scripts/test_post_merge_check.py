@@ -326,7 +326,45 @@ class WatchHealthTest(unittest.TestCase):
         self.cluster.budgets = [{"metadata": {"name": "checkout-pdb"}, "spec": {"selector": {"matchLabels": {"app": "checkout"}}}}]
         seen = post_merge_check.watch_health(self.conn, self.cluster, NOW, contains=lambda *a: None)
         self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
-        self.assertTrue(self.row()["sync_state"].startswith("observed"), self.row()["sync_state"])
+        state = self.row()["sync_state"]
+        self.assertTrue(state.startswith("observed"), state)
+        self.assertIn("could not be confirmed", state)
+        self.assertNotIn("no reconciler targets", state, "a reconciler does target the namespace")
+
+    def test_a_failed_reconciler_list_is_read_once_per_cluster(self):
+        self.conn.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit) SELECT ?, repo, 2, kind, project, location, cluster, namespace, "
+            "object, opened_at, merged_at, merge_commit FROM post_merge_records WHERE number = 1",
+            (f"{REPO}/pull/2",),
+        )
+        self.cluster.fail = post_merge_check.ClusterReadError("connection refused")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            seen = self.tick(1)
+        self.assertEqual(sorted(seen["unreadable"]), [f"{REPO}/pull/1", f"{REPO}/pull/2"])
+        self.assertEqual(len(self.cluster.calls), 1, self.cluster.calls)
+
+    def test_a_record_whose_update_fails_is_reported_unreadable_not_applied(self):
+        real = self.conn
+        real.commit()  # the failed UPDATE rolls back; keep setUp's row
+
+        class Locked:
+            def execute(self, sql, params=()):
+                if sql.startswith("UPDATE"):
+                    raise sqlite3.OperationalError("database is locked")
+                return real.execute(sql, params)
+
+            def __enter__(self):
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        self.cluster.apps = [argo_app()]
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            seen = post_merge_check.watch_health(Locked(), self.cluster, NOW + timedelta(minutes=1))
+        self.assertEqual((seen["applied"], seen["unreadable"]), ([], [f"{REPO}/pull/1"]))
+        self.assertIsNone(self.row()["applied_at"])
 
     def test_with_no_reconciler_for_the_namespace_the_budget_is_observed_directly(self):
         self.cluster.apps = [argo_app(namespace="elsewhere")]

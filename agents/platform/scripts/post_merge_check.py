@@ -354,13 +354,13 @@ def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict) -
     namespace = record["namespace"] or "default"
     resource = DIRECT_OBJECTS.get(record["kind"] or "")
     if resource is None:
-        return False, f"no reconciler targets {namespace} and a {record['kind']} fix cannot be observed directly"
+        return False, f"a {record['kind']} fix cannot be observed directly"
     labels = (((workload.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}
     budgets = kubectl_json(record, ["get", resource, "-n", namespace, "-o", "json"])
     for budget in budgets.get("items", []):
         if selects((budget.get("spec") or {}).get("selector") or {}, labels):
-            return True, f"no reconciler targets {namespace}; budget {budget['metadata']['name']} selects the workload"
-    return False, f"no reconciler targets {namespace}; no budget selects the workload yet"
+            return True, f"budget {budget['metadata']['name']} selects the workload"
+    return False, "no budget selects the workload yet"
 def cluster_coordinates(record: dict) -> tuple[str, str, str]:
     """``(project, name, location)`` for ``gcloud``: the fleet audit names a cluster
     ``<project>/<location>/<name>``, so a qualified ``cluster`` gives the bare name, and its parts
@@ -435,7 +435,8 @@ def watch_health(
     now = now or datetime.now(timezone.utc)
     stamp = _now_text(now)
     seen: dict[str, list[str]] = {"applied": [], "waiting": [], "failed": [], "unreadable": []}
-    lists_by_cluster: dict[tuple, dict] = {}
+    # A cluster's reconciler lists, or the error reading them, so a failed read is not repeated per record.
+    lists_by_cluster: dict[tuple, dict | Exception] = {}
     answers: dict[tuple, bool | None] = {}
     for values in conn.execute(HEALTH_SQL, (limit,)).fetchall():
         record = dict(zip(HEALTH_COLUMNS, values))
@@ -446,17 +447,23 @@ def watch_health(
             if not (all(cluster) and record["object"]):
                 raise ClusterReadError("the record names no cluster or workload to read")
             if cluster not in lists_by_cluster:
-                lists_by_cluster[cluster] = {
-                    resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])
-                    for resource in RECONCILER_RESOURCES
-                }
+                try:
+                    lists_by_cluster[cluster] = {
+                        resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])
+                        for resource in RECONCILER_RESOURCES
+                    }
+                except Exception as exc:
+                    lists_by_cluster[cluster] = exc
+            lists = lists_by_cluster[cluster]
+            if isinstance(lists, Exception):
+                raise lists
 
             def asked(ancestor: str, revision: str, repo: str = record["repo"]) -> bool | None:
                 if (repo, ancestor, revision) not in answers:
                     answers[(repo, ancestor, revision)] = contains(repo, ancestor, revision)
                 return answers[(repo, ancestor, revision)]
 
-            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists_by_cluster[cluster])
+            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists)
             workload, pods = _read_workload(kubectl_json, record)
             if objects:
                 state, detail = combined_sync(objects, record["merge_commit"], asked)
@@ -466,25 +473,26 @@ def watch_health(
                     # abbreviated or SHA-256 merge commit, a fetch it refused): look for the fix itself.
                     applied, direct = observed_directly(kubectl_json, record, workload)
                     if applied:
-                        state, detail = OBSERVED, direct
+                        state, detail = OBSERVED, f"the reconcilers' commit could not be confirmed; {direct}"
             else:
-                applied, detail = observed_directly(kubectl_json, record, workload)
+                applied, direct = observed_directly(kubectl_json, record, workload)
                 state = OBSERVED if applied else reconciler_sync.PENDING
+                detail = f"no reconciler targets {record['namespace'] or 'default'}; {direct}"
             updates["sync_state"] = f"{state}: {detail}"[:500]
             if applied:
                 updates["applied_at"] = stamp
                 updates["health_baseline"] = json.dumps(restart_baseline(pods), sort_keys=True)
-                seen["applied"].append(url)
+                bucket = "applied"
             else:
-                seen["waiting"].append(url)
+                bucket = "waiting"
         except WorkloadGone as exc:
             logger.warning("post-merge check: %s cannot be judged: %s", url, exc)
             updates.update(health_result=HEALTH_FAILED, health_detail=f"cannot judge: {exc}"[:500], health_at=stamp)
-            seen["failed"].append(url)
+            bucket = "failed"
         except Exception as exc:  # noqa: BLE001 — one unreadable cluster must not stop the tick
             logger.warning("post-merge check: could not read the cluster for %s: %r", url, exc)
             updates["sync_state"] = f"unreadable: {exc}"[:500]
-            seen["unreadable"].append(url)
+            bucket = "unreadable"
         try:
             with conn:
                 conn.execute(
@@ -492,7 +500,10 @@ def watch_health(
                     (*updates.values(), url),
                 )
         except sqlite3.Error as exc:
+            # Nothing was written, so the tick reports what the row still says: not read.
             logger.warning("post-merge check: could not record the health step for %s: %r", url, exc)
+            bucket = "unreadable"
+        seen[bucket].append(url)
     return seen
 
 
