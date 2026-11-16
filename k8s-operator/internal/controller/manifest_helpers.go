@@ -94,6 +94,10 @@ const (
 	interfaceGoogleChat = "googlechat"
 	interfaceSlack      = "slack"
 	interfaceTeams      = "teams"
+
+	imagePathSeparator   = "/"
+	imageTagSeparator    = ":"
+	imageDigestSeparator = "@"
 )
 
 // The Kubernetes recommended labels, stamped on every object this controller
@@ -277,6 +281,48 @@ func deriveImageFromOperator(operatorImage, repository string) string {
 		suffix = refPart[tagIdx:]
 	}
 	return prefix + repository + suffix
+}
+
+// extractImageVersion returns only the tag or digest portion of a container
+// image reference (for example, "v0.12.3", "sha-abc1234", or "sha256:...").
+// The registry host and repository path are never returned because private
+// mirrors embed project or tenant identifiers in the path.
+func extractImageVersion(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return ""
+	}
+	refPart := image
+	if lastSlash := strings.LastIndex(image, imagePathSeparator); lastSlash >= 0 {
+		refPart = image[lastSlash+len(imagePathSeparator):]
+	}
+	digestIdx := strings.Index(refPart, imageDigestSeparator)
+	withoutDigest := refPart
+	if digestIdx >= 0 {
+		withoutDigest = refPart[:digestIdx]
+	}
+	if tagIdx := strings.Index(withoutDigest, imageTagSeparator); tagIdx >= 0 {
+		if tag := withoutDigest[tagIdx+len(imageTagSeparator):]; tag != "" {
+			return tag
+		}
+	}
+	if digestIdx >= 0 {
+		if digest := refPart[digestIdx+len(imageDigestSeparator):]; digest != "" {
+			return digest
+		}
+	}
+	return ""
+}
+
+// workloadObservedVersion extracts the running agent version from the
+// platform-agent container in a reconciled gateway workload's PodSpec.
+func workloadObservedVersion(containers []corev1.Container) string {
+	for i := range containers {
+		if containers[i].Name == platformAgentContainerName {
+			return extractImageVersion(containers[i].Image)
+		}
+	}
+	return ""
 }
 
 // defaultPlatformAgentImage returns the agent image used when a CR omits
@@ -585,7 +631,7 @@ func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceR
 	// evicts a Burstable pod whose working set is above its request, and the
 	// gateway was evicted three times in four days at 3.1 to 3.5 GiB against
 	// 2Gi. And the kanban dispatcher's memory admission takes the request as
-	// its default budget: a gateway under spec.mode next idles at about
+	// its default budget: the A2A gateway idles at about
 	// 1.5 GiB of working set, so a 2Gi budget admitted no worker at all on the
 	// presubmit install and refused every card after the queue bound. 4Gi
 	// holds the idle set and about five or six workers at 430 MiB, the count

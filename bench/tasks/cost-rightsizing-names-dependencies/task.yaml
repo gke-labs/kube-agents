@@ -1,4 +1,4 @@
-# CERTIFICATION: an entry in hack/eval/certification-cases.txt, a baseline
+# CERTIFICATION: a `suite: certification` case (the line below), a baseline
 # of the cost capability row (#3978); a nightly case 2026-10-23 to 2026-11-09
 # (#3199), admitted to the suite on that record. What the fixture carries
 # versus the customer failure: the seeded fleet carries a Deployment scaled by

@@ -222,6 +222,10 @@ DAYS_LAST_JOIN = " and "
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
+# Appended to a clear decided on a superseding run that failed: its summary
+# may name failures, none of them on the projects this clear is about, and
+# what they need is that run's own message, not this one.
+CLEARED_BY_FAILED_RUN = " (that run failed elsewhere, not on these projects)"
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_NEAR_DEADLINE = "near_deadline"  # a near_deadline note with a deadline kill; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
@@ -1281,9 +1285,10 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
         return is_token == key.endswith(TOKEN_TOLD_SUFFIX)
 
     def recovered(key):
-        # Its own passed build, or the tick's decision that a later pass of
-        # the job that supersedes it reached its projects. A silence (a
-        # later failed daily) is not a recovery and clears nothing. The token
+        # Its own passed build, or the tick's decision that a later run of
+        # the job that supersedes it reached its projects (a pass, or a run
+        # that failed elsewhere and applied them). A silence (a later failed
+        # daily that owes a hand step) is not a recovery and clears nothing. The token
         # episode is about the credential, so only a passed build whose
         # GitLab report was read and names no token ends it: a build whose
         # report was not read says nothing about the token.
@@ -1426,6 +1431,10 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
             theirs = (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_BY) or runs.get(other) or {}
             when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
             did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
+            # A run that failed elsewhere still did this build's work; said,
+            # or the ✅ reads as if it carried a failure of its own.
+            if theirs.get("passed") is False:
+                did += CLEARED_BY_FAILED_RUN
             lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
             continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None

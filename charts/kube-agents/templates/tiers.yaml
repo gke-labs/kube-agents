@@ -5,8 +5,8 @@ trigger's. The chart owns these two, so an edit to either is reverted on the nex
 upgrade; an install's own tiers go under other names.
 
 The operator renders every Tier into the tiers file the verifier, gateway and
-callout load; no AgentProfile can list one yet, and writeMode isn't enforced.
-Rendered only when the API
+callout load, and profiles can list them; people aren't mapped to tiers yet, and
+writeMode isn't enforced. Rendered only when the API
 server serves the Tier kind, so a helm upgrade that hasn't applied crds/ skips them
 rather than failing on an unknown kind (upgrade.sh applies crds/ first).
 */}}

@@ -18,6 +18,7 @@ from tests.testing.common import (
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
     MOCK_TARGET_RELEASE_VERSION,
+    create_mock_go_binary,
     create_mock_helm_binary,
     create_mock_syft_binary,
 )
@@ -111,6 +112,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
 
             create_mock_helm_binary(bin_dir)
             create_mock_syft_binary(bin_dir)
+            create_mock_go_binary(bin_dir)
 
             head_commit = subprocess.check_output(
                 ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
@@ -232,6 +234,10 @@ class PackageReleaseBundleTest(unittest.TestCase):
             self.assertIn(zip_path.name, checksums_content)
             self.assertIn(chart_path.name, checksums_content)
             self.assertIn(spdx_fs.name, checksums_content)
+            # The k8s-api-proxy archives are staged with the bundle, so the checksums cover them.
+            proxy_archive = dist_dir / f"k8s-api-proxy_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz"
+            self.assertTrue(proxy_archive.exists(), f"{proxy_archive.name} missing from {dist_dir}")
+            self.assertIn(proxy_archive.name, checksums_content)
             self.assertNotIn("checksums.txt", checksums_content)
 
     def test_idempotent_rerun(self):
@@ -242,6 +248,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
 
             create_mock_helm_binary(bin_dir)
             create_mock_syft_binary(bin_dir)
+            create_mock_go_binary(bin_dir)
 
             head_commit = subprocess.check_output(
                 ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
@@ -291,6 +298,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
                 dist_dir = temp_path / "dist"
                 create_mock_helm_binary(bin_dir)
                 create_mock_syft_binary(bin_dir)
+                create_mock_go_binary(bin_dir)
 
                 head_commit = subprocess.check_output(
                     ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True

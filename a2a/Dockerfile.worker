@@ -21,7 +21,7 @@
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_IMAGE=node
-ARG NODE_VERSION=22-slim
+ARG NODE_VERSION=24-slim
 
 # --- adapter build stage ---
 FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build

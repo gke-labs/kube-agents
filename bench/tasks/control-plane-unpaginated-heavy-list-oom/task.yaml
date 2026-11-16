@@ -24,6 +24,7 @@ id: control-plane-unpaginated-heavy-list-oom
 name: "Unpaginated cluster-wide LIST caller (declared gap; planted as a suspended CronJob with --chunk-size=0 when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit

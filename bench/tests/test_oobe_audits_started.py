@@ -62,6 +62,7 @@ CREATE TABLE executions (
 )
 """
 ARMED = datetime(2026, 10, 6, 20, 0, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _local_shell(script: str, timeout: float) -> str:
@@ -71,6 +72,7 @@ def _local_shell(script: str, timeout: float) -> str:
 class Store:
     def __init__(self, root: Path) -> None:
         self.state = root / ".bench-oobe.json"
+        self.own_state = root / ".bench-oobe-own.json"
         self.marker = root / ".oobe_audits_fired"
         self.db = root / "executions.db"
         with sqlite3.connect(self.db) as con:
@@ -114,6 +116,7 @@ class Store:
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
     s = Store(tmp_path)
     monkeypatch.setattr(oobe, "STATE_FILE", str(s.state))
+    monkeypatch.setattr(oobe, "OWN_STATE_FILE", str(s.own_state))
     monkeypatch.setattr(oobe, "AUDITS_MARKER", str(s.marker))
     monkeypatch.setattr(oobe, "PLATFORM_EXECUTIONS_DB", str(s.db))
     monkeypatch.setattr(oobe, "HERMES_PYTHON", sys.executable)
@@ -169,9 +172,9 @@ def test_the_audit_list_matches_the_stage(store: Store) -> None:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
     )
     assert tuple(shipped) == oobe.FIRST_RUN_AUDITS
-    # The streams the case makes the runner lock: every audit the stage starts, and no other.
-    declared = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])["audit_streams"]
-    assert sorted(declared) == sorted(shipped)
+    # On a lease the case starts no audit, so it locks no stream: the five would hold every
+    # audit case on them for the install's whole chain.
+    assert "audit_streams" not in yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])
 
 
 def test_a_run_from_before_the_arm_does_not_count(store: Store) -> None:
@@ -316,10 +319,60 @@ def test_another_jobs_run_does_not_count(store: Store) -> None:
     assert _verify().status == "fail"
 
 
-def test_no_state_file_is_an_error(store: Store) -> None:
+def test_no_state_file_and_no_own_choice_is_an_error(store: Store) -> None:
+    # The stack did not run, or ran nothing: even a recent chain is not graded without its choice.
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": NOW.timestamp()}))
+    store.chain(NOW - timedelta(minutes=30))
     result = _verify()
     assert result.status == "error"
-    assert "did not arm" in result.reason
+    assert "neither armed the stage nor chose the install's own first run" in result.reason
+
+
+# --- the install's own first run (no state file) ------------------------------
+
+
+
+def _own_record(store: Store, at: datetime, **extra) -> None:
+    """The stage's record as a fresh install's own first run leaves it, and the stack's choice of it."""
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": at.timestamp(), **extra}))
+    store.own_state.write_text(json.dumps({"first_run_at": at.timestamp()}))
+
+
+def test_a_fresh_installs_own_chain_is_graded_without_a_state_file(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert result.reason.startswith("on the install's own first run, ")
+
+
+def test_a_fresh_install_whose_stage_skipped_is_a_red_that_says_so(store: Store) -> None:
+    store.marker.write_text(json.dumps({"done": True, "skipped": True, "reason": "no sweep", "at": NOW.timestamp()}))
+    store.own_state.write_text("{}")
+    result = _verify()
+    assert result.status == "fail"
+    assert "the stage skipped the first-run audits: no sweep" in result.reason
+
+
+def test_on_the_own_chain_a_run_before_its_mark_does_not_count(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    # The last audit's only run was claimed before the stage marked it.
+    last = oobe.FIRST_RUN_AUDITS[-1]
+    store.mark(last, NOW)
+    result = _verify()
+    assert result.status == "fail"
+    assert last in result.reason
+
+
+def test_the_own_choice_file_is_the_one_the_stack_writes_and_the_disarm_removes() -> None:
+    name = Path(oobe.OWN_STATE_FILE).name
+    assert name == ".bench-oobe-own.json"
+    for script in ("own_stage.py", "disarm.py"):
+        assert f'OWN_STATE = os.path.join(home, "{name}")' in (ARM.parent / script).read_text(), script
+    # The stack's window for a recent first run is the stage's own idea of a new install.
+    assert "FRESH_SECONDS = 24 * 60 * 60" in (ARM.parent / "own_stage.py").read_text()
+    assert "NEW_INSTALL_SECONDS = 24 * 60 * 60" in STAGE.read_text()
 
 
 def test_an_unreadable_store_is_an_error(store: Store) -> None:
