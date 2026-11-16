@@ -57,10 +57,12 @@ platformAgent:
     # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
     # shell sandbox, where the audits run, and passes every name it does not
     # reserve to the credential-proxy and agent-api-auth containers. The name
-    # here reaches the container that reads it. CLOUDSDK_CORE_DISABLE_FILE_LOGGING
-    # and MALLOC_ARENA_MAX are not on the agent container's allowlist: set here
-    # they would reach the proxy pod, where gcloud and kubectl run, and not the
-    # agent container. This file leaves them out. The fold window that bounds
+    # here reaches the container that reads it. MALLOC_ARENA_MAX is not on the
+    # agent container's allowlist: set here it would reach the proxy pod, where
+    # gcloud and kubectl run, and not the agent container. This file leaves it
+    # out. CLOUDSDK_CORE_DISABLE_FILE_LOGGING is left out too: the credential
+    # proxy does not pass the pod's value to the commands it runs, so setting
+    # it here changes nothing for gcloud. The fold window that bounds
     # the triage turns a flapping workload can cause, INCIDENT_WORKLOAD_DEDUP_SECONDS,
     # is an hour on every install through
     # platformAgent.deployment.incidentWorkloadDedupSeconds and is not repeated

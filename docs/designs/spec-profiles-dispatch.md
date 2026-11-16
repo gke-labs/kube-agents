@@ -364,7 +364,7 @@ leave open:
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
-  task, `proxyToken` also carries that `trigger` (`{name, origin, stream}`), which the verifier
+  task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
   found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
@@ -436,9 +436,7 @@ leave open:
   `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
   the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
   the profile count, and one entry can't be split across shards, so it fills one shard near 650
-  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit: under Job mode
-  each profile that allows `unattended` carries its Job template there, which fills the
-  ConfigMap near 200 such profiles (#5479). The operator binds profiles oldest first (creation
+  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit. Since #5485 an unattended profile's Job template is its own `DispatchJobTemplate`, and the config carries only a reference to it, so that limit is reached first only by profiles that declare many parameters (#5479). The operator binds profiles oldest first (creation
   time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
   `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
   `DispatcherCeiling` condition warns at four fifths of either budget and reads
@@ -448,10 +446,12 @@ leave open:
   drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
   ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
   target.
-  `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves the dispatcher's per-profile grants
-  out of the identity map and onto per-bucket connections the callout derives
-  (spec-nats-deployment.md); a dispatcher that doesn't open them loses every profile grant, so
-  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the dispatcher's entry is a fixed size whatever the profile count, so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
+  Its per-profile grants are out of the identity map and on 32 bucket connections the callout
+  derives (spec-nats-deployment.md); `A2A_DISPATCHER_BUCKETED_GRANTS=false` on the operator puts
+  them back in the map on one connection. The operator and the dispatcher move together: a
+  dispatcher from before the bucket connections binds nothing under a split map and stays not
+  Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
+  so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
@@ -495,6 +495,21 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
+  The dispatch config doesn't carry the Job's pod template. It names the profile's own
+  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
+  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
+  object when it launches the Job, with `get` alone on those objects, and uses it only while
+  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
+  missing param, or one with no containers keeps that profile's task queued, shows on the
+  dispatcher's health as a Job admission error, and leaves every other profile alone. The
+  operator writes params before the config, so the usual transient is a param ahead of the
+  dispatcher's cached config. The hash says which rendering a param holds; it is the
+  writer's claim, not a digest of the param's contents, and only the operator and cluster
+  admins can write params. Copying the template into the config made a two-tier unattended
+  profile's entry about 4.4 KB, which put the config's ConfigMap past 1 MiB at about 240
+  such profiles. A dispatcher older than this reads only an inline template, so it refuses
+  unattended tasks `no-worker` under an operator that sends the reference: move the
+  dispatcher's image with the operator.
   Without a Job runner or a Job template, an unattended task has no worker (the operator builds
   warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
   for unattended on this install: Job mode is off"), rather than leave it queued until its

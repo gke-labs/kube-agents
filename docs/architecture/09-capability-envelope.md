@@ -249,8 +249,11 @@ narrows only to itself, and a hop (a child entry a broker writes) carries its pa
 unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
 chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
 the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
-crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream}`, added
-11/11, #4685): the unattended trigger whose submission the gateway minted it for. Only that tier
+crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream, script}`, added
+11/11, #4685): the unattended trigger whose submission the gateway minted it for. `script`, on a
+built-in schedule's run, names the profile script it executes: a label, only on a schedule's
+trigger. The readers accept it; resolving it against a profile allowlist, and writing it, are
+later changes. Only that tier
 carries one, and a hop carries it unchanged, as it does `profile`. The dispatcher asks the verb
 `profile.run` with three request fields of its own, `profile`, `tier` and an optional `trigger`
 (the one the submission claims), and a target scope (`project/P/location/L/cluster/C`, or the install's
@@ -506,7 +509,13 @@ back to advisory bytes. And the reply subject has to be namespaced the same way:
 `a2a.cap.reply.<caller>.*` rather than `_INBOX`, because under `_INBOX` the verifier's publish
 grant would have to be `_INBOX.>`, which would let it forge JetStream API replies into any
 principal's inbox -- including the gateway's. The verifier also drops any request whose reply
-subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen.
+subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen. Each
+check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
+echoes on every verdict, and the client acts only on a reply that echoes its own id. That's defence
+in depth for the dispatcher's admission, which mints a task's credentials on the answer: a reply
+carrying another id is dropped, and a check with no answer of its own fails closed at its timeout,
+as does one whose reply doesn't parse. A reply with no id, from a verifier older than the echo, is
+still acted on while a release without the echo is inside the rollback window.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose
