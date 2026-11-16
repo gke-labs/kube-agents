@@ -8,15 +8,18 @@ holds the field names this module writes). No model is in the loop:
   fleet), each with the open findings the findings queue holds for it, ranked
   by the queue's own order (``findings_queue.ranked_findings``). Under
   ``spec.mode: next`` the fleet is the resolved scope's instead
-  (``fleet_scope_targets.list_scope_clusters``, #3658) and no profile is read:
-  a member project's clusters as the scope publisher listed them, and one row
-  each for the projects it holds no list for, the ones the watch scripts list
-  live (the management and explicit projects; the board runs no ``gcloud``)
-  and the unread ones, so neither draws as a project with no clusters;
+  (``fleet_scope_targets.list_scope_clusters``, #3658): a member project's
+  clusters as the scope publisher listed them, never from a profile. The
+  projects the watch scripts list live (the management and explicit
+  projects; the board runs no ``gcloud``) keep their Cluster Agent
+  profiles' clusters until those profiles retire, the profiles walk
+  filtered to those projects. One row each stands for the live projects no
+  profile names yet and for the unread members, so neither draws as a
+  project with no clusters;
 - running: the kanban cards whose status is ``running``, the cluster their
-  assignee profile is scoped to beside each (under next, the profile name
-  derived from each cluster the resolved scope lists, for a card still filed
-  to one; a card in a project listed live has no label);
+  assignee profile is scoped to beside each (under next, for a member
+  project, the profile name derived from each cluster the resolved scope
+  lists, for a card still filed to one);
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
@@ -39,7 +42,7 @@ import json
 import os
 import sqlite3
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,7 +93,7 @@ IDENTITY_KEY = "cluster_identity"
 LIVE_ROW = "{projects} (clusters not listed here)"
 UNREAD_ROW = "{projects} (clusters unread)"
 UNLISTED_NAMED_MAX = 3
-UNLISTED_MORE = "{named} and {more} more projects"
+UNLISTED_MORE = "{named} and {more} more project{s}"
 # The placeholder fleet_scope_targets names the members of an unusable resolved scope by.
 SCOPE_MEMBERS = "scope members"
 
@@ -132,8 +135,12 @@ def _rfc3339(value: Any) -> str:
     return stamp.astimezone(timezone.utc).isoformat()
 
 
-def cluster_identities(profiles_dir: Path | None = None) -> dict[str, tuple[str, str]]:
-    """Profile name -> (project, cluster), for every profile stamped with a ``cluster_identity``."""
+def cluster_identities(profiles_dir: Path | None = None, projects: set[str] | None = None) -> dict[str, tuple[str, str]]:
+    """Profile name -> (project, cluster), for every profile stamped with a ``cluster_identity``.
+
+    ``projects``, when given, keeps only the profiles in those projects (under
+    next, the projects the scope lists live).
+    """
     import yaml  # lazy, like cluster_agent_profile's reader
 
     profiles_dir = profiles_dir or PROFILES_DIR
@@ -150,7 +157,9 @@ def cluster_identities(profiles_dir: Path | None = None) -> dict[str, tuple[str,
             continue
         identity = data.get(IDENTITY_KEY) if isinstance(data, dict) else None
         if isinstance(identity, dict) and identity.get("cluster"):
-            out[home.name] = (str(identity.get("project") or ""), str(identity["cluster"]))
+            project = str(identity.get("project") or "")
+            if projects is None or project in projects:
+                out[home.name] = (project, str(identity["cluster"]))
     return out
 
 
@@ -174,9 +183,8 @@ def scope_identities(scope: fleet_scope_targets.ScopeClusters) -> dict[str, tupl
     A card may still be filed to a cluster's per-cluster profile until routing
     moves to the `cluster` profile; its name is derived from the triple, so its
     card keeps its cluster without a profile being read. Only LISTED projects
-    have triples: a card on a cluster in a project listed live (the management
-    and explicit projects) gets no cluster label under next, since labelling
-    it would mean reading the profiles this mode no longer reads.
+    have triples; the projects listed live take theirs from their profiles
+    (``live_identities``).
     """
     from cluster_agent_profile import profile_name  # lazy: next mode only
 
@@ -188,15 +196,34 @@ def scope_identities(scope: fleet_scope_targets.ScopeClusters) -> dict[str, tupl
     }
 
 
+def live_projects(scope: fleet_scope_targets.ScopeClusters) -> set[str]:
+    """The projects the scope lists live: the management and explicit projects."""
+    return {e.project for e in scope.projects if e.status == fleet_scope_targets.STATUS_LIST_LIVE}
+
+
+def live_identities(scope: fleet_scope_targets.ScopeClusters, profiles_dir: Path | None) -> dict[str, tuple[str, str]]:
+    """Profile name -> (project, cluster) for the clusters of the projects listed live.
+
+    The scope publisher never lists those projects and the board runs no
+    ``gcloud``, so their Cluster Agent profiles (which exist under next until
+    they retire, #3658 4d) name their clusters, as outside next. The walk is
+    filtered to those projects: a member project's clusters come from the
+    scope alone. No project listed live, no walk.
+    """
+    live = live_projects(scope)
+    return cluster_identities(profiles_dir, live) if live else {}
+
+
 def _named(projects: list[str]) -> str:
     named = ", ".join(projects[:UNLISTED_NAMED_MAX])
     more = len(projects) - UNLISTED_NAMED_MAX
-    return UNLISTED_MORE.format(named=named, more=more) if more > 0 else named
+    return UNLISTED_MORE.format(named=named, more=more, s="" if more == 1 else "s") if more > 0 else named
 
 
-def unlisted_rows(scope: fleet_scope_targets.ScopeClusters) -> list[dict]:
-    """A row for the projects listed live and one for the unread ones, each only when there are some."""
-    live = [e.project for e in scope.projects if e.status == fleet_scope_targets.STATUS_LIST_LIVE]
+def unlisted_rows(scope: fleet_scope_targets.ScopeClusters, profiled: Collection[str] = ()) -> list[dict]:
+    """A row for the projects listed live that no profile in ``profiled`` names,
+    and one for the unread ones, each only when there are some."""
+    live = [e.project for e in scope.projects if e.status == fleet_scope_targets.STATUS_LIST_LIVE and e.project not in profiled]
     unread = [
         SCOPE_MEMBERS if e.project == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else e.project
         for e in scope.projects
@@ -367,10 +394,15 @@ def snapshot(
     except sqlite3.Error as exc:
         raise BoardError(f"the findings queue could not be read: {exc}") from None
     scope = scope_clusters(profiles_dir)
-    identities = cluster_identities(profiles_dir) if scope is None else scope_identities(scope)
+    unlisted = None
+    if scope is None:
+        identities = cluster_identities(profiles_dir)
+    else:
+        identities = {**live_identities(scope, profiles_dir), **scope_identities(scope)}
+        unlisted = unlisted_rows(scope, {project for project, _ in identities.values()})
     roster = set(identities.values())
     labels = cluster_labels(roster | {(str(f.get("project") or ""), str(f.get("cluster") or "")) for f in findings})
-    fleet, count = clusters(findings, roster, labels, unlisted_rows(scope) if scope is not None else None)
+    fleet, count = clusters(findings, roster, labels, unlisted)
     board: dict[str, Any] = {
         "generated_at": now.astimezone(timezone.utc).isoformat(),
         "clusters": fleet,

@@ -25,7 +25,8 @@ type Board struct {
 	// GeneratedAt is when the sender read it.
 	GeneratedAt time.Time `json:"generated_at"`
 	// Clusters is the clusters the agent manages (a Cluster Agent profile
-	// each; under spec.mode: next, the resolved scope's) and any other cluster
+	// each; under spec.mode: next, the resolved scope's for member projects,
+	// and the profiles' for the projects listed live) and any other cluster
 	// an open finding names, with their open findings, worst first and capped
 	// by the sender, plus any Unlisted rows, which the cap and ClusterCount
 	// leave out; ClusterCount is how many clusters there are in all. A name
@@ -60,8 +61,8 @@ type BoardCluster struct {
 	Severity string `json:"severity,omitempty"`
 	Top      string `json:"top,omitempty"`
 	// Unlisted marks a row that stands for projects whose clusters the sender
-	// holds no list for (under spec.mode: next, the projects listed live and
-	// the unread ones; the Name says which). It has no findings because
+	// holds no list for (under spec.mode: next, the projects listed live that
+	// no profile names and the unread ones; the Name says which). It has no findings because
 	// nothing read it, so it is never drawn as a healthy cluster, is not
 	// counted in ClusterCount, and is not cut by the cap. Absent from an older
 	// sender and from every real cluster row. A gateway older than the field

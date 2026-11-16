@@ -373,14 +373,70 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         self.assertNotIn("skipped", names)
         self.assertNotIn("ghost", names)
 
+    def profile(self, name, project, cluster, location="us-central1"):
+        home = self.profiles / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(f"cluster_identity:\n  project: {project}\n  cluster: {cluster}\n  location: {location}\n")
+
     def test_a_project_listed_live_is_named_not_left_out(self):
         # The management project's clusters are listed live by the watch
-        # scripts; the board has no gcloud in its request path, so the project
-        # is a row that says so rather than a fleet without it.
+        # scripts and the board has no gcloud in its request path, so they come
+        # from its Cluster Agent profiles until those retire (#3658, 4d); a
+        # project listed live that no profile names yet is a row that says so,
+        # never a fleet without it.
         self.next_mode([], {})
         rows = self.snap()["clusters"]
         self.assertEqual([r["name"] for r in rows], ["mgmt (clusters not listed here)"])
         self.assertEqual(rows[0]["findings"], 0)
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        board = self.snap()
+        self.assertEqual(board["clusters"], [{"name": "host", "findings": 0}])
+        self.assertEqual(board["cluster_count"], 1)
+
+    def test_an_install_with_no_container_scope_shows_the_management_projects_clusters(self):
+        # Every next install today: no folder, organization, Shared VPC host or
+        # Metrics Scope, so the scope publisher never runs and the management
+        # project is listed live. Its clusters come from its profiles, so the
+        # tab shows what it showed outside next.
+        from cluster_agent_profile import profile_name
+
+        render = {"present": True, "projects": []}
+        self.next_mode([], {}, render=render)
+        for cluster in ("web", "api", "db"):
+            self.profile(profile_name("mgmt", cluster, "us-central1"), "mgmt", cluster)
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'look at db', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "db", "us-central1"), STARTED, STARTED))
+        board = self.snap(kanban)
+        self.assertEqual(board["clusters"], [{"name": n, "findings": 0} for n in ("api", "db", "web")])
+        self.assertEqual(board["cluster_count"], 3)
+        self.assertEqual(board["running"][0]["cluster"], "db")
+
+    def test_a_mixed_install_reads_members_from_the_scope_and_live_projects_from_profiles(self):
+        # Member clusters from the resolved scope, the management and explicit
+        # projects' from their profiles, an unread member a placeholder row. A
+        # member's own profile (here member-a's retired "old") and a profile in
+        # a project the scope does not name (ghost) are not read into the fleet.
+        from cluster_agent_profile import profile_name
+
+        render = dict(self.RENDER, projects=["explicit-a"])
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        }, render=render)
+        self.profile(profile_name("mgmt", "host", "us-central1"), "mgmt", "host")
+        self.profile(profile_name("explicit-a", "svc", "us-east1"), "explicit-a", "svc", "us-east1")
+        self.profile(profile_name("member-a", "old", "us-central1"), "member-a", "old")
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'host work', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "host", "us-central1"), STARTED, STARTED))
+        kanban.execute("INSERT INTO tasks VALUES ('t2', 'old work', ?, 'running', ?, ?)",
+                       (profile_name("member-a", "old", "us-central1"), STARTED, STARTED))
+        board = self.snap(kanban)
+        self.assertEqual([r["name"] for r in board["clusters"]], ["member-b (clusters unread)", "host", "svc", "web"])
+        self.assertEqual(board["cluster_count"], 3)
+        cards = {c["title"]: c for c in board["running"]}
+        self.assertEqual(cards["host work"]["cluster"], "host")
+        self.assertNotIn("cluster", cards["old work"])
 
     def test_an_unread_project_is_a_row_never_no_clusters(self):
         self.next_mode([("member-a", "ok"), ("member-b", "denied"), ("member-c", "ok")], {
@@ -402,6 +458,11 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         names = [c["name"] for c in self.snap()["clusters"]]
         self.assertIn("member-00, member-01, member-02 and 7 more projects (clusters unread)", names)
         self.assertEqual(len(names), 2)
+
+    def test_one_more_unread_project_is_singular(self):
+        self.next_mode([(f"member-{i:02d}", "denied") for i in range(4)], {})
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("member-00, member-01, member-02 and 1 more project (clusters unread)", names)
 
     def test_findings_rank_ahead_of_the_unlisted_rows(self):
         self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
@@ -438,10 +499,9 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         self.assertEqual(len([r for r in rows if not r.get("unlisted")]), board_snapshot.CLUSTERS_MAX)
         self.assertEqual(board["cluster_count"], hot)
 
-    def test_a_card_in_a_project_listed_live_has_no_cluster_label(self):
-        # Under next the label is derived from the clusters the resolved scope
-        # lists; the management and explicit projects are listed live, so no
-        # name is derived for their clusters and no profile is read for one.
+    def test_a_card_in_a_project_listed_live_with_no_profile_has_no_cluster_label(self):
+        # A project listed live labels its cards from its own profiles (above);
+        # a card filed to a profile name no profile carries gets no label.
         from cluster_agent_profile import profile_name
 
         self.next_mode([], {})
