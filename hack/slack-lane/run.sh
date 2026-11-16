@@ -16,8 +16,9 @@
 # Secret Manager in ${SLACK_LANE_SECRETS_PROJECT}, the project the nightly
 # already reads its shared GitLab tokens from (hack/ci-eval-pr.sh,
 # read_gitlab_token). Absent any of them, the lane prints one skip line and
-# exits 0. Nothing runs it on a schedule yet: it runs by hand against an
-# install, and a nightly part is to call it once the Slack test account exists.
+# exits 0. The nightly runs it as ci-kube-agents-eval-nightly-slack
+# (EVAL_SLACK_LANE=1 in hack/ci-eval-pr.sh, which also arms Slack on the install
+# in hack/ci-deploy.sh); by hand it runs against any install set up as below.
 #
 # Beside the three Slack values it needs what any devops-bench run against the
 # install needs: PROJECT_ID, CLUSTER_NAME, AGENT_CLUSTER_CONTEXT (the harness
@@ -94,8 +95,13 @@ record_overhead() { # <before file> <after file> <out file>
   echo "slack lane: overhead $(cat "$3")"
 }
 
-read_secret() { # <name> -> the value on stdout, newline stripped; empty when unreadable
-  gcloud secrets versions access latest --secret="$1" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>/dev/null | tr -d '\r\n'
+read_secret() { # <name> -> the value on stdout, newline stripped; empty when unreadable, its error class on stderr
+  local err
+  err="$(mktemp)"
+  gcloud secrets versions access latest --secret="$1" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>"${err}" | tr -d '\r\n'
+  # The error names the failure, never the value: NOT_FOUND or PERMISSION_DENIED.
+  grep -oE 'NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED' "${err}" | head -n 1 | sed "s|^|slack lane: $1: |" >&2 || true
+  rm -f -- "${err}"
 }
 
 main() {
