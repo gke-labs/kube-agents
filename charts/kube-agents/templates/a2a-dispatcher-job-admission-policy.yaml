@@ -36,7 +36,8 @@
 #
 # The operator writes a template before listing its ServiceAccount in the index, and unlists it
 # before deleting the template, so the index never names a ServiceAccount whose template is missing.
-# Only the operator writes DispatchJobTemplates: no Role it renders grants the kind, and the
+# Only the operator writes DispatchJobTemplates: no Role it renders grants a write on the kind
+# (the dispatcher's Jobs Role grants get, to read the template its config names), and the
 # built-in admin and edit roles don't aggregate it.
 #
 # WHY A CRD. The API server's param cache for a built-in param kind (a PodTemplate, a ConfigMap)

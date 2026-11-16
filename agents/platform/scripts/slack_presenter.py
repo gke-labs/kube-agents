@@ -405,6 +405,15 @@ CLAUSE_HEADLINE_MIN = 20
 #: A clause cut never falls inside a parenthetical or a link's label or url.
 CLAUSE_OPENERS = "(["
 CLAUSE_CLOSERS = ")]"
+# A word cut steps back from a head that ends on one of these: a connector leaves the headline
+# hanging ("…overnight and…") and a bare number loses its unit ("…found 209…"). It also prefers a
+# cut outside a bracket, so a parenthetical opens the detail whole when a word before it fits.
+WORD_CUT_HOLDS = frozenset(("a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "of", "on", "or",
+                            "the", "to", "with"))
+# A word cut never falls inside a link, whose label and url read as one word: a Markdown link, or
+# an mrkdwn link or mention (``<url|label>``, ``<@U…>``, ``<#C…|name>``, ``<!here>``); a bare
+# ``<`` of a comparison is not one.
+WORD_CUT_LINKS = (MD_LINK, re.compile(r"<(?:https?://|mailto:|[@#!])[^<>]*>"))
 
 
 def enabled() -> bool:
@@ -741,13 +750,38 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
 
     The headline is the first sentence of the first paragraph, as plain text
     capped at ``HEADLINE_MAX``; one longer than that is cut at a clause
-    (:func:`clause_cut`) and clipped only when no clause fits. The rest of that
+    (:func:`clause_cut`), or at a word with an ellipsis (:func:`word_cut`), and clipped only
+    when neither fits. The rest of that
     paragraph and every later paragraph are the body sections, still markdown,
     in order. Empty input gives ``("", [])``, and an answer that opens with a
     code fence has no headline: ``("", paragraphs)``.
     """
-    lead, body = split_lead(markdown)
+    lead, body = split_lead(markdown, word=True)
     return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
+
+
+def _bold_wrapped(sentence: str, marker: str) -> bool:
+    """Whether ``sentence`` is one bold run in ``marker`` from end to end: its code spans held, so a
+    ``**`` inside a code span does not read as a second run, and no edge marker inside, so an
+    in-word one (``2**20``) does not either."""
+    held, _spans = _hold_code(sentence)
+    return len(held) > 2 * len(marker) and held.startswith(marker) and held.endswith(marker) \
+        and not _bold_edges(held[len(marker) : -len(marker)], marker)
+
+
+def _bold_edges(text: str, marker: str) -> int:
+    """How many of ``marker``'s edges ``text`` holds, as :data:`BOLD_EDGES` reads them: an in-word
+    marker is none, and one that reads as both an opener and a closer (between two non-word
+    characters, a held code span or a bracket, say) is one."""
+    opener, closer = BOLD_EDGES[marker]
+    return len({match.start() for pattern in (opener, closer) for match in pattern.finditer(text)})
+
+
+def _opens_bold(head: str) -> bool:
+    """Whether ``head`` opens a bold run it does not close: an odd number of edge markers, an opener
+    among them. An in-word marker (``DB__HOST``, ``2**20``) is neither edge, as :data:`BOLD_EDGES`
+    reads it, so one after a closed run does not reopen it."""
+    return any(_bold_edges(head, marker) % 2 and opener.search(head) for marker, (opener, _closer) in BOLD_EDGES.items())
 
 
 def clause_cut(sentence: str) -> tuple[str, str] | None:
@@ -762,10 +796,8 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
     one, is cut inside the bold, and each half stays bold.
     """
     for marker in BOLD_MARKERS:
-        inner = sentence[len(marker) : -len(marker)]
-        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
-                and marker not in inner:
-            cut = clause_cut(inner)
+        if _bold_wrapped(sentence, marker):
+            cut = clause_cut(sentence[len(marker) : -len(marker)])
             return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
     if len(sentence) > CLAUSE_SCAN_MAX:
         # No headline comes from past the scan, so only its prefix is read, up to its last space,
@@ -787,7 +819,7 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
         head = held[: match.start()].rstrip()
         connector = match.group("connector") is not None
         rest = held[match.end("connector") if connector else match.end() :].strip()
-        if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
+        if not rest or _opens_bold(head):
             continue
         # A lone italic marker this head opens and does not close, as _first_sentence counts them.
         if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
@@ -811,11 +843,75 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
     return head, rest[:1].upper() + rest[1:] if LOWER_WORD.match(rest) else rest
 
 
-def split_lead(markdown: str, cut: bool = True) -> tuple[str, list[str]]:
+def word_cut(sentence: str) -> tuple[str, str] | None:
+    """``(headline, rest)`` for a first sentence longer than ``HEADLINE_MAX`` that :func:`clause_cut` cannot cut, or None.
+
+    A sentence with no clause break outside a bracket, a code span or an emphasis run (one long
+    parenthetical, say) used to be clipped at the cap with the clipped words dropped. The cut is
+    the last space outside a code span and a bold or italic run that leaves a headline of
+    :data:`CLAUSE_HEADLINE_MIN` to ``HEADLINE_MAX`` characters once plain, the ellipsis counted,
+    outside a bracket when one such space exists and inside one otherwise, never inside a link
+    (:data:`WORD_CUT_LINKS`) and never after a word in :data:`WORD_CUT_HOLDS` or a bare number; the
+    headline ends on the ellipsis and the rest
+    opens with one, so the sentence reads on in the detail as written. A sentence bold from end
+    to end is cut inside the bold, each half bold.
+    """
+    for marker in BOLD_MARKERS:
+        if _bold_wrapped(sentence, marker):
+            cut = word_cut(sentence[len(marker) : -len(marker)])
+            return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
+    if len(sentence) > CLAUSE_SCAN_MAX:
+        end = sentence.rfind(" ", 0, CLAUSE_SCAN_MAX)
+        end = end if end > 0 else CLAUSE_SCAN_MAX
+        cut = word_cut(sentence[:end])
+        return (cut[0], cut[1] + sentence[end:]) if cut else None
+    held, spans = _hold_code(sentence)
+    limit = HEADLINE_MAX - len(ELLIPSIS)
+    links = [match.span() for pattern in WORD_CUT_LINKS for match in pattern.finditer(held)]
+    outside = inside = None
+    depth = 0
+    for offset, char in enumerate(held):
+        if char in CLAUSE_OPENERS:
+            depth += 1
+        elif char in CLAUSE_CLOSERS and depth:
+            depth -= 1
+        if char != " " or any(start < offset < end for start, end in links):
+            continue
+        head, rest = held[:offset].rstrip(), held[offset:].strip()
+        if not rest or _opens_bold(head):
+            continue
+        if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
+               for marker, (opener, _closer) in ITALIC_EDGES.items()):
+            continue
+        title = len(_plain(_restore_code(head, spans)))
+        if title > limit:
+            break
+        last = head.rsplit(" ", 1)[-1].lstrip(CLAUSE_OPENERS + CLAUSE_EMPHASIS).rstrip(CLAUSE_EMPHASIS)
+        if title < CLAUSE_HEADLINE_MIN or last.lower() in WORD_CUT_HOLDS or (last.isascii() and last.isdigit()):
+            continue
+        if depth:
+            inside = head, rest
+        else:
+            outside = head, rest
+    found = outside or inside
+    if found is None:
+        return None
+    head, rest = (_restore_code(part, spans) for part in found)
+    # A sentence that carries its own ellipsis at the cut is not given a second one.
+    if not head.rstrip(CLAUSE_EMPHASIS).endswith(ELLIPSIS):
+        head += ELLIPSIS
+    if not rest.lstrip(CLAUSE_EMPHASIS).startswith(ELLIPSIS):
+        rest = ELLIPSIS + rest
+    return head, rest
+
+
+def split_lead(markdown: str, cut: bool = True, word: bool = False) -> tuple[str, list[str]]:
     """:func:`split_answer` with the first sentence as it was written: markdown, unclipped.
 
     A first sentence longer than ``HEADLINE_MAX`` is cut at a clause (:func:`clause_cut`), the
-    rest leading the body; with ``cut`` False, or when no clause fits, it comes back whole.
+    rest leading the body, and with ``word`` True at a word with an ellipsis when no clause fits
+    (:func:`word_cut`), as :func:`split_answer` asks, so its clip drops nothing; with ``cut`` False,
+    or when nothing fits, it comes back whole.
     """
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
@@ -838,6 +934,8 @@ def split_lead(markdown: str, cut: bool = True) -> tuple[str, list[str]]:
     held, spans = _hold_code(LIST_MARKER.sub("", joined))
     sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
     clause = clause_cut(sentence) if cut and len(_plain(sentence)) > HEADLINE_MAX else None
+    if clause is None and cut and word and len(_plain(sentence)) > HEADLINE_MAX:
+        clause = word_cut(sentence)
     if clause:
         sentence, overflow = clause
         remainder = " ".join(part for part in (overflow, remainder) if part)

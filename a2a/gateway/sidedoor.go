@@ -17,16 +17,15 @@ import (
 // exit alive.
 const sideDoorDrainBound = 3 * injectShutdownGrace
 
-// The side doors beside a real backend: one gateway, several ingresses.
+// The side doors beside the real backends: one gateway, several ingresses.
 //
-// The one-backend guard refuses two real backends because two processes on
-// one Chat relay durable split its event deliveries, and the symptom is a
-// gateway that answers half the messages. A door has no such failure mode --
-// it consumes nothing and competes for nothing -- and stage 2 of the eval
-// transport needs the inject door and the Chat relay on one install so the
-// two can be compared against it (the A2A owner's reading, 2026-09-17). The
-// A2A door sits beside them for the same reason: an external agent and a
-// chat user reach the same gateway.
+// The mux carries every armed real backend, each on its own transport, so a
+// door beside them competes with nothing. The doors are still not backends,
+// decided 2026-09-17: a door consumes nothing and competes for nothing, and
+// stage 2 of the eval transport needs the inject door and the Chat relay on
+// one install so the two can be compared against it (the A2A owner's
+// reading). The A2A door sits beside them for the same reason: an external
+// agent and a chat user reach the same gateway.
 //
 // So this composite, rather than a second Deployment: Run delivers from every
 // half into the same handleInbound, and everything the gateway sends back is
@@ -321,11 +320,16 @@ func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verifi
 	}
 }
 
-// OpenDirect goes to the real backend, because a user id is not qualified the
-// way a conversation is and the DM switch is a chat affordance: the caller
-// that will one day use it is a classifier deciding to move a reply out of a
-// room, which only a room has. With no real backend the first door answers,
-// as the inject door alone did when it was the gateway's only ingress.
+// OpenDirect goes to the chat stack, because the DM switch is a chat
+// affordance: the caller that will one day use it is a classifier deciding to
+// move a reply out of a room, which only a room has. Behind the mux a user id
+// may name its backend as <backend>:<id>, and the mux routes it there with
+// the bare id. A chat backend name the mux knows (gchat, slack, discord,
+// console) that is not armed is refused by name. On
+// a one-backend mux any id without a known backend prefix goes whole to that
+// backend; with several backends armed, a bare or unknown-prefixed id is
+// refused. With no chat stack the first door answers, as the inject door
+// alone did when it was the gateway's only ingress.
 func (s *sideDoorAdapter) OpenDirect(userID string) (string, error) {
 	if s.primary != nil {
 		return s.primary.OpenDirect(userID)

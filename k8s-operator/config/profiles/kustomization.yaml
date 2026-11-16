@@ -1,0 +1,34 @@
+# The profile namespace and the operator's grant in it, for a kustomize
+# install. The chart renders the same three objects (profiles-namespace.yaml
+# and the second Role and RoleBinding in operator-rbac.yaml) under mode next.
+# Profile worker pods run in <install namespace>-profiles, and the operator
+# writes there (ConfigMaps, ServiceAccounts, Deployments, Roles, the quota,
+# the fence, the dispatcher's params) under the namespaced Role document of
+# config/rbac/role.yaml, which it must be bound to in each namespace it writes
+# in. This is its own kustomization because config/default's `namespace:`
+# rewrites every namespaced object to the install namespace; `make deploy`
+# applies it after config/default. role.yaml here is the Role document of
+# config/rbac/role.yaml, copied by `make chart-sync` and held to it by
+# `make chart-check` (kustomize refuses a resource above its own directory).
+# docs/designs/operator-namespaced-write-verbs.md.
+# A kustomize install that changes config/default's `namespace:` changes three
+# literals here too: this `namespace:`, the release-namespace annotation in
+# namespace.yaml (the operator checks it against the agent's namespace), and
+# the RoleBinding subject's namespace in role_binding.yaml.
+namespace: kubeagents-system-profiles
+namePrefix: kubeagents-
+resources:
+  - namespace.yaml
+  - role.yaml
+  - role_binding.yaml
+# The same four labels config/default puts on every object it installs
+# (docs/site: reference/resource-labels.md), so the profile namespace's
+# objects answer the same one-query selection.
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/name: kube-agents-operator
+      app.kubernetes.io/instance: kube-agents-operator
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize

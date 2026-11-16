@@ -36,6 +36,7 @@ import credential_proxy
 import credential_proxy_client
 import feedback_broker
 import gke_endpoint
+import no_live_kubectl
 import providers
 import scope_exclude
 import vcs_broker
@@ -133,6 +134,23 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
 _SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class _FakeClock:
@@ -4976,28 +4994,32 @@ class CommandExecutorTest(unittest.TestCase):
         # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
         # that names no endpoint would otherwise move an internal-ip cluster
         # back to its public IP for every brokered kubectl after it.
-        executor = self.fake_gcloud(self.executor())
-        seen = []
-        original = executor._execute
+        # Both endpoint flags: a caller under the kube-api proxy sends no flag
+        # (gke_endpoint.KUBE_PROXY_ENVS), so a DNS-only cluster relies on this too.
+        for flag in ("--internal-ip", "--dns-endpoint"):
+            with self.subTest(flag):
+                executor = self.fake_gcloud(self.executor())
+                seen = []
+                original = executor._execute
 
-        def record(argv, **kwargs):
-            seen.append(argv)
-            return original(argv, **kwargs)
+                def record(argv, _seen=seen, _original=original, **kwargs):
+                    _seen.append(argv)
+                    return _original(argv, **kwargs)
 
-        with (
-            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
-            mock.patch.object(executor, "_execute", record),
-        ):
-            executor.execute(
-                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
-                 "--location=us-central1", "--project=demo-project"],
-            )
+                with (
+                    mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([flag])) as decide,
+                    mock.patch.object(executor, "_execute", record),
+                ):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
 
-        fetches = [argv for argv in seen if "get-credentials" in argv]
-        self.assertEqual(1, len(fetches))
-        self.assertEqual("--internal-ip", fetches[0][-1])
-        decide.assert_called_once()
-        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+                fetches = [argv for argv in seen if "get-credentials" in argv]
+                self.assertEqual(1, len(fetches))
+                self.assertEqual(flag, fetches[0][-1])
+                decide.assert_called_once()
+                self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
 
     def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
         # Every spelling a hand-typed command might carry: a global flag with a
@@ -16425,7 +16447,7 @@ def yaml_value(text):
 # outside the enum fails Envoy's validation, and any other shape fails the
 # load. A UInt32Value takes a JSON number with no fraction or a string
 # spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
-# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# 1.39.1 and re-checked on 1.39.6, --mode validate, on each shape the tests below name). pyyaml's
 # integers are Envoy's: yaml-cpp converts a scalar with the base left to its
 # prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
 # shows.
@@ -16798,7 +16820,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
         # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
         # loader; proto-JSON, given a string that is not an enum value's
-        # name, reads the number it spells. Envoy 1.39.1 loads
+        # name, reads the number it spells. Envoy 1.39.1 and 1.39.6 load
         # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
         # that threshold's count, so the cap has to read it the same way
         # rather than fall to 1024 under a breaker of 4096; `"2"` fails
@@ -16820,7 +16842,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
             self.assertIsNone(credential_proxy._routing_priority(value), value)
 
     def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
-        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # max_connections is a UInt32Value: Envoy 1.39.1 and 1.39.6 refuse to load
         # 4294967296 (`integer out of range`) and loads 4294967295, so the
         # first is not a count and the second is. An integer pyyaml read
         # from the file needs no re-reading: yaml-cpp converts a scalar with

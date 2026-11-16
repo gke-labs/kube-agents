@@ -249,7 +249,11 @@ jobs:
           fi
           cd a2a
           go vet ./...
-          KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race ./...
+          # Each package's test binary gets go test's 10-minute default unless
+          # told otherwise, and the gateway package alone runs about 9.5
+          # minutes under -race on this runner. 20 minutes stays inside the
+          # job's 30 and leaves room for the suite to grow.
+          KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race -timeout 20m ./...
 
       # The one writer; see the twin step in k8s-operator-test.yml.
       - name: Save envtest binaries to the cache

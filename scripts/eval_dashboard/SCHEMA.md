@@ -1510,14 +1510,18 @@ daily passed having reached every project the failed build named, at the same
 `fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
 is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
-failed itself, so its own note is the current story and nothing clears; `by`
+failed itself on a build that owes a hand step, so its own note is the current
+story and nothing clears (a later failure the next run retries writes none of
+its own unless a project persists, and silences nothing); `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,
-`summary`), what the clear cites. A failed build whose report is absent or
-cut short is never recovered by a pass, and a silence ends when a later daily
-passes without reaching the projects. The
+`summary`, `passed`), what the clear cites; a later daily that failed
+elsewhere but applied the projects at the same tree is a recovery too, cited
+with `passed` false. A failed build whose report is absent or cut short is
+never recovered, and a silence ends when a later daily passes without reaching
+the projects, or fails without reaching them on a build that owes no hand step. The
 entry is carried from the previous tick while `build` is still the job's
 latest, unchanged on a tick blind to either job, so neither re-opens the
-failure, and a silence becomes a recovery once a later pass reaches the
+failure, and a silence becomes a recovery once a later run reaches the
 projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
@@ -1530,8 +1534,12 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the reconciles and for the certification slice), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+failure for the certification slice and the replay lane, and for the reconciles
+the first failure that owes a hand step, otherwise a project at `PERSISTENT_AFTER`
+consecutive runs: [`ci-health.md`](../../docs/ci-health.md), "The watched
+periodics"), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`) or, for the postsubmit reconcile, a
+`periodics_superseded` recovery, not on a sub-threshold failure, and
 a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note

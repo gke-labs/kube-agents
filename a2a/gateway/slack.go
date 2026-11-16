@@ -836,6 +836,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				}
 				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
 					s.metrics.slackIngress(arrived, eventTS)
+					msg.ArrivedAt = arrived
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)

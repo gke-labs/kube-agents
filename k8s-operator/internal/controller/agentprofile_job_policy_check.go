@@ -87,13 +87,10 @@ const jobModeOffConsequence = "so unattended profile tasks have no worker and ar
 // jobModeTornDown is the verdict of a pass that tore Job mode down, or found
 // nothing of it left to tear down: removeA2ADispatcher with the dispatcher
 // disabled and the gate-off sweep with the signal off, each run to
-// completion, and cleanupA2AWithJobMode on a flip to today when it reports
-// tornDown (its delete of the Jobs Role, the Jobs and the templates
-// succeeded, or nothing of the stack was left). It alone removes the
+// completion. It alone removes the
 // condition. A pass that returns before any of them (a refusal above the A2A
-// step, a sweep that failed), or a flip whose profile-namespace delete of
-// those failed, leaves the condition as it was, as BusCredentialsReady is
-// left on a refused flip: the Jobs Role and the templates are still live,
+// step, a sweep that failed) leaves the condition as it was: the Jobs Role
+// and the templates are still live,
 // and an absent condition would say Job mode is off. Compared by identity.
 var jobModeTornDown = &metav1.Condition{Type: dispatcherJobModeCondition}
 

@@ -128,6 +128,7 @@ func doorDelegation(t *testing.T) func(*Config) {
 // raw result), then one completed terminal, in that order, and nothing at
 // all under the child's or the wake's id.
 func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, backend, conv string
 		tweak               func(t *testing.T) func(*Config)
@@ -182,6 +183,7 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 // reports the same end once the chain settles. The room still gets the
 // turn's line and the notice.
 func TestARefusedDelegationEndsTheRootFailed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, rule, backend, conv string
 		tweak                     func(t *testing.T) func(*Config)
@@ -281,6 +283,7 @@ func assertHandOffNotDelivered(t *testing.T, r *rig, obs *recordingObserver, con
 // `completed` is only the hand-off line: the root ends failed with a
 // delegation-not-started reason naming why, and nothing is delivered.
 func TestAnIgnoredDelegationEndsTheRootFailed(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-ignored"
 	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "do a thing")
@@ -297,6 +300,7 @@ func TestAnIgnoredDelegationEndsTheRootFailed(t *testing.T) {
 // `completed` on the hand-off line, which is not an answer: the root ends
 // failed, the child could not reach the bus, and nothing is delivered.
 func TestAChildThatCannotReachTheBusEndsTheRootFailed(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-child-off-bus"
 	exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
@@ -314,6 +318,7 @@ func TestAChildThatCannotReachTheBusEndsTheRootFailed(t *testing.T) {
 // called the tool `completed` with the hand-off line. That is not an answer:
 // the root ends failed, the turn was stopped, and nothing is delivered.
 func TestAStoppedTurnsIgnoredDelegationEndsTheRootFailed(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-stopped"
 	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
@@ -335,6 +340,7 @@ func TestAStoppedTurnsIgnoredDelegationEndsTheRootFailed(t *testing.T) {
 // root ends failed, the request could not be read, and nothing is delivered.
 // The probe, reading the stream fine later, reports the same recorded end.
 func TestATerminalWhoseReplayFailsDoesNotDeliverTheHandOff(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-replay-fails"
 	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
@@ -370,6 +376,7 @@ func TestATerminalWhoseReplayFailsDoesNotDeliverTheHandOff(t *testing.T) {
 // a turn whose stream carries a delegate request; any other session turn's
 // answer and terminal reach the observer as before, and the probe agrees.
 func TestATurnThatNeverDelegatedKeepsItsOwnEnd(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-plain"
 	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "hello")
@@ -397,6 +404,7 @@ func TestATurnThatNeverDelegatedKeepsItsOwnEnd(t *testing.T) {
 // root canceled; a wake that cannot run (here, the requester aged out) is
 // the root failed, with a reason token naming it. Neither delivers.
 func TestAChainThatEndsWithoutAWakeEndsTheRoot(t *testing.T) {
+	t.Parallel()
 	t.Run("a human stop", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-stop"
@@ -465,6 +473,7 @@ func assertNoDelivery(t *testing.T, obs *recordingObserver) {
 // observer nothing for the child; the wake it starts delivers under the
 // root, as the relay's wake does.
 func TestAHealedChildsResultIsNotTheRootsDeliverable(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-heal"
 	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
@@ -515,6 +524,7 @@ func TestAHealedChildsResultIsNotTheRootsDeliverable(t *testing.T) {
 // wake's result. The heal runs here as routeTurn runs it, under the session
 // lock that holds the relay's batch back.
 func TestTheHealLeavesAnUnrelayedDelegationToTheRelay(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	ctx := context.Background()
 	conv := injectKeyPrefix + "case-heal-unrelayed"
@@ -582,6 +592,7 @@ func TestTheHealLeavesAnUnrelayedDelegationToTheRelay(t *testing.T) {
 // nothing delivered. Either way nothing announces the hand-off line as the
 // root's end.
 func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
+	t.Parallel()
 	const grace = time.Second
 	lost := func(t *testing.T, tweak func(*Config), conv string, forgeTS bool) (*rig, *fakeSpawner, *recordingObserver, *lib.Envelope) {
 		t.Helper()
@@ -765,6 +776,7 @@ func offTheList(c *Config) {
 // wake's result, or it refuses, and the root ends failed. Never is the
 // hand-off line the root's deliverable.
 func TestALostDelegateArtifactIsRunFromTheStreamAtTheTerminal(t *testing.T) {
+	t.Parallel()
 	lost := func(t *testing.T, tweak func(*Config), conv string) (*rig, *fakeSpawner, *recordingObserver, *lib.Envelope) {
 		t.Helper()
 		r, spawn, _ := startObservedRig(t, func(c *Config) {
@@ -849,6 +861,7 @@ func TestALostDelegateArtifactIsRunFromTheStreamAtTheTerminal(t *testing.T) {
 // the relay runs it, and the batch's in-memory record is then dropped
 // unwritten, which is what a failed end-of-batch write leaves behind.
 func TestARefusalIsOnTheStoreWhenItIsMade(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, func(c *Config) {
 		armInjectMap(t, c)
 		offTheList(c)
@@ -895,6 +908,7 @@ func TestARefusalIsOnTheStoreWhenItIsMade(t *testing.T) {
 // sees the request handled and heals the turn as any lost terminal, rather
 // than running the refusal and the hand-off line a second time.
 func TestTheHealDoesNotRerunARefusalTheRelayMade(t *testing.T) {
+	t.Parallel()
 	const grace = time.Second
 	r, spawn, _ := startObservedRig(t, func(c *Config) {
 		armInjectMap(t, c)
@@ -947,6 +961,7 @@ func TestTheHealDoesNotRerunARefusalTheRelayMade(t *testing.T) {
 // root's id, so tasks/cancel names it while the child runs. The cancel goes
 // to the child, the task that is running, and is announced under the root.
 func TestACancelNamingTheRootStopsTheActiveChild(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-cancel"
 	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
@@ -982,6 +997,7 @@ func TestACancelNamingTheRootStopsTheActiveChild(t *testing.T) {
 // parent's turn, which ended when it delegated, and is announced under the
 // root.
 func TestACancelNamingTheRootAfterTheHealStopsTheChild(t *testing.T) {
+	t.Parallel()
 	const grace = 500 * time.Millisecond
 	r, spawn, obs := startObservedRig(t, func(c *Config) {
 		armInjectMap(t, c)
@@ -1026,6 +1042,7 @@ func TestACancelNamingTheRootAfterTheHealStopsTheChild(t *testing.T) {
 // reads the chain's running task through the probe, not the parent's own
 // finished stream, until the chain ends.
 func TestTheProbeReadsTheRootAsTheChainsActiveTask(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-probe"
 	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
@@ -1049,6 +1066,7 @@ func TestTheProbeReadsTheRootAsTheChainsActiveTask(t *testing.T) {
 // stays live through the chain and ends completed with the wake's result as
 // its artifact, and the door never learns the child's or the wake's id.
 func TestTheA2ADoorShowsADelegatingTurnAsOneTask(t *testing.T) {
+	t.Parallel()
 	spawn := &fakeSpawner{}
 	r := startA2ARigOpts(t, func(d *A2ADoor) Adapter { return d }, spawn, func(c *Config) {
 		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {a2aBackend: {a2aTestCaller}}}
@@ -1106,6 +1124,7 @@ func TestTheA2ADoorShowsADelegatingTurnAsOneTask(t *testing.T) {
 // terminal on the stream before the record names the child it minted. The
 // probe reports the root running, with no result to adopt.
 func TestTheProbeNeverReportsTheRootFinalFromAChainTask(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		stale func(rec *SessionRecord, root, child string, parentActive, childActive ActiveTask)
@@ -1175,6 +1194,7 @@ func TestTheProbeNeverReportsTheRootFinalFromAChainTask(t *testing.T) {
 // terminal and result, or, with no wake, the end the observer was told. A
 // turn that never delegated reads its own stream, as before.
 func TestASettledChainProbesAsItsLastTask(t *testing.T) {
+	t.Parallel()
 	settled := func(t *testing.T, r *rig, obs *recordingObserver, conv, root string) (ConversationState, observed) {
 		t.Helper()
 		waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(root); return ok })
@@ -1279,6 +1299,7 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 // addressee's work. A probe that did not ask reads no extra streams and
 // carries none.
 func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startObservedRig(t, doorDelegation(t))
 	ctx := context.Background()
 	conv := "a2a:agent-1001/ctx-usage-chain"
@@ -1403,6 +1424,7 @@ func TestChainChildAddresseesNameTheChainsChildrenOnce(t *testing.T) {
 // The door's one deliverable is the last turn's answer; earlier turns are
 // history posts.
 func TestTurnAnswersPostAndOnlyTheLastIsDelivered(t *testing.T) {
+	t.Parallel()
 	r, _, obs := startObservedRig(t, nil)
 	conv := "discord:g1/obs-turns"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ot-1", Text: "check the fleet"}

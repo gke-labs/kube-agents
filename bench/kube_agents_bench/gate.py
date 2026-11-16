@@ -105,7 +105,7 @@ from kube_agents_bench.scoring import (
     Rung,
     grade_case,
     grade_suite,
-    is_inject_record,
+    is_next_lane_record,
     load_run,
     token_count,
 )
@@ -156,7 +156,7 @@ ROLLBACK_LANE_ENV = "EVAL_ROLLBACK_LANE"
 
 def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) -> str:
     """The ``spec.mode`` the matrix graded: next when a repetition's record is
-    the inject transport's (``inject_run``, read off the run like the other
+    the inject transport's or the A2A door's (``inject_run``, read off the run like the other
     run-derived components) or, failing that, under ``AGENT_TRANSPORT=inject``;
     today otherwise.
 
@@ -496,9 +496,10 @@ def _cmd_case(args: argparse.Namespace) -> int:
         return 2
 
     # The mode is the one component read across every repetition: any record
-    # carrying the inject transport's marker makes the run next's.
+    # carrying the inject transport's marker, or the A2A door's send entry,
+    # makes the run next's.
     loaded = [load_run(d) if d else None for d in run_dirs]
-    inject_run = any(r is not None and is_inject_record(r.trajectory) for r in loaded)
+    inject_run = any(r is not None and is_next_lane_record(r.trajectory) for r in loaded)
     for record in loaded:
         if record is None or record.empty_record:
             continue

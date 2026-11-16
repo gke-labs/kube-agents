@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -206,7 +205,7 @@ func startEmbeddedJetStream(t *testing.T) string {
 	}
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        lib.StreamTopicsJournal,
-		Subjects:    []string{SubjectAnnotations, SubjectCuratorOutcomes},
+		Subjects:    []string{SubjectAnnotations},
 		AllowDirect: true,
 	}); err != nil {
 		t.Fatalf("create TOPICS-JOURNAL: %v", err)
@@ -214,21 +213,10 @@ func startEmbeddedJetStream(t *testing.T) string {
 	return ns.ClientURL()
 }
 
-func runGitTestCmd(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
-	}
-}
-
 func commitRecordInGit(t *testing.T, repoDir string, rec Record) {
 	t.Helper()
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
-		runGitTestCmd(t, repoDir, "init")
-	}
 	rec.Meta.Status = StatusActive
-	if len( rec.Meta.Scope.Paths) == 0 && len(rec.Meta.Scope.Resources) == 0 && len(rec.Meta.Scope.Checks) == 0 {
+	if len(rec.Meta.Scope.Paths) == 0 && len(rec.Meta.Scope.Resources) == 0 && len(rec.Meta.Scope.Checks) == 0 {
 		rec.Meta.Scope.Paths = []string{"**"}
 	}
 	if rec.Meta.Type == RecordTypeLesson && rec.Meta.Evidence.PullRequest == "" {
@@ -240,8 +228,6 @@ func commitRecordInGit(t *testing.T, repoDir string, rec Record) {
 	if err := SaveRecord(repoDir, &rec); err != nil {
 		t.Fatalf("SaveRecord for git commit: %v", err)
 	}
-	runGitTestCmd(t, repoDir, "add", "-A")
-	runGitTestCmd(t, repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "merge "+rec.Meta.ID)
 }
 
 func promoteExistingRecordInGit(t *testing.T, repoDir, id, prRef string) {
@@ -706,6 +692,7 @@ spec:
 				Severity: "warn",
 			}
 			r.Meta.Evidence.PullRequest = "https://github.com/acme/infra/pull/273 (#273)"
+			r.Body += "\n## Reviewer Modification Before Merge\n\nReviewer expanded scope from staging-only to staging and preprod before merging.\n"
 			commitRecordInGit(t, repoDir, r)
 			break
 		}
@@ -2071,6 +2058,56 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 		}
 	}
 
+	// Verify an unverified OutcomeModifiedMerged with KnowledgePR=true stays StatusProposed when not active in Git.
+	unverifiedModRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeModifiedMerged,
+		RecordID:    "DEC-2026-002",
+		RecordType:  RecordTypeDecision,
+		KnowledgePR: true,
+		Title:       "Unverified modified-merged claiming KnowledgePR=true",
+		Rule:        "Allow 1 replica",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unverifiedModRes.Status != StatusProposed {
+		t.Fatalf("unverified OutcomeModifiedMerged with KnowledgePR=true must stay status=proposed, got %s", unverifiedModRes.Status)
+	}
+
+	// Verify that on a Git-verified active record (DEC-2026-001), OutcomeApproved takes Title, Scope, Guard,
+	// Supersedes, and Body strictly from gitRec and ignores publisher-supplied Guard/Summary/Title overrides.
+	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeApproved,
+		RecordID:   "DEC-2026-001",
+		RecordType: RecordTypeDecision,
+		Title:      "Injected Publisher Title",
+		Summary:    "Injected publisher summary body section",
+		Guard: &RecordGuard{
+			Rule:     "Injected publisher guard",
+			Severity: "block",
+			Expect:   &GuardExpect{File: "clusters/**", Path: "spec.replicas", Op: ">=", Value: 99},
+		},
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+	recsAfterVerify, err := LoadRecords(gitRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recsAfterVerify {
+		if r.Meta.ID == "DEC-2026-001" {
+			if r.Meta.Title != "Human-merged active rule" {
+				t.Fatalf("expected Git-verified Title to be preserved, got %q", r.Meta.Title)
+			}
+			if r.Meta.Guard == nil || r.Meta.Guard.Expect != nil || r.Meta.Guard.Rule != "Require 2 replicas." {
+				t.Fatalf("expected Git-verified Guard without publisher-injected Expect, got %+v", r.Meta.Guard)
+			}
+			if strings.Contains(r.Body, "Injected publisher summary") {
+				t.Fatalf("expected Git-verified Body to ignore publisher Summary, got:\n%s", r.Body)
+			}
+		}
+	}
+
 	// 6. Medium 3: Simulate emptyDir restart by creating a new Curator on a fresh empty directory
 	// connected to the same Hindsight and NATS TOPICS-STATE. NextRecordID must not reset to DEC-2026-001.
 	freshEmptyDir := t.TempDir()
@@ -2102,12 +2139,6 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	mockHS.mu.Unlock()
 	if !has002 || !has003 {
 		t.Fatalf("expected Hindsight to retain both DEC-2026-002 and DEC-2026-003 without collision")
-	}
-
-	// Verify outcome was journaled to TOPICS-JOURNAL on SubjectCuratorOutcomes.
-	journalEnv, jErr := client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectCuratorOutcomes)
-	if jErr != nil || journalEnv == nil {
-		t.Fatalf("expected outcome to be journaled on TOPICS-JOURNAL (%s), err=%v", SubjectCuratorOutcomes, jErr)
 	}
 }
 

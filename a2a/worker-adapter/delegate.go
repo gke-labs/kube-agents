@@ -133,6 +133,57 @@ func validateDelegate(req lib.DelegateRequest) string {
 	return ""
 }
 
+// The refusals of a batch the turn may not send, and the prefix that names
+// the entry a per-entry refusal is about.
+const (
+	refuseBatchNoWidth   = "this conversation takes one task per call; send addressee and text"
+	refuseBatchOverWidth = "%d tasks; this conversation may hand out at most %d in one call: split them over turns or pick the ones that matter"
+	batchEntryRefusal    = "task %d: %s"
+)
+
+// validateDelegateFor is validateDelegate for a request that may be a batch:
+// the single shape is checked as it always was, and a batch is held to the
+// shape (lib.ValidateDelegateRequest), to the width the turn's targets
+// advertised (one when none: a gateway built before batches would drop the
+// tasks list), and each entry to validateDelegate.
+func validateDelegateFor(req lib.DelegateRequest, width int) string {
+	if !req.IsBatch() {
+		return validateDelegate(req)
+	}
+	if req.Addressee != "" || req.Text != "" || len(req.Parameters) > 0 || len(req.Tasks) == 0 {
+		return lib.ValidateDelegateRequest(req).Error()
+	}
+	if width <= 1 {
+		return refuseBatchNoWidth
+	}
+	if len(req.Tasks) > width {
+		return fmt.Sprintf(refuseBatchOverWidth, len(req.Tasks), width)
+	}
+	for i, e := range req.Tasks {
+		if why := validateDelegate(lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}); why != "" {
+			return fmt.Sprintf(batchEntryRefusal, i+1, why)
+		}
+	}
+	return ""
+}
+
+// delegatedTo is how a published request reads in the turn's reply and
+// result: the addressee for one child, the count and the distinct addressees
+// for a batch.
+func delegatedTo(req lib.DelegateRequest) string {
+	entries := req.Entries()
+	if len(entries) == 1 {
+		return "delegated to " + entries[0].Addressee
+	}
+	var names []string
+	for _, e := range entries {
+		if !slices.Contains(names, e.Addressee) {
+			names = append(names, e.Addressee)
+		}
+	}
+	return fmt.Sprintf("delegated %d tasks to %s", len(entries), strings.Join(names, ", "))
+}
+
 // taskSocketSuffixBytes is the random part of a reused pod's per-turn
 // delegate socket name, in bytes (twice as many hex characters).
 const taskSocketSuffixBytes = 8
@@ -187,6 +238,21 @@ func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
 		return argv, false
 	}
 	return withDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+}
+
+// delegateWidthOf is the batch width the submission's delegateTargets part
+// advertises, or one when it has no part or one that doesn't parse: the
+// single shape, which every gateway takes.
+func delegateWidthOf(origin *lib.Envelope) int {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return 1
+	}
+	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
+	if !ok || err != nil {
+		return 1
+	}
+	return targets.Width()
 }
 
 // withDelegateServerEnv sets key to value in the delegate MCP server's env

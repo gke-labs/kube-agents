@@ -225,7 +225,11 @@ class HealthRulesRenderTest(unittest.TestCase):
 
     def test_the_scrape_alert_watches_the_nats_exporter_only_where_it_runs(self):
         # The operator omits the exporter sidecar when A2A_NATS_IMAGE is set
-        # and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). There
+        # and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). The
+        # chart sets both from a2aBus.images, except where operator.extraEnv
+        # sets the bus image alone (the mirror from before the exporter
+        # existed: kube-agents.a2aBusExporterFromChart keeps the chart's pin
+        # out) or clears the exporter's while the bus image stays set. There
         # the scrape would only ever read down, so neither the PodMonitoring
         # nor the alert's job renders; everywhere else both do, so a hung or
         # dead exporter fires the alert.
@@ -236,13 +240,19 @@ class HealthRulesRenderTest(unittest.TestCase):
         # a later empty entry clears an earlier one.
         image_then_cleared = image + ["--set", "operator.extraEnv[1].name=A2A_NATS_IMAGE", "--set-string", "operator.extraEnv[1].value="]
         exporter_then_cleared = image + exporter + ["--set", "operator.extraEnv[2].name=A2A_NATS_EXPORTER_IMAGE", "--set-string", "operator.extraEnv[2].value="]
+        exporter_cleared = ["--set", "operator.extraEnv[0].name=A2A_NATS_EXPORTER_IMAGE", "--set-string", "operator.extraEnv[0].value="]
         for name, extra, rendered in (
             ("default", [], True),
+            # The chart keeps its exporter pin out for a bus image set alone.
             ("nats image overridden alone", image, False),
             ("both overridden", image + exporter, True),
             ("nats image empty", empty, True),
             ("nats image set, then cleared by a later entry", image_then_cleared, True),
             ("exporter image set, then cleared by a later entry", exporter_then_cleared, False),
+            # The chart's own A2A_NATS_IMAGE is still set.
+            ("exporter image cleared alone", exporter_cleared, False),
+            ("no a2aBus values, as a reused older release's", ["--set", "a2aBus=null"], True),
+            ("no a2aBus values, nats image overridden alone", ["--set", "a2aBus=null", *image], False),
         ):
             with self.subTest(name):
                 docs = _render(*_ON, *extra)

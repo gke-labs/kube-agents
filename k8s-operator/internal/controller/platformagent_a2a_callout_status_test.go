@@ -31,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -269,25 +268,6 @@ func TestAPendingMapIsLookedAtAgainSoon(t *testing.T) {
 	}
 	if res.RequeueAfter <= 0 || res.RequeueAfter > a2aPendingRequeue {
 		t.Errorf("a pass with the map Pending requeues after %v, want within %v", res.RequeueAfter, a2aPendingRequeue)
-	}
-}
-
-// With the A2A stack off there is no callout, so no claim about its map:
-// a condition left from when it was on goes.
-func TestTheConditionGoesWhenTheA2AStackIsOff(t *testing.T) {
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	agent.Status.Conditions = []metav1.Condition{{Type: a2aIdentityMapAppliedConditionType, Status: metav1.ConditionTrue,
-		Reason: a2aIdentityMapServing, Message: "left over", LastTransitionTime: metav1.Now()}}
-	r, cl, req := a2aGateTestReconciler(t, agent)
-	ctx := context.Background()
-	reconcileTwice(t, ctx, r, req)
-	got := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
-		t.Fatal(err)
-	}
-	if c := meta.FindStatusCondition(got.Status.Conditions, a2aIdentityMapAppliedConditionType); c != nil {
-		t.Errorf("with the A2A stack off the condition stayed: %+v", c)
 	}
 }
 

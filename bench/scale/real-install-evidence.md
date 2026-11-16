@@ -261,15 +261,15 @@ commands come from the Stall Watch sweep (inferred; the log does not name the ca
 
 ### Prices (Cloud Billing Catalog API)
 
-| SKU                                               | Price                     |
-| ------------------------------------------------- | ------------------------- |
-| Gemini 3.5 Flash Global Text Input - Predictions  | $1.50 per million tokens  |
-| Gemini 3.5 Flash Global Text Input Caching        | $0.15 per million tokens  |
-| Gemini 3.5 Flash Global Text Output - Predictions | $9.00 per million tokens  |
-| E2 Instance Core, Americas (us-central1)          | $0.02181159 per vCPU-hour |
-| E2 Instance Ram, Americas (us-central1)           | $0.00292353 per GiB-hour  |
-| Balanced PD Capacity (us-central1)                | $0.10 per GiB-month       |
-| Zonal Kubernetes Clusters                         | $0.10 per hour            |
+| SKU                                      | Price                     |
+| ---------------------------------------- | ------------------------- |
+| <model> Global Text Input - Predictions  | $1.50 per million tokens  |
+| <model> Global Text Input Caching        | $0.15 per million tokens  |
+| <model> Global Text Output - Predictions | $9.00 per million tokens  |
+| E2 Instance Core, Americas (us-central1) | $0.02181159 per vCPU-hour |
+| E2 Instance Ram, Americas (us-central1)  | $0.00292353 per GiB-hour  |
+| Balanced PD Capacity (us-central1)       | $0.10 per GiB-month       |
+| Zonal Kubernetes Clusters                | $0.10 per hour            |
 
 The install's LiteLLM runs with `VERTEXAI_LOCATION=global`, so the global SKUs apply. Regional
 SKUs cost 10% more.

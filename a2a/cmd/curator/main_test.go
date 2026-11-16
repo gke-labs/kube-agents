@@ -63,7 +63,7 @@ func startCLIJetStream(t *testing.T) string {
 	})
 	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        lib.StreamTopicsJournal,
-		Subjects:    []string{memory.SubjectAnnotations, memory.SubjectCuratorOutcomes},
+		Subjects:    []string{memory.SubjectAnnotations},
 		AllowDirect: true,
 	})
 	return ns.ClientURL()

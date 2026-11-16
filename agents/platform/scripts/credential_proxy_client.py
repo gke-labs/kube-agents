@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import math
@@ -24,7 +25,7 @@ from pathlib import Path
 # on the caller's clock (#5578). `argparse` is imported in `parse_args`, and
 # `ClusterTarget` is a plain class, not a dataclass: `dataclasses` pulls in
 # `inspect`. A call through the `gcloud` or `kubectl` name uses neither.
-# (`tempfile` stays: `urllib.request` imports it anyway.)
+# (`hashlib` and `tempfile` stay: `urllib.request` imports them anyway.)
 
 
 # What this client may be invoked *as*, which is a different list from what the
@@ -268,6 +269,12 @@ GET_CREDENTIALS_FETCHING_LINE = "Fetching cluster endpoint and auth data."
 GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+# Beside each kubeconfig the merge below checks, one line per context it found current or wrote:
+# `<context> <sha256 of the file> <sha256 of proxy URL, CA file and token file>`. The sandbox's
+# kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an exact line,
+# so any later edit to the file, or a new proxy URL, CA file or token file, runs the merge once more.
+REGISTERED_MARKER_NAME = ".{name}.contexts-registered"
+REGISTERED_MARKER_ENV_SEPARATOR = "\n"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -1151,6 +1158,29 @@ def _ensure_host_kubeconfig_initialized(
         pass
 
 
+def _record_registered_context(
+    path: Path,
+    content: bytes,
+    context: str,
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
+    """Record that `content`, the bytes of `path` the merge checked or wrote, holds `context`'s current
+    entries. Called under the merge's lock; the digest is of those bytes, never of a later read, so a
+    writer that does not take the lock can only make the line stale, never vouch for unchecked bytes."""
+    marker = path.with_name(REGISTERED_MARKER_NAME.format(name=path.name))
+    file_digest = hashlib.sha256(content).hexdigest()
+    env_digest = hashlib.sha256(
+        REGISTERED_MARKER_ENV_SEPARATOR.join((proxy_url, ca_file, token_file)).encode("utf-8")
+    ).hexdigest()
+    kept = []
+    if marker.is_file() and not marker.is_symlink():
+        kept = [line for line in marker.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.split(" ", 1)[0] != context]
+    _replace_file(marker, "\n".join([*kept, f"{context} {file_digest} {env_digest}"]) + "\n")
+
+
 def _merge_context_into_kubeconfig_file(
     path: Path,
     context: str,
@@ -1191,7 +1221,8 @@ def _merge_context_into_kubeconfig_file(
             st = path.stat()
             if st.st_uid != os.geteuid() or st.st_nlink != 1:
                 return
-            doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+            content = path.read_bytes()
+            doc = yaml.safe_load(content.decode("utf-8", errors="replace"))
         except (OSError, yaml.YAMLError, RecursionError):
             return
         if not isinstance(doc, dict):
@@ -1223,6 +1254,10 @@ def _merge_context_into_kubeconfig_file(
             for u in existing_users
         )
         if has_cluster and has_context and has_user:
+            try:
+                _record_registered_context(path, content, context, proxy_url, ca_file, token_file)
+            except OSError:
+                pass
             return
         clusters = [
             c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context
@@ -1263,7 +1298,9 @@ def _merge_context_into_kubeconfig_file(
         )
         doc["contexts"] = contexts
         try:
-            _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+            written = yaml.safe_dump(doc, sort_keys=False)
+            _replace_file(path, written)
+            _record_registered_context(path, written.encode("utf-8"), context, proxy_url, ca_file, token_file)
         except OSError:
             pass
     finally:
@@ -2388,7 +2425,11 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
+    """The command line: the names the shim is linked as, the explicit
+    form, and `--ensure-kubectl-context`. Ends with SystemExit. The
+    images' launcher imports this module, so its precompiled bytecode
+    is used, and calls this."""
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
         try:
             ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
@@ -2425,3 +2466,7 @@ if __name__ == "__main__":
             fallback=fallback,
         )
     )
+
+
+if __name__ == "__main__":
+    main()

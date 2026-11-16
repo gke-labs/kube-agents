@@ -146,7 +146,9 @@ it is a developer tool that runs on your own machine.
 - **[`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) checks the body.** It fails when
   the diff changes a user-facing path and the body, outside comments, code fences (an unclosed
   one at the margin runs to the end) and code spans, has neither an image nor the ticked box;
-  editing the body re-runs it. The paths are the `paths:` of
+  editing the body re-runs it, and a re-run reads the body as it is then. GitHub starts no
+  `pull_request` run on a branch that conflicts with `main`, so an edit made while it conflicts is
+  judged at the push that clears the conflict, or by a re-run. The paths are the `paths:` of
   [`chat_ux.md`](chat_ux.md) plus `SURFACES` in
   [`scripts/ux_evidence.py`](../../scripts/ux_evidence.py); test files never count, and the docs
   site counts for its rendering (config, components, styles, assets, `public/`), not its prose,

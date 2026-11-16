@@ -170,13 +170,12 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
-// (profile, tier) whose tier is interactive. Read is the only interactive
-// tier until tiers are CR data (#3659).
+// (profile, tier) whose tier's mode is interactive (#3659).
 func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 	n := 0
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
-			if tier == agentv1alpha1.AgentProfileTierRead {
+			if interactiveTier(&profiles[i], tier) {
 				n++
 			}
 		}
@@ -203,7 +202,7 @@ func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	pools := interactiveProfileTiers(profiles)
 	jobs := resolveProfileCeiling(agent)
 	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
-		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
+		return unattendedTierOf(&p) != ""
 	}) {
 		jobs *= 2
 	}
@@ -358,9 +357,19 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
+			// Nothing is written there while it is absent (a flip to today
+			// removes it with its RoleBinding), so its denials must not stand
+			// against this agent; Observe adds it back the pass it returns.
+			r.RBAC.Forget(profileNamespaceName(agent))
 		}
 		return false, err
 	}
+	// The namespace exists, so the operator's writes there are about to
+	// start: the RBAC self-check probes the namespaced Role's verbs in it
+	// from now on (once inline, then on the ticker), and reportRBACSkew
+	// reads the denials as this agent's. handleDeletion forgets it, and so
+	// does the branch above once the namespace is gone.
+	r.RBAC.Observe(profileNamespaceName(agent))
 	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
 		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
 	}
@@ -502,15 +511,12 @@ func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context
 }
 
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
-// into the profile namespace, for the flip back to today (deleting the
-// PlatformAgent removes the quota, removeProfileQuotaOnDeletion, and leaves
-// the fence for the chart's uninstall). Those objects
-// carry no owner reference, so nothing else reclaims them, and an install
-// that isn't running next should look like it never did. An object of that
-// name that this agent's labels don't mark as its own is left to its owner,
-// like the callout's unowned ClusterRoleBinding. cleanupA2A removes the
-// fence last, after the bus fence that admits the namespace is gone; a pass
-// that dies before then leaves a fence that only restricts.
+// into the profile namespace (deleting the PlatformAgent removes the quota,
+// removeProfileQuotaOnDeletion, and leaves the fence for the chart's
+// uninstall). Those objects carry no owner reference, so nothing else
+// reclaims them. An object of that name that this agent's labels don't mark
+// as its own is left to its owner, like the callout's unowned
+// ClusterRoleBinding.
 func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), profileQuotaComponent)
 }
@@ -532,10 +538,9 @@ func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent
 	return nil
 }
 
-// profileFenceRendered reports whether this agent's profile fence exists,
-// for cleanupA2A's sentinels: it is the first write of
-// reconcileA2ANetworkFences, and it carries no owner reference, so the
-// owner test the other sentinels use can't see it.
+// profileFenceRendered reports whether this agent's profile fence exists: it
+// is the first write of reconcileA2ANetworkFences, and it carries no owner
+// reference, so an owner test can't see it.
 func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	var np networkingv1.NetworkPolicy
 	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)
