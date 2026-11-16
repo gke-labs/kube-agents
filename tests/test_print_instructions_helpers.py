@@ -85,9 +85,9 @@ class ChatInstructionHelpersTest(unittest.TestCase):
 class SlackStepsFollowTheModeTest(unittest.TestCase):
     """The Slack checklist follows the path the install's Slack is on (#3386).
 
-    Under next without Google Chat the A2A gateway holds Slack: it does not
-    acknowledge slash commands, ignores /sethome, and takes its home channel
-    only from SLACK_HOME_CHANNEL. Everywhere else the Hermes listener does.
+    Under next the A2A gateway holds Slack, with Google Chat on or off: it
+    does not acknowledge slash commands, ignores /sethome, and takes its home
+    channel only from SLACK_HOME_CHANNEL. Under today the Hermes listener does.
     """
 
     _NEXT_HOME = "C0123ABCD"
@@ -158,7 +158,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         self.assertNotIn("No home channel is configured", out)
 
     def test_the_namespace_the_run_used_wins_over_install_env(self):
-        applied = {"SLACK_STEPS_SLACK_ENABLED": "true", "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
+        applied = {"SLACK_STEPS_SLACK_ENABLED": "true",
                    "SLACK_STEPS_HOME_CHANNEL": "", "SLACK_STEPS_NAMESPACE": "custom-ns"}
         out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n",
                         {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"})
@@ -170,8 +170,8 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
                         {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today", "SLACK_STEPS_NAMESPACE": ""})
         self.assertIn("-n file-ns -- hermes pairing approve slack", out)
 
-    def test_next_with_google_chat_keeps_slack_on_the_today_steps(self):
-        self._assert_today(self._run(self._env(mode="next", gchat=True)))
+    def test_next_with_google_chat_prints_the_gateway_steps_too(self):
+        self._assert_next(self._run(self._env(mode="next", gchat=True)))
 
     def test_today_prints_the_listener_steps(self):
         for home in ("", self._NEXT_HOME):
@@ -181,16 +181,15 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
     def test_the_values_install_sh_applied_win_over_install_env(self):
         # An interactive run applies its chat-menu and home-channel answers
         # without writing them to install.env.
-        file_says_both = self._env(mode="next", gchat=True)
+        file_says_today = self._env(mode="today", gchat=True)
         applied_slack_only = {"SLACK_STEPS_PLATFORM_AGENT_MODE": "next",
                               "SLACK_STEPS_SLACK_ENABLED": "true",
-                              "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
                               "SLACK_STEPS_HOME_CHANNEL": self._NEXT_HOME}
-        out = self._run(file_says_both, applied_slack_only)
+        out = self._run(file_says_today, applied_slack_only)
         self._assert_next(out)
         self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
-        applied_both = {**applied_slack_only, "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "true"}
-        self._assert_today(self._run(self._env(mode="next"), applied_both))
+        # An applied today moves Slack off the gateway.
+        self._assert_today(self._run(self._env(mode="next"), {**applied_slack_only, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"}))
         # Slack added on a re-run over a file that records it off.
         file_says_no_slack = self._env(mode="next").replace("SLACK_ENABLED=true", "SLACK_ENABLED=false")
         self._assert_next(self._run(file_says_no_slack, applied_slack_only))
@@ -199,7 +198,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         # install.sh's bootstrap drops an inherited PLATFORM_AGENT_MODE too.
         exported = {"PLATFORM_AGENT_MODE": "next"}
         self._assert_today(self._run(self._env(mode=None), exported))
-        self._assert_today(self._run(self._env(mode="next", gchat=True), exported))
+        self._assert_today(self._run(self._env(mode="today", gchat=True), exported))
 
     def test_the_home_channel_is_trimmed_not_rewritten(self):
         out = self._run(self._env(mode="next", home=f'"  {self._NEXT_HOME} "'))
@@ -219,11 +218,11 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         # turn every old install into next once that default changes.
         self._assert_today(self._run(self._env(mode=None)))
 
-    def test_a_standalone_run_keeps_an_exported_google_chat_the_file_does_not_set(self):
+    def test_an_exported_google_chat_leaves_slack_on_the_gateway(self):
         # install.sh applies an exported GOOGLE_CHAT_ENABLED when install.env
-        # does not assign the key, and Chat then holds the gateway.
+        # does not assign the key; the gateway takes Slack beside it.
         out = self._run("SLACK_ENABLED=true\nPLATFORM_AGENT_MODE=next\n", {"GOOGLE_CHAT_ENABLED": "true"})
-        self._assert_today(out)
+        self._assert_next(out)
 
     def test_a_home_channel_padded_with_unicode_space_is_the_channel(self):
         out = self._run(self._env(mode="next", home=f'"\u00a0{self._NEXT_HOME}\u3000"'))
@@ -484,10 +483,11 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         handoff = printed["print_instructions_slack"]
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "SLACK_STEPS_PLATFORM_AGENT_MODE=today", "SLACK_STEPS_SLACK_ENABLED=true",
-                     "SLACK_STEPS_GOOGLE_CHAT_ENABLED=false", "SLACK_STEPS_HOME_CHANNEL=C123",
-                     "SLACK_STEPS_NAMESPACE=custom-ns"):
+                     "SLACK_STEPS_HOME_CHANNEL=C123", "SLACK_STEPS_NAMESPACE=custom-ns"):
             with self.subTest(line=line):
                 self.assertIn(line, handoff)
+        # Google Chat beside Slack does not change where Slack goes, so it is not handed over.
+        self.assertNotIn("SLACK_STEPS_GOOGLE_CHAT_ENABLED", handoff)
 
     def test_a_toggle_is_read_the_way_the_tfvars_generator_reads_it(self):
         out, printed = self._run({**self._CHAT, "GOOGLE_CHAT_ENABLED": "yes"})

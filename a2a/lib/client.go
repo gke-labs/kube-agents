@@ -48,6 +48,29 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
 
+// TaskProfileSupervisorToken marks the profile form of a supervisor subject:
+// a2a.tasks.p.{profile}.{taskId}.supervisor (gke-labs/kube-agents#5301). Six
+// tokens, so the gateway's five-token grant on a2a.tasks.*.*.supervisor can
+// never match a profile task's supervisor subject, which the dispatcher alone
+// writes, and the subject stays on TASKS (a2a.tasks.>) beside the task's
+// events, in one stream order for tasks/get. The token count is what keeps the
+// two forms apart (a five-token subject whose addressee is "p" still parses as
+// five tokens); task ids are single subject tokens everywhere they enter.
+const TaskProfileSupervisorToken = "p"
+
+// ProfileSupervisorSubject is a profile task's supervisor subject in its
+// profile form. Nothing publishes it yet: readers accept it beside
+// TaskSupervisorSubject until the dispatcher moves to it (#5301).
+func ProfileSupervisorSubject(profile, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s", TaskProfileSupervisorToken, profile, taskID, TaskClassSupervisor)
+}
+
+// IsTaskSupervisorSubject reports whether subject is the task's supervisor
+// subject in either form.
+func IsTaskSupervisorSubject(subject, addressee, taskID string) bool {
+	return subject == TaskSupervisorSubject(addressee, taskID) || subject == ProfileSupervisorSubject(addressee, taskID)
+}
+
 // TaskSubmitSubject is where a new task for a profile is submitted (added
 // 10/22, #3660; moved off TASKS 10/28): a2a.submit.{profile}.{tier}.{kind}.{taskId},
 // on its own stream, ProfileSubmitStream. The tier and kind tokens exist only
@@ -96,14 +119,21 @@ func AgentSubject(profile string) string {
 }
 
 // ParseTaskSubject splits a task subject into its addressee, taskId, and
-// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). ok is false for
-// any other subject shape.
+// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). It reads the
+// profile supervisor form (ProfileSupervisorSubject) too, whose addressee is
+// the profile. ok is false for any other subject shape.
 func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool) {
 	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
 	if !found {
 		return "", "", "", false
 	}
 	parts := strings.Split(rest, ".")
+	if len(parts) == 4 && parts[0] == TaskProfileSupervisorToken && parts[3] == TaskClassSupervisor {
+		if parts[1] == "" || parts[2] == "" {
+			return "", "", "", false
+		}
+		return parts[1], parts[2], TaskClassSupervisor, true
+	}
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
 		return "", "", "", false
 	}
@@ -234,10 +264,13 @@ func (c *Client) ProtocolViolations() int64 {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	name      string
-	logger    *slog.Logger
-	natsOpts  []nats.Option
-	agreement AgreementPolicy
+	name     string
+	logger   *slog.Logger
+	natsOpts []nats.Option
+	// firstDialOpts apply to Connect's dial alone, never to a rebuild
+	// (WithFirstDialNATSOptions).
+	firstDialOpts []nats.Option
+	agreement     AgreementPolicy
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come
@@ -270,6 +303,16 @@ func WithNATSOptions(opts ...nats.Option) ClientOption {
 	return func(o *clientOptions) { o.natsOpts = append(o.natsOpts, opts...) }
 }
 
+// WithFirstDialNATSOptions adds nats.go options to Connect's first dial
+// only. A rebuild (the ClosedHandler recovery, Reconnect) dials without
+// them. For nats.RetryOnFailedConnect above all: on the first dial it lets
+// Connect return a connection that keeps trying in the background, but on a
+// rebuild it would make a failed dial look like success and skip the
+// rebuild's own backoff.
+func WithFirstDialNATSOptions(opts ...nats.Option) ClientOption {
+	return func(o *clientOptions) { o.firstDialOpts = append(o.firstDialOpts, opts...) }
+}
+
 // Connect dials NATS and establishes JetStream. All four connection callbacks
 // — disconnected, reconnected, closed, error — are registered here and logged
 // with the server error that triggered them (NR-3).
@@ -285,7 +328,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 	if c.log == nil {
 		c.log = slog.Default()
 	}
-	nc, js, err := c.dial()
+	nc, js, err := c.dial(c.opts.firstDialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +339,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 // dial builds a fresh connection with the callback set. It never touches
 // existing connection objects, so the rebuild path (NR-2) can call it against
 // a dead predecessor.
-func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
+func (c *Client) dial(extra ...nats.Option) (*nats.Conn, jetstream.JetStream, error) {
 	// Order matters: overridable defaults, then the caller's options, then the
 	// four connection callbacks — last, so nothing can displace them (NR-3).
 	opts := []nats.Option{
@@ -306,6 +349,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	}
 	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)
+	opts = append(opts, extra...)
 	opts = append(opts,
 		// NR-6: jittered backoff on every reconnection attempt, library-owned
 		// like the callbacks below.
@@ -659,6 +703,11 @@ type SubscribeConfig struct {
 	// provision Job's TASKS stream can trail by more than the window while a
 	// three-server bus forms). The wait is logged; see startWithRetry.
 	WaitForStream bool
+	// AcceptFilterSets are further filter sets a Precreated durable may
+	// carry and still be bound, while the operator moves it from one set to
+	// another (gke-labs/kube-agents#5301: the gateway's relay gains the profile
+	// supervisor form). The subscriber reads whatever the durable delivers.
+	AcceptFilterSets [][]string
 	// Precreated binds to a durable the operator created and never creates
 	// or updates one (#4173): the subscriber needs no consumer-create grant
 	// for it, and holds none on its name. Until the operator has made it, the
@@ -687,8 +736,15 @@ func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
 	refuse := func(why string) error {
 		return fmt.Errorf("%w: %s on %s %s", ErrPrecreatedBindRefused, cfg.Durable, cfg.Stream, why)
 	}
+	sameSet := func(a, b []string) bool {
+		return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
+	}
+	accepted := sameSet(have, want)
+	for _, alt := range cfg.AcceptFilterSets {
+		accepted = accepted || sameSet(have, alt)
+	}
 	switch {
-	case !slices.Equal(slices.Sorted(slices.Values(have)), slices.Sorted(slices.Values(want))):
+	case !accepted:
 		return refuse(fmt.Sprintf("filters %q, not %q", have, want))
 	case got.AckPolicy != jetstream.AckExplicitPolicy:
 		return refuse(fmt.Sprintf("acks %s, not explicit", got.AckPolicy))

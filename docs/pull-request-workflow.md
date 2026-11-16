@@ -130,6 +130,13 @@ place, and the comment above the target says why. In a mirrored `gke-*` skill, m
 place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
 fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
+**A new or changed test.** Run it through `scripts/dev/repeat_under_load.sh -- <test command>`.
+By default it runs the command ten times pinned to four cores (fewer on a smaller machine, and
+unpinned where `taskset` is missing or cannot bind them, which the line then says), with three busy
+loops per core on the same cores; `-n`, `-c` and `-l` change those. It keeps each run's output and
+prints the line the Testing section carries. A failure in any run blocks the push. The rule is in
+`.agents/rules/pre_pr_review.md`, "Repeat a new or changed test".
+
 **Agent blueprints.** If you add a `kubectl get` to a `.py`, `.sh` or `.md` under `agents/`, run
 `make cluster-reads-check`. It fails a read of several kinds, or of one kind in one page, across
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply

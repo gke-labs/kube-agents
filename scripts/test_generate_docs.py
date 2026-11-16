@@ -714,7 +714,7 @@ class FootprintBlocksTest(unittest.TestCase):
     @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
     def test_a_hand_edited_figure_fails_the_check(self):
         page_text = generate_docs.FOOTPRINT_PAGE.read_text(encoding="utf-8")
-        row = next(line for line in page_text.splitlines() if line.startswith("| `today`, GKE Standard |"))
+        row = next(line for line in page_text.splitlines() if line.startswith("| GKE Standard |"))
         cells = row.split(" | ")
         cells[1] = str(int(cells[1]) + 1)
         edited = page_text.replace(row, " | ".join(cells), 1)
@@ -732,15 +732,16 @@ class FootprintBlocksTest(unittest.TestCase):
     def test_the_figures_come_from_the_chart_and_the_golden(self):
         footprint = generate_docs.install_footprint
         model = footprint.profiles_model()["profiles"]
-        self.assertIsNone(model["today-standard"]["sessionQuotaPods"])
-        self.assertEqual(model["next-standard"]["sessionQuotaPods"], footprint.golden_session_quota())
+        self.assertEqual(model["standard"]["sessionQuotaPods"], footprint.golden_session_quota())
         # Autopilot counts the credential proxy at its Autopilot requests.
         self.assertGreater(
-            model["today-autopilot"]["requirements"]["requestsCpu"],
-            model["today-standard"]["requirements"]["requestsCpu"],
+            model["autopilot"]["requirements"]["requestsCpu"],
+            model["standard"]["requirements"]["requestsCpu"],
         )
         # Hindsight and the minter add chart pods, which the session quota counts.
-        self.assertGreater(model["next-hindsight-minter"]["sessionQuotaPods"], model["next-standard"]["sessionQuotaPods"])
+        self.assertGreater(model["hindsight-minter"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"])
+        # One NATS server is two fewer standing pods in the quota.
+        self.assertEqual(model["one-server"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"] - 2)
         self.assertEqual(footprint.cpu(2000), "2")
         self.assertEqual(footprint.cpu(2756), "2756m")
         self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
@@ -772,13 +773,13 @@ class FootprintBlocksTest(unittest.TestCase):
         self.assertIn("cpuMillisRequest", str(caught.exception))
 
     @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
-    def test_a_next_mode_workload_the_table_does_not_list_fails_the_render(self):
+    def test_an_a2a_workload_the_table_does_not_list_fails_the_render(self):
         footprint = generate_docs.install_footprint
-        with mock.patch.object(footprint, "NEXT_WORKLOADS", footprint.NEXT_WORKLOADS[1:]):
+        with mock.patch.object(footprint, "A2A_WORKLOADS", footprint.A2A_WORKLOADS[1:]):
             with self.assertRaises(SystemExit) as caught:
                 footprint.workloads_rows()
         self.assertIn("a2aNats", str(caught.exception))
-        self.assertIn("NEXT_WORKLOADS", str(caught.exception))
+        self.assertIn("A2A_WORKLOADS", str(caught.exception))
 
 
 class ReplayBaselineMetricsTest(unittest.TestCase):

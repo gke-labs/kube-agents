@@ -4,8 +4,8 @@ Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
 that ``hermes send`` posts through, because the A2A gateway consumes the chat
 backend instead. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
-nowhere. The operator names the platforms the gateway now holds in
-``A2A_NOTIFY_PLATFORM``, and for those platforms these callers run
+nowhere. The operator names the platforms the gateway now holds, and for the
+ones :func:`routed_platforms` picks these callers run
 ``a2a notify`` instead, which asks the gateway to post to the home channel over
 its ``chat.notify`` route.
 
@@ -35,10 +35,12 @@ import os
 import sqlite3
 from contextlib import closing
 
-# The variable the operator renders into the agent container exactly when the
-# next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar). Its value is a list of platform names as Hermes
-# spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list of one.
+# The variable the operator renders into the agent container when the next
+# stack holds the chat backend (platformagent_manifests.go,
+# a2aNotifyPlatformEnvVar): every armed platform whose home channel the CR
+# sets, and absent when none is. Its value is a list of platform names as
+# Hermes spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list
+# of one. routed_platforms() adds the learned Slack channel and the fallback.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
@@ -158,31 +160,38 @@ def platform_list(raw: str) -> list[str]:
     return names
 
 
-def routed_platforms() -> list[str]:
-    """The platforms whose posts go through the gateway, or [] when none does.
+def home_platforms() -> list[str]:
+    """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
 
-    The rendered env names them when the CR sets the home channel, and when the
-    gateway's backend is the install's only chat platform with no home channel
-    set: the gateway then refuses each post and keeps it for the digest it
-    posts once one is. A learned channel is never rendered into the pod, so
-    with the env empty the answer is derived: the gateway holds Slack
-    (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
-    A non-empty env wins over the file.
+    The operator lists every armed route whose home channel the CR sets
+    (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds it
+    and the projected file names a channel, the CR's or one it learned.
     """
-    routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
-    if routed:
-        return routed
-    if SLACK_PLATFORM in gateway_platforms() and home_file_value():
-        return [SLACK_PLATFORM]
-    return []
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    slack_home = SLACK_PLATFORM in gateway_platforms() and bool(home_file_value())
+    if slack_home and SLACK_PLATFORM not in listed:
+        return [*listed, SLACK_PLATFORM]
+    return listed
+
+
+def routed_platforms() -> list[str]:
+    """The platforms that get home posts through the gateway, or [] when none does.
+
+    Those are the platforms with a home channel (:func:`home_platforms`). With
+    none, home posts go to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
+    whose posts the gateway keeps for the digest it posts once a channel is set.
+    The rule reads only those two variables and the projected Slack file, so
+    every process computes the same list and a learned channel restarts no pod.
+    """
+    return home_platforms() or gateway_platforms()
 
 
 def gateway_platforms() -> list[str]:
     """The platforms whose backends the gateway holds, or [] when it holds none.
 
-    Unlike :func:`routed_platforms` this is set with no home channel, so it names
-    the platforms an install has when nothing routes a proactive post there, and
-    whose conversations :func:`conversation_command` can post into.
+    It names every armed route, home channel or not: the platforms whose
+    conversations :func:`conversation_command` can post into, and the home-post
+    fallback of :func:`routed_platforms`.
     """
     return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
