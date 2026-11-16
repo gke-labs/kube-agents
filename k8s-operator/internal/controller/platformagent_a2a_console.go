@@ -195,6 +195,7 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
 					// It never talks to the API server.
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{

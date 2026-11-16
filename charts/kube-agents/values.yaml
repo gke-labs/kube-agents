@@ -1182,6 +1182,13 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
+    # Optional Google Cloud API universe domain (for example, a Google Cloud
+    # Dedicated sovereign domain). Leave empty to auto-detect from the GKE
+    # metadata server on operator-rendered workloads; set explicitly when
+    # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
+    # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
+    # cluster's OIDC issuer host at install time.
+    universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an
     # install pins it, so set it explicitly when it must not float with the

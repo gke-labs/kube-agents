@@ -920,10 +920,12 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     text = sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv, extend)
     # The second pass, last: every rule above has read the text as before, so
     # these only add masks (`SHELL_ESCAPED_SPACE`).
-    text = CLI_LONG_FLAG_AT_FOLD_RE.sub(_mask_long_flag, text)
-    text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment_at_fold)
-    text = sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, text, _mask_short_p)
-    return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
+    if SHELL_ESCAPED_SPACE_FOLD in text:
+        text = CLI_LONG_FLAG_AT_FOLD_RE.sub(_mask_long_flag, text)
+        text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment_at_fold)
+        text = sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, text, _mask_short_p)
+        return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
+    return text
 
 
 def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[tuple[str, int], ...]]:
@@ -1218,17 +1220,21 @@ def _fold_line_breaks(command: str, masking: bool) -> str:
     before an LF loses its last backslash and the LF, and the indentation after it stays as the
     blank between words; with ``masking``, an even run or a run before CRLF also loses its last
     backslash, the break and the indentation, which become ``SHELL_MASK_JOIN``."""
+    if SHELL_ESCAPE not in command or LINE_BREAK not in command:
+        return command
     out: list[str] = []
     i, n = 0, len(command)
     while i < n:
-        if command[i] != SHELL_ESCAPE:
-            out.append(command[i])
-            i += 1
-            continue
-        j = i
+        slash = command.find(SHELL_ESCAPE, i)
+        if slash < 0:
+            out.append(command[i:])
+            break
+        if slash > i:
+            out.append(command[i:slash])
+        j = slash
         while j < n and command[j] == SHELL_ESCAPE:
             j += 1
-        run = j - i
+        run = j - slash
         if command.startswith(LINE_BREAK, j) and run % 2:
             out.append(SHELL_ESCAPE * (run - 1))
             i = j + len(LINE_BREAK)

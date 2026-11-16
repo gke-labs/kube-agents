@@ -274,6 +274,12 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 	if host := kubeProxyHostClusterID(agent); host != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", Value: host})
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: kubeProxyUniverseDomainEnv, Value: universe},
+			corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe},
+		)
+	}
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},

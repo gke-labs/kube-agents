@@ -450,6 +450,12 @@ agent the install is explain-only. Issues and reads are unaffected, so an audit 
 report issue. Unset or `propose` is the default: the agent pushes branches and opens pull requests.
 Any other value is treated as `none`.
 
+With `KUBEAGENTS_DIAL` set to `on`, the broker also reads the autonomy dial's level, and the stricter
+of the two applies: at Explain the broker refuses what `none` refuses, and the refusal's detail names
+the dial. The broker keeps the last level it was given for as long as its Pod lives; a new broker Pod,
+which every operator roll makes, reads Explain until it is given one. Nothing sets the level yet, so
+turning `KUBEAGENTS_DIAL` on today makes the install explain-only.
+
 ## Change control & safety
 
 - **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; a change you asked for becomes a pull request, and a diagnostic request gets its fix in the reply rather than on your repository. On an [explain-only](#explain-only-mode) install the broker refuses that pull request. See [Platform Agent](/kube-agents/concepts/platform-agent/) and [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
