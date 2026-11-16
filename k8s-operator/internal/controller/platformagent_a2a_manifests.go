@@ -4754,7 +4754,9 @@ const (
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
 	// after its TTL), the scope publisher's Job pods, and three for the
-	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// gateway's transient overshoot at the cap: a replacing turn's slot while
+	// its old pod is still going, and a gateway older than #6033, whose
+	// count-then-create race could pass a burst together (a2a/gateway/spawn.go,
 	// refuseAtSessionCap).
 	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
 	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
