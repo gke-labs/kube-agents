@@ -60,9 +60,6 @@ const (
 //     removed otherwise, as updateStatusReady removes a Degraded no reason
 //     holds. Any other reason stays; RBACIncomplete in particular is
 //     reportRBACSkew's to clear.
-//
-// busStreamsMissingCondition is nil off the A2A stack, so a today install or
-// an unrecognised mode gets no streams reason.
 func parkBusStreamsDegraded(agent *agentv1alpha1.PlatformAgent) (busStreamsDegradedEdit, *metav1.Condition) {
 	degraded := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType)
 	streams := busStreamsMissingCondition(agent)

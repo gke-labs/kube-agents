@@ -303,6 +303,9 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if got := sts.Spec.Template.Spec.Containers[0].Image; got != defaultA2ANATSImage {
 		t.Errorf("image = %q, want %q", got, defaultA2ANATSImage)
 	}
+	if !strings.Contains(defaultA2ANATSImage, "@sha256:") {
+		t.Errorf("default bus image %q carries no digest; it must be pinned as tag@sha256", defaultA2ANATSImage)
+	}
 	if got := sts.Labels["app.kubernetes.io/part-of"]; got != a2aPartOf {
 		t.Errorf("part-of label = %q, want %q", got, a2aPartOf)
 	}
@@ -3589,7 +3592,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
-		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
+		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.p.*.*.supervisor", "a2a.agents.>",
 		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
@@ -6682,7 +6685,7 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	}{
 		{"Chat only", agent(true, false, false), true},
 		{"Slack only", agent(false, true, false), true},
-		{"Chat and Slack: Slack on Hermes", agent(true, true, false), false},
+		{"Chat and Slack: both on the gateway", agent(true, true, false), true},
 		{"Teams", agent(false, false, true), false},
 		{"no platform", agent(false, false, false), true},
 	} {
