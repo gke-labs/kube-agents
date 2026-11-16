@@ -21,6 +21,7 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -64,6 +65,8 @@ class FakeBroker:
         self.refuse: dict[tuple[str, str], int] = {}
         # A status every request is answered with, when set.
         self.down: int | None = None
+        # Answer every request 302 to this base URL, when set.
+        self.redirect_to: str | None = None
         broker = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -80,6 +83,12 @@ class FakeBroker:
                     "task": self.headers.get(report_status.TASK_CREDENTIAL_HEADER),
                     "body": body,
                 })
+                if broker.redirect_to:
+                    self.send_response(302)
+                    self.send_header("Location", broker.redirect_to + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 status, payload = broker.answer(self.command, self.path, body)
                 self.send_response(status)
                 data = b"" if payload is None else (payload if isinstance(payload, bytes) else json.dumps(payload).encode())
@@ -311,6 +320,41 @@ class TestTheHttpStore(BrokerTestCase):
         with self.assertRaises(report_status.ReportStoreUnavailable) as caught:
             report_status.BrokerReportStore("").read_latest(AUDIT, REPO)
         self.assertIn(report_status.BROKER_URL_ENV, str(caught.exception))
+
+    def test_a_redirect_is_never_followed(self):
+        """A 3xx is a store that can't be used now, and the host it names
+        sees nothing: urllib would re-send the bearer across a redirect."""
+        elsewhere = FakeBroker()
+        self.addCleanup(elsewhere.close)
+        self.broker.redirect_to = elsewhere.url
+        store = self.store()
+        for call in (lambda: store.read_latest(AUDIT, REPO),
+                     lambda: store.write_run(AUDIT, REPO, stamp_name(NOW), self.envelope())):
+            with self.assertRaises(report_status.ReportStoreUnavailable) as caught:
+                call()
+            self.assertEqual(302, caught.exception.status)
+        self.assertEqual(2, len(self.broker.requests))
+        self.assertEqual(f"Bearer {BROKER_TOKEN}", self.broker.requests[0]["authorization"])
+        self.assertEqual([], elsewhere.requests)
+
+    def test_no_proxy_from_the_environment_sees_a_request(self):
+        proxy = FakeBroker()
+        self.addCleanup(proxy.close)
+        proxied = {name: proxy.url for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY")}
+        # urlopen's module-wide opener reads the proxy environment once, when
+        # it is first built; dropping it makes a regression to urlopen show.
+        with patch.dict(os.environ, {**proxied, "NO_PROXY": "", "no_proxy": ""}), \
+                patch.object(urllib.request, "_opener", None):
+            store = self.store()
+            store.write_run(AUDIT, REPO, stamp_name(NOW), self.envelope())
+            self.assertEqual([stamp_name(NOW)], store.list_runs(AUDIT, REPO))
+        self.assertEqual([], proxy.requests)
+        self.assertEqual(2, len(self.broker.requests))
+
+    def test_only_an_http_url_is_used(self):
+        for url in ("file:///etc/passwd", "ftp://127.0.0.1/x"):
+            with self.subTest(url=url), self.assertRaises(report_status.ReportStoreUnavailable):
+                report_status.BrokerReportStore(url).read_latest(AUDIT, REPO)
 
     def test_a_404_is_file_not_found_and_not_a_store_error(self):
         with self.assertRaises(FileNotFoundError):

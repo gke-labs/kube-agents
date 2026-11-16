@@ -834,6 +834,22 @@ def _bearer_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of the broker (credential_proxy_client's
+    rule): urllib re-sends the Authorization header across a cross-host
+    redirect, so following one would hand the bearer and the task credential
+    to whatever host the answer names. The 3xx comes back as an HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+def _broker_opener() -> urllib.request.OpenerDirector:
+    """An opener of this module's own for every broker call: no proxy from
+    HTTP(S)_PROXY, which would see both credentials, and no redirect."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
 class BrokerReportStore(str):
     """The report store, read and written through the broker's /v1/audit-reports.
 
@@ -871,12 +887,14 @@ class BrokerReportStore(str):
         """One request; the body of a 2xx answer. Raises as the class says."""
         if not self.url:
             raise ReportStoreUnavailable(f"the report store is unavailable: {BROKER_URL_ENV} is unset")
+        if urllib.parse.urlsplit(self.url).scheme not in ("http", "https"):
+            raise ReportStoreUnavailable(f"the report store is unavailable: {BROKER_URL_ENV} is not an http(s) URL")
         headers = {**_bearer_headers(), **task_credential_headers(path)}
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.url + path, data=body, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=BROKER_TIMEOUT_S) as response:  # noqa: S310 - the operator's URL
+            with _broker_opener().open(request, timeout=BROKER_TIMEOUT_S) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
             status = exc.code
@@ -890,7 +908,9 @@ class BrokerReportStore(str):
         where = f"{method} {urllib.parse.unquote(path[len(AUDIT_REPORTS_ROUTE):]) or '/'}"
         if status == 404:
             raise FileNotFoundError(f"the report store has no {where}")
-        if status in UNAVAILABLE_STATUSES:
+        if status in UNAVAILABLE_STATUSES or 300 <= status < 400:
+            # A redirect is never followed (_NoRedirect): the store is not
+            # where it should be, which is a store that can't be used now.
             raise ReportStoreUnavailable(
                 f"the report store at {self} is unavailable: HTTP {status}{detail}", status
             )
