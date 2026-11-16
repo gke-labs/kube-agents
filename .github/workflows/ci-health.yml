@@ -692,7 +692,7 @@ jobs:
             --env autopush=kube-agents-autopush --env staging=kube-agents-gkedemos \
             --prior work/slack-crosscheck-prev.json --out work/slack-crosscheck.json
           if [ -f work/slack-crosscheck.json ]; then
-            gcloud storage cp work/slack-crosscheck.json "$DASHBOARD_BUCKET/slack-crosscheck.json"
+            gcloud storage cp --cache-control=no-cache work/slack-crosscheck.json "$DASHBOARD_BUCKET/slack-crosscheck.json"
           fi
 
       # Where the bots file and read their issues (docs/ci-health.md, "The

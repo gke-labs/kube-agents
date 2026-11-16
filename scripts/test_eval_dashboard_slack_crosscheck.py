@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s scripts -p 'test_eval_dashboard_slack_crosscheck.py' -v
 """
 
+import http.client
 import io
 import json
 import pathlib
@@ -112,6 +113,18 @@ class CrosscheckTest(unittest.TestCase):
     def test_a_non_finite_answer_reads_as_none(self):
         self.assertIsNone(slack_crosscheck._value({"data": {"result": [{"value": [0, "NaN"]}]}}))
         self.assertIsNone(slack_crosscheck._value({"data": {"result": []}}))
+        self.assertIsNone(slack_crosscheck._value([1, 2]), "a JSON value that is not an object")
+        self.assertIsNone(slack_crosscheck._value({"data": "x"}))
+
+    def test_a_truncated_body_is_that_environments_error(self):
+        def opener(request, timeout):
+            if "/projects/p-auto/" in request.full_url:
+                raise http.client.IncompleteRead(b"")
+            return FakeOpener({"p-stage": VALUES})(request, timeout)
+
+        got = self.run_main(opener)
+        self.assertIn("IncompleteRead", got["environments"]["autopush"]["error"])
+        self.assertEqual(1.0, got["environments"]["staging"]["delivery_lag_s"], "the next environment is still read")
 
 
 if __name__ == "__main__":

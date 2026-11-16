@@ -28,6 +28,7 @@ Usage: slack_crosscheck.py --data data.json --env NAME=PROJECT ... --prior prev.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import pathlib
@@ -89,10 +90,10 @@ class Forbidden(Exception):
 
 def _value(document) -> float | None:
     """The single sample of an instant query's vector, or None (no data, NaN, Inf)."""
-    result = ((document or {}).get("data") or {}).get("result") or []
     try:
+        result = ((document or {}).get("data") or {}).get("result") or []
         value = float(result[0]["value"][1])
-    except (IndexError, KeyError, TypeError, ValueError):
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return None
     return round(value, ROUND_TO) if math.isfinite(value) else None
 
@@ -110,7 +111,8 @@ def read_environment(project: str, now: datetime, token: str, opener=urllib.requ
             if exc.code == FORBIDDEN:
                 raise Forbidden(project) from exc
             return {"project": project, "error": f"HTTP {exc.code}"}
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+            # HTTPException covers a body cut short (IncompleteRead), which is not an OSError.
             return {"project": project, "error": f"{type(exc).__name__}: {exc}"}
     return {"project": project, **out}
 
