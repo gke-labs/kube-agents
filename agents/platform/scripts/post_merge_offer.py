@@ -218,8 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kind", required=True)
     parser.add_argument("--environment", required=True)
     args = parser.parse_args(argv)
-    print(json.dumps(offer(args.repo, args.number, args.kind, args.environment), indent=2))
-    return 0
+    result = offer(args.repo, args.number, args.kind, args.environment)
+    print(json.dumps(result, indent=2))
+    # As the step-down's CLI does: a retry is a run that did not finish.
+    return 1 if result["action"] == "retry" else 0
 
 
 if __name__ == "__main__":

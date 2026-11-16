@@ -1,7 +1,10 @@
 """Tests for post_merge_offer: the draft rules-file pull request that offers auto-merge."""
 
+import contextlib
+import io
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import automation_rules as ar
@@ -134,7 +137,17 @@ class TestOffer(unittest.TestCase):
                 forge = FakeForge(existing=draft, **kwargs)
                 result = run(forge)
                 self.assertIn(reason, result["reason"])
+                self.assertEqual(result["action"], "retry" if name == "no identity" else "none")
                 self.assertNotIn("proposal-comment", forge.verbs())
+
+    def test_the_cli_fails_a_run_that_must_be_retried(self):
+        draft = {"url": "https://x/pull/3", "state": "open", "body": "Offered on https://x/pull/9"}
+        for viewer, code in (("", 1), ("kube-agents", 0)):
+            with self.subTest(viewer=viewer), \
+                    mock.patch.object(pmo.post_merge_stepdown, "_forge", return_value=FakeForge(existing=draft, viewer=viewer)), \
+                    mock.patch("kubeagents_switches.switch", return_value="practice"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pmo.main(["--repo", REPO, "--number", "9", "--kind", "no-pdb", "--environment", "dev"]), code)
 
     def test_the_repository_is_named_as_a_person_reads_it(self):
         for repo in ("https://github.com/org/infra", "https://github.com/org/infra.git/", "git@github.com:org/infra.git",
