@@ -82,7 +82,8 @@ class ProfilesNamespaceRenderTest(unittest.TestCase):
                 netpol_verbs = {
                     v
                     for rule in role["rules"]
-                    if "networkpolicies" in rule.get("resources", []) and "networking.k8s.io" in rule.get("apiGroups", [])
+                    if "networkpolicies" in rule.get("resources", [])
+                    and any(group == "networking.k8s.io" for group in rule.get("apiGroups", []))
                     for v in rule["verbs"]
                 }
                 self.assertTrue({"create", "patch", "update", "delete"} <= netpol_verbs, role["rules"])
