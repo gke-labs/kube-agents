@@ -29,6 +29,7 @@ COPIED = (
 )
 SCRIPT = "scripts/release/open_upgrade_relabel_pr.sh"
 BRANCH = "relabel-upgrade-table/pending"
+ISOLATED_ENV_VARS = ("GIT_USER_NAME", "GIT_USER_EMAIL", "STUB_OPEN_PR")
 STUB = """#!/bin/sh
 echo "$(basename "$0") $*" >> "{log}"
 if [ "$(basename "$0")" = npx ]; then echo "npx GH_TOKEN=${{GH_TOKEN:-unset}}" >> "{log}"; fi
@@ -63,7 +64,7 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
             stub.chmod(0o755)
 
     def run_script(self, version: str = "1.0.0", **env: str) -> subprocess.CompletedProcess:
-        clean = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_") and k not in ISOLATED_ENV_VARS}
         clean.update(PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}", RELEASE_VERSION=version, **env)
         return subprocess.run(["bash", SCRIPT], cwd=self.repo.root, capture_output=True, text=True, env=clean)
 
@@ -73,6 +74,12 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
     def origin_has(self, ref: str) -> bool:
         return subprocess.run(["git", "--git-dir", str(self.origin), "rev-parse", "--verify", "-q", ref],
                               capture_output=True).returncode == 0
+
+    def origin_commit_identity(self) -> list[str]:
+        return subprocess.run(
+            ["git", "--git-dir", str(self.origin), "log", "-1", "--format=%an%n%ae%n%cn%n%ce", f"refs/heads/{BRANCH}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
 
     def test_a_shipped_pending_row_is_pushed_and_a_pull_request_opened(self):
         self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
@@ -85,6 +92,15 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
                                 check=True, capture_output=True, text=True).stdout
         self.assertIn("| 1.0.0   | a shipped change | x |", pushed)
         self.assertIn("| pending | an unshipped change | x |", pushed)
+        self.assertEqual(
+            self.origin_commit_identity(),
+            [
+                "kube-agents-release-bot[bot]",
+                "324943056+kube-agents-release-bot[bot]@users.noreply.github.com",
+                "kube-agents-release-bot[bot]",
+                "324943056+kube-agents-release-bot[bot]@users.noreply.github.com",
+            ],
+        )
         create = [c for c in self.calls() if c.startswith("gh pr create")]
         self.assertEqual(len(create), 1, self.calls())
         self.assertIn("--base main", create[0])
@@ -145,6 +161,30 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         result = self.run_script(version="v1.0")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.calls(), [])
+
+    def test_commit_identity_ignores_caller_git_env_and_honours_git_user_overrides(self):
+        self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
+        self.repo.tag("1.0.0")
+        self.repo.git("config", "author.name", "wrong-config-author")
+        self.repo.git("config", "committer.email", "wrong-config@example.invalid")
+        result = self.run_script(
+            GIT_AUTHOR_NAME="wrong-author",
+            GIT_AUTHOR_EMAIL="wrong-author@example.invalid",
+            GIT_COMMITTER_NAME="wrong-committer",
+            GIT_COMMITTER_EMAIL="wrong-committer@example.invalid",
+            GIT_USER_NAME="custom-bot[bot]",
+            GIT_USER_EMAIL="12345+custom-bot[bot]@users.noreply.github.com",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.origin_commit_identity(),
+            [
+                "custom-bot[bot]",
+                "12345+custom-bot[bot]@users.noreply.github.com",
+                "custom-bot[bot]",
+                "12345+custom-bot[bot]@users.noreply.github.com",
+            ],
+        )
 
 
 if __name__ == "__main__":

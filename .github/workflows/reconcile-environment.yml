@@ -338,13 +338,6 @@ jobs:
           VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
-          # The PlatformAgent's spec.mode. Unset or `today` renders no key, so
-          # an environment that does not set it renders the file it always
-          # did; anything but today or next is refused by the renderer. The
-          # installer reads the key, so a full upgrade renders the mode into
-          # the chart: this is how a long-lived environment's declared mode
-          # reaches its cluster, and how one a rebuild left on today returns.
-          PLATFORM_AGENT_MODE: ${{ vars.PLATFORM_AGENT_MODE }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}

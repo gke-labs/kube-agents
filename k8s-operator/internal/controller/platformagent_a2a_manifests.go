@@ -6638,8 +6638,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}
 		// Proactive posts land here (the chat.notify route). Unset leaves
 		// the route serving a kanban card's report back to its conversation
-		// only: proactive posts have nowhere to go, as on today with no home
-		// channel.
+		// only: proactive posts have nowhere to go.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
@@ -8652,13 +8651,6 @@ type a2aTeardownEntry struct {
 // shard at or past this pass's count.
 func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
 	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
-}
-
-// deleteA2AAuthMapShards removes every identity-map object, the unsharded
-// legacy one and every shard. Only tests call it since the flip-to-today
-// teardown went; CR deletion leaves the objects to their owner reference.
-func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
 }
 
 // deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns
