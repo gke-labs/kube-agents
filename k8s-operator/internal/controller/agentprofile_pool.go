@@ -149,6 +149,9 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	if credentialProxyExecTierEnabled(agent) {
 		env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+	}
 	if m := profile.Spec.Harness.Model; m != "" {
 		env = append(env, corev1.EnvVar{Name: "A2A_MODEL", Value: m})
 	}

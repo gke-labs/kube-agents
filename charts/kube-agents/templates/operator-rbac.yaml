@@ -303,12 +303,12 @@ subjects:
 # namespaced kind the operator renders (Secrets, Deployments, ConfigMaps,
 # Roles, ...). The operator writes them in the namespace of the PlatformAgent
 # it reconciles, which this chart places in the release namespace, and in that
-# namespace's profile namespace under mode next (profiles-namespace.yaml
+# namespace's profile namespace (profiles-namespace.yaml
 # creates it), so the Role and its RoleBinding render once per namespace from
 # the one rules block `make chart-sync` splices. The ClusterRole above holds
 # the reads alone. docs/designs/operator-namespaced-write-verbs.md.
 {{- $operatorRoleNamespaces := list .Release.Namespace }}
-{{- if and .Values.platformAgent.enabled (eq (toString .Values.platformAgent.mode) "next") }}
+{{- if .Values.platformAgent.enabled }}
 {{- $operatorRoleNamespaces = append $operatorRoleNamespaces (printf "%s-profiles" .Release.Namespace) }}
 {{- end }}
 {{- range $operatorRoleNamespace := $operatorRoleNamespaces }}

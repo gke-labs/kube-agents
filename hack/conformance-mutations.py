@@ -94,6 +94,16 @@ MUTATIONS: list[Mutation] = [
         "forge read no task target confines",
     ),
     Mutation(
+        "A3-report-credential-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
+         "        if False:\n"),
+        "test_A3_a_report_credential_reaches_the_audit_report_routes_alone",
+        "let a report credential reach every route, since a fleet audit only "
+        "ever calls the store -- until its model output calls /v1/exec with "
+        "no target to confine it",
+    ),
+    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
@@ -107,7 +117,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-mcp-without-task",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if principal.task is None:\n        return (\n",
+        ("    if principal.task is None or getattr(principal.task, \"report_only\", False):\n        return (\n",
          "    if False:\n        return (\n"),
         "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
         "let a warm profile pod between tasks read through the MCP relay "
@@ -1443,6 +1453,18 @@ Mutation(
         "loopback sentinel got there in the first place",
     ),
     Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -2465,7 +2487,10 @@ Mutation(
     Mutation(
         "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "drop the gateway's call to lib.ValidateDelegateRequest: an "
         "over-length text, or a malformed batch, that reached the bus without "
@@ -2473,10 +2498,26 @@ Mutation(
         "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
+    ),
+    Mutation(
         "C1-delegate-gateway-validates-only-some-requests",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
-         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "condition the gateway's validator call so it guards only batches: "
         "the call still appears, but a single over-length task that reached "
