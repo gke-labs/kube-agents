@@ -94,7 +94,7 @@ Today `/opt/data` holds four kinds of cron state. Each moves to a home that does
 
 ## 2. The scheduler component
 
-The scheduler runs as `AgentScheduleReconciler` (new) inside `k8s-operator`, gated by the operator's existing Lease leader election (`main.go`). Running the reconciler inside `k8s-operator` avoids a separate Deployment and pod budget on Autopilot, reuses the operator's controller-runtime informer cache and per-agent TLS NATS connection (`natsCardPublisher` in `k8s-operator/internal/controller/agentprofile_card.go`), and ensures only the elected leader fires schedules. Today the operator's `authcallout` identity (`operator-controller`) is narrowed to publishing agent cards on `a2a.agents.*`; Track 2 extends that grant in `a2a/authcallout` so `operator-controller` may also publish to `a2a.trigger.schedule.submit` (new) and subscribe to `_INBOX.operator-controller.>`.
+The scheduler runs as `AgentScheduleReconciler` (new) inside `k8s-operator`, gated by the operator's existing Lease leader election (`main.go`). Running the reconciler inside `k8s-operator` avoids a separate Deployment and pod budget on Autopilot, reuses the operator's controller-runtime informer cache and per-agent TLS NATS connection (`natsCardPublisher` in `k8s-operator/internal/controller/agentprofile_card.go`), and ensures only the elected leader fires schedules. Today the operator's `authcallout` identity (`operator-controller`) is narrowed to publishing agent cards on `a2a.agents.*`; Track 2 extends that grant in `a2a/authcallout` so `operator-controller` may also publish to `a2a.trigger.schedule.submit` (new) and subscribe to its reply namespace `a2a.trigger.reply.schedule.>` (§3).
 
 ### Two-phase slot claim and restart safety
 
@@ -116,23 +116,25 @@ When the dispatcher publishes the task's terminal event on `a2a.tasks.<profile>.
 
 Every unattended trigger runs in the cluster under an operator-rendered Kubernetes ServiceAccount and connects to NATS through `a2a/authcallout`. We authenticate triggers on the bus using the same KSA `TokenReview` path (`a2a/authcallout/tokenreview.go`) that authenticates profile workers and the dispatcher:
 
-1. **Callout identity and per-identity inbox narrowing:** The operator registers each trigger's ServiceAccount in the `authcallout` identity map (`agentprofile_identities.go`) with a fixed trigger source slug (`schedule` on `operator-controller`, plus `event-watcher`, `drift-detector`, `stall-watch`, and `repo-watcher`). `a2a/authcallout` narrows each trigger identity `<trigger-identity>` to publish only to `a2a.trigger.<source>.submit` and subscribe only to its own reply prefix `_INBOX.<trigger-identity>.>`, and the client connects with `nats.CustomInboxPrefix("_INBOX.<trigger-identity>")` (matching the per-identity inbox pattern in `a2a/authcallout/contract_test.go` and `dispatcher_contract_test.go`). No trigger receives a wildcard `_INBOX.>` subscribe grant, and a contract-test row in `a2a/authcallout` verifies that a trigger subscribing to `_INBOX.>` or another identity's `_INBOX.<other>.>` is refused. No profile worker, chat bridge, or console client can publish to `a2a.trigger.>`.
-2. **Request payload:**
+1. **Callout identity and reply namespace:** The operator registers each trigger's ServiceAccount in the `authcallout` identity map (`agentprofile_identities.go`) with a fixed trigger source slug (`schedule` on the operator, later `event-watcher`, `drift-detector`, `stall-watch`, and `repo-watcher`). `a2a/authcallout` narrows each trigger identity to publish only to `a2a.trigger.<source>.submit` and subscribe only to its own reply namespace `a2a.trigger.reply.<source>.>`. The gateway answers there and nowhere else (`lib.TriggerReplySubject`), never into a caller's `_INBOX`, for the reason the verifier answers on `a2a.cap.reply.>`: a grant to publish into callers' inboxes would reach where they read their JetStream replies. A submission naming any other reply subject is dropped, unanswered, before anything is started. No profile worker, chat bridge, or console client can publish to `a2a.trigger.>`. (The grants themselves are #5617's second pull request; the ingress below ships dark until then.)
+2. **Request and reply** (`lib.TriggerSubmit`, `lib.TriggerSubmitReply` in `a2a/lib/trigger_submit.go`):
    ```json
    {
-     "idempotencyKey": "schedule/kubeagents-system/compliance-audit/1793686800",
-     "triggerName": "schedule/compliance-audit",
-     "origin": "builtin",
-     "profile": "platform",
-     "prompt": "Run the daily GKE Fleet Compliance & RBAC Governance audit...",
-     "parameters": {
-       "stream": "compliance-audit",
-       "schedule_mode": "scheduled"
+     "trigger": {
+       "name": "schedule/compliance-audit",
+       "origin": "builtin",
+       "stream": "compliance-audit"
      },
+     "idempotencyKey": "schedule/kubeagents-system/compliance-audit/1793686800",
+     "schedule": {
+       "namespace": "kubeagents-system",
+       "name": "compliance-audit"
+     },
+     "profile": "fleet-audit",
+     "prompt": "Run the daily GKE Fleet Compliance & RBAC Governance audit...",
+     "parameters": { "schedule_mode": "scheduled" },
      "skills": ["fleet-audit", "gke-security-posture"],
      "maxTurns": 250,
-     "createdByPrincipal": "",
-     "createdBySubject": "",
      "delivery": {
        "mode": "chat",
        "silentWhenClean": true,
@@ -140,13 +142,16 @@ Every unattended trigger runs in the cluster under an operator-rendered Kubernet
      }
    }
    ```
-3. **Gateway verification and grant minting:** The active gateway replica subscribes to `a2a.trigger.*.submit`. On receiving a submission:
-   - It takes `<source>` from the subject token (which NATS `authcallout` bound to the caller's KSA) and verifies that `triggerName` belongs to that `<source>`.
-   - It checks the per-trigger rate cap ([`spec-profiles-dispatch.md`](spec-profiles-dispatch.md#scale-rules)). Because `spec-profiles-dispatch.md` states only that each trigger has its own rate cap without fixing numbers, Track 2 adds a token-bucket limiter in the gateway (default 6 submissions per hour per named schedule trigger and 12 per hour for `event-watcher`, `drift-detector`, `stall-watch`, and `repo-watcher`, configurable on `PlatformAgent`) and returns a `rate_limited` refusal when a trigger exceeds its window budget.
-   - It verifies that the target `AgentProfile` exists and lists `unattended` in `spec.allowedTiers`.
-   - For schedule triggers, it verifies `parameters.stream` against `origin`: built-in stream names are allowed only when `origin == "builtin"` and `triggerName == "schedule/" + stream`, and any `origin == "user"` submission carrying a built-in stream name (or any non-empty `stream` other than `user/<schedule-name>`) is refused.
-   - It stamps `AuthorityRequester{Principal: ps.Hash("trigger:" + triggerName), Backend: "trigger", Subject: triggerName, VerifiedBy: "unattended-ksa"}` (and, on `origin: user` schedules carrying `createdByPrincipal`, records the creator attribution in the requester/audit metadata; see [§6](#6-user-created-schedules)).
-   - It mints a root capability grant in `KV_cap` with `Tier: capability.TierUnattended`, `Profile: resolvedProfile`, and the install's resolved scope (plus `triggerName`, `origin`, the bound `stream` parameter, and, for `origin: user` schedules, the read-only `origin: user` constraint), records the delivery metadata on the task's session record, and publishes the submission to `a2a.submit.<profile>.unattended.top.<task>` on `PROFILE_SUBMITS`.
+   The idempotency key is `schedule/<ns>/<name>/<slot-unix>` or `run-now/<ns>/<name>/<token>`. The reply is `{"taskId": "..."}` or `{"refused": {"reason": "...", "detail": "..."}}`, the reason one of `rate_limited`, `unavailable` (both worth a later slot), `invalid`, `profile_unknown`, `tier_not_allowed`. `delivery.mode` is exactly `chat` or `local`, and `delivery.jobKey` is a DNS-1123 label (`lib.ValidateScheduleDelivery`), since it keys Track 3's stores. `activeDeadlineSeconds` and `maxTurns` are validated but not yet carried to the run, so the profile's lifecycle applies.
+3. **Gateway verification and grant minting** (`a2a/gateway/trigger_ingress.go`): The elected gateway subscribes to `a2a.trigger.*.submit` for its term. On a submission:
+   - It drops one whose reply subject isn't in its source's reply namespace, then decodes strictly (no unknown fields, nothing after the object) and validates: only source `schedule` submits; origin is `builtin` (a user's schedule runs at its creator's tier with no trigger, #5635); the trigger name is `schedule/<stream>` with `stream` the schedule's own name, and it names the schedule and the key.
+   - It refuses a schedule outside the install's own namespace: a trigger's identity carries no namespace, and built-in schedules live with the one PlatformAgent.
+   - Under the trigger's session lock, a recent run's key is answered with its task, before any other check, so a retry neither mints nor spends the rate budget.
+   - It checks the profile's card lists `unattended`, and takes the route every profile task takes (`profileRouteFor`): the install's namespace scope, or a target the scope file admits; the persona's declared parameters; a pin's tiers. A target that routes the task to another profile is refused.
+   - It checks the per-trigger rate cap ([`spec-profiles-dispatch.md`](spec-profiles-dispatch.md#scale-rules)): a token bucket per trigger conversation, 12 an hour by default (#5635, so a schedule every five minutes runs every time; the gateway's `TriggerRatePerHour`), and refuses `rate_limited` past it. The bucket lives in the elected gateway's memory, so a failover refills it; the reconciler's one-run-per-slot rule is the steady bound.
+   - It stamps `AuthorityRequester{Principal: ps.Hash("trigger:" + name), Backend: "trigger", Subject: name, VerifiedBy: "unattended-ksa"}`.
+   - It mints the root grant at a task ID derived from the idempotency key: `Tier: unattended`, the route's profile and scope, `Delegate: dispatcher`, and `Trigger` (name, origin, stream), and writes the same trigger into the envelope's `authority.trigger`, which the dispatcher reads back and the verifier holds equal to the grant's.
+   - It records the run on the trigger's own conversation, `trigger:schedule/<ns>/<name>`: the task, its delivery (`SessionRecord.Delivery`, for Track 3), and the last 64 runs' keys. It publishes the submission to `a2a.submit.<profile>.unattended.top.<task>` on `PROFILE_SUBMITS`, with an envelope ID derived from the key so a repeated publish is the stream's duplicate. Nothing is posted to chat for that conversation; where the result goes is Track 3's.
 4. **Migrating `k8s-event-watcher` and `drift-detector`:** Under `spec.mode: next`, both components switch from `POST /sessions` and `/sessions/{id}/inject` on the Session KV daemon (and its shared `SESSION_KV_BEARER_TOKEN`) to publishing on `a2a.trigger.event-watcher.submit` and `a2a.trigger.drift-detector.submit` under their own Kubernetes ServiceAccounts.
 
 ## 4. Where an Unattended result goes
@@ -211,7 +216,7 @@ All scheduled collectors and helper scripts that enumerate the managed fleet mus
 
 - **[`spec-profiles-dispatch.md`](spec-profiles-dispatch.md):** Links this spec for scheduled `Unattended` task submission, `AgentSchedule`, and the retirement of Hermes cron alongside kanban.
 - **[`spec-chatops-gateway.md`](spec-chatops-gateway.md):** Specifies the `unattended` trigger verifier class on `a2a.trigger.<source>.submit` (attested via `authcallout` KSA identity) and gateway-native delivery of top-level `TierUnattended` results to `chat.notify` and `SCHEDULED_REPORTS`.
-- **[`spec-nats-deployment.md`](spec-nats-deployment.md):** Adds the `a2a.trigger.<source>.submit` publish and `_INBOX.<trigger-identity>.>` subscribe permissions for trigger KSAs in `authcallout`, the `SCHEDULE_THREADS` KV bucket (48h TTL), and the `SCHEDULED_REPORTS` stream/KV store.
+- **[`spec-nats-deployment.md`](spec-nats-deployment.md):** Adds the `a2a.trigger.<source>.submit` publish and `a2a.trigger.reply.<source>.>` subscribe permissions for trigger KSAs (and the gateway's `a2a.trigger.*.submit` subscribe and `a2a.trigger.reply.>` publish) in `authcallout`, the `SCHEDULE_THREADS` KV bucket (48h TTL), and the `SCHEDULED_REPORTS` stream/KV store.
 - **[`fleet-audit-report-store.md`](fleet-audit-report-store.md):** Adds the broker-mediated store endpoints (`/v1/audit-reports/...`) with per-`audit_id` and per-repository write authorization so ephemeral `Job` pods read and write `latest.json` and `runs/<ts>.json` without mounting `/opt/data`.
 - **[`oobe.md`](oobe.md):** Updates §4.3 so first-run audits trigger via the `AgentSchedule` `run-now` annotation and observe completion through `AgentScheduleStatus` instead of `cron.jobs.trigger_job` and `executions.db`.
 - **[`agent-communication.md`](agent-communication.md):** Corrects §1 and §2.7's stale claims that Cluster Agents run their own cron roster.
@@ -221,7 +226,7 @@ All scheduled collectors and helper scripts that enumerate the managed fleet mus
 Each step is filed and landed as its own sub-issue under #4685:
 
 1. **Design (#4685 Track 1):** Land this design document.
-2. **Scheduler, `AgentSchedule` CRD, and unattended trigger ingress (#4685 Track 2):** Add `AgentSchedule` types, `AgentScheduleReconciler` in `k8s-operator`, the `platform` (or `fleet-audit`) `AgentProfile` CR with `allowedTiers: [read, unattended]`, the `a2a.trigger.<source>.submit` and `_INBOX.<trigger-identity>.>` grants in `a2a/authcallout` (extending `operator-controller` in `agentprofile_card.go` and adding contract tests refusing cross-identity inbox subscriptions), the gateway trigger subscriber and per-trigger token-bucket rate limiter, `run-now` annotation handling, unit/envtest/conformance tests, and an eval case that runs a no-op `Unattended` schedule end to end in Job mode. Seamless gateway failover during schedule submission depends on active-standby gateway Lease election (#4206).
+2. **Scheduler, `AgentSchedule` CRD, and unattended trigger ingress (#4685 Track 2):** Add `AgentSchedule` types, `AgentScheduleReconciler` in `k8s-operator`, the `platform` (or `fleet-audit`) `AgentProfile` CR with `allowedTiers: [read, unattended]`, the `a2a.trigger.<source>.submit` and `a2a.trigger.reply.<source>.>` grants in `a2a/authcallout` (with contract tests refusing another source's submit and reply subjects), the gateway trigger subscriber and per-trigger token-bucket rate limiter, `run-now` annotation handling, unit/envtest/conformance tests, and an eval case that runs a no-op `Unattended` schedule end to end in Job mode. Seamless gateway failover during schedule submission depends on active-standby gateway Lease election (#4206).
 3. **Unattended result delivery (#4685 Track 3):** Gateway terminal-event delivery to `chat.notify`, `SCHEDULE_THREADS` daily thread grouping, incident store write for threaded replies (#4059), `kube-agents.report/v1` artifact extraction for `fleet-audit`, and `SCHEDULED_REPORTS` persistence for no-home-channel installs (#4053, #3928).
 4. **Fleet audits migration (#4685 Track 4):** Broker-backed `/v1/audit-reports` store with task-grant write scoping; migrate `compliance-audit` first as a canary under `spec.mode: next` and compare against Hermes runs, then migrate the remaining nine fleet audits and `upgrade-readiness-weekly-brief`.
 5. **Helper jobs and cluster-list cutover (#4685 Track 5):** Switch `fleet_scope_targets.py`, `stall_watch.py`, `upgrade_readiness_watch.py`, `sa_role_watch.py`, and `leeway_watch.py` to `<agent>-resolved-scope`; add `unattended` to the `cluster` `AgentProfile`'s `allowedTiers` (`[read, unattended]`); render Kubernetes `CronJob`s for the surviving deterministic scripts (`stall-watch`, `github-repo-watcher`, `upgrade-readiness-watch`, `upgrade-readiness-weekly-review`, `sa-role-watch`, `leeway-watch`, `findings-morning-nudge`, `feedback-prompt`, `eod-event-watcher-daily-report`); migrate `k8s-event-watcher` and `drift-detector` from Session KV `/sessions/{id}/inject` to `a2a.trigger.<source>.submit`; replace `chat-delivery-watch` with gateway/scheduler metrics and health conditions.
