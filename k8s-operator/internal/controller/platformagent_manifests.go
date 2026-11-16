@@ -167,6 +167,12 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
+	// systemMetadataStorageSize is the request of the namespace's system-metadata
+	// claim, and the floor for small PersistentVolumeClaims the operator renders.
+	// Hyperdisk Balanced (hyperdisk-balanced), the default StorageClass on C3-only
+	// GKE clusters, rejects CreateVolume below 4 GB with HTTP 400 InvalidArgument
+	// rather than rounding up, leaving unbound 1Gi claims permanently Pending.
+	systemMetadataStorageSize = "4Gi"
 	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
 	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
 	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
@@ -2579,7 +2585,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("1Gi"),
+					corev1.ResourceStorage: resource.MustParse(systemMetadataStorageSize),
 				},
 			},
 		},
