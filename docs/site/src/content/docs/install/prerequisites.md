@@ -247,6 +247,8 @@ helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --set crds.enabled=true
 ```
 
+`crds.enabled` is the key in chart 1.15 and later. If you pin a chart below 1.15, set `installCRDs=true` instead: those charts ignore `crds.enabled` and install no CRDs.
+
 ### GKE Autopilot install
 
 Autopilot blocks leader-election Leases in `kube-system`. Move them to the `cert-manager` namespace during install:
@@ -269,7 +271,7 @@ If Helm isn't available:
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml
 ```
 
-On Autopilot you'll additionally need to patch the deployments to append `--leader-elect=false`. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
+The manifest cannot move the leader-election Leases: it writes them to `kube-system` and has no RBAC for another namespace. On Autopilot, patch the controller and cainjector deployments to append `--leader-elect=false` instead. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
 
 ## Chat platform
 
