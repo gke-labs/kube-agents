@@ -22523,10 +22523,48 @@ class TestDraftFindings(BaseTestCase):
         target.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(SystemExit) as refused:
             self.draft()
-        self.assertIn("already has findings you filled", str(refused.exception))
+        self.assertIn("a second draft would erase", str(refused.exception))
         self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "a")
         self.assertEqual(self.draft("--overwrite"), 0, self.err)
         self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "")
+
+    def test_a_second_draft_keeps_an_edit_to_any_field(self):
+        """The worker fills more than recommendations in place, and a run with no finding has no
+        recommendation at all, so the guard reads the whole document."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+
+        def remediation_only(document):
+            document["findings"][0]["remediation"] = {"kind": "manual", "note": "narrow the rule"}
+
+        def resolved_because(document):
+            document["resolved_because"] = {"some.finding.id": "the workload is gone"}
+
+        def declared(document):
+            document["declared"] = {"some.finding.id": "accepted by the owner"}
+
+        def scope_note(document):
+            document["scope"]["clusters"][0]["limitations"] = ["one read failed"]
+
+        for edit in (remediation_only, resolved_because, declared, scope_note):
+            with self.subTest(edit=edit.__name__):
+                self.assertEqual(self.draft("--overwrite"), 0, self.err)
+                document = json.loads(target.read_text(encoding="utf-8"))
+                edit(document)
+                kept = json.dumps(document)
+                target.write_text(kept, encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    self.draft()
+                self.assertEqual(target.read_text(encoding="utf-8"), kept)
+        with self.subTest(edit="a file that no longer parses"):
+            target.write_text('{"audit": "half an edit', encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.draft()
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"audit": "half an edit')
+        with self.subTest(edit="an empty file is not work"):
+            target.write_text("", encoding="utf-8")
+            self.assertEqual(self.draft(), 0, self.err)
+            self.assertIn("findings", json.loads(target.read_text(encoding="utf-8")))
 
     def test_the_fill_step_bounds_a_tool_call_under_half_the_stale_bound(self):
         """A tool call's arguments arrive only when complete, so the call must be written well

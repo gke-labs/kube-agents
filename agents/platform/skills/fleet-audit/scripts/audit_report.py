@@ -22531,28 +22531,30 @@ def handle_draft(args: argparse.Namespace) -> None:
         sys.stdout.write(text)
         return
     out = Path(args.out or findings_path_for(args.audit))
-    if not args.overwrite and _draft_already_filled(out):
+    if not args.overwrite and _draft_would_erase(out, text):
         raise SystemExit(
-            f"draft: {out} already has findings you filled; a second draft would erase them. "
-            "Go on to `finish`, or pass --overwrite to start the document again."
+            f"draft: {out} holds content a second draft would erase: fields you filled, or the draft of "
+            "another manifest. Go on to `finish`, or pass --overwrite to start the document again."
         )
     out.write_text(text, encoding="utf-8")
     log(f"draft: wrote {out}: {len(document['findings'])} findings, each with an empty recommendation. {DRAFT_FILL_HINT}")
 
 
-def _draft_already_filled(path: Path) -> bool:
-    """Whether `path` holds a findings document with a recommendation someone wrote.
+def _draft_would_erase(path: Path, fresh: str) -> bool:
+    """Whether `path` holds anything other than the document `fresh`, the text this draft would write.
 
-    `start` removes the stream's findings file, so a filled one is this run's work.
+    The worker fills the drafted file in place, in any field: a recommendation, a remediation,
+    `declared`, `resolved_because`, a scope note. So any difference is content a second draft
+    would erase. `start` removes the stream's findings file, so what is there is this run's work.
     """
     try:
-        findings = json.loads(path.read_text(encoding="utf-8")).get("findings")
-    except (OSError, ValueError, AttributeError):
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
         return False
-    return any(
-        isinstance(f, dict) and isinstance(f.get("recommendation"), dict) and any(str(v).strip() for v in f["recommendation"].values())
-        for f in findings or []
-    )
+    try:
+        return json.loads(existing) != json.loads(fresh)
+    except ValueError:
+        return bool(existing.strip())
 
 
 def handle_grep(args: argparse.Namespace) -> None:
@@ -27552,7 +27554,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the document here rather than to the run's findings path; `-` prints it instead.",
     )
     draft_parser.add_argument(
-        "--overwrite", action="store_true", help="Replace a findings document that already has filled findings."
+        "--overwrite", action="store_true", help="Replace a findings document that differs from a fresh draft."
     )
 
     list_parser = subparsers.add_parser(

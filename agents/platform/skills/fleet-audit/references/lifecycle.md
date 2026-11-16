@@ -290,7 +290,7 @@ findings document to the run's `findings_path` (or to `--out`) from the collecto
 one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
 `recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
 cannot make: write them into the file in place, as step 3 of the skill says, and `finish` has nothing
-else to reject. A second `draft` refuses to replace a document you have filled (`--overwrite` starts it again).
+else to reject. A second `draft` refuses to replace a document you have changed in any field (`--overwrite` starts it again).
 
 `audit_report.py precheck --audit <audit-id> --manifest-file <manifest> [--repo "<owner>/<repo>"] [--scheduled]`
 runs after the collector command and before the drafting by hand, where the SOP puts it (two
