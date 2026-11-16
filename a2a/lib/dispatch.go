@@ -398,7 +398,8 @@ type DispatchJobTemplateRef struct {
 }
 
 // dispatchJobTemplatePrefix is a profile's DispatchJobTemplate name, less the
-// profile's name: the operator's agentProfileJobTemplateName.
+// profile's name: the operator's own dispatchJobTemplatePrefix
+// (agentprofile_job_template.go), which must stay the same string.
 const dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
 
 // DispatchJobTemplateName is the DispatchJobTemplate that holds profile's Job
