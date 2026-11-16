@@ -524,7 +524,17 @@ module "gke_cluster" {
   # kube-agents-iam and therefore from the cluster -- a cycle. Indexing the
   # single output depends on that output alone, which is why teardown_gate
   # has to name everything the ordering covers.
-  create_after = try(module.drift_pubsub[0].teardown_gate, null)
+  # Include the stockout drain, grant, and topic alongside drift_pubsub's
+  # teardown_gate so Terraform destroys google_logging_project_sink.stockout_alerts
+  # (which reads module.gke_cluster.cluster_name), then the cluster, then the
+  # drain/grant/topic -- stopping cluster autoscaler log emissions before the
+  # topic or publish binding disappears, without referencing the sink (cycle).
+  create_after = [
+    try(module.drift_pubsub[0].teardown_gate, null),
+    try(time_sleep.stockout_sink_drain[0].id, null),
+    try(google_pubsub_topic_iam_member.stockout_sink_writer[0].id, null),
+    try(google_pubsub_topic.stockout_alerts[0].id, null),
+  ]
 
   depends_on = [google_project_service.required]
 }
@@ -809,7 +819,50 @@ module "github_minter" {
 # Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
 # Declaratively provisioned by the composition when enable_stockout_investigator = true.
 # Matches the resource names and filter configuration created imperatively by
-# agentplugins/gke-stockout-investigator/install.sh.
+# agentplugins/gke-stockout-investigator/install.sh, and orders the sink after
+# its publish grant (and a destroy-time drain wait) so Cloud Logging never
+# exports to an ungranted or deleted topic.
+#
+# Omit depends_on = [google_project_service.required] here deliberately: that
+# for_each changes whenever a toggle or upgrade adds an API, which would defer
+# this read until apply, turn member "(known after apply)" on a ForceNew IAM
+# member, and replace stockout_sink_writer while the sink stays live. Existing
+# GKE projects normally already have Resource Manager active (and install.sh /
+# lifecycle.sh enable cloudresourcemanager.googleapis.com via google_project_service.required);
+# callers on a fresh project without Resource Manager active rely on an ADC quota
+# project or enabling cloudresourcemanager.googleapis.com first.
+data "google_project" "stockout" {
+  count      = var.enable_stockout_investigator ? 1 : 0
+  project_id = var.project_id
+}
+
+locals {
+  # Partitioned projects look like <partition>:<project>; legacy domain-scoped IDs look like example.com:my-project and stay in the standard universe.
+  stockout_service_agent_domain          = length(split(":", var.project_id)) == 2 && !strcontains(split(":", var.project_id)[0], ".") ? "${split(":", var.project_id)[0]}-system.iam.gserviceaccount.com" : "iam.gserviceaccount.com"
+  derived_stockout_sink_writer_identity  = var.enable_stockout_investigator ? "serviceAccount:service-${data.google_project.stockout[0].number}@gcp-sa-logging.${local.stockout_service_agent_domain}" : null
+  expected_stockout_sink_writer_identity = var.enable_stockout_investigator ? coalesce(var.stockout_pubsub_sink_writer_identity_override, local.derived_stockout_sink_writer_identity) : null
+}
+
+resource "google_project_service_identity" "stockout_logging" {
+  count    = var.enable_stockout_investigator ? 1 : 0
+  provider = google-beta
+
+  project = var.project_id
+  service = "logging.googleapis.com"
+
+  depends_on = [google_project_service.required]
+}
+
+resource "time_sleep" "stockout_logging_identity" {
+  count           = var.enable_stockout_investigator ? 1 : 0
+  create_duration = var.stockout_pubsub_logging_identity_propagation_duration
+
+  triggers = {
+    logging_service_identity = google_project_service_identity.stockout_logging[0].id
+    duration                 = var.stockout_pubsub_logging_identity_propagation_duration
+  }
+}
+
 resource "google_pubsub_topic" "stockout_alerts" {
   #checkov:skip=CKV_GCP_83:Stockout alert topic uses default Google-managed encryption keys
   count   = var.enable_stockout_investigator ? 1 : 0
@@ -838,6 +891,25 @@ resource "google_pubsub_subscription" "stockout_alerts" {
   }
 }
 
+# Bind on the topic ID (not name) and derive the Logging agent identity from the
+# project number so the publish grant precedes the sink rather than racing it.
+resource "google_pubsub_topic_iam_member" "stockout_sink_writer" {
+  count   = var.enable_stockout_investigator ? 1 : 0
+  project = var.project_id
+  topic   = google_pubsub_topic.stockout_alerts[0].id
+  role    = "roles/pubsub.publisher"
+  member  = local.expected_stockout_sink_writer_identity
+
+  depends_on = [time_sleep.stockout_logging_identity]
+}
+
+resource "time_sleep" "stockout_sink_drain" {
+  count            = var.enable_stockout_investigator ? 1 : 0
+  destroy_duration = var.stockout_pubsub_sink_drain_duration
+
+  depends_on = [google_pubsub_topic_iam_member.stockout_sink_writer]
+}
+
 resource "google_logging_project_sink" "stockout_alerts" {
   count       = var.enable_stockout_investigator ? 1 : 0
   project     = var.project_id
@@ -846,20 +918,21 @@ resource "google_logging_project_sink" "stockout_alerts" {
   filter      = "(log_id(\"test-stockout\") OR log_id(\"container.googleapis.com/cluster-autoscaler-visibility\")) AND (resource.labels.cluster_name=\"${module.gke_cluster.cluster_name}\" OR jsonPayload.resource.labels.cluster_name=\"${module.gke_cluster.cluster_name}\") AND (jsonPayload.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\"))"
 
   unique_writer_identity = true
-}
 
-resource "google_pubsub_topic_iam_member" "stockout_sink_writer" {
-  count   = var.enable_stockout_investigator ? 1 : 0
-  project = var.project_id
-  topic   = google_pubsub_topic.stockout_alerts[0].name
-  role    = "roles/pubsub.publisher"
-  member  = google_logging_project_sink.stockout_alerts[0].writer_identity
+  lifecycle {
+    postcondition {
+      condition     = self.writer_identity == local.expected_stockout_sink_writer_identity
+      error_message = "sink ${var.stockout_pubsub_sink} publishes as ${self.writer_identity}, not the ${local.expected_stockout_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.stockout_pubsub_topic}. The sink already exists and is exporting: this check runs after it is created and does not remove it, so until you resolve this every export fails with topic_permission_denied and Cloud Logging mails an \"[ACTION REQUIRED] sink configuration error\" to every principal holding roles/owner on ${var.project_id}. To stop that now, either delete the sink (gcloud logging sinks delete ${var.stockout_pubsub_sink} --project=${var.project_id}) or grant roles/pubsub.publisher on ${var.stockout_pubsub_topic} to ${self.writer_identity} by hand -- the hand grant stops the mail but will NOT clear this check, which compares identities rather than grants. The fix that clears it is stockout_pubsub_sink_writer_identity_override = \"${self.writer_identity}\", which moves the grant and this check onto the identity Logging reported; through the install.sh / upgrade.sh front doors set it as a passthrough line in install.env, TF_VAR_stockout_pubsub_sink_writer_identity_override=\"${self.writer_identity}\", because those regenerate terraform.tfvars wholesale on every run and a key added there by hand is gone on the next one. A hand-driven apply sets it in terraform.tfvars instead."
+    }
+  }
+
+  depends_on = [time_sleep.stockout_sink_drain]
 }
 
 resource "google_pubsub_subscription_iam_member" "stockout_agent_subscriber" {
   count        = var.enable_stockout_investigator ? 1 : 0
   project      = var.project_id
-  subscription = google_pubsub_subscription.stockout_alerts[0].name
+  subscription = google_pubsub_subscription.stockout_alerts[0].id
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
 }
@@ -867,7 +940,7 @@ resource "google_pubsub_subscription_iam_member" "stockout_agent_subscriber" {
 resource "google_pubsub_subscription_iam_member" "stockout_agent_viewer" {
   count        = var.enable_stockout_investigator ? 1 : 0
   project      = var.project_id
-  subscription = google_pubsub_subscription.stockout_alerts[0].name
+  subscription = google_pubsub_subscription.stockout_alerts[0].id
   role         = "roles/pubsub.viewer"
   member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
 }
