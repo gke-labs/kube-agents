@@ -18,6 +18,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -571,7 +572,45 @@ class ListenerFaultTest(RoutesTestCase):
             "http", "127.0.0.1", stalled.getsockname()[1], str(self.token_file), timeout=0.5,
         )
         status, answer = self.request("GET", f"{STREAM}/latest", token=REPORT["token"])
-        self.assertEqual(502, status, answer)
+        self.assertEqual(504, status, answer)
+        self.assertEqual("AUDIT_REPORT_STORE_TIMEOUT", answer["code"])
+
+    def test_a_listener_that_drips_hits_the_whole_relays_deadline(self):
+        # Each byte inside the per-read timeout, the whole well past the deadline.
+        listening = socket.socket()
+        listening.bind(("127.0.0.1", 0))
+        listening.listen(1)
+        self.addCleanup(listening.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def drip():
+            try:
+                conn, _ = listening.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(65536)
+                try:
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n")
+                    while not stop.is_set():
+                        conn.sendall(b" ")
+                        stop.wait(0.1)
+                except OSError:
+                    return
+
+        threading.Thread(target=drip, daemon=True).start()
+        CredentialProxyHandler.report_store = credential_proxy.ReportStoreRelay(
+            "http", "127.0.0.1", listening.getsockname()[1], str(self.token_file), timeout=5.0, deadline=1.0,
+        )
+        started = time.monotonic()
+        status, answer = self.request("GET", f"{STREAM}/latest", token=REPORT["token"])
+        self.assertEqual(504, status, answer)
+        self.assertEqual("AUDIT_REPORT_STORE_TIMEOUT", answer["code"])
+        self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_the_default_deadline(self):
+        self.assertEqual(15.0, credential_proxy.ReportStoreRelay("http", "h", 1, "t").deadline)
 
 
 class ShellIdentityTest(RoutesTestCase):
@@ -641,6 +680,21 @@ class MethodsTest(RoutesTestCase):
                     response = connection.getresponse()
                     self.assertEqual(501, response.status)
                     self.assertIn(f"Unsupported method ('{method}')", response.read().decode())
+        self.assertEqual([], self.store.seen)
+
+    def test_a_path_that_only_starts_like_the_store_keeps_its_old_answer(self):
+        # Not one of the store's routes: no role demanded, and the unknown
+        # route's 404, as before this change, for any role.
+        self.assertEqual((), credential_proxy.required_roles("/v1/audit-reportsx"))
+        self.assertEqual(credential_proxy.LABEL_OTHER, credential_proxy._endpoint_label("/v1/audit-reportsx"))
+        for role in (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_SHELL):
+            self.authenticator.principal = credential_proxy.Principal(workload="w", uid="u", role=role)
+            for path in ("/v1/audit-reportsx", "/v1/audit-reports-latest", "/v1/audit-reports?x=1"):
+                with self.subTest(role=role, path=path):
+                    status, answer = self.request("GET", path)
+                    self.assertEqual(404, status, answer)
+                    self.assertEqual({"status": "not_found"}, answer)
+        self.assertEqual("/v1/audit-reports", credential_proxy._endpoint_label(f"{STREAM}/latest"))
         self.assertEqual([], self.store.seen)
 
     def test_patch_on_a_store_path_is_still_501(self):

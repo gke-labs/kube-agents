@@ -2541,7 +2541,10 @@ AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
-# "/v1/chat" and inherit its rule.
+# "/v1/chat" and inherit its rule. AUDIT_REPORTS_PREFIX is the one entry with
+# neither a trailing slash nor an exact path: it names the stream list itself
+# and every path below it, so it matches on equality or on the prefix plus "/"
+# (_route_matches), and "/v1/audit-reportsx" is not one of its routes.
 #
 # A route absent from this table is reachable by any authenticated caller.
 # That is the right default for the two that are: /healthz, which the readiness
@@ -2586,12 +2589,14 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
     (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The audit-report store (#5619), relayed to its listener on the gateway
-    # pod. The shell writes today's file store directly, so it reads every
-    # stream and writes the keys of the repositories the install manages; a
-    # profile worker reads with an allowlisted profile and writes only the stream its
-    # schedule's trigger binds (report_read_permitted, report_write_permitted).
-    # No trailing slash: the stream list is the prefix itself, and the handler
-    # answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match whole.
+    # pod. The shell reads every stream and writes only the install's publish
+    # key (no_forge%2Flocal when it has none) or a registered repository's key,
+    # as it writes today's file store directly; a profile worker reads with a
+    # profile on the reports allowlist and writes only the stream its builtin
+    # schedule's trigger binds, to the publish key (report_read_permitted,
+    # report_write_permitted). No trailing slash: the stream list is the prefix
+    # itself, matched whole or with "/" after it (_route_matches), and the
+    # handler answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match.
     (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
@@ -2712,10 +2717,21 @@ def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> Non
 _validate_route_roles(ROUTE_ROLES)
 
 
+def _route_matches(path: str, prefix: str) -> bool:
+    """Whether ``path`` is under the ROUTE_ROLES entry ``prefix``: a prefix match,
+    except AUDIT_REPORTS_PREFIX, which matches itself and the paths below it.
+
+    _validate_route_roles' shadowing check stays a plain prefix test: it is the
+    stricter of the two, so an entry it passes is reachable under either."""
+    if prefix == AUDIT_REPORTS_PREFIX:
+        return path == prefix or path.startswith(prefix + "/")
+    return path.startswith(prefix)
+
+
 def required_roles(path: str) -> tuple[str, ...]:
     """The caller roles ``path`` admits, or () if it demands none."""
     for prefix, roles in ROUTE_ROLES:
-        if path.startswith(prefix):
+        if _route_matches(path, prefix):
             return roles
     return ()
 
@@ -2815,6 +2831,9 @@ AUDIT_REPORT_STORE_TOKEN_FILE_ENV = "AUDIT_REPORT_STORE_TOKEN_FILE"  # noqa: S10
 # than this is a fault (502), since nothing the listener serves is.
 AUDIT_REPORT_MAX_BYTES = 1 << 20
 AUDIT_REPORT_STORE_TIMEOUT_SECONDS = 10.0
+# The whole relay, connect to last byte: a listener that drips its answer a
+# byte at a time inside the per-read timeout is cut off here, and answered 504.
+AUDIT_REPORT_STORE_DEADLINE_SECONDS = 15.0
 
 # The file store's names, mirrored from audit_report.py (fleet-audit skill),
 # which this image does not import: a test holds them equal.
@@ -2956,6 +2975,10 @@ class ReportStoreFault(Exception):
     """The listener failed or answered something the broker will not pass on: a 502."""
 
 
+class ReportStoreTimeout(ReportStoreFault):
+    """The listener did not answer whole within the relay's deadline: a 504."""
+
+
 class ReportStoreCredentialRefused(ReportStoreFault):
     """The listener refused the broker's own store token (401 or 403): a 502, never the caller's."""
 
@@ -3012,6 +3035,14 @@ def report_publish_store_key() -> str | None:
 def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]:
     """report_publish_store_key, with the managed keys it read.
 
+    Known window: managed_repos comes through managed_repositories(), cached
+    for MANAGED_REPOSITORY_CACHE_SECONDS, while gitops_repo is read fresh, so
+    for up to that long after a ConfigMap edit the two can disagree (a new
+    gitops_repo against the old list's count). In that window a write can be
+    checked against a key neither state alone gives, no_forge included; the
+    key is still a repository one of the two states registers, or no_forge; the
+    kubelet's own mount refresh is a lag of the same order.
+
     Read per call: managed_repos through managed_repositories() (its cache and
     refresh, the list the broker's forge gates read), and with more than one
     repository the gitops_repo key from the gitops-state ConfigMap the broker
@@ -3063,6 +3094,7 @@ class ReportStoreRelay:
     port: int
     token_file: str
     timeout: float = AUDIT_REPORT_STORE_TIMEOUT_SECONDS
+    deadline: float = AUDIT_REPORT_STORE_DEADLINE_SECONDS
 
     @classmethod
     def from_url(cls, url: str, token_file: str) -> "ReportStoreRelay | None":
@@ -3091,11 +3123,13 @@ class ReportStoreRelay:
     def relay(self, method: str, path: str, body: bytes | None) -> tuple[int, bytes]:
         """Send one request on and return the listener's (status, body).
 
-        Raises ReportStoreUnavailable when the token cannot be read, and
-        ReportStoreFault on a connection error, a timeout, an answer over
-        AUDIT_REPORT_MAX_BYTES, or a 401 or 403: those are the listener
-        refusing the broker, not the caller, and are not the caller's to read
-        as its own.
+        Raises ReportStoreUnavailable when the token cannot be read;
+        ReportStoreTimeout when a read times out or the whole exchange outlasts
+        ``deadline`` (a timer shuts the socket then, so no single blocking call
+        outlives it); and ReportStoreFault on a connection error, an answer
+        over AUDIT_REPORT_MAX_BYTES, or a 401 or 403 (ReportStoreCredentialRefused):
+        those are the listener refusing the broker, not the caller, and are not
+        the caller's to read as its own.
         """
         token = self._token()
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -3103,18 +3137,47 @@ class ReportStoreRelay:
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(body))
         connection_class = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        connection = connection_class(self.host, self.port, timeout=self.timeout)
+        connection = connection_class(self.host, self.port, timeout=min(self.timeout, self.deadline))
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            sock = connection.sock
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        timer = threading.Timer(self.deadline, expire)
+        timer.daemon = True
+        timer.start()
+        payload = bytearray()
         try:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             status = response.status
-            payload = response.read(AUDIT_REPORT_MAX_BYTES + 1)
+            while len(payload) <= AUDIT_REPORT_MAX_BYTES:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                payload += chunk
+        except TimeoutError:
+            raise ReportStoreTimeout("a read from the store timed out") from None
         except (OSError, http.client.HTTPException) as exc:
+            if expired.is_set():
+                raise ReportStoreTimeout(f"the store did not answer within {self.deadline:g}s") from None
             raise ReportStoreFault(f"the store did not answer ({type(exc).__name__})") from None
         finally:
+            timer.cancel()
             connection.close()
+        if expired.is_set():
+            # The shutdown can end a read as a clean end of file: never pass a
+            # body cut short by the deadline on as the listener's answer.
+            raise ReportStoreTimeout(f"the store did not answer within {self.deadline:g}s")
         if len(payload) > AUDIT_REPORT_MAX_BYTES:
             raise ReportStoreFault("the store's answer is over the size cap")
+        payload = bytes(payload)
         if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
             raise ReportStoreCredentialRefused(f"status {status}")
         if not 200 <= status <= 599:
@@ -12845,7 +12908,7 @@ def _endpoint_label(path: str) -> str:
     if path == HEALTHZ_PATH:
         return HEALTHZ_PATH
     for prefix, _ in ROUTE_ROLES:
-        if path.startswith(prefix):
+        if _route_matches(path, prefix):
             return prefix.rstrip("/")
     return LABEL_OTHER
 
@@ -14261,6 +14324,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "the audit-report store is unavailable", "code": "AUDIT_REPORT_STORE_UNAVAILABLE"},
+            )
+            return
+        except ReportStoreTimeout as exc:
+            LOGGER.warning("audit-report store timed out: %s", exc)
+            self._log_audit_report(HTTPStatus.GATEWAY_TIMEOUT, "store-timed-out")
+            self._json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {"error": "the audit-report store did not answer in time", "code": "AUDIT_REPORT_STORE_TIMEOUT"},
             )
             return
         except ReportStoreCredentialRefused as exc:
