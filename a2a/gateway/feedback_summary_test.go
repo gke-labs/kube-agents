@@ -272,7 +272,7 @@ func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testin
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: next", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -330,7 +330,7 @@ func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
 // TestUsageSummaryWithoutFixedLinesDropsTheModelLine: the audit's input is
 // the block less the model line; every other line stays audited.
 func TestUsageSummaryWithoutFixedLinesDropsTheModelLine(t *testing.T) {
-	text := "```\n  mode: today\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	text := "```\n  mode: next\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
 	got := usageSummaryWithoutFixedLines(text)
 	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
 		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
@@ -402,7 +402,7 @@ func TestUsageIdentifiersAreTheNamingSubtreesStringsButNotSettings(t *testing.T)
 }
 
 func TestAuditUsageSummaryMatchesWholeTokensAndSkipsTheTemplate(t *testing.T) {
-	if got := auditUsageSummary("on prod-eu-1 today", []string{"prod-eu-1", "today", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
+	if got := auditUsageSummary("on prod-eu-1 next", []string{"prod-eu-1", "next", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
 		t.Fatalf("audit = %v, want [prod-eu-1]", got)
 	}
 	if got := auditUsageSummary("version: 0.14.0-rc", []string{"0.14.0"}); len(got) != 0 {
@@ -420,7 +420,7 @@ func TestAuditSkipsTheBlocksOwnVocabulary(t *testing.T) {
 			t.Fatalf("fixture: %q is not in the block", word)
 		}
 	}
-	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "today", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
+	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "next", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
 	if leaked := auditUsageSummary(text, vocabulary); len(leaked) != 0 {
 		t.Fatalf("the audit refused the block's own words: %v", leaked)
 	}

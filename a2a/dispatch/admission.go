@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -68,7 +69,7 @@ var errHeldBack = errors.New("held back at admission")
 // listed its pods yet says nothing, so a dispatcher just started refuses
 // nothing on it.
 func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
-	if !d.cfg.unattended(tier) || (d.jobs != nil && len(prof.JobTemplate) > 0) {
+	if !d.cfg.unattendedFor(prof, tier) || (d.jobs != nil && prof.HasJobTemplate()) {
 		return false
 	}
 	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
@@ -91,6 +92,9 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (_ admitted, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
+	if prof.DrainsTier(tier) {
+		return admitted{}, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
+	}
 	if !allowsTier(prof, tier) {
 		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
@@ -123,6 +127,9 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	target, cluster, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
 		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
+	}
+	if ref := profileParentRefusal(env, snap, prof, hk.kind, target); ref != nil {
+		return admitted{}, ref, nil
 	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
 	if err != nil {
@@ -244,4 +251,50 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 		return "", nil, "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
 	return capability.Scope(namespaceTarget + namespace), nil, ""
+}
+
+// parentChainSeparator joins a parent's chain in a parent-cycle refusal.
+const parentChainSeparator = " → "
+
+// profileParentRefusal re-checks a child whose parent is an AgentProfile task
+// (#5686): the gateway holds it to these rules at mint, and this holds the
+// child to them even when the gateway that sent it is an older one that
+// never checked, during a roll or after a rollback. The parent is a profile
+// task when the child's `via.session` names a profile this install
+// dispatches; a session's child names its session pod instead. Such a child
+// must carry the parent's scope (the gateway writes it with the parent's
+// chain), its profile must not be on the parent's chain unless the parent
+// heads it and starts its own profile once, and its target must lie inside
+// the parent's scope, where the install's namespace scope holds any target
+// the install admits. nil admits.
+func profileParentRefusal(env *lib.Envelope, snap lib.DispatchConfig, prof lib.DispatchProfile, kind string, target capability.Scope) *refusal {
+	if kind != lib.SubmitKindChild {
+		return nil
+	}
+	via, err := capability.ViaFromAuthority(env.Authority)
+	if err != nil || via == nil || !dispatchesProfile(snap, via.Session) {
+		return nil
+	}
+	if via.Scope == "" {
+		return &refusal{ReasonParentUnchecked, fmt.Sprintf("a child of profile %s's task carries no parent scope, so its chain and scope were never checked", via.Session)}
+	}
+	chain := append(slices.Clone(via.ProfileChain), via.Session)
+	headSelfNest := len(via.ProfileChain) == 0 && prof.Name == via.Session
+	if slices.Contains(chain, prof.Name) && !headSelfNest {
+		return &refusal{ReasonParentCycle, fmt.Sprintf("profile %s is already on its parent's chain (%s)", prof.Name, strings.Join(chain, parentChainSeparator))}
+	}
+	if via.Scope != capability.NamespaceScope(snap.Namespace) && !via.Scope.Contains(target) {
+		return &refusal{ReasonOutsideParentScope, fmt.Sprintf("target %s is outside its parent's scope %s", target, via.Scope)}
+	}
+	return nil
+}
+
+// dispatchesProfile reports whether name is a profile in snap.
+func dispatchesProfile(snap lib.DispatchConfig, name string) bool {
+	for _, p := range snap.Profiles {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }

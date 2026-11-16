@@ -245,10 +245,10 @@ func TestTheWebsocketOriginsAreTheConsoleServers(t *testing.T) {
 	}
 }
 
-// The console server renders with the rest of the next stack, before the
-// gateway's hold (it serves the page whether or not the gateway is up), and
-// goes away with the stack on a flip back to today. Its fence goes with it.
-func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
+// The console server renders with the rest of the A2A stack, before the
+// gateway's hold (it serves the page whether or not the gateway is up), with
+// its fence.
+func TestReconcileA2ARendersTheConsoleAheadOfTheGateway(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	cl := fake.NewClientBuilder().
@@ -275,72 +275,16 @@ func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
 	}
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, name, dep); err != nil {
-		t.Fatalf("console Deployment not rendered under next, ahead of the gateway: %v", err)
+		t.Fatalf("console Deployment not rendered ahead of the gateway: %v", err)
 	}
 	if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Name != agent.Name {
 		t.Errorf("console Deployment owner refs = %+v, want the PlatformAgent", dep.OwnerReferences)
 	}
 	if err := cl.Get(ctx, name, &corev1.Service{}); err != nil {
-		t.Errorf("console Service not rendered under next: %v", err)
+		t.Errorf("console Service not rendered: %v", err)
 	}
 	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); err != nil {
-		t.Errorf("console NetworkPolicy not rendered under next: %v", err)
-	}
-
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-	fresh.Spec.Mode = nil
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("failed to update agent: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after the flip failed: %v", err)
-	}
-	if err := cl.Get(ctx, name, &appsv1.Deployment{}); !errors.IsNotFound(err) {
-		t.Errorf("console Deployment still present under today (err=%v)", err)
-	}
-	if err := cl.Get(ctx, name, &corev1.Service{}); !errors.IsNotFound(err) {
-		t.Errorf("console Service still present under today (err=%v)", err)
-	}
-	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
-		t.Errorf("console NetworkPolicy still present under today (err=%v)", err)
-	}
-}
-
-// The console fence outlives every other front-door object in the teardown:
-// its Deployment's Delete returns before the pod has exited, and an unfenced
-// console pod hands its password to any in-cluster caller. It goes directly
-// before the session fence, which is as late as it can go:
-// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes holds the session fence
-// last.
-func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
-	agent := a2aTestAgent()
-	r := &PlatformAgentReconciler{}
-	pos := map[string]int{}
-	for i, e := range r.a2aNamespacedTeardown(agent) {
-		pos[fmt.Sprintf("%T/%s", e.obj, e.obj.GetName())] = i
-	}
-	idx := func(key string) int {
-		i, ok := pos[key]
-		if !ok {
-			t.Fatalf("teardown has no %s", key)
-		}
-		return i
-	}
-	fence := idx("*v1.NetworkPolicy/" + a2aConsoleNetpolName(agent))
-	if dep := idx("*v1.Deployment/" + a2aConsoleName(agent)); fence < dep {
-		t.Errorf("console fence at %d, before its Deployment at %d", fence, dep)
-	}
-	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence != session-1 {
-		t.Errorf("console fence at %d, want directly before the session fence at %d", fence, session)
-	}
-	// cleanupA2A deletes the StatefulSet sentinel after this whole walk, so
-	// being in the walk is being before it. Should the StatefulSet move back
-	// into the walk, the order still has to hold.
-	if sts, ok := pos["*v1.StatefulSet/"+a2aNATSName(agent)]; ok && fence > sts {
-		t.Errorf("console fence at %d, after the StatefulSet sentinel at %d", fence, sts)
+		t.Errorf("console NetworkPolicy not rendered: %v", err)
 	}
 }
 

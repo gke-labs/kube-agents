@@ -63,6 +63,11 @@ const (
 	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
 	// series.
 	answerFeedbackName = "answer_feedback_total"
+	// postFeedbackName counts the ratings chat users gave the posts the agent
+	// made on its own (alerts and reports on the chat.notify route), by
+	// platform, rating and kind (feedback.go): apart from answer_feedback_total,
+	// so a 👎 on a noisy alert reads as noise rather than as a bad answer.
+	postFeedbackName = "post_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
 	// sessionsTotal, beside the watcher's triage sessions and the
@@ -118,6 +123,7 @@ const (
 	labelPlatform = "platform"
 	labelRating   = "rating"
 	labelAnswer   = "answer"
+	labelKind     = "kind"
 	labelWindow   = "window"
 	labelMethod   = "method"
 	// The Slack API outcomes: ok (a 2xx), rate_limited (a 429) and error
@@ -142,6 +148,11 @@ const (
 	// or the root aged out of its history) is counted as other.
 	answerReply = "reply"
 	answerCard  = "card"
+	// The kind label's values: what the rated post was, an alert (a keyed
+	// home post, whose thread its triage edits) or a report (any other home
+	// post: a scheduled or audit report, a digest).
+	postKindAlert  = "alert"
+	postKindReport = "report"
 	// The window label's values: peopleWindowShort and peopleWindowLong.
 	peopleWindowShortLabel = "7d"
 	peopleWindowLongLabel  = "30d"
@@ -212,6 +223,7 @@ var (
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	metricsAnswers         = []string{answerReply, answerCard}
+	metricsPostKinds       = []string{postKindAlert, postKindReport}
 	// metricsRatedPlatforms are the backends that draw rating controls, each
 	// given a zero answer_feedback_total series per rating and answer.
 	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
@@ -258,6 +270,7 @@ type Metrics struct {
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
 	answerFeedback      *prometheus.CounterVec
+	postFeedback        *prometheus.CounterVec
 	sessions            *prometheus.CounterVec
 	slackIngressLag     *prometheus.HistogramVec
 	slackAPIDuration    *prometheus.HistogramVec
@@ -394,6 +407,12 @@ func NewMetrics() *Metrics {
 			Name:      answerFeedbackName,
 			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
 		}, []string{labelPlatform, labelRating, labelAnswer}),
+		postFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      postFeedbackName,
+			Help:      "Ratings verified chat users gave the posts the agent made on its own, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and kind (alert, a keyed home post its triage edits; report, any other home post; other); counted once per rating change, apart from answer_feedback_total.",
+		}, []string{labelPlatform, labelRating, labelKind}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -444,7 +463,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -464,6 +483,9 @@ func NewMetrics() *Metrics {
 		for _, rating := range metricsRatings {
 			for _, answer := range metricsAnswers {
 				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
+			for _, kind := range metricsPostKinds {
+				m.postFeedback.WithLabelValues(platform, rating, kind)
 			}
 		}
 	}
@@ -737,4 +759,23 @@ func (m *Metrics) answerRated(platform, rating, answer string) {
 		answer = metricsLabelOther
 	}
 	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
+}
+
+// postRated counts one rating of a post the agent made on its own. Every
+// label comes from a closed list: a platform, rating or kind outside them is
+// counted as other.
+func (m *Metrics) postRated(platform, rating, kind string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	if !slices.Contains(metricsPostKinds, kind) {
+		kind = metricsLabelOther
+	}
+	m.postFeedback.WithLabelValues(platform, rating, kind).Inc()
 }

@@ -297,37 +297,9 @@ func TestReconcileInvalidShellSandboxResources(t *testing.T) {
 
 	// With every workload ready the agent reaches Ready while Degraded still
 	// carries the refusal, as the two sibling tests assert for their fields.
-	deps := &appsv1.DeploymentList{}
-	if err := cl.List(ctx, deps, client.InNamespace(agent.Namespace)); err != nil {
-		t.Fatalf("list deployments: %v", err)
-	}
-	for i := range deps.Items {
-		d := &deps.Items[i]
-		want := int32(1)
-		if d.Spec.Replicas != nil {
-			want = *d.Spec.Replicas
-		}
-		d.Status.Replicas = want
-		d.Status.ReadyReplicas = want
-		if err := cl.Status().Update(ctx, d); err != nil {
-			t.Fatalf("mark %s ready: %v", d.Name, err)
-		}
-	}
-	stses := &appsv1.StatefulSetList{}
-	if err := cl.List(ctx, stses, client.InNamespace(agent.Namespace)); err != nil {
-		t.Fatalf("list statefulsets: %v", err)
-	}
-	for i := range stses.Items {
-		st := &stses.Items[i]
-		want := int32(1)
-		if st.Spec.Replicas != nil {
-			want = *st.Spec.Replicas
-		}
-		st.Status.Replicas = want
-		st.Status.ReadyReplicas = want
-		if err := cl.Status().Update(ctx, st); err != nil {
-			t.Fatalf("mark %s ready: %v", st.Name, err)
-		}
+	markEveryWorkloadReady(t, ctx, cl, r, req, agent)
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
 	}
 	r.APIReader = cl
 	phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))

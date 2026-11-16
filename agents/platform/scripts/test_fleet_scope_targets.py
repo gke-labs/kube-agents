@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s agents/platform/scripts -p 'test_fleet_scop
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pathlib
@@ -429,6 +430,280 @@ class CollectorArgvTest(unittest.TestCase):
         excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",), declared_containers=("folders/1",), retiring=("legacy",))
         self.assertEqual(excluding.collector_argv(), ("--scope-projects", "ops-mgmt"))
 
+
+
+def _identity_config(project, cluster, location):
+    return f"cluster_identity:\n  project: {project}\n  cluster: {cluster}\n  location: {location}\n"
+
+
+def _resolved(rows, clusters=None, state="ok", excluded=(), version=1):
+    document = {"v": version, "resolvedAt": "2026-11-10T12:00:00Z", "state": state, "memberHash": "sha256:x",
+                "excludedProjects": list(excluded),
+                "projects": [{"id": p, "via": ["folders/1"], "outcome": o, "confirmedAt": "2026-11-10T12:00:00Z"} for p, o in rows]}
+    if clusters is not None:
+        document["clusters"] = clusters
+    return document
+
+
+class ListScopeClustersTest(unittest.TestCase):
+    """list_scope_clusters (#5621): the resolved scope under spec.mode: next,
+    the profiles walk otherwise."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = pathlib.Path(self.tmp.name)
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in (fst.SCOPE_FILE_ENV, fst.RESOLVED_SCOPE_FILE_ENV, *fst.MANAGEMENT_PROJECT_ENVS):
+            os.environ.pop(name, None)
+        # A profile that would give a different answer if anything walked it
+        # in next mode.
+        self._profile("cluster-ghost", "ghost-proj", "ghost", "us-east1")
+
+    def _profile(self, name, project, cluster, location):
+        home = self.home / "profiles" / name
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(_identity_config(project, cluster, location), encoding="utf-8")
+
+    def _render(self, render):
+        path = self.home / "scope.json"
+        path.write_text(json.dumps(render), encoding="utf-8")
+        os.environ[fst.SCOPE_FILE_ENV] = str(path)
+
+    def _resolved_file(self, document):
+        path = self.home / "resolved-scope.json"
+        path.write_text(document if isinstance(document, str) else json.dumps(document), encoding="utf-8")
+        os.environ[fst.RESOLVED_SCOPE_FILE_ENV] = str(path)
+        return path
+
+    def _next(self, document, render=None, management="mgmt"):
+        render = render if render is not None else {"present": True, "projects": ["explicit-a"], "folders": ["1"]}
+        self._render(render)
+        if isinstance(document, dict) and document.get("memberHash") == "sha256:x":
+            # Resolved for this declaration, as the publisher stamps it.
+            import scope_publisher
+            document = {**document, "memberHash": scope_publisher.member_hash(render)}
+        self._resolved_file(document)
+        return fst.list_scope_clusters(self.home, management_project=management)
+
+    def test_members_come_from_the_clusters_map_and_live_projects_are_marked(self):
+        got = self._next(_resolved([("member-a", "ok"), ("member-b", "ok")], clusters={
+            "member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"], ["europe-west1", "api"]]},
+            "member-b": {"at": "2026-11-09T08:00:00Z", "clusters": []},
+        }))
+        self.assertEqual(got.source, fst.SOURCE_RESOLVED_SCOPE)
+        self.assertTrue(got.next_mode)
+        by = got.by_project()
+        self.assertEqual(list(by), ["mgmt", "explicit-a", "member-a", "member-b"])
+        self.assertEqual(by["mgmt"].status, fst.STATUS_LIST_LIVE)
+        self.assertEqual(by["explicit-a"].status, fst.STATUS_LIST_LIVE)
+        # "List live" is never an empty list a caller could read as no clusters.
+        self.assertIsNone(by["mgmt"].clusters)
+        self.assertIsNone(by["explicit-a"].clusters)
+        self.assertEqual(by["member-a"].status, fst.STATUS_LISTED)
+        self.assertEqual(by["member-a"].clusters, (("member-a", "europe-west1", "api"), ("member-a", "us-central1", "web")))
+        self.assertEqual(by["member-a"].at, "2026-11-10T12:00:00Z")
+        # A member the probe listed empty is a real empty list, with its age.
+        self.assertEqual(by["member-b"].clusters, ())
+        self.assertEqual(by["member-b"].at, "2026-11-09T08:00:00Z")
+        self.assertNotIn("ghost-proj", by)
+
+    def test_management_falls_back_to_the_project_env(self):
+        os.environ[fst.MANAGEMENT_PROJECT_ENVS[0]] = "env-mgmt"
+        got = self._next(_resolved([]), management=None)
+        self.assertEqual(got.by_project()["env-mgmt"].status, fst.STATUS_LIST_LIVE)
+
+    def test_a_member_with_no_entry_is_unread_never_empty(self):
+        got = self._next(_resolved([("member-a", "ok"), ("member-c", "denied")], clusters={
+            "member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        }))
+        entry = got.by_project()["member-c"]
+        self.assertEqual(entry.status, fst.STATUS_UNREAD)
+        self.assertIsNone(entry.clusters)
+        self.assertIn("denied", entry.reason)
+        self.assertIsNone(got.note)
+
+    def test_a_document_resolved_for_another_declaration_leaves_members_unread(self):
+        # The gateway refuses a stale document; so does the reader, or a scope
+        # edit would be read through the old membership until the next publish.
+        document = _resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        document["memberHash"] = "sha256:" + "0" * 64
+        got = self._next(document)
+        self.assertEqual(got.by_project()["member-a"].status, fst.STATUS_UNREAD)
+        self.assertIn("another declaration", got.note)
+        self.assertEqual(got.by_project()["explicit-a"].status, fst.STATUS_LIST_LIVE)
+
+    def test_an_api_disabled_member_is_listed_empty(self):
+        # A project whose clusters API is off has no GKE clusters: listed empty,
+        # not unread, so every run doesn't read as partial.
+        got = self._next(_resolved([("member-a", "api-disabled")]))
+        entry = got.by_project()["member-a"]
+        self.assertEqual(entry.status, fst.STATUS_LISTED)
+        self.assertEqual(entry.clusters, ())
+
+    def test_an_api_disabled_member_is_listed_empty_over_a_carried_entry(self):
+        # The publisher keeps a member's previous entry whenever this run's
+        # outcome is not ok, api-disabled included: the API being off now
+        # outranks the clusters an older run listed.
+        got = self._next(_resolved([("member-a", "api-disabled")], clusters={"member-a": {"at": "2026-11-01T12:00:00Z", "clusters": [["l", "gone"]]}}))
+        entry = got.by_project()["member-a"]
+        self.assertEqual(entry.status, fst.STATUS_LISTED)
+        self.assertEqual(entry.clusters, ())
+        self.assertNotEqual(entry.at, "2026-11-01T12:00:00Z")
+
+    def test_a_malformed_entry_is_unread(self):
+        got = self._next(_resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["only-one"]]}}))
+        self.assertEqual(got.by_project()["member-a"].status, fst.STATUS_UNREAD)
+
+    def test_an_unusable_document_leaves_every_member_unread_and_says_why(self):
+        cases = {
+            "too-large": _resolved([], state="too-large"),
+            "error": _resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["l", "c"]]}}, state="error"),
+            "version": _resolved([("member-a", "ok")], version=2),
+            "unparseable": "{not json",
+            "not an object": "[]",
+        }
+        for label, document in cases.items():
+            with self.subTest(label):
+                got = self._next(document)
+                by = got.by_project()
+                self.assertIsNotNone(got.note)
+                self.assertEqual(by["mgmt"].status, fst.STATUS_LIST_LIVE)
+                self.assertEqual(by["explicit-a"].status, fst.STATUS_LIST_LIVE)
+                # The members no row names are one named gap, not "no members".
+                self.assertEqual(by[fst.UNRESOLVED_SCOPE_ROW].status, fst.STATUS_UNREAD)
+                self.assertFalse(any(e.status == fst.STATUS_LISTED for e in got.projects))
+                if label == "error":
+                    # The rows an error document carries are named unread, not listed.
+                    self.assertEqual(by["member-a"].status, fst.STATUS_UNREAD)
+
+    def test_a_missing_document_leaves_members_unread(self):
+        self._render({"present": True, "projects": [], "folders": ["1"]})
+        os.environ[fst.RESOLVED_SCOPE_FILE_ENV] = str(self.home / "absent.json")
+        got = fst.list_scope_clusters(self.home, management_project="mgmt")
+        self.assertEqual(got.source, fst.SOURCE_RESOLVED_SCOPE)
+        self.assertIn("cannot be read", got.note)
+        self.assertEqual(got.by_project()[fst.UNRESOLVED_SCOPE_ROW].status, fst.STATUS_UNREAD)
+
+    def test_an_unusable_document_on_explicit_projects_alone_names_no_member_gap(self):
+        # A declaration with no folder, organisation or selector has no members.
+        got = self._next("{not json", render={"present": True, "projects": ["explicit-a"]})
+        self.assertNotIn(fst.UNRESOLVED_SCOPE_ROW, got.by_project())
+
+    def test_exclusions_are_applied(self):
+        render = {"present": True, "projects": ["explicit-a", "explicit-skip"], "folders": ["1"],
+                  "exclude": {"projects": ["*-skip"], "clusters": [{"projectId": "member-a", "location": "us-central1", "clusterName": "web"},
+                                                                    {"projectId": "explicit-a", "location": "us-east1", "clusterName": "old"}]}}
+        got = self._next(_resolved([("member-a", "ok"), ("member-skip", "ok"), ("member-dropped", "ok")], clusters={
+            "member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"], ["us-central1", "api"]]},
+            "member-skip": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "x"]]},
+            "member-dropped": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "y"]]},
+        }, excluded=["member-dropped"]), render=render)
+        by = got.by_project()
+        self.assertEqual(list(by), ["mgmt", "explicit-a", "member-a"])
+        self.assertEqual(by["member-a"].clusters, (("member-a", "us-central1", "api"),))
+        self.assertIn(("explicit-a", "us-east1", "old"), got.excluded_clusters)
+        self.assertFalse(got.admits("explicit-a", "us-east1", "old"))
+        self.assertTrue(got.admits("explicit-a", "us-east1", "new"))
+        self.assertTrue(got.admits("member-a", "us-central1", "api"))
+        self.assertFalse(got.admits("member-a", "us-central1", "web"))
+        self.assertFalse(got.admits("ghost-proj", "us-east1", "ghost"))
+        self.assertFalse(got.admits(fst.UNRESOLVED_SCOPE_ROW, "l", "c"))
+
+    def test_an_unreadable_render_raises_in_next_mode(self):
+        os.environ[fst.SCOPE_FILE_ENV] = str(self.home / "absent-render.json")
+        self._resolved_file(_resolved([]))
+        with self.assertRaises(fst.ScopeRenderUnreadable):
+            fst.list_scope_clusters(self.home, management_project="mgmt")
+
+    def test_an_empty_env_is_today_mode_the_profiles_walk(self):
+        self._resolved_file(_resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["l", "c"]]}}))
+        os.environ[fst.RESOLVED_SCOPE_FILE_ENV] = ""
+        got = fst.list_scope_clusters(self.home)
+        self.assertEqual(got.source, fst.SOURCE_PROFILES_WALK)
+        self.assertFalse(got.next_mode)
+        self.assertEqual([e.project for e in got.projects], ["ghost-proj"])
+
+    def test_the_profiles_walk_reads_identities_as_the_scripts_did(self):
+        self._profile("cluster-a1", "proj-a", "one", "us-central1")
+        self._profile("cluster-a2", "proj-a", "two", "us-east1")
+        # Reserved and hidden profiles, files and unreadable identities.
+        self._profile("platform", "reserved-proj", "x", "y")
+        self._profile(".hidden", "hidden-proj", "x", "y")
+        (self.home / "profiles" / "a-file").write_text("", encoding="utf-8")
+        (self.home / "profiles" / "cluster-broken").mkdir()
+        (self.home / "profiles" / "cluster-broken" / "config.yaml").write_text("cluster_identity: [", encoding="utf-8")
+        got = fst.list_scope_clusters(self.home)
+        by = got.by_project()
+        self.assertEqual(list(by), ["ghost-proj", "proj-a"])
+        self.assertEqual(by["proj-a"].status, fst.STATUS_LISTED)
+        self.assertEqual(by["proj-a"].clusters, (("proj-a", "us-central1", "one"), ("proj-a", "us-east1", "two")))
+        self.assertIsNone(by["proj-a"].at)
+        self.assertEqual(got.unidentified_profiles, ("cluster-broken",))
+        self.assertEqual(sorted(name for name, _ in fst.profile_identities(self.home)), ["cluster-a1", "cluster-a2", "cluster-broken", "cluster-ghost"])
+
+    def test_no_profiles_directory_is_an_empty_answer(self):
+        empty = pathlib.Path(self.tmp.name) / "elsewhere"
+        empty.mkdir()
+        got = fst.list_scope_clusters(empty)
+        self.assertEqual((got.source, got.projects, got.unidentified_profiles), (fst.SOURCE_PROFILES_WALK, (), ()))
+
+    def test_next_mode_never_reads_the_profiles_directory(self):
+        with mock.patch.object(fst, "profile_identities", side_effect=AssertionError("walked the profiles")):
+            got = self._next(_resolved([]))
+        self.assertEqual(got.source, fst.SOURCE_RESOLVED_SCOPE)
+
+
+class NoCallerWalksProfilesTest(unittest.TestCase):
+    """#5621: fleet_scope_targets is the one reader of the profiles directory
+    for a cluster list; the watch scripts call it rather than list the
+    directory themselves."""
+
+    SCRIPTS = ("stall_watch.py", "upgrade_readiness_watch.py", "sa_role_watch.py", "leeway_watch.py")
+    WALKS = {"iterdir", "listdir", "scandir", "glob", "rglob", "walk"}
+
+    @classmethod
+    def walking_functions(cls, source: str) -> list[str]:
+        """The functions that both name the profiles directory (PROFILES_DIR
+        or a "profiles" literal) and list a directory."""
+        found = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names_profiles = any(
+                (isinstance(n, ast.Name) and n.id == "PROFILES_DIR")
+                or (isinstance(n, ast.Attribute) and n.attr == "PROFILES_DIR")
+                or (isinstance(n, ast.Constant) and n.value == "profiles")
+                for n in ast.walk(node)
+            )
+            walks = any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in cls.WALKS
+                for n in ast.walk(node)
+            )
+            if names_profiles and walks:
+                found.append(f"{node.name}:{node.lineno}")
+        return found
+
+    def test_no_watch_script_lists_the_profiles_directory(self):
+        here = pathlib.Path(__file__).resolve().parent
+        for name in self.SCRIPTS:
+            with self.subTest(name):
+                self.assertEqual(self.walking_functions((here / name).read_text(encoding="utf-8")), [],
+                                 f"{name} walks the profiles directory; call fleet_scope_targets.list_scope_clusters")
+
+    def test_the_check_catches_the_walk_it_replaced(self):
+        # The shape every script had before #5621, and the reader's own walk.
+        before = (
+            "def roster_projects():\n"
+            "    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR\n"
+            "    for home in base.iterdir():\n"
+            "        pass\n"
+        )
+        self.assertEqual(self.walking_functions(before), ["roster_projects:1"])
+        reader = (pathlib.Path(__file__).resolve().parent / "fleet_scope_targets.py").read_text(encoding="utf-8")
+        self.assertEqual([f.split(":")[0] for f in self.walking_functions(reader)], ["profile_identities"])
 
 if __name__ == "__main__":
     unittest.main()
