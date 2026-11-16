@@ -14,12 +14,13 @@ and cannot import the Go package. So this is a second implementation of
     TestCredentialProxyFixtures -update-proxy-fixtures`` regenerates them) and
     verified again here by ``test_task_credential.py``, so the two verifiers
     are held to one verdict per token.
-  * Where this is stricter it says so: ``target`` is required except on a
-    report credential (Go makes it optional for this audience, and a proxy
-    credential with no target confines nothing; see REPORT_TIER), base64url must be canonical, the header must carry exactly
-    ``typ`` and ``alg``, and a JSON ``null`` is refused where Go would read the
-    zero value. Each of those is a fixture with ``go_ok`` and ``proxy_ok``
-    apart.
+  * ``target`` is required except on a report credential (a proxy credential
+    with no target confines nothing; see REPORT_TIER), and Go holds the same
+    rule, so the dispatcher never mints one this refuses.
+  * Where this is stricter it says so: base64url must be canonical, the header
+    must carry exactly ``typ`` and ``alg``, and a JSON ``null`` is refused where
+    Go would read the zero value (a null target included). Each of those is a
+    fixture with ``go_ok`` and ``proxy_ok`` apart.
 
 The credential authenticates nothing by itself. The broker binds it to the pod
 the API server attested by TokenReview (pod name and UID) and to that pod's
@@ -102,9 +103,8 @@ ED25519_SIGNATURE_LENGTH = 64
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
 NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger"})
-# Every nats key but target and trigger is required. Target is optional in Go
-# for this audience; here it may be absent only on a report credential (below),
-# so this is stricter than Go everywhere else. Trigger is optional in both.
+# Every nats key but target and trigger is required. Target may be absent only
+# on a report credential (below), in Go as here. Trigger is optional in both.
 NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid"})
 # A report credential (#5619): a proxy credential with no target, which only an
 # unattended task started by a trigger may carry. A fleet audit names no

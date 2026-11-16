@@ -236,6 +236,7 @@ func TestTheAudienceMustMatch(t *testing.T) {
 	}
 	proxy := validClaims(now)
 	proxy.Audience = AudienceCredentialProxy
+	proxy.Target = &Target{Project: "my-project", Location: "us-central1", Cluster: "prod-1"}
 	if _, err := Verify(mint(t, kp, proxy), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
 		t.Error("a credential-proxy credential verified for nats")
 	}
@@ -362,10 +363,48 @@ func TestATargetIsForTheCredentialProxyAlone(t *testing.T) {
 		t.Errorf("target = %+v, want %+v", got.Target, target)
 	}
 
+	// With no target it is a report credential or nothing (#5619): see
+	// TestATargetlessProxyCredentialIsAReportCredentialAlone.
 	c.Target = nil
-	got, err = Verify(mint(t, kp, c), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
-	if err != nil || got.Target != nil {
-		t.Errorf("a proxy credential without a target: %+v, %v", got.Target, err)
+	if _, err := Mint(kp, c); err == nil {
+		t.Error("Mint made a read-tier proxy credential with no target and no trigger")
+	}
+}
+
+// A proxy credential with no target confines nothing, so Go holds it to the
+// Python verifier's rule (#5619): only a ReportTier task with a trigger may
+// omit the target, at Mint and at Verify both.
+func TestATargetlessProxyCredentialIsAReportCredentialAlone(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	trig := Trigger{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit"}
+	report := validClaims(now)
+	report.Audience, report.Tier, report.Trigger = AudienceCredentialProxy, ReportTier, &trig
+	got, err := Verify(mint(t, kp, report), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
+	if err != nil || got.Target != nil || got.Trigger == nil || *got.Trigger != trig || got.Tier != ReportTier {
+		t.Fatalf("a report credential: %+v, %v", got, err)
+	}
+
+	for name, edit := range map[string]func(*Claims){
+		"the read tier, a trigger":        func(c *Claims) { c.Tier = "read" },
+		"a custom tier, a trigger":        func(c *Claims) { c.Tier = "nightly" },
+		"the unattended tier, no trigger": func(c *Claims) { c.Trigger = nil },
+	} {
+		c := report
+		edit(&c)
+		if _, err := Mint(kp, c); err == nil || !strings.Contains(err.Error(), "names no target") {
+			t.Errorf("%s: Mint err = %v; want the no-target refusal", name, err)
+		}
+		tok := handMint(t, kp, now, func(gc *jwt.GenericClaims) {
+			gc.Audience = string(AudienceCredentialProxy)
+			gc.Data["tier"] = c.Tier
+			if c.Trigger != nil {
+				gc.Data["trigger"] = map[string]any{"name": c.Trigger.Name, "origin": c.Trigger.Origin, "stream": c.Trigger.Stream}
+			}
+		})
+		if _, err := Verify(tok, []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew); err == nil {
+			t.Errorf("%s: Verify accepted a proxy credential with no target", name)
+		}
 	}
 }
 

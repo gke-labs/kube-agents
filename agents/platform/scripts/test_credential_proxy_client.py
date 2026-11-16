@@ -7,6 +7,7 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
+import base64
 import http.client
 import http.server
 import io
@@ -1174,6 +1175,54 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(1, sent["exit_code"])
         self.assertNotIn("request", sent)
         self.assertIn("does not hold a task credential", sent["stderr"])
+
+    @staticmethod
+    def jwt_shaped(nats):
+        """An unsigned header.payload.sig string: the shim reads claims, never verifies."""
+
+        def segment(value):
+            return base64.urlsafe_b64encode(json.dumps(value).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+        return f"{segment({'typ': 'JWT'})}.{segment({'jti': 'J', 'nats': nats})}.c2ln"
+
+    def headers_for(self, path):
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            return credential_proxy_client.task_credential_headers(path)
+
+    def test_a_report_credential_is_sent_only_on_the_audit_report_routes(self):
+        # No target: the broker admits it on /v1/audit-reports alone, so on
+        # any other call the task goes without and keeps local-only commands.
+        token = self.jwt_shaped({"type": "task", "tier": "report", "trigger": {"name": "t"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reportsx", "/v1/audit", "/"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
+        for path in ("/v1/audit-reports", "/v1/audit-reports/fleet-audit/k/latest", "/v1/audit-reports?x=1"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+        sent = self.run_shim(["kubectl", "version", "--client"], self.task_env())
+        self.assertEqual(0, sent["exit_code"])
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_a_targeted_credential_is_sent_on_every_route(self):
+        token = self.jwt_shaped({"type": "task", "target": {"cluster": "c"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+
+    def test_a_credential_whose_claims_cannot_be_read_is_sent_as_before(self):
+        # The broker refuses a bad one loudly; leaving it off would hide that.
+        for token in ("a.b.c", "a.-_-.c", "a." + base64.urlsafe_b64encode(b"[1]").decode().rstrip("=") + ".c", "abc"):
+            with self.subTest(token=token):
+                self.token_path.write_text(token, encoding="utf-8")
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for("/v1/exec"))
+
+    def test_no_token_file_sends_nothing_on_any_route(self):
+        self.token_path.unlink()
+        for path in ("/v1/exec", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
 
     def test_kubeconfig_does_not_choose_the_cluster_in_a_task(self):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env(KUBECONFIG=str(self.kubeconfig)))

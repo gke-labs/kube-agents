@@ -363,12 +363,16 @@ leave open:
   mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. When an unattended trigger submitted the
+  admission. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). The broker also accepts a
-  `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
-  credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
+  found equal to the grant's at admission (added 11/11, #4685). A task that names no cluster gets
+  no `proxyToken`, except an `unattended` task a trigger started: it gets a report credential, a
+  `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
+  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
+  only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
+  trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
+  binds a trigger at. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon

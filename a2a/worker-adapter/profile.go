@@ -669,7 +669,7 @@ func removeAllWritable(path string) error {
 
 // writeTaskToken writes the proxy token where the shims read it, for the
 // task's lifetime, and returns what removes it. A task with no token (no
-// target, or no signing key) leaves no file, so the broker gives its calls
+// target and not a report credential, or no signing key) leaves no file, so the broker gives its calls
 // no cluster.
 func (w *profileWorker) writeTaskToken(token string) func() {
 	path := w.pw.TaskTokenFile

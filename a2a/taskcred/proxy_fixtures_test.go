@@ -25,12 +25,13 @@ import (
 // verifies the same file, so a change to either verifier that moves a verdict
 // fails one of them.
 //
-// The two verdicts differ only where the proxy is deliberately stricter:
-// a credential with no target (Verify accepts it for this audience; a proxy
-// credential with no target confines nothing, so the proxy takes one only as
-// a report credential: tier unattended and a trigger, #5619), and the encodings the Python
-// verifier refuses (non-canonical base64url, a JSON null, header keys beyond
-// typ and alg).
+// The two verdicts differ only where the proxy is deliberately stricter: the
+// encodings the Python verifier refuses (non-canonical base64url, a JSON
+// null, header keys beyond typ and alg). A credential with no target is
+// refused by both unless it is a report credential (tier unattended and a
+// trigger, #5619): a proxy credential with no target confines nothing, and
+// Verify holds the same rule so the dispatcher never mints a shape the proxy
+// refuses.
 //
 // To regenerate after changing a case or the format:
 //
@@ -224,12 +225,16 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 		Token: report("unattended", `{"name":"stall-watch","origin":"builtin"}`),
 		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(collector)})
 
-	// Go accepts, the proxy refuses: stricter by design.
+	// No target and not a report credential: both refuse.
 	noTarget := edited(`,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`, ``)
-	add(proxyFixture{Name: "no target", Token: noTarget, Now: fixtureNow, GoOK: true})
-	add(proxyFixture{Name: "no target, a trigger, at the read tier",
-		Token: report("read", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`), Now: fixtureNow, GoOK: true})
-	add(proxyFixture{Name: "no target, unattended, no trigger", Token: report("unattended", ""), Now: fixtureNow, GoOK: true})
+	add(refused("no target", noTarget))
+	add(refused("no target, a trigger, at the read tier",
+		report("read", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`)))
+	add(refused("no target, a trigger, at a custom tier",
+		report("nightly", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`)))
+	add(refused("no target, unattended, no trigger", report("unattended", "")))
+
+	// Go accepts, the proxy refuses: stricter by design.
 	add(proxyFixture{Name: "a null target, unattended, a trigger",
 		Token: edited(`"tier":"read"`, `"tier":"unattended"`, trig, `,"target":null,"trigger":{"name":"stall-watch","origin":"builtin"}`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
