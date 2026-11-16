@@ -692,7 +692,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         the trap from either launcher and the orphan comes back with every test
         above still green, because they run a fake supervisor rather than these.
         """
-        for name in ("start_event_watcher", "start_drift_detector"):
+        for name in ("start_event_watcher", "start_drift_detector", "start_audit_report_store"):
             with self.subTest(launcher=name):
                 self.assertIn(
                     "trap 'exit 0' TERM",
@@ -745,7 +745,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         )
 
         terminate = self.lift("terminate")
-        for pid_var in ("watcher_pid", "drift_pid"):
+        for pid_var in ("watcher_pid", "drift_pid", "store_pid"):
             with self.subTest(pid_var=pid_var):
                 self.assertRegex(
                     terminate,
@@ -1011,7 +1011,7 @@ class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):
         self.assertEqual(url, f"http://{host}:{port}")
 
     def test_neither_launcher_writes_the_address_out(self) -> None:
-        for name in ("start_event_watcher", "start_drift_detector"):
+        for name in ("start_event_watcher", "start_drift_detector", "start_audit_report_store"):
             with self.subTest(launcher=name):
                 launcher = self.lift(name)
                 self.assertIn('--daemon-url="${KV_DAEMON_URL}"', launcher)

@@ -1108,13 +1108,17 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         gateway = gateways[0]
         pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        # Every port entry on the store's port or carrying its name: a second name
+        # on 8700 would let a rule admitting that name reach the store unseen.
         declared = [
-            (c["name"], p["containerPort"])
+            (c["name"], p.get("name"), p.get("containerPort"))
             for c in h.containers_of(gateway)
             for p in c.get("ports") or []
-            if p.get("name") == port_name
+            if p.get("name") == port_name or p.get("containerPort") == port
         ]
-        self.assertEqual(declared, [("agent-api-auth", port)], "the store's port is not agent-api-auth's alone")
+        self.assertEqual(
+            declared, [("agent-api-auth", port_name, port)], "the store's port is not agent-api-auth's alone"
+        )
 
         brokers = [
             d for d in h.objects_of_kind(documents, "Deployment")
@@ -1130,8 +1134,14 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         def selects_gateway(policy: dict) -> bool:
             chosen = policy["spec"].get("podSelector") or {}
+            # Not evaluated, so refused outright: a policy selecting the gateway
+            # by matchExpressions could admit any peer to the store unseen.
+            self.assertFalse(
+                chosen.get("matchExpressions"),
+                f"{policy['metadata']['name']} uses matchExpressions, which this check does not evaluate",
+            )
             labels = chosen.get("matchLabels") or {}
-            return not chosen.get("matchExpressions") and labels == {k: pod_labels.get(k) for k in labels}
+            return labels == {k: pod_labels.get(k) for k in labels}
 
         isolating = [
             p for p in h.objects_of_kind(documents, "NetworkPolicy")

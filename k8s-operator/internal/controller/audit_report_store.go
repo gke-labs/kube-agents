@@ -67,8 +67,9 @@ import (
 )
 
 const (
-	// auditReportStorePort is the listener's port. start-services.sh binds the
-	// same number (AUDIT_REPORT_STORE_PORT); Session KV keeps 8699 on loopback.
+	// auditReportStorePort is the listener's port, the number
+	// audit_report_store.py binds (its LISTEN_PORT); Session KV keeps 8699 on
+	// loopback.
 	auditReportStorePort     = int32(8700)
 	auditReportStorePortName = "report-store"
 	auditReportStoreSuffix   = "-report-store"
