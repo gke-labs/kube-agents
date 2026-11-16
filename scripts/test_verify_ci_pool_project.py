@@ -4502,7 +4502,7 @@ FLEET_RESOURCE_ROLES = {
     "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
     # The declared-mtu-peering fixture: a VPC network and its two one-way peerings
     # with `default` (compute.networks.create/.delete/.addPeering/.removePeering/
-    # .updatePeering are networkAdmin's; no narrower predefined role holds them).
+    # .updatePeering are networkAdmin's; no other role in the set holds them).
     "google_compute_network": {"roles/compute.networkAdmin", "roles/compute.viewer"},
     "google_compute_network_peering": {"roles/compute.networkAdmin", "roles/compute.viewer"},
     # The lb-drain fixture: a health check and a backend service on the default pool's instance

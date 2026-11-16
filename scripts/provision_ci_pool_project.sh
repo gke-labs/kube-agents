@@ -509,8 +509,8 @@ done
 # compute.healthChecks.* and compute.instanceGroups.use.
 # compute.networkAdmin: the stack plants a VPC network peered with `default`
 # (declared-mtu-peering, main.tf), and the create needs compute.networks.create,
-# .delete, .addPeering, .removePeering and .updatePeering, which no narrower
-# predefined role carries.
+# .delete, .addPeering, .removePeering and .updatePeering, which no other role
+# here carries.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
