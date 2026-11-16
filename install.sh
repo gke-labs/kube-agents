@@ -4050,7 +4050,8 @@ auto_install_tool() {
 # memory_mode -- rather than restating a default the run never applied.
 write_json_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-install-report.json"
+  # KUBE_AGENTS_INSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_INSTALL_REPORT_FILE:-/tmp/kube-agents-install-report.json}"
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")
 
