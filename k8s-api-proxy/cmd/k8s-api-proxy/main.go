@@ -177,6 +177,8 @@ func main() {
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
 		scopeFile                = flag.String("scope-file", envOrDefault("KUBE_PROXY_SCOPE_FILE", ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
 		excludeHostCluster       = flag.String("exclude-host-cluster-id", envOrDefault("KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
+		universeDomainRaw        = flag.String("universe-domain", envOrDefault(universeDomainEnv, envOrDefault(googleCloudUniverseEnv, "")), "Google Cloud API universe domain (auto-detected from GKE metadata when unset on GKE, defaulting to googleapis.com)")
+		containerAPIURLOverride  = flag.String("container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
 		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
@@ -223,10 +225,23 @@ func main() {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
 	}
 
+	probeMetadata := strings.HasPrefix(*hostClusterIDF, gkeClusterIDPrefix) ||
+		strings.HasPrefix(*excludeHostCluster, gkeClusterIDPrefix) ||
+		os.Getenv(wifAudienceEnv) != "" ||
+		scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv))
+	resolvedUniverse, err := resolveKubeProxyUniverseDomain(ctx, *universeDomainRaw, probeMetadata, "", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	iamCredentialsURL := iamCredentialsURLForUniverse(resolvedUniverse)
+	containerAPIURL := containerAPIURLForUniverse(resolvedUniverse, *containerAPIURLOverride)
+
 	gcpTokens := newGCPTokenSource(gcpTokenConfig{
 		WIFAudience:       os.Getenv("CREDENTIAL_PROXY_WIF_AUDIENCE"),
 		WIFServiceAccount: os.Getenv("CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"),
 		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
+		STSURL:            stsURLForUniverse(resolvedUniverse),
+		IAMCredentialsURL: iamCredentialsURL,
 	})
 
 	var upstreamTransport k8sapiproxy.UpstreamTransport
@@ -239,15 +254,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to load scoped service account pool: %v", err)
 		}
-		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, "", nil, inCluster, "")
+		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, iamCredentialsURL, nil, inCluster, containerAPIURL)
 		if err != nil {
 			log.Fatalf("failed to initialize scoped upstream transport: %v", err)
 		}
 	} else {
 		upstreamTransport, err = upstream.New(ctx, upstream.Config{
-			InCluster:     inCluster,
-			HostClusterID: *hostClusterIDF,
-			TokenSource:   gcpTokens,
+			InCluster:       inCluster,
+			HostClusterID:   *hostClusterIDF,
+			TokenSource:     gcpTokens,
+			ContainerAPIURL: containerAPIURL,
 		})
 		if err != nil {
 			log.Fatalf("failed to initialize upstream transport: %v", err)

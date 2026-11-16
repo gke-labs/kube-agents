@@ -9,13 +9,14 @@ taskset runs unpinned and says so in the line.
 """
 
 import os
+import re
 import shutil
 import signal
 import subprocess
 import time
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "dev" / "repeat_under_load.sh"
@@ -81,6 +82,44 @@ TOO_MANY_LOOPS = "999"
 # More digits than any run count a person would type; a 64-bit shell integer
 # wraps on it.
 OVERSIZED_COUNT = "9" * 20
+# What a test needs from the machine. Each is found by a probe of the ability, never by
+# the system's name, and each reason says what is absent and what the test would show.
+PROC_STATUS = Path("/proc/self/status")
+NO_PROC_STATUS = (
+    "this machine has no /proc/self/status: the test reads the kernel's own cpu list or "
+    "ignored-signal mask there, to show what the script pinned, clamped to or left ignored"
+)
+NO_SETSID = (
+    "this machine has no setsid: the script then signals the run's pid alone, and the test "
+    "shows a signal that reaches the run's whole process group, its children included"
+)
+RUN_STARTS_WITH_SIGINT_IGNORED = (
+    "this bash does not restore SIGINT in an async subshell, as bash 3.2 does not: the run "
+    "starts with Ctrl-C ignored, and the test shows the command's own answer to Ctrl-C "
+    "reaching its log"
+)
+# A command started the way the script starts a run: an async subshell that restores
+# SIGINT and execs. The command traps SIGINT, signals itself, and prints the mark from
+# the trap; a command that started with SIGINT ignored cannot trap it and prints nothing.
+SIGINT_RESTORED_MARK = "restored"
+SIGINT_RESTORE_PROBE = (
+    f"( trap - INT QUIT; exec bash -c 'trap \"echo {SIGINT_RESTORED_MARK}\" INT; kill -INT $$; :' ) "
+    "</dev/null & wait $!"
+)
+SIGINT_PROBE_DEADLINE_SECONDS = 20
+# Builtins that bash 4 added and macOS's /bin/bash 3.2 lacks.
+BASH_4_BUILTINS = ("mapfile", "readarray")
+# A cpu count below the cores the fallback test asks for, so the clamp shows.
+STAND_IN_CPU_COUNT = 2
+ASKED_CORES_ABOVE_STAND_IN = "8"
+
+
+def sigint_at_its_default():
+    """Run in a child before it starts: SIGINT at its default, whatever the test runner
+    inherited. A runner started in the background of a non-interactive shell (or under
+    this script on bash 3.2) hands SIGINT on ignored, and a shell cannot trap a signal
+    it started with ignored, so the script under test could not answer Ctrl-C at all."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def run_script(args, cwd, env=None):
@@ -95,6 +134,7 @@ def run_script(args, cwd, env=None):
         text=True,
         check=False,
         timeout=SCRIPT_DEADLINE_SECONDS,
+        preexec_fn=sigint_at_its_default,
     )
 
 
@@ -127,6 +167,48 @@ def path_without(name):
                 continue
             link.symlink_to(Path(d) / entry)
     return bin_dir
+
+
+def path_hiding(name):
+    """A directory and a PATH on which `name` is not found. The caller may add a stand-in
+    to the directory and removes it afterwards.
+
+    Where the machine has no `name` there is nothing to hide: the PATH is the current one
+    behind a new, empty directory, and no tool is linked. Otherwise the PATH is
+    `path_without(name)` alone.
+    """
+    if shutil.which(name) is None:
+        bin_dir = Path(mkdtemp(prefix=f"repeat-under-load-path-{name}-"))
+        return bin_dir, f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    bin_dir = path_without(name)
+    return bin_dir, str(bin_dir)
+
+
+def add_stand_in(bin_dir, name, script):
+    """Put an executable `script` at `bin_dir/name`, in place of a link to the real tool:
+    the link is removed first, so the write never follows it to the tool itself."""
+    stand_in = bin_dir / name
+    if stand_in.is_symlink() or stand_in.exists():
+        stand_in.unlink()
+    stand_in.write_text(script)
+    stand_in.chmod(0o755)
+
+
+def run_starts_with_sigint_ignored():
+    """Whether a command started the way the script starts a run has SIGINT ignored."""
+    probe = subprocess.run(
+        ["bash", "-c", SIGINT_RESTORE_PROBE],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=SIGINT_PROBE_DEADLINE_SECONDS,
+        preexec_fn=sigint_at_its_default,
+    )
+    return SIGINT_RESTORED_MARK not in probe.stdout
+
+
+# Probed once, for the skips below and for the test that holds the probe to the kernel.
+RUN_SIGINT_IGNORED = run_starts_with_sigint_ignored()
 
 
 def allowed_cpus(status_text):
@@ -195,14 +277,14 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertIn("-mod=mod", log, "the caller's GOFLAGS were dropped")
 
     def test_without_taskset_it_runs_unpinned_and_says_so(self):
-        bin_dir = path_without("taskset")
+        bin_dir, path = path_hiding("taskset")
         try:
-            self.assertIsNone(shutil.which("taskset", path=str(bin_dir)))
+            self.assertIsNone(shutil.which("taskset", path=path))
             with TemporaryDirectory() as tmp:
                 result = run_script(
                     ["-n", "1", *LIGHT_LOAD, "--", "true"],
                     cwd=tmp,
-                    env={"PATH": str(bin_dir)},
+                    env={"PATH": path},
                 )
         finally:
             shutil.rmtree(bin_dir)
@@ -211,16 +293,18 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertIn("no pinning: taskset missing", result.stdout)
 
     def test_a_taskset_that_cannot_bind_the_cores_runs_unpinned_and_says_so(self):
-        bin_dir = path_without("taskset")
+        bin_dir, path = path_hiding("taskset")
         try:
-            fake = bin_dir / "taskset"
-            fake.write_text("#!/bin/sh\necho 'taskset: failed to set pid affinity: Invalid argument' >&2\nexit 1\n")
-            fake.chmod(0o755)
+            add_stand_in(
+                bin_dir,
+                "taskset",
+                "#!/bin/sh\necho 'taskset: failed to set pid affinity: Invalid argument' >&2\nexit 1\n",
+            )
             with TemporaryDirectory() as tmp:
                 result = run_script(
                     ["-n", "1", *LIGHT_LOAD, "--", "true"],
                     cwd=tmp,
-                    env={"PATH": str(bin_dir)},
+                    env={"PATH": path},
                 )
         finally:
             shutil.rmtree(bin_dir)
@@ -228,6 +312,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertIn("1 of 1 passed under load", result.stdout)
         self.assertRegex(result.stdout, r"no pinning: taskset cannot bind cpus \d")
 
+    @unittest.skipUnless(PROC_STATUS.exists(), NO_PROC_STATUS)
     def test_the_command_runs_pinned_to_the_first_cpu_this_process_may_use(self):
         first_cpu = allowed_cpus(Path("/proc/self/status").read_text())[0]
         if shutil.which("taskset") is None or subprocess.run(
@@ -253,6 +338,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             try:
                 # The first run has started once its log file exists in this run's own
@@ -280,9 +366,11 @@ class RepeatUnderLoadTest(unittest.TestCase):
         for pid in pids:
             self.assertTrue(wait_until(lambda: not pid_alive(pid)), f"busy loop {pid} outlived the script")
 
+    @unittest.skipUnless(shutil.which("setsid"), NO_SETSID)
     def test_a_term_signal_to_the_script_ends_the_run_in_flight(self):
         self.signal_to_the_pid_ends_the_run_in_flight(signal.SIGTERM, SIGTERM_EXIT_CODE)
 
+    @unittest.skipUnless(shutil.which("setsid"), NO_SETSID)
     def test_a_hangup_signal_to_the_script_ends_the_run_in_flight(self):
         self.signal_to_the_pid_ends_the_run_in_flight(signal.SIGHUP, SIGHUP_EXIT_CODE)
 
@@ -296,6 +384,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             try:
                 pid_file = Path(tmp) / "cmd.pid"
@@ -325,6 +414,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             try:
                 pid_file = Path(tmp) / "cmd.pid"
@@ -355,6 +445,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             try:
                 self.assertTrue(
@@ -372,6 +463,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
             log = next(Path(tmp).glob("repeat-under-load.*/run-1.log")).read_text()
         return proc.returncode, log, took, stderr
 
+    @unittest.skipUnless(shutil.which("setsid"), NO_SETSID)
     def test_a_command_that_ignores_ctrl_c_gets_a_term_it_can_answer(self):
         returncode, log, took, stderr = self.interrupt_after_ready(HANDLES_TERM_ONLY)
         self.assertEqual(returncode, SIGINT_EXIT_CODE, stderr)
@@ -379,6 +471,8 @@ class RepeatUnderLoadTest(unittest.TestCase):
         # bash's own "Terminated" line for the sleep may precede the command's answer.
         self.assertEqual(log.split()[-1:], ["termed"], f"the command was killed before it could answer TERM: {log!r}")
 
+    @unittest.skipUnless(shutil.which("setsid"), NO_SETSID)
+    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
     def test_a_child_that_outlives_the_leader_finishes_its_own_report(self):
         returncode, log, _, stderr = self.interrupt_after_ready(CHILD_OUTLIVES_LEADER)
         self.assertEqual(returncode, SIGINT_EXIT_CODE, stderr)
@@ -387,12 +481,12 @@ class RepeatUnderLoadTest(unittest.TestCase):
     def test_without_setsid_the_script_still_stops_the_run_and_exits(self):
         # The fallback signals the pid alone: the script still waits its grace for a
         # run that ignores Ctrl-C, ends it, and exits with the signal's code.
-        bin_dir = path_without("setsid")
+        bin_dir, path = path_hiding("setsid")
         try:
-            self.assertIsNone(shutil.which("setsid", path=str(bin_dir)))
+            self.assertIsNone(shutil.which("setsid", path=path))
             returncode, log, took, stderr = self.interrupt_after_ready(
                 'trap "" INT; trap "echo termed; exit 0" TERM; : > ready; exec sleep 30',
-                env={"PATH": str(bin_dir)},
+                env={"PATH": path},
             )
         finally:
             shutil.rmtree(bin_dir)
@@ -409,6 +503,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             run_pid = None
             try:
@@ -431,6 +526,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
         for pid in pids:
             self.assertTrue(wait_until(lambda: not pid_alive(pid)), f"busy loop {pid} outlived a killed script")
 
+    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
     def test_an_interrupt_lets_the_command_finish_its_own_report(self):
         with TemporaryDirectory() as tmp:
             proc = subprocess.Popen(
@@ -441,6 +537,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                preexec_fn=sigint_at_its_default,
             )
             try:
                 self.assertTrue(
@@ -457,6 +554,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertEqual(proc.returncode, SIGINT_EXIT_CODE)
         self.assertEqual(log.split(), ["first", "second"], "the command's interrupt report was cut short")
 
+    @unittest.skipUnless(PROC_STATUS.exists(), NO_PROC_STATUS)
     def test_the_command_can_still_be_interrupted_by_sigint(self):
         # A background job of a non-interactive shell starts with SIGINT ignored, and a
         # test that handles Ctrl-C itself would never see it.
@@ -466,6 +564,8 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         ignored = int(log.split(":", 1)[1].strip(), 16)
         self.assertFalse(ignored & (1 << (signal.SIGINT - 1)), f"SIGINT is ignored under the script: {log.strip()}")
+        # The probe that skips the interrupt-report tests must agree with the kernel here.
+        self.assertFalse(RUN_SIGINT_IGNORED, "the SIGINT probe says ignored where the kernel says it is not")
 
     def test_a_flag_as_a_flag_value_prints_usage(self):
         with TemporaryDirectory() as tmp:
@@ -485,6 +585,7 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("10 of 10 passed under load", result.stdout)
 
+    @unittest.skipUnless(PROC_STATUS.exists(), NO_PROC_STATUS)
     def test_more_cores_than_this_process_may_use_clamps_to_what_it_may(self):
         count = len(allowed_cpus(Path("/proc/self/status").read_text()))
         if count >= MAX_BUSY_LOOPS:
@@ -498,6 +599,42 @@ class RepeatUnderLoadTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"({count} cores, {count} busy loops", result.stdout)
+
+    def test_with_no_cpu_list_and_no_nproc_the_core_count_comes_from_sysctl(self):
+        # macOS has no /proc/self/status and no nproc. Stand-ins show the same on any
+        # machine: a grep that finds no allowed list, no nproc on PATH, and a sysctl that
+        # answers a count below the cores asked for.
+        bin_dir, path = path_hiding("nproc")
+        try:
+            add_stand_in(
+                bin_dir,
+                "grep",
+                f'#!/bin/sh\ncase "$1" in "^Cpus_allowed_list:") exit 1 ;; esac\nexec "{shutil.which("grep")}" "$@"\n',
+            )
+            add_stand_in(
+                bin_dir,
+                "sysctl",
+                f'#!/bin/sh\n[ "$*" = "-n hw.ncpu" ] || exit 1\necho {STAND_IN_CPU_COUNT}\n',
+            )
+            with TemporaryDirectory() as tmp:
+                result = run_script(
+                    ["-n", "1", "-c", ASKED_CORES_ABOVE_STAND_IN, "-l", "1", "--", "true"],
+                    cwd=tmp,
+                    env={"PATH": path},
+                )
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"({STAND_IN_CPU_COUNT} cores, {STAND_IN_CPU_COUNT} busy loops", result.stdout)
+
+    def test_the_script_uses_no_builtin_that_bash_3_2_lacks(self):
+        # macOS's /bin/bash is 3.2. The Linux job that runs this file has a bash with
+        # these builtins, so there only the script's text can show one coming back.
+        code = [line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#")]
+        for builtin in BASH_4_BUILTINS:
+            with self.subTest(builtin=builtin):
+                used = [line for line in code if re.search(rf"(^|[\s;|&(]){builtin}\b", line)]
+                self.assertEqual(used, [], f"{builtin} is a bash 4 builtin")
 
     def test_a_count_of_zero_however_spelt_prints_usage(self):
         for spelling in ("0", "00", "000"):

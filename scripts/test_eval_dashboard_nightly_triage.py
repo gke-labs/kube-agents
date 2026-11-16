@@ -330,7 +330,10 @@ class NovemberTest(Harness):
 class RoutingTableTest(unittest.TestCase):
     """route(): the verdict's choice, then the filer's chain."""
 
-    BUNDLE: typing.ClassVar[dict] = {"prs": {str(CULPRIT): {"author": "grader-author"}, "4999": {"author": "dependabot[bot]"}}}
+    BUNDLE: typing.ClassVar[dict] = {
+        "green": {"date": "2026-11-05"}, "red": {"date": "2026-11-06"},
+        "prs": {str(CULPRIT): {"author": "grader-author", "merged_at": "2026-11-05T10:00:00Z"},
+                "4999": {"author": "dependabot[bot]", "merged_at": "2026-11-05T11:00:00Z"}}}
 
     def verdict(self, **over):
         v = {"classification": "product", "suspected_pr": CULPRIT, "fix_pr": None, "fix_state": "none", "priority": "P2",
@@ -377,6 +380,35 @@ class RoutingTableTest(unittest.TestCase):
 
     def test_the_author_who_is_also_the_rules_assignee_is_listed_once(self):
         self.assertEqual([x for x, _ in self.first(self.verdict(), chain=("grader-author", "sam"))], ["grader-author", "sam"])
+
+    def test_a_pr_merged_before_the_last_green_night_goes_by_the_rule(self):
+        # 2026-11-16 dry run, private issue #42: the case was green until
+        # Nov 10 and red from Nov 11, and the model named a pull request
+        # merged Oct 30, inside the commit window but 12 days before.
+        bundle = {"green": {"date": "2026-11-10"}, "red": {"date": "2026-11-11"},
+                  "prs": {"4255": {"author": "old-author", "merged_at": "2026-10-30T15:00:00Z"}}}
+        why = nightly_triage.WHY_RULE.format(why=nightly_triage.RULE_WHY["outside_nights"])
+        for classification in ("product", "grader_or_harness"):
+            out = nightly_triage.route(self.verdict(classification=classification, suspected_pr=4255, confidence="medium"), None, bundle, ["carol", "sam"], "ivan")
+            self.assertEqual(out[0], ("carol", why), classification)
+            self.assertNotIn("old-author", [login for login, _ in out])
+
+    def test_a_pr_merged_between_the_green_and_red_nights_goes_to_its_author(self):
+        bundle = {"green": {"date": "2026-11-10"}, "red": {"date": "2026-11-11"}, "prs": {}}
+        for merged in ("2026-11-10T03:00:00Z", "2026-11-10T22:00:00Z", "2026-11-11T00:00:10Z"):
+            bundle["prs"]["4255"] = {"author": "new-author", "merged_at": merged}
+            self.assertEqual(nightly_triage.route(self.verdict(suspected_pr=4255), None, bundle, ["carol"], "ivan")[0][0], "new-author", merged)
+        # A green build that started at 23:50 UTC Nov 9 is dated Nov 10
+        # (NIGHT_START_GRACE); a merge at 23:55 is after it.
+        bundle["prs"]["4255"]["merged_at"] = "2026-11-09T23:55:00Z"
+        self.assertEqual(nightly_triage.route(self.verdict(suspected_pr=4255), None, bundle, ["carol"], "ivan")[0][0], "new-author", "merged just after a late green build")
+        bundle["prs"]["4255"]["merged_at"] = "2026-11-12T01:00:00Z"
+        self.assertEqual(nightly_triage.route(self.verdict(suspected_pr=4255), None, bundle, ["carol"], "ivan")[0][0], "carol", "merged after the first red night")
+
+    def test_no_green_night_or_no_merge_date_goes_by_the_rule(self):
+        for bundle in ({"green": None, "red": {"date": "2026-11-11"}, "prs": {"4255": {"author": "a", "merged_at": "2026-11-10T00:00:00Z"}}},
+                       {"green": {"date": "2026-11-10"}, "red": {"date": "2026-11-11"}, "prs": {"4255": {"author": "a", "merged_at": None}}}):
+            self.assertEqual(nightly_triage.route(self.verdict(suspected_pr=4255), None, bundle, ["carol"], "ivan")[0][0], "carol")
 
     def test_the_model_cannot_name_a_pr_outside_the_window_or_a_fix_outside_the_candidates(self):
         bundle = {"commits": [{"pr": CULPRIT}], "later": [], "open_prs": [{"number": FIX}]}

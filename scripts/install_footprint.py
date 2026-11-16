@@ -91,8 +91,6 @@ INSTALLER_SETS = (
     "platformAgent.harness.hermes.dashboardEnabled=false",
     "webConsole.enabled=true",
     "githubMinter.enabled=true",
-    # The installer still passes the deprecated key until the installer piece.
-    "platformAgent.mode=next",
 )
 PROFILES = (
     Profile("standard", "GKE Standard", ()),
@@ -126,6 +124,7 @@ A2A_WORKLOADS = (
 )
 FLAGGED_LABELS = {
     "mcp": "MCP server",
+    "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {
     "true": "With the operator's `{env}=true`",
