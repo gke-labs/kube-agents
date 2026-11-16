@@ -815,6 +815,14 @@ Layout:
   subjects and grants, and only the gateway may publish the request, so no other principal can
   ask the bridge to act; session-kv acts only on cards still `blocked`.
 
+- **The incident route.** A scheduled report the gateway posted, kept in the agent pod's incident
+  store against the thread it landed in (scheduling-on-profiles.md, section 4). The board
+  route's shape: the gateway user gains publish on `chat.incident` and subscribe on
+  `chat.incident.reply.gateway.>`, the bridge user the matching grants, and no other principal
+  holds either, so the gateway gains no session-kv credential. The bridge stores a report only
+  in a channel this install's chat backend serves, so the request cannot attach text to an
+  arbitrary thread. Core NATS.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the

@@ -266,6 +266,16 @@ const (
 	a2aBoardSubject       = "chat.board"
 	a2aBoardReplySubjects = "chat.board.reply.gateway.>"
 
+	// The incident route (a2a/gateway/report_incident.go,
+	// a2a/hermes-bridge/report_incident.go, a2a/lib/incident.go): a posted
+	// scheduled report, kept by the bridge in the agent pod's incident
+	// store against the thread it landed in. The board route's shape: the
+	// gateway publishes the first and reads the second, the bridge reads
+	// the first and publishes the second, and no other principal holds
+	// either, so no credential reaches session-kv but the bridge's.
+	a2aIncidentSubject       = "chat.incident"
+	a2aIncidentReplySubjects = "chat.incident.reply.gateway.>"
+
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from
 	// the container above.
@@ -589,6 +599,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// session-kv. This grant being the gateway's alone is what keeps any
 		// other principal from asking the bridge to act.
 		a2aBoardSubject,
+		// A posted scheduled report to keep against its thread
+		// (a2aIncidentSubject), answered by the bridge on
+		// a2aIncidentReplySubjects. The bridge stores it only in a channel
+		// this install's chat backend serves.
+		a2aIncidentSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
@@ -667,6 +682,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
+			// The bridge's answer to an incident write.
+			a2aIncidentReplySubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -1059,6 +1076,11 @@ func bridgeIdentity() a2aIdentity {
 	// it forged would show on the Home tab to the members the gateway admits,
 	// and an outcome it forged on a tapped row; it cannot ask for a tap.
 	publish = append(publish, a2aBoardReplySubjects)
+	// The answer to the gateway's incident write (a2aIncidentSubject):
+	// whether session-kv's POST /v1/incidents kept the report. The same
+	// pod boundary as the board's answer: a forged answer misleads only
+	// the gateway's log line.
+	publish = append(publish, a2aIncidentReplySubjects)
 
 	return a2aIdentity{
 		user:     a2aBridgeUser,
@@ -1081,6 +1103,8 @@ func bridgeIdentity() a2aIdentity {
 			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 			// The gateway's board request.
 			a2aBoardSubject,
+			// The gateway's incident write.
+			a2aIncidentSubject,
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was

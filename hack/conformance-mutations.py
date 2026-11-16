@@ -2802,6 +2802,26 @@ Mutation(
         "on its behalf",
     ),
     Mutation(
+        "A3-agent-answers-an-incident",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aIncidentReplySubjects)\n"),
+        "test_A3_an_incident_write_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the incident reply namespace, so the agent "
+        "container can tell the gateway a scheduled report was kept for "
+        "replies when it was not",
+    ),
+    Mutation(
+        "A3-session-writes-an-incident",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.IncidentSubject,\n\t\t},'),
+        "test_A3_an_incident_write_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the incident request, so "
+        "whatever runs in a session pod can have the bridge attach text to a "
+        "home-channel thread as the report a reply there is answered with",
+    ),
+    Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',

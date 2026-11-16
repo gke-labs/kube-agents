@@ -2630,6 +2630,7 @@ accounts {
       { stream: "a2a.cap.reply.>", accounts: [ APP ] }
       { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
       { stream: "chat.board", accounts: [ APP ] }
+      { stream: "chat.incident", accounts: [ APP ] }
       { stream: "_INBOX.bridge.>", accounts: [ APP ] }
       { stream: "_INBOX.web.>", accounts: [ APP ] }
       { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
@@ -2646,6 +2647,7 @@ accounts {
       { stream: { account: APP, subject: "chat.notify.slack" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+      { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
     ]
     users [
 ` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
@@ -2683,6 +2685,7 @@ accounts {
       { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
       { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+      { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
     ]
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
@@ -2704,6 +2707,7 @@ accounts {
       { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
       { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
       { stream: { account: TRUSTED, subject: "chat.board" } }
+      { stream: { account: TRUSTED, subject: "chat.incident" } }
       { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
       { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
     ]

@@ -1317,6 +1317,30 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "the callout derives a session a publish grant on the board route",
         )
 
+    INCIDENT_PROBE = "chat.incident"
+    INCIDENT_REPLY_PROBE = "chat.incident.reply.gateway.r1"
+
+    def test_A3_an_incident_write_has_one_writer_and_its_answer_has_one(self) -> None:
+        """The incident route: only the gateway asks, only the bridge answers.
+
+        The bridge stores what the request carries as the report a reply in
+        that thread is answered with, so a second writer on the request could
+        attach untrusted text to a thread; a second writer on the reply
+        namespace could tell the gateway a report was kept. The session
+        pods' derived grants must not reach either subject.
+        """
+        grants = self._rendered_publish_grants()
+        for probe, want in ((self.INCIDENT_PROBE, ["gateway"]), (self.INCIDENT_REPLY_PROBE, ["bridge"])):
+            writers = sorted(
+                builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
+            )
+            self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
+        self.assertNotRegex(
+            self._session_publish_derivation(),
+            r"chat\.incident|Incident(Subject|Reply)",
+            "the callout derives a session a publish grant on the incident route",
+        )
+
     def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:
         """The executor's subject has one writer class, and it is not the supervisor.
 

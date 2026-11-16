@@ -164,6 +164,13 @@ type Config struct {
 	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
 	RouteURL string
 	RouteKey string
+	// The channels this install's chat backend serves, which an incident
+	// write must name (report_incident.go): the Slack and Google Chat home
+	// channels from the CR, and the file the Slack home a gateway learned
+	// is projected into. Empty serves none, and every write is refused.
+	IncidentSlackHome     string
+	IncidentGchatHome     string
+	IncidentSlackHomeFile string
 	// CardStopTimeout bounds a card stop's request to session-kv
 	// (cardstop.go); zero is DefaultCardStopTimeout. The wait for the
 	// session's turn before it is bounded apart (cardStopTurnWait).
@@ -638,6 +645,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
 	if board := b.serveBoard(); board != nil {
 		defer board.Stop()
+	}
+	if incidents := b.serveIncidents(); incidents != nil {
+		defer incidents.Stop()
 	}
 	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
 		// The door is open but nothing can be attributed through it: the
