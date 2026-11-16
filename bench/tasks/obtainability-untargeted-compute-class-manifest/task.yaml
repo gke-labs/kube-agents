@@ -36,8 +36,10 @@ expected_output: >-
   defines ComputeClass `general-ccc` over its only untainted node pool, the
   Deployment's pod template carries no `cloud.google.com/compute-class`
   nodeSelector and its namespace no default class, so the autoscaler's
-  pre-filter leaves its pods out of the scale-up simulation; the fix is the
-  compute-class nodeSelector on the workload (kind: manifest). The closing
+  pre-filter leaves its pods out of the scale-up simulation. The remediation
+  is `kind: manual`, since the workload has no declaration in the GitOps
+  repository: the namespace's default compute class set in GitOps, or the
+  compute-class nodeSelector added to the workload at source. The closing
   response is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
