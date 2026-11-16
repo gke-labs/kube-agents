@@ -516,6 +516,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertIsNotNone(rule)
+        # Each refusal names its own rule; a missing trigger is not read as a
+        # trigger of the wrong origin.
+        self.assertEqual(cp.RULE_REPORT_NO_TRIGGER, write(grant=None))
         # The shell writes any audit, but only to the install's own key.
         self.assertIsNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None))
         self.assertIsNotNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None, request_key="acme%2Fterraform"))
