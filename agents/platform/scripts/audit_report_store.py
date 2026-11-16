@@ -60,7 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -84,6 +84,11 @@ DEFAULT_REPORTS_DIR = "/opt/data/fleet-audit/reports"
 # skill script and is not importable from here; test_audit_report_store.py
 # holds the two copies equal.
 REPORT_HISTORY = 14
+# The clock run stamps are checked against; a test seam.
+_now = time.time
+# How far ahead of this clock a written run's stamp may be: finish stamps with
+# its own clock as it ends, so this is clock skew, not a schedule.
+RUN_STAMP_MAX_FUTURE_SECONDS = 300
 REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
@@ -452,6 +457,19 @@ def _validate_stamp(stamp: str) -> str:
     return stamp
 
 
+def _refuse_a_future_stamp(stamp: str) -> None:
+    """Refuse a run stamped further ahead of this clock than RUN_STAMP_MAX_FUTURE_SECONDS.
+
+    The ring prunes by name, oldest first, so a far-future stamp would never be
+    pruned and would hold one of the stream's REPORT_HISTORY places for good.
+    `finish` stamps a run with its own clock as it ends, so a small skew is all
+    an honest writer needs.
+    """
+    when = datetime.strptime(stamp, REPORT_STAMP_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+    if when > _now() + RUN_STAMP_MAX_FUTURE_SECONDS:
+        raise Refused(400, "the run is stamped in the future")
+
+
 # Every filesystem step below is fd-relative and refuses a symlink. The tree
 # is on the agent's data volume, which the platform-agent container beside
 # this one writes as the same uid, so a path checked and then used could be a
@@ -759,6 +777,7 @@ def _handle_store(
         with _DirChain(root, store + [REPORT_RUNS_DIR], create=False) as runs:
             return 200, _read_at(runs.fd, f"{stamp}.json")
     if method == "PUT":
+        _refuse_a_future_stamp(stamp)
         data = _validated_body(body)
         with _DirChain(root, store, create=True) as chain, _locked(chain.fd):
             runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=True)
