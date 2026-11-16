@@ -2947,10 +2947,13 @@ every message through either stamps its own backend.
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
   when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
-  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response)
-  is answered with the `Task` and publishes nothing, whatever terminal it has reached since:
-  `canceled`, or `completed` or `failed` if the turn finished before the cancel took. A task that
-  ended with no cancel published refuses one with `TaskNotCancelableError` (-32002).
+  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response,
+  or one queued behind the first for the conversation's turn) is answered with the `Task` and
+  publishes nothing, whatever terminal it has reached since: `canceled`, or `completed` or `failed`
+  if the turn finished before the cancel took. A task that ended with no cancel published refuses
+  one with `TaskNotCancelableError` (-32002). A queued cancel checks, while it waits and in the same
+  critical section as any claim, whether a cancel is on the bus or the task has ended. It answers as
+  soon as either is true, without taking a turn (#5777).
 - `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
   next, as SSE frames from the same observer hooks.
 
@@ -2968,7 +2971,7 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. A turn that delegates is one Task through its whole chain
+never inferred from a post's position. On a canceled terminal the Task shows one artifact only when the executor's canceled result carries the `cardStop` part's result form (a cancel that stopped the turn's Kanban cards, #5528): the `result` artifact with `canceled; ` and the gateway's own reply for that result (`cardStopReply`, titles cleaned as there) and the `cardStop` data part re-encoded from the parsed result, the same schema the card-stop control returns (`CardStopObserver`, handed over by the relay and the heal path before the terminal, bounded like the deliverable, with the part dropped rather than cut and `metadata.resultTruncatedFrom` set). The gateway writes both halves, so none of the executor's text and no field the schema doesn't name passes through: a canceled turn's other output (a partial answer chunked into the same artifact, any other data part) is never rendered, as before. The part names only the caller's own session's cards. A turn that delegates is one Task through its whole chain
 ("Sessions by default"): the child's and the wake's posts land in its `history`, and the wake's
 result is its artifact. A chain that runs past the gateway's task deadline is no longer exempt
 from the door's conversation cap while the caller waits, which is a known limit. The door keeps up to 4 MiB of it; a longer deliverable
