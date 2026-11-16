@@ -405,8 +405,8 @@ class LostRun(NamedTuple):
     crashed: bool
     claimed_at: float
 
-# The sentence that names the home channel, and what replaces it where the gateway has none to post
-# to (no A2A_NOTIFY_PLATFORM on the conversation path).
+# The sentence that names the home channel, and what replaces it where no platform has one
+# (``chat_notify.home_platforms()`` empty on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
 AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
@@ -2334,7 +2334,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     # Sized as filed (markers, intro, report, note), before the second sandbox read and the
     # findings registration; counted, so a report that will never fit stops after the waits.
     no_ranking = _no_ranking(data_dir)
-    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platforms()))
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.home_platforms()))
     body = _with_note(content, note)
     composed = len(_issue_text(body, sweep, filed_at, now))
     if composed > ISSUE_BODY_MAX_CHARS:
@@ -2499,7 +2499,7 @@ def main(data_dir: Path | None = None) -> int:
     platform = conversation["platform"] if conversation is not None else _origin_platform()
     card, text_reason = _first_report_card(platform, no_ranking, files, suppressed)
     # Also before the claim, so its reads cannot cost the report once the claim is taken.
-    home = bool(chat_notify.routed_platforms()) if conversation is not None else True
+    home = bool(chat_notify.home_platforms()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
     # The cheap check above is advisory; this is the decision. Nothing may be

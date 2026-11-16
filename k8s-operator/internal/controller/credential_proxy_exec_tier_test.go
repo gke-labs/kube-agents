@@ -217,6 +217,8 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 		corev1.EnvVar{Name: "SLACK_BOT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "k"}}},
 		corev1.EnvVar{Name: "TOKEN_BROKER_URL", Value: "http://minter"},
 		corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "sub"},
+		corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: "a2a-sub"},
+		corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: "aud"},
 	)
 	bc.EnvFrom = append(bc.EnvFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "plugin"}}})
 	broker.Spec.Template.Annotations[secretEnvHashAnnotation] = "digest"
@@ -255,7 +257,7 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 			t.Errorf("exec pod reads %s from a Secret", e.Name)
 		}
 	}
-	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME"} {
+	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}
@@ -487,7 +489,7 @@ func TestTheExecTierFenceAdmitsItsCallersOnly(t *testing.T) {
 		}
 	}
 	// The session pods only under the cluster view, which points them at the
-	// tier; the agent is already mode next.
+	// tier.
 	for _, view := range []string{"true", ""} {
 		t.Setenv(a2aSessionClusterViewEnvVar, view)
 		admitted := false

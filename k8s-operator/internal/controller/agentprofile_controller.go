@@ -50,9 +50,9 @@ import (
 // PlatformAgent reconciler's (agentprofile_platformagent.go), because it lives
 // in the one identity map that reconciler already owns.
 //
-// Everything is dark unless the PlatformAgent in the profile's namespace runs
-// `spec.mode: next`. On today, the reconciler removes what it rendered and
-// renders nothing.
+// Everything is dark unless a PlatformAgent is bound in the profile's
+// namespace: without one the reconciler removes what it rendered and renders
+// nothing.
 //
 // Deletion is finalizer-ordered: the tombstone is published before the
 // finalizer comes off, so a profile never disappears from the cluster while its
@@ -98,12 +98,10 @@ const (
 // Condition reasons.
 const (
 	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNotNext         = "ModeNotNext"
 	reasonAgentProfileNoAgent         = "NoPlatformAgent"
 	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
 	reasonAgentProfileRefused         = "ServiceAccountRefused"
 	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileModeUnknown     = "ModeNotRecognized"
 	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
 	reasonAgentProfilePublished       = "Published"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
@@ -136,9 +134,12 @@ type AgentProfileReconciler struct {
 // is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
 // reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
 // owner-references admission never asks for it, and the finalizer itself is a field of the
-// main resource, written by the merge patch above.
+// main resource, written by the merge patch above. The one `get` on the
+// bus StatefulSet's ControllerRevisions reads which profiles every server has
+// loaded (a2aClusterLoadedProfiles).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
+// +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -161,26 +162,9 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if agent == nil || !a2aStackRendering(agent) {
-		if agent != nil {
-			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
-			if _, modeErr := resolveMode(agent); modeErr != nil {
-				// Version skew freezes the bus rather than tearing it
-				// down; freeze the profile's objects with it. A deletion
-				// still runs: the frozen bus is running, so the tombstone
-				// can be tried, and holding the finalizer would hang the
-				// delete until the operator is rolled forward.
-				if !profile.DeletionTimestamp.IsZero() {
-					return r.finalize(ctx, &profile, agent)
-				}
-				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, nil, "", reasonAgentProfileModeUnknown, modeErr.Error(), reasonAgentProfileModeUnknown, modeErr.Error(), false)
-			}
-		}
+	if agent == nil {
 		// No bus to talk to: drop any connection held for this namespace's
-		// agent rather than let it reconnect to a dead Service forever. Not
-		// under version skew above, where the bus is frozen and still
-		// running, and a deletion still needs the connection for its
-		// tombstone.
+		// agent rather than let it reconnect to a dead Service forever.
 		r.forgetBus(profile.Namespace)
 		return ctrl.Result{}, r.renderNothing(ctx, &profile, agent, reason, msg)
 	}
@@ -255,7 +239,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if !ready {
 		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
-		msg := "the profile namespace " + profilesNS + " does not exist or lacks the chart's markers; the chart creates it on a mode: next install"
+		msg := "the profile namespace " + profilesNS + " does not exist or lacks the chart's markers; the chart creates it on every install"
 		if err := r.writeStatus(ctx, &profile, agent, &verdict, "", reasonAgentProfileNamespaceAbsent, msg, cardReason, cardMsg, false); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -297,6 +281,21 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		case err != nil:
 			return ctrl.Result{}, err
 		}
+	}
+
+	// A newly bound profile's card waits until every bus server has loaded
+	// its config entry, as the dispatcher's config does
+	// (platformagent_a2a_profile_hold.go): the gateway routes by the card.
+	held, err := r.agentProfileCardHeld(ctx, agent, &profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		msg := "the A2A bus is loading this profile's config on every server; the card is published once it has"
+		if err := r.writeStatus(ctx, &profile, agent, &verdict, resolution.serviceAccountList(), idReason, idMsg, reasonAgentProfileBusConfigPending, msg, idReason == reasonAgentProfileRendered); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: a2aBusReloadRecheck}, nil
 	}
 
 	// The card and the durables follow the narrowed copy, never the raw
@@ -346,9 +345,9 @@ func (r *AgentProfileReconciler) boundAgent(ctx context.Context, namespace strin
 	}
 }
 
-// renderNothing is the today path: remove what this reconciler rendered and
-// release the finalizer. There is no bus to tombstone on, and on a flip to
-// today the PlatformAgent reconciler tears down the directory with the bus.
+// renderNothing is the path with no bound PlatformAgent: remove what this
+// reconciler rendered and release the finalizer. There is no bus to tombstone
+// on.
 func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, reason, msg string) error {
 	if err := r.deleteOwnServiceAccount(ctx, p); err != nil {
 		return err

@@ -311,6 +311,15 @@ class TestWriters(unittest.TestCase):
         self.assertIn("https://x/pull/7 was still broken", (self.tree / ar.RULES_FILE).read_text())
         self.assertEqual(self.vcs.committed[1], [ar.RULES_FILE])
 
+    def test_step_down_adds_automerge_to_a_bare_file(self):
+        # A fix merged under rules since cut back to `version: 1` still steps down.
+        (self.tree / ar.RULES_FILE).write_text("version: 1\n")
+        _git(self.tree, "add", "-A")
+        _git(self.tree, "commit", "-q", "-m", "bare rules")
+        pms._step_down_writer("no-pdb", "dev", "https://x/pull/7")(self.tree, self.vcs, REPO, "b")
+        rules = ar.load(self.tree)
+        self.assertEqual(rules.deny, (ar.Rule("no-pdb", ("dev",)),))
+
     def test_step_down_keeps_crlf(self):
         (self.tree / ar.RULES_FILE).write_bytes(RULES.replace("\n", "\r\n").encode())
         pms._step_down_writer("no-pdb", "dev", "u")(self.tree, self.vcs, REPO, "b")
