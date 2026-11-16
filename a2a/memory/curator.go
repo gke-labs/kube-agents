@@ -699,12 +699,8 @@ func (c *Curator) verifiedRepoDir() string {
 	if v := strings.TrimSpace(c.cfg.VerifiedRepoDir); v != "" {
 		return v
 	}
-	cand := filepath.Join(c.cfg.RepoDir, verifiedGitSubdir)
 	if strings.TrimSpace(c.cfg.BrokerURL) != "" {
-		return cand
-	}
-	if st, err := os.Stat(cand); err == nil && st.IsDir() {
-		return cand
+		return filepath.Join(c.cfg.RepoDir, verifiedGitSubdir)
 	}
 	return ""
 }
@@ -773,12 +769,12 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 		return errors.New("broker snapshot response exceeds size limit")
 	}
 	var snap struct {
-		Tar string `json:"tar"`
+		ArchiveBase64 string `json:"archiveBase64"`
 	}
-	if err := json.Unmarshal(rawResp, &snap); err != nil || snap.Tar == "" {
-		return errors.New("broker snapshot missing tar payload")
+	if err := json.Unmarshal(rawResp, &snap); err != nil || snap.ArchiveBase64 == "" {
+		return errors.New("broker snapshot missing archiveBase64 payload")
 	}
-	tarBytes, err := base64.StdEncoding.DecodeString(snap.Tar)
+	tarBytes, err := base64.StdEncoding.DecodeString(snap.ArchiveBase64)
 	if err != nil {
 		return err
 	}
@@ -786,15 +782,18 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 	if vDir == "" {
 		return nil
 	}
-	_ = os.RemoveAll(vDir)
-	if err := os.MkdirAll(vDir, recordDirPerm); err != nil {
+	stagingDir := vDir + ".staging"
+	_ = os.RemoveAll(stagingDir)
+	if err := os.MkdirAll(stagingDir, recordDirPerm); err != nil {
 		return err
 	}
-	vRoot, err := os.OpenRoot(vDir)
+	defer func() {
+		_ = os.RemoveAll(stagingDir)
+	}()
+	vRoot, err := os.OpenRoot(stagingDir)
 	if err != nil {
 		return err
 	}
-	defer vRoot.Close()
 
 	tr := tar.NewReader(bytes.NewReader(tarBytes))
 	for {
@@ -803,6 +802,7 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 			break
 		}
 		if tErr != nil {
+			_ = vRoot.Close()
 			return tErr
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
@@ -825,14 +825,20 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 		dirPart := filepath.Dir(filepath.FromSlash(rel))
 		if dirPart != "." && dirPart != "" {
 			if err := vRoot.MkdirAll(dirPart, recordDirPerm); err != nil {
+				_ = vRoot.Close()
 				return err
 			}
 		}
 		if err := vRoot.WriteFile(filepath.FromSlash(rel), data, recordFilePerm); err != nil {
+			_ = vRoot.Close()
 			return err
 		}
 	}
-	return nil
+	if err := vRoot.Close(); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(vDir)
+	return os.Rename(stagingDir, vDir)
 }
 
 func (c *Curator) loadGitVerifiedByIDLocked(ctx context.Context, repoID string) map[string]Record {

@@ -296,6 +296,7 @@ spec:
 
 	cur, err := NewCurator(CuratorConfig{
 		RepoDir:             repoDir,
+		VerifiedRepoDir:     filepath.Join(repoDir, verifiedGitSubdir),
 		RepoID:              "acme/infra",
 		Session:             "agent",
 		Profile:             "platform",
@@ -1137,7 +1138,11 @@ spec:
 	// Verify Curator lifecycle: OutcomePRMergedPersists, OutcomeRetired, Precedence Rule 3 on same check,
 	// and rejection of spoofed/redirected JetStream deliveries.
 	curDir := t.TempDir()
-	cur, err := NewCurator(CuratorConfig{RepoDir: curDir, RepoID: "acme/infra"})
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:         curDir,
+		VerifiedRepoDir: filepath.Join(curDir, verifiedGitSubdir),
+		RepoID:          "acme/infra",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1248,8 +1253,9 @@ func TestOutcomeProposedNeverOverwritesActiveOrConflictingProposed(t *testing.T)
 		t.Fatal(err)
 	}
 	cur, err := NewCurator(CuratorConfig{
-		RepoDir: repoDir,
-		RepoID:  "acme/gitops",
+		RepoDir:         repoDir,
+		VerifiedRepoDir: filepath.Join(repoDir, verifiedGitSubdir),
+		RepoID:          "acme/gitops",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1715,6 +1721,7 @@ func TestLifecycleBuildersMatchFormattedPRRefAndCheckScopedGraduation(t *testing
 	}
 	cur, err := NewCurator(CuratorConfig{
 		RepoDir:             repoDir,
+		VerifiedRepoDir:     filepath.Join(repoDir, verifiedGitSubdir),
 		RepoID:              "acme/gitops",
 		RecurrenceThreshold: 2,
 		LLM: LLMConfig{
@@ -2051,10 +2058,11 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	commitRecordInGit(t, gitRepo, gitCommitted010)
 
 	cur, err := NewCurator(CuratorConfig{
-		RepoDir:   gitRepo,
-		RepoID:    "acme/gitops",
-		Client:    client,
-		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+		RepoDir:         gitRepo,
+		VerifiedRepoDir: filepath.Join(gitRepo, verifiedGitSubdir),
+		RepoID:          "acme/gitops",
+		Client:          client,
+		Hindsight:       NewHindsightClient(hsSrv.URL, DefaultBankID),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2242,6 +2250,26 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 			t.Fatal(err)
 		}
 	}
+	// Also include a path-traversal entry and a symlink entry to verify both are rejected.
+	evilContent := "---\ntype: decision\nid: DEC-2026-998\ntitle: Evil\nstatus: active\ndate: \"2026-11-16\"\n---\n\nEvil.\n"
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "../evil-outside.md",
+		Mode: 0o600,
+		Size: int64(len(evilContent)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(evilContent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "knowledge/decision/DEC-2026-997-symlink.md",
+		Typeflag: tar.TypeSymlink,
+		Linkname: "/etc/passwd",
+		Mode:     0o777,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := tw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -2258,8 +2286,8 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"tar":      tarB64,
-			"revision": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			"archiveBase64": tarB64,
+			"revision":      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		})
 	}))
 	defer brokerSrv.Close()
@@ -2321,6 +2349,12 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 		if r.Meta.ID == "DEC-2026-011" && r.Meta.Status != StatusSuperseded {
 			t.Fatalf("expected DEC-2026-011 to be superseded by broker-verified DEC-2026-020, got %s", r.Meta.Status)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(freshEmptyDir, "evil-outside.md")); !os.IsNotExist(err) {
+		t.Fatalf("expected traversal tar entry ../evil-outside.md to be rejected, err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(freshEmptyDir, verifiedGitSubdir, "knowledge", "decision", "DEC-2026-997-symlink.md")); !os.IsNotExist(err) {
+		t.Fatalf("expected symlink tar entry to be rejected, err=%v", err)
 	}
 }
 
