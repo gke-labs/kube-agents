@@ -13,7 +13,7 @@ func TestParseTierMembership(t *testing.T) {
 	if err != nil || len(got) != 3 || got[0] != (TierMember{Backend: "gchat", User: "users/1", Tier: "oncall"}) {
 		t.Fatalf("parse = %+v, %v", got, err)
 	}
-	for _, bad := range []string{"gchat:u", "gchat=read", "teams:u=read", "console:x=read", "gchat:u=on.call", "gchat:u=read,gchat:u=oncall", "gchat:=read"} {
+	for _, bad := range []string{"gchat:u", "gchat=read", "teams:u=read", "console:x=read", "gchat:u=on.call", "gchat:u=read,gchat:u=oncall", "gchat:Alice=read,gchat:alice=oncall", "gchat:=read"} {
 		if _, err := parseTierMembership(bad); err == nil {
 			t.Errorf("parse(%q) accepted a bad list", bad)
 		}

@@ -61,7 +61,12 @@ func parseTierMembership(raw string) ([]TierMember, error) {
 		if !lib.ValidSubjectToken(tier) {
 			return nil, fmt.Errorf("%s: entry %q names tier %q, which isn't a subject token", EnvTierMembership, entry, tier)
 		}
-		key := backend + ":" + user
+		// The key a turn is matched on (requesterSubject): a Google Chat id
+		// is case-blind, so two spellings of one person are a repeat.
+		key := backend + ":" + strings.TrimSpace(user)
+		if backend == gchatBackend {
+			key = strings.ToLower(key)
+		}
 		if seen[key] {
 			return nil, fmt.Errorf("%s: %s is listed twice", EnvTierMembership, key)
 		}
