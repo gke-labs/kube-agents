@@ -61,32 +61,29 @@ class ProfilesNamespaceRenderTest(unittest.TestCase):
         self.assertEqual(docs[0]["metadata"]["annotations"]["meta.helm.sh/release-namespace"], _RELEASE_NS)
 
     def test_the_operator_gets_its_write_role_in_the_profile_namespace_whatever_the_mode(self):
-        # The operator renders into the profile namespace on every install
-        # (the A2A stack renders whatever spec.mode says), so its namespaced
-        # Role and RoleBinding must render there whenever the namespace does.
-        # Gated on mode next, a mode-today install left the operator with no
-        # write verbs in a namespace it writes to, and every pass failed to
-        # apply the profile-namespace resources.
+        # The chart renders the profile namespace on every install with a
+        # platform agent, and the operator renders into it whatever spec.mode
+        # says, so the operator's namespaced Role and RoleBinding render there
+        # whenever the namespace does, with the rules the install namespace's
+        # copy has. They used to render there under mode next only.
         profile_ns = f"{_RELEASE_NS}-profiles"
         for mode in (None, "today", "next"):
             with self.subTest(mode=mode):
                 overrides = [] if mode is None else [f"platformAgent.mode={mode}"]
                 docs = _docs(_RBAC_TEMPLATE, *overrides)
-                in_ns = {(d["kind"], d["metadata"]["name"]): d for d in docs if d["metadata"].get("namespace") == profile_ns}
+                by_ns = {}
+                for d in docs:
+                    by_ns.setdefault(d["metadata"].get("namespace"), {})[(d["kind"], d["metadata"]["name"])] = d
+                in_ns = by_ns.get(profile_ns, {})
                 role = in_ns.get(("Role", "ka-operator-namespaced-role"))
                 binding = in_ns.get(("RoleBinding", "ka-operator-namespaced-rolebinding"))
                 self.assertIsNotNone(role, sorted(in_ns))
                 self.assertIsNotNone(binding, sorted(in_ns))
                 self.assertEqual(binding["roleRef"]["name"], "ka-operator-namespaced-role")
                 self.assertEqual(binding["subjects"][0]["name"], "ka-operator-sa")
-                netpol_verbs = {
-                    v
-                    for rule in role["rules"]
-                    if "networkpolicies" in rule.get("resources", [])
-                    and any(group == "networking.k8s.io" for group in rule.get("apiGroups", []))
-                    for v in rule["verbs"]
-                }
-                self.assertTrue({"create", "patch", "update", "delete"} <= netpol_verbs, role["rules"])
+                install_role = by_ns.get(_RELEASE_NS, {}).get(("Role", "ka-operator-namespaced-role"))
+                self.assertIsNotNone(install_role)
+                self.assertEqual(role["rules"], install_role["rules"])
 
     def test_without_a_platform_agent_there_is_no_profile_namespace_role(self):
         docs = _docs(_RBAC_TEMPLATE, "platformAgent.enabled=false")
