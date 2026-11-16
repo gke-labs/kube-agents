@@ -1828,7 +1828,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
         # request lib.ValidateDelegateRequest refuses, and the validator caps
-        # the single task's text and every batch entry's.
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
         # Followed only by `||` or the block: an `&&` after the call (a
         # condition on it) would validate only some requests and mint the rest.
