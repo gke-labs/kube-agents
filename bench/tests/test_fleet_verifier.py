@@ -1043,14 +1043,22 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     for role, entry in _catalog()["roles"].items():
         if entry["cluster_slot"] is None:
             # A project-scoped probe, `<kind>/<name-prefix>*`: the Terraform
-            # names the object `<name-prefix>${var.cluster_prefix}`.
+            # names the object `<name-prefix>${var.cluster_prefix}`, or
+            # `<name-prefix>` bare where a repository declaration has to spell
+            # the object without knowing the prefix (the declared-mtu-peering
+            # network), or peers with the project's own `default` network,
+            # which it references as `global/networks/<name-prefix>` and never
+            # plants.
             for probe in entry["probes"]:
                 seen += 1
                 prefix = probe.split("/", 1)[1].removesuffix("*")
-                assert re.search(rf'name\s*=\s*"{re.escape(prefix)}\$\{{var\.cluster_prefix\}}"', main), (
+                assert re.search(
+                    rf'name\s*=\s*"{re.escape(prefix)}(?:\$\{{var\.cluster_prefix\}})?"|global/networks/{re.escape(prefix)}"',
+                    main,
+                ), (
                     f"project-scoped role {role!r} probes for {probe!r}, but no stack "
-                    f"file outside the defects files declares a name {prefix!r} followed "
-                    "by ${var.cluster_prefix}"
+                    f"file outside the defects files declares a name {prefix!r} (bare, or followed "
+                    "by ${var.cluster_prefix}) or references global/networks/" + prefix
                 )
             continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
@@ -1454,7 +1462,7 @@ YAML
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
-  "compute instances list"|"compute firewall-rules list")
+  "compute instances list"|"compute firewall-rules list"|"compute networks list")
     # A project-scoped probe. Planted by default: prints one name with the
     # filter's prefix. STUB_COMPUTE_ABSENT lists `<collection>:<prefix>` pairs
     # that are not there; STUB_COMPUTE_FAIL fails every list.
@@ -1882,7 +1890,7 @@ def test_the_runner_publishes_a_project_role_as_its_confirmed_list_alone(shell, 
         assert not any(line.startswith(f"slot.{role}=") for line in context), role
         for probe in entry["probes"]:
             kind, prefix = probe.split("/", 1)
-            collection = {"instance": "instances", "firewall": "firewall-rules"}[kind]
+            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}[kind]
             assert f"compute {collection} list --project kube-agents-evals --filter=name ~ ^{prefix[:-1]} --format=value(name)" in log
 
 

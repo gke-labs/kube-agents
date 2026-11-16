@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Forty-seven fixtures: forty-four across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Forty-eight fixtures: forty-four across the four cluster slots and four project-scoped. Three of the project-scoped ones, `startup-fail-vm`, `world-open-ingress` and `declared-mtu-peering`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
@@ -137,6 +137,7 @@ its roles are never published.
 | `orphan-disks`                      | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                              |
 | `startup-fail-vm`                   | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                       |
 | `world-open-ingress`                | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                               |
+| `declared-mtu-peering`              | project | 0   | `mtu-peer-declared`, a custom-mode VPC at MTU 8896, no subnet, peered both ways with `default` (MTU 1460); not a defect, the networking SOP's 2.4 peered-MTU posture, graded by no case until the stream's declared-intent slice lands        |
 | `version-laggard`                   | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                                    |
 | `drift-outlier`                     | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                                       |
 | `drift-pool-outlier`                | c       | 1   | `default-pool` on a 50 GB boot disk with `kubeletConfig.cpuCfsQuota` false, where every other pool runs 20 GB and no kubelet block; planted ahead of the `boot-disk` and `kubelet-config` drift facets, which the drift SOP does not read yet |

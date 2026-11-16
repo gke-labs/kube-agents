@@ -1000,6 +1000,39 @@ resource "google_compute_firewall" "world_open_deny_remote" {
   }
 }
 
+# Posture (networking): a jumbo-frame VPC peered with `default` (MTU 1460).
+# The networking audit's §2.4 (`mtu-packet-fragmentation`) flags two networks
+# joined by an ACTIVE peering at different MTUs; the SOP calls each network's
+# MTU a choice, not a defect, so the pair is a posture an owner can keep on
+# purpose (a storage or Interconnect network at 8896 beside a 1460 network
+# whose VMs cannot all restart to adopt a new MTU). Custom mode with no
+# subnet: nothing to overlap with `default`, no route exchanged, nothing to
+# bill (a VPC and a peering are free). The name carries no cluster_prefix, so
+# a declaration can spell the object without knowing the prefix, and it sorts
+# after `default`, so the collector's sorted pair reads
+# `NetworkPeering/default--mtu-peer-declared`. Both one-way halves are
+# needed: a peering with one half is INACTIVE, which the check skips. No
+# `labels`: a VPC network and a peering take none, so neither carries
+# fleet_labels. Until the stream's declared-intent slice lands, the finding
+# publishes and no case grades it. Catalogue role: declared-mtu-peering.
+resource "google_compute_network" "mtu_peer_declared" {
+  name                    = "mtu-peer-declared"
+  auto_create_subnetworks = false
+  mtu                     = 8896
+}
+
+resource "google_compute_network_peering" "default_to_mtu_peer_declared" {
+  name         = "default-to-mtu-peer-declared"
+  network      = "projects/${var.project_id}/global/networks/default"
+  peer_network = google_compute_network.mtu_peer_declared.self_link
+}
+
+resource "google_compute_network_peering" "mtu_peer_declared_to_default" {
+  name         = "mtu-peer-declared-to-default"
+  network      = google_compute_network.mtu_peer_declared.self_link
+  peer_network = "projects/${var.project_id}/global/networks/default"
+}
+
 # Defect (compute): a standalone VM whose startup script fails. The GCE
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on

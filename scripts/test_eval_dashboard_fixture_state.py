@@ -301,6 +301,12 @@ def healthy_world(*projects):
             {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
             {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"]},
         ],
+        # The declared-mtu-peering role's pair as `networks list` prints it:
+        # `default` on GCP's 1460 default, which the listing omits.
+        "networks": [
+            {"name": "default", "peerings": [{"name": "default-to-mtu-peer-declared", "state": "ACTIVE"}]},
+            {"name": "mtu-peer-declared", "mtu": 8896, "peerings": [{"name": "mtu-peer-declared-to-default", "state": "ACTIVE"}]},
+        ],
     }
     return {
         "clusters": {project: fleet for project in projects},
@@ -596,10 +602,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 49, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 50, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 49, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 50, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -653,7 +659,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 97, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 99, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -678,7 +684,7 @@ class NotChecked(ScanHarness):
         states = self.states(doc)
         # The project-scoped roles are read with gcloud compute, not through a
         # cluster, so a refused cluster list leaves them readable.
-        project_roles = {"startup-fail-vm", "world-open-ingress"}
+        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering"}
         self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
         self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
