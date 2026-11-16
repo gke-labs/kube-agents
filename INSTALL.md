@@ -1002,8 +1002,8 @@ helm upgrade kube-agents ./charts/kube-agents \
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
 On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
-first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
-re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+first install writes it as true; a file without the key is read from the live install (the
+Terraform state, then the node pools), and a re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
 `install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
 `agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
 set only on the Helm release or only in `terraform.tfvars` is reverted.

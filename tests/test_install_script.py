@@ -10588,10 +10588,32 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     def test_the_interviews_no_marks_gvisor_explicit(self):
         text = _INSTALL_SH.read_text()
-        branch = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"'):]
-        branch = branch[: branch.index("    else\n")]
-        self.assertIn('enable_gvisor="false"', branch)
-        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', branch)
+        start = text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"')
+        yes_default = text[start:]
+        yes_default = yes_default[: yes_default.index("    else\n")]
+        self.assertIn('enable_gvisor="false"', yes_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', yes_default)
+        # No as the default (install.env already false), kept at the prompt:
+        # the operator affirmed it, so it confirms the destroy too.
+        no_default = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)"'):]
+        no_default = no_default[: no_default.index("    fi\n")]
+        self.assertIn("else", no_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', no_default[no_default.index("else"):])
+
+    def test_the_enable_gvisor_flag_marks_the_choice_explicit(self):
+        for flag, want in (("--enable-gvisor=false", "M=[true]"), ("--enable-gvisor=true", "M=[true]")):
+            with self.subTest(flag=flag):
+                proc = self._run_func(f'parse_args {flag}; echo "M=[${{PARAM_ENABLE_GVISOR_EXPLICIT:-}}]"')
+                self.assertIn(want, proc.stdout, proc.stderr)
+        proc = self._run_func('parse_args; echo "M=[${PARAM_ENABLE_GVISOR_EXPLICIT:-}]"')
+        self.assertIn("M=[]", proc.stdout, proc.stderr)
+
+    def test_the_control_panel_reads_gvisor_from_the_live_install(self):
+        text = _INSTALL_SH.read_text()
+        panel = text[text.index("run_menu_system() {"):]
+        panel = panel[: panel.index("\n}\n")]
+        self.assertIn('enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"', panel)
+        self.assertNotIn("${ENABLE_GVISOR:-false}", panel)
 
     def test_successful_apply_writes_log_file_and_succeeds(self):
         repo_dir = self._tmp_path / "mock-repo"

@@ -8737,6 +8737,11 @@ main() {
       prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice
       if [ "$gvisor_choice" = "2" ]; then
         enable_gvisor="true"
+      else
+        # "No" kept, with install.env (or a flag) already saying false: the
+        # operator affirmed it at the prompt, which is the confirmation
+        # guard_gvisor_pool_teardown names for a live pool.
+        PARAM_ENABLE_GVISOR_EXPLICIT="true"
       fi
     fi
 
