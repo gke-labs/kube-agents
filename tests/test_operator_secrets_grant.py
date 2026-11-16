@@ -422,18 +422,27 @@ class OperatorSecretsGrantTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_to_the_operator_on_both_delivery_paths(self):
-        # The Role's verbs are pinned above; this pins that something binds it,
-        # in the install namespace alone on a stock render.
-        for path, documents in (("helm", _render_helm()), ("kustomize", _render_kustomize())):
+        # The Role's verbs are pinned above; this pins that something binds it
+        # on a stock render. The chart renders the profile namespace on every
+        # install with a platform agent, whatever platformAgent.mode says, and
+        # the operator writes into it, so the chart binds the Role there too;
+        # kustomize's config/default is the install namespace alone, and
+        # config/profiles adds the profile namespace (the next test).
+        for path, documents, want in (
+            ("helm", _render_helm(), {INSTALL_NAMESPACE, PROFILE_NAMESPACE}),
+            ("helm, mode today", _render_helm("--set", "platformAgent.mode=today"), {INSTALL_NAMESPACE, PROFILE_NAMESPACE}),
+            ("kustomize", _render_kustomize(), {INSTALL_NAMESPACE}),
+        ):
             with self.subTest(path=path):
-                self._assert_role_bound_in(path, documents, {INSTALL_NAMESPACE})
+                self._assert_role_bound_in(path, documents, want)
 
     @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_in_the_profile_namespace_too(self):
-        # Under mode next the chart creates the profile namespace and renders
-        # the Role and its binding there as well; the kustomize path's
-        # config/profiles does the same beside config/default. The subject is
-        # still the operator's ServiceAccount in the install namespace.
+        # The chart creates the profile namespace and renders the Role and its
+        # binding there as well, in every mode (mode next shown here); the
+        # kustomize path's config/profiles does the same beside
+        # config/default. The subject is still the operator's ServiceAccount
+        # in the install namespace.
         both = {INSTALL_NAMESPACE, PROFILE_NAMESPACE}
         for path, documents in (
             ("helm", _render_helm(*HELM_MODE_NEXT_SETS)),

@@ -129,8 +129,8 @@ each kind stays without `namespace=`.
 Objects. In the install namespace: the Role (`kubeagents-manager-role` under kustomize,
 `<release>-operator-namespaced-role` under Helm) and its RoleBinding, both existing. In the profile
 namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the Role and
-its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace only
-under `mode: next`, where `profiles-namespace.yaml` creates it), with the spliced rules block
+its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace
+whenever `profiles-namespace.yaml` creates it, on every install with a platform agent), with the spliced rules block
 inline rather than in a named template: `hack/sync-chart-manifests.sh` keeps splicing one block
 between the `GENERATED NAMESPACED RULES` markers, and the conformance harness's text reader would
 drop an `include` line (§3 Guard). Kustomize's `config/default` rewrites every namespaced object to
