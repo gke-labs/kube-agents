@@ -39500,5 +39500,75 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
+class ComplianceWiGsaUnverifiableDeclarableTests(unittest.TestCase):
+    """§2.19 `wi-gsa-iam-binding-unverifiable` is declarable per ServiceAccount (§3a)."""
+
+    SLUG = "wi-gsa-iam-binding-unverifiable"
+    CLUSTER = "prod-us-east"
+
+    def _finding(self, obj="ServiceAccount/kms-signer-sa", ns="payments"):
+        return make_finding(
+            f"{self.SLUG}.{self.CLUSTER}.{ns}.{obj.lower().replace('/', '-')}",
+            check=self.SLUG,
+            cluster=self.CLUSTER,
+            namespace=ns,
+            obj=obj,
+            severity="minor",
+            excerpt="iam.gke.io/gcp-service-account=kms-signer@central-iam.iam.gserviceaccount.com",
+        )
+
+    def _doc(self, findings):
+        return audit_report.validate_findings(make_doc(findings=findings, audit=AUDIT), AUDIT)
+
+    def test_declarable_set_includes_wi_gsa_iam_binding_unverifiable(self):
+        self.assertEqual(
+            audit_report.audit_declarable_checks(AUDIT),
+            frozenset({"netpol-missing", "default-sa-automount", self.SLUG}),
+        )
+
+    def test_declaration_moves_annotated_serviceaccount_to_declared_intent(self):
+        declared_sa = self._finding("ServiceAccount/kms-signer-sa", "payments")
+        undeclared_sa = self._finding("ServiceAccount/other-sa", "payments")
+        doc = self._doc([declared_sa, undeclared_sa])
+        declarations = [
+            {
+                "check": self.SLUG,
+                "namespace": "payments",
+                "object": "ServiceAccount/kms-signer-sa",
+                "repo": "acme/fleet",
+                "path": "knowledge/central-iam.md",
+                "excerpt": "Central IAM project sits outside this install's read scope by design.",
+            }
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["ServiceAccount/kms-signer-sa"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ServiceAccount/other-sa"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["ServiceAccount/kms-signer-sa"])
+
+    def test_validator_accepts_serviceaccount_and_rejects_other_kinds(self):
+        doc = self._doc([])
+        doc["declared"] = [
+            make_declared(
+                check=self.SLUG,
+                cluster=self.CLUSTER,
+                namespace="payments",
+                obj="ServiceAccount/kms-signer-sa",
+                title="kms-signer-sa uses central IAM project outside install scope",
+                repo="acme/fleet",
+                path="knowledge/central-iam.md",
+                excerpt="Central IAM project.",
+            )
+        ]
+        audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        for obj in ("Namespace/payments", "Cluster/prod-us-east", "Deployment/kms-signer"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("serviceaccount", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

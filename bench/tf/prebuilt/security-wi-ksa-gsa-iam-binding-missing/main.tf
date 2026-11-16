@@ -20,9 +20,9 @@
 # account can exist behind it, and a one-replica Deployment that runs under
 # the account. That is the pair a check would read: the annotation on the
 # Kubernetes side, the missing member on the IAM side. Nothing in IAM is
-# created or edited: the fixture is namespace objects only. The compliance
-# audit has no check that names the pattern: the case carries
-# expected_fail: true.
+# created or edited: the fixture is namespace objects only. Check 2.19
+# (wi-gsa-iam-binding-unverifiable) names ServiceAccount/kms-signer-sa at minor
+# severity.
 #
 # Isolation class: namespace-scoped, in its own namespace so another case's
 # namespace left Terminating on the same host cluster cannot stop this plant.

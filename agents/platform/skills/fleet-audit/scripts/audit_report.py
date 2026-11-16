@@ -182,14 +182,18 @@ AUDITS: dict[str, AuditSpec] = {
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
             "webhook-backend-unreachable",
+            "wi-gsa-iam-binding-unverifiable",
         ),
-        # The two compliance checks that judge a posture an owner may choose:
+        # The three compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
         # (2.6, the zero-policy and partial-coverage shapes, which name the
         # namespace; the allow-all shape names the policy and is a fault),
-        # and a workload that needs the API token the default ServiceAccount
-        # mounts (2.7). Every other check is a fault no declaration excuses.
-        declarable=("netpol-missing", "default-sa-automount"),
+        # a workload that needs the API token the default ServiceAccount
+        # mounts (2.7), and a Workload Identity ServiceAccount annotation
+        # pointing into a central-IAM project outside this install's read
+        # scope (2.19, `ServiceAccount/<name>`). Every other check is a fault
+        # no declaration excuses.
+        declarable=("netpol-missing", "default-sa-automount", "wi-gsa-iam-binding-unverifiable"),
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",
@@ -1224,6 +1228,7 @@ CHECK_PHRASES = {
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
+    "wi-gsa-iam-binding-unverifiable": "{object} names a Google service account this install cannot vouch for",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -2060,6 +2065,12 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
 STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ZONE_ARM_CHECK: frozenset({"nodepool"}),
 }
+# Compliance 2.19 (`wi-gsa-iam-binding-unverifiable`) names the annotated
+# ServiceAccount and nothing else: a `Namespace/` or `Cluster/` declaration
+# cannot excuse an entire namespace or cluster of Workload Identity bindings.
+COMPLIANCE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    "wi-gsa-iam-binding-unverifiable": frozenset({"serviceaccount"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
@@ -2067,6 +2078,7 @@ STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+    **COMPLIANCE_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what

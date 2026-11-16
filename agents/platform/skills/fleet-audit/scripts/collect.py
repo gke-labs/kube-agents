@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-five-check roster (§3.1–§3.25 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s eighteen-check roster (§2.1–§2.18 of
+`compliance-audit`'s nineteen-check roster (§2.1–§2.19 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -22,8 +22,9 @@ collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, six of them
-best-effort (four because their CRDs are not installed everywhere, two because
-an identity may not list webhook configurations or EndpointSlices); ai-security reads
+best-effort cluster reads (four because their CRDs are not installed everywhere, two because
+an identity may not list webhook configurations or EndpointSlices) plus one deduplicated
+best-effort `gcloud projects describe` per unique project §2.19's Workload Identity annotations name; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
@@ -82,6 +83,7 @@ import stat
 import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -252,6 +254,115 @@ IMPACT_HPA_AGGRESSIVE_SCALEDOWN = (
     "dropping connections in flight and flapping capacity on brief load dips."
 )
 
+COMPLIANCE_AUDIT_ID = "compliance-audit"
+# §2.19 `wi-gsa-iam-binding-unverifiable` (arm A): on a cluster with Workload
+# Identity enabled, a ServiceAccount whose `iam.gke.io/gcp-service-account`
+# annotation names a Google service account in a project this install cannot
+# read (`gcloud projects describe <project>` is explicitly refused).
+# Informational (`minor`), never "missing" or "broken": the IAM binding may be
+# in place in a project outside this install's read scope, and central-IAM
+# installs may declare intentional accounts under §3a. Arm B (a readable
+# account whose IAM policy lacks `roles/iam.workloadIdentityUser`) reserves
+# `wi-gsa-iam-binding-missing` and waits on the
+# `iam service-accounts get-iam-policy` allowlist entry (`#5027`).
+WI_GSA_BINDING_UNVERIFIABLE_SLUG = "wi-gsa-iam-binding-unverifiable"
+WI_GSA_ANNOTATION = "iam.gke.io/gcp-service-account"
+WI_IAM_ROLE = "roles/iam.workloadIdentityUser"
+WI_GSA_BINDING_SEVERITY = "minor"
+WI_PROJECT_DESCRIBE_FORMAT_FLAG = "--format"
+WI_PROJECT_DESCRIBE_FORMAT = "value(projectNumber)"
+WI_SERVICEACCOUNT_KIND = "ServiceAccount"
+WI_COMMAND_JOIN = "; "
+# GCP project IDs are 6-30 characters; 128 admits intentionally overlong invalid
+# project IDs (such as the 41-character certification fixture) while bounding
+# malformed annotations so a single label cannot blow `MAX_COMMAND_CHARS`.
+WI_MAX_PROJECT_ID_CHARS = 128
+# Below `audit_report.MAX_COMMAND_CHARS` (2000), which `finish` enforces on
+# every `checks_run` command copied from `commands[]`.
+WI_MAX_COMMAND_CHARS = 1900
+WI_CACHE_KWARG = "wi_project_cache"
+WI_PROJECT_RUNS_KEY = "wi_gsa_project_runs"
+WI_SA_COMMAND_KEY = "wi_sa_command"
+WI_PROJECT_READABLE = "readable"
+WI_PROJECT_REFUSED = "refused"
+WI_PROJECT_UNREAD = "unread"
+WI_GSA_IAM_DOMAIN_RE = re.compile(
+    r"^[^@\s]+@([a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?)\.iam\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GSA_COMPUTE_DEFAULT_RE = re.compile(
+    r"^([0-9]{1,30})-compute@developer\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GSA_APPSPOT_DEFAULT_RE = re.compile(
+    r"^([a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?)@appspot\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GOOGLE_MANAGED_PROJECT_PREFIX = "gcp-sa-"
+WI_GOOGLE_MANAGED_PROJECTS = frozenset({"container-engine-robot"})
+# Failures that mean `gcloud projects describe` never established whether the
+# install's IAM identity may read the target project: credential-broker
+# throttling or transport errors, caller quota-project or OAuth-scope errors,
+# auth refresh failures, gRPC/HTTP 429 or 5xx, or gcloud crashes (same classes
+# as `scripts/verify_ci_pool_project.py` and `scripts/installer/installer_common.sh`).
+WI_PROJECT_UNREAD_PATTERNS = (
+    re.compile(r"\bcredential proxy\b|CREDENTIAL_PROXY_", re.IGNORECASE),
+    re.compile(
+        r"USER_PROJECT_DENIED|quota project|serviceusage\.services\.use"
+        r"|ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"invalid_grant|problem refreshing your current auth|reauthentication (?:required|failed)"
+        r"|\bUNAUTHENTICATED\b|invalid authentication credentials",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b"
+        r"|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"
+    ),
+    re.compile(
+        r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()"
+        r"(?:401|408|429|500|502|503|504)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known"
+        r"|Connection reset by peer|Unable to find the server at|dial tcp|TLS handshake timeout"
+        r"|unexpected EOF|server closed idle connection|timed out",
+        re.IGNORECASE,
+    ),
+)
+# Explicit target-project refusals from Cloud Resource Manager (`gcloud projects
+# describe`): caller lacks `resourcemanager.projects.get` (or project does not
+# exist — gcloud prints both together), 404/NOT_FOUND, or 400 Bad Request /
+# INVALID_ARGUMENT on an invalid project ID.
+WI_PROJECT_REFUSAL_PATTERNS = (
+    re.compile(
+        r"permission[ _]denied|does not have permission|not authorized to access project"
+        r"|denied on resource|403 forbidden"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()403\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bnot[ _]found\b|may not exist"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()404\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\binvalid[ _]argument\b|\bbad request\b|invalid project(?:\s+id)?|project id must|invalid value"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()400\b",
+        re.IGNORECASE,
+    ),
+)
+_IMPACT_WI_GSA_BINDING_MISSING = (
+    "This ServiceAccount's iam.gke.io/gcp-service-account annotation names a Google "
+    "service account in a project this install cannot read, so this audit cannot "
+    "vouch that the account's IAM policy grants roles/iam.workloadIdentityUser to "
+    "this namespace and ServiceAccount; the binding may exist in a project outside "
+    "this install's read scope."
+)
+
 
 def _platform_script_dirs() -> tuple[str, ...]:
     checkout = Path(__file__).resolve().parents
@@ -282,6 +393,7 @@ for _shared_dir in _platform_script_dirs():
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+import credential_proxy_client  # noqa: E402
 # The Config Connector read that the collectors share: this file's `gcp` read
 # gives the compliance stream's entries their `kcc_unready` keys through it.
 # It sits beside this file, which a caller can load by path with this
@@ -4494,7 +4606,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all eighteen checks of §2.
+# compliance-audit: all nineteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -7855,7 +7967,7 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
 # its rules match today, and a config-management system is the first caller to
 # find out. Both reads are best-effort, like `ccnp` above: a cluster whose
 # identity cannot list webhook configurations or EndpointSlices keeps its
-# other seventeen checks, and this one reads `Undetermined` there.
+# other eighteen checks, and this one reads `Undetermined` there.
 WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
 ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
 UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
@@ -7984,6 +8096,172 @@ def check_webhook_backend_unreachable(context: dict) -> list[dict]:
             }
         )
     return hits
+
+
+# §2.19 `wi-gsa-iam-binding-unverifiable` (arm A): on a cluster with Workload
+def _classify_wi_project_describe(proj_run: Run) -> str:
+    """Classify a `gcloud projects describe` `Run` as readable, refused, or unread.
+
+    Only an explicit target-project refusal (`PERMISSION_DENIED`, `NOT_FOUND`,
+    or `INVALID_ARGUMENT` / `Bad Request` on the project ID, without consumer
+    `SERVICE_DISABLED`, `USER_PROJECT_DENIED`, or insufficient auth scopes)
+    establishes Arm A. Any timeout, spawn failure, policy/session-cap refusal,
+    credential-broker error, auth refresh failure, consumer/quota-project error,
+    429/5xx, or unrecognized stderr leaves the project unread (`Undetermined`).
+    """
+    if proj_run.rc == 0:
+        return WI_PROJECT_READABLE
+    if proj_run.rc < 0 or proj_run.rc in (
+        TIMEOUT_RC,
+        credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED,
+    ):
+        return WI_PROJECT_UNREAD
+    stderr = str(proj_run.stderr or "").strip()
+    if not stderr:
+        return WI_PROJECT_UNREAD
+    if any(code in stderr for code in credential_proxy_client.POLICY_BLOCKED_CODES):
+        return WI_PROJECT_UNREAD
+    if any(marker in stderr for marker in API_DISABLED_MARKERS):
+        return WI_PROJECT_UNREAD
+    if any(pattern.search(stderr) for pattern in WI_PROJECT_UNREAD_PATTERNS):
+        return WI_PROJECT_UNREAD
+    if any(pattern.search(stderr) for pattern in WI_PROJECT_REFUSAL_PATTERNS):
+        return WI_PROJECT_REFUSED
+    return WI_PROJECT_UNREAD
+
+
+class _WiProjectDescribeCache:
+    """Deduplicates `gcloud projects describe <project>` across a collector sweep."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
+        self._results: dict[str, Run] = {}
+
+    def describe(self, gsa_project: str, *, run: RunFn) -> tuple[str, Run]:
+        argv = [
+            *PROJECT_DESCRIBE_ARGV,
+            gsa_project,
+            WI_PROJECT_DESCRIBE_FORMAT_FLAG,
+            WI_PROJECT_DESCRIBE_FORMAT,
+        ]
+        cmd_text = shlex.join(argv)
+        while True:
+            with self._lock:
+                cached = self._results.get(gsa_project)
+                if cached is not None:
+                    return cmd_text, cached
+                waiter = self._inflight.get(gsa_project)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._inflight[gsa_project] = waiter
+                    owner = True
+                else:
+                    owner = False
+            if not owner:
+                waiter.wait()
+                continue
+            cacheable = False
+            result: Run | None = None
+            try:
+                result = run(argv)
+                verdict = _classify_wi_project_describe(result)
+                cacheable = verdict != WI_PROJECT_UNREAD or result.rc == TIMEOUT_RC
+            finally:
+                with self._lock:
+                    if cacheable and result is not None:
+                        self._results[gsa_project] = result
+                    self._inflight.pop(gsa_project, None)
+                    waiter.set()
+            return cmd_text, result
+
+
+def _wi_gsa_project(gsa_email: str) -> str:
+    """The GCP project id or number `gsa_email` belongs to, or `""` when none."""
+    email = str(gsa_email or "").strip()
+    if not email:
+        return ""
+    iam_match = WI_GSA_IAM_DOMAIN_RE.match(email)
+    if iam_match:
+        project = iam_match.group(1).lower()
+        if (
+            len(project) > WI_MAX_PROJECT_ID_CHARS
+            or project.startswith(WI_GOOGLE_MANAGED_PROJECT_PREFIX)
+            or project in WI_GOOGLE_MANAGED_PROJECTS
+        ):
+            return ""
+        return project
+    compute_match = WI_GSA_COMPUTE_DEFAULT_RE.match(email)
+    if compute_match:
+        return compute_match.group(1)
+    appspot_match = WI_GSA_APPSPOT_DEFAULT_RE.match(email)
+    if appspot_match:
+        project = appspot_match.group(1).lower()
+        return project if len(project) <= WI_MAX_PROJECT_ID_CHARS else ""
+    return ""
+
+
+def _in_scope_annotated_serviceaccounts(
+    serviceaccounts: list[dict],
+) -> list[tuple[dict, str, str, str, str]]:
+    """In-scope ServiceAccounts carrying a Workload Identity GSA annotation."""
+    annotated: list[tuple[dict, str, str, str, str]] = []
+    for item in serviceaccounts or []:
+        meta = item.get("metadata") or {}
+        ns = str(meta.get("namespace") or "")
+        sa_name = str(meta.get("name") or "")
+        if not ns or not sa_name or _is_system_namespace(ns):
+            continue
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        annotations = meta.get("annotations") or {}
+        if annotations.get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        gsa_email = str(annotations.get(WI_GSA_ANNOTATION) or "").strip()
+        gsa_project = _wi_gsa_project(gsa_email)
+        if not gsa_project:
+            continue
+        annotated.append((meta, ns, sa_name, gsa_email, gsa_project))
+    return annotated
+
+
+def check_wi_gsa_iam_binding_unverifiable(context: dict) -> list[dict]:
+    """§2.19 (arm A): a ServiceAccount naming a GSA in a project this install cannot read."""
+    describe = context.get("cluster_describe") or {}
+    workload_pool = ((describe.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
+    if not workload_pool:
+        return []
+    project_runs = context.get(WI_PROJECT_RUNS_KEY) or {}
+    if not project_runs:
+        return []
+    sa_cmd = str(context.get(WI_SA_COMMAND_KEY) or "").strip()
+    hits = []
+    for meta, ns, sa_name, gsa_email, gsa_project in _in_scope_annotated_serviceaccounts(
+        context.get("serviceaccounts") or []
+    ):
+        entry = project_runs.get(gsa_project)
+        if entry is None:
+            continue
+        cmd_text, proj_run = entry
+        if _classify_wi_project_describe(proj_run) != WI_PROJECT_REFUSED:
+            continue
+        hits.append(
+            {
+                "namespace": ns,
+                "object": f"{WI_SERVICEACCOUNT_KIND}/{sa_name}",
+                "command": f"{sa_cmd}{WI_COMMAND_JOIN}{cmd_text}" if sa_cmd else cmd_text,
+                "excerpt": (
+                    f"{WI_GSA_ANNOTATION}={gsa_email}; `{cmd_text}` exited {proj_run.rc}, "
+                    f"so this install cannot read project {gsa_project} or vouch that {gsa_email} "
+                    f"grants {WI_IAM_ROLE} to serviceAccount:{workload_pool}[{ns}/{sa_name}]"
+                ),
+                "severity": WI_GSA_BINDING_SEVERITY,
+                "impact": _IMPACT_WI_GSA_BINDING_MISSING,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
 
 
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
@@ -8168,6 +8446,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "critical",  # overridden per hit: major when the selector reaches no severity namespace
         None,
         _IMPACT_WEBHOOK_BACKEND_UNREACHABLE,
+    ),
+    CheckSpec(
+        WI_GSA_BINDING_UNVERIFIABLE_SLUG,
+        "cluster",
+        check_wi_gsa_iam_binding_unverifiable,
+        WI_GSA_BINDING_SEVERITY,
+        None,
+        _IMPACT_WI_GSA_BINDING_MISSING,
     ),
 )
 
@@ -8398,6 +8684,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "configsync-reconciler-stalled": ("configsync",),
     "lb-world-open": ("services",),
     "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
+    WI_GSA_BINDING_UNVERIFIABLE_SLUG: ("serviceaccounts", "describe", "projects"),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -8545,7 +8832,14 @@ def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[s
     return "", _record("; ".join(cmd for cmd, _ in served), combined)
 
 
-def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
+def _collect_compliance(
+    cluster: dict,
+    kubeconfig: Path,
+    checks: tuple[CheckSpec, ...],
+    *,
+    run: RunFn,
+    wi_project_cache: _WiProjectDescribeCache | None = None,
+) -> CollectedContext:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     commands: dict[str, dict] = {}
     # `cluster_name` is here for the two cluster-scoped checks, whose object is
@@ -8638,7 +8932,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
 
     # §2.18's two reads, best-effort like `ccnp` below: both APIs exist on
     # every cluster, but an identity that cannot list them must not cost the
-    # cluster its other seventeen checks. A failed read leaves the check
+    # cluster its other eighteen checks. A failed read leaves the check
     # `Undetermined` on this cluster; the same disposition when the sibling
     # skill's predicate cannot be imported, which is a packaging fault, not a
     # clean cluster. The Services the check joins against are the read above.
@@ -8815,11 +9109,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # workload names, and a read narrowed to `default` left it nothing to find
     # -- every named account read as absent, so the check returned no hits on
     # any cluster while its command recorded a clean run.
-    parsed, result = paged(SERVICEACCOUNT_DUMP_KINDS)
+    parsed, sa_result = paged(SERVICEACCOUNT_DUMP_KINDS)
     if parsed is None:
-        raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
+        raise GateFailure(f"ServiceAccount dump gate failed (rc={sa_result.rc}): {sa_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), result)
+    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), sa_result)
     commands["default-sa-automount"] = sa_record
     commands["unbound-sa-automount"] = sa_record
 
@@ -8836,6 +9130,73 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     describe_record = _record(describe_command, result)
     for slug in ("workload-identity-off", "public-control-plane"):
         commands[slug] = describe_record
+
+    # §2.19 `wi-gsa-iam-binding-unverifiable` (arm A): one `gcloud projects describe`
+    # per unique project named by an in-scope ServiceAccount's Workload Identity
+    # annotation when Workload Identity is enabled on the cluster, deduplicated
+    # across the sweep. Only an explicit target-project refusal (`WI_PROJECT_REFUSED`)
+    # is the positive observation that this install cannot read the project to
+    # vouch for its binding; any timeout, broker/auth/429/5xx error, or consumer
+    # `SERVICE_DISABLED` (`WI_PROJECT_UNREAD`) leaves §2.19 `Undetermined` here.
+    context[WI_SA_COMMAND_KEY] = sa_record["command"]
+    wi_pool = ((parsed.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
+    wi_annotated = _in_scope_annotated_serviceaccounts(context["serviceaccounts"]) if wi_pool else []
+    wi_projects = sorted({gsa_project for _, _, _, _, gsa_project in wi_annotated})
+    project_cache = wi_project_cache if wi_project_cache is not None else _WiProjectDescribeCache()
+    wi_project_runs: dict[str, tuple[str, Run]] = {}
+    wi_unread_reason = ""
+    for gsa_project in wi_projects:
+        cmd_text, proj_run = project_cache.describe(gsa_project, run=run)
+        verdict = _classify_wi_project_describe(proj_run)
+        if verdict == WI_PROJECT_UNREAD:
+            if proj_run.rc == TIMEOUT_RC:
+                wi_unread_reason = (
+                    f"{UNDETERMINED_PREFIX} `{cmd_text}` did not finish within "
+                    f"{DEFAULT_TIMEOUT_S}s and was killed, so whether project {gsa_project!r} "
+                    "is readable by this install was not established. This check cleared "
+                    "nothing on this cluster."
+                )
+            else:
+                err_detail = proj_run.stderr.strip()[:ERROR_EXCERPT_CHARS]
+                detail_clause = f" ({err_detail})" if err_detail else ""
+                wi_unread_reason = (
+                    f"{UNDETERMINED_PREFIX} `{cmd_text}` failed without a target-project "
+                    f"refusal (rc={proj_run.rc}{detail_clause}), so whether project "
+                    f"{gsa_project!r} is readable by this install was not established. "
+                    "This check cleared nothing on this cluster."
+                )
+            break
+        wi_project_runs[gsa_project] = (cmd_text, proj_run)
+    if wi_unread_reason:
+        context.setdefault("unevaluated", {})[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = wi_unread_reason
+        context[WI_PROJECT_RUNS_KEY] = {}
+    else:
+        context[WI_PROJECT_RUNS_KEY] = wi_project_runs
+        if wi_project_runs:
+            wi_command_parts = [sa_record["command"]]
+            for _, (cmd_text, _) in sorted(wi_project_runs.items()):
+                candidate_chain = WI_COMMAND_JOIN.join([*wi_command_parts, cmd_text])
+                if len(candidate_chain) > WI_MAX_COMMAND_CHARS:
+                    break
+                wi_command_parts.append(cmd_text)
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = _record(
+                WI_COMMAND_JOIN.join(wi_command_parts),
+                Run(
+                    [],
+                    0,
+                    sa_result.stdout
+                    + "".join(
+                        f"\n{proj}:{proj_run.rc}:{proj_run.stdout}"
+                        for proj, (_, proj_run) in sorted(wi_project_runs.items())
+                    ),
+                    "",
+                    sa_result.duration_s + sum(proj_run.duration_s for _, proj_run in wi_project_runs.values()),
+                ),
+            )
+        elif wi_pool:
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = sa_record
+        else:
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = describe_record
 
     # Not attempted on Autopilot, where the API refuses it outright:
     # `node-pools list` answers HTTP 400 "Autopilot node pools cannot be
@@ -9717,6 +10078,7 @@ def collect_cluster(
     declarations: dict[tuple[str, str, str, str], set[str]] | None = None,
     releases: dict[tuple, dict] | None = None,
     namespaces: dict[tuple[str, str], dict] | None = None,
+    wi_project_cache: _WiProjectDescribeCache | None = None,
 ) -> dict:
     """One manifest `clusters[]` entry: every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -9739,7 +10101,10 @@ def collect_cluster(
             }
 
         try:
-            collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, run=run)
+            collector_kwargs: dict[str, object] = {"run": run}
+            if wi_project_cache is not None and audit_id == COMPLIANCE_AUDIT_ID:
+                collector_kwargs[WI_CACHE_KWARG] = wi_project_cache
+            collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, **collector_kwargs)
         except GateFailure as exc:
             return {
                 "name": target, "project": project, "location": location,
@@ -9782,6 +10147,8 @@ def collect_cluster(
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        if isinstance(hit.get("command"), str) and hit["command"].strip():
+            emitted["command"] = hit["command"].strip()
         if isinstance(hit.get("pod_selector"), dict):
             emitted["pod_selector"] = hit["pod_selector"]
         if isinstance(hit.get("namespace_pdbs"), list):
@@ -10102,6 +10469,7 @@ def collect_fleet(
         if shared_note:
             log(f"{KUBECONFIG_DIR}: {shared_note}")
 
+    wi_project_cache = _WiProjectDescribeCache() if audit_id == COMPLIANCE_AUDIT_ID else None
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -10114,6 +10482,7 @@ def collect_fleet(
                 declarations=declarations,
                 releases=releases,
                 namespaces=namespaces,
+                wi_project_cache=wi_project_cache,
             ): index
             for index, cluster in enumerate(clusters)
         }
