@@ -1408,7 +1408,8 @@ LOG_EXCEPTION_KEY = "exception"
 TOOL_EXECUTION_AUDIT_EVENT = "tool_execution_audit"
 # The `status` of a tool-execution audit record: one per outcome the exec route
 # can reach. `completed` says the command ran, whatever its exit code; the
-# code is beside it.
+# code is beside it. The Cloud API relay uses the same words: its `completed`
+# says the read was forwarded, and the upstream's HTTP status is beside it.
 AUDIT_STATUS_STARTED = "started"
 AUDIT_STATUS_COMPLETED = "completed"
 AUDIT_STATUS_BLOCKED = "blocked"
@@ -1420,6 +1421,14 @@ AUDIT_STATUS_ABANDONED = "abandoned"
 FEEDBACK_AUDIT_TOOL = "feedback"
 FEEDBACK_AUDIT_SUBCOMMAND = "submit"
 FEEDBACK_REASON_LOG_LENGTH = 200
+# The Cloud API relay's audit vocabulary. The tool is one fixed word, apart from
+# `gcloud`, so a record whose tool is `gcloud` still means a gcloud process ran.
+# The subcommand is the service word of a host the route table names (the host's
+# first label), and LABEL_OTHER for every other host, so no caller text is a label.
+API_RELAY_AUDIT_TOOL = "gcp-api"
+API_RELAY_AUDIT_SUBCOMMANDS = {
+    route.host: route.host.partition(".")[0] for route in api_policy.API_READ_ROUTES
+}
 FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
@@ -12522,6 +12531,7 @@ def _tool_audit(
     exit_code: int | None = None,
     duration_ms: int | None = None,
     rule: str | None = None,
+    upstream_status: int | None = None,
     pod: str = "",
     broker_tier: str,
     klass: str,
@@ -12532,8 +12542,9 @@ def _tool_audit(
     tool and subcommand as the metrics label them (a closed vocabulary, never the
     argv), the outcome, the broker's tier (`broker_tier_of`), the admission class,
     this broker's pod and, where there is one, the exit code, the duration and
-    the policy rule. No argument, path, stdin or output is ever here, so there is
-    nothing in the record for a `--token` to leak through.
+    the policy rule; for a relayed Cloud API read, the upstream's HTTP status in
+    place of an exit code. No argument, path, stdin or output is ever here, so
+    there is nothing in the record for a `--token` to leak through.
     """
     record: dict[str, Any] = {
         "event_type": TOOL_EXECUTION_AUDIT_EVENT,
@@ -12557,6 +12568,8 @@ def _tool_audit(
         record["duration_ms"] = duration_ms
     if rule:
         record["rule"] = rule
+    if upstream_status is not None:
+        record["upstream_status"] = upstream_status
     return record
 
 
@@ -14288,11 +14301,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
 
-    def _relay_authorization(self, label: str, request_id: str) -> str | None:
+    def _relay_authorization(
+        self, label: str, request_id: str, audit: Callable[..., dict[str, Any]] | None = None
+    ) -> str | None:
         """The broker's own `Authorization` value, or None after answering 503.
 
         Shared by the Cloud API relay and the MCP relay; `label` is the first
-        word of their audit lines.
+        word of their audit lines. `audit`, when the caller passes one, builds
+        the `extra` of the failure's record (the Cloud API relay's
+        tool-execution audit mapping).
         """
         try:
             return self.api_relay.authorization_header()
@@ -14304,6 +14321,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 label,
                 request_id,
                 type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED) if audit else None,
             )
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -14321,14 +14339,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         host: str,
         target: str,
         authorization: str,
+        audit: Callable[..., dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> ApiRelayResponse | None:
         """`GoogleApiRelay.fetch`, or None after answering the upstream failure.
 
         Every failure answers the way the Cloud API relay always has, with the
-        same codes; `label` is the first word of the audit line. `kwargs` go to
-        `fetch` unchanged.
+        same codes; `label` is the first word of the audit line. `audit`, when
+        the caller passes one, builds the `extra` of the failure's record.
+        `kwargs` go to `fetch` unchanged.
         """
+        failed = audit(AUDIT_STATUS_FAILED) if audit else None
         try:
             return self.api_relay.fetch(host, target, authorization, **kwargs)
         except ApiRelayConnectTimeout:
@@ -14338,6 +14359,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 request_id,
                 host,
                 API_RELAY_CONNECT_TIMEOUT_S,
+                extra=failed,
             )
             self._json(
                 HTTPStatus.BAD_GATEWAY,
@@ -14351,6 +14373,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 request_id,
                 host,
                 API_RELAY_DEADLINE_S,
+                extra=failed,
             )
             self._json(
                 HTTPStatus.GATEWAY_TIMEOUT,
@@ -14373,6 +14396,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 request_id,
                 API_RELAY_BAD_QUERY,
                 type(exc).__name__,
+                extra=audit(AUDIT_STATUS_REJECTED) if audit else None,
             )
             self._json(
                 HTTPStatus.BAD_REQUEST,
@@ -14393,6 +14417,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 host,
                 len(exc.partial),
                 len(exc.partial) + (exc.expected or 0),
+                extra=failed,
             )
             self._json(
                 HTTPStatus.BAD_GATEWAY,
@@ -14409,6 +14434,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 request_id,
                 host,
                 type(exc).__name__,
+                extra=failed,
             )
             self._json(
                 HTTPStatus.BAD_GATEWAY,
@@ -14428,7 +14454,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
         decision and exactly one verdict -- rejected, blocked, forwarded, or
-        one of the upstream failures. `host` and `path` are caller text and go through
+        one of the upstream failures. Each carries the exec route's
+        tool-execution audit mapping, under API_RELAY_AUDIT_TOOL and the host's
+        service word: started, then rejected, blocked, completed (a forwarded
+        answer, whatever its status) or failed. `host` and `path` are caller text and go through
         `_sanitize_for_logging` as `argv[0]` does. docs/designs/gcp-api-relay.md
         is the design and its security review names which line stops what.
         """
@@ -14441,23 +14470,38 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
+        # Same width as the exec line, for the same reason: this value is the
+        # TokenReview's, and a truncated identity names the wrong ServiceAccount.
+        principal_label = _sanitize_for_logging(
+            principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
+        )
+        subcommand_label = API_RELAY_AUDIT_SUBCOMMANDS.get(host, LABEL_OTHER)
+
+        def audit(status: str, **fields: Any) -> dict[str, Any]:
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, API_RELAY_AUDIT_TOOL, subcommand_label,
+                    pod=principal.pod if principal else "",
+                    broker_tier=broker_tier_of(self.broker_role),
+                    klass=admission_class(principal.role) if principal else CLASS_INTERACTIVE,
+                    **fields,
+                )
+            }
+
         LOGGER.info(
             "api request_id=%s principal=%s host=%s path=%s",
             request_id,
-            # Same width as the exec line, for the same reason: this value is
-            # the TokenReview's, and a truncated identity names the wrong
-            # ServiceAccount.
-            _sanitize_for_logging(
-                principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
-            ),
+            principal_label,
             _sanitize_for_logging(host),
             _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
+            extra=audit(AUDIT_STATUS_STARTED),
         )
         problem = api_relay_target_problem(host, path, parts.query)
         if problem is not None:
             code, reason = problem
             LOGGER.warning(
-                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason,
+                extra=audit(AUDIT_STATUS_REJECTED),
             )
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
@@ -14465,7 +14509,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # below log it as-is; `path` is never logged again.
         decision = api_policy.evaluate(self.command, host, path, parts.query)
         if not decision.allowed:
-            LOGGER.warning("api blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning(
+                "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=decision.rule_id),
+            )
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -14483,26 +14530,32 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             try:
                 self.exclusions.check(segments[2], segments[4], segments[6])
             except scope_exclude.ExcludedCluster as exc:
-                LOGGER.warning("api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule)
+                LOGGER.warning(
+                    "api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
+                )
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": exc.rule, "message": str(exc)},
                 )
                 return
         if self.api_relay is None:
-            LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning(
+                "api disabled request_id=%s rule=%s", request_id, decision.rule_id,
+                extra=audit(AUDIT_STATUS_FAILED),
+            )
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("api", request_id)
+        authorization = self._relay_authorization("api", request_id, audit)
         if authorization is None:
             return
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        upstream = self._relay_fetch("api", request_id, host, target, authorization)
+        upstream = self._relay_fetch("api", request_id, host, target, authorization, audit)
         if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
@@ -14513,6 +14566,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 host,
                 upstream.status,
                 API_RELAY_MAX_RESPONSE_BYTES,
+                extra=audit(AUDIT_STATUS_FAILED, duration_ms=duration_ms),
             )
             self._json(
                 HTTPStatus.BAD_GATEWAY,
@@ -14534,6 +14588,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 request_id,
                 host,
                 upstream.status,
+                extra=audit(AUDIT_STATUS_FAILED, duration_ms=duration_ms),
             )
             self._json(
                 HTTPStatus.BAD_GATEWAY,
@@ -14558,6 +14613,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     host,
                     decision.rule_id,
                     upstream.status,
+                    extra=audit(AUDIT_STATUS_FAILED, duration_ms=duration_ms),
                 )
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -14575,6 +14631,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             upstream.status,
             len(upstream.body),
             duration_ms,
+            extra=audit(AUDIT_STATUS_COMPLETED, duration_ms=duration_ms, upstream_status=upstream.status),
         )
         self.send_response(upstream.status)
         if upstream.content_type:
@@ -14593,7 +14650,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         can read; otherwise the upstream POST of the broker's re-serialisation
         of the message, and the passthrough of status and body, with
         `tools/list` cut down to the table. Two audit lines per request, as the
-        Cloud API relay writes them.
+        Cloud API relay writes them, without that relay's audit mapping.
 
         A refusal of a request with an id answers HTTP 200. mcp-remote's SDK
         throws away the body of any non-2xx reply, so a 403 would reach the
