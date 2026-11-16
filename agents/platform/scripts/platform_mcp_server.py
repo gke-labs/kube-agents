@@ -11,6 +11,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import subprocess
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from pathlib import Path
 from mcp.server import MCPServer
@@ -92,6 +93,22 @@ FIRST_RUN_REPORT_FULL_MAX_BYTES = 256 * 1024
 FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS = 30
 # What the ERROR line names when the read failed.
 FIRST_RUN_REPORT_SUBJECT = "the first-run report"
+
+# `get_alert_history`'s window and page. The ceilings are the feed route's page
+# cap (session_kv_server.FEED_EVENTS_MAX_LIMIT) and the ledger's retention
+# (CLEANUP_TTL_DAYS); a larger ask is clamped. The route cuts the window
+# (`since`); one call is one page of it.
+ALERT_HISTORY_DEFAULT_HOURS = 24
+# The daemon runs in this container with the same environment (session_kv_server.CLEANUP_TTL_DAYS).
+ALERT_HISTORY_MAX_HOURS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14")) * 24
+ALERT_HISTORY_DEFAULT_LIMIT = 50
+ALERT_HISTORY_MAX_LIMIT = 500
+# The route's `since` form (session_kv_server.FEED_EVENTS_SINCE_FORMAT):
+# `intercepted_events.created_at` is SQLite's CURRENT_TIMESTAMP, UTC, no zone.
+ALERT_HISTORY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+# What a failed Session KV call is named in the ERROR line each tool returns.
+FINDINGS_SUBJECT = "the findings queue"
+ALERT_HISTORY_SUBJECT = "the alert ledger"
 
 # Initialize the MCP server
 mcp = MCPServer("GKE Platform Control Plane")
@@ -1172,17 +1189,22 @@ def _findings_request(method: str, path: str, body: dict | None = None) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _findings_call(method: str, path: str, body: dict | None = None) -> str:
-    try:
-        return json.dumps(_findings_request(method, path, body), indent=2)
-    except urllib.error.HTTPError as exc:
+def _loopback_error(exc: Exception, subject: str) -> str:
+    """The ERROR line a tool returns when its Session KV route failed."""
+    if isinstance(exc, urllib.error.HTTPError):
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("detail")
         except Exception:
             detail = None
-        return f"ERROR: the findings queue refused this ({exc.code}): {detail or exc.reason}"
+        return f"ERROR: {subject} refused this ({exc.code}): {detail or exc.reason}"
+    return f"ERROR: could not reach {subject}: {exc}"
+
+
+def _findings_call(method: str, path: str, body: dict | None = None) -> str:
+    try:
+        return json.dumps(_findings_request(method, path, body), indent=2)
     except Exception as exc:
-        return f"ERROR: could not reach the findings queue: {exc}"
+        return _loopback_error(exc, FINDINGS_SUBJECT)
 
 
 @mcp.tool()
@@ -1462,6 +1484,53 @@ def get_first_run_report(which: str = first_run_report.WHICH_RANKED) -> str:
         # a workload's name or a probe's message carried, as a pod's logs do.
         result["report"]["text"] = _neutralize_tokens(_strip_unsafe_chars(result["report"]["text"]))
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_alert_history(
+    since_hours: int = ALERT_HISTORY_DEFAULT_HOURS, limit: int = ALERT_HISTORY_DEFAULT_LIMIT
+) -> str:
+    """
+    What the alert path saw and did: the event ledger over a window, newest first.
+
+    One row per event a producer forwarded (a cluster event, a drift record, a
+    controller stall), whether or not it reached chat; `status` says what became
+    of it (the alert-history skill has the table), `session_id` is its thread,
+    `pull_request` its fix. A row is dated at its first sighting: an excluded
+    event that keeps recurring is one row an hour, dated at its first sighting
+    in that hour. The ledger keeps at most its retention (14 days by default);
+    a quiet follow-up is a card comment, not a row.
+
+    Args:
+        since_hours: Window back from now, in hours (default 24, at most 336).
+        limit: Most rows to return (default 50, at most 500). `truncated` true
+            means the window holds more rows than were returned.
+    """
+    try:
+        hours = max(1, min(int(since_hours), ALERT_HISTORY_MAX_HOURS))
+        page = max(1, min(int(limit), ALERT_HISTORY_MAX_LIMIT))
+    except (TypeError, ValueError) as exc:
+        return f"ERROR: since_hours and limit must be whole numbers: {exc}"
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(ALERT_HISTORY_TIME_FORMAT)
+    query = urllib.parse.urlencode({"since": window_start, "limit": page})
+    try:
+        feed = _findings_request("GET", f"/v1/intercepted-events?{query}")
+    except Exception as exc:
+        return _loopback_error(exc, ALERT_HISTORY_SUBJECT)
+    events = feed.get("events") or []
+    return json.dumps(
+        {
+            "since_hours": hours,
+            "window_start": window_start,
+            "returned": len(events),
+            # The route counted the window's rows, so this is its word.
+            "truncated": bool(feed.get("truncated")),
+            # Cluster-originated text: an event message carries what a probe or
+            # a controller wrote, as a pod's logs do.
+            "events": _sanitize_json_value(events),
+        },
+        indent=2,
+    )
 
 
 def start_session_kv_server() -> None:
