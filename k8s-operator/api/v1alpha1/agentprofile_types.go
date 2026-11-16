@@ -30,8 +30,8 @@ import (
 // of record, and AgentProfileSpec is its field table, field for field
 // (TestAgentProfileFieldsMatchTheSpecTable).
 //
-// Everything an AgentProfile renders is dark unless the PlatformAgent in its
-// namespace runs `spec.mode: next`.
+// Everything an AgentProfile renders is dark unless a PlatformAgent is bound
+// in its namespace.
 
 // DefaultAgentProfileQueueTimeoutSeconds is the spec's default for
 // AgentProfileSpec.QueueTimeoutSeconds.

@@ -471,6 +471,17 @@ side.
 
 Additive, optional, and safe to omit — consumers must default them.
 
+- `slack_overhead` — the Slack lane's overhead per night, newest first,
+  read with `--slack-lane-prefix` from the Slack lane
+  (`ci-kube-agents-eval-nightly-slack`) and merged by build over
+  `--merge-with`'s list, so a failed read keeps it; absent until the lane has
+  recorded one. Each entry is
+  `{build_id, date, delivery_lag_s, post_s, first_ack_p50_s, first_ack_p95_s}`
+  from the build's `artifacts/slack-lane/slack-overhead.json`
+  (`hack/slack-lane/overhead.py`), `date` the night it belongs to (`nightly.night_day` of its start), for
+  the newest `SLACK_OVERHEAD_NIGHTS` (14) builds; a file that records an error is
+  left out, and a value is `null` when the night recorded no sample of it.
+  `nightly.py` reads it into `nights[].slack` and `nights[].cases[].slack_e2e_s`.
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
   page labels itself `STALE`. Emitted only when the collector is invoked
   with `--stale-after-s` (the 15-minute refresh job passes its cadence plus
@@ -1078,7 +1089,7 @@ each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
 previous_build, parts[], missing_parts[], running_parts[],
-verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, cases[]}`. A
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, slack?, cases[]}`. A
 night is one nightly run, or the runs of one date of the parts `nightly.py`
 names in `PARTS` (main, main-b to main-e, writers, writers-b, writers-c):
 a run's date is the UTC date of its start plus 15 minutes
@@ -1127,7 +1138,7 @@ verdict for the night, though `newly_failing` still lists what the parts on
 record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
-infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape}` with `state` in `pass|partial|fail|infra`
+infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape, slack_e2e_s?}` with `state` in `pass|partial|fail|infra`
 by the strip's rule over the task's reps (no `reps` key: the task's result
 is one rep), `reason` the first failing rep's grader text (`null` on a
 pass), and `turn1_p50_s` / `agent_p50_s` the median of the task's reps'
@@ -1145,7 +1156,15 @@ bot_messages_p50, words_before_answer_p50, answer_words_p50}`: `n` the reps
 that carried one with both flags, each flag the number of them it was true on, and each
 count's nearest-rank median (`null` when no rep carried it); `null` when no
 rep carried a shape. The night's `shape` is the same over every such rep of
-the night's `cases[]`. Reported, never a verdict. `expected` counts the cases `nightly_active` on this checkout,
+the night's `cases[]`. Reported, never a verdict. When the Slack lane recorded
+its overhead on the night's date (data.json's `slack_overhead`), each case
+carries `slack_e2e_s`, its estimated end-to-end Slack time (`agent_p50_s` plus
+that night's delivery lag plus its `shape.bot_messages_p50` times a post's time,
+`slack_estimate.py`), and the night carries `slack`: `{e2e_p50_s, e2e_p95_s,
+e2e_p95_7n_s, first_ack_p50_s, first_ack_p95_s, delivery_lag_s, post_s,
+build_id}`, `e2e_p95_7n_s` the mean p95 of up to 7 dates that carry one, the
+night's own and the dates before it (a same-date re-run counted once). Absent
+without an overhead that night. Advisory. `expected` counts the cases `nightly_active` on this checkout,
 less any case a part of the night dropped on the inject lane
 (`runs[].lane_excluded`); `missing[]` names the expected cases the night did
 not record.

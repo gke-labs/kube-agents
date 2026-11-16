@@ -29,7 +29,7 @@ agents/
 
 Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile. The [skill catalog](/kube-agents/skills/) lists each persona's skills.
 
-The GKE Support Agent's skills live in `agents/tse/skills/` and reach a pod only when the optional `tse` profile is enabled. On a `mode: next` install, applying the sample [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml) makes the operator set `KUBE_AGENTS_ENABLED_PROFILES=tse` on the gateway Deployment, and the entrypoint scaffolds `$HERMES_HOME/profiles/tse` from the image's `/opt/tse-template` on the next start ([AgentProfile CRD](/kube-agents/operator/agentprofile-crd/)).
+The GKE Support Agent's skills live in `agents/tse/skills/` and reach a pod only when the optional `tse` profile is enabled. Applying the sample [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml) makes the operator set `KUBE_AGENTS_ENABLED_PROFILES=tse` on the gateway Deployment, and the entrypoint scaffolds `$HERMES_HOME/profiles/tse` from the image's `/opt/tse-template` on the next start ([AgentProfile CRD](/kube-agents/operator/agentprofile-crd/)).
 
 Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
 

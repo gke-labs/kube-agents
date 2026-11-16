@@ -311,6 +311,15 @@ class TestWriters(unittest.TestCase):
         self.assertIn("https://x/pull/7 was still broken", (self.tree / ar.RULES_FILE).read_text())
         self.assertEqual(self.vcs.committed[1], [ar.RULES_FILE])
 
+    def test_step_down_adds_automerge_to_a_bare_file(self):
+        # A fix merged under rules since cut back to `version: 1` still steps down.
+        (self.tree / ar.RULES_FILE).write_text("version: 1\n")
+        _git(self.tree, "add", "-A")
+        _git(self.tree, "commit", "-q", "-m", "bare rules")
+        pms._step_down_writer("no-pdb", "dev", "https://x/pull/7")(self.tree, self.vcs, REPO, "b")
+        rules = ar.load(self.tree)
+        self.assertEqual(rules.deny, (ar.Rule("no-pdb", ("dev",)),))
+
     def test_step_down_keeps_crlf(self):
         (self.tree / ar.RULES_FILE).write_bytes(RULES.replace("\n", "\r\n").encode())
         pms._step_down_writer("no-pdb", "dev", "u")(self.tree, self.vcs, REPO, "b")
@@ -340,6 +349,21 @@ class TestOpen(unittest.TestCase):
             url = pms._open(forge, REPO, "platform-agent/revert-7", "main", "t", "b", lambda *a: None)
         self.assertEqual(url, "P")
         self.assertEqual(calls, ["branch-view", "proposal-create"])
+
+    def test_draft_reaches_the_forge(self):
+        created = []
+
+        def forge(verb, payload):
+            if verb == "branch-view":
+                return {"branch": {"exists": True}}
+            created.append(payload)
+            return {"proposal": {"url": "P"}}
+
+        fake = types.ModuleType("vcs_client")
+        with unittest.mock.patch.dict("sys.modules", {"vcs_client": fake}):
+            pms._open(forge, REPO, "b", "main", "t", "b", lambda *a: None, draft=True)
+            pms._open(forge, REPO, "b", "main", "t", "b", lambda *a: None)
+        self.assertEqual([c["draft"] for c in created], [True, None])
 
 
 if __name__ == "__main__":
