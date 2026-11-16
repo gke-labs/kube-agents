@@ -346,7 +346,7 @@ class JobReadingTest(unittest.TestCase):
     def test_a_compensation_job_is_the_stage_when_nothing_else_failed(self):
         jobs = jobs_with(STAGING_26_JOBS, **{ROLLBACK_LEG: "success", WITHDRAWAL: "failure"})["jobs"]
         self.assertEqual(notifier.failing_job(jobs)["name"], WITHDRAWAL)
-        self.assertTrue(notifier.is_compensation({"name": "Next mode (non-gating) - Step 7 - Run E2E Tests"}))
+        self.assertTrue(notifier.is_compensation({"name": "Step 5 - Tear Down RC Environment"}))
         self.assertTrue(notifier.is_compensation({"name": "Step 7 - Tear Down Nightly Environment"}))
         self.assertFalse(notifier.is_compensation({"name": EVAL_STAGE}))
 
