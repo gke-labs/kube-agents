@@ -368,7 +368,8 @@ leave open:
   found equal to the grant's at admission (added 11/11, #4685). A task that names no cluster gets
   no `proxyToken`, except an `unattended` task a trigger started: it gets a report credential, a
   `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
-  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619).
+  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
+  only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
   Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
   trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
   binds a trigger at. Both name the task, its profile and

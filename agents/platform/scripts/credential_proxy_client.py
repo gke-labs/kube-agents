@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -513,7 +514,8 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec, re-read on every call, so a
+# the task's end. Sent in this header on every exec (a report credential only
+# on the audit-report routes), re-read on every call, so a
 # warm pod's next task presents its own. The broker confines the call to the
 # cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
@@ -550,8 +552,43 @@ def task_mode() -> bool:
     return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
 
 
-def task_credential_headers() -> dict[str, str]:
-    """The task credential header, or nothing when there is no task.
+# The broker routes a report credential (one naming no target cluster:
+# task_credential.REPORT_TIER) is admitted on, and refused on every other,
+# /v1/exec included (credential_proxy.REPORT_CREDENTIAL_ROUTES).
+AUDIT_REPORTS_ROUTE = "/v1/audit-reports"
+
+
+def _is_report_credential(token: str) -> bool:
+    """Whether a task credential names no target cluster, read unverified.
+
+    This only decides whether to send it; the broker verifies whatever is
+    sent. A token whose claims can't be read is not called a report
+    credential, so it is sent as before and the broker refuses it loudly.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    return isinstance(nats, dict) and "target" not in nats
+
+
+def _audit_reports_path(path: str) -> bool:
+    path = urllib.parse.urlsplit(path).path
+    return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
+
+
+def task_credential_headers(path: str) -> dict[str, str]:
+    """The task credential header for a broker request to `path`, or nothing.
+
+    A report credential is sent only on the audit-report routes, the only
+    ones the broker admits it on: on any other call the task goes without
+    it and keeps the local-only commands a task with no credential gets.
+    A credential that names a target is sent on every call.
 
     Read per call. A missing file is no task, not an error: the adapter
     removes it when the task ends, and the broker then runs local-only
@@ -573,6 +610,8 @@ def task_credential_headers() -> dict[str, str]:
         return {}
     if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
         raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    if _is_report_credential(token) and not _audit_reports_path(path):
+        return {}
     return {TASK_CREDENTIAL_HEADER: token}
 
 
@@ -1949,7 +1988,7 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
-        headers.update(task_credential_headers())
+        headers.update(task_credential_headers(EXEC_ROUTE))
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
