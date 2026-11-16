@@ -38,6 +38,12 @@ import (
 const (
 	usageEnvtestNamespace = "usage-env"
 	usageEnvtestImage     = "example.com/kube-agents/test:0"
+	// usageEnvtestSettleStep is how many minutes the poller's clock moves
+	// between the probes that wait for the API server to serve the full CRD:
+	// one past usageStatusReprobeInterval, so every per-field pruning record,
+	// which the poller reads through its own clock, has expired by the next
+	// probe, as it has for a real poller once the interval has passed.
+	usageEnvtestSettleStep = int(usageStatusReprobeInterval/time.Minute) + 1
 )
 
 // usageEnvtestHarness is the poller against a real API server: the merge
@@ -242,8 +248,9 @@ func TestUsagePollerOnAServedCRDEnvtest(t *testing.T) {
 // TestUsagePollerUnderACRDWithoutUsageEnvtest: under a served CRD without
 // status.usage the poller writes the status once per
 // usageStatusReprobeInterval, shares the pruning record with the Ready writer,
-// and keeps the ConfigMap current throughout; when the CRD is applied the next
-// probe lands everything accumulated since.
+// and keeps the ConfigMap current throughout; a probe under the pruning CRD
+// re-stamps the records; and when the CRD is applied the next probe lands
+// everything accumulated since.
 func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 	pruned, full := platformAgentCRDWithoutUsage(t)
 	crdDir := t.TempDir()
@@ -287,6 +294,30 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 		t.Fatalf("the ConfigMap fell behind under the pruning CRD: %v", doc.Totals)
 	}
 
+	// A probe while the served CRD still prunes status.usage: the patch goes
+	// out, the echo comes back without the counters, and both records are
+	// re-stamped, the shared one at the wall clock and the inference totals'
+	// at the poller's minute. The retries below used to take this step only
+	// when the server was slow to serve the new schema; taken here, every
+	// run exercises what follows it.
+	h.r.prunedUsageStatus.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
+	minute := 20
+	h.poll(minute)
+	if h.patches != 2 {
+		t.Fatalf("the probe under the expired record patched %d times in total, want 2", h.patches)
+	}
+	if status := h.status(); status.ToolExecutionsTotal != 0 || status.InputTokensTotal != 0 {
+		t.Fatalf("the status carried the totals under the pruning CRD: %+v", status)
+	}
+	if !h.r.usageStatusPruned(h.agent) {
+		t.Fatal("the probe's echo under the pruning CRD did not refresh the record")
+	}
+	// Read through the poller's clock, still at this probe's minute: the
+	// record the retries below have to outrun.
+	if !h.p.newerFieldPruned(h.agent, usageNewerFieldInference) {
+		t.Fatal("the probe's echo under the pruning CRD did not re-stamp the inference totals' record")
+	}
+
 	// Apply this release's CRD, expire the record, and the next poll lands
 	// the totals accumulated since the operator was upgraded.
 	live := &unstructured.Unstructured{}
@@ -301,8 +332,14 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 	}
 	deadline := time.Now().Add(crdSettleTimeout)
 	for {
+		// The shared record is read against the wall clock and expired here
+		// by hand; the per-field records are read through the poller's
+		// clock, so each probe moves it past the interval. Held still, a
+		// probe that ran under the old schema would leave the inference
+		// totals' record fresh, and the next probe would skip those totals.
 		h.r.prunedUsageStatus.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
-		h.poll(20)
+		minute += usageEnvtestSettleStep
+		h.poll(minute)
 		if status := h.status(); status.ToolExecutionsTotal == 20 {
 			if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(h.at(15)) {
 				t.Fatalf("lastActiveTime after the CRD landed = %v, want the last move %v", status.LastActiveTime, h.at(15))

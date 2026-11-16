@@ -241,25 +241,26 @@ The Helm chart on its own is the one path that never installs cert-manager: a ch
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true
+  --set crds.enabled=true
 ```
+
+`crds.enabled` is the key in chart 1.15 and later. If you pin a chart below 1.15, set `installCRDs=true` instead: those charts ignore `crds.enabled` and install no CRDs.
 
 ### GKE Autopilot install
 
-Autopilot blocks leader-election Leases in `kube-system`. Disable leader election during install:
+Autopilot blocks leader-election Leases in `kube-system`. Move them to the `cert-manager` namespace during install:
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true \
-  --set controller.leaderElection.enabled=false \
-  --set cainjector.leaderElection.enabled=false
+  --set crds.enabled=true \
+  --set global.leaderElection.namespace=cert-manager
 ```
 
 ### Manifest fallback
@@ -270,7 +271,7 @@ If Helm isn't available:
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml
 ```
 
-On Autopilot you'll additionally need to patch the deployments to append `--leader-elect=false`. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
+The manifest cannot move the leader-election Leases: it writes them to `kube-system` and has no RBAC for another namespace. On Autopilot, patch the controller and cainjector deployments to append `--leader-elect=false` instead. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.
 
 ## Chat platform
 
