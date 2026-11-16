@@ -38,6 +38,7 @@ import board_health_card
 import board_snapshot
 import chat_notify
 import clean_merges
+import dial_state
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -10925,6 +10926,10 @@ def _board_action_one(kanban_db, conn: sqlite3.Connection, action: str, task_id:
 def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """Retry or Drop the stuck cards one row of the board-health card names; see the section comment.
 
+    An ``action`` of ``dial.level``, ``dial.request`` or ``dial.stop`` is the
+    autonomy dial's instead (``dial_state.handle``), answered ``{action, ok,
+    message}``.
+
     Body: ``action`` (``retry`` or ``drop``), ``tasks`` (the row's card ids)
     and ``by`` (who pressed, logged). Answers each card's ``outcome``:
     ``done``, ``moved`` (no longer blocked: someone or something got there
@@ -10933,6 +10938,10 @@ def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
     card ``gone``.
     """
     action = str(request_data.get("action") or "").strip().lower()
+    if action in dial_state.ACTIONS:
+        # The autonomy dial's taps (dial_state.handle): the switch, the admin
+        # check, the record, the broker and the sandbox are all its own.
+        return dial_state.handle(action, request_data)
     tasks = request_data.get("tasks")
     by = str(request_data.get("by") or "").strip()[:BOARD_ACTION_BY_MAX_CHARS]
     if action not in BOARD_ACTIONS:

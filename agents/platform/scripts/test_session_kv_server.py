@@ -12215,6 +12215,21 @@ class TestBoardAction(unittest.TestCase):
     def act(self, action, tasks, by="Jayanti"):
         return self.client.post("/v1/board/actions", json={"action": action, "tasks": tasks, "by": by})
 
+    def test_a_dial_action_is_the_dials_and_touches_no_card(self):
+        seen = []
+
+        def handle(action, payload):
+            seen.append((action, payload.get("user"), payload.get("level")))
+            return {"action": action, "ok": True, "message": "Set to Explain."}
+
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server.dial_state, "handle", handle):
+            response = self.client.post("/v1/board/actions", json={"action": "dial.level", "user": "U0ADMIN01", "level": "explain"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"action": "dial.level", "ok": True, "message": "Set to Explain."})
+        self.assertEqual(seen, [("dial.level", "U0ADMIN01", "explain")])
+        self.assertEqual((self.calls, self.status("t_a")), ([], "blocked"))
+
     def test_retry_unblocks_a_blocked_card(self):
         self.card("t_a", "blocked", "Investigate payments-api")
         response = self.act("retry", ["t_a"])

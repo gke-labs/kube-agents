@@ -28,6 +28,7 @@ unreadable findings table must not draw as a healthy fleet.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -38,6 +39,8 @@ from typing import Any
 
 import findings_nudge
 import findings_queue
+
+logger = logging.getLogger(__name__)
 
 HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
 PROFILES_DIR = Path(HERMES_HOME) / "profiles"
@@ -275,6 +278,7 @@ def snapshot(
     now: datetime,
     profiles_dir: Path | None = None,
     audit: Callable[[], dict | None] | None = None,
+    dial: Callable[[sqlite3.Connection], dict] | None = None,
 ) -> dict:
     """The whole board. ``kanban`` is None before the board's first card, which is an empty board."""
     try:
@@ -311,7 +315,19 @@ def snapshot(
     last = audit()
     if last is not None:
         board["audit"] = last
+    board["dial"] = (dial or default_dial)(session_db)
     return board
+
+
+def default_dial(session_db: sqlite3.Connection) -> dict:
+    """The autonomy dial's section (`dial_state.snapshot_section`); off rather than no board."""
+    try:
+        import dial_state
+
+        return dial_state.snapshot_section(session_db)
+    except Exception:  # noqa: BLE001 — no dial panel rather than no board
+        logger.exception("board: the dial section could not be built")
+        return {"enabled": False}
 
 
 def default_audit() -> dict | None:
