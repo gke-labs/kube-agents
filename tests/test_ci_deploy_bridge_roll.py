@@ -28,7 +28,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 
 _START = "BRIDGE_ROLL_START=$SECONDS"
-_END_MARKER = "so there is no second roll to wait for"
+_END_MARKER = "carrying on without the second-roll wait"
 
 
 def _block() -> str:
@@ -45,7 +45,9 @@ _STUB = r"""#!/bin/bash
 echo "$*" >> "$STATE/calls"
 case "$*" in
   "get deployment/platform-agent-a2a-callout"*)
-    [ -f "$STATE/callout" ] && exit 0 || exit 1 ;;
+    if [ -f "$STATE/callout" ]; then echo deployment.apps/platform-agent-a2a-callout; exit 0; fi
+    if [ -f "$STATE/callout_flaky" ]; then echo "Unable to connect to the server: dial tcp: i/o timeout" >&2; exit 1; fi
+    echo 'Error from server (NotFound): deployments.apps "platform-agent-a2a-callout" not found' >&2; exit 1 ;;
   "get deployment/platform-agent-gateway"*jsonpath*)
     n=$(cat "$STATE/polls")
     if [ "$n" -gt 0 ]; then
@@ -61,7 +63,7 @@ esac
 
 
 class BridgeRollWaitTest(unittest.TestCase):
-    def _run(self, *, callout: bool, polls: int, rollout_rc: int = 0):
+    def _run(self, *, callout: bool, polls: int, rollout_rc: int = 0, callout_flaky: bool = False):
         with tempfile.TemporaryDirectory() as d:
             state = pathlib.Path(d)
             stub_dir = state / "bin"
@@ -71,18 +73,21 @@ class BridgeRollWaitTest(unittest.TestCase):
             kubectl.chmod(0o755)
             if callout:
                 (state / "callout").write_text("")
+            if callout_flaky:
+                (state / "callout_flaky").write_text("")
             (state / "polls").write_text(str(polls))
             (state / "rollout_rc").write_text(str(rollout_rc))
             (state / "calls").write_text("")
             script = "\n".join(
                 [
-                    "set -u",
+                    "set -euo pipefail",
                     'NAMESPACE="kubeagents-system"',
                     'PLATFORM_AGENT_CR_NAME="platform-agent"',
                     'AGENT_DEPLOYMENT_NAME="platform-agent-gateway"',
                     'BRIDGE_SIDECAR_NAME="hermes-bridge"',
                     "MODE_NEXT_GENERATION_ATTEMPTS=5",
                     "MODE_NEXT_POLL_SECONDS=0",
+                    'MODE_NEXT_ROLLOUT_TIMEOUT="600s"',
                     _block(),
                     "echo DONE",
                 ]
@@ -110,15 +115,23 @@ class BridgeRollWaitTest(unittest.TestCase):
     def test_skips_the_wait_without_an_a2a_stack(self):
         proc, calls = self._run(callout=False, polls=0)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("so there is no second roll to wait for", proc.stdout)
+        self.assertIn("renders no A2A stack", proc.stdout)
         self.assertFalse([c for c in calls if "jsonpath" in c], calls)
         self.assertFalse([c for c in calls if c.startswith("rollout status")], calls)
 
     def test_a_bridge_that_never_arrives_does_not_fail_the_deploy(self):
         proc, calls = self._run(callout=True, polls=99)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("so there is no second roll to wait for", proc.stdout)
+        self.assertIn("WARNING: the A2A stack is rendered", proc.stdout)
         self.assertEqual(len([c for c in calls if "jsonpath" in c]), 5, calls)
+
+    def test_a_callout_read_that_fails_transiently_still_waits(self):
+        # Only a NotFound means no A2A stack; skipping on a flaky read would
+        # bring back the restart the wait is for.
+        proc, calls = self._run(callout=False, callout_flaky=True, polls=1)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("rolled out with the hermes-bridge sidecar", proc.stdout)
+        self.assertEqual(sum(c.startswith("rollout status") for c in calls), 1, calls)
 
     def test_a_failed_second_rollout_stops_the_deploy(self):
         proc, _ = self._run(callout=True, polls=0, rollout_rc=1)
