@@ -68,6 +68,20 @@ const (
 	// a2aClusterIntruderWait is how long a server with a foreign certificate
 	// is given to try the routes before the test reads who it peers with.
 	a2aClusterIntruderWait = 3 * time.Second
+	// a2aTestServerReadyWait bounds how long an embedded server may take to
+	// open its client and route listeners in start.
+	a2aTestServerReadyWait = 10 * time.Second
+	// a2aClusterSeedPortRetries is how many times server 0 retries with a
+	// fresh loopback port if another process claims its reserved seed port
+	// before StartRouting binds it.
+	a2aClusterSeedPortRetries = 5
+	// a2aClusterConnectRetries is how many times an embedded server retries an
+	// implicit gossip route dial before giving up.
+	a2aClusterConnectRetries = 30
+	// a2aLoopbackNetwork and a2aLoopbackAnyPort are the network and address
+	// a2aFreePort binds to reserve an ephemeral loopback port.
+	a2aLoopbackNetwork = "tcp"
+	a2aLoopbackAnyPort = "127.0.0.1:0"
 )
 
 // a2aTestAgentWithBusReplicas is a2aTestAgent with spec.harness.tuning.busReplicas set.
@@ -538,10 +552,10 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		t.Fatalf("the cluster block does not route to %s", routeHost)
 	}
 
-	ports := a2aFreePorts(t, 4)
+	ports := []int{a2aFreePort(t), -1, -1, -1}
 	// tlsDir, when set, is a serving pair from another CA: a server that can
 	// reach 6222 but does not hold the bus's serving key.
-	start := func(i int, tlsDir string) *natsserver.Server {
+	startOnce := func(i int, tlsDir string) *natsserver.Server {
 		t.Helper()
 		c := strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-"+strconv.Itoa(i), 1)
 		c = strings.Replace(c, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, 1)
@@ -560,8 +574,9 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("server %d: the rendered nats.conf does not parse: %v", i, err)
 		}
-		opts.Port, opts.HTTPPort, opts.Websocket.Port = -1, -1, -1
+		opts.Port, opts.HTTPPort, opts.Websocket.Port = -1, 0, 0
 		opts.Host, opts.Cluster.Host = "127.0.0.1", "127.0.0.1"
+		opts.Cluster.ConnectRetries = a2aClusterConnectRetries
 		opts.StoreDir = t.TempDir()
 		opts.NoLog, opts.NoSigs = true, true
 		s, err := natsserver.NewServer(opts)
@@ -569,8 +584,27 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 			t.Fatalf("server %d: %v", i, err)
 		}
 		go s.Start()
+		if !s.ReadyForConnections(a2aTestServerReadyWait) || s.ClusterAddr() == nil {
+			s.Shutdown()
+			s.WaitForShutdown()
+			return nil
+		}
 		t.Cleanup(func() { s.Shutdown(); s.WaitForShutdown() })
 		return s
+	}
+	start := func(i int, tlsDir string) *natsserver.Server {
+		t.Helper()
+		for range a2aClusterSeedPortRetries {
+			if s := startOnce(i, tlsDir); s != nil {
+				return s
+			}
+			if i != 0 {
+				break
+			}
+			ports[0] = a2aFreePort(t)
+		}
+		t.Fatalf("server %d did not become ready with a route listener within %s", i, a2aTestServerReadyWait)
+		return nil
 	}
 
 	servers := []*natsserver.Server{start(0, ""), start(1, ""), start(2, "")}
@@ -711,24 +745,17 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	}
 }
 
-// a2aFreePorts reserves n distinct loopback ports and releases them for the
-// caller to bind.
-func a2aFreePorts(t *testing.T, n int) []int {
+// a2aFreePort reserves a loopback port and releases it for the seed server's
+// route listener to bind.
+func a2aFreePort(t *testing.T) int {
 	t.Helper()
-	var ports []int
-	var ls []net.Listener
-	for range n {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		ls = append(ls, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+	l, err := net.Listen(a2aLoopbackNetwork, a2aLoopbackAnyPort)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, l := range ls {
-		_ = l.Close()
-	}
-	return ports
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
 }
 
 // a2aServerAuthOnlyCert issues the serving certificate as the bus issued it
