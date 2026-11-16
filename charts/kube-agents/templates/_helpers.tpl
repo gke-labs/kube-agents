@@ -3774,6 +3774,10 @@ true
   {{- fail "quota preflight: footprint.yaml has no operatorRenderedPerReplica.sessionPod entry, so the session pods cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
 {{- end -}}
 {{- $tuning := ((.Values.platformAgent | default dict).harness | default dict).tuning | default dict -}}
+{{- /* The installer summary in NOTES.txt and the preflight can render before the CR
+       template, so a malformed override must fail here naming its key, not in the
+       quantity parsers below with "please report it". */ -}}
+{{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") -}}
 {{- $count := $pod.maxSessionsDefault | int64 -}}
 {{- if and (hasKey $tuning "maxSessions") (not (kindIs "invalid" $tuning.maxSessions)) -}}
   {{- $count = $tuning.maxSessions | int64 -}}

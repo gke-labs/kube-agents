@@ -582,6 +582,13 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(both["sessionRequestsMemory"], 2 * 1024**3)
         self.assertEqual(both["sessionLimitsMemory"], 2 * 1024**3)
 
+    def test_a_malformed_session_quantity_fails_naming_its_key(self) -> None:
+        res = self._render({"probe": {"emitRequirements": True}, "platformAgent": {"harness": {"tuning": {
+            "sessionResources": {"requests": {"cpu": "1e.5"}}}}}})
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("platformAgent.harness.tuning.sessionResources.requests.cpu", res.stderr)
+        self.assertNotIn("please report it", res.stderr)
+
     def test_a_zero_or_negative_key_keeps_its_default(self) -> None:
         base = self._requirements(["platformAgent.harness.tuning.maxSessions=2"])
         req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
