@@ -57,7 +57,8 @@ that repository and never reads the note, and a file's content does not flap,
 so the lease-time read alone excuses the cases on the role. A
 published document that cannot be read excuses nothing else. ``drifted`` is the
 only lease-time verdict that can excuse; ``unchecked`` (the read failed), ``unpublished`` (the
-runner wrote no kubeconfig for it) and ``no_state`` say nothing about the
+runner wrote no kubeconfig for it), ``not_ready`` (the fixture is in shape and its audit's age
+gate has not passed; a case on it waits in ``FIXTURE_NOT_READY``) and ``no_state`` say nothing about the
 fixture, and the case is graded as usual. A report that is missing, will
 not parse, or is of another schema version is the same: every case is graded
 as usual and the run says why. A task file that will not read leaves that
