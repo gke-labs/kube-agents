@@ -161,8 +161,9 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
-// version is the release the binary was built for, set by
-// scripts/release/build_release_binaries.sh with -ldflags "-X main.version=X.Y.Z".
+// version is what the binary was built for: the release (X.Y.Z) for a release archive,
+// stamped by scripts/release/build_release_binaries.sh, or the commit SHA for the
+// kube-proxy image, stamped by deploy/kube-proxy/Dockerfile. Both use -ldflags "-X main.version=...".
 var version = devVersion
 
 // versionString is what --version prints and the startup log names.
@@ -172,7 +173,7 @@ func versionString() string {
 
 func main() {
 	var (
-		showVersion              = flag.Bool("version", false, "Print the release this binary was built for and exit")
+		showVersion              = flag.Bool("version", false, "Print the release or commit this binary was built for and exit")
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
 		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")

@@ -197,6 +197,9 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/kube-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/kube-proxy:${{ github.sha }}
+          # The SHA it is tagged with, for `k8s-api-proxy --version` and the startup log.
+          build-args: |
+            KUBE_AGENTS_VERSION=${{ github.sha }}
 
       - name: Build and Push Agent Sandbox (GHCR)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
