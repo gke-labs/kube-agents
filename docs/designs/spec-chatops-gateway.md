@@ -3028,8 +3028,9 @@ every message through either stamps its own backend.
   when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
   a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response,
   or one queued behind the first for the conversation's turn) is answered with the `Task` and
-  publishes nothing, whatever terminal it has reached since: `canceled`, or `completed` or `failed`
-  if the turn finished before the cancel took. A task that ended with no cancel published refuses
+  publishes nothing, whatever terminal it has reached since. That terminal reads `canceled` even
+  when the executor finished the turn before the cancel took, since nothing a canceled task writes
+  afterwards reaches the room or the door ("Stop"). A task that ended with no cancel published refuses
   one with `TaskNotCancelableError` (-32002). A queued cancel checks, while it waits and in the same
   critical section as any claim, whether a cancel is on the bus or the task has ended. It answers as
   soon as either is true, without taking a turn (#5777).
