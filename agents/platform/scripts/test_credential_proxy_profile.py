@@ -1410,10 +1410,11 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self):
+    def test_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone(self):
         # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
-        # its handler (#3658); every other route stays closed to the role.
-        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX}
+        # its handler (#3658), and the audit-report routes to the report rules
+        # (#5619); every other route stays closed to the role.
+        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX, credential_proxy.AUDIT_REPORTS_PREFIX}
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
                 self.assertEqual(prefix in reached, credential_proxy.CALLER_ROLE_PROFILE in roles)
@@ -1701,8 +1702,9 @@ class ReportCredentialTest(unittest.TestCase):
                 self.assert_report_refused(*self.request(method, path))
 
     def test_a_listed_route_passes_the_gate(self):
-        # No handler serves these yet (#5619 PR 3): past the gate, GET is the
-        # broker's unknown-route answer, not the allowlist's refusal.
+        # Past the gate, the store routes decide (test_audit_report_routes):
+        # here the profile is on no report allowlist, so the answer is theirs,
+        # not the allowlist's refusal.
         for method, path in REPORT_ROUTES:
             if method != "GET":
                 continue

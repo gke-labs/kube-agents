@@ -2533,6 +2533,12 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     return None
 
 
+# The audit-report store's routes (#5619): the stream list is this path
+# exactly, and every stream is below it. Here rather than beside the store's
+# other names because ROUTE_ROLES spells it.
+AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
+
+
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
 # "/v1/chat" and inherit its rule.
@@ -2559,8 +2565,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and the MCP relay's profile set: the
-    # Cloud API relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route, the MCP relay's profile set and the
+    # audit-report store: the Cloud API relay, the watcher and Pub/Sub routes
+    # all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -2578,6 +2585,14 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # that wires them, not by default. Profile workers are, for a task in hand
     # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
     (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
+    # The audit-report store (#5619), relayed to its listener on the gateway
+    # pod. The shell writes today's file store directly, so it reads every
+    # stream and writes the install's own repository keys; a profile worker
+    # reads with an allowlisted profile and writes only the stream its
+    # schedule's trigger binds (report_read_permitted, report_write_permitted).
+    # No trailing slash: the stream list is the prefix itself, and the handler
+    # answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match whole.
+    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -2705,9 +2720,8 @@ def required_roles(path: str) -> tuple[str, ...]:
     return ()
 
 
-# The audit-report store (#5619, docs/designs/scheduling-on-profiles.md §1).
-AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
-# One path segment each. An audit id is a DNS-1123 label. A store key is the
+# The audit-report store's routes (#5619, docs/designs/scheduling-on-profiles.md
+# §1): AUDIT_REPORTS_PREFIX, defined above ROUTE_ROLES. One path segment each. An audit id is a DNS-1123 label. A store key is the
 # file store's repository directory as one URL segment (`owner%2Fname`, a
 # non-GitHub path escaped again); `_report_store_key_is_plain` refuses one that
 # decodes to an empty, `.` or `..` part or a control character, in any escaping.
@@ -2769,6 +2783,307 @@ def report_credential_permits(method: str, path: str) -> bool:
     return len(segments) < 5 or _report_store_key_is_plain(segments[4])
 
 
+# -- Who may read and write the store (#5619) --------------------------------
+#
+# docs/designs/scheduling-on-profiles.md §1 item 4. Two roles reach these
+# routes (ROUTE_ROLES), and each is decided here, default deny: a role this
+# does not name, a claim it cannot read, or a stand-in of the wrong type is
+# refused, never defaulted.
+#
+# Where the role comes from: ServiceAccountAuthenticator.authenticate reads it
+# off the one audience the TokenReview validated (``audience_roles``, built by
+# build_authenticator: the shell audience confers CALLER_ROLE_SHELL, the
+# profile audience CALLER_ROLE_PROFILE). A profile worker's ServiceAccount is
+# a key of ``profile_identities``, and a caller named there may present only
+# the profile audience ("a profile caller may present only the profile
+# audience"), so no profile worker holds the shell role; and nothing a caller
+# sends, its task credential included, moves the role once it is read. A
+# principal with no role (NullAuthenticator behind a Unix socket, or a broker
+# with no audience split) is refused here: it is no identity this can name.
+
+# The operator renders it under next, reserved against spec.deployment.env
+# (audit_report_store.go): the AgentProfiles whose tasks may use the store,
+# comma-separated. Empty or unset: no profile task reads or writes.
+REPORT_PROFILES_ENV = "CREDENTIAL_PROXY_REPORT_PROFILES"
+# Where the store listener is, and the projected token the broker presents to
+# it (audit_report_store.go, auditReportStoreBrokerEnv). Both rendered under
+# next only and reserved in every mode; either unset means no store.
+AUDIT_REPORT_STORE_URL_ENV = "AUDIT_REPORT_STORE_URL"
+AUDIT_REPORT_STORE_TOKEN_FILE_ENV = "AUDIT_REPORT_STORE_TOKEN_FILE"  # noqa: S105 - an env name
+# One envelope, the listener's cap (audit_report_store.REPORT_MAX_BYTES): a
+# larger body is answered 413 here and never relayed. A listener answer larger
+# than this is a fault (502), since nothing the listener serves is.
+AUDIT_REPORT_MAX_BYTES = 1 << 20
+AUDIT_REPORT_STORE_TIMEOUT_SECONDS = 10.0
+
+# The file store's names, mirrored from audit_report.py (fleet-audit skill),
+# which this image does not import: a test holds them equal.
+# audit_report.STORE_PATH_SEPARATOR, NO_FORGE_REPO, REPORT_REPO_SEGMENT_RE.
+REPORT_STORE_PATH_SEPARATOR = "%2F"
+REPORT_NO_FORGE_REPO = "no_forge/local"
+REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
+# task_credential.TRIGGER_ORIGINS and TRIGGER_SCHEDULE_SOURCE, mirrored so the
+# decision imports nothing that needs `cryptography`.
+REPORT_TRIGGER_ORIGIN = "builtin"
+REPORT_TRIGGER_SCHEDULE_SOURCE = "schedule"
+
+# Each refusal's rule, one per condition, so a 403 says which one failed.
+RULE_REPORT_ROLE = "audit-report.role"
+RULE_REPORT_NO_TASK = "audit-report.no-task-credential"
+RULE_REPORT_PROFILE = "audit-report.profile"
+RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
+RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
+RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
+RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+
+
+def report_store_key(repo: str) -> str | None:
+    """The store key, as one raw URL segment, for a repository name; None if it is none.
+
+    audit_report.reports_dir_for's directory below the stream, spelled the way
+    the listener reads it back (audit_report_store.store_dirs_for_key):
+    lower-cased, a GitHub name with its host keeps the bare `owner/name`, and
+    another forge's `host/a/b` is `host` then `a%2Fb`; the whole is then escaped
+    as one segment, so `acme%2Fgitops` and `gitlab.com%2Fa%252Fb`.
+    """
+    if not isinstance(repo, str):
+        return None
+    segments = repo.lower().split("/")
+    if len(segments) == 3 and segments[0] == "github.com":
+        segments = segments[1:]
+    if len(segments) > 2 and "." not in segments[0]:
+        return None
+    if len(segments) < 2 or not all(
+        REPORT_REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in segments
+    ):
+        return None
+    if len(segments) > 2:
+        segments = [segments[0], REPORT_STORE_PATH_SEPARATOR.join(segments[1:])]
+    return urllib.parse.quote("/".join(segments), safe="")
+
+
+# `no_forge%2Flocal`: an install that registers no GitOps repository keeps its
+# runs here (audit_report.NO_FORGE_REPO).
+REPORT_NO_FORGE_STORE_KEY = report_store_key(REPORT_NO_FORGE_REPO)
+
+
+def _report_profile_permitted(profile: Any, allowlist: frozenset[str]) -> bool:
+    return isinstance(profile, str) and bool(profile) and profile in allowlist
+
+
+def report_read_permitted(role: Any, profile: Any, allowlist: frozenset[str]) -> str | None:
+    """The rule a read of the store breaks, or None when the caller may read.
+
+    The shell reads every stream: it reads today's file store directly. A
+    profile caller reads with a task credential whose profile is in
+    ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's, None
+    when the caller presented none. Every other role is refused.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return None
+    if role != CALLER_ROLE_PROFILE:
+        return RULE_REPORT_ROLE
+    if profile is None:
+        return RULE_REPORT_NO_TASK
+    if not _report_profile_permitted(profile, allowlist):
+        return RULE_REPORT_PROFILE
+    return None
+
+
+def report_write_permitted(
+    role: Any,
+    profile: Any,
+    trigger: Any,
+    audit_id: Any,
+    key: Any,
+    gitops_key: str | None,
+    allowlist: frozenset[str],
+) -> str | None:
+    """The rule a write to the store breaks, or None when the caller may write.
+
+    A write is a ring entry, latest, or dropping latest. ``key`` is the
+    request's raw store-key segment, compared whole with the install's own:
+    ``gitops_key`` (report_store_key of the gitops_repo), or, when the install
+    names no GitOps repository (``gitops_key`` None), REPORT_NO_FORGE_STORE_KEY.
+
+    - The shell may write any stream, to the install's key alone: exactly what
+      it writes to the file store today.
+    - A profile caller needs all of: a task credential whose profile is in
+      ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
+      whose stream is ``audit_id`` (so only that schedule's grant writes that
+      audit's baseline); and the install's key.
+    - Every other role is refused.
+    """
+    if role == CALLER_ROLE_SHELL:
+        pass
+    elif role != CALLER_ROLE_PROFILE:
+        return RULE_REPORT_ROLE
+    else:
+        if profile is None:
+            return RULE_REPORT_NO_TASK
+        if not _report_profile_permitted(profile, allowlist):
+            return RULE_REPORT_PROFILE
+        if trigger is None:
+            return RULE_REPORT_NO_TRIGGER
+        if getattr(trigger, "origin", None) != REPORT_TRIGGER_ORIGIN:
+            return RULE_REPORT_TRIGGER_ORIGIN
+        stream = getattr(trigger, "stream", None)
+        if (
+            not isinstance(stream, str)
+            or not stream
+            or stream != audit_id
+            or getattr(trigger, "name", None) != f"{REPORT_TRIGGER_SCHEDULE_SOURCE}/{stream}"
+        ):
+            return RULE_REPORT_TRIGGER_STREAM
+    writable = gitops_key if gitops_key is not None else REPORT_NO_FORGE_STORE_KEY
+    if not isinstance(key, str) or not isinstance(writable, str) or not writable or key != writable:
+        return RULE_REPORT_REPOSITORY_KEY
+    return None
+
+
+class ReportStoreUnavailable(Exception):
+    """The store, or what a write is checked against, cannot be used now: a 503."""
+
+
+class ReportStoreFault(Exception):
+    """The listener failed or answered something the broker will not pass on: a 502."""
+
+
+def report_gitops_store_key() -> str | None:
+    """The install's own store key: the gitops_repo's, or None when it names none.
+
+    Read on every call from the gitops-state ConfigMap the broker mounts at
+    /etc/gitops (GITOPS_STATE_PATH names its managed_repos file), through
+    gitops_workspace, so a repository change takes effect with the mount.
+    Raises ReportStoreUnavailable when the key cannot be read, or names a
+    repository this install does not manage: a write is then refused, rather
+    than checked against a guess.
+    """
+    import gitops_workspace
+
+    try:
+        text = gitops_workspace.gitops_repo_key_text()
+    except Exception as exc:  # noqa: BLE001 - every failure is the one answer
+        raise ReportStoreUnavailable(f"the gitops_repo key could not be read ({type(exc).__name__})") from None
+    if not text:
+        return None
+    repo = gitops_workspace.get_gitops_repo()
+    key = report_store_key(repo) if repo else None
+    if key is None:
+        raise ReportStoreUnavailable("the gitops_repo key names no repository this install manages")
+    return key
+
+
+def report_profiles_from_env() -> frozenset[str]:
+    """REPORT_PROFILES_ENV's profiles; a name that is not a DNS-1123 label is dropped."""
+    names = set()
+    for raw in os.environ.get(REPORT_PROFILES_ENV, "").split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        if not re.fullmatch(_REPORT_AUDIT_ID, name) or len(name) > 63:
+            LOGGER.warning("ignoring a report profile that is not a DNS-1123 label env=%s", REPORT_PROFILES_ENV)
+            continue
+        names.add(name)
+    return frozenset(names)
+
+
+@dataclass(frozen=True)
+class ReportStoreRelay:
+    """The broker's client for the audit-report store listener (audit_report_store.py).
+
+    It presents the broker's projected token, read from ``token_file`` on every
+    call and never kept, so kubelet's rotation reaches the next request. The
+    token and the bodies are never logged.
+    """
+
+    scheme: str
+    host: str
+    port: int
+    token_file: str
+    timeout: float = AUDIT_REPORT_STORE_TIMEOUT_SECONDS
+
+    @classmethod
+    def from_url(cls, url: str, token_file: str) -> "ReportStoreRelay | None":
+        """A relay for ``url`` (scheme, host and port, nothing else), or None for one that is not."""
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.scheme not in ("http", "https") or not parts.hostname or not token_file:
+            return None
+        if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username or parts.password:
+            return None
+        return cls(parts.scheme, parts.hostname, port or (443 if parts.scheme == "https" else 80), token_file)
+
+    def _token(self) -> str:
+        try:
+            with open(self.token_file, encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ReportStoreUnavailable(f"the store token could not be read ({type(exc).__name__})") from None
+        if not token or any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in token):
+            raise ReportStoreUnavailable("the store token file holds no token")
+        return token
+
+    def relay(self, method: str, path: str, body: bytes | None) -> tuple[int, bytes]:
+        """Send one request on and return the listener's (status, body).
+
+        Raises ReportStoreUnavailable when the token cannot be read, and
+        ReportStoreFault on a connection error, a timeout, an answer over
+        AUDIT_REPORT_MAX_BYTES, or a 401 or 403: those are the listener
+        refusing the broker, not the caller, and are not the caller's to read
+        as its own.
+        """
+        token = self._token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(body))
+        connection_class = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
+        connection = connection_class(self.host, self.port, timeout=self.timeout)
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            status = response.status
+            payload = response.read(AUDIT_REPORT_MAX_BYTES + 1)
+        except (OSError, http.client.HTTPException) as exc:
+            raise ReportStoreFault(f"the store did not answer ({type(exc).__name__})") from None
+        finally:
+            connection.close()
+        if len(payload) > AUDIT_REPORT_MAX_BYTES:
+            raise ReportStoreFault("the store's answer is over the size cap")
+        if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            raise ReportStoreFault(f"the store refused the broker (status {status})")
+        if not 200 <= status <= 599:
+            raise ReportStoreFault(f"the store answered status {status}")
+        return status, payload
+
+
+def report_store_from_env(role: str) -> ReportStoreRelay | None:
+    """The store relay the environment configures, or None: today, an exec pod, or unset."""
+    if role == EXEC_ROLE:
+        return None
+    url = os.environ.get(AUDIT_REPORT_STORE_URL_ENV, "").strip()
+    token_file = os.environ.get(AUDIT_REPORT_STORE_TOKEN_FILE_ENV, "").strip()
+    if not url and not token_file:
+        return None
+    relay = ReportStoreRelay.from_url(url, token_file)
+    if relay is None:
+        LOGGER.warning(
+            "the audit-report store is not configured: %s or %s is unset or malformed",
+            AUDIT_REPORT_STORE_URL_ENV,
+            AUDIT_REPORT_STORE_TOKEN_FILE_ENV,
+        )
+    return relay
+
+
+def is_audit_report_path(path: str) -> bool:
+    """Whether ``path`` is the store's: the stream list, or anything below it."""
+    return path == AUDIT_REPORTS_PREFIX or path.startswith(AUDIT_REPORTS_PREFIX + "/")
+
+
 def exec_pod_serves(method: str, path: str) -> bool:
     """Whether an exec pod serves ``method`` on ``path``.
 
@@ -2777,8 +3092,13 @@ def exec_pod_serves(method: str, path: str) -> bool:
     and the readiness probe. The metrics listener is a server of its own and
     does not pass through here. Everything else is the stateful broker's.
     A POST to the Cloud API relay passes too: the relay refuses it by policy
-    and writes the audit line, as the stateful broker does (do_POST).
+    and writes the audit line, as the stateful broker does (do_POST). The
+    audit-report routes (#5619) are the stateful broker's: the exec tier has
+    no store token (credential_proxy_exec_tier.go drops it), so an exec pod
+    answers them, every method, with the unknown route's 404.
     """
+    if is_audit_report_path(path):
+        return False
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
@@ -13376,6 +13696,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # serve() when the authenticator confers that role. None leaves a profile
     # caller with no task, so local-only commands only.
     profile_gate: ProfileTaskGate | None = None
+    # The audit-report store's relay (#5619), set by serve() from
+    # AUDIT_REPORT_STORE_URL and AUDIT_REPORT_STORE_TOKEN_FILE; None (today, an
+    # exec pod, a test that has not set it) answers the store routes 503.
+    report_store: ReportStoreRelay | None = None
+    # REPORT_PROFILES_ENV, set by serve(): the profiles whose tasks use the
+    # store. Empty: no profile task reads or writes it.
+    report_profiles: frozenset[str] = frozenset()
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
     # What the metrics listener serves. One registry per process; a test that
@@ -13637,6 +13964,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if self._exec_pod_refuses("GET", None):
             return
+        if is_audit_report_path(self.path):
+            self._handle_audit_reports()
+            return
         if self.path == ADMISSION_PATH:
             self._json(HTTPStatus.OK, self._admission_report())
             return
@@ -13740,6 +14070,188 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
             return
         self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._serve_audit_report_write()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._serve_audit_report_write()
+
+    def _serve_audit_report_write(self) -> None:
+        """PUT and DELETE: the audit-report store's writes, and nothing else (#5619).
+
+        Any other path gets the answer it got before these methods existed,
+        BaseHTTPRequestHandler's 501 for a method it has no do_ for, before
+        authentication, as then. A store path goes through what do_POST's
+        routes do: authentication and the role table, the drain, the exec pod.
+        """
+        if not is_audit_report_path(self.path):
+            self.send_error(HTTPStatus.NOT_IMPLEMENTED, f"Unsupported method ({self.command!r})")
+            return
+        principal = self._authenticated()
+        if principal is None:
+            return
+        if self._refused_while_draining(self.command):
+            return
+        if self._exec_pod_refuses(self.command, principal):
+            return
+        self._handle_audit_reports()
+
+    def _refuse_audit_report(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        """Answer a store request that is not relayed, draining a PUT body first."""
+        if self.command == "PUT":
+            drain_request_body(self, AUDIT_REPORT_MAX_BYTES)
+        self._json(status, payload)
+
+    def _log_audit_report(self, status: int, outcome: str) -> None:
+        # The method, the path, the caller and the status: never the token or a body.
+        LOGGER.info(
+            "audit-report %s path=%s principal=%s status=%d outcome=%s",
+            _sanitize_for_logging(self.command),
+            _sanitize_for_logging(self.path),
+            _sanitize_for_logging(self.principal.describe() if self.principal else "", max_length=PRINCIPAL_LOG_LENGTH),
+            int(status),
+            outcome,
+        )
+
+    def _handle_audit_reports(self) -> None:
+        """Decide one store request and relay it to the listener (#5619).
+
+        After authentication, the role table, the drain and the exec pod. In
+        order: the path must be one of REPORT_CREDENTIAL_ROUTES whole (else
+        404); the caller must pass report_read_permitted or
+        report_write_permitted (else 403 with the rule); the store must be
+        configured (else 503); a PUT body must fit AUDIT_REPORT_MAX_BYTES (else
+        413). Only then is anything sent to the listener, whose status and body
+        come back. Nothing is relayed on any refusal.
+        """
+        method, path = self.command, self.path
+        if not report_credential_permits(method, path):
+            self._log_audit_report(HTTPStatus.NOT_FOUND, "no-such-route")
+            self._refuse_audit_report(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        principal = self.principal
+        role = getattr(principal, "role", None)
+        task = getattr(principal, "task", None) if role == CALLER_ROLE_PROFILE else None
+        profile = getattr(task, "profile", None) if task is not None else None
+        segments = path.split("/")
+        write = method in ("PUT", "DELETE")
+        if write:
+            # The install's key is read only for a caller that could pass: a
+            # role refused anyway is refused without the ConfigMap read.
+            gitops_key: str | None = None
+            if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):
+                try:
+                    gitops_key = report_gitops_store_key()
+                except ReportStoreUnavailable as exc:
+                    LOGGER.warning("audit-report write refused: %s", exc)
+                    self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "gitops-repo-unavailable")
+                    self._refuse_audit_report(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {
+                            "error": "the install's GitOps repository could not be read, so no write is checked",
+                            "code": "GITOPS_REPO_UNAVAILABLE",
+                        },
+                    )
+                    return
+            rule = report_write_permitted(
+                role,
+                profile,
+                getattr(task, "trigger", None) if task is not None else None,
+                segments[3],
+                segments[4],
+                gitops_key,
+                self.report_profiles,
+            )
+        else:
+            rule = report_read_permitted(role, profile, self.report_profiles)
+        if rule is not None:
+            self._log_audit_report(HTTPStatus.FORBIDDEN, rule)
+            self._refuse_audit_report(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": rule,
+                    "message": f"This caller may not {'write' if write else 'read'} this audit-report stream.",
+                },
+            )
+            return
+        store = self.report_store
+        if store is None:
+            self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "store-not-configured")
+            self._refuse_audit_report(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "the audit-report store is not configured on this broker", "code": "AUDIT_REPORT_STORE_UNCONFIGURED"},
+            )
+            return
+        body: bytes | None = None
+        if method == "PUT":
+            body = self._read_audit_report_body()
+            if body is None:
+                return
+        try:
+            status, payload = store.relay(method, path, body)
+        except ReportStoreUnavailable as exc:
+            LOGGER.warning("audit-report store unavailable: %s", exc)
+            self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "store-unavailable")
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "the audit-report store is unavailable", "code": "AUDIT_REPORT_STORE_UNAVAILABLE"},
+            )
+            return
+        except ReportStoreFault as exc:
+            LOGGER.warning("audit-report store failed: %s", exc)
+            self._log_audit_report(HTTPStatus.BAD_GATEWAY, "store-failed")
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the audit-report store failed", "code": "AUDIT_REPORT_STORE_FAILED"},
+            )
+            return
+        self._log_audit_report(status, "relayed")
+        self._write_audit_report_answer(status, payload)
+
+    def _read_audit_report_body(self) -> bytes | None:
+        """A PUT's body, whole and within AUDIT_REPORT_MAX_BYTES, or None once answered."""
+        refusal: tuple[HTTPStatus, str] | None = None
+        lengths = self.headers.get_all("Content-Length") or []
+        if self.headers.get("Transfer-Encoding"):
+            refusal = (HTTPStatus.LENGTH_REQUIRED, "a store write takes a Content-Length body, not a chunked one")
+        elif len(set(lengths)) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0].strip()):
+            refusal = (HTTPStatus.LENGTH_REQUIRED, "a store write takes one Content-Length")
+        elif int(lengths[0]) > AUDIT_REPORT_MAX_BYTES:
+            refusal = (HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "the report is over the store's size cap")
+        if refusal is None:
+            length = int(lengths[0])
+            try:
+                body = self.rfile.read(length)
+            except OSError:
+                body = b""
+                self.close_connection = True
+            if len(body) == length:
+                return body
+            refusal = (HTTPStatus.BAD_REQUEST, "the report body ended early")
+        status, message = refusal
+        self._log_audit_report(status, "body-refused")
+        self._json(status, {"error": message, "code": "AUDIT_REPORT_BODY_REFUSED"})
+        return None
+
+    def _write_audit_report_answer(self, status: int, payload: bytes) -> None:
+        """The listener's status and body, framed here: no header of the listener's is passed on."""
+        self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
+        try:
+            self.send_response(status)
+            # A 204 carries neither a body nor a Content-Length (RFC 9110 §8.6).
+            if status != HTTPStatus.NO_CONTENT:
+                if payload:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+            self._end_headers()
+            if status != HTTPStatus.NO_CONTENT and payload:
+                self.wfile.write(payload)
+        except OSError as exc:
+            LOGGER.warning("response not delivered status=%d bytes=%d type=%s", int(status), len(payload), type(exc).__name__)
+            self.close_connection = True
 
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
@@ -16095,6 +16607,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if method == "POST":
             # Read first, so the refusal is not lost to a connection reset.
             drain_request_body(self, self.max_request_bytes)
+        elif method == "PUT":
+            # An audit-report write (#5619), under its own cap.
+            drain_request_body(self, AUDIT_REPORT_MAX_BYTES)
         self._busy(CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING))
         return True
 
@@ -16715,6 +17230,9 @@ def serve(args: argparse.Namespace) -> None:
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
     CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
+    # The audit-report store (#5619): unset outside next, and on an exec pod.
+    CredentialProxyHandler.report_store = report_store_from_env(role)
+    CredentialProxyHandler.report_profiles = report_profiles_from_env()
     if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
         # A listener the cluster can reach, with no authentication, hands the
         # credentials to whoever reaches the port. The sidecar deployment gets
