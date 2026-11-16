@@ -1043,22 +1043,24 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     for role, entry in _catalog()["roles"].items():
         if entry["cluster_slot"] is None:
             # A project-scoped probe, `<kind>/<name-prefix>*`: the Terraform
-            # names the object `<name-prefix>${var.cluster_prefix}`, or
-            # `<name-prefix>` bare where a repository declaration has to spell
-            # the object without knowing the prefix (the declared-mtu-peering
-            # network), or peers with the project's own `default` network,
-            # which it references as `global/networks/<name-prefix>` and never
-            # plants.
+            # names the object `<name-prefix>${var.cluster_prefix}`. A network
+            # is the one kind named whole: bare, where a repository declaration
+            # has to spell the object without knowing the prefix (the
+            # declared-mtu-peering network), or as the project's own `default`,
+            # which the stack references as `global/networks/<name>` in a
+            # peering and never plants. The bare form is accepted for networks
+            # alone, so a mistyped instance probe cannot ride on a pool's name.
             for probe in entry["probes"]:
                 seen += 1
-                prefix = probe.split("/", 1)[1].removesuffix("*")
-                assert re.search(
-                    rf'name\s*=\s*"{re.escape(prefix)}(?:\$\{{var\.cluster_prefix\}})?"|global/networks/{re.escape(prefix)}"',
-                    main,
-                ), (
+                kind, prefix = probe.split("/", 1)
+                prefix = prefix.removesuffix("*")
+                prefixed = rf'name\s*=\s*"{re.escape(prefix)}\$\{{var\.cluster_prefix\}}"'
+                whole = rf'name\s*=\s*"{re.escape(prefix)}"|global/networks/{re.escape(prefix)}"'
+                pattern = f"{prefixed}|{whole}" if kind == "network" else prefixed
+                assert re.search(pattern, main), (
                     f"project-scoped role {role!r} probes for {probe!r}, but no stack "
-                    f"file outside the defects files declares a name {prefix!r} (bare, or followed "
-                    "by ${var.cluster_prefix}) or references global/networks/" + prefix
+                    f"file outside the defects files declares a name {prefix!r} followed "
+                    "by ${var.cluster_prefix}" + (", bare, or as global/networks/" + prefix if kind == "network" else "")
                 )
             continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"

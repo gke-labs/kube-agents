@@ -1039,6 +1039,11 @@ FLEET_RECONCILER_ROLES = {
     # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
     # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
     "roles/compute.securityAdmin",
+    # networkAdmin: the stack plants a VPC network and peers it with `default`
+    # (`mtu_peer_declared`, main.tf), and the create needs compute.networks.create,
+    # .delete, .addPeering, .removePeering and .updatePeering, which no other role
+    # here or any narrower predefined role carries.
+    "roles/compute.networkAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",

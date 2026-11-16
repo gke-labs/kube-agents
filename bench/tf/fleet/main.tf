@@ -150,11 +150,12 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 }
 
 # The project-scoped fixtures (the startup-fail VM, the world-open firewall
-# rule and its VM; fixtures.json roles with cluster_slot null) are Compute
-# Engine objects, which container.viewer cannot read. The CI health bot's scan
-# runs every gcloud read as this account, so the presence probe and the state
-# pass list instances and firewall rules as it (#2483, #2682), and the state
-# pass reads the startup-fail VM's serial port output as it.
+# rule and its VM, the peered mtu-peer-declared network; fixtures.json roles
+# with cluster_slot null) are Compute Engine objects, which container.viewer
+# cannot read. The CI health bot's scan runs every gcloud read as this
+# account, so the presence probe and the state pass list instances, firewall
+# rules and networks as it (#2483, #2682), and the state pass reads the
+# startup-fail VM's serial port output as it.
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this

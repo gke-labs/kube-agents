@@ -9,7 +9,7 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time, the project-scoped `startup-fail-vm` and `world-open-ingress`
+against at run time, the project-scoped `startup-fail-vm`, `world-open-ingress` and `declared-mtu-peering`
 included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
 machine-readable form of the rest of this document — the day-N gates below, and
 `orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not

@@ -507,11 +507,16 @@ done
 # check on the default pool's instance group (readiness-lb-drain-timeout,
 # defects-b.tf), and the create needs compute.backendServices.*,
 # compute.healthChecks.* and compute.instanceGroups.use.
+# compute.networkAdmin: the stack plants a VPC network peered with `default`
+# (declared-mtu-peering, main.tf), and the create needs compute.networks.create,
+# .delete, .addPeering, .removePeering and .updatePeering, which no narrower
+# predefined role carries.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
   roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
+  roles/compute.networkAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
