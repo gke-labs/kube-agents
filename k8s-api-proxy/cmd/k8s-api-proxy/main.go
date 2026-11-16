@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -30,6 +31,9 @@ const (
 	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
 	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+	binaryName              = "k8s-api-proxy"
+	// devVersion is what a build without the release's -ldflags reports.
+	devVersion = "dev"
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
 	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
@@ -157,8 +161,18 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
+// version is the release the binary was built for, set by
+// scripts/release/build_release_binaries.sh with -ldflags "-X main.version=X.Y.Z".
+var version = devVersion
+
+// versionString is what --version prints and the startup log names.
+func versionString() string {
+	return binaryName + " " + version
+}
+
 func main() {
 	var (
+		showVersion              = flag.Bool("version", false, "Print the release this binary was built for and exit")
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
 		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
@@ -181,6 +195,10 @@ func main() {
 		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	mode, err := k8sapiproxy.ParseMode(*modeRaw)
 	if err != nil {
@@ -300,10 +318,10 @@ func main() {
 
 	listen := srv.ListenAndServe
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting %s (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting %s (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 	}
 	drainErr, err := serveUntilDrained(ctx, srv, listen, serverShutdownTimeout)
 	if err != nil {
