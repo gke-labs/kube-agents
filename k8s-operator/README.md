@@ -79,8 +79,8 @@ images and downloading dependencies.
 The two scripts handle the unset case differently. `dev_rebuild_agent.sh` takes the default pool's
 default machine (2 vCPUs), while `hack/ci-deploy.sh` requests `e2-highcpu-8` because it compiles the
 first-party images (platform, credential-proxy, sandbox, operator, on a pull request's path the
-two AgentPlugin images and the web console, and under `EVAL_MODE_NEXT=1` the A2A images and the
-Hermes bridge) in a single Cloud Build
+two AgentPlugin images, the web console, and the A2A images and the Hermes bridge the deploy
+asks for) in a single Cloud Build
 submission ([`deploy/docker/cloudbuild-ci.yaml`](../deploy/docker/cloudbuild-ci.yaml)), with the
 sandbox, operator, AgentPlugin and web console builds running in parallel alongside the
 platform-agent and credential-proxy builds (the web console waits for the A2A step, which exits at

@@ -545,7 +545,7 @@ func TestTheReservedListNamesThePoolVariablesInItsOwnRight(t *testing.T) {
 }
 
 // The A2A gateway's broker-side variables are reserved whether or not the
-// operator renders them (it does, under next with Chat), so a CR cannot decide
+// operator renders them (it does, with Chat on), so a CR cannot decide
 // who holds the a2a-chat role or arm a second Chat consumer through
 // spec.deployment.env. Called with an empty managed list for the same reason
 // as the test above: on an install where the render does not set them, the
@@ -554,7 +554,7 @@ func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
 		{Name: "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", Value: "kubeagents-credential-proxy"},
 		{Name: "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "projects/p/subscriptions/theirs"},
-		// The legacy name too: under next with Chat the render no longer
+		// The legacy name too: with Chat on the gateway the render no longer
 		// sets it, so the managed-names loop stops protecting it, and a CR
 		// that set it would arm a second relay instance on whatever the
 		// broker's credential can pull, or refuse the broker's start.

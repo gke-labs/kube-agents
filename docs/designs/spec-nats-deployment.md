@@ -34,6 +34,15 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
+bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
+server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
+payloads and CI logs are public; debug names connections and the public keys they
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the
@@ -362,8 +371,8 @@ The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` 
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
 running across the reconnect. Listing them all in its map entry grows the entry about
 1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
-With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
-`dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+By default (`A2A_DISPATCHER_BUCKETED_GRANTS` on the operator, which only `false` turns off) the
+entry narrows on `dispatcher` instead. It carries only the fixed grants, which are its control connection's,
 and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
 CONNECT password beside the token gets the per-profile grants, draining profiles' included,
 of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
@@ -371,8 +380,11 @@ from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's ow
 password picks a slice of what the token already allows; it is not a credential. A bucket the
 callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
 names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
-profiles. The switch is off by default, and stays off until the dispatcher opens its bucket
-connections. With a dispatcher the
+profiles. The operator renders the same switch onto the dispatcher, which then opens one
+connection per bucket beside its control connection, and is Ready only with all of them up. A
+profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
+the operator's: one from before the bucket connections ignores the switch, binds no durable on
+its control connection, and stays not Ready. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -414,8 +426,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. The gateway's per-profile deny is left out of
-that hash, since a reload applies it (below).
+without a credential reaching the digest. On a single server the gateway's per-profile
+deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
+profile change rolls the servers (below).
 
 Layout:
 
@@ -1183,13 +1196,31 @@ The pod template's config hash leaves out the per-profile gateway deny, so an Ag
 added, removed or done draining changes the config Secret and not the template: the bus is
 reloaded, not rolled. Every other config change still rolls it. The operator records the
 reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. If it hasn't moved within three minutes, or
-can't be read, the operator deletes the bus pod so it restarts onto the new config, and
-writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+and confirms the reload when that value moves. A config written while a reload is still
+pending can't be confirmed by that move, which may be the earlier write landing, so the move
+restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
+kubelet write, so a restarted wait usually sees no further move, and nothing the server
+reports says whether the newest write was in the one it saw. If the value hasn't moved
+within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
+the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+`BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
+restart is kept even then: confirming by the absence of a move would admit a profile whose
+deny the server might not hold. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after
 the profile does. On the roll path it landed when the new pod came up, tens of seconds
 later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
+
+**A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
+grant and the agent card take a newly bound AgentProfile only once every bus server has
+loaded the config carrying its deny; until then the profile's `CardPublished` condition is
+`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
+servers, the pod template records the profile list, and the operator reads the revision
+each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
+them). On one server the config Secret records the previous list while a reload is pending
+or the pod restarts, and the profile counts as loaded once the server is on the new config.
+Only the way in waits: a profile the dispatch config already lists live, or whose card is
+already published, stays, and a removed profile keeps its deny while it drains, as before.
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the

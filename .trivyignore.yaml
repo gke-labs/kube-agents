@@ -81,8 +81,8 @@ misconfigurations:
   #     read values; only their HMAC-SHA256 digest, keyed by the UIDs of the
   #     Secrets read, leaves the controller, and the digest goes on an object
   #     the operator already writes.
-  #   - create/update/patch/delete, in the install namespace and the profile namespace only: under
-  #     `mode: next` the operator generates and repairs the A2A NATS credential
+  #   - create/update/patch/delete, in the install namespace and the profile namespace only:
+  #     the operator generates and repairs the A2A NATS credential
   #     and config Secrets, and ensureKubeProxyTLSSecret manages the
   #     `<agent>-kube-proxy-tls` Secret, owner-referenced to the PlatformAgent.
   #     Every write names a Secret in the namespace of the PlatformAgent being

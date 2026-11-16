@@ -511,15 +511,12 @@ func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context
 }
 
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
-// into the profile namespace, for the flip back to today (deleting the
-// PlatformAgent removes the quota, removeProfileQuotaOnDeletion, and leaves
-// the fence for the chart's uninstall). Those objects
-// carry no owner reference, so nothing else reclaims them, and an install
-// that isn't running next should look like it never did. An object of that
-// name that this agent's labels don't mark as its own is left to its owner,
-// like the callout's unowned ClusterRoleBinding. cleanupA2A removes the
-// fence last, after the bus fence that admits the namespace is gone; a pass
-// that dies before then leaves a fence that only restricts.
+// into the profile namespace (deleting the PlatformAgent removes the quota,
+// removeProfileQuotaOnDeletion, and leaves the fence for the chart's
+// uninstall). Those objects carry no owner reference, so nothing else
+// reclaims them. An object of that name that this agent's labels don't mark
+// as its own is left to its owner, like the callout's unowned
+// ClusterRoleBinding.
 func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), profileQuotaComponent)
 }
@@ -541,10 +538,9 @@ func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent
 	return nil
 }
 
-// profileFenceRendered reports whether this agent's profile fence exists,
-// for cleanupA2A's sentinels: it is the first write of
-// reconcileA2ANetworkFences, and it carries no owner reference, so the
-// owner test the other sentinels use can't see it.
+// profileFenceRendered reports whether this agent's profile fence exists: it
+// is the first write of reconcileA2ANetworkFences, and it carries no owner
+// reference, so an owner test can't see it.
 func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	var np networkingv1.NetworkPolicy
 	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)

@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1179,138 +1178,6 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	}
 }
 
-// flipRig is a next install reconciled through Reconcile, with the fake
-// client's status subresource and server-side apply.
-func flipRig(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
-	t.Helper()
-	scheme := setupScheme()
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, sandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
-	return r, cl, ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-}
-
-func reconcileN(t *testing.T, r *PlatformAgentReconciler, req ctrl.Request, n int, when string) {
-	t.Helper()
-	for i := 0; i < n; i++ {
-		if _, err := r.Reconcile(context.Background(), req); err != nil {
-			t.Fatalf("Reconcile %d %s: %v", i+1, when, err)
-		}
-	}
-}
-
-func setMode(t *testing.T, cl client.Client, req ctrl.Request, mode string) {
-	t.Helper()
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(context.Background(), req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	fresh.Spec.Mode = ptr.To(mode)
-	if err := cl.Update(context.Background(), fresh); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// A flip to today keeps status.busReplicas (#5451): the bus's claims are
-// kept for the flip back, and so is the count it ran at. The status writers
-// read the kept field as current, so no today pass writes status for it.
-func TestAFlipToTodayKeepsTheBusServerCount(t *testing.T) {
-	r, cl, req := flipRig(t, a2aTestAgent())
-	ctx := context.Background()
-	reconcileN(t, r, req, 2, "under next")
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	before := fresh.Status.BusReplicas
-	if before == 0 {
-		t.Fatal("precondition: status.busReplicas not written under next")
-	}
-	setMode(t, cl, req, "today")
-	reconcileN(t, r, req, 2, "after the flip to today")
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Status.BusReplicas != before {
-		t.Errorf("status.busReplicas = %d after the flip to today, want the %d it ran at", fresh.Status.BusReplicas, before)
-	}
-	rv := fresh.ResourceVersion
-	reconcileN(t, r, req, 2, "settled under today")
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.ResourceVersion != rv {
-		t.Errorf("settled today passes wrote the CR (resourceVersion %s -> %s); the kept field must read current", rv, fresh.ResourceVersion)
-	}
-}
-
-// TestABusComesBackFromTodayAtItsCount is #5451's round trip through
-// Reconcile: a bus at a count, with data claims, flipped to today and back,
-// comes back at the count it ran, not the count its claims imply. A single
-// server once scaled by hand keeps claims 1 and 2 under WhenScaled Retain;
-// read alone they say three, over a one-server store. A bus whose claims are
-// gone has nothing to keep and comes back at the default.
-func TestABusComesBackFromTodayAtItsCount(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		single bool
-		claims []int
-		want   int32
-	}{
-		{"one server with stray claims 1 and 2", true, []int{0, 1, 2}, 1},
-		{"three servers with claims 0-2", false, []int{0, 1, 2}, 3},
-		{"one server, claims gone under today: a new bus", true, nil, agentv1alpha1.DefaultBusReplicas},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			agent := a2aTestAgent()
-			if tc.single {
-				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-			}
-			r, cl, req := flipRig(t, agent)
-			ctx := context.Background()
-			reconcileN(t, r, req, 2, "under next")
-			fresh := &agentv1alpha1.PlatformAgent{}
-			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-				t.Fatal(err)
-			}
-			if tc.single {
-				// The field goes; the record keeps the bus at one server.
-				fresh.Spec.Harness.Tuning.BusReplicas = nil
-				if err := cl.Update(ctx, fresh); err != nil {
-					t.Fatal(err)
-				}
-				reconcileN(t, r, req, 1, "with the field removed")
-			}
-			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
-			for _, o := range tc.claims {
-				if err := cl.Create(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
-				}}); err != nil && !errors.IsAlreadyExists(err) {
-					t.Fatal(err)
-				}
-			}
-			setMode(t, cl, req, "today")
-			reconcileN(t, r, req, 2, "under today")
-			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
-				t.Fatalf("precondition: the bus StatefulSet survived the flip to today (err %v)", err)
-			}
-			setMode(t, cl, req, "next")
-			reconcileN(t, r, req, 2, "back under next")
-			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-				t.Fatal(err)
-			}
-			sts := &appsv1.StatefulSet{}
-			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
-				t.Fatal(err)
-			}
-			if fresh.Status.BusReplicas != tc.want || sts.Spec.Replicas == nil || *sts.Spec.Replicas != tc.want {
-				t.Errorf("back from today: status.busReplicas = %d, StatefulSet replicas = %v; want %d", fresh.Status.BusReplicas, sts.Spec.Replicas, tc.want)
-			}
-		})
-	}
-}
-
 // A NATS pod the hostname spread holds Pending is named with the scheduler's
 // reason by the status pod scan, not blamed on the CR's RuntimeClass, which
 // the pod does not ask for: the remedy that message gives (a gVisor node pool)
@@ -1935,5 +1802,47 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
+	}
+}
+
+// The bus logs at debug only while the operator's environment carries
+// A2A_NATS_DEBUG=true, as CI's does; never trace, which logs payloads. The
+// default render, and any other value, has neither.
+func TestTheBusLogsAtDebugOnlyWhenTheOperatorAsks(t *testing.T) {
+	render := func() string {
+		return renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "") // a developer shell may carry it
+	debugLine := regexp.MustCompile(`(?m)^\s*debug:`)
+	traceLine := regexp.MustCompile(`(?m)^\s*(trace|trace_verbose):`)
+	if conf := render(); debugLine.MatchString(conf) || traceLine.MatchString(conf) {
+		t.Errorf("the default render logs at debug or trace:\n%s", conf)
+	}
+	for _, v := range []string{"1", "yes", "TRUE", ""} {
+		t.Setenv(a2aNATSDebugEnvVar, v)
+		if debugLine.MatchString(render()) {
+			t.Errorf("%s=%q turned debug on; only \"true\" does", a2aNATSDebugEnvVar, v)
+		}
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "true")
+	conf := render()
+	if !regexp.MustCompile(`(?m)^debug: true$`).MatchString(conf) {
+		t.Errorf("%s=true left debug off:\n%s", a2aNATSDebugEnvVar, conf)
+	}
+	if traceLine.MatchString(conf) {
+		t.Error("debug brought trace with it")
+	}
+	// The rendered config still parses with the line in it.
+	full := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aFullCreds("c", "1"), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	path := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, strings.NewReplacer(`pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, "server_name: $POD_NAME", "server_name: n0").Replace(full))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(path)
+	if err != nil {
+		t.Fatalf("the debug render does not parse: %v", err)
+	}
+	if !opts.Debug || opts.Trace {
+		t.Errorf("parsed debug=%v trace=%v, want debug only", opts.Debug, opts.Trace)
 	}
 }
