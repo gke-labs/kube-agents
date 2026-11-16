@@ -1008,7 +1008,7 @@ a2aBus:
   images:
     nats:
       repository: docker.io/library/nats
-      tag: "2.10-alpine"
+      tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
     natsBox:
       repository: docker.io/natsio/nats-box
       tag: "0.14.5"
@@ -1035,12 +1035,6 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
-  # Deprecated and ignored. platformAgent.mode once chose between the A2A
-  # stack and the previous one; the operator now runs every install on the
-  # A2A stack and the CRD defaults spec.mode to next. A value set here still
-  # renders spec.mode on the CR, which the webhook rewrites to next. The key
-  # goes in a later release.
-  mode: null
   telemetry:
     # The A2A gateway keeps one hashed key and a last-active time per chat
     # person for 30 days, and serves the people seen in the last 7 and 30 days

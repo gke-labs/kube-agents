@@ -96,7 +96,7 @@ const (
 // cluster, and is called on the way out of Reconcile rather than at a point in
 // its sequence.
 //
-// The sequence has no point that works. Four refusals of today's stack return
+// The sequence has no point that works. Four refusals return
 // above the bus step -- ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
 // RuntimeClassNotFound, EgressAllowlistRefused -- and the bus step cannot move
 // above them, because it renders on top of what they withhold. Written after

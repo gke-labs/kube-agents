@@ -178,6 +178,12 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	noStream := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin}
 	noStreamClaims := *wantClaims
 	noStreamClaims.Trigger = &noStream
+	// A built-in schedule's script run (#5622): both readers take the script.
+	scripted := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin, Stream: "compliance-audit", Script: "compliance-audit"}
+	scriptedClaims := *wantClaims
+	scriptedClaims.Trigger = &scripted
+	add(proxyFixture{Name: "a builtin schedule trigger naming a script", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &scriptedClaims})
 	add(proxyFixture{Name: "a schedule trigger with an explicit empty stream", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":""}`),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &noStreamClaims})
 	mintedTrigger, err := Mint(kp, Claims{
@@ -288,6 +294,16 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a trigger name past 63 bytes", withTrigger(`{"name":"schedule/`+strings.Repeat("a", 64)+`","origin":"builtin"}`)))
 	add(refused("an uppercase trigger name", withTrigger(`{"name":"Schedule/a","origin":"builtin"}`)))
 	add(refused("a non-ASCII trigger name", withTrigger(`{"name":"schedule/caf\u00e9","origin":"builtin"}`)))
+	add(refused("a trigger script that is a path", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"/opt/scripts/run.sh"}`)))
+	add(refused("a trigger script on a collector trigger", withTrigger(`{"name":"stall-watch","origin":"builtin","script":"stall-watch"}`)))
+	add(refused("a trigger script on a bare schedule trigger", withTrigger(`{"name":"schedule","origin":"builtin","script":"compliance-audit"}`)))
+	add(refused("an upper-case trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"Run"}`)))
+	add(refused("a dotted trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"run.sh"}`)))
+	add(refused("a non-ASCII trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"caf\u00e9"}`)))
+	add(refused("an over-long trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"`+strings.Repeat("a", 64)+`"}`)))
+	add(refused("a case-variant trigger script key", withTrigger(`{"name":"schedule/a","origin":"builtin","SCRIPT":"a"}`)))
+	// As a null stream: Go reads it as none, the stricter proxy refuses it.
+	add(proxyFixture{Name: "a null trigger script", Token: withTrigger(`{"name":"schedule/nightly","origin":"builtin","script":null}`), Now: fixtureNow, GoOK: true})
 	add(refused("a trigger origin as a number", withTrigger(`{"name":"schedule/a","origin":1}`)))
 	add(refused("an empty target field", edited(`"cluster":"cluster-a"`, `"cluster":""`)))
 

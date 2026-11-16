@@ -46,7 +46,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
 #      holds roles/storage.objectUser on gs://kube-agents-dashboards, the
 #      read roles bench/tf/fleet grants it on each pool project (the pool-state
-#      scan, below), and is
+#      scan, below), roles/monitoring.viewer on autopush's and staging's
+#      projects for the weekly Slack cross-check (docs/ci-health.md), and is
 #      the identity of the Chat app "Smoke Health" (same project), so the
 #      Chat token is minted under it too: `gcloud auth print-access-token
 #      --scopes=chat.bot`, because the auth action's default access token
@@ -261,14 +262,14 @@ env:
   NIGHTLY_MAIN_E_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/
   NIGHTLY_WRITERS_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/
   NIGHTLY_WRITERS_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/
-  # The GitLab lane's nightly, next mode (kube-agents#2832): the lane's list
+  # The GitLab lane's nightly (kube-agents#2832): the lane's list
   # once a night, tier gitlab with no pull request, listed under the Brief's
   # GitLab section; the job sets no gcs_configuration, so it logs to Prow's
   # bucket.
   GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
   # The self-managed forge lanes (kube-agents#3682), a tier each and one
   # Brief section together: their presubmits log to the lanes' own bucket,
-  # their next-mode weekly jobs to Prow's. Until a job has run, its listing
+  # their weekly jobs to Prow's. Until a job has run, its listing
   # holds nothing, which collect.py notes and does not refuse on.
   GHES_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/*
   GHES_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/
@@ -433,6 +434,7 @@ jobs:
             --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
             --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
             --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
+            --slack-lane-prefix \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \
             --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \
@@ -457,7 +459,10 @@ jobs:
           # with no release candidate would otherwise stop every publish. Both
           # RC warning shapes (the ls failure and the timeout) name the glob,
           # so dropping lines that mention the job name drops exactly those.
-          if grep -v "post-kube-agents-eval-rc" work/collect.log \
+          # The Slack lane is excluded for the same reason: a failed read
+          # carries slack_overhead forward, and an optional lane must not stall
+          # the publish.
+          if grep -Ev "post-kube-agents-eval-rc|ci-kube-agents-eval-nightly-slack" work/collect.log \
             | grep -Eq "warning: gcloud storage (ls|cat) .*(failed|timed out)"; then
             echo "::error::collect.py could not list or read the Prow archive; not publishing"
             exit 1
@@ -670,6 +675,25 @@ jobs:
           clock=$(python3 -c 'import json; print(json.load(open("work/data.json")).get("generated_at") or "")' 2>/dev/null || true)
           if [ -n "$clock" ]; then set -- --now "$clock"; fi
           python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json "$@"
+
+      # The weekly Slack cross-check (docs/ci-health.md, "The Slack
+      # cross-check"): the Slack lane's overhead beside autopush's and
+      # staging's, from their Managed Prometheus, as the publisher. The script
+      # runs at most once a week, keyed on the published document's age, and
+      # skips an environment with one line until the publisher holds
+      # roles/monitoring.viewer there. A run that misses an environment does
+      # not count as the week's, so a grant takes effect on the next tick.
+      - name: Cross-check the Slack lane against autopush and staging (weekly)
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          gcloud storage cp "$DASHBOARD_BUCKET/slack-crosscheck.json" work/slack-crosscheck-prev.json 2>/dev/null || true
+          python3 scripts/eval_dashboard/slack_crosscheck.py --data work/data.json \
+            --env autopush=kube-agents-autopush --env staging=kube-agents-gkedemos \
+            --prior work/slack-crosscheck-prev.json --out work/slack-crosscheck.json
+          if [ -f work/slack-crosscheck.json ]; then
+            gcloud storage cp --cache-control=no-cache work/slack-crosscheck.json "$DASHBOARD_BUCKET/slack-crosscheck.json"
+          fi
 
       # Where the bots file and read their issues (docs/ci-health.md, "The
       # tracking issue"): this repository with the job's own token while the

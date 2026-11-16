@@ -2681,6 +2681,16 @@ conversation and the rating, never the text; `answer_feedback_total` carries onl
 rating and what kind of message was rated (`answer`: `reply` for the chain's own answer, `card` for a
 card's report that settled the ask, `other` when no session record names the rated task).
 
+The posts the agent makes on its own in the home channel (the chat.notify route's home requests: an
+alert, a scheduled or audit report, a digest) carry the same controls, after the post's own buttons:
+the post that opens a thread, and the edit of it under the same key, never a reply in the thread
+(the triage card's plan or progress).
+They are rated under an id of the post's own rather than a task id: `alert-` for a keyed post, whose
+hash of the update key keeps the id through the triage edit that rewrites it, `report-` for any
+other, random. The record keeps the kind and no ask, the rating counts in `post_feedback_total` by
+kind and not in `answer_feedback_total`, the Home tab's weekly tally leaves it out, and the export's
+draft names the trigger to plant in place of a question. The controls read Useful and Not useful.
+
 An answer whose layout is already at Slack's 50-block cap posts laid out without the controls. The
 answered line a click or typed reply leaves on an answer's question goes above the controls, which
 stay the last block.
@@ -2937,10 +2947,13 @@ every message through either stamps its own backend.
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
   when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
-  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response)
-  is answered with the `Task` and publishes nothing, whatever terminal it has reached since:
-  `canceled`, or `completed` or `failed` if the turn finished before the cancel took. A task that
-  ended with no cancel published refuses one with `TaskNotCancelableError` (-32002).
+  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response,
+  or one queued behind the first for the conversation's turn) is answered with the `Task` and
+  publishes nothing, whatever terminal it has reached since: `canceled`, or `completed` or `failed`
+  if the turn finished before the cancel took. A task that ended with no cancel published refuses
+  one with `TaskNotCancelableError` (-32002). A queued cancel checks, while it waits and in the same
+  critical section as any claim, whether a cancel is on the bus or the task has ended. It answers as
+  soon as either is true, without taking a turn (#5777).
 - `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
   next, as SSE frames from the same observer hooks.
 
@@ -2958,7 +2971,7 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. A turn that delegates is one Task through its whole chain
+never inferred from a post's position. On a canceled terminal the Task shows one artifact only when the executor's canceled result carries the `cardStop` part's result form (a cancel that stopped the turn's Kanban cards, #5528): the `result` artifact with `canceled; ` and the gateway's own reply for that result (`cardStopReply`, titles cleaned as there) and the `cardStop` data part re-encoded from the parsed result, the same schema the card-stop control returns (`CardStopObserver`, handed over by the relay and the heal path before the terminal, bounded like the deliverable, with the part dropped rather than cut and `metadata.resultTruncatedFrom` set). The gateway writes both halves, so none of the executor's text and no field the schema doesn't name passes through: a canceled turn's other output (a partial answer chunked into the same artifact, any other data part) is never rendered, as before. The part names only the caller's own session's cards. A turn that delegates is one Task through its whole chain
 ("Sessions by default"): the child's and the wake's posts land in its `history`, and the wake's
 result is its artifact. A chain that runs past the gateway's task deadline is no longer exempt
 from the door's conversation cap while the caller waits, which is a known limit. The door keeps up to 4 MiB of it; a longer deliverable
@@ -3126,6 +3139,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                                   |
 | `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`            | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
+| `kubeagents_a2a_gateway_post_feedback_total`         | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`            | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
