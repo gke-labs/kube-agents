@@ -1,0 +1,111 @@
+{
+  "comment": "Shared by session_resources_parity_test.go (ResolveSessionResources) and tests/test_quota_preflight.py (the chart's kube-agents.quotaSessionShare), so the two resolve every override alike. Figures are millicores and bytes.",
+  "cases": [
+    {
+      "name": "no override",
+      "override": {},
+      "want": {
+        "cpuRequestMillis": 150,
+        "cpuLimitMillis": 2000,
+        "memoryRequestBytes": 335544320,
+        "memoryLimitBytes": 2147483648
+      }
+    },
+    {
+      "name": "one request keeps the other three",
+      "override": {
+        "requests": {
+          "cpu": "500m"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 500,
+        "cpuLimitMillis": 2000,
+        "memoryRequestBytes": 335544320,
+        "memoryLimitBytes": 2147483648
+      }
+    },
+    {
+      "name": "a lower limit alone drops the request",
+      "override": {
+        "limits": {
+          "memory": "256Mi"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 150,
+        "cpuLimitMillis": 2000,
+        "memoryRequestBytes": 268435456,
+        "memoryLimitBytes": 268435456
+      }
+    },
+    {
+      "name": "a request alone above the default limit raises the limit",
+      "override": {
+        "requests": {
+          "memory": "4Gi",
+          "cpu": "3"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 3000,
+        "cpuLimitMillis": 3000,
+        "memoryRequestBytes": 4294967296,
+        "memoryLimitBytes": 4294967296
+      }
+    },
+    {
+      "name": "both set, request above limit, drops the request",
+      "override": {
+        "requests": {
+          "memory": "4Gi"
+        },
+        "limits": {
+          "memory": "1Gi"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 150,
+        "cpuLimitMillis": 2000,
+        "memoryRequestBytes": 1073741824,
+        "memoryLimitBytes": 1073741824
+      }
+    },
+    {
+      "name": "zero and negative keep their defaults",
+      "override": {
+        "requests": {
+          "cpu": "0",
+          "memory": "-1Gi"
+        },
+        "limits": {
+          "cpu": "-2",
+          "memory": "0Mi"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 150,
+        "cpuLimitMillis": 2000,
+        "memoryRequestBytes": 335544320,
+        "memoryLimitBytes": 2147483648
+      }
+    },
+    {
+      "name": "a limit below a set request drops the request",
+      "override": {
+        "requests": {
+          "cpu": "1"
+        },
+        "limits": {
+          "cpu": "500m"
+        }
+      },
+      "want": {
+        "cpuRequestMillis": 500,
+        "cpuLimitMillis": 500,
+        "memoryRequestBytes": 335544320,
+        "memoryLimitBytes": 2147483648
+      }
+    }
+  ]
+}

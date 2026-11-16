@@ -34,6 +34,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _ROOT / "charts" / "kube-agents"
 _VALUES = _CHART / "values.yaml"
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
+_SESSION_RESOURCES_CASES = _ROOT / "k8s-operator" / "api" / "v1alpha1" / "testdata" / "session_resources_cases.json"
 _FLAGGED_PODS = _CHART / "files" / "flagged-pods.yaml"
 _TRANSIENT_PODS = _CHART / "files" / "transient-pods.yaml"
 _SCHEMA = _CHART / "values.schema.json"
@@ -504,6 +505,22 @@ class PreflightDecisionTest(unittest.TestCase):
         # A null leaf is unset, so the default stands; ephemeral storage is not overridable.
         self.assertEqual(req["sessionLimitsMemory"], base["sessionLimitsMemory"])
         self.assertEqual(req["sessionRequestsEphemeral"], base["sessionRequestsEphemeral"])
+
+    def test_the_chart_resolves_every_shared_case_as_the_operator_does(self) -> None:
+        """k8s-operator/api/v1alpha1/testdata/session_resources_cases.json, which
+        TestResolveSessionResourcesMatchesTheSharedCases runs through ResolveSessionResources."""
+        table = json.loads(_SESSION_RESOURCES_CASES.read_text())["cases"]
+        self.assertTrue(table)
+        for case in table:
+            with self.subTest(case=case["name"]):
+                req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+                    "maxSessions": 1, "sessionResources": case["override"],
+                }}}})
+                want = case["want"]
+                self.assertEqual(req["sessionRequestsCpu"], want["cpuRequestMillis"])
+                self.assertEqual(req["sessionLimitsCpu"], want["cpuLimitMillis"])
+                self.assertEqual(req["sessionRequestsMemory"], want["memoryRequestBytes"])
+                self.assertEqual(req["sessionLimitsMemory"], want["memoryLimitBytes"])
 
     def test_a_limit_below_the_default_request_lowers_the_request_to_it(self) -> None:
         """ResolveSessionResources: per key, then a request above its limit drops to it."""
