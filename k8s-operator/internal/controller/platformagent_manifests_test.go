@@ -489,9 +489,11 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
-	// 4, not 5: the credential proxy is a native sidecar and lives in InitContainers.
-	if len(dep.Spec.Template.Spec.Containers) != 4 {
-		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 5, not 6: the credential proxy is a native sidecar and lives in
+	// InitContainers. The fifth is the rendered hermes-bridge, in the pod from
+	// the first render (#5962).
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := containerByName(t, dep.Spec.Template.Spec.Containers, "platform-agent-dashboard")
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -679,7 +681,7 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
-		// The allowlist is two entries long and stays that way unless someone
+		// The allowlist is three entries long and stays that way unless someone
 		// argues the same case again. Both are pod-scoped: SESSION_KV_API_KEY
 		// authenticates callers of the Session KV server on this pod's
 		// loopback, and SESSION_KV_SALT is the HMAC salt for pseudonymising
@@ -687,8 +689,13 @@ func TestBuildDeployment(t *testing.T) {
 		// Neither reaches a cloud API, a repository, or anything off the pod —
 		// which is what the isolation boundary is for. A Secret-backed variable
 		// that does not meet that bar belongs in the credential-proxy container.
+		// A2A_ACTIVITY_SECRET joined on the same terms: it signs the agent's
+		// tool-call deliveries to the bridge's door on this pod's loopback
+		// (a2aActivitySecretEnv), and nothing off the pod reads it. The agent
+		// held it once the bus was provisioned before #5962; it now holds it
+		// from the first render, which is the only reason this test sees it.
 		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil &&
-			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" {
+			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" && env.Name != a2aActivitySecretEnvVar {
 			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
 		}
 		seen[env.Name] = true
@@ -1071,10 +1078,11 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 				t.Errorf("expected ShareProcessNamespace to be unset with the dashboard enabled, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			// 3: the front door is a native sidecar and lives in InitContainers,
-			// and the credential runtime is not in this Pod at all.
-			if len(dep.Spec.Template.Spec.Containers) != 3 {
-				t.Fatalf("expected dashboard deployment to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			// 4: the front door is a native sidecar and lives in InitContainers,
+			// the credential runtime is not in this Pod at all, and the
+			// rendered hermes-bridge is in it from the first render (#5962).
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected dashboard deployment to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if _, ok := findContainer(dep.Spec.Template.Spec, "agent-api-auth"); !ok {
 				t.Fatal("the agent-API front door is missing")
@@ -1127,10 +1135,11 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	// 2: the front door is a native sidecar and lives in InitContainers, and the
-	// credential runtime is not in this Pod at all.
-	if len(dep.Spec.Template.Spec.Containers) != 2 {
-		t.Fatalf("expected dashboard-disabled deployment to have 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 3: the front door is a native sidecar and lives in InitContainers, the
+	// credential runtime is not in this Pod at all, and the rendered
+	// hermes-bridge is in it from the first render (#5962).
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected dashboard-disabled deployment to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if _, ok := findContainer(dep.Spec.Template.Spec, "agent-api-auth"); !ok {
 		t.Fatal("the agent-API front door is missing")
@@ -7506,6 +7515,9 @@ func TestUnrelatedExtraMountKeepsTmpScratch(t *testing.T) {
 // touch this file: the test below fails on a name it does not know, and the fix is to add
 // it here and give it hardenedSecurityContext().
 var operatorBuiltContainers = []string{
+	// The rendered bridge: buildA2ABridgeContainer copies the agent
+	// container's securityContext.
+	"hermes-bridge",
 	"sandbox-credential-cleanup",
 	"sandbox-ssh-key",
 	"agent-api-auth",

@@ -438,8 +438,8 @@ carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deplo
 hands that image to the operator as `A2A_BRIDGE_IMAGE`, with `A2A_BRIDGE_CONCURRENCY` set to
 `EVAL_TASK_PARALLELISM`, through the chart's `operator.extraEnv`; the operator renders the bridge
 with the bus URL and the `bridge` user's password from its creds Secret as the bridge doc lists
-its env, and withholds it from the agent pod until the bus is provisioned (a bridge that starts
-before the bus exists crash-loops the agent's pod). The worker count is sized against the
+its env, and puts it in the agent pod from the first render (the bridge waits for the bus
+rather than exiting, so it no longer has to be withheld until the bus is provisioned). The worker count is sized against the
 bridge's fixed queue as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
 sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`

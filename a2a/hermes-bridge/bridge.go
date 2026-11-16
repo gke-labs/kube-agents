@@ -202,6 +202,12 @@ type Config struct {
 	// BRIDGE_DURABLE_PRECREATED=true beside a grant that denies this
 	// principal the create on that name. Off, the bridge creates it as before.
 	DurablePrecreated bool
+	// BusWaitMax caps the backoff between attempts to reach the bus and the
+	// runtime-state bucket in New (default DefaultBusWaitMax). A bus that is
+	// not there yet (an install whose provisioning Job has not run) is waited
+	// for rather than exited on, so the operator can render the bridge from
+	// its first pass and the agent pod rolls once (#5962).
+	BusWaitMax time.Duration
 	// ResultChunkSize bounds one result artifact-update's text part so a
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
@@ -273,6 +279,9 @@ func (c *Config) defaults() {
 	}
 	if c.APIConnectRetry <= 0 {
 		c.APIConnectRetry = DefaultAPIConnectRetry
+	}
+	if c.BusWaitMax <= 0 {
+		c.BusWaitMax = DefaultBusWaitMax
 	}
 	if c.APIModel == "" {
 		c.APIModel = DefaultAPIModel
@@ -535,13 +544,73 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
+	if err := b.waitForBus(ctx); err != nil {
+		return nil, err
+	}
+	if err := b.listenActivity(); err != nil {
+		b.close()
+		return nil, err
+	}
+	return b, nil
+}
+
+func (b *Bridge) close() {
+	b.c.Close()
+	b.nc.Close()
+	b.closeActivity()
+}
+
+// DefaultBusWaitMax is the longest wait between attempts to reach the bus.
+const DefaultBusWaitMax = 30 * time.Second
+
+// busWaitStart is the first wait between attempts; each failure doubles it
+// up to Config.BusWaitMax.
+const busWaitStart = time.Second
+
+// waitForBus connects to the bus and opens the runtime-state bucket,
+// retrying with a capped backoff until both succeed or ctx ends. On a fresh
+// install the bridge starts before the provisioning Job has created the
+// bucket, or before the bus serves at all; exiting then would crash-loop the
+// agent pod, which is why the operator used to withhold the bridge until
+// the bus was provisioned and so rolled the pod a second time (#5962). Each
+// failed attempt is logged with its cause. The pod is not held unready
+// meanwhile: the agent's own API serves without the bus, and the
+// PlatformAgent's BusProvisioned condition says the bus is not there yet.
+func (b *Bridge) waitForBus(ctx context.Context) error {
+	wait := busWaitStart
+	for attempt := 1; ; attempt++ {
+		err := b.connectBus(ctx)
+		if err == nil {
+			if attempt > 1 {
+				b.cfg.Logger.Info("reached the bus", "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b.cfg.Logger.Info("the bus is not ready yet; waiting", "attempt", attempt, "retryIn", wait, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, b.cfg.BusWaitMax)
+	}
+}
+
+// connectBus is one attempt at the bus connection, the KV connection and the
+// runtime-state bucket. On failure it closes whatever it opened, so the next
+// attempt starts clean.
+func (b *Bridge) connectBus(ctx context.Context) error {
+	cfg := b.cfg
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
 		lib.WithLogger(cfg.Logger),
 		lib.WithNATSOptions(cfg.NATSOptions...))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// An async error handler, for the same reason the session executor has one
 	// (worker-adapter/adapter.go) and one this connection made sharper.
@@ -579,29 +648,21 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
-		return nil, fmt.Errorf("kv connection: %w", err)
+		return fmt.Errorf("kv connection: %w", err)
 	}
 	b.js, err = jetstream.New(b.nc)
 	if err != nil {
-		b.close()
-		return nil, fmt.Errorf("kv jetstream: %w", err)
+		b.c.Close()
+		b.nc.Close()
+		return fmt.Errorf("kv jetstream: %w", err)
 	}
 	b.kv, err = b.js.KeyValue(ctx, cfg.KVBucket)
 	if err != nil {
-		b.close()
-		return nil, fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
+		b.c.Close()
+		b.nc.Close()
+		return fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
 	}
-	if err := b.listenActivity(); err != nil {
-		b.close()
-		return nil, err
-	}
-	return b, nil
-}
-
-func (b *Bridge) close() {
-	b.c.Close()
-	b.nc.Close()
-	b.closeActivity()
+	return nil
 }
 
 // Run sweeps orphans from a prior incarnation, then consumes the profile's

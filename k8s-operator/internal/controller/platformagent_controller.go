@@ -1362,6 +1362,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The bus creds Secret before the agent Deployment, which reads two of its
+	// keys from the first render: the bridge's password and the activity-hook
+	// key (a2aBridgeInPod). The A2A stack below ensures it as well, but runs
+	// after the workload, so on a fresh install the first render would digest
+	// the Secret as absent (secretEnvHash) and the next pass, finding it, would
+	// change the pod template and roll the agent a second time (#5962). The
+	// ensure is idempotent: it returns the Secret when it is there.
+	if a2aBridgeInPod(instance) {
+		if _, err := r.ensureA2ACredsSecret(ctx, instance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
+		}
+	}
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}

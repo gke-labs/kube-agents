@@ -219,7 +219,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
 
    The A2A gateway creates a session pod only for a conversation switched to `/session` or a message that starts with `delegate`; other tasks run in the agent pod. It runs up to `spec.harness.tuning.maxSessions` (10 by default) at once, and a fresh install has none. The console pod serves the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console), a browser page over the bus with a chat pane, reached with `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`.
 
-5. **Check the agent's bridge.** The operator adds a `hermes-bridge` container to the agent pod once the bus is provisioned, so the `platform-agent-gateway` pod is replaced once during a first boot. The bridge takes tasks off the bus and runs them on the agent's API server.
+5. **Check the agent's bridge.** The agent pod carries a `hermes-bridge` container from its first start. Until the bus is provisioned, it waits for it and logs that it's waiting. The bridge takes tasks off the bus and runs them on the agent's API server.
 
    ```bash
    kubectl get deployment platform-agent-gateway -n kubeagents-system -o jsonpath='{.spec.template.spec.containers[*].name}{"\n"}'

@@ -209,15 +209,16 @@ func TestARenderedBridgeAtItsDefaultIsBudgetedAtTheRenderedDefault(t *testing.T)
 	}
 }
 
-// Before the bus is provisioned the bridge has nothing to connect to and would
-// crash-loop the agent pod through bring-up, so it is withheld from the pod.
-// The TASKS budget counts it anyway, so the first provisioning Job is sized for
-// the bridge that will arrive and does not re-render when it does.
-func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) {
+// The bridge is in the pod from the first render, before the bus is
+// provisioned: it waits for the bus instead of exiting, so the pod template
+// does not change when provisioning completes and a fresh install rolls the
+// agent once (#5962). The TASKS budget counts it from the start too, so the
+// first provisioning Job is sized for it and nothing re-renders.
+func TestTheRenderedBridgeIsInThePodAndBudgetedFromTheStart(t *testing.T) {
 	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "6")
 	agent := a2aTestAgent()
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("the bridge is in the pod before the bus is provisioned (%d containers)", len(got))
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 1 {
+		t.Errorf("before provisioning the pod has %d bridge containers, want 1", len(got))
 	}
 	if n := a2aBridgeConcurrency(agent); n != 6 {
 		t.Errorf("before provisioning the budget reads %d workers, want the 6 the bridge will run", n)
@@ -228,7 +229,7 @@ func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) 
 		t.Errorf("after provisioning the pod has %d bridge containers, want 1", len(got))
 	}
 	if a2aProvisionScript(agent) != before {
-		t.Error("the provision script changed when the bridge arrived; the Job would re-render")
+		t.Error("the provision script changed when the bus was provisioned; the Job would re-render")
 	}
 }
 

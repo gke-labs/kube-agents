@@ -56,11 +56,12 @@ func TestActivityHookRendersOnlyWithABridge(t *testing.T) {
 		sidecars []corev1.Container
 		want     bool
 	}{
-		// No declared bridge and no bus yet: the rendered bridge is not
-		// in the pod, so there is no door to post to.
-		// TestARenderedBridgeGetsTheHookOnceInThePod covers the rest.
-		{"without sidecars", nil, false},
-		{"with another sidecar", other, false},
+		// No declared bridge: the operator renders its own, which is in the
+		// pod from the first render, bus provisioned or not (#5962), so the
+		// hook renders. TestARenderedBridgeGetsTheHookFromTheFirstRender
+		// covers the rest.
+		{"without sidecars", nil, true},
+		{"with another sidecar", other, true},
 		{"with a bridge", bridge, true},
 		{"with an api bridge", bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
 		{"with the door at its default", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:8651"}), true},
@@ -159,12 +160,14 @@ func TestARenderedCliBridgeGetsNoHook(t *testing.T) {
 	}
 }
 
-// The rendered bridge, on the shipped api executor, gets the hook once it is
-// in the pod (bus provisioned), and not before.
-func TestARenderedBridgeGetsTheHookOnceInThePod(t *testing.T) {
+// The rendered bridge, on the shipped api executor, is in the pod from the
+// first render, bus provisioned or not, and so is the hook (#5962): a delivery
+// before the bridge has reached the bus is refused at a closed door and
+// dropped by hermes's fire-and-forget queue, which blocks no turn.
+func TestARenderedBridgeGetsTheHookFromTheFirstRender(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("next")}}
-	if a2aActivityHookWanted(agent) {
-		t.Error("the hook rendered before the bridge was in the pod")
+	if !a2aActivityHookWanted(agent) {
+		t.Error("the rendered api bridge is in the pod before provisioning and the hook did not render")
 	}
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
 	if !a2aActivityHookWanted(agent) {

@@ -138,13 +138,20 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	if err := realMain(ctx, log); err != nil {
-		if errors.Is(err, errUsage) {
-			return exitUsage
-		}
+	return exitCode(realMain(ctx, log))
+}
+
+// exitCode maps realMain's result to the process exit: usage for a missing
+// or malformed environment, failure for anything else, zero for a clean stop.
+func exitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, errUsage):
+		return exitUsage
+	default:
 		return exitFailure
 	}
-	return 0
 }
 
 // managedScopeDir is hermes's managed scope as this process sees it, the

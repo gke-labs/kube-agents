@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -41,24 +42,43 @@ func TestRunMapsUsageErrorToExitUsage(t *testing.T) {
 	}
 }
 
-// Every failure after the environment is read is the failure exit, not the
-// usage exit and not a clean zero: a bridge that cannot reach the bus must
-// show as Error in the pod, not Completed. The dial is the first such
-// failure a test can reach without a bus.
-func TestRunMapsDialFailureToExitFailure(t *testing.T) {
+// A bus that is not there yet is waited for, not exited on (#5962): the
+// operator renders the bridge from the first pass, before the provisioning Job
+// has run, and a bridge that exited would crash-loop the agent pod. realMain
+// keeps trying until its context ends, and that end is the failure exit, not
+// the usage exit and not a clean zero.
+func TestRealMainWaitsForAnUnreachableBusUntilItsContextEnds(t *testing.T) {
 	t.Setenv("NATS_URL", unreachableNATSURL)
 	t.Setenv("NATS_USER", "")
 	t.Setenv(apiServerKeyEnv, "loopback-key")
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	err := realMain(context.Background(), log)
-	if !errors.Is(err, nats.ErrNoServers) {
-		t.Fatalf("realMain against %s returned %v, want a wrapped nats.ErrNoServers", unreachableNATSURL, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := realMain(ctx, log)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("realMain against %s returned %v, want it to wait until its context ended", unreachableNATSURL, err)
 	}
-	if errors.Is(err, errUsage) {
-		t.Fatalf("realMain dial failure %v satisfies errUsage; it must not", err)
+	if waited := time.Since(start); waited < time.Second {
+		t.Fatalf("realMain gave up on the bus after %s; it must wait for it", waited)
 	}
-	if got := run(); got != exitFailure {
-		t.Errorf("run() = %d, want %d", got, exitFailure)
+	if got := exitCode(err); got != exitFailure {
+		t.Errorf("exitCode(%v) = %d, want %d", err, got, exitFailure)
+	}
+}
+
+func TestExitCodeMapsEachResult(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{nil, 0},
+		{fmt.Errorf("bad env: %w", errUsage), exitUsage},
+		{errors.New("anything else"), exitFailure},
+	} {
+		if got := exitCode(tc.err); got != tc.want {
+			t.Errorf("exitCode(%v) = %d, want %d", tc.err, got, tc.want)
+		}
 	}
 }
 
@@ -77,10 +97,15 @@ func TestRunAPIExecutorWithoutKey(t *testing.T) {
 	if err == nil || errors.Is(err, nats.ErrNoServers) || !strings.Contains(err.Error(), "APIKey") {
 		t.Fatalf("realMain with %s=api and no %s returned %v, want the missing-key refusal before any dial", executorEnv, apiServerKeyEnv, err)
 	}
+	// Without a key, cli and the unset default get past the environment to
+	// the bus, which is not there and is waited for (#5962) until ctx ends.
 	for _, executor := range []string{"cli", ""} {
 		t.Setenv(executorEnv, executor)
-		if err := realMain(context.Background(), log); !errors.Is(err, nats.ErrNoServers) {
-			t.Fatalf("realMain with %s=%q and no key returned %v, want the dial failure", executorEnv, executor, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		err := realMain(ctx, log)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("realMain with %s=%q and no key returned %v, want it to reach the bus and wait for it", executorEnv, executor, err)
 		}
 	}
 }
