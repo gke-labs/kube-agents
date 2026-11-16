@@ -55,13 +55,41 @@ class SessionResourcesRenderTest(unittest.TestCase):
     values file's float reaches the CRD's int-or-string quantity as a string, and a null leaf
     dropped (Helm's way to unset a key)."""
 
+    def _helm(self, values: str, *extra: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "values.yaml"
+            path.write_text(values)
+            return subprocess.run(["helm", "template", "t", str(_CHART), *_REQUIRED, "-f", str(path), *extra],
+                                  capture_output=True, text=True, check=False)
+
     def _render(self, values: str) -> str:
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write(values)
-        proc = subprocess.run(["helm", "template", "t", str(_CHART), *_REQUIRED, "-f", f.name],
-                              capture_output=True, text=True, check=False)
+        proc = self._helm(values)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout
+
+    @staticmethod
+    def _one(side: str, name: str, value: str) -> str:
+        return (f"platformAgent:\n  harness:\n    tuning:\n      sessionResources:\n"
+                f"        {side}:\n          {name}: {value}\n")
+
+    def test_a_value_the_operator_cannot_read_is_refused(self):
+        # 1e.5 passes the CRD's pattern, is stored, and then fails resource.ParseQuantity on
+        # every decode of the PlatformAgent. The schema refuses it first, and the template's
+        # own check refuses it when schema validation is skipped.
+        for value in ['"1e.5"', '"2GB"', '"lots"', '"1.5.0"']:
+            for extra in ((), ("--skip-schema-validation",)):
+                with self.subTest(value=value, extra=extra):
+                    proc = self._helm(self._one("limits", "memory", value), *extra)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])
+                    self.assertIn("sessionResources", proc.stderr)
+
+    def test_a_signed_or_exponent_quantity_renders(self):
+        # The resolver treats zero and negative as unset, so they pass through; an integer
+        # exponent is a quantity resource.ParseQuantity reads.
+        for value, want in [('"-1Gi"', '"-1Gi"'), ('"+384Mi"', '"+384Mi"'), ('"1e3"', '"1e3"'), ("0", '"0"')]:
+            with self.subTest(value=value):
+                out = self._render(self._one("requests", "cpu", value))
+                self.assertIn(f"cpu: {want}", out)
 
     def test_a_float_is_quoted_and_a_null_leaf_dropped(self):
         out = self._render("platformAgent:\n  harness:\n    tuning:\n      sessionResources:\n"
