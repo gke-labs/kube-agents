@@ -2547,10 +2547,13 @@ with `views.publish`: a dashboard of five panels, with no model in the loop (`sl
 Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
 gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
 and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
-every Cluster Agent profile's cluster and any cluster a finding names (under `spec.mode: next`, the resolved scope's clusters instead, read through
-`fleet_scope_targets.list_scope_clusters` with no profile read, #3658), with the findings queue's open findings for each, the worst 15 listed beside the total; under `next`,
-one `unlisted` row per kind for the projects the scope holds no cluster list for (`(clusters not listed here)` for the projects listed live,
-`(clusters unread)` for the unread ones), which the cap and the total leave out and the tab draws as `⚪ health unknown`, never green; the running
+the managed clusters and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total. Under
+`spec.mode: next` (#3658) a member project's clusters are the resolved scope's, read through `fleet_scope_targets.list_scope_clusters` with no profile
+read; the projects the scope lists live (the management and explicit projects) keep their Cluster Agent profiles' clusters until those retire, the
+profiles walk filtered to those projects. Outside `next` every Cluster Agent profile's cluster is listed. One `unlisted` row per kind stands for the
+projects the board holds no cluster list for (`(clusters not listed here)` for a project listed live that no profile names, `(clusters unread)` for the
+unread members); the cap and the total leave it out, and the tab draws it as `⚪ health unknown`, never green, and heads a board of only such rows
+`No clusters listed`, never `0 clusters`. A running card's cluster label comes from the same identities. Then the running
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
 store; and `first_report_pending` while onboarding has filed its sweep, its first report is not out
 (the findings nudge's own marker pair, `findings_nudge.first_report_markers`: the delivery claim, or
