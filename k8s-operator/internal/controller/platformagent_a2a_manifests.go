@@ -170,9 +170,13 @@ const (
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
 	// on every running next install, rolling the NATS pod and minting a new
-	// provision Job for the same image.
+	// provision Job for the same image. Pinned by exact version and the
+	// digest of its multi-arch OCI index, like the reloader and the exporter:
+	// a floating tag would let two installs a day apart run different servers.
+	// A bump changes this string, images.json and the docs table together,
+	// and rolls every running bus once.
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
-	defaultA2ANATSImage     = "nats:2.10-alpine"
+	defaultA2ANATSImage     = "nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"

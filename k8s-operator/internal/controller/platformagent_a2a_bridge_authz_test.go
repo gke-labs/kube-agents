@@ -199,7 +199,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 		t.Fatal("embedded nats-server did not come up")
 	}
 	// The evidence names the server it came from: the module pin here and
-	// the image tag the operator deploys are independent, and the tag floats.
+	// the image the operator deploys (pinned by tag and digest) are
+	// independent, so their server versions can differ.
 	t.Logf("embedded nats-server %s (the operator deploys %s)", natsserver.VERSION, defaultA2ANATSImage)
 	return s, log
 }
