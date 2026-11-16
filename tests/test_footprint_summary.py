@@ -187,6 +187,16 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertNotEqual(_expected_lines(req)["total"], _expected_lines(default_req)["total"])
         self.assertIn(_expected_lines(default_req)["total"], default_notes)
 
+    def test_the_summary_sizes_the_session_pods_at_the_cap(self) -> None:
+        """#6028: the session line gives the share at maxSessions from the same requirements."""
+        notes, req = self._render()
+        self.assertIn(
+            "At the cap of 10 they request 2.500 cores and 5.00 GiB over 10 pods,"
+            " which a namespace ResourceQuota needs room for too.", notes)
+        notes, req = self._render(["platformAgent.harness.tuning.maxSessions=4"])
+        self.assertEqual(req["sessionRequestsCpu"], 4 * 250)
+        self.assertIn("At the cap of 4 they request 1.000 cores and 2.00 GiB over 4 pods", notes)
+
     def test_the_summary_names_what_it_leaves_out(self) -> None:
         notes, req = self._render()
         self._assert_summary_matches(notes, req)

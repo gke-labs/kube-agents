@@ -430,7 +430,8 @@ class PreflightDecisionTest(unittest.TestCase):
         original = footprint.read_text()
         try:
             data = yaml.safe_load(original)
-            data.pop("operatorRenderedPerReplica")
+            # The session pod's entry is required on every render, so drop the tier's alone.
+            data["operatorRenderedPerReplica"].pop("credentialProxyExecTier")
             footprint.write_text(yaml.safe_dump(data))
             self.assertEqual(self._render({"probe": {"emitRequirements": True}}).returncode, 0)
             res = self._render({"probe": {"emitRequirements": True}}, [f"{_EXEC_VALUE}=1"])
@@ -438,6 +439,112 @@ class PreflightDecisionTest(unittest.TestCase):
             self.assertIn("operatorRenderedPerReplica.credentialProxyExecTier", res.stderr)
         finally:
             footprint.write_text(original)
+
+    # The session pods (#6028): the gateway creates up to maxSessions of them at run time.
+    _SESSION_KEYS = {
+        "sessionPods": "pods",
+        "sessionRequestsCpu": "cpuMillisRequest", "sessionLimitsCpu": "cpuMillisLimit",
+        "sessionRequestsMemory": "memoryBytesRequest", "sessionLimitsMemory": "memoryBytesLimit",
+        "sessionRequestsEphemeral": "ephemeralStorageBytesRequest",
+        "sessionLimitsEphemeral": "ephemeralStorageBytesLimit",
+    }
+
+    def _session_pod(self) -> dict:
+        return yaml.safe_load(_FOOTPRINT.read_text())["operatorRenderedPerReplica"]["sessionPod"]
+
+    def test_the_session_share_is_one_footprint_pod_times_the_default_cap(self) -> None:
+        pod = self._session_pod()
+        req = self._requirements()
+        self.assertEqual(req["maxSessions"], pod["maxSessionsDefault"])
+        for key, field in self._SESSION_KEYS.items():
+            with self.subTest(key=key):
+                self.assertEqual(req[key], pod["maxSessionsDefault"] * pod[field])
+        # The figures the gateway runs today (spawn.go): 250m and 512Mi requested, 2 CPU
+        # and 2Gi limits, 1088Mi ephemeral, ten at once. A footprint that stopped reading
+        # them would move both sides of the loop above; this pins the numbers.
+        self.assertEqual(req["sessionRequestsCpu"], 10 * 250)
+        self.assertEqual(req["sessionLimitsCpu"], 10 * 2000)
+        self.assertEqual(req["sessionRequestsMemory"], 10 * 512 * 1024**2)
+        self.assertEqual(req["sessionLimitsMemory"], 10 * 2 * 1024**3)
+        self.assertEqual(req["sessionRequestsEphemeral"], 10 * 1088 * 1024**2)
+
+    def test_max_sessions_scales_the_session_share(self) -> None:
+        pod = self._session_pod()
+        for count in (0, 3, 40):
+            with self.subTest(count=count):
+                req = self._requirements([f"platformAgent.harness.tuning.maxSessions={count}"])
+                self.assertEqual(req["maxSessions"], count)
+                for key, field in self._SESSION_KEYS.items():
+                    self.assertEqual(req[key], count * pod[field], key)
+
+    def test_a_session_resources_override_moves_the_share_by_the_cap_times_the_delta(self) -> None:
+        base = self._requirements(["platformAgent.harness.tuning.maxSessions=4"])
+        req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 4,
+            "sessionResources": {"requests": {"cpu": "150m", "memory": "256Mi"},
+                                 "limits": {"cpu": "1", "memory": None}},
+        }}}})
+        self.assertEqual(req["sessionRequestsCpu"] - base["sessionRequestsCpu"], 4 * (150 - 250))
+        self.assertEqual(req["sessionRequestsMemory"] - base["sessionRequestsMemory"], 4 * (256 - 512) * 1024**2)
+        self.assertEqual(req["sessionLimitsCpu"] - base["sessionLimitsCpu"], 4 * (1000 - 2000))
+        # A null leaf is unset, so the default stands; ephemeral storage is not overridable.
+        self.assertEqual(req["sessionLimitsMemory"], base["sessionLimitsMemory"])
+        self.assertEqual(req["sessionRequestsEphemeral"], base["sessionRequestsEphemeral"])
+
+    def test_a_limit_below_the_default_request_lowers_the_request_to_it(self) -> None:
+        """ResolveSessionResources: per key, then a request above its limit drops to it."""
+        req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 2,
+            "sessionResources": {"limits": {"memory": "256Mi", "cpu": "100m"}},
+        }}}})
+        self.assertEqual(req["sessionLimitsMemory"], 2 * 256 * 1024**2)
+        self.assertEqual(req["sessionRequestsMemory"], 2 * 256 * 1024**2)
+        self.assertEqual(req["sessionLimitsCpu"], 2 * 100)
+        self.assertEqual(req["sessionRequestsCpu"], 2 * 100)
+
+    def test_the_session_share_stays_out_of_the_totals_while_the_gate_is_off(self) -> None:
+        """kube-agents.quotaCountsSessions is false: the share is reported, not compared."""
+        base = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
+        req = self._requirements(["platformAgent.harness.tuning.maxSessions=20"])
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory", "limitsMemory",
+                    "requestsEphemeral", "limitsEphemeral"):
+            self.assertEqual(req[key], base[key], key)
+
+    def test_with_the_gate_on_the_totals_carry_the_session_share(self) -> None:
+        """Flipping kube-agents.quotaCountsSessions adds exactly the session* keys."""
+        gate = self.chart / "templates" / "_0-session-gate.tpl"
+        gate.write_text('{{- define "kube-agents.quotaCountsSessions" -}}\ntrue\n{{- end }}\n')
+        try:
+            off = self._requirements(["platformAgent.harness.tuning.maxSessions=0"])
+            on = self._requirements(["platformAgent.harness.tuning.maxSessions=6"])
+        finally:
+            gate.unlink()
+        for total, key in (("pods", "sessionPods"), ("requestsCpu", "sessionRequestsCpu"),
+                           ("limitsCpu", "sessionLimitsCpu"), ("requestsMemory", "sessionRequestsMemory"),
+                           ("limitsMemory", "sessionLimitsMemory"),
+                           ("requestsEphemeral", "sessionRequestsEphemeral"),
+                           ("limitsEphemeral", "sessionLimitsEphemeral")):
+            with self.subTest(total=total):
+                self.assertGreater(on[key], 0)
+                self.assertEqual(on[total] - off[total], on[key])
+
+    def test_a_footprint_without_the_session_pod_fails_the_render(self) -> None:
+        footprint = self.chart / "files" / "footprint.yaml"
+        original = footprint.read_text()
+        try:
+            data = yaml.safe_load(original)
+            data["operatorRenderedPerReplica"].pop("sessionPod")
+            footprint.write_text(yaml.safe_dump(data))
+            res = self._render({"probe": {"emitRequirements": True}})
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("operatorRenderedPerReplica.sessionPod", res.stderr)
+        finally:
+            footprint.write_text(original)
+
+    def test_an_operator_only_release_counts_no_sessions(self) -> None:
+        req = self._requirements(["platformAgent.enabled=false"])
+        for key in ("maxSessions", *self._SESSION_KEYS):
+            self.assertEqual(req[key], 0, key)
 
     def test_exec_tier_replicas_that_do_not_fit_the_quota_fail_the_render(self) -> None:
         base = self._requirements()

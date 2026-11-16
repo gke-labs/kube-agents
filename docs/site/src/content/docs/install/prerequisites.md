@@ -153,6 +153,8 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
 | Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
 
+The session pods at the default cap of 10 add 10 pods, 2500m CPU and 5Gi memory requested, 20 CPU and 20Gi memory in limits, and 10880Mi of ephemeral storage: one `a2a-worker` row below per session. A namespace ResourceQuota needs room for them on top of the totals, and `spec.harness.tuning.maxSessions` scales them.
+
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
 The A2A stack, per pod:
