@@ -197,7 +197,7 @@ in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make
 probes the agent pods for both containers and reads the sandbox first.
 
 Under `mode: next` a profile worker runs in a pod with no PVC, so the store is also served over the
-network, to the credential broker and to nothing else (#5619; the broker's routes follow). `audit_report_store.py` listens on
+network, to the credential broker and to nothing else (#5619). `audit_report_store.py` listens on
 port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
 volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
 store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
@@ -221,6 +221,8 @@ directory step is relative to an open directory and refuses a symlink (409), bec
 `platform-agent` container writes the same volume as the same user; a read opens non-blocking and
 takes regular files of at most 1 MiB alone, and a write holds a lock on its store directory. A ring write prunes to 14, and
 `latest` must be a byte-identical copy of a ring entry. Today mode renders none of this.
+
+The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker refused) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the install's GitOps repository key or `no_forge%2Flocal`; the platform agent's shell reads every stream and writes to those keys alone; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, and logs the method, path, caller and status of each request, never a token or a body. The exec tier doesn't serve these routes.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it

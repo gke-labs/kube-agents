@@ -185,6 +185,7 @@ one pod's CPU is one limit.
 | `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                                                                                                                        |
 | `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                                                                                                                      |
 | `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                                                                                                              |
+| `/v1/audit-reports*` (#5619)                                | Stateful broker                                               | The exec tier has no audit-report store token (`credential_proxy_exec_tier.go` drops it), so an exec pod answers these routes 404                                          |
 
 Two route groups need the single pod: the chat relays' event, ack and nack routes, and the
 `scope` role's `/v1/exec` calls (#4119), whose member window lives in one process. The content
