@@ -310,6 +310,12 @@ spec:
                     - idempotencyKey
                     - slotTime
                   type: object
+                postFailed:
+                  description: |-
+                    PostFailed counts runs whose report the gateway couldn't post to chat
+                    after its redeliveries (Delivery post_failed).
+                  format: int64
+                  type: integer
                 recentRuns:
                   description: RecentRuns are the last ten runs, newest first.
                   items:
@@ -318,6 +324,20 @@ spec:
                       completionTime:
                         description: CompletionTime is when it ended.
                         format: date-time
+                        type: string
+                      delivery:
+                        description: |-
+                          Delivery is how its report was delivered, once that is final: posted,
+                          stored for want of a home channel, kept local, silent when clean, not
+                          delivered, or post_failed when the gateway gave up posting it. Empty
+                          until the gateway reports a final value, and on a run it never does.
+                        enum:
+                          - no_delivery
+                          - local
+                          - silent
+                          - stored_no_home
+                          - posted
+                          - post_failed
                         type: string
                       outcome:
                         description: Outcome is how it ended.

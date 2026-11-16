@@ -180,6 +180,8 @@ func TestTheTrackerReadsARunsEndFromTheGateway(t *testing.T) {
 		{"failed", triggerStatusReplyWire{Found: true, State: "failed", Terminal: true},
 			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: time.Unix(1763100500, 0)}},
 		{"gone", triggerStatusReplyWire{Found: false}, ScheduleTaskState{Found: false}},
+		{"delivered", triggerStatusReplyWire{Found: true, State: "completed", Terminal: true, Delivery: "posted"},
+			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: time.Unix(1763100500, 0), Delivery: "posted"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var asked triggerStatusWire

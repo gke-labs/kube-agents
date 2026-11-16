@@ -313,4 +313,9 @@ type TriggerStatusReply struct {
 	// EndedAt is when it ended, when Terminal.
 	EndedAt string          `json:"endedAt,omitempty"`
 	Refused *TriggerRefusal `json:"refused,omitempty"`
+	// Delivery is how the run's report was delivered, from the gateway's
+	// scheduled-reports store: no_delivery, local, silent, stored_no_home,
+	// posting (still in flight), posted or post_failed. Omitted while there
+	// is no record. The reconciler keeps asking while it reads posting.
+	Delivery string `json:"delivery,omitempty"`
 }

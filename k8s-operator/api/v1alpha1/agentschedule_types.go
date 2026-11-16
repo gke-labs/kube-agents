@@ -58,6 +58,18 @@ const (
 	AgentScheduleOutcomeLost = "Lost"
 )
 
+// How a run's report was delivered, as the gateway's scheduled-reports store
+// records it (Track 3). Every value but posting is final.
+const (
+	AgentScheduleReportNone         = "no_delivery"
+	AgentScheduleReportLocal        = "local"
+	AgentScheduleReportSilent       = "silent"
+	AgentScheduleReportStoredNoHome = "stored_no_home"
+	AgentScheduleReportPosting      = "posting"
+	AgentScheduleReportPosted       = "posted"
+	AgentScheduleReportPostFailed   = "post_failed"
+)
+
 // AgentScheduleProfileRef names the AgentProfile a schedule's runs go to.
 type AgentScheduleProfileRef struct {
 	// Name is the AgentProfile's name, in the schedule's namespace.
@@ -207,6 +219,13 @@ type AgentScheduleRun struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Outcome is how it ended.
 	Outcome string `json:"outcome"`
+	// Delivery is how its report was delivered, once that is final: posted,
+	// stored for want of a home channel, kept local, silent when clean, not
+	// delivered, or post_failed when the gateway gave up posting it. Empty
+	// until the gateway reports a final value, and on a run it never does.
+	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed
+	// +optional
+	Delivery string `json:"delivery,omitempty"`
 }
 
 // AgentScheduleStatus is the schedule's run state. It is the run ledger: no
@@ -250,6 +269,10 @@ type AgentScheduleStatus struct {
 	// SkipCounts counts slots that did not run.
 	// +optional
 	SkipCounts AgentScheduleSkipCounts `json:"skipCounts,omitempty"`
+	// PostFailed counts runs whose report the gateway couldn't post to chat
+	// after its redeliveries (Delivery post_failed).
+	// +optional
+	PostFailed int64 `json:"postFailed,omitempty"`
 	// RecentRuns are the last ten runs, newest first.
 	// +kubebuilder:validation:MaxItems=10
 	// +optional

@@ -124,6 +124,9 @@ type ScheduleTaskState struct {
 	Outcome string
 	// CompletedAt is when it ended.
 	CompletedAt time.Time
+	// Delivery is how its report was delivered (an AgentScheduleReport*
+	// value), or empty while the gateway has no record of it.
+	Delivery string
 }
 
 // ScheduleTaskTracker reports on a run in flight.
@@ -362,6 +365,8 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	if st.ActiveTaskID != "" {
 		r.trackActive(ctx, sched, now, pass)
 	}
+	// 1b. Runs that ended: how was each one's report delivered?
+	r.trackDeliveries(ctx, sched, now)
 
 	// 2. A claimed slot the gateway has not taken yet (a retry, or a
 	// restart between the claim and the status write after it).
@@ -466,11 +471,64 @@ func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv
 	}
 	switch {
 	case state.Found && state.Terminal:
+		taskID := st.ActiveTaskID
 		r.settle(pass, sched, state.Outcome, state.CompletedAt)
+		recordDelivery(st, taskID, state.Delivery)
 	case !state.Found:
 		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
 	case st.ActiveTaskStartedAt != nil && now.Sub(st.ActiveTaskStartedAt.UTC()) > deadline+agentScheduleLostGrace:
 		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+	}
+}
+
+// agentScheduleDeliveryWindow is how long after a run ends the reconciler
+// keeps asking how its report was delivered: the relay's redeliveries finish
+// well inside it, and past it the run keeps an empty Delivery.
+const agentScheduleDeliveryWindow = 10 * time.Minute
+
+// awaitingDelivery reports whether run ended recently enough, and with a task
+// the gateway may still hold, for its delivery to be asked after.
+func awaitingDelivery(run agentv1alpha1.AgentScheduleRun, active string, now time.Time) bool {
+	return run.Delivery == "" && run.TaskID != active && run.CompletionTime != nil &&
+		run.Outcome != agentv1alpha1.AgentScheduleOutcomeLost &&
+		now.Sub(run.CompletionTime.UTC()) <= agentScheduleDeliveryWindow
+}
+
+// trackDeliveries asks the gateway, for each recent run still awaiting it, how
+// its report was delivered, and records a final answer. A run settles when it
+// ends, so this never holds up the next slot.
+func (r *AgentScheduleReconciler) trackDeliveries(ctx context.Context, sched *agentv1alpha1.AgentSchedule, now time.Time) {
+	st := &sched.Status
+	for i := range st.RecentRuns {
+		if !awaitingDelivery(st.RecentRuns[i], st.ActiveTaskID, now) {
+			continue
+		}
+		state, err := r.Tracker.State(ctx, sched, st.RecentRuns[i].TaskID)
+		if err != nil {
+			logf.FromContext(ctx).Error(err, "reading a scheduled run's delivery", "schedule", sched.Name, "task", st.RecentRuns[i].TaskID)
+			return
+		}
+		recordDelivery(st, st.RecentRuns[i].TaskID, state.Delivery)
+	}
+}
+
+// recordDelivery stores delivery on taskID's run when it is final and one the
+// status's enum admits, once, counting post_failed. posting, empty or an
+// unknown spelling leaves the run as it was.
+func recordDelivery(st *agentv1alpha1.AgentScheduleStatus, taskID, delivery string) {
+	switch delivery {
+	case agentv1alpha1.AgentScheduleReportNone, agentv1alpha1.AgentScheduleReportLocal, agentv1alpha1.AgentScheduleReportSilent,
+		agentv1alpha1.AgentScheduleReportStoredNoHome, agentv1alpha1.AgentScheduleReportPosted, agentv1alpha1.AgentScheduleReportPostFailed:
+	default:
+		return
+	}
+	for i := range st.RecentRuns {
+		if st.RecentRuns[i].TaskID == taskID && st.RecentRuns[i].Delivery == "" {
+			st.RecentRuns[i].Delivery = delivery
+			if delivery == agentv1alpha1.AgentScheduleReportPostFailed {
+				st.PostFailed++
+			}
+		}
 	}
 }
 
@@ -592,6 +650,11 @@ func (r *AgentScheduleReconciler) requeueAfter(sched *agentv1alpha1.AgentSchedul
 	}
 	if sched.Status.ActiveTaskID != "" && agentScheduleActivePoll < d {
 		d = agentScheduleActivePoll
+	}
+	for _, run := range sched.Status.RecentRuns {
+		if awaitingDelivery(run, sched.Status.ActiveTaskID, now) && agentScheduleActivePoll < d {
+			d = agentScheduleActivePoll
+		}
 	}
 	if d < time.Second {
 		d = time.Second

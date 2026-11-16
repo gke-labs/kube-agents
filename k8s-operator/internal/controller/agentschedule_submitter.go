@@ -112,6 +112,7 @@ type triggerStatusReplyWire struct {
 	Terminal bool                `json:"terminal,omitempty"`
 	EndedAt  string              `json:"endedAt,omitempty"`
 	Refused  *triggerRefusalWire `json:"refused,omitempty"`
+	Delivery string              `json:"delivery,omitempty"`
 }
 
 // errTriggerRefused is a refusal that isn't worth retrying at the next slot:
@@ -212,7 +213,7 @@ func (s *natsScheduleSubmitter) State(ctx context.Context, sched *agentv1alpha1.
 	if r := reply.Refused; r != nil {
 		return ScheduleTaskState{}, fmt.Errorf("%w: status refused (%s): %s", ErrScheduleGatewayUnavailable, r.Reason, r.Detail)
 	}
-	state := ScheduleTaskState{Found: reply.Found, Terminal: reply.Terminal}
+	state := ScheduleTaskState{Found: reply.Found, Terminal: reply.Terminal, Delivery: reply.Delivery}
 	if reply.Terminal {
 		state.Outcome = scheduleOutcomeFor(reply.State)
 		state.CompletedAt = s.now()

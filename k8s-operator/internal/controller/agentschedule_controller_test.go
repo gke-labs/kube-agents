@@ -685,3 +685,58 @@ func TestAgentScheduleAnUnchangedPassWritesNoStatus(t *testing.T) {
 		t.Fatalf("an idle pass wrote status: resourceVersion %s -> %s", before, after)
 	}
 }
+
+// How a run's report was delivered (Track 3): a final value on the terminal
+// is recorded at once; posting is asked after on later passes, inside the
+// window, without holding the next slot; post_failed is counted once; an
+// unknown spelling and anything past the window leave the run as it was.
+func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
+	ended := func(delivery string) ScheduleTaskState {
+		return ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: hourAt(1, 20), Delivery: delivery}
+	}
+	t.Run("final on the terminal", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosted)
+		f.at(t, hourAt(1, 21))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPosted || s.Status.PostFailed != 0 {
+			t.Fatalf("status = %+v", s.Status)
+		}
+	})
+	t.Run("posting, then post_failed", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosting)
+		res := f.at(t, hourAt(1, 21))
+		s := f.get(t)
+		if s.Status.ActiveTaskID != "" || s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("posting: the run is settled with no delivery yet; status = %+v", s.Status)
+		}
+		if res.RequeueAfter > agentScheduleActivePoll {
+			t.Errorf("requeue %v while a delivery is awaited, want at most %v", res.RequeueAfter, agentScheduleActivePoll)
+		}
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPostFailed)
+		f.at(t, hourAt(1, 23))
+		f.at(t, hourAt(1, 24))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPostFailed || s.Status.PostFailed != 1 {
+			t.Fatalf("post_failed: want it recorded and counted once; status = %+v", s.Status)
+		}
+	})
+	t.Run("unknown, then past the window", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended("bounced")
+		f.at(t, hourAt(1, 21))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("an unknown spelling was recorded: %+v", s.Status.RecentRuns[0])
+		}
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosted)
+		f.at(t, hourAt(1, 20).Add(agentScheduleDeliveryWindow+time.Minute))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("a delivery was asked after past the window: %+v", s.Status.RecentRuns[0])
+		}
+	})
+}
