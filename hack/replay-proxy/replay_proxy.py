@@ -517,6 +517,8 @@ def unstorable_reasons(
         reasons.append(F.UNSTORABLE_UNBOUND_IDENTIFIER)
     if any(mapping.answer_names_dropped_file(t) for t in texts):
         reasons.append(F.UNSTORABLE_NAMES_DROPPED_FILE)
+    if any(mapping.answer_talks_about_dropped_queue(t) for t in texts):
+        reasons.append(F.UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE)
     if any(mapping.has_timestamp(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
     # Read after the swap: a timestamp the answer copied from the request is a

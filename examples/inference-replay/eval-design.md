@@ -234,6 +234,24 @@ The rules that keep this safe:
   same small number would refuse about one answer in five after a queued card, and none of the
   64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
   queued event.
+- **The front door's `kanban_create` queue fields are dropped from the key.** When the new card's
+  class has no free worker slot at that moment, the result carries `"queued": true` and
+  `"queue": {"running": N, "limit": M}`, and neither key otherwise; the card is created `ready`
+  either way, and the thread hears about the wait from the dispatcher's queued event above, not
+  from the model. So in a tool message answering a `kanban_create` call, a result holding
+  `task_id` and `subscribed` keys the same queued or not, also when Hermes has appended a warning
+  after it. Any other tool's result, and any other JSON holding `queued`, keeps it. In 9,780
+  front-door answers after a create (4,281 queued) none mentioned a queue, so the model does not
+  read the fields. `running` and `limit` count against an answer as a dropped queued event's
+  payload numbers do. And when the dropped `queued` was true, an answer that talks about a queue or
+  a slot at all ("queued", "frees up", "slot", "in use", "board is full", "waiting for a worker")
+  isn't saved, with or without a number: served to a run whose card had a free slot, it would
+  announce a wait that run doesn't have. That is the only direction the drop opens that could
+  mislead: an answer recorded without the fields came from a model never told of a wait, and a
+  queued run's thread hears of its wait from the dispatcher, so nothing more is checked at replay.
+  It would refuse none of the 4,358 answers that came straight after a queued create in the Nov 6–14
+  nightly and presubmit stores, nor any of the up to twelve answers after each before the next user
+  turn.
 - **A missing file's list of similar names is dropped from the key.** When `read_file` can't find
   a file, Hermes lists up to five names like it from the same directory (`similar_files`), as the
   directory stood at that moment, and leaves the list out when nothing is like it. Whether another

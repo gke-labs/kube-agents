@@ -1129,6 +1129,122 @@ class SimilarFilesTest(unittest.TestCase):
         self.assertFalse(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-21-notes.md"}'))
 
 
+def created(queued=None, running=5, limit=5, task_id="t_d07508c5"):
+    """The front door's kanban_create result as Hermes returns it: kanban_priority's queue fields when `queued` is True.
+
+    `queued` False writes a bare `"queued": false`, which queue_fields never does, to show it reads as no wait.
+    """
+    result = {"ok": True, "task_id": task_id, "status": "ready", "workspace_kind": "scratch", "workspace_path": None,
+              "project_id": None, "subscribed": True}
+    if queued is not None:
+        result["queued"] = queued
+    if queued:
+        result["queue"] = {"running": running, "limit": limit}
+    return json.dumps(result)
+
+
+def create_conversation(content, tool_name="kanban_create", call_id="call_1__thought__Y3Jl", answered=None):
+    """A front-door request whose last message is `content`, returned by a call to `tool_name`."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"title": "triage seeded-a", "assignee": "platform"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "triage seeded-a"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": answered or call_id, "content": content},
+    ]}
+
+
+class KanbanCreateQueueTest(unittest.TestCase):
+    NOTICE = "\n\n[Tool loop warning: same_tool_failure_warning; count=3; kanban_create has failed 3 times this turn.]"
+
+    def mapping(self, content, **kwargs):
+        return normalizer.normalize_request(create_conversation(content, **kwargs), NOW).mapping
+
+    def test_a_create_result_keys_alike_queued_or_not(self):
+        keys = {fp(create_conversation(created(queued))) for queued in (True, False, None)}
+        keys.add(fp(create_conversation(created(True, running=4))))
+        self.assertEqual(len(keys), 1)
+
+    def test_the_rest_of_the_result_still_counts(self):
+        self.assertNotEqual(fp(create_conversation(created(True))),
+                            fp(create_conversation(created(True).replace('"ready"', '"todo"'))))
+        walked = normalizer.normalize_request(create_conversation(created(True)), NOW)
+        self.assertNotIn("queue", walked.messages[-1]["content"])
+
+    def test_a_notice_hermes_appended_keeps_the_fields_dropped(self):
+        keys = {fp(create_conversation(created(queued) + self.NOTICE)) for queued in (True, None)}
+        self.assertEqual(len(keys), 1)
+        self.assertNotEqual(fp(create_conversation(created(True) + self.NOTICE)),
+                            fp(create_conversation(created(True) + "\n\nanother notice")))
+        self.assertTrue(self.mapping(created(True) + self.NOTICE).create_queued)
+
+    def test_another_tools_result_keeps_its_fields(self):
+        self.assertNotEqual(fp(create_conversation(created(True), tool_name="kanban_show")),
+                            fp(create_conversation(created(None), tool_name="kanban_show")))
+        self.assertFalse(self.mapping(created(True), tool_name="kanban_show").create_queued)
+
+    def test_a_result_answering_no_create_call_keeps_its_fields(self):
+        # The call is matched by id: a tool message naming another call is not read as kanban_create's.
+        self.assertNotEqual(fp(create_conversation(created(True), answered="call_2")),
+                            fp(create_conversation(created(None), answered="call_2")))
+        mapping = self.mapping(created(True), answered="call_2")
+        self.assertFalse(mapping.create_queued)
+        self.assertEqual(mapping.dropped_counts, set())
+
+    def test_a_result_that_is_no_create_result_keeps_its_fields(self):
+        other = {"ok": True, "task_id": "t_d07508c5", "queued": True, "queue": {"running": 5, "limit": 5}}
+        self.assertNotEqual(fp(create_conversation(json.dumps(other))),
+                            fp(create_conversation(json.dumps({"ok": True, "task_id": "t_d07508c5"}))))
+        self.assertEqual(normalizer.without_queue_fields(json.dumps(other)), (json.dumps(other), False, None))
+        self.assertFalse(self.mapping(json.dumps(other)).create_queued)
+
+    def test_a_result_with_nothing_to_drop_keeps_its_text(self):
+        content = created(None)
+        self.assertIs(normalizer.without_queue_fields(content)[0], content)
+        self.assertEqual(normalizer.without_queue_fields("<persisted-output>"), ("<persisted-output>", False, None))
+        mapping = self.mapping(content)
+        self.assertFalse(mapping.create_queued)
+        self.assertEqual(mapping.dropped_counts, set())
+
+    def test_only_a_queued_result_marks_the_request(self):
+        self.assertTrue(self.mapping(created(True)).create_queued)
+        self.assertFalse(self.mapping(created(False)).create_queued)
+        self.assertFalse(self.mapping(created(None)).create_queued)
+        # A queue block without `queued: true` is not what queue_fields writes; it is read as a wait.
+        for odd in ({"queue": {"running": 5, "limit": 5}}, {"queued": False, "queue": {"running": 5, "limit": 5}},
+                    {"queued": "yes"}):
+            with self.subTest(odd=odd):
+                self.assertTrue(normalizer.without_queue_fields(json.dumps(dict(odd, task_id="t_1", subscribed=True)))[1])
+
+    def test_the_dropped_counts_count_against_an_answer(self):
+        mapping = self.mapping(created(True, running=4, limit=5))
+        self.assertEqual(mapping.dropped_counts, {"4", "5"})
+        self.assertEqual(mapping.dropped_count_keys, {"running", "limit"})
+        for answer in ("queued behind 4 running", "running: 4", "limit 5"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+        self.assertFalse(mapping.answer_repeats_bare_number("Checking all 5 clusters."))
+        self.assertFalse(self.mapping(created(None)).answer_repeats_bare_number("queued behind 4 running"))
+
+    def test_an_answer_talking_about_the_queue_counts_only_after_a_queued_create(self):
+        talks = ("It's queued and will start when a worker frees up.", "waiting for a slot (5 of 5 in use)",
+                 "queued behind 5 running", "The board is full right now.", "It is waiting for a worker.")
+        quiet = ("I'm checking all 3 clusters.", "Checking seeded-a now.", "[silent]")
+        queued, unqueued, absent = self.mapping(created(True)), self.mapping(created(False)), self.mapping(created(None))
+        for answer in talks:
+            with self.subTest(answer=answer):
+                self.assertTrue(queued.answer_talks_about_dropped_queue(answer))
+                self.assertFalse(unqueued.answer_talks_about_dropped_queue(answer))
+                self.assertFalse(absent.answer_talks_about_dropped_queue(answer))
+        for answer in quiet:
+            with self.subTest(answer=answer):
+                self.assertFalse(queued.answer_talks_about_dropped_queue(answer))
+
+    def test_the_mark_survives_a_copy(self):
+        self.assertTrue(self.mapping(created(True)).copy().create_queued)
+        self.assertTrue(normalizer.normalize_request(create_conversation(created(True)), NOW).history_mapping.create_queued)
+
+
 def spent_notice(number, revision, outcome="The repository no longer holds the branch, so the name is free."):
     """submit_suggestion prepare's output after it found a spent proposal on the branch (`clear_spent_branch`)."""
     return json.dumps({"output": (

@@ -650,6 +650,61 @@ class SimilarFilesTest(AnalyzeCase):
         self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
 
 
+class KanbanCreateQueueTest(AnalyzeCase):
+    """A front door's kanban_create result matches its recording whether its card waited for a slot or not."""
+
+    @staticmethod
+    def body(queued, running=5):
+        call = {"id": "call_1__thought__Y3Jl", "type": "function",
+                "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-a"})}}
+        result = {"ok": True, "task_id": "t_d07508c5", "status": "ready", "workspace_kind": "scratch",
+                  "workspace_path": None, "project_id": None, "subscribed": True}
+        if queued is not None:
+            result["queued"] = queued
+        if queued:
+            result["queue"] = {"running": running, "limit": 5}
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "triage seeded-a"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__Y3Jl", "content": json.dumps(result)},
+        ]}
+
+    TALKS = ("It's queued and will start when a worker frees up.", "waiting for a slot (5 of 5 in use)",
+             "queued behind 5 running")
+
+    def test_the_ack_is_served_whether_or_not_the_card_waited(self):
+        for recorded, replayed in ((True, None), (None, True), (True, False)):
+            with self.subTest(recorded=recorded, replayed=replayed):
+                self.setUp()
+                answer = {"role": "assistant", "content": "I'm checking seeded-a."}
+                self.assertEqual(self.recorded(self.body(recorded), answer)["unstorable"], [])
+                hit, refused = self.proxy().lookup(self.body(replayed), time.time())
+                self.assertIsNone(refused)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[3], "exact")
+                self.assertEqual(hit[0]["content"], "I'm checking seeded-a.")
+
+    def test_an_answer_talking_about_the_wait_is_not_stored_after_a_queued_create(self):
+        # Served to a run whose card had a free slot, it would announce a wait that run does not have.
+        for said in self.TALKS:
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(True), {"role": "assistant", "content": said})
+                self.assertIn("talks_about_dropped_queue", line["unstorable"])
+                self.assertIsNone(self.proxy().lookup(self.body(None), time.time())[0])
+
+    def test_the_count_guard_still_refuses_a_quoted_count(self):
+        line = self.recorded(self.body(True), {"role": "assistant", "content": "queued behind 5 running"})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number", "talks_about_dropped_queue"])
+
+    def test_the_same_words_are_stored_after_a_create_that_did_not_wait(self):
+        for queued in (False, None):
+            for said in self.TALKS:
+                with self.subTest(queued=queued, said=said):
+                    self.setUp()
+                    self.assertEqual(self.recorded(self.body(queued), {"role": "assistant", "content": said})["unstorable"], [])
+
+
 class SpentProposalTest(AnalyzeCase):
     """An earlier run's proposal number and revision in submit_suggestion's notice don't fork the key."""
 
