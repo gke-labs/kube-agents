@@ -296,5 +296,118 @@ class TestMain(unittest.TestCase):
         self.assertFalse(out["decision"]["allowed"])
 
 
+class TestWithDeny(unittest.TestCase):
+    LAYOUTS = {
+        "block deny": GOOD + "# trailing comment\n",
+        "no deny": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments:\n        - dev\n        - qa\n# end\n",
+        "empty deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n",
+        "flow empty deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: []\n",
+        "flow deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: [{fix: '*', environments: [prod]}]\n",
+        "flow automerge, no newline": "version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}]}",
+        "deny first, wide dash": "version: 1\nautomerge:\n  deny:\n  -   fix: '*'\n      environments: [prod]\n  allow:\n  - fix: no-pdb\n    environments: [dev]\n",
+        "bare dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n    -\n      fix: '*'\n      environments: [prod]\n",
+        "comment after dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n  - # why\n    fix: '*'\n    environments: [prod]\n",
+        "flow deny, trailing comma": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: [{fix: '*', environments: [prod]},]\n",
+        "flow automerge, trailing comma": "version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}],}\n",
+        "numeric environment": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: ['1']}]\n",
+        "no automerge": "# mine\nversion: 1\n",
+        "empty automerge": "version: 1\nautomerge:\n",
+    }
+
+    def test_every_layout_gains_exactly_the_deny(self):
+        for name, text in self.LAYOUTS.items():
+            env = "1" if "numeric" in name else "dev"
+            with self.subTest(name):
+                before = ar.parse(text)
+                out = ar.with_deny(text, "no-pdb", env, "x/pull/7 was still broken")
+                after = ar.parse(out)
+                self.assertEqual(after.status, ar.LOADED, after.error)
+                self.assertFalse(ar.decide(after, "no-pdb", env).allowed)
+                self.assertEqual(after.allow, before.allow)
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", (env,)),))
+                # Everything the customer wrote is still there, in order: whole
+                # lines in a block file, characters in a flow one.
+                kept = iter(out.splitlines() if "flow" not in name else out)
+                for piece in text.splitlines() if "flow" not in name else text:
+                    self.assertIn(piece, kept)
+
+    def test_note_is_a_comment_in_block_files(self):
+        out = ar.with_deny(GOOD, "no-pdb", "dev", "x/pull/7\nwas still broken")
+        self.assertIn("    # x/pull/7 was still broken\n    - fix: \"no-pdb\"", out)
+
+    def test_refusals(self):
+        for name, text in {
+            "invalid file": "version: 2\n",
+            "null deny keyword": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: ~\n",
+        }.items():
+            with self.subTest(name), self.assertRaises(ar.RulesError):
+                ar.with_deny(text, "no-pdb", "dev")
+
+    def test_an_alias_never_moves_an_allow_rule_into_deny(self):
+        # The alias's node keeps its anchor's marks, which point into `allow`.
+        for name, text in {
+            "no deny": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
+                       "    - fix: no-pdb\n      environments: *dev\n",
+            "deny ends in an alias": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
+                                     "    - fix: no-pdb\n      environments: [qa]\n  deny:\n    - fix: '*'\n      environments: *dev\n",
+        }.items():
+            with self.subTest(name):
+                before = ar.parse(text)
+                self.assertEqual(before.status, ar.LOADED, before.error)
+                try:
+                    out = ar.with_deny(text, "no-pdb", "prod")
+                except ar.RulesError:
+                    continue
+                after = ar.parse(out)
+                self.assertEqual(after.allow, before.allow)
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("prod",)),))
+
+
+class TestWithAllow(unittest.TestCase):
+    def test_every_layout_gains_exactly_the_allow(self):
+        for name, text in TestWithDeny.LAYOUTS.items():
+            with self.subTest(name):
+                before = ar.parse(text)
+                after = ar.parse(ar.with_allow(text, "no-pdb", "staging"))
+                self.assertEqual(after.status, ar.LOADED, after.error)
+                self.assertEqual(after.allow, before.allow + (ar.Rule("no-pdb", ("staging",)),))
+                self.assertEqual(after.deny, before.deny)
+
+    def test_new_file_allows_exactly_one(self):
+        rules = ar.parse(ar.new_file("no-pdb", "dev"))
+        self.assertEqual(rules.status, ar.LOADED)
+        self.assertEqual(rules.allow, (ar.Rule("no-pdb", ("dev",)),))
+        self.assertEqual(rules.deny, ())
+        self.assertTrue(ar.decide(rules, "no-pdb", "dev").allowed)
+
+    def test_an_allow_a_deny_overrides_is_refused(self):
+        text = "version: 1\nautomerge:\n  deny: [{fix: '*', environments: [dev]}]\n"
+        with self.assertRaisesRegex(ar.RulesError, "already denies"):
+            ar.with_allow(text, "no-pdb", "dev")
+
+    def test_a_bad_argument_says_why(self):
+        with self.assertRaisesRegex(ar.RulesError, "bogus"):
+            ar.with_allow("version: 1\n", "bogus", "dev")
+
+    def test_a_layout_that_cannot_take_the_rule_is_one_line(self):
+        for section, text in (
+            ("allow", "version: 1\nautomerge: ~\n"),
+            ("deny", "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: ~\n"),
+        ):
+            with self.subTest(section):
+                edit = ar.with_allow if section == "allow" else ar.with_deny
+                with self.assertRaises(ar.RulesError) as caught:
+                    edit(text, "no-pdb", "qa")
+                self.assertIn("this layout", str(caught.exception))
+                self.assertNotIn("\n", str(caught.exception))
+
+    def test_every_known_fix_type_has_a_name(self):
+        self.assertEqual(set(ar.FIX_TYPE_NAMES), set(ar.KNOWN_FIX_TYPES))
+
+    def test_a_flow_root_without_automerge_is_refused(self):
+        with self.assertRaises(ar.RulesError):
+            ar.with_allow("{version: 1}\n", "no-pdb", "dev")
+
+
 if __name__ == "__main__":
     unittest.main()

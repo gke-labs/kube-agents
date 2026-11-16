@@ -52,8 +52,8 @@ REGISTRY_STAND_IN = (
     "        self.seen = []\n"
     "    def record_dispatch_tick(self, board, error_class):\n"
     "        self.seen.append((board, error_class))\n"
-    "    def record_dispatch_tick_start(self, board):\n"
-    "        self.seen.append(('start', board))\n"
+    "    def record_dispatch_tick_start(self, board, tick=False):\n"
+    "        self.seen.append(('start', board, tick))\n"
     "    def record_dispatch_tick_end(self, board):\n"
     "        self.seen.append(('end', board))\n"
     "REGISTRY = _R()\n"
@@ -118,12 +118,12 @@ def check_helper(root: Path) -> None:
         sys.modules.pop(f"{PLUGIN_PACKAGE}.{PLUGIN_MODULE}", None)
         _reset(lookup, plugins)
         failure = type(FAILURE_CLASS, (Exception,), {})()
-        helper.record_tick_start(BOARD)
+        helper.record_tick_start(BOARD, tick=True)
         helper.record_tick(BOARD, failure)
         helper.record_tick(BOARD)
         helper.record_tick_end(BOARD)
         seen = getattr(lookup._registry, "seen", None)
-        want = [("start", BOARD), (BOARD, FAILURE_CLASS), (BOARD, ""), ("end", BOARD)]
+        want = [("start", BOARD, True), (BOARD, FAILURE_CLASS), (BOARD, ""), ("end", BOARD)]
         if seen != want:
             raise _fail(f"record_tick recorded {seen!r}, expected {want!r}")
     print("kanban-dispatch-failures verify: the helper records on a reachable registry and nothing without one")

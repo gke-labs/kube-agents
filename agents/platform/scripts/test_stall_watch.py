@@ -515,7 +515,7 @@ class Base(unittest.TestCase):
         conn.executescript(BOARD_SCHEMA)
         conn.close()
         env = {stall_watch.PROJECT_ENVS[0]: PROJECT, "PLATFORM_AGENT_HOME": self.tmp.name}
-        for var in (stall_watch.KINDS_ENV, stall_watch.EXCLUDE_NAMESPACES_ENV, stall_watch.MIN_AGE_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, *stall_watch.PROJECT_ENVS[1:]):
+        for var in (stall_watch.KINDS_ENV, stall_watch.EXCLUDE_NAMESPACES_ENV, stall_watch.MIN_AGE_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, stall_watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV, *stall_watch.PROJECT_ENVS[1:]):
             env[var] = ""
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -559,7 +559,7 @@ class Base(unittest.TestCase):
             home.mkdir(parents=True, exist_ok=True)
             (home / "config.yaml").write_text(yaml.safe_dump({"cluster_identity": {"project": project, "cluster": name, "location": location}}))
 
-    def run_tick(self, fleet, unmanaged=(), now=None, **kw):
+    def run_tick(self, fleet, unmanaged=(), now=None, dry_run=False, **kw):
         """Every cluster in the fleet has a Cluster Agent profile unless
         `unmanaged` names it, the way the reconciler prunes one. `now` pins
         the tick's clock, for tests about the order of first sightings.
@@ -572,7 +572,7 @@ class Base(unittest.TestCase):
                 self.scaffold(name, location=location, project=project)
         before = len(self.kv.alerts)
         with patch.object(stall_watch, "run_sandbox", fake), patch.object(stall_watch, "now_iso", side_effect=lambda: now or stall_watch.datetime.now(stall_watch.timezone.utc).replace(microsecond=0).isoformat()):
-            lines = stall_watch.tick(self.state, dry_run=False)
+            lines = stall_watch.tick(self.state, dry_run=dry_run)
         self.last_alerts = self.kv.alerts[before:]
         return lines, fake
 
@@ -2217,6 +2217,42 @@ class ClusterRead(Base):
         self.assertEqual(len(whole), 4)
 
 
+class EmptyCluster(Base):
+    """A cluster with no namespace to watch asks for no kind, so the watch
+    skips the served-kinds call and the wildcard discovery there, and still
+    records the cluster as read (#5542)."""
+
+    def cluster_calls(self, fake, name):
+        """Every call on the cluster after its credential fetch, kubectl or a read."""
+        return [argv[:3] for argv, kubeconfig, _ in fake.calls if kubeconfig and argv[:1] != ["gcloud"] and fake._cluster_from(kubeconfig)[1] == name]
+
+    def test_a_cluster_with_no_namespace_to_watch_gets_only_its_listing(self):
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments," + stall_watch.KCC_KINDS_WILDCARD}):
+            _, fake = self.run_tick({"full": {"payments": []}, "empty": {}}, served=KCC_SERVED, objects=KCC_OBJECTS, namespaces_extra=["kube-system"])
+        self.assertEqual(self.cluster_calls(fake, "empty"), [["kubectl", "get", "namespaces"]], "no api-resources and no discovery")
+        full = self.cluster_calls(fake, "full")
+        self.assertIn(["kubectl", "api-resources", "--namespaced=true"], full, "a cluster with a namespace to watch still asks")
+        self.assertTrue(fake.discoveries(), "and its wildcard discovery still runs")
+        timing = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("empty")]
+        self.assertEqual((timing[stall_watch.TIMING_NAMESPACES_KEY], timing[stall_watch.TIMING_SCANS_KEY], timing[stall_watch.TIMING_CUT_KEY]), (0, 0, False))
+        self.assertNotIn(cid("empty"), self.ledger()["unreadable"])
+
+    def test_a_cluster_whose_namespaces_are_all_excluded_closes_its_card_as_excluded_without_the_kinds_call(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            lines, fake = self.run_tick(fleet, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.cluster_calls(fake, "c"), [["kubectl", "get", "namespaces"]])
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: the namespace was excluded from the watch; card `{tid}` closed"])
+
+    def test_a_failing_kinds_call_cannot_make_an_empty_cluster_unreadable(self):
+        served = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        self.run_tick({"full": {"ns": []}, "empty": {}}, served=served)
+        self.assertEqual(set(self.ledger()["unreadable"]), {cid("full")}, "the empty cluster makes no such call")
+
+
 class Parallel(Base):
     """Clusters are read SCAN_WORKERS at a time, and the ledger does not
     depend on the order they finish in."""
@@ -2909,6 +2945,160 @@ class Projects(Base):
     def test_a_domain_scoped_project_splits_back_out_of_its_key(self):
         project = "example.com:proj"
         self.assertEqual(stall_watch.split_cluster_id(stall_watch.cluster_id(project, "c", LOCATION)), (project, "c", LOCATION))
+
+
+class ResolvedScope(Base):
+    """Under spec.mode: next (#5621) the resolved scope names the fleet: the
+    management and explicit projects are listed live, a member project's
+    clusters come from the scope publisher's list, and a cluster in scope and
+    not excluded is swept whether or not it has a Cluster Agent profile."""
+
+    MEMBER = "member-proj"
+    UNREAD = "member-unread"
+    GHOST = "ghost-proj"
+
+    def next_mode(self, exclude_clusters=()):
+        render = {"present": True, "projects": [], "folders": ["1"],
+                  "exclude": {"clusters": [{"projectId": p, "location": l, "clusterName": c} for p, l, c in exclude_clusters]}}
+        (self.home / "scope.json").write_text(json.dumps(render))
+        document = {"v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((self.home / "scope.json").read_text())), "excludedProjects": [],
+                    "projects": [{"id": self.MEMBER, "via": ["folders/1"], "outcome": "ok"}, {"id": self.UNREAD, "via": ["folders/1"], "outcome": "denied"}],
+                    "clusters": {self.MEMBER: {"at": "2026-11-10T12:00:00Z", "clusters": [[LOCATION, "m"]]}}}
+        (self.home / "resolved-scope.json").write_text(json.dumps(document))
+        patcher = patch.dict(os.environ, {stall_watch.fleet_scope_targets.SCOPE_FILE_ENV: str(self.home / "scope.json"),
+                                          stall_watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(self.home / "resolved-scope.json")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def listed(self, fake):
+        return [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "list"]]
+
+    def test_members_come_from_the_resolved_scope_and_no_profile_is_needed(self):
+        self.next_mode()
+        # A profile naming another project: the walk would list it; next mode does not walk.
+        self.scaffold("g", project=self.GHOST)
+        fleet = {"c": {"storefront": []}, f"{self.MEMBER}:m": {"checkout": []}, f"{self.GHOST}:g": {"web": []}}
+        with patch.object(stall_watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")):
+            lines, fake = self.run_tick(fleet, unmanaged=("c", "m"))
+        self.assertEqual(self.listed(fake), [f"--project={PROJECT}"], "only the management project is listed live")
+        self.assertEqual(sorted(fake.scanned()), ["checkout", "storefront"])
+        unreadable = self.ledger()["unreadable"]
+        self.assertNotIn(cid("c"), unreadable, "no profile is not a gap in next mode")
+        self.assertNotIn(cid("m", project=self.MEMBER), unreadable)
+        self.assertIn("denied", unreadable[f"{stall_watch.LISTING_SCOPE} {self.UNREAD}"])
+        self.assertIsNone(self.ledger()["sweep_error"])
+
+    def test_an_excluded_cluster_is_not_read_and_not_a_gap(self):
+        self.next_mode(exclude_clusters=[(self.MEMBER, LOCATION, "m"), (PROJECT, LOCATION, "c")])
+        lines, fake = self.run_tick({"c": {"storefront": []}, f"{self.MEMBER}:m": {"checkout": []}}, unmanaged=("c", "m"))
+        self.assertEqual(fake.scanned(), [])
+        unreadable = self.ledger()["unreadable"]
+        self.assertNotIn(cid("c"), unreadable)
+        self.assertNotIn(cid("m", project=self.MEMBER), unreadable)
+
+    def test_a_stall_with_no_cluster_agent_to_alert_is_said_once_not_dropped(self):
+        # Next mode sweeps a cluster with no Hermes profile; with no profile to
+        # assign the alert to, it is said in chat once while it stays stalled,
+        # not written to stderr the scheduler discards (#5622 moves the alert
+        # to the cluster profile).
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.last_alerts, [])
+        said = [l for l in lines if stall_watch.UNROUTED_MARK in l]
+        self.assertEqual(len(said), 1, lines)
+        self.assertIn("storefront", said[0])
+        again, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-02T13:00:00+00:00")
+        self.assertEqual([l for l in again if stall_watch.UNROUTED_MARK in l], [], "an unchanged set is said once")
+
+    def unrouted(self, lines):
+        return [l for l in lines if stall_watch.UNROUTED_MARK in l]
+
+    def test_an_unrouted_stall_is_not_said_again_after_an_unread_tick(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"))
+        self.assertEqual(len(self.unrouted(lines)), 1, lines)
+        # The member goes unread for a tick: its rows are held, not cleared.
+        (self.home / "resolved-scope.json").write_text("{not json")
+        self.run_tick(fleet, unmanaged=("c", "m"))
+        self.next_mode()
+        again, _ = self.run_tick(fleet, unmanaged=("c", "m"))
+        self.assertEqual(self.unrouted(again), [], "the same stall, held through an unread tick, is not news")
+
+    def test_a_partly_cleared_unrouted_set_is_not_said_again(self):
+        self.next_mode()
+        both = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS, "checkout": [DEPLOYMENT_ROW]}}
+        lines, _ = self.run_tick(both, unmanaged=("c", "m"))
+        self.assertEqual(len(self.unrouted(lines)), 1, lines)
+        one = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS, "checkout": []}}
+        again, _ = self.run_tick(one, unmanaged=("c", "m"))
+        self.assertEqual(self.unrouted(again), [], "storefront was already said")
+
+    def test_the_unrouted_line_names_clusters_and_promises_no_clear(self):
+        self.next_mode()
+        both = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS, "checkout": [DEPLOYMENT_ROW]}}
+        with patch.object(stall_watch, "MAX_OBJECTS_IN_LINE", 1):
+            lines, _ = self.run_tick(both, unmanaged=("c", "m"))
+        said = self.unrouted(lines)
+        self.assertEqual(len(said), 1, lines)
+        member_scope = stall_watch.scope_key(cid("m", project=self.MEMBER), "checkout")
+        self.assertIn(stall_watch.scope_label_text(member_scope), said[0])
+        self.assertNotIn(member_scope, said[0], "no raw scope key")
+        self.assertIn("and 1 more", said[0])
+        self.assertNotIn("cleared when", said[0])
+
+    def test_a_dry_run_does_not_say_it_would_alert_a_cluster_with_no_profile(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), dry_run=True)
+        self.assertFalse(any("would raise an alert for" in l for l in lines), lines)
+        said = self.unrouted(lines)
+        self.assertEqual(len(said), 1, lines)
+        self.assertTrue(said[0].startswith(stall_watch.DRY_RUN_PREFIX))
+
+    def test_an_unrouted_stall_at_the_cap_is_said_as_unrouted_not_promised_an_alert(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), patch.object(stall_watch, "MAX_ALERTS_PER_TICK", 0):
+                lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), dry_run=dry_run)
+                self.assertFalse(any("alerts follow" in l for l in lines), lines)
+                self.assertEqual(len(self.unrouted(lines)), 1, lines)
+
+    def test_an_unrouted_stall_that_still_holds_an_episode_is_said_once(self):
+        # Alerted while the cluster had a profile; the card never came, the
+        # alert expired, and the profile has gone since.
+        self.next_mode()
+        self.kv.file_cards = False
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": [DEADLINE_ROW]}}
+        self.run_tick(fleet, unmanaged=("c",), now="2026-10-02T12:00:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1)
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(len(self.unrouted(lines)), 1, lines)
+        again, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-03T12:30:00+00:00")
+        self.assertEqual(self.unrouted(again), [], "said once while it stays stalled")
+
+    def test_an_excluded_member_cluster_leaves_the_roster(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        self.run_tick(fleet, unmanaged=("c", "m"))
+        self.next_mode(exclude_clusters=[(self.MEMBER, LOCATION, "m")])
+        self.run_tick(fleet, unmanaged=("c", "m"))
+        sweep_cid = cid("m", project=self.MEMBER)
+        self.assertEqual([e for e in self.ledger()["stalls"].values() if e["cluster"] == sweep_cid], [],
+                         "an excluded cluster's rows go")
+        self.assertNotIn(sweep_cid, self.ledger()["unreadable"])
+
+    def test_an_unreadable_document_holds_member_rows_instead_of_clearing_them(self):
+        self.next_mode()
+        self.run_tick({"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": [DEPLOYMENT_ROW]}}, unmanaged=("c", "m"))
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("m", project=self.MEMBER)})
+        (self.home / "resolved-scope.json").write_text("{not json")
+        lines, fake = self.run_tick({"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": []}}, unmanaged=("c", "m"))
+        self.assertEqual(self.cleared(lines), [])
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("m", project=self.MEMBER)})
+        self.assertIn(f"{stall_watch.LISTING_SCOPE} {stall_watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW}", self.ledger()["unreadable"])
 
 
 class Knobs(Base):

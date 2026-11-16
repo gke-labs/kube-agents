@@ -686,5 +686,39 @@ class ShardTest(unittest.TestCase):
         self.assertEqual(_failed(done.stdout), SHARD_BAD)
 
 
+class WorkerEnvironmentTest(unittest.TestCase):
+    """What the sweep's worker gives each test file besides its command."""
+
+    def test_each_file_runs_with_an_empty_kubeconfig_of_its_own(self):
+        """A kubeconfig the shell exports, like the default one, must not be what
+        an unstubbed kubectl or helm call in a test reads. Two files get two
+        paths, so a context one test writes cannot reach the file beside it."""
+        probe = (
+            "include Makefile\n"
+            "sweep-probe:\n"
+            "\t@$(call sweep_python_test_files,sh -c "
+            '"echo kubeconfig=$$KUBECONFIG ; test -f $$KUBECONFIG && test ! -s $$KUBECONFIG && echo it-is-empty ; true"'
+            " probe)\n"
+        )
+        with fixture_files() as (green, red), tempfile.NamedTemporaryFile("w") as inherited:
+            inherited.write("current-context: a-developers-cluster\n")
+            inherited.flush()
+            done = _with_wrapper(
+                probe,
+                "sweep-probe",
+                [f"PYTHON_TEST_FILES={green} {red}", "PYTHON_TEST_JOBS=2"],
+                extra_env={"KUBECONFIG": inherited.name},
+            )
+            self.assertNotEqual(pathlib.Path(inherited.name).read_text(), "")
+        paths = []
+        for file in (green, red):
+            self.assertIn(f"==> {file}", done.stdout, done.stdout + done.stderr)
+            block = _block(done.stdout, file)
+            self.assertIn("it-is-empty", block)
+            paths += re.findall(r"^kubeconfig=(.+)$", block, re.MULTILINE)
+        self.assertEqual(len(set(paths)), 2, paths)
+        self.assertNotIn(inherited.name, paths)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,8 @@ replies short", "Write replies as warm, full sentences that lead with the fact")
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 ("Short by default") and §7. The
 layout is `answer_message` in `agents/platform/scripts/chat_message.py` and its port `answerChat`
 in `a2a/hermes-bridge/chat.go`: the first sentence becomes `headline`, cut at a clause to stay
-within 150 characters and rendered bold, and a rest too long for `detail` goes under `fold`.
+within 150 characters, or at a word with an ellipsis the detail then opens with when no clause
+fits, and rendered bold, and a rest too long for `detail` goes under `fold`.
 
 ## The acknowledgement names its target
 

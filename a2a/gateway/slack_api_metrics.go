@@ -81,3 +81,13 @@ func (m *Metrics) slackIngress(now time.Time, ts string) {
 	lag := float64(now.UnixNano())/float64(time.Second) - secs
 	m.slackIngressLag.WithLabelValues().Observe(max(lag, 0))
 }
+
+// slackFirstAck observes an ask's time to its first receipt, from arrived (the
+// adapter's receipt, InboundMessage.ArrivedAt) to now. A zero arrival (an
+// adapter that does not set it) observes nothing.
+func (m *Metrics) slackFirstAck(arrived, now time.Time) {
+	if m == nil || arrived.IsZero() {
+		return
+	}
+	m.slackFirstAckSecs.WithLabelValues().Observe(max(now.Sub(arrived).Seconds(), 0))
+}

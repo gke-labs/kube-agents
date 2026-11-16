@@ -325,6 +325,23 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
             self.assertIn(name, env, f"platform_control's env block does not pass {name}, which `a2a notify` reads")
             self.assertEqual(env[name], "${%s}" % name)
 
+    def test_the_notify_platform_entries_track_what_chat_notify_reads(self):
+        """Both notify-platform lists reach the child.
+
+        `routed_platforms()` reads `A2A_NOTIFY_PLATFORM` and
+        `gateway_platforms()` reads `A2A_NOTIFY_CONVERSATIONS`, each a
+        comma-separated list of platform names. Without the second, the child
+        reads no gateway platform, so `routed_platforms()` never derives Slack
+        from a learned home channel and the post goes through Hermes instead.
+        """
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import chat_notify
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in (chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV):
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}, which chat_notify reads")
+            self.assertEqual(env[name], "${%s}" % name)
+
 
 if __name__ == "__main__":
     unittest.main()

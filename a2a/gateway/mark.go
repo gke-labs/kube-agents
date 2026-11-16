@@ -159,13 +159,14 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 // nothing. Every route's asks get it, the session route's and a profile's
 // included, whose executors mark nothing of their own. The executor's marks
 // and the terminal take over from there. It reports whether anything was
-// drawn; the caller holds the session lock.
-func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) bool {
+// drawn, and whether the reaction landed (its call succeeded); the caller
+// holds the session lock.
+func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) (drawn, landed bool) {
 	i := rec.markingRootIndex(taskID)
 	if i < 0 || rec.Tasks[i].Mark != nil {
-		return false
+		return false, false
 	}
-	return g.drawMark(rec, i, MarkState{Ask: askkind.Kind(text)})
+	return g.drawMarkLanded(rec, i, MarkState{Ask: askkind.Kind(text)})
 }
 
 // applyTerminalMark is the default for the newest task ending with no mark
@@ -387,8 +388,16 @@ func (rec *SessionRecord) sessionMarkHeld(bounded bool) MarkState {
 // state still advances, so a reaction refused once (a missing scope) is not
 // retried on every event.
 func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
+	changed, _ := g.drawMarkLanded(rec, i, next)
+	return changed
+}
+
+// drawMarkLanded is drawMark, also reporting whether every reaction call it
+// made succeeded (false when one failed; true when it changed nothing).
+func (g *Gateway) drawMarkLanded(rec *SessionRecord, i int, next MarkState) (changed, landed bool) {
+	landed = true
 	if i < 0 || i >= len(rec.Tasks) || rec.Tasks[i].AskMessageID == "" {
-		return false
+		return false, landed
 	}
 	ref := &rec.Tasks[i]
 	prev := MarkState{}
@@ -396,17 +405,19 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 		prev = *ref.Mark
 	}
 	if prev == next {
-		return false
+		return false, landed
 	}
 	session := rec.sessionMark()
 	remove, add := markDiff(prev, next)
 	for _, t := range remove {
 		if err := g.adapter.RemoveReaction(rec.Key, ref.AskMessageID, t); err != nil {
+			landed = false
 			g.log.Warn("mark: removing a reaction failed", "conversation", rec.Key, "token", t, "err", err)
 		}
 	}
 	for _, t := range add {
 		if err := g.adapter.React(rec.Key, ref.AskMessageID, t); err != nil {
+			landed = false
 			g.log.Warn("mark: adding a reaction failed", "conversation", rec.Key, "token", t, "err", err)
 		}
 	}
@@ -424,5 +435,5 @@ func (g *Gateway) drawMark(rec *SessionRecord, i int, next MarkState) bool {
 			observer.MarkChanged(rec.Key, now.Ask, now.Settle)
 		}
 	}
-	return true
+	return true, landed
 }

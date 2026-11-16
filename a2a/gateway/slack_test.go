@@ -394,6 +394,15 @@ func TestEmptyPrincipalMapBootNotice(t *testing.T) {
 				IdleTTL:          30 * time.Minute,
 				AttributionSalt:  []byte("test-salt"),
 			}
+			// The notices follow the armed backend's credential, not Options.Backend.
+			switch tc.backend {
+			case slackBackend:
+				cfg.SlackBotToken, cfg.SlackAppToken = "xoxb-test", "xapp-test"
+			case discordBackend:
+				cfg.DiscordToken = "x"
+			case gchatBackend:
+				cfg.GchatRelayURL, cfg.GchatAllowAllUsers = "http://relay.invalid", true
+			}
 			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
 				t.Fatalf("New: %v", err)
 			}

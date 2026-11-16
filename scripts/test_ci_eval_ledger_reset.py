@@ -721,11 +721,19 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_a_case_holds_the_streams_it_declares(self):
-        # oobe-first-run-audits grades no ledger, but its stack starts five real
-        # audit runs; it holds their streams, sorted, and is counted on each, so
-        # an audit case waiting behind it on one of them waits long enough.
+        # A case that grades no ledger but whose stack starts real audit runs on
+        # several streams holds them all, sorted, and is counted on each, so an
+        # audit case waiting behind it on one of them waits long enough.
+        starter = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "task.yaml"
+        starter.write_text(
+            "id: starts-five\naudit_streams:\n"
+            + "".join(f"  - {a}\n" for a in (
+                "upgrade-retrospective", "compliance-audit", "stockout-prevention",
+                "fleet-wide-cost-analysis", "obtainability-audit",
+            ))
+        )
         tasks = (
-            "./tasks/oobe-first-run-audits/task.yaml",
+            str(starter),
             "./tasks/compliance-declared-intent-no-finding/task.yaml",
             "./tasks/reliability-pdb-probe/task.yaml",
         )

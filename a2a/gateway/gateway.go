@@ -273,10 +273,10 @@ type Gateway struct {
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
 	consoleResults consoleResultStash
-	// consoleCardsPending marks a console chain end whose task handed work
-	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
-	// the frame (consoleFrame); the value is unused.
-	consoleCardsPending consoleResultStash
+	// beforeBatchChild, when set, runs before each child of a batch is
+	// minted, with the entry's index; true stops the mint there, as a
+	// gateway that died partway through a batch would (tests only).
+	beforeBatchChild func(i int) bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -337,11 +337,9 @@ type Gateway struct {
 	steersRefusedBy map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
-	// message that names none is attributed to. Since the mux and the side
-	// door there are ingresses that name their own - the console adapter
-	// stamps console on every frame it delivers, the inject door stamps
-	// inject - so this is the answer for the configured backend's own
-	// messages rather than for all of them (backendFor).
+	// message that names none is attributed to (backendFor). Behind the mux
+	// every chat message is stamped with its adapter's key, so empty means a
+	// hand-built single-adapter gateway with no mux.
 	backend string
 	// injectAudience is injectPM's inject: section with the prefix removed
 	// and only eval: values kept -- the shape BuildAuthority and hashRoster
@@ -488,12 +486,12 @@ func New(o Options) (*Gateway, error) {
 	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
-	// keep working.
-	switch {
-	case backend == discordBackend && pm.Len() == 0:
+	// keep working. Each armed backend gets its own line, so both can fire.
+	if o.Config.DiscordToken != "" && pm.Len() == 0 {
 		log.Warn("principal map is empty; every discord message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
-	case backend == slackBackend && pm.Len() == 0:
+	}
+	if o.Config.SlackBotToken != "" && pm.Len() == 0 {
 		// Not a warning since the map became an override: every listed
 		// sender is admitted and attributed by member id.
 		log.Info("the Slack principal map is empty; listed senders are attributed by their Slack member id",
@@ -539,7 +537,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
 		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
-	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
+	if o.Config.GchatRelayURL != "" && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	ps := NewPseudonymizer(o.Config.AttributionSalt)
@@ -559,7 +557,7 @@ func New(o Options) (*Gateway, error) {
 			slackAllowed[u] = true
 		}
 	}
-	if backend == slackBackend && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
+	if o.Config.SlackBotToken != "" && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
 		log.Warn("slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	if o.RelayDurable == "" {
@@ -768,6 +766,10 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 		MaxAckPending: relayMaxAckPending,
 		WaitForStream: true,
 		Precreated:    g.relayPrecreated,
+		// The operator moves the relay durable to read the profile
+		// supervisor form too (#5301); either set binds meanwhile.
+		AcceptFilterSets: [][]string{{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor,
+			"a2a.tasks." + lib.TaskProfileSupervisorToken + ".*.*." + lib.TaskClassSupervisor}},
 	}
 }
 
@@ -804,23 +806,14 @@ type RunOptions struct {
 func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
 	t := time.NewTicker(busWatchEvery)
 	defer t.Stop()
-	var downSince time.Time
+	var tracker busDownTracker
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
 		}
-		if g.client.Connected() {
-			downSince = time.Time{}
-			continue
-		}
-		now := time.Now()
-		if downSince.IsZero() {
-			downSince = now
-			continue
-		}
-		if down := now.Sub(downSince); down >= limit {
+		if down, giveUp := tracker.observe(g.client.Connected(), time.Now(), limit); giveUp {
 			// Once per give-up, at Info: during a full outage the lease
 			// cycles between replicas, and each cycle logs this once.
 			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
@@ -829,6 +822,29 @@ func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel cont
 			return err
 		}
 	}
+}
+
+// busDownTracker is watchBus's count of how long the connection has been
+// down without a break, separate from the ticker and the client so the
+// count itself can be tested on a clock the test steps.
+type busDownTracker struct {
+	downSince time.Time
+}
+
+// observe takes one look at the connection at now. A connected look starts
+// the count again; the first disconnected look starts it. It reports how
+// long the connection has been down and whether that reaches limit.
+func (b *busDownTracker) observe(connected bool, now time.Time, limit time.Duration) (time.Duration, bool) {
+	if connected {
+		b.downSince = time.Time{}
+		return 0, false
+	}
+	if b.downSince.IsZero() {
+		b.downSince = now
+		return 0, false
+	}
+	down := now.Sub(b.downSince)
+	return down, down >= limit
 }
 
 // RunWith is Run with the elected gateway's options.
@@ -1455,6 +1471,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
+	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus) && rec.fanOutPending(active.TaskID):
+		// A turn whose batch runs answers from the tree: each child still
+		// running, by addressee and target, with its state.
+		parent, _ := rec.TaskRefFor(active.TaskID)
+		g.answerFanOutStatus(ctx, rec, parent)
 	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case msg.Intent == "" && msg.TopLevel && active == nil && chattext.IsStatusQuery(msg.Text, false):
@@ -1557,6 +1578,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// the running task was granted: refused rather than steered in as
 		// text that asks for a change the task has no permit to make.
 		g.post(rec.Key, noticeTurnNotStarted+noticeConfirmWhileRunning)
+	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
+		// Text while a batch runs steers nothing: the turn that asked has
+		// ended, and which child it was meant for isn't for the gateway to
+		// guess.
+		parent, _ := rec.TaskRefFor(active.TaskID)
+		g.refuseFanOutSteer(rec, parent)
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
 		// "ingress", a heal logs itself, but a steer used to be silent, and
@@ -1726,12 +1753,12 @@ func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
 	}
 }
 
-// backendFor names the ingress one message arrived through. A message that
-// names none is the configured backend's, which is the Discord and Google
-// Chat adapters' case; the inject door and the console adapter stamp their
-// own, because either can be armed beside a real backend and the authority
-// block must say which door a task came in through rather than which backend
-// the process was configured with.
+// backendFor names the ingress one message arrived through. Behind the mux
+// every chat message is stamped with its adapter's key, and the inject door
+// stamps its own; a message that names none comes from a hand-built
+// single-adapter gateway with no mux and is the configured backend's. The
+// authority block says which door a task came in through rather than which
+// backend the process was configured with.
 func (g *Gateway) backendFor(msg InboundMessage) string {
 	if msg.Backend != "" {
 		return msg.Backend
@@ -1772,6 +1799,14 @@ func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
 	if active == nil || active.Detached {
+		return
+	}
+	// A turn whose batch is on the record whole and still running holds the
+	// conversation for its children: they are what is healed, not its own
+	// hand-off line (healFanOut). A batch cut short heals below, where its
+	// request is read back from the stream and finished (delegationHandled).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
+		g.healFanOut(ctx, rec, active, ref)
 		return
 	}
 	// The addressee the task's own subjects carry, as probeConversation
@@ -1840,7 +1875,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// caller classifying a bridge's own failure by its reason token
 		// would grade it as the persona's for the one that came this way.
 		source := TerminalFromExecutor
-		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
+		if lib.IsTaskSupervisorSubject(terminalSubject, addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
 		// The deliverable too, from the stream, for the same program: the
@@ -1854,13 +1889,20 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
+		// A canceled task's card-stop result, the one part of a canceled
+		// result a program's caller is handed (CardStopObserver).
+		if task.State == lib.StateCanceled {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				g.observeCardStop(rec, active.TaskID, art.Parts)
+			}
+		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		// A console client is told the task handed work to cards, as the
 		// relay tells it (relayTerminal): the fold read here carries the
 		// handoff too, so a heal-found end is not the one path without it.
 		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
 			root, _ := rec.observedAs(active.TaskID)
-			g.consoleCardsPending.put(root, "")
+			rec.markCardsPending(root)
 		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
@@ -2053,7 +2095,7 @@ func (g *Gateway) relayLagStart(taskID string, storedAt, now time.Time) time.Tim
 // acts twice.
 func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionRecord, taskID, addressee string, task *lib.Task, terminalSubject string) {
 	source := TerminalFromExecutor
-	if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
+	if lib.IsTaskSupervisorSubject(terminalSubject, addressee, taskID) {
 		source = TerminalFromSupervisor
 	}
 	g.mu.Lock()
@@ -2280,7 +2322,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, read) {
+			if lib.IsTaskSupervisorSubject(terminalSubject, addressee, read) {
 				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
@@ -2554,7 +2596,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		rec.Profile = sessionProfile
 	}
 	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "", "taskRunning", running)
+	fanOutRunning := running && rec.fanOutPending(rec.ActiveTask.TaskID)
 	switch {
+	case rest == "" && fanOutRunning:
+		// A message while the batch runs is refused, not a steer, so the
+		// running-task promise below would be false.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.post(rec.Key, fmt.Sprintf(noticeSessionOnDuringFanOut, rec.batchLeft(parent), g.cfg.DefaultAddressee))
+		return true
 	case rest == "" && running:
 		// Truthful about the order: the next message steers the running
 		// task (the steer case below), so it is the one after the task
@@ -2563,6 +2612,12 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	case rest == "":
 		g.post(rec.Key, sessionOnAck(backend, rec.Kind, conversationIsOwnThread(backend, rec.Key), g.cfg.DefaultAddressee))
+		return true
+	case fanOutRunning && rec.AddressedToOwnSession():
+		// The steer case's text during a batch: refused as a plain message
+		// is (routeTurn), never steered into the parent's ended turn.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.refuseFanOutSteer(rec, parent)
 		return true
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
@@ -2778,7 +2833,9 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
-	_, cardsPending := g.consoleCardsPending.take(taskID)
+	// The chain's mark is on its root's entry (TaskRef.CardsPending), taken
+	// here once; the caller writes the record.
+	cardsPending := rec.takeCardsPending(taskID)
 	text := terminalNotice(state, reason)
 	// An end the gateway declared itself carries no executor reason; its
 	// frame says what the page's notice says rather than the bare line.
@@ -2891,6 +2948,40 @@ func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string
 	if stash && isConsoleConversation(rec.Key) {
 		g.consoleResults.put(taskID, result)
 	}
+}
+
+// observeCardStop hands a CardStopObserver a canceled task's card-stop
+// result, read from the result's cardStop part (the result form only). The
+// gateway writes both halves itself: the text in its own wording
+// (canceledCardStopText) and the part re-encoded from the parsed result
+// (lib.CardStopPart), so none of the executor's text and no field the
+// schema doesn't name reaches a door's caller: a canceled turn's partial
+// answer, chunked into the same artifact, stays unrendered. A result with
+// no such part hands over nothing. Announced under the chain's root, and
+// only for the task whose end is the chain's, as observeDelivered.
+func (g *Gateway) observeCardStop(rec *SessionRecord, taskID string, parts []lib.Part) {
+	res, ok := cardStopResultOf(parts)
+	if !ok {
+		return
+	}
+	id, ends := rec.observedAs(taskID)
+	if !ends {
+		return
+	}
+	part, err := lib.CardStopPart(lib.CardStop{CardStopResult: res})
+	if err != nil {
+		return
+	}
+	if observer, ok := g.adapter.(CardStopObserver); ok {
+		observer.TaskCardStop(rec.Key, id, canceledCardStopText(res), part)
+	}
+}
+
+// canceledCardStopText is a canceled task's card-stop result as a door's
+// caller reads it: "canceled; " and the gateway's own reply for the result
+// (cardStopReply, titles cleaned as there).
+func canceledCardStopText(r *lib.CardStopResult) string {
+	return "canceled; " + cardStopReply(r, false)
 }
 
 // finalMessageText is the text of a folded task's terminal status message,
@@ -3043,6 +3134,9 @@ type taskStart struct {
 	// names no message of its own; an answer with no earlier chain marks
 	// itself.
 	Click, Answer bool
+	// ArrivedAt is InboundMessage's: when the adapter received the turn, the
+	// start of the first-ack time; zero where the adapter does not set it.
+	ArrivedAt time.Time
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -3053,6 +3147,10 @@ type taskStart struct {
 	// CorrelationID empty mints a fresh one, which is a human turn: the
 	// originating user interaction. A child rides its parent's.
 	CorrelationID string
+	// ProfileChain goes onto a profile task's history entry (TaskRef):
+	// the waiting profile tasks above it, set only by a profile parent's
+	// child mint.
+	ProfileChain []string
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
 	Role         string
@@ -3089,6 +3187,11 @@ type taskStart struct {
 	// where the relay closes it on the task's terminal. Set for a batch
 	// child only.
 	KeepActive bool
+	// BatchIndex and Target are a batch child's place in its batch, from 1,
+	// and its parameters as the wake names them (TaskRef.BatchIndex). Set
+	// for a child of a batch of two or more only.
+	BatchIndex int
+	Target     string
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3113,6 +3216,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
+		ArrivedAt: msg.ArrivedAt,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -3285,6 +3389,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if ts.KeepActive {
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
+	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 		// The message the chain's mark is drawn on (mark.go).
@@ -3300,6 +3405,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	if ts.Route != nil {
 		ref.Tier = string(ts.Route.Tier)
+		ref.Scope = string(ts.Route.Scope)
+		ref.ProfileChain = ts.ProfileChain
 	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
@@ -3315,9 +3422,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
 	}
 	rec.LastTaskActivity = time.Now().UTC()
-	if len(rec.Tasks) > taskHistoryCap {
-		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
-	}
+	rec.trimHistory()
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -3397,7 +3502,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
 	// slow reactions call never delays it. A click or an answer continues an
 	// earlier ask, whose mark is the executor's to redraw.
-	if ts.Role == "" && !ts.Click && !ts.Answer && g.drawArrivalMark(rec, taskID, ts.Text) {
+	if ts.Role == "" && !ts.Click && !ts.Answer {
+		drawn, landed := g.drawArrivalMark(rec, taskID, ts.Text)
+		if drawn && landed {
+			// The ask's first receipt is on Slack: the reactions call succeeded.
+			g.metrics.slackFirstAck(ts.ArrivedAt, time.Now())
+		}
+		if !drawn {
+			return taskID, true
+		}
 		if err := g.reg.Put(ctx, rec); err != nil {
 			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 		}

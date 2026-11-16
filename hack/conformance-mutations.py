@@ -222,10 +222,14 @@ MUTATIONS: list[Mutation] = [
         # the operator holds full CRUD through"; the auth callout has since
         # brought bind back, scoped to one name, and A4-bind-unscoped below
         # is the mutation that covers the scoping. This one stays on escalate.
+        # The anchor is the ClusterRole's rbac rule, whose resource list ends
+        # in `clusterroles` since the Role and RoleBinding writes moved to the
+        # Role document; `roles` followed by `create` is in that document now,
+        # where C5's write-verb ceiling would catch the escalate first.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
-        ("      - roles\n    verbs:\n      - create\n",
-         "      - roles\n    verbs:\n      - create\n      - escalate\n"),
+        ("      - clusterroles\n    verbs:\n      - create\n",
+         "      - clusterroles\n    verbs:\n      - create\n      - escalate\n"),
         "test_A4_the_operator_cannot_escalate_its_own_grants",
         "grant the operator escalate so a reconcile can widen a role in place "
         "-- the ceiling in C5 becomes advisory",
@@ -233,15 +237,35 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         # The operator's Secret write verbs are a namespaced Role, the second
         # document in role.yaml; the ClusterRole holds the reads only. This
-        # puts `secrets` on the ClusterRole's core-group write rule as well,
-        # which is the pre-#4906 shape: write of every Secret on the cluster.
+        # adds `create` to the ClusterRole's core read rule, the one that
+        # names secrets, configmaps, pods and serviceaccounts together, which
+        # is the pre-#4906 shape for every kind in it: write of every Secret
+        # on the cluster. The anchor is that rule's last resource and its
+        # first verb, a pair no other rule in either document has (the Role
+        # document's core rule ends in `services` too, but its first verb is
+        # `create`), so the first-occurrence replace lands on the ClusterRole.
         "C5-operator-secrets-cluster-wide",
         "k8s-operator/config/rbac/role.yaml",
+        ("      - services\n    verbs:\n      - get\n",
+         "      - services\n    verbs:\n      - create\n      - get\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "add create to the operator ClusterRole's core read rule, the rule that already names "
+        "secrets and pods, so one marker edit makes the operator cluster-admin in effect",
+    ),
+    Mutation(
+        # The positive half of the same test: the Role document must name
+        # every namespaced kind the operator renders, so dropping one is a
+        # write the operator can no longer do and the equality assertion is
+        # what says so. `configmaps` is followed by `persistentvolumeclaims`
+        # only in the Role document (the ClusterRole's read rule has
+        # `endpoints` between them), so the anchor is unique.
+        "C5-operator-role-drops-configmaps",
+        "k8s-operator/config/rbac/role.yaml",
         ("      - configmaps\n      - persistentvolumeclaims\n",
-         "      - configmaps\n      - persistentvolumeclaims\n      - secrets\n"),
-        "test_C5_the_operators_secret_grant_is_namespaced",
-        "add secrets to the operator ClusterRole's core write rule, beside the "
-        "configmaps it manages, so one marker edit makes the operator cluster-admin in effect",
+         "      - persistentvolumeclaims\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "drop configmaps from the operator's namespaced Role, the shape of a marker split that "
+        "forgot a kind, which the self-check would report only once an install ran it",
     ),
     Mutation(
         "A1-refusal-emptied",
@@ -349,11 +373,11 @@ MUTATIONS: list[Mutation] = [
         "reach tiers through a wildcard resource, which a resource-name match misses",
     ),
     Mutation(
-        # Next mode reads tiers through an operator-rendered ConfigMap, so no
-        # role it mints needs them. A builder that grants them shows up in the
-        # next golden when it is regenerated, which is what this edits.
-        "A4-next-gateway-reads-tiers",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        # The A2A stack reads tiers through an operator-rendered ConfigMap, so
+        # no role it mints needs them. A builder that grants them shows up in
+        # the settled golden when it is regenerated, which is what this edits.
+        "A4-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
         ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
          "      - create\n      - get\n      - list\n      - watch\n      - delete",
          "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
@@ -361,12 +385,12 @@ MUTATIONS: list[Mutation] = [
          "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
          "      - create\n      - get\n      - list\n      - watch\n      - delete"),
         "test_A4_only_cluster_administrators_write_tiers",
-        "let the next-mode A2A gateway read tiers directly, as tier-aware "
+        "let the A2A gateway read tiers directly, as tier-aware "
         "routing might, instead of through the operator's ConfigMap",
     ),
     Mutation(
-        "A4-next-callout-wildcard-resource",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        "A4-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml",
         ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
          "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
          "    verbs:\n      - get\n"
@@ -720,6 +744,23 @@ Mutation(
         "bind the gateway to the broker's TokenReview role too -- the agent can then "
         "validate any bearer token it gets hold of, a grant its own token use never "
         "asked for",
+    ),
+    Mutation(
+        # The callout's Role reads the bus identity map, and its name carries
+        # no tier. Before the parse learned to pass a tierless name through
+        # whole, this edit crashed the test with an IndexError rather than
+        # failing it -- red for the wrong reason.
+        "C1-gateway-identity-reads-the-identity-map",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  kind: Role\n  name: platformagent-a2a-callout\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "let the gateway resolve a principal itself by reading the identity "
+        "map the callout serves, saving a bus round trip -- the model's pod "
+        "gains a read on the table that joins chat identities to bus "
+        "principals, which is what the callout exists to keep behind a "
+        "TokenReview",
     ),
     Mutation(
         "C1-broker-keeps-the-leader-binding",
@@ -1402,6 +1443,18 @@ Mutation(
         "loopback sentinel got there in the first place",
     ),
     Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -1673,6 +1726,37 @@ Mutation(
         "cannot see it",
     ),
     Mutation(
+        # The one binding allowed to name system:auth-delegator is the
+        # callout's, and the test pins its subject list. A second subject
+        # on that binding is the cheapest way to hand another identity a
+        # TokenReview and SubjectAccessReview oracle without a new object.
+        "C5-callout-binding-gains-the-sandbox",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n',
+         '  name: system:auth-delegator\nsubjects:\n  - kind: ServiceAccount\n    name: platformagent-a2a-callout\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-shell\n    namespace: kubeagents-system\n'),
+        "test_C5_no_agent_binding_names_the_auth_delegator_role",
+        "let the sandbox's tooling validate bearer tokens itself instead of "
+        "asking the callout, by adding it to the binding that already exists "
+        "-- the roleRef is unchanged, so a test that checks roleRefs alone "
+        "sees nothing, and the pod where model-authored shell runs gains a "
+        "TokenReview and SubjectAccessReview oracle over the cluster",
+    ),
+    Mutation(
+        # The spawner's pod rule is the one place a write verb already sits,
+        # so one more verb there reads as housekeeping. patch on pods is a
+        # route into a running session: labels off the fence's selector, an
+        # ephemeral container, a changed image.
+        "C5-spawner-role-gains-pod-patch",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n',
+         '      - pods\n    verbs:\n      - create\n      - get\n      - list\n      - watch\n      - delete\n      - patch\n'),
+        "test_C5_the_spawner_role_holds_exactly_its_audited_rules",
+        "let the gateway relabel a session pod it owns, so a stuck session can "
+        "be taken out of the fence's selector for debugging -- which is also "
+        "what a compromised gateway would do to a session it wants unfenced",
+    ),
+    Mutation(
         "C5-leader-reaches-configmaps",
         # platformagent-ha.yaml: the fixture that asks for more than one
         # replica. Since the operator caps the gateway at one replica (#3027),
@@ -1737,9 +1821,13 @@ Mutation(
         "stretch the projection to a day to stop a rotation warning",
     ),
     Mutation(
+        # Anchored at the line's own indentation: a shorter prefix matches the
+        # same line as a substring, leaves four stray spaces behind and breaks
+        # the golden's YAML parse, which fails every golden reader at once --
+        # a kill for the wrong reason that hid whether D4 saw the audience go.
         "D4-audience-dropped",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("              audience: kubeagents-credential-proxy\n", ""),
+        ("                  audience: kubeagents-credential-proxy\n", ""),
         "test_D4_the_broker_token_is_audience_bound",
         "drop the audience, making the broker's token a general-purpose "
         "cluster bearer token and TokenReview a formality",
@@ -1963,7 +2051,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
         "test_A3_the_inject_door_renders_only_under_the_operator_flag",
         "render the eval door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door has no customer-facing purpose and maps a principal out of a "
         "request body, so an install that never asked for it must not carry "
         "it. The operator's own flag-off render test "
@@ -2017,7 +2105,7 @@ Mutation(
          "\tif true {\n\t\tinjectEnv = append(injectEnv,"),
         "test_A3_the_a2a_door_renders_only_under_the_operator_flag",
         "render the A2A door's env, port and principal-map mount on every "
-        "mode: next gateway rather than only under the operator's flag. The "
+        "gateway rather than only under the operator's flag. The "
         "door resolves a caller the request names into an eval identity, so "
         "an install that never asked for it must not carry it; the "
         "conformance test is the one that has to notice, from the source, "
@@ -2389,12 +2477,41 @@ Mutation(
     Mutation(
         "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "drop the gateway's call to lib.ValidateDelegateRequest: an "
         "over-length text, or a malformed batch, that reached the bus without "
         "the adapter would then be minted, and the gateway's line of defence "
         "is gone (#5682 moved the cap check into the shared validator)",
+    ),
+    Mutation(
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
+    ),
+    Mutation(
+        "C1-delegate-gateway-validates-only-some-requests",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "condition the gateway's validator call so it guards only batches: "
+        "the call still appears, but a single over-length task that reached "
+        "the bus without the adapter is minted",
     ),
     Mutation(
         "C1-delegate-validator-cap-hand-spelled",
@@ -2417,11 +2534,63 @@ Mutation(
     Mutation(
         "C1-delegate-validator-skips-batch-entries",
         "a2a/lib/payload.go",
-        ("validateDelegateText(e.Text)", "validateDelegateText(r.Text)"),
+        ("validateDelegateText(e.Text)", "error(nil)"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "cap the request's top-level text inside the batch loop instead of "
-        "each entry's: every batch entry then goes uncapped, through the "
-        "adapter and the gateway alike",
+        "stop checking each batch entry's text in lib's shared validator: the "
+        "gateway then mints a batch entry of any length that reached the bus "
+        "without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-batch-entries",
+        "a2a/worker-adapter/delegate.go",
+        ('if why := validateDelegate(lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}); why != "" {',
+         'if why := ""; why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating each batch entry in the worker-adapter's "
+        "validateDelegateFor: the adapter then publishes a batch whose "
+        "entries it never capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-checks-the-wrong-batch-text",
+        "a2a/worker-adapter/delegate.go",
+        ("Text: e.Text, Parameters: e.Parameters}); why", 'Text: "ok", Parameters: e.Parameters}); why'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "validate each batch entry with a fixed text instead of its own: the "
+        "per-entry call still runs, but no entry's real text is capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-batch-refusal-neutered",
+        "a2a/worker-adapter/delegate.go",
+        ('Parameters: e.Parameters}); why != "" {', 'Parameters: e.Parameters}); false {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the per-entry validateDelegate call but never act on its answer: "
+        "the call is still there, and every batch entry is published unchecked",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-refusal-neutered",
+        "a2a/worker-adapter/adapter.go",
+        ('validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'validateDelegateFor(ask.req, a.delegateWidth); false && why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the adapter's validateDelegateFor call but never refuse on it: "
+        "an over-length request is published to the bus",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-check-commented-out",
+        "a2a/worker-adapter/adapter.go",
+        ('if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'if why := ""; why != "" { // validateDelegateFor(ask.req, a.delegateWidth)'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "drop the adapter's check and leave its call in a comment on the same "
+        "line: only a pin that reads code without comments sees it gone",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-the-single-request",
+        "a2a/worker-adapter/delegate.go",
+        ("\t\treturn validateDelegate(req)\n", "\t\treturn \"\"\n"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating a single (non-batch) request in the worker-adapter's "
+        "entry point: validateDelegate then guards nothing the adapter publishes",
     ),
     Mutation(
         "C1-delegate-validator-skips-the-single-text",
@@ -2818,8 +2987,8 @@ Mutation(
     Mutation(
         "C1-bus-token-file-reservation-spelled-by-hand",
         "k8s-operator/internal/controller/platformagent_manifests.go",
-        ('\t\t\t\t\te.Name == a2aBusTokenFileEnv ||',
-         '\t\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
+        ('\t\t\t\te.Name == a2aBusTokenFileEnv ||',
+         '\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
         "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
         "inline the constant at the plugin-env drop, which changes no "
         "behaviour today and is the shape a reviewer waves through. It costs "
