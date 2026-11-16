@@ -143,7 +143,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					},
 					"addressee": map[string]any{
 						"type":        "string",
-						"description": "Optional AgentProfile to send the turn to, by name (for example cluster), as a new task for it. Default: the conversation's agent. Not for a stop or a /session command.",
+						"description": "Optional AgentProfile to send the turn to, by name (for example cluster), as a new task for it. Default: the conversation's agent. Refused on a stop word, a bare /session, /session off, /session stop, a bare /feedback or /feedback summary; /session followed by a message goes through.",
 					},
 					"parameters": map[string]any{
 						"type":                 "object",

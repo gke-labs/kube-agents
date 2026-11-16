@@ -123,7 +123,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 				"read_topics with action cards lists the agent cards on DIRECTORY, by profile. " +
 				"The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, " +
 				"and its notice is the answer. An addressed turn still running when the wait ends returns its task as <profile>/<task-id>; " +
-				"read it with task_control under that reference, not a bare id.",
+				"read it with task_control under that reference, which always resolves; a bare id resolves only while this server still holds the task.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
@@ -134,7 +134,8 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("How long to wait for the answer, %d at most. Default %d.", maxWaitSeconds, defaultWaitSeconds)},
 					"stream_steps":       map[string]any{"type": "boolean", "description": "When true, return a custom step envelope after the next step so the caller can stream progress step-by-step with task_control get."},
 					"addressee": map[string]any{"type": "string", "description": "The AgentProfile to send the turn to, by name (for example cluster), as a new task for it. " +
-						"Default: the conversation's agent. Not for a stop or a /session command."},
+						"Default: the conversation's agent. " +
+						"Refused on a stop word, a bare /session, /session off, /session stop, a bare /feedback or /feedback summary; /session followed by a message goes through."},
 					"parameters": map[string]any{
 						"type":                 "object",
 						"additionalProperties": map[string]any{"type": "string"},
