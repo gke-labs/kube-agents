@@ -113,7 +113,7 @@ func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, auth
 	if allowed(targetPlatform) {
 		out.Targets = append(out.Targets, lib.DelegateTarget{Name: targetPlatform, Description: platformTargetDescription})
 	}
-	tier, err := requesterTier(r)
+	tier, err := g.tierFor(everyone, false) // an unknown author list returned above
 	if err != nil {
 		// No attested identity reaches no profile (profileRouteFor's caller
 		// refuses it the same way).

@@ -317,6 +317,13 @@ type Config struct {
 	// empty means nobody. The A2A door's backend ("a2a") is the exception:
 	// no pair for it means nobody (doorUnlisted). See allowlist.go.
 	TargetAllowedUsers map[string]map[string][]string
+	// TierMembership maps a person, by backend and plaintext user id, to the
+	// tier their AgentProfile tasks run at (#3659, Tier 2c): the operator
+	// renders the PlatformAgent's spec.tiers.membership into
+	// A2A_TIER_MEMBERSHIP, and the gateway HMACs each id as it does the
+	// allowlists. Anyone unlisted runs at read; the console's shared principal
+	// always does (#5557).
+	TierMembership []TierMember
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend (see
@@ -855,6 +862,11 @@ func FromEnv() (*Config, error) {
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
 	}
+	members, err := parseTierMembership(os.Getenv(EnvTierMembership))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TierMembership = members
 	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)

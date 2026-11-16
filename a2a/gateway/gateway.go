@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -364,6 +365,9 @@ type Gateway struct {
 	// targetAllowed is Config.TargetAllowedUsers compiled for lookup: the
 	// platform agent's own lists, checked when a session asks to delegate.
 	targetAllowed targetAllowed
+	// tierMembers is the tier each listed person's AgentProfile tasks run
+	// at, by requester (tier_membership.go, #3659 Tier 2c).
+	tierMembers map[TaskRequester]capability.Tier
 	// slackAllowed and slackAllowAll gate the slack backend's identity
 	// resolution ahead of the principal map (Config.SlackAllowedUsers,
 	// case preserved: Slack member ids compare exactly).
@@ -546,6 +550,10 @@ func New(o Options) (*Gateway, error) {
 		return nil, fmt.Errorf("people keyer: %w", err)
 	}
 	targetAllowed := buildTargetAllowed(o.Config, ps)
+	tierMembers := buildTierMembers(o.Config.TierMembership, ps)
+	if len(tierMembers) > 0 {
+		log.Info("tier membership loaded", "entries", len(tierMembers))
+	}
 	for target, byBackend := range targetAllowed {
 		for b, set := range byBackend {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
@@ -623,6 +631,7 @@ func New(o Options) (*Gateway, error) {
 		gchatAllowed:     gchatAllowed,
 		gchatAllowAll:    o.Config.GchatAllowAllUsers,
 		targetAllowed:    targetAllowed,
+		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
@@ -1583,7 +1592,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		var route *profileRoute
 		if msg.Profile != "" {
 			requester := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
-			tier, err := requesterTier(requester)
+			// Every author whose text reaches the task, this one included:
+			// a thread runs at its authors' common tier (tierFor).
+			authors, unknown, _ := delegateAuthors(rec, requester)
+			tier, err := g.tierFor(authors, unknown)
 			if err == nil {
 				route, err = g.profileRouteFor(msg.Profile, msg.Parameters, tier, lib.SubmitKindTop)
 			}
@@ -3523,6 +3535,18 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
 				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
+			return
+		}
+	}
+	// A profile task's grant was minted once, at its authors' tier: a steer
+	// from someone at another tier is refused, before the author is
+	// recorded, rather than left to reach a task that runs at a tier its
+	// author doesn't have (#3659, Tier 2c).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" {
+		if at := g.tierOf(author); string(at) != ref.Tier {
+			g.log.Warn("steer refused", "rule", ruleSteerTier, "taskId", active.TaskID, "conversation", rec.Key,
+				"taskTier", ref.Tier, "steerTier", at, "steerBackend", author.Backend, "steerAuthor", author.Subject)
+			g.post(rec.Key, fmt.Sprintf(noticeSteerTierDiffers, ref.Tier, at))
 			return
 		}
 	}
