@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -596,10 +597,13 @@ func TestTheCardsPendingMarkSurvivesARestart(t *testing.T) {
 	if len(got) != 1 || got[0].TaskID != origin.TaskID || !got[0].CardsPending {
 		t.Fatalf("terminal frames = %+v, want one for %s with cardsPending", got, origin.TaskID)
 	}
-	rec, _ := r2.g.reg.Get(context.Background(), conv)
-	if ref, _ := rec.TaskRefFor(origin.TaskID); ref.CardsPending {
-		t.Fatal("the chain's end left the mark on the record")
-	}
+	// The frame goes out before the relay writes the record, so the mark's
+	// clearing is waited for, not read once.
+	waitFor(t, "the chain's end clears the mark from the record", func() bool {
+		rec, _ := r2.g.reg.Get(context.Background(), conv)
+		ref, _ := rec.TaskRefFor(origin.TaskID)
+		return !ref.CardsPending
+	})
 }
 
 // TestABatchCutShortByARestartFinishesOnRedelivery: a gateway that stops
@@ -1229,4 +1233,165 @@ func TestAWithdrawnBatchChildsLineKeepsItsNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	editedTo(t, r, "the withdrawn child's line closed with its note", withLineNote(noticeBatchChildWithdrawn, batchChildNote()))
+}
+
+// TestAFanOutsWakeClearsTheResultsFromTheRecord: once the wake is on the
+// bus, each child's result text is cleared from its entry, its state and
+// source kept: the session record outlives the stream copy of a result, so
+// the record keeps no copy past the wake. The batch still counts ended, and
+// the chain ends at the wake's end as before.
+func TestAFanOutsWakeClearsTheResultsFromTheRecord(t *testing.T) {
+	t.Parallel()
+	r, spawn, obs := startFanOutRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-wake-clears"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	completeTask(t, r.execFor(t, f.envs[0], targetPlatform), "one done")
+	childEndedLogged(t, r, f.kids[0].ID)
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if ref, _ := rec.TaskRefFor(f.kids[0].ID); ref.BatchEnd == nil || ref.BatchEnd.Text != "one done" {
+		t.Fatalf("first child's end before the wake = %+v, want its result kept", ref.BatchEnd)
+	}
+	publishFinal(t, r, f.envs[1], targetPlatform, lib.StateFailed, "reason: quota - exceeded")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	if got := envText(t, wake); !strings.Contains(got, "one done") || !strings.Contains(got, "reason: quota - exceeded") {
+		t.Fatalf("wake text lacks the results:\n%s", got)
+	}
+	waitFor(t, "the wake holds the conversation", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == wake.TaskID
+	})
+	rec, _ = r.g.reg.Get(ctx, conv)
+	want := map[string]lib.TaskState{f.kids[0].ID: lib.StateCompleted, f.kids[1].ID: lib.StateFailed}
+	for _, k := range childrenOf(rec, f.origin.TaskID) {
+		if k.BatchEnd == nil || k.BatchEnd.Text != "" || k.BatchEnd.State != want[k.ID] || k.BatchEnd.Source == "" {
+			t.Fatalf("child %s's end after the wake = %+v, want state %s and source kept, text cleared", k.ID, k.BatchEnd, want[k.ID])
+		}
+	}
+	parent, _ := rec.TaskRefFor(f.origin.TaskID)
+	if left := rec.batchLeft(parent); left != 0 || rec.fanOutPending(f.origin.TaskID) {
+		t.Fatalf("batchLeft = %d, pending = %v after the wake; want 0 and false", left, rec.fanOutPending(f.origin.TaskID))
+	}
+	completeTask(t, r.execFor(t, wake, wakeSession), "one of two is down")
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(f.origin.TaskID); return ok })
+	assertOnlyRoot(t, obs, f.origin.TaskID)
+	if wakeEntries(t, r, conv) != 1 {
+		t.Fatal("more than one wake on the record")
+	}
+}
+
+// TestTheAskBoundClearsAnUnwokenBatchsResults: a child's result kept for a
+// wake that hasn't run is a content copy like the ask, so the ask bound
+// clears its text at AskTTL from the child's start, and not before; its end
+// stays, so the batch still counts it ended.
+func TestTheAskBoundClearsAnUnwokenBatchsResults(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerCap(t, targetPlatform, 0, func(c *Config) {
+		c.DelegationWidthMax = 2
+		c.AskTTL = time.Hour
+	})
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-ask-bound"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	completeTask(t, r.execFor(t, f.envs[0], targetPlatform), "one done")
+	childEndedLogged(t, r, f.kids[0].ID)
+	// Only the child's text is past the TTL at the bound's instant: every
+	// other copy the pass ages out is younger, or (the child's own requester
+	// copy) gone, so the pass runs for the child's text alone.
+	start := time.Now().UTC().Truncate(time.Second)
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			rec.Tasks[i].StartedAt = start.Add(time.Minute)
+			if rec.Tasks[i].ID == f.kids[0].ID {
+				rec.Tasks[i].StartedAt = start
+				rec.Tasks[i].Requester, rec.Tasks[i].Attribution, rec.Tasks[i].Request = nil, nil, ""
+				rec.Tasks[i].SteerAuthors, rec.Tasks[i].SteerAuthorsOverflow = nil, false
+			}
+		}
+		if !rec.SessionAuthorsSince.IsZero() {
+			rec.SessionAuthorsSince = start.Add(time.Minute)
+		}
+		if rec.ActiveTask != nil {
+			rec.ActiveTask.SubmittedAt = start.Add(time.Minute)
+		}
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	r.g.boundAskCopyAt(ctx, rec, start.Add(time.Hour-time.Nanosecond))
+	rec, _ = r.g.reg.Get(ctx, conv)
+	if ref, _ := rec.TaskRefFor(f.kids[0].ID); ref.BatchEnd == nil || ref.BatchEnd.Text != "one done" {
+		t.Fatalf("result inside the TTL = %+v, want it kept", ref.BatchEnd)
+	}
+	r.g.boundAskCopyAt(ctx, rec, start.Add(time.Hour))
+	rec, _ = r.g.reg.Get(ctx, conv)
+	ref, _ := rec.TaskRefFor(f.kids[0].ID)
+	if ref.BatchEnd == nil || ref.BatchEnd.Text != "" || ref.BatchEnd.State != lib.StateCompleted {
+		t.Fatalf("result past the TTL = %+v, want the text cleared and the state kept", ref.BatchEnd)
+	}
+	parent, _ := rec.TaskRefFor(f.origin.TaskID)
+	if left := rec.batchLeft(parent); left != 1 {
+		t.Fatalf("batchLeft = %d after the bound, want 1", left)
+	}
+}
+
+// TestAQueuedFanOutChildOutlivesTheFirstEventGrace: the dispatcher holds a
+// profile child over its profile's concurrency queued with nothing on its
+// stream, and ends it itself at the profile's queue timeout. So a fan-out of
+// three to `cluster` (concurrency 2) whose third child is still queued past
+// FirstEventGrace is not ended by a status ask's heal; past the dispatcher's
+// queue timeout and the grace after it, it is, as never started.
+func TestAQueuedFanOutChildOutlivesTheFirstEventGrace(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := startFanOutRig(t, 3)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-queued"
+	f := fanOut(t, r, spawn, conv, clusterTask("web-1", "a"), clusterTask("web-2", "b"), clusterTask("web-3", "c"))
+	for _, i := range []int{0, 1} {
+		if err := r.execFor(t, f.envs[i], "cluster").PublishStatus(ctx, lib.StateWorking, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queuedFor := func(d time.Duration) {
+		putRecord(t, r, conv, func(rec *SessionRecord) {
+			for i := range rec.Tasks {
+				if rec.Tasks[i].ID == f.kids[2].ID {
+					rec.Tasks[i].StartedAt = time.Now().Add(-d)
+				}
+			}
+		})
+	}
+	queuedFor(r.g.cfg.FirstEventGrace + time.Minute)
+	sessionRigTurn(r, conv, "status-1", "status")
+	waitFor(t, "the fan-out status", postedContaining(r, fmt.Sprintf(noticeFanOutStatusHead, 3, 3)))
+	if loggedContaining(r, "fan-out child ended", "child="+f.kids[2].ID)() || postIndex(r, f.kids[2].ID) >= 0 {
+		t.Fatalf("the heal ended a child still queued at the dispatcher:\n%s", r.logs.String())
+	}
+
+	queuedFor(batchChildQueueAllowance + r.g.cfg.FirstEventGrace + time.Minute)
+	sessionRigTurn(r, conv, "status-2", "status")
+	childEndedLogged(t, r, f.kids[2].ID)
+	waitFor(t, "the never-started notice", postedContaining(r, "delegated task `"+f.kids[2].ID+"` has produced nothing"))
+}
+
+// TestAFanOutWakeSaysCardsArePending: a child that handed its work to
+// cards puts the cards note in the batch's wake, so the session says their
+// reports are still to come.
+func TestAFanOutWakeSaysCardsArePending(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	conv := "discord:g1/t-fanout-cards-note"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	e0 := r.execFor(t, f.envs[0], targetPlatform)
+	if err := e0.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, e0, "filed cards")
+	childEndedLogged(t, r, f.kids[0].ID)
+	completeTask(t, r.execFor(t, f.envs[1], targetPlatform), "two done")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	got := envText(t, r.awaitTask(t, spawn.calls()[1].Session))
+	if !strings.Contains(got, "\n"+wakeCardsPendingNote+"\n") {
+		t.Fatalf("wake text lacks the cards note:\n%s", got)
+	}
 }

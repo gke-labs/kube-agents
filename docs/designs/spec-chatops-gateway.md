@@ -630,6 +630,10 @@ replay.
 **A fan-out's wake.** A batch of two or more wakes the session once, when the last of its children
 has ended, with every child's outcome. Each child's end is kept on its own history entry as it
 arrives (`BatchEnd`): its result, its reason, or its question, already cut to its share of the wake.
+That text is content under the content rule, and the session record outlives the stream copy it was
+read from, so it is cleared once the wake is on the bus, and at `A2A_ASK_TTL` from the child's start
+for a wake that hasn't run; the rest of the end (its state and source) stays, so the batch still
+counts the child ended.
 The children before the last wake nothing and end nothing, and the chain's root terminal is
 announced once, by the wake's end, or at the last child when no wake runs. The wake opens with the
 ask as a single child's does, then `You delegated N tasks, and all of them have ended.` and, under
@@ -651,7 +655,18 @@ with no events yet), a stop cancels the delegating turn and every child, and any
 is refused with `N delegated tasks are running. Say stop to cancel them.` rather than sent: the
 turn it would steer has ended, and which child it was meant for isn't the gateway's to guess. A
 heal during a fan-out looks at each child still running as it looks at a single child, a terminal
-on the stream or nothing past `A2A_FIRST_EVENT_GRACE`, so the last one it finds wakes the session.
+on the stream or nothing past its grace, so the last one it finds wakes the session. A child's grace
+is `A2A_FIRST_EVENT_GRACE`, except for a profile child not stopped: a batch wider than its
+profile's concurrency leaves children queued at the dispatcher, which publishes nothing for a
+queued submission (it holds it back until a slot frees) and ends one itself, with a
+`queue-timeout` terminal the heal reads, once it has waited past the profile's queue timeout. So a
+profile child's grace is the dispatcher's default queue timeout, an hour, then
+`A2A_FIRST_EVENT_GRACE` for the pod to start after it is admitted (`batchChildQueueAllowance`):
+a fan-out of three to `cluster`, at its concurrency of 2, keeps its third child however long the
+first two take, up to that bound. A profile whose queue timeout is set longer than an hour can
+still have a queued child ended as never started past it; its stop record then drops the child
+from the dispatcher's queue. A stopped child's stop record ends it at the dispatcher at once, so it
+gets `A2A_FIRST_EVENT_GRACE` alone, as a platform child does.
 The history cap of fifty entries never drops a fan-out still running: its root, its delegating
 turn and every child stay, ended or not, and the oldest of the rest go first.
 

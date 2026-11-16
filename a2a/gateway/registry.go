@@ -484,7 +484,11 @@ type TaskRef struct {
 // that carries every sibling's (batchChildEnded). Text is the child's result
 // for completed, its question for input-required, and its reason otherwise,
 // already cut to the child's share of the wake (batchShare) and marked when
-// cut, so the record holds at most one wake's worth across the batch.
+// cut, so the record holds at most one wake's worth across the batch. Text
+// is a content copy: it is cleared once the wake is on the bus (wakeBatch),
+// or at AskTTL from the child's start for a wake that hasn't run
+// (boundAskCopyAt), since the record outlives the stream copy; the rest of
+// the end stays for the batch's accounting.
 // Stopped is a child the gateway had sent a cancel to before it ended, which
 // does not wake the session on its own. Unposted is a result the room was
 // not shown whole (the heal found it), and Cards a child that handed work to
@@ -554,6 +558,25 @@ func (rec *SessionRecord) setBatchEnd(taskID string, end *BatchEnd) {
 			rec.Tasks[i].BatchEnd = end
 		}
 	}
+}
+
+// clearBatchText clears the result text from every ended child of the
+// fan-out parent parentID, keeping the rest of each end (BatchEnd).
+func (rec *SessionRecord) clearBatchText(parentID string) {
+	for i := range rec.Tasks {
+		ref := &rec.Tasks[i]
+		if ref.ParentTaskID == parentID && ref.BatchEnd != nil && ref.BatchEnd.Text != "" {
+			ref.clearBatchText()
+		}
+	}
+}
+
+// clearBatchText clears the entry's result text, on a copy of its end, so
+// an end shared with a caller's TaskRef is left as it was.
+func (ref *TaskRef) clearBatchText() {
+	end := *ref.BatchEnd
+	end.Text = ""
+	ref.BatchEnd = &end
 }
 
 // markCardsPending marks a console chain's root (CardsPending).
