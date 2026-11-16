@@ -147,9 +147,19 @@ type AgentProfileReconciler struct {
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	res, err := r.reconcile(ctx, req)
+	var drainEnd time.Time
+	res, err := r.reconcile(ctx, req, &drainEnd)
 	if err != nil {
 		return res, err
+	}
+	// A tier this profile drains is torn down (its ServiceAccounts and
+	// durables) by the first pass after its end, and nothing watched moves
+	// when the end passes: come back just after it (#3659, #5850).
+	if !drainEnd.IsZero() {
+		wait := max(time.Until(drainEnd)+time.Second, time.Second)
+		if res.RequeueAfter == 0 || res.RequeueAfter > wait {
+			res.RequeueAfter = wait
+		}
 	}
 	// The end-tier-drain lever is consumed once the applied dispatch config
 	// carries it (consumeEndTierDrain), and nothing this controller watches
@@ -165,7 +175,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return res, nil
 }
 
-func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request, drainEnd *time.Time) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// The namespace-only request SetupWithManager sends when a PlatformAgent
@@ -219,6 +229,11 @@ func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	verdict := verdicts[profile.Name]
+	for _, until := range verdict.draining {
+		if drainEnd.IsZero() || until.Before(*drainEnd) {
+			*drainEnd = until
+		}
+	}
 	// The end-tier-drain lever, consumed once the applied dispatch config
 	// carries it (agentprofile_tier_drain.go, #5850).
 	if err := r.consumeEndTierDrain(ctx, &profile, verdict); err != nil {

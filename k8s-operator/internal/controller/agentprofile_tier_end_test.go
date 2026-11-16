@@ -312,3 +312,31 @@ func TestTheProfilePassComesBackSoonWhileTheLeverIsSet(t *testing.T) {
 		t.Errorf("RequeueAfter %s with the lever set, want at most %s", res.RequeueAfter, endTierDrainRecheck)
 	}
 }
+
+// The AgentProfile pass, which tears a tier's ServiceAccounts and durables
+// down, comes back just after its profile's earliest drain end rather than at
+// the 5-minute resync: an ended drain is minutes long, not hours.
+func TestTheProfilePassComesBackAtItsDrainEnd(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	cat := catalogWith(map[string]string{"oncall": tierModeInteractive})
+	oncall := &agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: "oncall", Namespace: agent.Namespace}, Spec: agentv1alpha1.TierSpec{Mode: tierModeInteractive}}
+	was := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "oncall"} })
+	cm := appliedConfig(t, agent, cat, func(c *a2aDispatchConfig) {
+		for i := range c.Profiles {
+			c.Profiles[i].Tiers = []string{"read"}
+			c.Profiles[i].DrainingTiers = []a2aDrainingTier{{Tier: "oncall", Mode: tierModeInteractive, Until: time.Now().Add(90 * time.Second), Ending: true}}
+		}
+	}, &was)
+	is := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
+	ownSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: "agentprofile-tse-oncall", Namespace: profileNamespaceName(agent),
+		Labels:      map[string]string{agentProfileNameLabel: "tse", agentProfileTierLabel: "oncall", agentProfileTierModeLabel: tierModeInteractive},
+		Annotations: map[string]string{agentProfileUIDAnnotation: string(is.UID)},
+	}}
+	h := newProfileHarness(t, agent, &is, oncall, cm, ownSA)
+	res := h.reconcile(agent.Namespace, "tse")
+	if res.RequeueAfter < 60*time.Second || res.RequeueAfter > 95*time.Second {
+		t.Errorf("RequeueAfter %s with a drain ending in 90s, want about 90s", res.RequeueAfter)
+	}
+}
