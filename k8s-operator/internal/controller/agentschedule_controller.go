@@ -63,6 +63,11 @@ const (
 	agentScheduleReasonProfileNotFound   = "ProfileNotFound"
 	agentScheduleReasonProfileDisallowed = "ProfileTierDisallowed"
 	agentScheduleReasonNoPlatformAgent   = "NoPlatformAgent"
+	// agentScheduleReasonUserDeferred: a schedule the PlatformAgent didn't
+	// render. User schedules are deferred to Track 7 (#5624; decided B on
+	// #5635): which identity the gateway resolves a creator's tier from is
+	// open, so none fires, and the gateway refuses origin user anyway.
+	agentScheduleReasonUserDeferred = "UserSchedulesDeferred"
 )
 
 const (
@@ -290,6 +295,12 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, nil
 	}
 	agent := &agents.Items[0]
+	if agentScheduleOrigin(sched, agent) != agentv1alpha1.AgentScheduleOriginBuiltin {
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonUserDeferred
+		cond.Message = "only schedules the PlatformAgent renders run for now; user schedules wait on Track 7 (#5624)"
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
 	var profile agentv1alpha1.AgentProfile
 	err := r.Get(ctx, types.NamespacedName{Namespace: sched.Namespace, Name: sched.Spec.ProfileRef.Name}, &profile)
 	switch {
