@@ -494,7 +494,12 @@ class ScanHarness(unittest.TestCase):
         env.update(extra)
         return env
 
-    def scan(self, world, projects=(PROJECT,), prior=None, impersonate=True, timeout=120, **extra_env):
+    # The scan's own per-project budget, not a shorter one: a harness scan is
+    # meant to run to completion over the whole catalogue, and under CPU
+    # contention (scripts/dev/repeat_under_load.sh, 12 busy loops on 4 cores)
+    # the fifty-role fake fleet ran past 120 s and every role read
+    # `not_checked`. The one test about the budget passes its own `timeout`.
+    def scan(self, world, projects=(PROJECT,), prior=None, impersonate=True, timeout=fixture_state.DEFAULT_PROJECT_TIMEOUT_S, **extra_env):
         self.world_path.write_text(json.dumps(world))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
