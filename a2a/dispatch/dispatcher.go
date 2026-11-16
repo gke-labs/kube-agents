@@ -1288,8 +1288,8 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 // token only as a report credential (#5619): at the unattended tier with a
 // checked trigger, and then with no target, which the broker holds to the
 // audit-report routes. Any other checked trigger on a task with no cluster
-// is logged as dropped, and nothing is minted for it. Both name the task, its profile and tier, the pod and
-// the UID it had at the offer; a pod whose UID has changed since (deleted
+// is logged as dropped, and nothing is minted for it. Both name the task,
+// its profile and tier, the pod and the UID it had at the offer; a pod whose UID has changed since (deleted
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
