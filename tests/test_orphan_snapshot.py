@@ -291,17 +291,23 @@ class PlanterTriggerTest(unittest.TestCase):
         stack = (_REPO_ROOT / "bench" / "tf" / "fleet" / "main.tf").read_text()
         block = stack[stack.index('resource "terraform_data" "orphan_snapshots"'):]
         block = block[: block.index("\n}\n")]
-        self.assertIn('filesha256("${path.module}/orphan_snapshot.py")', block)
-        self.assertIn("jsonencode(local.orphan_snapshot_names)", block)
+        # The triggers are checked inside the triggers_replace list, not the
+        # whole block: the local-exec environment carries the same names
+        # expression, so a names trigger dropped from the list would otherwise
+        # still be found.
+        triggers = block[block.index("triggers_replace"):block.index("\n  ]")]
+        self.assertIn('filesha256("${path.module}/orphan_snapshot.py")', triggers)
+        self.assertIn("local.orphan_snapshot_source", triggers)
+        self.assertIn("jsonencode(local.orphan_snapshot_names)", triggers)
         self.assertIn('command     = "${path.module}/orphan_snapshot.py"', block)
         for env_name in ENV:
             self.assertIn(env_name, block)
-        # The probe's two readings are triggers too: that is what lets the
-        # daily re-apply repair a swept snapshot or a re-created source disk
-        # with nothing of theirs in the state.
-        self.assertIn("data.external.orphan_snapshots.result.missing", block)
-        self.assertIn("data.external.orphan_snapshots.result.source_disk", block)
-        self.assertIn("data.external.orphan_snapshots.result.read_at", block)
+        # The probe's readings are triggers too: that is what lets the daily
+        # re-apply repair a swept snapshot or a re-created source disk with
+        # nothing of theirs in the state.
+        self.assertIn("data.external.orphan_snapshots.result.missing", triggers)
+        self.assertIn("data.external.orphan_snapshots.result.source_disk", triggers)
+        self.assertIn("data.external.orphan_snapshots.result.read_at", triggers)
         probe = stack[stack.index('data "external" "orphan_snapshots"'):]
         probe = probe[: probe.index("\n}\n")]
         self.assertIn('program = ["python3", "${path.module}/orphan_snapshot.py", "probe"]', probe)
