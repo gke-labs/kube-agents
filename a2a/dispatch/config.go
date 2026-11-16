@@ -128,8 +128,9 @@ type Config struct {
 	UnattendedTiers []string
 	// TaskSigningKey, set, is the task-signing key (#3889, a2a/taskcred) the
 	// dispatcher mints each confirmed task's credentials with: a task
-	// credential for the bus and, for a task that names a cluster, a token
-	// for the credential proxy, both on the confirm. Unset, confirms carry
+	// credential for the bus and, for a task that names a cluster or an
+	// unattended task a trigger started (a report credential, #5619), a
+	// token for the credential proxy, both on the confirm. Unset, confirms carry
 	// neither and workers keep their pod-level grants.
 	TaskSigningKey nkeys.KeyPair
 	// TaskCredentialMaxLifetime caps those credentials' expiry from the time
