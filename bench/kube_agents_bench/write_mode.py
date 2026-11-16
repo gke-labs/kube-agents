@@ -25,8 +25,18 @@ for the next request. A read that never ran, or a broker that reports no mode,
 is infrastructure (:class:`ModeUnavailable`): an image without the write mode
 cannot run such a case at all, which says nothing about the agent.
 
-Setting the mode and running a case at it come in later changes; nothing calls
-this module yet. It imports nothing from ``devops_bench``, so the case loader
+:func:`set_mode` moves the dial the way an admin's tap on the Slack Home tab
+does under ``spec.mode: next``: in the agent container it posts ``dial.level``
+to session-kv's board action route (``POST /v1/board/actions``), which checks
+the admin list, records the level and reports it to the broker before it
+answers. The script reads the board snapshot's ``dial`` section first for the
+level to put back and an admin to act as. :func:`restore` posts the level it
+found. The install must run the dial (``KUBEAGENTS_DIAL=on``) with at least one
+admin; otherwise nothing is set and the set is :class:`ModeUnavailable`.
+:func:`entry` is the trajectory entry for the sets.
+
+Running a case at a mode comes in a later change; nothing calls this module
+yet. It imports nothing from ``devops_bench``, so the case loader
 can import it without the bench's dependencies.
 """
 
@@ -41,12 +51,15 @@ from dataclasses import dataclass
 __all__ = [
     "DIRECTIVE",
     "MODES",
+    "SET_ENTRY",
     "ModeUnavailable",
     "WriteMode",
     "is_write_mode_ask",
     "parse",
     "read_command",
     "read_mode",
+    "restore",
+    "set_mode",
 ]
 
 #: The first line that makes a prompt an ask at a set write mode.
@@ -55,7 +68,23 @@ SET_FIELD = "set="
 FROM_FIELD = "from="
 #: The broker's modes (``vcs_broker.WRITE_MODES``).
 MODES = ("none", "propose")
-#: The script prints this first, so an answer without it is a script that
+#: The trajectory entry the harness records for the sets.
+SET_ENTRY = "harness_write_mode_set"
+#: The dial level that gives each mode (``dial_state.LEVELS``): the dial's
+#: Explain is the broker's none; Propose fixes leaves the broker at propose.
+DIAL_LEVELS = {"none": "explain", "propose": "propose"}
+#: session-kv in the agent pod, as every in-pod client reaches it, and the
+#: routes the set uses: the board snapshot and the board action.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+#: The pods whose restart would make "no restart" false: the agent's and the
+#: broker's, by the names the operator gives them (``<agent>-<suffix>-...``).
+#: The credential proxy's exec tier shares the broker's prefix but serves no
+#: VCS verb, and its replicas scale on their own, so it is left out.
+WATCHED_POD_SUFFIXES = ("-gateway-", "-credential-proxy-")
+UNWATCHED_POD_SUFFIXES = ("-credential-proxy-exec-tier-",)
+#: ``kubectl get pods -o jsonpath=`` printing ``name restarts...`` per pod.
+PODS_JSONPATH = '{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[*].restartCount}{"\\n"}{end}'
+#: The scripts print this first, so an answer without it is a script that
 #: never ran (kubectl exec gave out) rather than one that failed.
 SENTINEL = "__BENCH_WRITE_MODE__"
 #: The repository ``capabilities`` asks about: the case's GitOps repository.
@@ -68,7 +97,16 @@ ANSWER_TAIL_CHARS = 200
 
 
 class ModeUnavailable(RuntimeError):
-    """A read never ran to completion in the pod: infrastructure, not a run."""
+    """A read or set never ran to completion in the pod: infrastructure, not a run.
+
+    ``previous`` is the dial level a failed set found, when it got that far, so
+    the caller still puts it back: a level recorded but not confirmed by the
+    broker is still recorded.
+    """
+
+    def __init__(self, message: str, previous: str | None = None) -> None:
+        super().__init__(message)
+        self.previous = previous
 
 
 @dataclass(frozen=True)
@@ -175,3 +213,132 @@ def read_mode(sandbox_shell: Callable[[str, float], str], timeout: float, reposi
     if mode not in MODES:
         raise ModeUnavailable(f"write mode: could not read the broker's mode: {payload.get('error') or mode!r}")
     return mode
+
+
+_SET_SCRIPT = r"""
+import json, os, sys, urllib.request
+SENTINEL, URL, LEVEL = sys.argv[1:4]
+print(SENTINEL)
+out = {"set": False, "previous": None, "error": None}
+def call(path, body=None):
+    request = urllib.request.Request(
+        URL + path,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + os.environ.get("SESSION_KV_API_KEY", ""), "Content-Type": "application/json"},
+        method="GET" if body is None else "POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read() or b"{}")
+try:
+    dial = call("/v1/board").get("dial") or {}
+    if not dial.get("enabled"):
+        raise RuntimeError("the dial is off on this install (KUBEAGENTS_DIAL)")
+    admins = dial.get("admins") or []
+    if not admins:
+        raise RuntimeError("the dial has no admin (KUBEAGENTS_DIAL_ADMINS) to act as")
+    out["previous"] = dial.get("level")
+    answer = call("/v1/board/actions", {"action": "dial.level", "level": LEVEL, "user": admins[0]})
+    if not answer.get("ok"):
+        raise RuntimeError("session-kv refused it: %s" % answer.get("message"))
+    if not answer.get("reported"):
+        raise RuntimeError("the broker did not confirm the level: %s" % answer.get("message"))
+    out["set"] = True
+except Exception as exc:
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+print(json.dumps(out))
+"""
+
+
+def set_command(level: str) -> str:
+    """The agent-container command that moves the dial to ``level``."""
+    args = " ".join(shlex.quote(a) for a in (SENTINEL, SESSION_KV_URL, level))
+    return f"cd /tmp && python3 -c {shlex.quote(_SET_SCRIPT)} {args}"
+
+
+def _set(shell: Callable[[str, float], str], level: str, timeout: float) -> str:
+    payload = _answer(shell(set_command(level), timeout), "set")
+    previous = payload.get("previous") if isinstance(payload.get("previous"), str) else None
+    if not payload.get("set") or previous is None:
+        raise ModeUnavailable(f"write mode: the dial could not be set to {level}: {payload.get('error')!r}", previous)
+    return previous
+
+
+def set_mode(shell: Callable[[str, float], str], mode: str, timeout: float) -> str:
+    """Move the dial to ``mode``'s level through session-kv's board action, as an
+    admin's tap does, and return the dial level it was at, for :func:`restore`.
+
+    The set acts as the first name on the admin list, so the Home tab shows that
+    admin as the last to set the level until the put-back. With a ``from=`` ask,
+    put back the level the first set returned: the second set returns the level
+    the first one made.
+
+    Raises :class:`ModeUnavailable` when the set never ran, session-kv refused
+    it, or the broker did not confirm it.
+    """
+    return _set(shell, DIAL_LEVELS[mode], timeout)
+
+
+def restore(shell: Callable[[str, float], str], previous: str, timeout: float) -> None:
+    """Put the dial back at ``previous``, the level :func:`set_mode` found."""
+    _set(shell, previous, timeout)
+
+
+def watched_pods(listing: str | None, agent: str) -> dict[str, str] | None:
+    """``{pod: restart counts}`` for the agent's and the broker's pods in a
+    :data:`PODS_JSONPATH` listing; ``None`` when the listing was not read."""
+    if listing is None:
+        return None
+    prefixes = tuple(agent + suffix for suffix in WATCHED_POD_SUFFIXES)
+    skipped = tuple(agent + suffix for suffix in UNWATCHED_POD_SUFFIXES)
+    pods = {}
+    for line in listing.splitlines():
+        name, _, counts = line.strip().partition(" ")
+        if name.startswith(prefixes) and not name.startswith(skipped):
+            pods[name] = counts.strip()
+    return pods
+
+
+def entry(
+    asked: WriteMode,
+    initial_mode: str,
+    readings: list[dict],
+    restored_mode: str | None,
+    pods: tuple[dict[str, str] | None, dict[str, str] | None],
+    error: str = "",
+) -> dict:
+    """The trajectory entry for the sets. Every mode here is the broker's, as
+    :func:`read_mode` reads it (``none``/``propose``), never a dial level from
+    :func:`set_mode`. ``completed`` only when the install
+    started at another mode than the first set, every set read back as asked,
+    the watched pods are the same pods, unrestarted, after the run as before the
+    first set, and the put-back read back ``initial_mode``. Pods that could not be
+    listed are an error: the entry would otherwise claim a no-restart it never
+    saw. A put-back that failed is one too: the next case would run at the
+    wrong mode."""
+    before, after = pods
+    wanted = 2 if asked.from_mode else 1
+    first = asked.from_mode or asked.mode
+    if not error and initial_mode == first:
+        error = f"the install was already at {initial_mode}, so setting it proves nothing"
+    if not error and len(readings) != wanted:
+        error = f"{len(readings)} of {wanted} sets were made"
+    if not error and any(r["read"] != r["set"] for r in readings):
+        error = "a set did not read back as asked"
+    if not error and (not before or after is None):
+        error = "the agent's and the broker's pods could not be listed, so a restart could not be ruled out"
+    if not error and before != after:
+        error = f"the agent's or the broker's pod restarted or was replaced during the run ({before} then {after})"
+    if not error and restored_mode != initial_mode:
+        error = f"the install was not put back to {initial_mode} (read back {restored_mode})"
+    return {
+        "name": SET_ENTRY,
+        "args": {"set": asked.mode, "from": asked.from_mode},
+        "result": {
+            "initial": initial_mode,
+            "readings": readings,
+            "restored": restored_mode,
+            "pods": [before, after],
+            "error": error or None,
+        },
+        "status": "error" if error else "completed",
+    }
