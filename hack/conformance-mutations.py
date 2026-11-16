@@ -87,8 +87,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-reaches-vcs",
         "agents/platform/scripts/credential_proxy.py",
-        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
-         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_CURATOR)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_CURATOR, CALLER_ROLE_PROFILE)),\n'),
         "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
         "let a profile worker read a proposal the way the MCP pod does -- a "
         "forge read no task target confines",
