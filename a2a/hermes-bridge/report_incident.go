@@ -21,11 +21,15 @@ import (
 // posted a scheduled report to the home channel and asks for it to be kept
 // against its thread, and the bridge, the one bus participant in this pod
 // holding session-kv's bearer, stores it with POST /v1/incidents, the
-// endpoint the kanban notifier writes, under the address getIncident reads.
+// endpoint the kanban notifier writes, under the address getIncident reads,
+// replacing the thread's earlier report (replace: true) so a reply reads
+// the day's newest.
 // A reply in that thread is then answered with the report as
-// <untrusted_report>, so the bridge writes only into a channel this install's
-// chat backend serves: a write naming any other would let the gateway attach
-// text to a thread it never posted in. Nothing here starts a turn.
+// <untrusted_report>, so the bridge writes only into a thread of a channel
+// this install's chat backend serves, its home channel: a write naming any
+// other channel is refused. Whether the gateway in fact posted in that
+// thread is not something the bridge can tell, so within the home channel
+// the gateway's word is taken. Nothing here starts a turn.
 const (
 	// IncidentSlackHomeEnv, IncidentGchatHomeEnv and IncidentSlackHomeFileEnv
 	// name the served channels (Config.IncidentSlackHome and the rest), set
@@ -40,6 +44,12 @@ const (
 	// incidentKeepMaxBytes bounds a request read: the gateway cuts a report
 	// at 24KiB, and JSON escaping can grow it.
 	incidentKeepMaxBytes = 256 << 10
+	// incidentReportMaxBytes bounds the decoded report: the gateway cuts one
+	// at 24KiB plus a note, so anything past this is not one of its reports.
+	incidentReportMaxBytes = 32 << 10
+	// incidentKeepsInFlight bounds the writes running at once; one past it
+	// is answered busy at once rather than holding the subscription.
+	incidentKeepsInFlight = 8
 	// incidentHomeFileMax bounds the projected home file read.
 	incidentHomeFileMax = 256
 )
@@ -47,6 +57,9 @@ const (
 // errIncidentNotHosted is a write naming a channel this install's chat
 // backend does not serve.
 var errIncidentNotHosted = errors.New("the incident names a channel this install's chat backend does not serve")
+
+// errIncidentBusy answers a write past incidentKeepsInFlight.
+var errIncidentBusy = errors.New("too many incident writes in flight; not kept")
 
 // serveIncidents binds the incident route, when the bridge has a session-kv
 // to write. It returns the subscription to stop, or nil when nothing was
@@ -57,6 +70,7 @@ func (b *Bridge) serveIncidents() lib.Subscription {
 			"env", RouteKeyEnv)
 		return nil
 	}
+	b.incidentSlots = make(chan struct{}, incidentKeepsInFlight)
 	sub, err := b.c.SubscribeCore(lib.IncidentSubject, b.answerIncident)
 	if err != nil {
 		b.cfg.Logger.Warn("incident route not bound; a reply under a scheduled report will not carry it", "err", err)
@@ -72,7 +86,16 @@ func (b *Bridge) answerIncident(m *nats.Msg) {
 	if !strings.HasPrefix(m.Reply, lib.IncidentReplyPrefix) {
 		return
 	}
+	select {
+	case b.incidentSlots <- struct{}{}:
+	default:
+		b.cfg.Logger.Warn("incident not kept", "err", errIncidentBusy)
+		data, _ := json.Marshal(lib.IncidentKeepResult{Error: errIncidentBusy.Error()})
+		_ = m.Respond(data)
+		return
+	}
 	go func() {
+		defer func() { <-b.incidentSlots }()
 		result := lib.IncidentKeepResult{OK: true}
 		if err := b.keepIncident(m.Data); err != nil {
 			b.cfg.Logger.Warn("incident not kept", "err", err)
@@ -90,14 +113,17 @@ func (b *Bridge) keepIncident(data []byte) error {
 	if len(data) > incidentKeepMaxBytes {
 		return fmt.Errorf("the request is %d bytes; the limit is %d", len(data), incidentKeepMaxBytes)
 	}
+	// Unknown fields are ignored: the gateway and the bridge roll
+	// separately, so a newer gateway's field must not refuse every write.
 	var keep lib.IncidentKeep
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&keep); err != nil {
+	if err := json.Unmarshal(data, &keep); err != nil {
 		return fmt.Errorf("the request is not an incident: %w", err)
 	}
 	if strings.TrimSpace(keep.Report) == "" {
 		return errors.New("the incident has no report")
+	}
+	if len(keep.Report) > incidentReportMaxBytes {
+		return fmt.Errorf("the report is %d bytes; the limit is %d", len(keep.Report), incidentReportMaxBytes)
 	}
 	addr, err := incidentStoreAddress(keep.Platform, keep.ChatID, keep.ThreadID)
 	if err != nil {
@@ -188,9 +214,20 @@ func readHomeFile(path string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// storeIncident writes report at addr with session-kv's POST /v1/incidents.
+// incidentStoreBody is POST /v1/incidents' request. Replace is always set:
+// a schedule posts every report of its UTC day into one thread, and a reply
+// there is answered with the newest, aged from when it was stored.
+type incidentStoreBody struct {
+	ChatID   string `json:"chat_id"`
+	ThreadID string `json:"thread_id"`
+	Report   string `json:"report"`
+	Replace  bool   `json:"replace"`
+}
+
+// storeIncident writes report at addr with session-kv's POST /v1/incidents,
+// replacing the thread's earlier report.
 func (b *Bridge) storeIncident(addr incidentAddress, report string) error {
-	body, err := json.Marshal(map[string]string{"chat_id": addr.chatID, "thread_id": addr.threadID, "report": report})
+	body, err := json.Marshal(incidentStoreBody{ChatID: addr.chatID, ThreadID: addr.threadID, Report: report, Replace: true})
 	if err != nil {
 		return err
 	}

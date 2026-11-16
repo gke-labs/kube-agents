@@ -5,8 +5,10 @@ package lib
 // is answered with the report in hand (a2a/hermes-bridge/incident.go reads
 // it back as <untrusted_report>). The gateway publishes an IncidentKeep on
 // IncidentSubject; the Hermes bridge, the one process beside the agent that
-// holds the session KV's key, checks the thread is in a channel this
-// install's chat backend serves, stores it with POST /v1/incidents, and
+// holds the session KV's key, checks the thread is one of a channel this
+// install's chat backend serves (its home channel; whether the gateway in
+// fact posted in that thread is the gateway's word), stores it with
+// POST /v1/incidents, and
 // answers an IncidentKeepResult on the request's subject under
 // IncidentReplyPrefix. Named and shaped as the board route is
 // (BoardSubject): a request the gateway alone sends and the bridge alone

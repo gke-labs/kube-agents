@@ -441,6 +441,63 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(data["thread_id"], "test-thread")
         self.assertEqual(data["report"], "This is a test report with Option A and Option B")
 
+    def test_a_second_incident_for_a_thread_keeps_the_first_by_default(self):
+        # The kanban notifier's writes: the first report, the one carrying
+        # the options, is the one a reply reads.
+        for report in ("first, with Option A", "second"):
+            resp = self.client.post("/v1/incidents", json={"chat_id": "c1", "thread_id": "t1", "report": report})
+            self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(
+            "/v1/incidents", json={"chat_id": "c1", "thread_id": "t1", "report": "third", "replace": False}
+        )
+        self.assertEqual(resp.status_code, 200)
+        got = self.client.get("/v1/incidents/by-thread?chat_id=c1&thread_id=t1").json()
+        self.assertEqual(got["report"], "first, with Option A")
+
+    def test_a_replacing_incident_keeps_the_newest_and_restarts_its_age(self):
+        # The gateway's scheduled reports: one thread per schedule per day,
+        # and a reply reads the newest, aged from when it was stored.
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+
+        old_time = (datetime.now(timezone.utc) - timedelta(days=13)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report, created_at) VALUES (?, ?, ?, ?)",
+                    ("C0HOME", "1763100000.000100", "the day's first report", old_time),
+                )
+        resp = self.client.post(
+            "/v1/incidents",
+            json={"chat_id": "C0HOME", "thread_id": "1763100000.000100", "report": "the newest", "replace": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "stored"})
+        got = self.client.get("/v1/incidents/by-thread?chat_id=C0HOME&thread_id=1763100000.000100").json()
+        self.assertEqual(got["report"], "the newest")
+        with sqlite3.connect(temp_db_path) as conn:
+            (created_at,) = conn.execute(
+                "SELECT created_at FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                ("C0HOME", "1763100000.000100"),
+            ).fetchone()
+        self.assertGreater(created_at, old_time, "the replaced report kept the old report's age")
+        # A first write with replace stores as any first write does.
+        resp = self.client.post(
+            "/v1/incidents", json={"chat_id": "C0HOME", "thread_id": "1763100000.000200", "report": "x", "replace": True}
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_an_incident_replace_that_is_not_a_boolean_is_refused(self):
+        for value in ("true", 1, None, [True]):
+            resp = self.client.post(
+                "/v1/incidents", json={"chat_id": "c2", "thread_id": "t2", "report": "r", "replace": value}
+            )
+            self.assertEqual(resp.status_code, 400, f"replace={value!r}")
+        self.assertEqual(
+            self.client.get("/v1/incidents/by-thread?chat_id=c2&thread_id=t2").status_code, 404,
+            "a refused write stored something",
+        )
+
     def test_get_incident_not_found(self):
         get_resp = self.client.get("/v1/incidents/by-thread?chat_id=missing&thread_id=missing")
         self.assertEqual(get_resp.status_code, 404)

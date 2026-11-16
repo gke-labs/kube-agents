@@ -8720,16 +8720,37 @@ def list_sessions(limit: int = 100) -> Dict[str, Any]:
 
 @app.post("/v1/incidents", dependencies=[Depends(verify_api_key)])
 def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
+    """Stores a report against the thread it was posted in.
+
+    By default the FIRST report per thread is kept (the one carrying the
+    options): a later write for the same thread changes nothing. With
+    ``replace: true`` the write replaces the thread's report and restarts its
+    ``created_at``, so the cleanup TTL counts from the newest report: the A2A
+    gateway's scheduled reports, which post into one thread per schedule per
+    UTC day and whose replies are answered with the newest
+    (a2a/hermes-bridge/report_incident.go).
+    """
     chat_id, thread_id, report = body.get("chat_id"), body.get("thread_id"), body.get("report")
     if not (chat_id and thread_id and report):
         raise HTTPException(status_code=400, detail="chat_id, thread_id, report required")
+    replace = body.get("replace", False)
+    if not isinstance(replace, bool):
+        raise HTTPException(status_code=400, detail="replace must be a boolean")
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
         with conn:
-            # keep the FIRST report per thread (the one carrying the options)
-            conn.execute(
-                "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
-                (chat_id, thread_id, report),
-            )
+            if replace:
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?) "
+                    "ON CONFLICT(chat_id, thread_id) DO UPDATE SET report = excluded.report, "
+                    "created_at = CURRENT_TIMESTAMP",
+                    (chat_id, thread_id, report),
+                )
+            else:
+                # keep the FIRST report per thread (the one carrying the options)
+                conn.execute(
+                    "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
+                    (chat_id, thread_id, report),
+                )
             cleanup_old_records(conn)
     return {"status": "stored"}
 

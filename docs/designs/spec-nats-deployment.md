@@ -820,8 +820,9 @@ Layout:
   route's shape: the gateway user gains publish on `chat.incident` and subscribe on
   `chat.incident.reply.gateway.>`, the bridge user the matching grants, and no other principal
   holds either, so the gateway gains no session-kv credential. The bridge stores a report only
-  in a channel this install's chat backend serves, so the request cannot attach text to an
-  arbitrary thread. Core NATS.
+  in a thread of a channel this install's chat backend serves (its home channel); it cannot
+  tell whether the gateway posted in that thread, so within the home channel the gateway's word
+  is taken. Core NATS.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

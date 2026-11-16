@@ -489,6 +489,9 @@ type Bridge struct {
 	apiClient *http.Client
 	// routeClient records conversation routes (route.go).
 	routeClient *http.Client
+	// incidentSlots bounds the incident writes in flight
+	// (report_incident.go), made when the route binds.
+	incidentSlots chan struct{}
 	// routesMu guards routes, the route each session last recorded
 	// (route.go), so a failed PUT that would have written the same route
 	// is not reported as a lost one.

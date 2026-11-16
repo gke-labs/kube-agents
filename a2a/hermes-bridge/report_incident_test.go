@@ -3,11 +3,13 @@ package hermesbridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,8 +24,11 @@ import (
 type incidentKV struct {
 	mu     sync.Mutex
 	status int
-	bodies []map[string]string
+	bodies []map[string]any
 	auth   []string
+	// rows is the table as session-kv keeps it: a write with replace
+	// true replaces the thread's row, any other keeps the first.
+	rows map[string]string
 }
 
 func (k *incidentKV) serve(t *testing.T) *httptest.Server {
@@ -34,9 +39,16 @@ func (k *incidentKV) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		raw, _ := io.ReadAll(r.Body)
-		var body map[string]string
+		var body map[string]any
 		_ = json.Unmarshal(raw, &body)
 		k.mu.Lock()
+		if k.rows == nil {
+			k.rows = map[string]string{}
+		}
+		row := fmt.Sprint(body["chat_id"], "|", body["thread_id"])
+		if _, have := k.rows[row]; !have || body["replace"] == true {
+			k.rows[row], _ = body["report"].(string)
+		}
 		k.bodies = append(k.bodies, body)
 		k.auth = append(k.auth, r.Header.Get("Authorization"))
 		status := k.status
@@ -51,10 +63,10 @@ func (k *incidentKV) serve(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func (k *incidentKV) writes() []map[string]string {
+func (k *incidentKV) writes() []map[string]any {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return append([]map[string]string(nil), k.bodies...)
+	return append([]map[string]any(nil), k.bodies...)
 }
 
 // incidentBridge is a bridge whose session-kv is kv and which serves the
@@ -77,7 +89,7 @@ func keepRequest(t *testing.T, keep lib.IncidentKeep) []byte {
 
 // TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt: a report posted in a
 // home-channel thread is stored with session-kv's POST /v1/incidents, with the
-// bearer, under the address the bridge's own lookup reads for a reply in that
+// bearer and replace: true (the day's newest report is the one a reply reads), under the address the bridge's own lookup reads for a reply in that
 // thread: on Slack the channel and the bare ts, on Google Chat the space and
 // the thread's full name.
 func TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt(t *testing.T) {
@@ -106,7 +118,8 @@ func TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := kv.writes()
-			if len(got) != 1 || got[0]["chat_id"] != tc.wantChat || got[0]["thread_id"] != tc.wantTh || got[0]["report"] != "Two findings." {
+			if len(got) != 1 || got[0]["chat_id"] != tc.wantChat || got[0]["thread_id"] != tc.wantTh || got[0]["report"] != "Two findings." ||
+				got[0]["replace"] != true {
 				t.Fatalf("writes = %v", got)
 			}
 			if kv.auth[0] != "Bearer kv-key" {
@@ -142,7 +155,7 @@ func TestAnIncidentOutsideTheServedChannelsIsRefused(t *testing.T) {
 		"a thread of another space":   `{"platform":"google_chat","chat_id":"spaces/HOME","thread_id":"spaces/OTHER/threads/t1","report":"x"}`,
 		"not a ts":                    `{"platform":"slack","chat_id":"C0HOME","thread_id":"abc","report":"x"}`,
 		"no report":                   `{"platform":"slack","chat_id":"C0HOME","thread_id":"1763100000.000100","report":" "}`,
-		"an unknown field":            `{"platform":"slack","chat_id":"C0HOME","thread_id":"1763100000.000100","report":"x","replace":true}`,
+		"a report over the cap":       `{"platform":"slack","chat_id":"C0HOME","thread_id":"1763100000.000100","report":"` + strings.Repeat("x", incidentReportMaxBytes+1) + `"}`,
 	} {
 		if err := b.keepIncident([]byte(raw)); err == nil {
 			t.Errorf("%s: kept", name)
@@ -227,5 +240,72 @@ func TestTheIncidentRouteAnswersOverTheBus(t *testing.T) {
 	}
 	if _, err := ask("_INBOX.elsewhere"); err == nil {
 		t.Fatal("a request with a reply outside the gateway's namespace was answered")
+	}
+}
+
+// TestTheNewestReportInAThreadIsTheOneKept: two reports posted into one
+// thread leave the second stored, since the bridge asks session-kv to
+// replace; and a request carrying a field this bridge does not know (a newer
+// gateway) is still kept.
+func TestTheNewestReportInAThreadIsTheOneKept(t *testing.T) {
+	t.Parallel()
+	kv := &incidentKV{}
+	b := incidentBridge(t, kv)
+	for _, report := range []string{"The day's first report.", "The day's second report."} {
+		keep := lib.IncidentKeep{Platform: lib.NotifyPlatformSlack, ChatID: "C0HOME", ThreadID: "1763100000.000100", Report: report}
+		if err := b.keepIncident(keepRequest(t, keep)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kv.mu.Lock()
+	got := kv.rows["C0HOME|1763100000.000100"]
+	kv.mu.Unlock()
+	if got != "The day's second report." {
+		t.Fatalf("stored %q, want the second report", got)
+	}
+	newer := `{"platform":"slack","chat_id":"C0HOME","thread_id":"1763100000.000200","report":"x","priority":"high"}`
+	if err := b.keepIncident([]byte(newer)); err != nil {
+		t.Fatalf("a request with an unknown field was refused: %v", err)
+	}
+}
+
+// TestIncidentWritesPastTheCapAreAnsweredBusy: with every slot taken, a
+// write is answered busy at once and stores nothing.
+func TestIncidentWritesPastTheCapAreAnsweredBusy(t *testing.T) {
+	t.Parallel()
+	_, url := startServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	kv := &incidentKV{}
+	b := incidentBridge(t, kv)
+	b.incidentSlots = make(chan struct{}, incidentKeepsInFlight)
+	for range incidentKeepsInFlight {
+		b.incidentSlots <- struct{}{}
+	}
+	if _, err := nc.Subscribe(lib.IncidentSubject, b.answerIncident); err != nil {
+		t.Fatal(err)
+	}
+	body := keepRequest(t, lib.IncidentKeep{Platform: lib.NotifyPlatformSlack, ChatID: "C0HOME", ThreadID: "1763100000.000100", Report: "x"})
+	reply := lib.IncidentReplyPrefix + "busy"
+	in, err := nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.PublishRequest(lib.IncidentSubject, reply, body); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := in.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r lib.IncidentKeepResult
+	if err := json.Unmarshal(msg.Data, &r); err != nil || r.OK || r.Error != errIncidentBusy.Error() {
+		t.Fatalf("answer = %s (%v), want busy", msg.Data, err)
+	}
+	if got := kv.writes(); len(got) != 0 {
+		t.Fatalf("stored %v past the cap", got)
 	}
 }
