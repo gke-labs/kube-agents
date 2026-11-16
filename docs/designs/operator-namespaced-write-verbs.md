@@ -232,9 +232,11 @@ kubeagents-system-profiles)` and the cause sentence names the object to add. The
 from one namespace to two on a stock install; the reviews are concurrent and bounded by
 `rbacProbeConcurrency`.
 
-The webhook. One `PlatformAgent` per cluster, in any namespace. Neither shape changes it. A rule
-that also pins the namespace to the operator's (`POD_NAMESPACE`) would remove the hand-managed case
-from shape (a) entirely; it is a behaviour change and a decision for the owner, listed below.
+The webhook. One `PlatformAgent` per cluster, and, since decision 2 (§8), in the operator's
+namespace (`POD_NAMESPACE`): a create elsewhere is refused where the webhook is enabled, an update
+of an agent that already exists elsewhere is admitted with a warning, and an operator with no
+`POD_NAMESPACE` skips the rule. Neither shape changes it; it removes the hand-managed agent
+namespace from shape (a).
 
 The leader-election Role. The chart's `operator-leader-election-role` grants `events` only and its
 comment says the lease verbs are in the ClusterRole; after the move they are in the install
@@ -302,8 +304,9 @@ comparison with both costs stated:
 
 The recommendation holds because the cost shape (b) removes falls on a namespace nobody ships, and
 the cost it adds falls on every audit of every install. It is a judgment about weights, and the
-ruling is the owners': if a `PlatformAgent` outside the install namespace is a shape to support, or
-hand-managed namespaces weigh more than the scanner surface, shape (b) is the right choice. The
+ruling is the owners': if a `PlatformAgent` outside the install namespace is a shape to support
+(which also reverses decision 2, the webhook's namespace rule), or hand-managed namespaces weigh
+more than the scanner surface, shape (b) is the right choice. The
 switch is a kind change in the chart template, a kustomize patch, the guard flip in §4, and the
 removal of the `config/profiles` Role copy; nothing in the prepared implementation stands in its
 way.
