@@ -3774,8 +3774,10 @@ wait_for_rollout() {
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
 
   local rc=0
+  # ${ctx_flag[@]+...}: empty without a context, and macOS's bash 3.2 treats
+  # an empty array expansion as unbound under `set -u`.
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -3816,7 +3818,8 @@ wait_for_deployment_object() {
   fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
+  # ${ctx_flag[@]+...}: as in wait_for_rollout, for bash 3.2.
+  while ! kubectl get deployment "$deployment" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -5409,7 +5412,9 @@ gitlab_repo_path() {
   local seg lower n=0 segs=()
   IFS=/ read -r -a segs <<<"$repo"
   [[ "$repo" == */ ]] && return 0
-  for seg in "${segs[@]}"; do
+  # ${segs[@]+...}: `/` and `.git` leave no segment, and bash 3.2 treats an
+  # empty array expansion as unbound under `set -u`.
+  for seg in ${segs[@]+"${segs[@]}"}; do
     # The reserved endings in any case, as the operator compares them.
     lower="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
     if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$lower" == *.git ]] || [[ "$lower" == *.atom ]]; then
