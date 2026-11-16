@@ -1406,7 +1406,7 @@ def validate_case(
 ) -> list[str]:
     """Every problem with one case file, as reader-facing sentences.
 
-    ``validated-capabilities`` is the set of case names the presubmit and nightly files
+    ``validated_capabilities`` is the set of case names the presubmit and nightly files
     hold, which a suite case must stay off; None skips that rule."""
     problems: list[str] = []
     spec = _load_yaml(path)
