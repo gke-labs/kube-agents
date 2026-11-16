@@ -13392,5 +13392,498 @@ class EmptyArrayExpansionsAreGuardedTest(unittest.TestCase):
                 self.assertEqual(expansions, guarded, f"{path.name}: a bare expansion of {array} is back")
 
 
+class StockoutInvestigatorPromptTest(unittest.TestCase):
+    """Interactive prompt, menu toggle, summary, and default parity for Stockout Investigator."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._install_env = pathlib.Path(self._tmp.name) / "install.env"
+        self._install_env.write_text("", encoding="utf-8")
+        self._install_env.chmod(0o600)
+
+    def _run_bash(self, body, extra_env=None, source_common=True):
+        common_line = f"{_SOURCE_INSTALLER_COMMON}\n" if source_common else ""
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"{common_line}"
+            f"{body}\n"
+        )
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)}
+        if extra_env:
+            overrides.update(extra_env)
+        env = get_isolated_test_env(overrides=overrides)
+        return _run_installer_bash(script, env=env, cwd=_REPO_ROOT)
+
+    def test_interactive_defaults_yes_when_home_channel_configured(self):
+        cases = (
+            ("gchat", "true", "spaces/AAAA1234", "false", ""),
+            ("slack", "false", "", "true", "C01234567"),
+        )
+        for label, g_on, g_home, s_on, s_home in cases:
+            with self.subTest(platform=label):
+                proc = self._run_bash(
+                    f"""
+resolve_shared_defaults
+has_controlling_tty() {{ return 0; }}
+PARAM_NON_INTERACTIVE=false
+prompt_read() {{
+  local prompt="$1" var="$2" default="${{3:-}}"
+  echo "PROMPT=$prompt DEFAULT=$default"
+  printf -v "$var" '%s' "$default"
+}}
+prompt_stockout_investigator "{g_on}" "{g_home}" "{s_on}" "{s_home}" "proj-1"
+echo "RESULT=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+"""
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("(Y/n)", proc.stdout)
+                self.assertIn("DEFAULT=y", proc.stdout)
+                self.assertIn("RESULT=true", proc.stdout)
+
+    def test_interactive_defaults_no_without_enabled_home_channel(self):
+        cases = (
+            ("no_chat", "false", "", "false", ""),
+            ("gchat_without_space", "true", "", "false", ""),
+            ("chat_disabled_with_stale_home", "false", "spaces/AAAA1234", "false", "C01234567"),
+        )
+        for label, g_on, g_home, s_on, s_home in cases:
+            with self.subTest(case=label):
+                proc = self._run_bash(
+                    f"""
+resolve_shared_defaults
+has_controlling_tty() {{ return 0; }}
+PARAM_NON_INTERACTIVE=false
+prompt_read() {{
+  local prompt="$1" var="$2" default="${{3:-}}"
+  echo "PROMPT=$prompt DEFAULT=$default"
+  printf -v "$var" '%s' "$default"
+}}
+prompt_stockout_investigator "{g_on}" "{g_home}" "{s_on}" "{s_home}" "proj-1"
+echo "RESULT=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+"""
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("(y/N)", proc.stdout)
+                self.assertIn("DEFAULT=n", proc.stdout)
+                self.assertIn("RESULT=false", proc.stdout)
+
+    def test_interactive_accepts_explicit_override_and_skipped_with_flag_or_non_interactive(self):
+        # Explicit 'y' without home channel enables; explicit 'n' with home channel disables.
+        proc = self._run_bash(
+            """
+resolve_shared_defaults
+has_controlling_tty() { return 0; }
+PARAM_NON_INTERACTIVE=false
+prompt_read() { printf -v "$2" '%s' "y"; }
+prompt_stockout_investigator "false" "" "false" "" "proj-1"
+echo "NO_HOME_YES=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+prompt_read() { printf -v "$2" '%s' "n"; }
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET=false
+prompt_stockout_investigator "true" "spaces/AAAA1234" "false" "" "proj-1"
+echo "HOME_NO=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+"""
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NO_HOME_YES=true", proc.stdout)
+        self.assertIn("HOME_NO=false", proc.stdout)
+
+        # CLI flag skips prompt; non-interactive keeps DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR=false.
+        proc_skip = self._run_bash(
+            """
+has_controlling_tty() { return 0; }
+prompt_read() { echo "UNEXPECTED_PROMPT"; return 1; }
+parse_args --enable-stockout-investigator=false
+resolve_shared_defaults
+PARAM_NON_INTERACTIVE=false
+prompt_stockout_investigator "true" "spaces/AAAA1234" "false" "" "proj-1"
+echo "FLAG_FALSE=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR=""
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED=false
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET=false
+parse_args --non-interactive
+resolve_shared_defaults
+prompt_stockout_investigator "true" "spaces/AAAA1234" "false" "" "proj-1"
+echo "NON_INTERACTIVE_RAW=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+echo "NON_INTERACTIVE_EFFECTIVE=${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+"""
+        )
+        self.assertEqual(proc_skip.returncode, 0, proc_skip.stderr + proc_skip.stdout)
+        self.assertNotIn("UNEXPECTED_PROMPT", proc_skip.stdout)
+        self.assertIn("FLAG_FALSE=false", proc_skip.stdout)
+        self.assertIn("NON_INTERACTIVE_RAW=\n", proc_skip.stdout)
+        self.assertIn("NON_INTERACTIVE_EFFECTIVE=false", proc_skip.stdout)
+
+    def test_loaded_install_env_setting_sets_prompt_default(self):
+        self._install_env.write_text("ENABLE_STOCKOUT_INVESTIGATOR=false\n", encoding="utf-8")
+        proc = self._run_bash(
+            """
+resolve_shared_defaults
+has_controlling_tty() { return 0; }
+PARAM_NON_INTERACTIVE=false
+prompt_read() {
+  echo "DEFAULT=$3"
+  printf -v "$2" '%s' "$3"
+}
+prompt_stockout_investigator "true" "spaces/AAAA1234" "false" "" "proj-1"
+echo "RESULT=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+"""
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("DEFAULT=n", proc.stdout)
+        self.assertIn("RESULT=false", proc.stdout)
+
+    def test_interactive_retries_on_invalid_input(self):
+        proc = self._run_bash(
+            """
+resolve_shared_defaults
+has_controlling_tty() { return 0; }
+PARAM_NON_INTERACTIVE=false
+ATTEMPT=0
+prompt_read() {
+  ATTEMPT=$((ATTEMPT + 1))
+  case "$ATTEMPT" in
+    1) printf -v "$2" '%s' "maybe" ;;
+    2) printf -v "$2" '%s' "y" ;;
+  esac
+}
+prompt_stockout_investigator "false" "" "false" "" "proj-1"
+echo "RESULT=$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+"""
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Please enter y or n.", proc.stdout + proc.stderr)
+        self.assertIn("RESULT=true", proc.stdout)
+
+    def test_day2_menu_toggles_and_saves_stockout_investigator(self):
+        for initial, toggled, expected_msg in (
+            ("false", "true", "GKE Stockout Investigator enabled!"),
+            ("true", "false", "GKE Stockout Investigator disabled."),
+        ):
+            with self.subTest(initial=initial, toggled=toggled):
+                self._install_env.write_text(
+                    "PROJECT_ID=p\n"
+                    "CLUSTER_NAME=c\n"
+                    "REGION=us-central1\n"
+                    "PLATFORM_AGENT_PERMISSION_SET=custom\n"
+                    "PLATFORM_AGENT_CUSTOM_ROLES=roles/container.viewer\n"
+                    f"ENABLE_STOCKOUT_INVESTIGATOR={initial}\n",
+                    encoding="utf-8",
+                )
+                with tempfile.TemporaryDirectory() as repo_tmp:
+                    proc = self._run_bash(
+                        f"""
+gcloud() {{ return 0; }}
+has_controlling_tty() {{ return 0; }}
+resolve_effective_image_tag() {{ return 0; }}
+validate_immutable_ref() {{ return 0; }}
+verify_local_source_ref() {{ return 0; }}
+tf_state_chat_subscription_name() {{ return 0; }}
+print_success() {{
+  echo "$1"
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}}
+STEP=0
+prompt_menu() {{
+  local var="${{!#}}"
+  STEP=$((STEP + 1))
+  case "$STEP" in
+    1) printf -v "$var" '%s' "4" ;;
+    2) printf -v "$var" '%s' "3" ;;
+    3) printf -v "$var" '%s' "6" ;;
+  esac
+}}
+run_menu_system "{repo_tmp}"
+""",
+                        source_common=False,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertIn(expected_msg, proc.stdout)
+                    saved = self._install_env.read_text(encoding="utf-8")
+                    self.assertIn(f"ENABLE_STOCKOUT_INVESTIGATOR={toggled}", saved)
+                    self.assertIn("PLATFORM_AGENT_PERMISSION_SET=custom", saved)
+                    self.assertIn("PLATFORM_AGENT_CUSTOM_ROLES=roles/container.viewer", saved)
+
+    def test_step11_preflight_summary_shows_stockout_status(self):
+        # Run Step 11 (dry-run main) both off (default non-interactive) and on (--enable-stockout-investigator)
+        # with an isolated TemporaryDirectory for terraform artifacts so nothing writes into the checkout.
+        # Step 13 completion summary coverage lives in test_step13_completion_summary_executes_stockout_status_branches.
+        for enabled, expected in (
+            (
+                False,
+                "Disabled (enable later with --enable-stockout-investigator, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)",
+            ),
+            (True, "Enabled (Pub/Sub adapter + noScaleUp sink)"),
+        ):
+            with self.subTest(enabled=enabled):
+                with tempfile.TemporaryDirectory() as kc_dir, tempfile.TemporaryDirectory() as tf_dir:
+                    kubeconfig = pathlib.Path(kc_dir) / "kubeconfig"
+                    kubeconfig.touch()
+                    flag = "--enable-stockout-investigator" if enabled else ""
+                    proc = self._run_bash(
+                        f"""
+command() {{ return 0; }}
+require_min_gcloud_version() {{ return 0; }}
+require_min_terraform_version() {{ return 0; }}
+acquire_source_repo() {{ printf -v "$1" "%s" "{_REPO_ROOT}"; }}
+tf_compose_dir() {{ echo "{tf_dir}"; }}
+gcloud() {{
+  case "$*" in
+    *"config get-value account"*) echo "user@example.com" ;;
+    *"projects describe"*) echo "123456" ;;
+    *"application-default print-access-token"*) return 1 ;;
+    *"clusters describe"*) echo "NOT_FOUND" >&2; return 1 ;;
+  esac
+  return 0
+}}
+write_tfvars_from_state() {{ : > "$1"; }}
+check_service_account_ownership() {{ return 0; }}
+bootstrap_install_env_file() {{ return 0; }}
+drop_stale_import_overrides() {{ :; }}
+run_with_spinner() {{ return 0; }}
+write_json_report() {{ echo "REPORT=$1"; }}
+main --dry-run -y --gcp-project-id=test-proj --gke-cluster-name=test-cluster --gcp-region=us-central1 {flag}
+""",
+                        extra_env={"KUBECONFIG": str(kubeconfig)},
+                        source_common=False,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertIn("GKE Stockout Investigator:", proc.stdout)
+                    self.assertIn(expected, proc.stdout)
+
+    def test_step13_completion_summary_executes_stockout_status_branches(self):
+        # Extract and directly execute the Step 13 summary snippet in bash so enabled and disabled lines are tested at runtime.
+        install_text = _INSTALL_SH.read_text(encoding="utf-8")
+        step13_full = install_text.split("# 13. Installation Summary & Next Steps", 1)[1]
+        step13_summary = step13_full.split("  print_chat_setup_checklists", 1)[0]
+        for enabled, expected in (
+            ("true", "Enabled (monitoring cluster-autoscaler noScaleUp events)"),
+            (
+                "false",
+                "Disabled (enable with --enable-stockout-investigator, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)",
+            ),
+        ):
+            with self.subTest(enabled=enabled):
+                proc = self._run_bash(
+                    f"""
+project_id="proj-1"
+project_number="123456"
+cluster_name="cluster-1"
+region="us-central1"
+TFVARS_CLUSTER_MODE="autopilot"
+cluster_mode="autopilot"
+enable_gvisor="true"
+model_provider="gemini"
+model_default_name="gemini-2.5-pro"
+permission_set="read-only"
+google_chat_enabled="false"
+slack_enabled="false"
+PARAM_ENABLE_WEBUI="false"
+PARAM_ENABLE_WEB_CONSOLE="false"
+WEB_CONSOLE_ENABLED="false"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR="{enabled}"
+{step13_summary}
+""",
+                    source_common=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("GKE Stockout Investigator:", proc.stdout)
+                self.assertIn(expected, proc.stdout)
+
+    def test_warn_unrecorded_interview_answers_reports_stockout_drift(self):
+        # Recorded false -> true drifts; omitted -> true also drifts (absent resolves to false).
+        for label, contents, expected_drift in (
+            ("recorded_false_drifts_to_true", "ENABLE_STOCKOUT_INVESTIGATOR=false\n", True),
+            ("omitted_key_drifts_to_true", "PROJECT_ID=p\n", True),
+        ):
+            with self.subTest(case=label):
+                self._install_env.write_text(contents, encoding="utf-8")
+                proc = self._run_bash(
+                    f"""
+has_controlling_tty() {{ return 0; }}
+PARAM_NON_INTERACTIVE=false
+PARAM_DRY_RUN=false
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED=false
+export ENABLE_STOCKOUT_INVESTIGATOR=true
+warn_unrecorded_interview_answers "{self._install_env}"
+"""
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                if expected_drift:
+                    self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true", proc.stdout + proc.stderr)
+
+        # Omitted key with false stays silent (matches default false); empty recorded key resolves to false too.
+        for label, contents in (
+            ("omitted_key_with_false", "PROJECT_ID=p\n"),
+            ("empty_recorded_key_with_false", "ENABLE_STOCKOUT_INVESTIGATOR=\n"),
+        ):
+            with self.subTest(case=label):
+                self._install_env.write_text(contents, encoding="utf-8")
+                proc_silent = self._run_bash(
+                    f"""
+has_controlling_tty() {{ return 0; }}
+PARAM_NON_INTERACTIVE=false
+PARAM_DRY_RUN=false
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED=false
+export ENABLE_STOCKOUT_INVESTIGATOR=false
+warn_unrecorded_interview_answers "{self._install_env}"
+"""
+                )
+                self.assertEqual(proc_silent.returncode, 0, proc_silent.stderr + proc_silent.stdout)
+                self.assertNotIn("ENABLE_STOCKOUT_INVESTIGATOR", proc_silent.stdout + proc_silent.stderr)
+
+        # Empty recorded key with interactive Yes drifts; interactive No over exported true + omitted key also drifts.
+        for label, contents, shell_val, chosen_val, expected_line in (
+            (
+                "empty_recorded_drifts_to_true",
+                "ENABLE_STOCKOUT_INVESTIGATOR=\n",
+                "",
+                "true",
+                "ENABLE_STOCKOUT_INVESTIGATOR=true",
+            ),
+            (
+                "interactive_no_over_exported_true_drifts",
+                "PROJECT_ID=p\n",
+                "true",
+                "false",
+                "ENABLE_STOCKOUT_INVESTIGATOR=false",
+            ),
+        ):
+            with self.subTest(case=label):
+                self._install_env.write_text(contents, encoding="utf-8")
+                proc_drift = self._run_bash(
+                    f"""
+has_controlling_tty() {{ return 0; }}
+PARAM_NON_INTERACTIVE=false
+PARAM_DRY_RUN=false
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED=false
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE=true
+SHELL_ENABLE_STOCKOUT_INVESTIGATOR="{shell_val}"
+export ENABLE_STOCKOUT_INVESTIGATOR="{chosen_val}"
+warn_unrecorded_interview_answers "{self._install_env}"
+"""
+                )
+                self.assertEqual(proc_drift.returncode, 0, proc_drift.stderr + proc_drift.stdout)
+                self.assertIn(expected_line, proc_drift.stdout + proc_drift.stderr)
+
+    def test_warn_flag_beats_unrecorded_file_value_for_stockout_flag(self):
+        # Passing --enable-stockout-investigator over an omitted or false install.env warns in bootstrap_install_env_file.
+        for label, contents, args in (
+            ("flag_true_over_omitted", "PROJECT_ID=p\n", "--enable-stockout-investigator"),
+            ("flag_true_over_false", "ENABLE_STOCKOUT_INVESTIGATOR=false\n", "--enable-stockout-investigator"),
+            ("flag_false_over_true", "ENABLE_STOCKOUT_INVESTIGATOR=true\n", "--enable-stockout-investigator=false"),
+        ):
+            with self.subTest(case=label):
+                self._install_env.write_text(contents, encoding="utf-8")
+                proc = self._run_bash(
+                    f"""
+parse_args -y {args}
+resolve_shared_defaults
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, combined)
+                self.assertIn("--enable-stockout-investigator=", combined)
+                self.assertIn("upgrade.sh takes no such flag", combined)
+                self.assertNotIn("every later install.sh and upgrade.sh run", combined)
+
+        # --enable-stockout-investigator=false over an omitted key agrees with default false -> silent.
+        self._install_env.write_text("PROJECT_ID=p\n", encoding="utf-8")
+        proc_false_omitted = self._run_bash(
+            f"""
+parse_args -y --enable-stockout-investigator=false
+resolve_shared_defaults
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+        )
+        self.assertEqual(proc_false_omitted.returncode, 0, proc_false_omitted.stderr + proc_false_omitted.stdout)
+        self.assertNotIn("ENABLE_STOCKOUT_INVESTIGATOR", proc_false_omitted.stdout + proc_false_omitted.stderr)
+        self.assertNotIn("applies to this run only", proc_false_omitted.stdout + proc_false_omitted.stderr)
+
+        # Exported ENABLE_STOCKOUT_INVESTIGATOR=true on non-interactive run over omitted key (even on a TTY) MUST warn once.
+        self._install_env.write_text("PROJECT_ID=p\n", encoding="utf-8")
+        proc_exported_on = self._run_bash(
+            f"""
+has_controlling_tty() {{ return 0; }}
+parse_args -y
+resolve_shared_defaults
+export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+            extra_env={"ENABLE_STOCKOUT_INVESTIGATOR": "true"},
+        )
+        combined_exp = proc_exported_on.stdout + proc_exported_on.stderr
+        self.assertEqual(proc_exported_on.returncode, 0, combined_exp)
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true applies to this run only", combined_exp)
+        self.assertIn("records no ENABLE_STOCKOUT_INVESTIGATOR", combined_exp)
+        self.assertIn("deletes the Log Router sink", combined_exp)
+        self.assertNotIn("This run applied answers", combined_exp)
+
+        # --enable-stockout-investigator=true over exported false + omitted key attributes the shell export.
+        self._install_env.write_text("PROJECT_ID=p\n", encoding="utf-8")
+        proc_true_over_export_false = self._run_bash(
+            f"""
+has_controlling_tty() {{ return 0; }}
+parse_args -y --enable-stockout-investigator
+resolve_shared_defaults
+export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+            extra_env={"ENABLE_STOCKOUT_INVESTIGATOR": "false"},
+        )
+        combined_true_exp_false = proc_true_over_export_false.stdout + proc_true_over_export_false.stderr
+        self.assertEqual(proc_true_over_export_false.returncode, 0, combined_true_exp_false)
+        self.assertIn("--enable-stockout-investigator=true applies to this run only", combined_true_exp_false)
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=false this shell exports", combined_true_exp_false)
+        self.assertNotIn("This run applied answers", combined_true_exp_false)
+
+        # --enable-stockout-investigator=false over an exported ENABLE_STOCKOUT_INVESTIGATOR=true MUST warn.
+        self._install_env.write_text("PROJECT_ID=p\n", encoding="utf-8")
+        proc_false_over_export = self._run_bash(
+            f"""
+has_controlling_tty() {{ return 0; }}
+parse_args -y --enable-stockout-investigator=false
+resolve_shared_defaults
+export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+            extra_env={"ENABLE_STOCKOUT_INVESTIGATOR": "true"},
+        )
+        combined_false_exp = proc_false_over_export.stdout + proc_false_over_export.stderr
+        self.assertEqual(proc_false_over_export.returncode, 0, combined_false_exp)
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true this shell exports", combined_false_exp)
+
+        # No flag passed over an omitted key must remain silent even after resolve_shared_defaults.
+        self._install_env.write_text("PROJECT_ID=p\n", encoding="utf-8")
+        proc_quiet = self._run_bash(
+            f"""
+parse_args -y
+resolve_shared_defaults
+bootstrap_install_env_file "{self._install_env}" v1.2.3
+""",
+        )
+        self.assertEqual(proc_quiet.returncode, 0, proc_quiet.stderr + proc_quiet.stdout)
+        self.assertNotIn("ENABLE_STOCKOUT_INVESTIGATOR", proc_quiet.stdout + proc_quiet.stderr)
+
+    def test_menu_rejects_enable_stockout_investigator_flag(self):
+        for flag in ("--enable-stockout-investigator", "--enable-stockout-investigator=false"):
+            with self.subTest(flag=flag):
+                proc = self._run_bash(
+                    f"""
+run_menu_system() {{ echo "SHOULD_NOT_RUN"; }}
+main --menu {flag}
+""",
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, combined)
+                self.assertIn("--menu takes no --enable-stockout-investigator", combined)
+                self.assertIn("Option 4 -> Option 3", combined)
+                self.assertNotIn("SHOULD_NOT_RUN", combined)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1086,6 +1086,14 @@ with two identities:
 | Infra                                                                      | `infra_owner`                               |
 | Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
 
+A suspected pull request also has to have merged between the issue's last
+green night and its first red one (the same nights that bound the commit
+window, by UTC date, the green one a day early to cover a build that started
+just before midnight). One that merged outside them, or an issue with no green
+night on record, routes by the filer's rule: with no green night the commit
+window is the 80 commits before the first red night, which can reach back
+weeks.
+
 The first login GitHub accepts is assigned, the rule's logins behind it; a
 person without access to the issues repository is not assignable there, and
 the issue falls to the rule. The job then posts one comment on the issue with
