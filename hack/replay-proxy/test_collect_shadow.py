@@ -444,6 +444,16 @@ class DeadlineTest(CollectorTestCase):
             C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
         self.assertLess(time.monotonic() - started, 10)
 
+    def test_default_runner_is_not_held_by_a_descendant_that_left_its_process_group(self):
+        # A descendant in a session of its own escapes the group kill; the
+        # bounded drain, then closing the pipes, still ends the wait.
+        started = time.monotonic()
+        child = "import os, time; os.setsid(); time.sleep(30)"
+        script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_default_runner_is_not_held_by_a_descendant_of_a_command_that_exited(self):
         started = time.monotonic()
         script = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])"

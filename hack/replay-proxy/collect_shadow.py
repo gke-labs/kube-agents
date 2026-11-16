@@ -51,9 +51,11 @@ Rollout step 2):
 - `replay`, in the replay lane: each pass seeds any proxy pod that has not got
   the cache (a pod that replaced one starts empty) from `--seed-dir`, which
   fetch_cache.py filled, and keeps the lines and stored requests. The last
-  pass writes lane_report.py's report, which names the commit replayed and
-  where it came from (`--lane-commit`, `--lane-commit-source`), and uploads it
-  under the job's prefix, in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
+  pass copies every pod first, then writes lane_report.py's report before it
+  uploads its lines and stored text, so a deadline that cuts the pass costs
+  those, not the report. The report names the commit replayed and where it
+  came from (`--lane-commit`, `--lane-commit-source`) and goes under the
+  job's prefix, in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
   pod took the cache, so the lane can stop before its cases. A pod being
   deleted is never seeded, though its lines are still collected.
 
@@ -856,7 +858,7 @@ class Collector:
         self.publish_thread.start()
 
     def write_lane_report(self) -> None:
-        """Replay mode's last step: the lane's report, into the job's prefix under report/. Tried once."""
+        """Replay mode's report, into the job's prefix under report/, written before the last pass's uploads. Tried once."""
         if self.lane_report is None or self.lane_report_tried:
             return
         self.lane_report_tried = True
