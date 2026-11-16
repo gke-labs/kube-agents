@@ -28,7 +28,8 @@ type incidentKV struct {
 	auth   []string
 	// rows is the table as session-kv keeps it: a write with replace
 	// true replaces the thread's row, any other keeps the first.
-	rows map[string]string
+	rows    map[string]string
+	sources map[string]string
 }
 
 func (k *incidentKV) serve(t *testing.T) *httptest.Server {
@@ -43,11 +44,17 @@ func (k *incidentKV) serve(t *testing.T) *httptest.Server {
 		_ = json.Unmarshal(raw, &body)
 		k.mu.Lock()
 		if k.rows == nil {
-			k.rows = map[string]string{}
+			k.rows, k.sources = map[string]string{}, map[string]string{}
 		}
 		row := fmt.Sprint(body["chat_id"], "|", body["thread_id"])
-		if _, have := k.rows[row]; !have || body["replace"] == true {
+		kept := false
+		if _, have := k.rows[row]; !have {
 			k.rows[row], _ = body["report"].(string)
+			k.sources[row], _ = body["source"].(string)
+		} else if body["replace"] == true && k.sources[row] == body["source"] {
+			k.rows[row], _ = body["report"].(string)
+		} else {
+			kept = true
 		}
 		k.bodies = append(k.bodies, body)
 		k.auth = append(k.auth, r.Header.Get("Authorization"))
@@ -57,6 +64,10 @@ func (k *incidentKV) serve(t *testing.T) *httptest.Server {
 			status = http.StatusOK
 		}
 		w.WriteHeader(status)
+		if kept {
+			_, _ = io.WriteString(w, `{"status":"kept"}`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"status":"stored"}`)
 	}))
 	t.Cleanup(srv.Close)
@@ -89,7 +100,8 @@ func keepRequest(t *testing.T, keep lib.IncidentKeep) []byte {
 
 // TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt: a report posted in a
 // home-channel thread is stored with session-kv's POST /v1/incidents, with the
-// bearer and replace: true (the day's newest report is the one a reply reads), under the address the bridge's own lookup reads for a reply in that
+// bearer, replace: true (the day's newest report is the one a reply reads)
+// and its own source, under the address the bridge's own lookup reads for a reply in that
 // thread: on Slack the channel and the bare ts, on Google Chat the space and
 // the thread's full name.
 func TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt(t *testing.T) {
@@ -119,7 +131,7 @@ func TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt(t *testing.T) {
 			}
 			got := kv.writes()
 			if len(got) != 1 || got[0]["chat_id"] != tc.wantChat || got[0]["thread_id"] != tc.wantTh || got[0]["report"] != "Two findings." ||
-				got[0]["replace"] != true {
+				got[0]["replace"] != true || got[0]["source"] != incidentStoreSource {
 				t.Fatalf("writes = %v", got)
 			}
 			if kv.auth[0] != "Bearer kv-key" {
@@ -307,5 +319,25 @@ func TestIncidentWritesPastTheCapAreAnsweredBusy(t *testing.T) {
 	}
 	if got := kv.writes(); len(got) != 0 {
 		t.Fatalf("stored %v past the cap", got)
+	}
+}
+
+// TestAnotherWritersReportInAThreadIsLeftAndSaidSo: a home thread whose
+// report another writer stored (session-kv answers that it kept it) is not
+// counted as kept for the scheduled report: the bridge answers an error the
+// gateway logs.
+func TestAnotherWritersReportInAThreadIsLeftAndSaidSo(t *testing.T) {
+	t.Parallel()
+	kv := &incidentKV{rows: map[string]string{"C0HOME|1763100000.000100": "a triage card's report"},
+		sources: map[string]string{"C0HOME|1763100000.000100": ""}}
+	b := incidentBridge(t, kv)
+	keep := lib.IncidentKeep{Platform: lib.NotifyPlatformSlack, ChatID: "C0HOME", ThreadID: "1763100000.000100", Report: "Scheduled."}
+	if err := b.keepIncident(keepRequest(t, keep)); err == nil || !strings.Contains(err.Error(), "another writer") {
+		t.Fatalf("err = %v, want the other writer's report named as kept", err)
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if got := kv.rows["C0HOME|1763100000.000100"]; got != "a triage card's report" {
+		t.Fatalf("stored %q", got)
 	}
 }

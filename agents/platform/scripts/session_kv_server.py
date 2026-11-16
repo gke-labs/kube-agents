@@ -1587,10 +1587,21 @@ def init_db() -> None:
                     thread_id TEXT NOT NULL,
                     report    TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source    TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (chat_id, thread_id)
                 )
                 """
             )
+            # `source` names the writer whose `replace` may update a row
+            # (POST /v1/incidents); it arrived after the table shipped, so
+            # an existing database gains it here, every older row reading ''
+            # (the writers that never replace).
+            if "source" not in {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}:
+                try:
+                    conn.execute("ALTER TABLE incidents ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
             # One row per `apply` in an incident's thread (INCIDENT_APPLY_CARD_WINDOW_S).
             # applied_at is epoch seconds, the unit kanban.db's tasks.created_at
             # is compared in; created_at is what cleanup_old_records ages.
@@ -8718,17 +8729,25 @@ def list_sessions(limit: int = 100) -> Dict[str, Any]:
     return {"sessions": sessions}
 
 
+# A writer's name on the incidents it stores (POST /v1/incidents `source`).
+_INCIDENT_SOURCE_RE = re.compile(r"[a-z0-9-]{1,32}")
+
+
 @app.post("/v1/incidents", dependencies=[Depends(verify_api_key)])
 def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
     """Stores a report against the thread it was posted in.
 
     By default the FIRST report per thread is kept (the one carrying the
     options): a later write for the same thread changes nothing. With
-    ``replace: true`` the write replaces the thread's report and restarts its
-    ``created_at``, so the cleanup TTL counts from the newest report: the A2A
-    gateway's scheduled reports, which post into one thread per schedule per
-    UTC day and whose replies are answered with the newest
-    (a2a/hermes-bridge/report_incident.go).
+    ``replace: true`` and a ``source`` the write replaces the thread's report,
+    and restarts its ``created_at`` so the cleanup TTL counts from the newest,
+    but only on a row the same source wrote: a row any other writer stored
+    (a relayed cron report, a triage card's, any row from before the column,
+    whose source is '') stays first-write-wins, and the answer says it was
+    kept. That is the A2A gateway's scheduled reports, which post into one
+    thread per schedule per UTC day and whose replies are answered with the
+    newest (a2a/hermes-bridge/report_incident.go, source ``a2a-schedule``).
+    Replace without a source is refused, so it can never reach the '' rows.
     """
     chat_id, thread_id, report = body.get("chat_id"), body.get("thread_id"), body.get("report")
     if not (chat_id and thread_id and report):
@@ -8736,22 +8755,32 @@ def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
     replace = body.get("replace", False)
     if not isinstance(replace, bool):
         raise HTTPException(status_code=400, detail="replace must be a boolean")
+    source = body.get("source", "")
+    if not isinstance(source, str) or (source and not _INCIDENT_SOURCE_RE.fullmatch(source)):
+        raise HTTPException(status_code=400, detail="source must be 1-32 of a-z, 0-9 and -")
+    if replace and not source:
+        raise HTTPException(status_code=400, detail="replace needs a source")
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
         with conn:
             if replace:
-                conn.execute(
-                    "INSERT INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?) "
+                cur = conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report, source) VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(chat_id, thread_id) DO UPDATE SET report = excluded.report, "
-                    "created_at = CURRENT_TIMESTAMP",
-                    (chat_id, thread_id, report),
+                    "created_at = CURRENT_TIMESTAMP WHERE incidents.source = excluded.source",
+                    (chat_id, thread_id, report, source),
                 )
+                stored = cur.rowcount > 0
             else:
                 # keep the FIRST report per thread (the one carrying the options)
                 conn.execute(
-                    "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
-                    (chat_id, thread_id, report),
+                    "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report, source) VALUES (?, ?, ?, ?)",
+                    (chat_id, thread_id, report, source),
                 )
+                stored = True
             cleanup_old_records(conn)
+    if not stored:
+        # Another writer's row: kept as it was.
+        return {"status": "kept"}
     return {"status": "stored"}
 
 

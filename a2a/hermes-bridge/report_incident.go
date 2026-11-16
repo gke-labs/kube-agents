@@ -47,6 +47,16 @@ const (
 	// incidentReportMaxBytes bounds the decoded report: the gateway cuts one
 	// at 24KiB plus a note, so anything past this is not one of its reports.
 	incidentReportMaxBytes = 32 << 10
+	// incidentStoreSource names this writer on the rows it stores: session-kv
+	// lets a replace update only a row the same source wrote, so a report
+	// the relay, the kanban notifier or a triage card stored in a home
+	// thread is never overwritten by a scheduled report.
+	incidentStoreSource = "a2a-schedule"
+	// incidentStoreKept is session-kv's answer when the thread's row is
+	// another writer's and was left as it was.
+	incidentStoreKept = "kept"
+	// incidentStoreAnswerMax bounds the answer read.
+	incidentStoreAnswerMax = 1 << 10
 	// incidentKeepsInFlight bounds the writes running at once; one past it
 	// is answered busy at once rather than holding the subscription.
 	incidentKeepsInFlight = 8
@@ -214,20 +224,22 @@ func readHomeFile(path string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// incidentStoreBody is POST /v1/incidents' request. Replace is always set:
-// a schedule posts every report of its UTC day into one thread, and a reply
-// there is answered with the newest, aged from when it was stored.
+// incidentStoreBody is POST /v1/incidents' request. Replace is always set,
+// with this writer's source: a schedule posts every report of its UTC day
+// into one thread, and a reply there is answered with the newest, aged from
+// when it was stored. session-kv replaces only a row this source wrote.
 type incidentStoreBody struct {
 	ChatID   string `json:"chat_id"`
 	ThreadID string `json:"thread_id"`
 	Report   string `json:"report"`
 	Replace  bool   `json:"replace"`
+	Source   string `json:"source"`
 }
 
 // storeIncident writes report at addr with session-kv's POST /v1/incidents,
 // replacing the thread's earlier report.
 func (b *Bridge) storeIncident(addr incidentAddress, report string) error {
-	body, err := json.Marshal(incidentStoreBody{ChatID: addr.chatID, ThreadID: addr.threadID, Report: report, Replace: true})
+	body, err := json.Marshal(incidentStoreBody{ChatID: addr.chatID, ThreadID: addr.threadID, Report: report, Replace: true, Source: incidentStoreSource})
 	if err != nil {
 		return err
 	}
@@ -247,6 +259,13 @@ func (b *Bridge) storeIncident(addr incidentAddress, report string) error {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
 		return fmt.Errorf("session-kv answered HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var answer struct {
+		Status string `json:"status"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, incidentStoreAnswerMax))
+	if json.Unmarshal(raw, &answer) == nil && answer.Status == incidentStoreKept {
+		return fmt.Errorf("thread %s in %s holds another writer's report, which was kept", addr.threadID, addr.chatID)
 	}
 	return nil
 }
