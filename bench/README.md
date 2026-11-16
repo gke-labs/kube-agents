@@ -19,7 +19,7 @@ Load and sizing measurements of the harness at fleet scale, as opposed to answer
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
-- `kube_agents_bench/oobe.py` — the `oobe_audits_started` verifier, in its own module and published the same way: reads the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
+- `kube_agents_bench/oobe.py` — the `oobe_audits_started` and `oobe_audits_ended` verifiers, in their own module and published the same way: they read the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
 - `kube_agents_bench/discovery.py` — reads the onboarding discovery sweep off the agent pod for the `bootstrap_fanout` verifier: the sweep's board rows and the Cluster Agent profiles beside them, in one `kubectl exec`.
 - `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, the raw file's findings block and the hand-off's board state for `bootstrap_handoff`, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, for `bootstrap_report_criticals` the report and the worker's scores there, for `bootstrap_report_posture` the report there, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
 - `kube_agents_bench/findings.py` — reads the install's findings queue for the `findings_item_state` verifier: one `kubectl exec` into the agent container that calls the Session KV server's `GET /v1/findings` on the pod's loopback.
@@ -230,15 +230,15 @@ validator check lands with the first stack that needs it:
    (an appended gentler entry fails it), taken from the dry run of rule 5; never a replica count
    on an autoscaled Deployment.
 8. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
-   labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
-   only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
+   labels: every Kubernetes object, a GKE cluster's or node pool's GCE resource labels (`--labels`
+   at create, not only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
    labels (a network, a subnetwork, a backend service, a health check, a service attachment)
    carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
    on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
    start and end against the host cluster's webhook configurations, node readiness rules,
-   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes addresses, subnets,
-   networks and alert policies today; forwarding rules, service attachments, backend services,
-   health checks and clusters wait on a sibling change to that script and its sweeper role.
+   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
+   rules, service attachments, backend services, health checks, addresses, subnets, networks and
+   alert policies every hour.
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.
