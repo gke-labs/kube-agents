@@ -2594,10 +2594,12 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # as it writes today's file store directly; a profile worker reads with a
     # profile on the reports allowlist and writes only the stream its builtin
     # schedule's trigger binds, to the publish key (report_read_permitted,
-    # report_write_permitted). No trailing slash: the stream list is the prefix
+    # report_write_permitted). The A2A gateway's relay (#5618) reads one
+    # finished report, latest or one run, on the publish key alone, and writes
+    # nothing (report_a2a_read_permitted). No trailing slash: the stream list is the prefix
     # itself, matched whole or with "/" after it (_route_matches), and the
     # handler answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match.
-    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),
+    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_CHAT)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -2811,7 +2813,7 @@ def report_credential_permits(method: str, path: str) -> bool:
 
 # -- Who may read and write the store (#5619) --------------------------------
 #
-# docs/designs/scheduling-on-profiles.md §1 item 4. Two roles reach these
+# docs/designs/scheduling-on-profiles.md §1 item 4. Three roles reach these
 # routes (ROUTE_ROLES), and each is decided here, default deny: a role this
 # does not name, a claim it cannot read, or a stand-in of the wrong type is
 # refused, never defaulted.
@@ -2819,7 +2821,8 @@ def report_credential_permits(method: str, path: str) -> bool:
 # Where the role comes from: ServiceAccountAuthenticator.authenticate reads it
 # off the one audience the TokenReview validated (``audience_roles``, built by
 # build_authenticator: the shell audience confers CALLER_ROLE_SHELL, the
-# profile audience CALLER_ROLE_PROFILE). A profile worker's ServiceAccount is
+# profile audience CALLER_ROLE_PROFILE, and CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
+# alone CALLER_ROLE_A2A_CHAT, never when it repeats another audience). A profile worker's ServiceAccount is
 # a key of ``profile_identities``, and a caller named there may present only
 # the profile audience ("a profile caller may present only the profile
 # audience"), so no profile worker holds the shell role; and nothing a caller
@@ -2864,6 +2867,24 @@ RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
 RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+# The A2A gateway's relay (#5618): a write, a route other than one report, and
+# a key other than the publish key are each their own refusal.
+RULE_REPORT_A2A_WRITE = "audit-report.a2a-chat-write"
+RULE_REPORT_A2A_ROUTE = "audit-report.a2a-chat-route"
+RULE_REPORT_A2A_KEY = "audit-report.a2a-chat-repository-key"
+
+# What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
+# the stream list, one stream's latest, its run index, or one run.
+REPORT_ROUTE_LIST = "list"
+REPORT_ROUTE_LATEST = "latest"
+REPORT_ROUTE_RUNS = "runs"
+REPORT_ROUTE_RUN = "run"
+# The reads the A2A gateway's relay makes: one finished report, never an index.
+REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})
+# The segment counts of a split store path ("", "v1", "audit-reports", ...).
+_REPORT_LIST_SEGMENTS = 3
+_REPORT_STREAM_ROUTE_SEGMENTS = 6
+_REPORT_RUN_SEGMENTS = 7
 
 
 def report_store_key(repo: str) -> str | None:
@@ -2900,23 +2921,72 @@ def _report_profile_permitted(profile: Any, allowlist: frozenset[str]) -> bool:
     return isinstance(profile, str) and bool(profile) and profile in allowlist
 
 
-def report_read_permitted(role: Any, profile: Any, allowlist: frozenset[str]) -> str | None:
+def report_route_kind(path: str) -> str | None:
+    """Which store route ``path`` is (REPORT_ROUTE_*), or None for any other shape.
+
+    Only the shape: report_credential_permits has already matched the path
+    whole against REPORT_CREDENTIAL_ROUTES before anything asks this.
+    """
+    segments = path.split("/")
+    if len(segments) == _REPORT_LIST_SEGMENTS:
+        return REPORT_ROUTE_LIST
+    if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "latest":
+        return REPORT_ROUTE_LATEST
+    if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "runs":
+        return REPORT_ROUTE_RUNS
+    if len(segments) == _REPORT_RUN_SEGMENTS and segments[5] == "runs":
+        return REPORT_ROUTE_RUN
+    return None
+
+
+def report_a2a_read_permitted(route: Any, key: Any, readable_key: Any) -> str | None:
+    """The rule an a2a-chat read breaks, or None when the relay may read (#5618).
+
+    The A2A gateway's relay reads one finished report: ``route`` must be
+    REPORT_ROUTE_LATEST or REPORT_ROUTE_RUN, never the stream list or a run
+    index. ``key`` is the request's raw store-key segment, compared whole with
+    ``readable_key``: the install's publish key (report_publish_store_key), or
+    REPORT_NO_FORGE_STORE_KEY when that yields none, resolved by the caller.
+    A registered repository that is not the publish target is refused, and a
+    ``readable_key`` that is not a non-empty str refuses every key. Any audit
+    id is read.
+    """
+    if route not in REPORT_A2A_READ_ROUTES:
+        return RULE_REPORT_A2A_ROUTE
+    if not isinstance(readable_key, str) or not readable_key or not isinstance(key, str) or key != readable_key:
+        return RULE_REPORT_A2A_KEY
+    return None
+
+
+def report_read_permitted(
+    role: Any,
+    profile: Any,
+    allowlist: frozenset[str],
+    route: Any = None,
+    key: Any = None,
+    readable_key: Any = None,
+) -> str | None:
     """The rule a read of the store breaks, or None when the caller may read.
 
-    The shell reads every stream: it reads today's file store directly. A
-    profile caller reads with a task credential whose profile is in
-    ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's, None
-    when the caller presented none. Every other role is refused.
+    - The shell reads every stream: it reads today's file store directly.
+    - A profile caller reads with a task credential whose profile is in
+      ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's,
+      None when the caller presented none.
+    - The a2a-chat role reads what report_a2a_read_permitted allows of
+      ``route``, ``key`` and ``readable_key``; left at their defaults, nothing.
+    - Every other role is refused.
     """
     if role == CALLER_ROLE_SHELL:
         return None
-    if role != CALLER_ROLE_PROFILE:
-        return RULE_REPORT_ROLE
-    if profile is None:
-        return RULE_REPORT_NO_TASK
-    if not _report_profile_permitted(profile, allowlist):
-        return RULE_REPORT_PROFILE
-    return None
+    if role == CALLER_ROLE_PROFILE:
+        if profile is None:
+            return RULE_REPORT_NO_TASK
+        if not _report_profile_permitted(profile, allowlist):
+            return RULE_REPORT_PROFILE
+        return None
+    if role == CALLER_ROLE_A2A_CHAT:
+        return report_a2a_read_permitted(route, key, readable_key)
+    return RULE_REPORT_ROLE
 
 
 def report_write_permitted(
@@ -2944,8 +3014,11 @@ def report_write_permitted(
       ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
       whose stream is ``audit_id`` (so only that schedule's grant writes that
       audit's baseline); and the install's key.
+    - The a2a-chat role (the A2A gateway's relay, #5618) writes nothing.
     - Every other role is refused.
     """
+    if role == CALLER_ROLE_A2A_CHAT:
+        return RULE_REPORT_A2A_WRITE
     if role == CALLER_ROLE_SHELL:
         pass
     elif role != CALLER_ROLE_PROFILE:
@@ -14300,7 +14373,28 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 registered,
             )
         else:
-            rule = report_read_permitted(role, profile, self.report_profiles)
+            route = report_route_kind(path)
+            key = segments[REPORT_STORE_KEY_SEGMENT] if len(segments) > REPORT_STORE_KEY_SEGMENT else None
+            # The publish key is read only for an a2a-chat read that could
+            # pass: the shell and profile reads never need it, and a route the
+            # relay may not use is refused without the ConfigMap read.
+            readable_key: str | None = None
+            if role == CALLER_ROLE_A2A_CHAT and route in REPORT_A2A_READ_ROUTES:
+                try:
+                    publish = report_publish_store_key()
+                except ReportStoreUnavailable as exc:
+                    LOGGER.warning("audit-report a2a-chat read refused: %s", exc)
+                    self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "gitops-repo-unavailable")
+                    self._refuse_audit_report(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {
+                            "error": "the install's repositories could not be read, so no read is checked",
+                            "code": "GITOPS_REPO_UNAVAILABLE",
+                        },
+                    )
+                    return
+                readable_key = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY
+            rule = report_read_permitted(role, profile, self.report_profiles, route, key, readable_key)
         if rule is not None:
             self._log_audit_report(HTTPStatus.FORBIDDEN, rule)
             self._refuse_audit_report(

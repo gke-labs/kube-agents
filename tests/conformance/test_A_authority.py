@@ -20,6 +20,7 @@ import types
 import re
 import textwrap
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -605,6 +606,121 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertIsNotNone(rule)
+
+    def test_A3_the_a2a_relay_reads_one_report_on_the_publish_key_from_its_own_audience(self) -> None:
+        # The A2A gateway's relay (#5618) holds the a2a-chat role. On the
+        # audit-report store it reads one finished report (latest, or one
+        # run) of any audit, on the install's publish key alone; it never
+        # lists, reads a run index, writes or deletes. The role is conferred by
+        # the a2a audience alone. Each refusal names its own rule, so a refusal
+        # that only falls through to another check is not taken for this one.
+        cp = h.credential_proxy
+        a2a = cp.CALLER_ROLE_A2A_CHAT
+        publish, other = "acme%2Fgitops", "acme%2Fterraform"
+        allowlist = frozenset({"fleet-audit", "platform"})
+        read = cp.report_read_permitted
+        self.assertIsNone(read(a2a, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish, publish))
+        self.assertIsNone(read(a2a, None, frozenset(), cp.REPORT_ROUTE_RUN, publish, publish))
+        for name, got, rule in (
+            ("the stream list", read(a2a, None, frozenset(), cp.REPORT_ROUTE_LIST, None, publish), cp.RULE_REPORT_A2A_ROUTE),
+            ("the run index", read(a2a, None, frozenset(), cp.REPORT_ROUTE_RUNS, publish, publish), cp.RULE_REPORT_A2A_ROUTE),
+            ("a registered repository that is not the publish target",
+             read(a2a, "fleet-audit", allowlist, cp.REPORT_ROUTE_LATEST, other, publish), cp.RULE_REPORT_A2A_KEY),
+            ("no_forge beside a publish target",
+             read(a2a, None, frozenset(), cp.REPORT_ROUTE_RUN, "no_forge%2Flocal", publish), cp.RULE_REPORT_A2A_KEY),
+            ("no key resolved", read(a2a, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish), cp.RULE_REPORT_A2A_KEY),
+        ):
+            with self.subTest(name):
+                self.assertEqual(rule, got)
+        for request_key, gitops_key in ((publish, publish), ("no_forge%2Flocal", None)):
+            with self.subTest(write_key=request_key):
+                grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+                self.assertEqual(cp.RULE_REPORT_A2A_WRITE, cp.report_write_permitted(
+                    a2a, "fleet-audit", grant, "compliance-audit", request_key, gitops_key, allowlist,
+                    frozenset({publish, other})))
+
+        # Through the handler, with the install's publish key stubbed: only the
+        # two reads on it reach the store.
+        relayed: list = []
+
+        class Store:
+            def relay(self, method, path, body):
+                relayed.append((method, path))
+                return 200, b"{}"
+
+        def handle(method: str, path: str) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.principal = cp.Principal(workload="gateway", uid="u", role=a2a)
+            handler.report_store = Store()
+            handler.report_profiles = allowlist
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        run = "20261113T120000.123456Z"
+        with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+            for audit in ("compliance-audit", "any-audit"):
+                for suffix in ("latest", f"runs/{run}"):
+                    path = f"/v1/audit-reports/{audit}/{publish}/{suffix}"
+                    with self.subTest(relayed=path):
+                        self.assertEqual([200], handle("GET", path))
+            self.assertEqual(4, len(relayed))
+            relayed.clear()
+            stream = f"/v1/audit-reports/compliance-audit/{publish}"
+            for method, path, rule in (
+                ("GET", "/v1/audit-reports", cp.RULE_REPORT_A2A_ROUTE),
+                ("GET", f"{stream}/runs", cp.RULE_REPORT_A2A_ROUTE),
+                ("GET", f"/v1/audit-reports/compliance-audit/{other}/latest", cp.RULE_REPORT_A2A_KEY),
+                ("GET", f"/v1/audit-reports/compliance-audit/{other}/runs/{run}", cp.RULE_REPORT_A2A_KEY),
+                ("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest", cp.RULE_REPORT_A2A_KEY),
+                ("PUT", f"{stream}/runs/{run}", cp.RULE_REPORT_A2A_WRITE),
+                ("PUT", f"{stream}/latest", cp.RULE_REPORT_A2A_WRITE),
+                ("DELETE", f"{stream}/latest", cp.RULE_REPORT_A2A_WRITE),
+            ):
+                with self.subTest(method=method, path=path):
+                    self.assertEqual([(403, rule)], handle(method, path))
+            self.assertEqual([], relayed)
+        # An install that publishes to no repository: no_forge is the one key.
+        with mock.patch.object(cp, "report_publish_store_key", return_value=None):
+            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest"))
+            self.assertEqual([(403, cp.RULE_REPORT_A2A_KEY)], handle("GET", f"/v1/audit-reports/compliance-audit/{publish}/latest"))
+
+        # The role comes from the a2a audience alone (build_authenticator's
+        # audience map), and an a2a audience that repeats another confers nothing.
+        base = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount", "CREDENTIAL_PROXY_ALLOWED_CALLERS": "shell,gateway",
+            "CREDENTIAL_PROXY_AUDIENCE": "shell-aud", "CREDENTIAL_PROXY_CHAT_AUDIENCE": "chat-aud",
+            "KUBERNETES_SERVICE_HOST": "127.0.0.1",
+        }
+        with mock.patch.dict("os.environ", {**base, "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "a2a-aud"}):
+            roles = cp.build_authenticator().audience_roles
+        self.assertEqual(["a2a-aud"], [audience for audience, role in roles.items() if role == a2a])
+        for repeated in ("shell-aud", "chat-aud"):
+            with self.subTest(repeated=repeated), mock.patch.dict(
+                "os.environ", {**base, "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": repeated}
+            ):
+                self.assertNotIn(a2a, cp.build_authenticator().audience_roles.values())
+
+        def review(username: str, audience: str) -> dict:
+            return {"status": {"authenticated": True, "audiences": [audience], "user": {"username": username, "uid": "u"}}}
+
+        authenticator = cp.ServiceAccountAuthenticator(
+            audience_roles={"shell-aud": cp.CALLER_ROLE_SHELL, "profile-aud": cp.CALLER_ROLE_PROFILE, "a2a-aud": a2a},
+            allowed_callers=frozenset({"shell", "gateway", "worker"}),
+            api_host="127.0.0.1", api_port="1", ca_file="", token_file="/nonexistent", cache_seconds=0.0,
+            profile_identities={"worker": ("fleet-audit", "unattended")},
+        )
+        self.assertEqual(a2a, authenticator._principal_from(review("gateway", "a2a-aud")).role)
+        for username, audience in (("gateway", "shell-aud"), ("shell", "shell-aud"), ("worker", "profile-aud")):
+            with self.subTest(username=username, audience=audience):
+                self.assertNotEqual(a2a, authenticator._principal_from(review(username, audience)).role)
+        # A profile worker may present only its own audience, the a2a one included.
+        with self.assertRaises(cp.AuthenticationError):
+            authenticator._principal_from(review("worker", "a2a-aud"))
 
     def test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod(self) -> None:
         # The store's handler relays a request only when its method and path
