@@ -225,6 +225,39 @@ every install.
 
 The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker's own store credential refused, which the broker's log says) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the repository `finish` publishes to (or `no_forge%2Flocal` when that rule yields none); the platform agent's shell reads every stream and writes that key or any repository `managed_repos` registers; the A2A gateway's relay, under the `a2a-reports` role its own `kubeagents-credential-proxy-a2a-reports` audience confers to the gateway's ServiceAccount alone, reads one finished report (`GET` latest or one run) of any audit on that publish key alone and writes nothing (#5618); the role may read any audit's report on the publish key, so the gateway's relay decides which conversation sees which report; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, answers 504 when the listener doesn't answer whole within 15 seconds, and logs the method, path, caller and status of each request, never a token or a body. One known window: the broker reads `managed_repos` through its 30-second managed-repository cache and `gitops_repo` fresh, so for up to that long after a ConfigMap edit a write can be checked against a key neither the old nor the new state alone gives. The key is still one a state registers, or `no_forge%2Flocal`. The exec tier doesn't serve these routes.
 
+The fleet-audit scripts use that broker store when `FLEET_AUDIT_REPORT_STORE` is `broker`, and the
+file store above otherwise, as before the switch existed. The operator renders `broker` on the shell
+sandbox's `shell` container and on every profile worker, on every install, and reserves the name
+against `spec.deployment.env`. It never renders it on the gateway's `platform-agent` container,
+whose shell writes the file store on the volume the listener serves. `audit_report.py`,
+`report_status.py` and `report_query.py` read and write the same names (`latest.json` and the ring's
+`<stamp>.json`) by the key `report_store_key` gives, which a test holds equal to the scripts' own.
+The client is `report_status.py`'s, standard library only, so the status view can still stream it
+into a pod. It sends each request to `CREDENTIAL_PROXY_URL` with the bearer from `CREDENTIAL_PROXY_TOKEN_FILE`, read
+fresh per call, and the task credential from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` when there is one,
+under `credential_proxy_client`'s rule. Each script logs one line on stderr naming the store and
+why (`report store: broker <url> (FLEET_AUDIT_REPORT_STORE=broker)`), and never a token;
+`audit_report.py` stays silent with the switch unset, so `finish`'s output is unchanged there.
+Everything in §2 holds through it: the ring entry is written first and `latest` as its byte copy,
+the listener prunes, `finish` drops `latest` before each ledger rewrite and after a failed write,
+and the readers flag a missing `latest` or a newer ring entry. A 404 is a missing file; a 502, 503
+or 504, or no answer, is a store that cannot be used now, which a write logs as a warning without
+changing the exit code and a read treats as unreadable, so a run over it has a lost memory rather
+than a first run. The in-flight notes and the precheck digest stay in the pod's scratch directory.
+
+The sandbox's own file store holds every run from before the switch, and the broker store starts
+empty. So the first time a script touches a stream through the broker (a read, or a write) and the
+broker store has no such stream (no `latest` and an empty ring) while the pod's local root holds
+it, the script copies that stream in once: the ring entries oldest first, then `latest.json` only
+when it is a byte copy of the newest entry. It then leaves `.seeded-to-broker` in the local stream
+directory so the copy never repeats, and logs one line for the stream. A stream the broker refuses
+to take (a 403: a repository the install does not register) is skipped and logged with no marker,
+so a later registration can still seed it, and any other failure is retried by the next run. The
+copy is idempotent and never deletes or changes a local envelope, so a rollback to the file store
+finds the history as it was at the seed. A profile worker has no local store, so nothing is seeded
+there. The known limit: the copied envelopes are as trustworthy as today's file store, which the
+agent can write; the seed is not attested.
+
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
 creates to the owner of the nearest directory that already existed. Mode alone would not do: the
