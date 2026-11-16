@@ -160,6 +160,13 @@ func a2aAuthMapShardNames(agent *agentv1alpha1.PlatformAgent, shards int) []stri
 type a2aAuthMapGrants struct {
 	Publish   []string `json:"publish"`
 	Subscribe []string `json:"subscribe"`
+
+	// DenyPublish and DenySubscribe subtract from the allows on their side
+	// (#5301), for a principal whose allow is a wildcard with named
+	// exceptions. Only the gateway's entry carries them; omitted elsewhere,
+	// so adding them changed no other entry's bytes.
+	DenyPublish   []string `json:"denyPublish,omitempty"`
+	DenySubscribe []string `json:"denySubscribe,omitempty"`
 }
 
 type a2aAuthMapIdentity struct {
@@ -248,14 +255,22 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 // grant built from dispatchable alone.
 func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatchable []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
-	for _, id := range calloutIdentities(agent) {
+	gatewayDenyProfiles, _ := dispatcherGrantNames(agent, profiles, draining)
+	for _, id := range mappedIdentities(agent) {
+		if id.user == a2aGatewayUser {
+			// nats.conf's per-profile supervisor deny, from the same
+			// names (gatewayCalloutEntry).
+			id = withGatewayProfileDeny(id, gatewayDenyProfiles)
+		}
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
 			User:           id.user,
 			Account:        id.account,
 			Grants: a2aAuthMapGrants{
-				Publish:   id.publish,
-				Subscribe: id.subscribe,
+				Publish:       id.publish,
+				Subscribe:     id.subscribe,
+				DenyPublish:   id.denyPublish,
+				DenySubscribe: id.denySubscribe,
 			},
 			Narrowing: id.narrowing,
 		})
@@ -525,7 +540,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 		if id.Narrowing != a2aNarrowingDispatcher && len(id.Draining) > 0 {
 			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
-		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		// A deny counts as a grant: a narrowed entry carries none of
+		// either kind, so one map edit can't hand every session a
+		// deny-shaped grant (the callout's Grants.hasAny).
+		hasDeny := len(id.Grants.DenyPublish) > 0 || len(id.Grants.DenySubscribe) > 0
+		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0 || hasDeny
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
 			return fmt.Errorf("identity %d: user %q carries profile or topics but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingProfile)
 		}
@@ -545,13 +564,13 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 			}
 		case a2aNarrowingPod:
 			if hasGrants {
-				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
-					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 			}
 		case a2aNarrowingProfile:
 			if hasGrants {
-				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
-					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 			}
 			if !isDNS1123LabelToken(id.Profile) {
 				return fmt.Errorf("identity %d: user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", i, id.User, id.Narrowing, id.Profile)
@@ -575,6 +594,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 			if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
 				return fmt.Errorf("identity %d: user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 					i, id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+			if hasDeny {
+				return fmt.Errorf("identity %d: user %q narrows on %q and may not carry deny lists", i, id.User, id.Narrowing)
 			}
 			seenDraining := map[string]bool{}
 			for _, p := range id.Draining {

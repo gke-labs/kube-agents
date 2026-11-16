@@ -110,7 +110,9 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
 //	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
 //	     refuses both
-const a2aIdentityMapSchema = "6"
+//	7 -> adds denyPublish and denySubscribe to grants (the gateway's token
+//	     entry, #5301); a callout from before it refuses them
+const a2aIdentityMapSchema = "7"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the

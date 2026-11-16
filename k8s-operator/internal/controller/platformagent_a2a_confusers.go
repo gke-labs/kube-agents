@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"slices"
 	"strings"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -96,7 +95,7 @@ func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string
 			continue
 		}
 		if id.user == a2aGatewayUser {
-			id.denyPublish = append(slices.Clone(id.denyPublish), gatewayProfileSupervisorDeny(profiles)...)
+			id = withGatewayProfileDeny(id, profiles)
 		}
 		b.WriteString(renderA2AStaticUser(id, pw))
 	}

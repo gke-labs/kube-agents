@@ -806,6 +806,9 @@ func permissionsFor(grants Grants) *jwt.Permissions {
 	p := &jwt.Permissions{}
 	p.Pub.Allow.Add(grants.Publish...)
 	p.Sub.Allow.Add(grants.Subscribe...)
+	// The entry's own denies, on top of its allows (Grants.DenyPublish).
+	p.Pub.Deny.Add(grants.DenyPublish...)
+	p.Sub.Deny.Add(grants.DenySubscribe...)
 	if len(p.Pub.Allow) == 0 {
 		p.Pub.Deny.Add(">")
 	}

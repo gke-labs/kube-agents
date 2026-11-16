@@ -203,7 +203,7 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	// whole map, so the check is against the rendered set rather than a
 	// list someone has to remember to extend.
 	mapKeys := map[string]string{}
-	for _, id := range calloutIdentities(agent) {
+	for _, id := range mappedIdentities(agent) {
 		mapKeys[id.serviceAccount] = id.user
 	}
 	// Oldest first, so an incumbent keeps a contested ServiceAccount and a
