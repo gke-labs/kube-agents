@@ -467,11 +467,20 @@ readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 # the gateway's Running pod is not the one the check started with, they wait
 # for the Deployment to roll out and retry without spending an attempt. A
 # second replacement, or a replacement that never becomes Ready, fails as
-# before. The availability fix is a second replica (#4206).
+# before. Accepted edges: a failure that merely coincides with a replacement
+# (a 403, say) fails one retry and one rollout wait later than it would have;
+# `rollout status` can answer before the Deployment reflects the new pod, which
+# wastes the free retry; and under next a Ready pod's bridge may not consume
+# yet. Each costs time or an attempt, never a wrong pass. The availability fix
+# is a second replica (#4206).
 readonly GATEWAY_REPLACEMENT_WAIT_TIMEOUT="600s"
+# A terminating pod keeps phase Running through its grace period, so one with
+# a deletionTimestamp is left out: it is the pod being replaced, not the gateway.
 gateway_pod_uids() {
-  kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" \
-    --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.uid}' 2>/dev/null || true
+  { kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true; } |
+    awk 'NF == 1 { print $1 }' | sort | tr '\n' ' '
 }
 # <uids at the check's start> <check name>. 0 when the pod was replaced and the
 # replacement rolled out (retry without spending an attempt), 1 otherwise.

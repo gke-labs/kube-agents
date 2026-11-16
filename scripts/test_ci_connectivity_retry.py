@@ -47,6 +47,9 @@ case "$1" in
       # failed GATEWAY_REPLACED_AFTER times (unset: never replaced).
       n=$(cat "${STUB_LOG}/curl.count" 2>/dev/null || echo 0)
       if [ -n "${GATEWAY_REPLACED_AFTER:-}" ] && [ "$n" -ge "${GATEWAY_REPLACED_AFTER}" ]; then
+        # The old pod can still be listed, Running with a deletionTimestamp,
+        # through its grace period; it is not the gateway any more.
+        [ -n "${OLD_POD_TERMINATING:-}" ] && echo "uid-1 2026-11-16T00:00:00Z"
         echo "uid-2"
       else
         echo "uid-1"
@@ -245,9 +248,16 @@ class ConnectivityRetryTest(unittest.TestCase):
         self.assertIn("connectivity attempt 1/5 failed: empty response after port-forward drop; the replacement is up", result.stdout)
         kubectl_args = (tmp / "kubectl.args").read_text(encoding="utf-8")
         self.assertEqual(len([l for l in kubectl_args.splitlines() if l.startswith("rollout status deployment/platform-agent-gateway")]), 1)
+        # The read is the gateway's Running pods, by the label the operator gives them.
+        self.assertIn("get pods -n test-ns -l app=platform-agent-gateway --field-selector=status.phase=Running", kubectl_args)
         # The waited-for attempt is not spent: six tunnels for five attempts.
         self.assertEqual(len([l for l in kubectl_args.splitlines() if l.startswith("port-forward")]), 6)
         self.assertIn("connectivity attempt 5/5 failed", result.stdout)
+
+    def test_a_terminating_old_pod_beside_its_replacement_still_counts_as_replaced(self):
+        result, tmp = run_check(succeed_on=2, env_overrides={"GATEWAY_REPLACED_AFTER": "1", "OLD_POD_TERMINATING": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the agent gateway pod was replaced during the API connectivity check", result.stdout)
 
     def test_a_replacement_that_never_rolls_out_spends_the_attempt(self):
         result, tmp = run_check(succeed_on=999, env_overrides={"GATEWAY_REPLACED_AFTER": "1", "ROLLOUT_EXIT": "1"})
