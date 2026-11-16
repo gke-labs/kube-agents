@@ -23,7 +23,7 @@ import (
 // rules PR #N" while the rules-file pull request is open, or on. Only a
 // viewer the section lists in Admins gets the radio buttons and the Request
 // or Stop button; everyone else sees the same lines read-only. That is display
-// only: session-kv checks the presser on every action.
+// only: session-kv checks the presser on every action and is the gate.
 //
 // A tap is no turn. It is admitted by the Home tab's rule (homeAdmitted), goes
 // over the board route as a lib.BoardAction (dial.level, dial.request or
@@ -95,7 +95,20 @@ func slackDialLevelTitle(level string) string {
 			return l.title
 		}
 	}
-	return slackEscaper.Replace(level)
+	return slackDialClip(level)
+}
+
+// slackDialClip is a snapshot string as panel text: its first line, cut well
+// inside a block's 3000 characters before escaping, so no one field can make
+// Slack refuse the whole tab.
+func slackDialClip(text string) string {
+	return slackEscaper.Replace(firstLine(text, slackHomeLineMax))
+}
+
+// slackDialLinkable is a URL safe to put in a <url|text> link: https, and
+// nothing that ends the URL early or writes its own link text.
+func slackDialLinkable(url string) bool {
+	return strings.HasPrefix(url, slackHomeHTTPS) && !strings.ContainsAny(url, "|<> \t\r\n")
 }
 
 // slackDialRowValue is a row's kind, environment and repository key in one
@@ -136,7 +149,7 @@ func slackDialStateLine(r lib.BoardDialRepo) string {
 	case lib.DialStateOn:
 		return slackDialStateOn
 	case lib.DialStatePending:
-		if r.PendingPR != nil && r.PendingPR.Number > 0 && strings.HasPrefix(r.PendingPR.URL, slackHomeHTTPS) {
+		if r.PendingPR != nil && r.PendingPR.Number > 0 && slackDialLinkable(r.PendingPR.URL) {
 			return fmt.Sprintf(slackDialPending, r.PendingPR.URL, r.PendingPR.Number)
 		}
 		return slackDialPendingNo
@@ -180,7 +193,7 @@ func (s *SlackAdapter) homeDialBlocks(member string, d *lib.BoardDial) []slack.B
 	}
 	if d.SetBy != "" && d.SetAt > 0 {
 		blocks = append(blocks, slack.NewContextBlock("", mrk(fmt.Sprintf(slackDialSetBy,
-			slackDialLevelTitle(d.Level), slackEscaper.Replace(d.SetBy), slackDate(time.Unix(d.SetAt, 0), slackDateDayTime)))))
+			slackDialLevelTitle(d.Level), slackDialClip(d.SetBy), slackDate(time.Unix(d.SetAt, 0), slackDateDayTime)))))
 	}
 	for i, k := range d.Kinds {
 		if i == slackDialKindsMax {
@@ -204,15 +217,17 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 	plain := func(text string) *slack.TextBlockObject {
 		return slack.NewTextBlockObject(slack.PlainTextType, text, false, false)
 	}
-	title := "*" + slackEscaper.Replace(k.Title) + "*"
+	title := "*" + slackDialClip(k.Title) + "*"
 	if k.Environment != "" {
-		title += " (" + slackEscaper.Replace(k.Environment) + ")"
+		title += " (" + slackDialClip(k.Environment) + ")"
 	}
-	// A repository key too long for a Slack value is left out of the whole
-	// row, picker and button alike, rather than blanking the tab.
+	// A repository with no key or name, or a key too long for a Slack value,
+	// is left out of the whole row, picker and button alike, rather than
+	// blanking the tab.
 	var repos []lib.BoardDialRepo
 	for _, r := range k.Repos {
-		if len(repos) < slackDialReposMax && len(slackDialRowValue(k.Kind, k.Environment, r.RepoKey)) <= slackDialValueMax {
+		if len(repos) < slackDialReposMax && r.RepoKey != "" && slackDialRepoName(r) != "" &&
+			len(slackDialRowValue(k.Kind, k.Environment, r.RepoKey)) <= slackDialValueMax {
 			repos = append(repos, r)
 		}
 	}
@@ -246,7 +261,7 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 	}
 	blocks := []slack.Block{slack.NewSectionBlock(mrk(title), nil, accessory)}
 	blocks = append(blocks, slack.NewContextBlock("", mrk(strings.Join([]string{
-		slackEscaper.Replace(slackDialRepoName(picked)), slackDialProgressLine(picked), slackDialStateLine(picked),
+		slackDialClip(slackDialRepoName(picked)), slackDialProgressLine(picked), slackDialStateLine(picked),
 	}, slackHomeDot))))
 	if note := strings.TrimSpace(picked.Note); note != "" {
 		blocks = append(blocks, slack.NewContextBlock("", mrk(slackEscaper.Replace(firstLine(note, slackHomeLineMax)))))
@@ -268,10 +283,10 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 // slackDialRepoName is how a repository is named on the panel: its name as
 // session-kv sent it, else its key.
 func slackDialRepoName(r lib.BoardDialRepo) string {
-	if r.Repo != "" {
-		return r.Repo
+	if name := strings.TrimSpace(r.Repo); name != "" {
+		return name
 	}
-	return r.RepoKey
+	return strings.TrimSpace(r.RepoKey)
 }
 
 // dialPick is member's picked repository for one kind, or "".
@@ -384,6 +399,9 @@ func (s *SlackAdapter) dialClick(p slackClickPayload, actionID, value, selected 
 
 // runDialTap admits the presser, sends the action and redraws the tab: for
 // the presser with session-kv's answer, then for everyone looking at it.
+// session-kv decides who may change the dial. The gateway only answers early
+// when the board it can read already shows the presser is not an admin; a tap
+// it cannot check (board unreadable, no dial section) goes on to session-kv.
 func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor BoardActor) {
 	if admitted, decided := s.homeAdmitted(member); !admitted || !decided {
 		s.log.Info("slack: ignoring a dial tap from a member the gateway would not answer", "member", member, "decided", decided)
@@ -394,7 +412,8 @@ func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor B
 	}
 	if board, err := s.homeBoard(); err == nil && board != nil && board.Dial != nil && !slices.Contains(board.Dial.Admins, member) {
 		// The controls were drawn for an admin who no longer is one, or the
-		// payload was not ours. session-kv would refuse it too.
+		// payload was not ours. session-kv would refuse it too; this only
+		// saves the round trip.
 		s.setDialStatus(member, slackDialNotAdmin)
 		s.publishHome(member, false)
 		return

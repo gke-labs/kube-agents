@@ -375,3 +375,91 @@ func boardActionEqual(a, b lib.BoardAction) bool {
 	jb, _ := json.Marshal(b)
 	return string(ja) == string(jb)
 }
+
+func TestSlackHomeDialCutsLongTextAndSkipsUnnamedRepositories(t *testing.T) {
+	b := dialBoard("U9")
+	long := strings.Repeat("&", 4000)
+	b.Dial.Level, b.Dial.SetBy = long, long
+	k := &b.Dial.Kinds[0]
+	k.Title = long
+	k.Repos[0].Repo = long
+	k.Repos = append(k.Repos, lib.BoardDialRepo{Repo: " ", RepoKey: "", Needed: 5})
+	a, api, _ := homeAdapter(t, b, nil)
+	openHome(a, "U1")
+	blocks := dialBlocks(t, api)
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case map[string]any:
+			if txt, ok := v["text"].(string); ok && len(txt) > 3000 {
+				t.Errorf("a text object is %d characters; Slack refuses the tab past 3000", len(txt))
+			}
+			for _, child := range v {
+				walk(child)
+			}
+		case []any:
+			for _, child := range v {
+				walk(child)
+			}
+		}
+	}
+	for _, blk := range blocks {
+		walk(blk)
+	}
+	if got := dialText(t, blocks); strings.Contains(got, `"no-pdb|dev|"`) || !strings.Contains(got, "static_select") {
+		t.Errorf("a repository with no key or name must be left out, the rest kept:\n%s", got)
+	}
+
+	pending := dialBoard("U1")
+	pending.Dial.Kinds[0].Repos = pending.Dial.Kinds[0].Repos[1:]
+	pending.Dial.Kinds[0].Repos[0].PendingPR.URL = "https://github.com/org/apps/pull/35|click here>"
+	a2, api2, _ := homeAdapter(t, pending, nil)
+	openHome(a2, "U1")
+	if got := dialText(t, dialBlocks(t, api2)); strings.Contains(got, "click here") || !strings.Contains(got, "Pending: rules PR") {
+		t.Errorf("a pending URL with | or > must not be linked:\n%s", got)
+	}
+}
+
+func TestSlackHomeDialTapFromAMemberNotAdmittedIsNotSent(t *testing.T) {
+	a, _, _ := homeAdapter(t, dialBoard("U2"), nil)
+	actor := &dialActor{res: &lib.BoardActionResult{OK: true}}
+	a.SetBoardActor(actor.act)
+	a.dialClick(dialClickPayload("U2", "8.1"), slackDialActionLevel, "", lib.DialLevelExplain)
+	if len(actor.sent) != 0 {
+		t.Errorf("a tap from a member the Home tab denies was sent: %+v", actor.sent)
+	}
+}
+
+func TestSlackHomeDialTapWithTheBoardUnreadableGoesToSessionKV(t *testing.T) {
+	a, _, _ := homeAdapter(t, nil, errors.New("board: no answer"))
+	actor := &dialActor{res: &lib.BoardActionResult{OK: true}}
+	a.SetBoardActor(actor.act)
+	a.dialClick(dialClickPayload("U1", "9.1"), slackDialActionLevel, "", lib.DialLevelExplain)
+	if len(actor.sent) != 1 || actor.sent[0].User != "U1" {
+		t.Errorf("a tap the gateway cannot check must go to session-kv, the gate, with its presser: %+v", actor.sent)
+	}
+}
+
+func TestDecodeBoardKeepsTheBoardWhenTheDialIsUnreadable(t *testing.T) {
+	raw, err := json.Marshal(homeBoardFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["dial"] = "not an object"
+	raw, _ = json.Marshal(m)
+	b, err := decodeBoard(raw)
+	if err != nil {
+		t.Fatalf("a bad dial section made the whole board unreadable: %v", err)
+	}
+	if b.Dial != nil || len(b.Clusters) != 3 {
+		t.Errorf("a bad dial section must leave the rest of the board and no dial: dial=%+v clusters=%d", b.Dial, len(b.Clusters))
+	}
+	raw, _ = json.Marshal(dialBoard("U1"))
+	if b, err := decodeBoard(raw); err != nil || b.Dial == nil || !b.Dial.Enabled || len(b.Dial.Kinds) != 1 {
+		t.Errorf("a good dial section did not decode: err=%v", err)
+	}
+}

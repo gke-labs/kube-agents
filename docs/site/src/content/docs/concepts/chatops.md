@@ -524,7 +524,7 @@ With `KUBEAGENTS_DIAL=on` (off by default), the **Autonomy dial** panel sits abo
 
 Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that turns it on is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing.
 
-A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser again on every change, and its one-line answer appears under the panel for the person who pressed.
+A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed.
 
 ### People seen
 
