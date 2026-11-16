@@ -808,8 +808,9 @@ func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
 }
 
 // A task's status line names its task and profile on the wire when the
-// gateway gives a profile (a profile turn), so a console client that can't
-// see the profile's submission can follow it. A plain status line, with
+// gateway gives a profile (a profile turn), and the inbound frame it answers,
+// so a console client that can't see the profile's submission can follow the
+// task its own turn started. A plain status line, with
 // Stop alone, is the bytes a notice always was.
 func TestConsoleStatusLineNamesAProfileTask(t *testing.T) {
 	r := startConsoleRig(t)
@@ -821,7 +822,7 @@ func TestConsoleStatusLineNamesAProfileTask(t *testing.T) {
 	if _, err := r.adapter.PostMessage("console:tab-6", OutMessage{Text: "⏳ submitted…", Stop: "task-plain"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.adapter.PostMessage("console:tab-6", OutMessage{Text: "⏳ submitted…", Stop: "task-7", Profile: "cluster"}); err != nil {
+	if _, err := r.adapter.PostMessage("console:tab-6", OutMessage{Text: "⏳ submitted…", Stop: "task-7", Profile: "cluster", InReplyTo: "mcp-0123abcd"}); err != nil {
 		t.Fatal(err)
 	}
 	var raw []string
@@ -837,7 +838,7 @@ func TestConsoleStatusLineNamesAProfileTask(t *testing.T) {
 	if got, want := norm(raw[0]), `{"messageId":"ID","text":"⏳ submitted…"}`; got != want {
 		t.Errorf("plain status line = %s, want %s", raw[0], want)
 	}
-	if got, want := norm(raw[1]), `{"messageId":"ID","text":"⏳ submitted…","addressee":"cluster","taskId":"task-7"}`; got != want {
+	if got, want := norm(raw[1]), `{"messageId":"ID","text":"⏳ submitted…","addressee":"cluster","taskId":"task-7","inReplyTo":"mcp-0123abcd"}`; got != want {
 		t.Errorf("profile status line = %s, want %s", raw[1], want)
 	}
 }

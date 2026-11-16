@@ -153,8 +153,9 @@ type ConsoleInFrame struct {
 // and the state it ended in. The page reads a completed answer off TASKS and
 // skips that frame; another console client (the MCP server) reads it here,
 // and from TASKS for a frame it missed. A top-level profile task's status
-// line names its task too (Addressee, TaskID), since a console client cannot
-// see the profile's submission. Every other field is absent on a notice.
+// line names its task too (Addressee, TaskID) and the inbound frame whose
+// turn started it (InReplyTo), since a console client cannot see the
+// profile's submission. Every other field is absent on a notice.
 type ConsoleOutFrame struct {
 	MessageID string        `json:"messageId"`
 	Text      string        `json:"text"`
@@ -170,6 +171,10 @@ type ConsoleOutFrame struct {
 	// work to kanban cards, whose reports follow as notify frames naming it
 	// (ReplyTo). Absent, no handoff was seen, so a client need not wait.
 	CardsPending bool `json:"cardsPending,omitempty"`
+	// InReplyTo, on a profile task's status line, is the messageId of the
+	// inbound frame whose turn started the task, so a client takes only its
+	// own turn's task. Absent on every other frame.
+	InReplyTo string `json:"inReplyTo,omitempty"`
 }
 
 // ConsoleTerminal is one task's end as a console conversation is told it.
@@ -627,14 +632,15 @@ func (a *ConsoleAdapter) Edit(conversation, messageID, text string) error {
 
 // PostMessage and EditMessage publish text only: a chat message falls back
 // to its text (ErrTextOnly). A profile task's status line also names its
-// task and profile (addressee, taskId), the one notice that does: a console
-// client sees no profile submission to learn the task from.
+// task and profile (addressee, taskId) and the inbound frame it answers
+// (inReplyTo), the one notice that does: a console client sees no profile
+// submission to learn the task from.
 func (a *ConsoleAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
 	if m.Chat != nil || m.Stop == "" || m.Profile == "" {
 		return postTextOnly(a.Post, conversation, m)
 	}
 	id := a.mintID()
-	if err := a.publishFrame(conversation, ConsoleOutFrame{MessageID: id, Text: m.Text, Addressee: m.Profile, TaskID: m.Stop}); err != nil {
+	if err := a.publishFrame(conversation, ConsoleOutFrame{MessageID: id, Text: m.Text, Addressee: m.Profile, TaskID: m.Stop, InReplyTo: m.InReplyTo}); err != nil {
 		return "", err
 	}
 	return id, nil

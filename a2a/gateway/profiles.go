@@ -160,6 +160,16 @@ func topProfile(route *profileRoute) string {
 	return route.Profile
 }
 
+// topInReplyTo is the message id of the turn that started a top-level
+// profile task, for its status line (OutMessage.InReplyTo), and "" for any
+// other task.
+func topInReplyTo(ts taskStart) string {
+	if topProfile(ts.Route) == "" {
+		return ""
+	}
+	return ts.MessageID
+}
+
 // submissionSubject is where a new task is published: a profile's submission
 // subject, carrying the tier and kind its durables route on, or the
 // addressee's .in subject for platform and sessions.

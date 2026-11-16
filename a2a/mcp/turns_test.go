@@ -203,6 +203,9 @@ type gatewayScenario struct {
 	// profile routing answers. Any other addressee is taken as an ordinary
 	// turn, so a test can read the frame it came in.
 	refuseProfiles map[string]string
+	// strayLine, on a profile turn, posts another turn's status line
+	// (another task, answering another frame) before this turn's own.
+	strayLine bool
 }
 
 // sentFrame is one console frame as the fake gateway read it.
@@ -281,7 +284,14 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			i := n.Add(1)
 			root := fmt.Sprintf("task-root%d", i)
 			publishProfileSubmissionOf(t, nc, lib.SubmitKindTop, addressed.Addressee, root, conv, f.Text, "")
-			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: root}))
+			if sc.strayLine {
+				// Another client's profile turn on the same conversation (the
+				// page, a second replica, or this server's earlier turn whose
+				// line came late): its line names its own frame, not this one.
+				publishRun(t, js, addressed.Addressee, "task-stray", forgedAnswer, true)
+				_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s0", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: "task-stray", InReplyTo: "page-0123"}))
+			}
+			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: root, InReplyTo: f.MessageID}))
 			publishRun(t, js, addressed.Addressee, root, answerText, sc.finish)
 			return
 		}
@@ -2987,8 +2997,8 @@ func TestARunningAddressedTurnReturnsItsTaskForTaskControl(t *testing.T) {
 // it, and a notice naming another task (a profile turn's line, say) is shown
 // as a notice and nothing more.
 func TestAPlainTurnTakesNoTaskFromANotice(t *testing.T) {
-	w := &turnWatch{known: map[string]bool{}}
-	m := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: "cluster", TaskID: "task-x"})}
+	w := &turnWatch{known: map[string]bool{}, messageID: "mcp-mine"}
+	m := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"})}
 	if _, ok := w.noticedTask(m); ok {
 		t.Error("an unaddressed turn took the task a notice named")
 	}
@@ -2997,14 +3007,34 @@ func TestAPlainTurnTakesNoTaskFromANotice(t *testing.T) {
 		t.Errorf("an addressed turn's noticed task = %v, %v; want cluster/task-x", ref, ok)
 	}
 	for name, f := range map[string]ConsoleOutFrame{
-		"a result frame":       {MessageID: "r", Text: "x", Kind: "result", Addressee: "cluster", TaskID: "task-x"},
-		"an edit":              {MessageID: "s1", Text: "x", Edit: true, Addressee: "cluster", TaskID: "task-x"},
-		"no addressee":         {MessageID: "s1", Text: "x", TaskID: "task-x"},
-		"a wildcard addressee": {MessageID: "s1", Text: "x", Addressee: "*", TaskID: "task-x"},
-		"a dotted task id":     {MessageID: "s1", Text: "x", Addressee: "cluster", TaskID: "a.b"},
+		"a result frame":       {MessageID: "r", Text: "x", Kind: "result", Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"an edit":              {MessageID: "s1", Text: "x", Edit: true, Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"no addressee":         {MessageID: "s1", Text: "x", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"a wildcard addressee": {MessageID: "s1", Text: "x", Addressee: "*", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"a dotted task id":     {MessageID: "s1", Text: "x", Addressee: "cluster", TaskID: "a.b", InReplyTo: "mcp-mine"},
+		// The line of this server's earlier addressed turn, arriving after
+		// that turn gave up on it, answers that turn's frame.
+		"an earlier turn's late line": {MessageID: "s0", Text: "x", Addressee: "cluster", TaskID: "task-prod", InReplyTo: "mcp-earlier"},
+		// Another client on the same token: the page or a second replica.
+		"another client's line": {MessageID: "s2", Text: "x", Addressee: "cluster", TaskID: "task-page", InReplyTo: "page-0123"},
+		// A gateway that names no inbound frame can't say whose turn it is.
+		"a line answering no frame": {MessageID: "s3", Text: "x", Addressee: "cluster", TaskID: "task-x"},
 	} {
 		if _, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, f)}); ok {
 			t.Errorf("%s named the turn's task", name)
 		}
 	}
+}
+
+// Another turn's status line on the conversation, arriving first, is not
+// taken for this turn's: the answer comes from the task whose line names this
+// turn's own frame.
+func TestAnAddressedTurnSkipsAnotherTurnsStatusLine(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, strayLine: true})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "look at staging", "addressee": "cluster"})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	mustNotContain(t, res.Content[0].Text, "task-stray", forgedAnswer)
 }

@@ -140,6 +140,9 @@ type ConsoleOutFrame struct {
 	ReplyTo   string `json:"replyTo,omitempty"`
 	// CardsPending is set on a result whose chain handed work to cards.
 	CardsPending bool `json:"cardsPending,omitempty"`
+	// InReplyTo, on a profile task's status line, is the messageId of the
+	// console frame whose turn started the task.
+	InReplyTo string `json:"inReplyTo,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -1242,6 +1245,9 @@ type turnWatch struct {
 	// is on a2a.submit, out of this server's sight: its task is the one the
 	// gateway's status line names (noticedTask).
 	addressed bool
+	// messageID is the id of the frame this turn published: an addressed
+	// turn takes only the status line that answers it (InReplyTo).
+	messageID string
 	token     string
 	texts     []string
 	// since is the event cursor before the turn was sent: a card's report
@@ -1473,7 +1479,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	// From here the watch holds the lock, and closing it releases it.
 	var once sync.Once
 	w.release = func() { once.Do(unlock) }
-	if err := b.publishFrame(token, text, to); err != nil {
+	if w.messageID, err = b.publishFrame(token, text, to); err != nil {
 		w.close()
 		return res, nil, err
 	}
@@ -1644,7 +1650,7 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 		return res, err
 	}
 	defer w.close()
-	if err := b.publishFrame(token, text, TurnAddress{}); err != nil {
+	if _, err := b.publishFrame(token, text, TurnAddress{}); err != nil {
 		return res, err
 	}
 	timeout := time.After(noticeGrace)
@@ -1663,13 +1669,15 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 	}
 }
 
-func (b *NATSBus) publishFrame(token, text string, to TurnAddress) error {
+// publishFrame publishes one console frame and returns its messageId.
+func (b *NATSBus) publishFrame(token, text string, to TurnAddress) (string, error) {
 	id := make([]byte, messageIDBytes)
 	if _, err := rand.Read(id); err != nil {
-		return err
+		return "", err
 	}
-	frame, _ := json.Marshal(ConsoleInFrame{MessageID: conversationTokenPrefix + "-" + hex.EncodeToString(id), Text: text, TurnAddress: to})
-	return b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
+	messageID := conversationTokenPrefix + "-" + hex.EncodeToString(id)
+	frame, _ := json.Marshal(ConsoleInFrame{MessageID: messageID, Text: text, TurnAddress: to})
+	return messageID, b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
 }
 
 // noticeText is a frame's text when it is a gateway notice about a turn, and
@@ -1738,16 +1746,18 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 // message for a task already running is the gateway sending the text into
 // it, and that task is where the turn's answer is.
 // noticedTask is the task an addressed turn's status line names: a fresh
-// notice (no kind, not an edit) carrying the task's id and the profile it was
-// published to. Only the gateway publishes on the conversation's .out, and
-// only a profile task's line names one. A plain turn takes its task from its
-// own submission alone.
+// notice (no kind, not an edit) carrying the task's id, the profile it was
+// published to, and this turn's own frame id (InReplyTo). Only the gateway
+// publishes on the conversation's .out, and only a profile task's line names
+// a task; the frame id keeps another turn's line on the same conversation (an
+// earlier turn's, arriving late, or another client's) from being taken. A
+// plain turn takes its task from its own submission alone.
 func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
 	if !w.addressed {
 		return TaskRef{}, false
 	}
 	var f ConsoleOutFrame
-	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" || f.Edit ||
+	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" || f.Edit || w.messageID == "" || f.InReplyTo != w.messageID ||
 		!lib.ValidSubjectToken(f.Addressee) || !lib.ValidSubjectToken(f.TaskID) {
 		return TaskRef{}, false
 	}

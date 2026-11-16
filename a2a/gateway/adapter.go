@@ -316,6 +316,10 @@ type OutMessage struct {
 	// console door names the task and its profile on the frame for it to
 	// follow; every other backend ignores it.
 	Profile string
+	// InReplyTo, on that same line, is the backend message id of the turn
+	// that started the task, so a console client takes the task its own turn
+	// started and not another turn's on the same conversation.
+	InReplyTo string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

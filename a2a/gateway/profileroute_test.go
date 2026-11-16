@@ -329,6 +329,22 @@ func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	childEnv := submissionOn(t, r, "prod-east")
+	// A delegated child's status line names neither its profile nor a
+	// turn: only a top-level profile task's line does, for the console
+	// client whose turn started it.
+	waitFor(t, "the child's status line", func() bool {
+		for _, m := range r.adapter.stopPostsCopy() {
+			if m.Stop == childEnv.TaskID {
+				return true
+			}
+		}
+		return false
+	})
+	for _, m := range r.adapter.stopPostsCopy() {
+		if m.Stop == childEnv.TaskID && (m.Profile != "" || m.InReplyTo != "") {
+			t.Errorf("the child's status line names profile %q, answering %q", m.Profile, m.InReplyTo)
+		}
+	}
 	childSubject := ""
 	for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>") {
 		childSubject = e.subject
@@ -848,6 +864,9 @@ func TestAProfileTurnsStatusLineNamesItsProfile(t *testing.T) {
 	if line.Profile != "prod-east" {
 		t.Errorf("status line profile = %q, want the resolved profile prod-east", line.Profile)
 	}
+	if line.InReplyTo != "m-discord:3/1" {
+		t.Errorf("status line answers %q, want the turn's message id m-discord:3/1", line.InReplyTo)
+	}
 	sub := submissionOn(t, r, "prod-east")
 	if line.Stop != sub.TaskID {
 		t.Errorf("status line task = %q, want the submitted task %q", line.Stop, sub.TaskID)
@@ -856,7 +875,7 @@ func TestAProfileTurnsStatusLineNamesItsProfile(t *testing.T) {
 	plain := startProfileRig(t)
 	plain.adapter.inbox <- InboundMessage{Conversation: "discord:3/2", Kind: "dm", AuthorID: "1001", MessageID: "m-plain", Text: "hello"}
 	waitFor(t, "the plain task's status line", func() bool { return len(plain.adapter.stopPostsCopy()) > 0 })
-	if p := plain.adapter.stopPostsCopy()[0]; p.Profile != "" {
-		t.Errorf("a plain turn's status line names profile %q", p.Profile)
+	if p := plain.adapter.stopPostsCopy()[0]; p.Profile != "" || p.InReplyTo != "" {
+		t.Errorf("a plain turn's status line names profile %q, answering %q", p.Profile, p.InReplyTo)
 	}
 }
