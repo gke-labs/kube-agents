@@ -2969,10 +2969,6 @@ func stripContainerMountsNamed(containers []corev1.Container, dropped map[string
 	return stripContainerMountsMatching(containers, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
 }
 
-// gatewaySafeToEvictAnnotation is the cluster autoscaler's per-pod opt-out
-// from consolidation evictions; buildPodTemplateSpec sets it "false".
-const gatewaySafeToEvictAnnotation = "cluster-autoscaler.kubernetes.io/safe-to-evict"
-
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -3761,17 +3757,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
 		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
 		"kubeagents.x-k8s.io/proxy-policy-hash":      policyHash,
-		// The gateway runs one replica, and its PDB (maxUnavailable: 1) does
-		// not stop an eviction at one replica. So autoscaler consolidation
-		// (Autopilot packing pods onto fewer nodes) took the only gateway down
-		// until a replacement scheduled (#6040). The autoscaler never evicts a
-		// pod carrying this to consolidate. The cost differs by shape: on
-		// Standard, the node under the gateway is never scaled down while the
-		// gateway is on it, and node upgrades and manual drains still move
-		// it; on Autopilot, GKE also holds the node's scale-down and auto-
-		// upgrade for at least 7 days. spec.deployment.podAnnotations
-		// overrides it ("true" opts out).
-		gatewaySafeToEvictAnnotation: "false",
 	}
 
 	if len(sidecars) > 0 {
