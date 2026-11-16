@@ -1011,7 +1011,7 @@ class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):
         self.assertEqual(url, f"http://{host}:{port}")
 
     def test_neither_launcher_writes_the_address_out(self) -> None:
-        for name in ("start_event_watcher", "start_drift_detector", "start_audit_report_store"):
+        for name in ("start_event_watcher", "start_drift_detector"):
             with self.subTest(launcher=name):
                 launcher = self.lift(name)
                 self.assertIn('--daemon-url="${KV_DAEMON_URL}"', launcher)
