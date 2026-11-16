@@ -118,7 +118,7 @@ SECRETS_MISCONFIG_ID = "KSV-0041"
 INSTALL_NAMESPACE = "kubeagents-system"
 KUSTOMIZE_DEFAULT_DIR = REPO_ROOT / "k8s-operator" / "config" / "default"
 # The profile namespace and the kustomization that renders the Role copy there;
-# the chart renders the same under mode next.
+# the chart renders the same on every install with a platform agent.
 PROFILE_NAMESPACE_SUFFIX = "-profiles"
 PROFILE_NAMESPACE = INSTALL_NAMESPACE + PROFILE_NAMESPACE_SUFFIX
 KUSTOMIZE_PROFILES_DIR = REPO_ROOT / "k8s-operator" / "config" / "profiles"
@@ -128,7 +128,8 @@ HELM_MODE_NEXT_SETS = ["--set", "platformAgent.mode=next"]
 # document names exactly this set and the ClusterRole grants no write verb on
 # any of it; every kind's reads stay in the ClusterRole (the informers,
 # escalation prevention, and the teardown's list of dispatchjobtemplates in a
-# profile namespace a mode-today install never binds the Role in).
+# profile namespace before checking that the namespace or a binding in it
+# exists).
 NAMESPACED_WRITE_KINDS = frozenset({
     (CORE_API_GROUP, "configmaps"),
     (CORE_API_GROUP, "events"),
