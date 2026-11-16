@@ -282,3 +282,37 @@ class ChunkedReadTest(unittest.TestCase):
             path = pathlib.Path(tmp) / "s.json.gz"
             at.archive(stores(), path)
             self.assertEqual(at.load_archive(path), stores())
+
+
+class MemoryTest(unittest.TestCase):
+    def data(self):
+        data = stores()
+        data["activity"] = [["cron_compliance-audit_20261111_200909", 2, 3, 0], ["k8s-evt-3f9c88ce", 2, 1, 0]]
+        for s in data["sessions"]:
+            s["ended_at"] = s["started_at"] + 1000
+        return data
+
+    def test_the_excess_is_split_by_the_minute_s_messages_and_the_rest_is_the_base(self):
+        # One container, idle at 1 GiB, at 2 GiB for the minute starting at 120 s.
+        series = {"agent": [(60.0, at.GIB), (120.0, 2 * at.GIB), (180.0, at.GIB)]}
+        mem = at.memory_by_capability(series, self.data(), 60, 240, caps=CAPS)
+        rows = {r["capability"]: r for r in mem["rows"]}
+        excess = 1 / 60  # 1 GiB for one minute, in GiB-hours
+        self.assertAlmostEqual(rows["compliance-audit"]["gib_hours"], excess * 3 / 4, places=4)
+        self.assertAlmostEqual(rows[at.INCIDENT_TRIAGE]["gib_hours"], excess / 4, places=4)
+        self.assertAlmostEqual(sum(r["share"] for r in mem["rows"]), 1.0, places=3)
+        self.assertEqual(mem["rows"][-1]["capability"], at.PLATFORM_BASE)
+
+    def test_live_sessions_with_no_message_share_equally_and_no_session_is_unattributed(self):
+        data = self.data()
+        data["activity"] = []
+        series = {"agent": [(100.0, 2 * at.GIB)]}
+        rows = {r["capability"]: r for r in at.memory_by_capability(series, data, 100, 160, base={"agent": at.GIB},
+                                                                     caps=CAPS)["rows"]}
+        # Equal shares among the live sessions: the compliance audit has 3 of them (its cron session,
+        # its card's worker and a subagent), chat 1.
+        self.assertAlmostEqual(rows["compliance-audit"]["gib_hours"] / rows[at.CHAT]["gib_hours"], 3.0, places=3)
+        empty = {"sessions": [], "cards": [], "runs": []}
+        rows = {r["capability"]: r for r in at.memory_by_capability(series, empty, 100, 160, base={"agent": at.GIB},
+                                                                     caps=CAPS)["rows"]}
+        self.assertIn(at.UNATTRIBUTED, rows)

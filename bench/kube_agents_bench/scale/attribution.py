@@ -50,6 +50,7 @@ SESSION_PODS = "session-pods"
 GITOPS_DRIFT = "gitops-drift"
 EXTRA_ROWS = (FIRST_RUN, INCIDENT_TRIAGE, CHAT, MEMORY_SERVICE, SESSION_PODS, GITOPS_DRIFT)
 UNATTRIBUTED = "unattributed"
+PLATFORM_BASE = "platform-base"
 OTHER = "other"
 OOBE_JOB = "oobe"
 TOP_ROWS = 5
@@ -106,6 +107,13 @@ for profile, path in stores:
                 "SELECT id, source, started_at, %s, parent_session_id, input_tokens, output_tokens, "
                 "cache_read_tokens, reasoning_tokens FROM sessions WHERE started_at >= ?" % end, (since,)):
             out["sessions"].append(dict(r, profile=profile))
+        mcols = {c[1] for c in conn.execute("PRAGMA table_info(messages)")}
+        if {"session_id", "timestamp"} <= mcols:
+            tok = "COALESCE(SUM(token_count), 0)" if "token_count" in mcols else "0"
+            for r in conn.execute(
+                    "SELECT session_id, CAST(timestamp / 60 AS INTEGER) AS minute, COUNT(*) AS messages, %s AS tokens "
+                    "FROM messages WHERE timestamp >= ? GROUP BY session_id, minute" % tok, (since,)):
+                out.setdefault("activity", []).append(list(r))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (path, exc))
 out["injects"] = []
@@ -434,5 +442,92 @@ def markdown(record: dict[str, dict[str, Any]]) -> str:
             split = ", ".join(f"{k} {v:,}" for k, v in sorted(row.get("by_profile", {}).items(), key=lambda kv: -kv[1]))
             lines.append(f"| {cap} | {row['sessions']} | {row['input']:,} | {row['cached']:,} | {row['output']:,} "
                          f"| {split} |")
+        if body.get("memory", {}).get("rows"):
+            lines += ["", "| Capability | Memory-time (GiB-hours) | Share | Peak share (GiB) |", "| --- | ---: | ---: | ---: |"]
+            lines += [f"| {r['capability']} | {r['gib_hours']:.3f} | {r['share']:.1%} | {r['peak_gib'] if r['peak_gib'] is not None else ''} |"
+                      for r in body["memory"]["rows"]]
         lines += ["", f"Checks: `{json.dumps(body['checks'])}`", ""]
     return "\n".join(lines)
+
+
+GIB = 2 ** 30
+SECONDS_PER_HOUR_F = 3600.0
+
+
+def memory_by_capability(series: dict[str, list[tuple[float, float]]], stores: dict[str, Any], start: float,
+                         end: float, base: dict[str, float] | None = None,
+                         caps: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Each capability's share of the containers' memory-time over [start, end): the design's
+    shared-process estimate (docs/designs/capability-usage-attribution.md, "Memory").
+
+    ``series`` is each container's memory in bytes per sample, ``(time, bytes)``. A container's
+    memory above its base is split, sample by sample, among the sessions active in that minute,
+    weighted by their messages in it; live sessions with no message in the minute share it
+    equally; with no live session it is Unattributed. ``base`` is each container's idle memory,
+    held fixed for the period; by default its first sample in the period.
+    """
+    caps = caps or capabilities()
+    joined = join(stores, caps)
+    sessions = {s["id"]: s for s in stores.get("sessions", [])}
+    activity: dict[int, dict[str, float]] = {}
+    for sid, minute, messages, _tokens in stores.get("activity", []):
+        activity.setdefault(int(minute), {})[sid] = activity.get(int(minute), {}).get(sid, 0.0) + float(messages)
+
+    def live(t: float) -> list[str]:
+        return [sid for sid, s in sessions.items()
+                if float(s.get("started_at") or 0) <= t <= float(s.get("ended_at") or s.get("started_at") or 0)]
+
+    gib_hours: dict[str, float] = {}
+    base_gib_hours, peaks = 0.0, {}
+    for container, points in series.items():
+        inside = sorted((t, b) for t, b in points if start <= t < end)
+        if not inside:
+            continue
+        idle = (base or {}).get(container, inside[0][1])
+        for i, (t, used) in enumerate(inside):
+            step = (inside[i + 1][0] - t) if i + 1 < len(inside) else (end - t)
+            step = max(0.0, min(step, end - t)) / SECONDS_PER_HOUR_F
+            base_gib_hours += min(used, idle) / GIB * step
+            excess = max(0.0, used - idle) / GIB * step
+            if not excess:
+                continue
+            weights = {sid: w for sid, w in activity.get(int(t // 60), {}).items() if sid in sessions}
+            if not weights:
+                weights = {sid: 1.0 for sid in live(t)}
+            if not weights:
+                gib_hours[UNATTRIBUTED] = gib_hours.get(UNATTRIBUTED, 0.0) + excess
+                continue
+            total = sum(weights.values())
+            for sid, w in weights.items():
+                cap = joined.capability.get(sid, UNATTRIBUTED)
+                gib_hours[cap] = gib_hours.get(cap, 0.0) + excess * w / total
+                share = excess * w / total / step if step else 0.0
+                peaks[cap] = max(peaks.get(cap, 0.0), share)
+    total = base_gib_hours + sum(gib_hours.values())
+    rows = [{"capability": c, "gib_hours": round(v, 4), "share": round(v / total, 4) if total else 0.0,
+             "peak_gib": round(peaks.get(c, 0.0), 3)} for c, v in sorted(gib_hours.items(), key=lambda kv: -kv[1])]
+    rows.append({"capability": PLATFORM_BASE, "gib_hours": round(base_gib_hours, 4),
+                 "share": round(base_gib_hours / total, 4) if total else 0.0, "peak_gib": None})
+    return {"rows": rows, "total_gib_hours": round(total, 4),
+            "method": "excess over each container's base, split each minute by the sessions' messages in it"}
+
+
+def container_memory(install: Any, start: float, end: float) -> dict[str, list[tuple[float, float]]]:
+    """Each install container's memory per minute over [start, end], its replicas summed, from Cloud Monitoring."""
+    from kube_agents_bench.scale import collect  # the Monitoring reader; imported here to keep the join importable alone
+    query = (f'metric.type="{collect.MEMORY_METRIC}" AND metric.labels.memory_type="{collect.MEMORY_TYPE}" '
+             f'AND resource.type="k8s_container" AND resource.labels.project_id="{install.project}" '
+             f'AND resource.labels.cluster_name="{install.cluster}" '
+             f'AND resource.labels.namespace_name="{install.namespace}"')
+    sums: dict[str, dict[float, float]] = {}
+    for s in install._time_series(query, "ALIGN_MAX", start, end):
+        container = s["resource"]["labels"].get("container_name", "")
+        for p in s.get("points", []):
+            t = datetime_ts(p["interval"]["endTime"])
+            sums.setdefault(container, {})[t] = sums.get(container, {}).get(t, 0.0) + collect._point_value(p)
+    return {c: sorted(v.items()) for c, v in sums.items() if c}
+
+
+def datetime_ts(text: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()

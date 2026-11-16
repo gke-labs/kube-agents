@@ -115,6 +115,8 @@ STORES_BEFORE = "session-records-before-reset.json.gz"
 STORES_AFTER = "session-records-after-run.json.gz"
 # The model the install's gateway serves; Vertex AI's count for it is the sessions' check.
 INSTALL_MODEL = "gemini-3.5-flash"
+# How far into the first window the containers' idle memory is read.
+MEMORY_BASE_SECONDS = 180
 # The label a host cluster carries when its install exists to be measured: a run resets the
 # install's state volumes, and refuses a host without it, as the scale runner does.
 HOST_LABEL = "purpose=harness-scale"
@@ -532,9 +534,15 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     return summary
 
 
-def measure_period(stores: dict, project: str, start: float, end: float, litellm: dict | None = None) -> dict:
-    """One period's tokens by capability, checked against Vertex AI's count, with the calls by account."""
+def measure_period(stores: dict, project: str, start: float, end: float, litellm: dict | None = None,
+                   install: collect.Install | None = None, base: dict | None = None) -> dict:
+    """One period's tokens and memory by capability, checked against Vertex AI's count, with the calls by account."""
     usage = attribution.attribute(stores, start, end, litellm=litellm)
+    if install is not None:
+        usage["memory"] = sized_records.safe(
+            lambda: attribution.memory_by_capability(attribution.container_memory(install, start, end), stores,
+                                                     start, end, base=base),
+            usage.setdefault("errors", []), "memory by capability")
     vertex = model_counters.vertex_tokens(project, start, end)
     usage["vertex"] = model_counters.against_sessions(vertex, usage["capabilities"], INSTALL_MODEL)
     usage["requests_by_account"] = model_counters.requests_by_account(project, start, end)
@@ -548,18 +556,24 @@ def measure_period(stores: dict, project: str, start: float, end: float, litellm
 
 
 def capability_usage(host_context: str, namespace: str, windows: dict[str, dict], project: str = "",
-                     stores: dict | None = None) -> dict[str, dict]:
+                     stores: dict | None = None, install: collect.Install | None = None) -> dict[str, dict]:
     """Each window's tokens by capability (docs/designs/capability-usage-attribution.md), from one read."""
     starts = [datetime.fromisoformat(w["start"]).timestamp() for w in windows.values() if "start" in w]
     if stores is None:
         stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
     usage = {}
+    # The platform base is each container's idle memory at the run's first window, held for the run.
+    base = None
+    if install is not None and starts:
+        first = attribution.container_memory(install, min(starts), min(starts) + MEMORY_BASE_SECONDS)
+        base = {c: points[0][1] for c, points in first.items() if points}
     for name, window in windows.items():
         try:
             start = datetime.fromisoformat(window["start"]).timestamp()
             end = start + window["seconds"]
             if project:
-                usage[name] = measure_period(stores, project, start, end, litellm=window.get("tokens"))
+                usage[name] = measure_period(stores, project, start, end, litellm=window.get("tokens"),
+                                             install=install, base=base)
             else:
                 usage[name] = attribution.attribute(stores, start, end, litellm=window.get("tokens"))
         except (KeyError, ValueError, OSError, kube.CommandError) as exc:
@@ -602,7 +616,7 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     if stores_after:
         attribution.archive(stores_after, out / STORES_AFTER)
     usage = sized_records.safe(lambda: capability_usage(host_context, args.namespace, record.windows, args.project,
-                                                        stores=stores_after),
+                                                        stores=stores_after, install=install),
                                record.errors, "capability usage") or {}
     result["errors"] = list(record.errors)
     records = {
@@ -778,7 +792,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
                     project=args.project)
         stores = attribution.read_stores(host_context, args.namespace, since=since)
     period = f"{datetime.fromtimestamp(since, timezone.utc):%Y%m%dT%H%M}-{datetime.fromtimestamp(until, timezone.utc):%Y%m%dT%H%M}"
-    usage = {period: measure_period(stores, args.project, since, until)}
+    install = collect.Install(args.project, kube.context_name(args.project, args.host_location, args.host_cluster),
+                              args.namespace, args.host_cluster, args.host_location)
+    usage = {period: measure_period(stores, args.project, since, until, install=install)}
     out = Path(args.out or tempfile.mkdtemp(prefix="sized-usage-"))
     out.mkdir(parents=True, exist_ok=True)
     (out / f"usage-{period}.json").write_text(json.dumps(usage, indent=2) + "\n")
