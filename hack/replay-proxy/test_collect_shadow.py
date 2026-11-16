@@ -422,6 +422,23 @@ class DeadlineTest(CollectorTestCase):
                              remaining=lambda: 1.5 - (time.monotonic() - started))
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_default_runner_is_not_held_by_a_descendant_keeping_its_pipes(self):
+        # `gcloud storage cp` hands the copy to worker processes, which inherit
+        # stdout and stderr; killing only the command left them holding the
+        # pipes, and the wait for EOF after the kill never returned.
+        started = time.monotonic()
+        script = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_default_runner_is_not_held_by_a_descendant_of_a_command_that_exited(self):
+        started = time.monotonic()
+        script = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_default_runner_feeds_input_and_returns_output(self):
         proc = C.default_runner([sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read()[::-1])"],
                                 input=b"abc")

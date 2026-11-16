@@ -147,6 +147,9 @@ DEFAULT_FINAL_DEADLINE_SECONDS = 60.0
 DEFAULT_DATA_DIR = "/data"
 STAGING_PREFIX = "replay-shadow-"
 SLEEP_SLICE_SECONDS = 1.0
+# After a command is killed, how long its output is still read. A descendant
+# that left its process group can hold the pipes open; it is abandoned then.
+KILLED_DRAIN_SECONDS = 5.0
 KUBECTL_TIMEOUT_SECONDS = 120.0
 GCLOUD_TIMEOUT_SECONDS = 180.0
 # One exec's tar stream is held in memory; one pass copies at most this much,
@@ -411,21 +414,37 @@ def default_runner(cmd: Sequence[str], input: Optional[bytes] = None,
     SIGTERM that brings the collector's deadline forward also cuts a command
     already running. `stdin_path` feeds a file instead of `input`, for a stream
     too large to hold in memory (a seeded cache).
+
+    The command runs in a process group of its own, and the kill takes the
+    whole group: `gcloud storage cp` copies in worker processes that inherit
+    the pipes, so killing the command alone left the read after the kill
+    waiting on them for good.
     """
     merged = dict(os.environ)
     merged.update(env or {})
     if stdin_path is not None:
         with open(stdin_path, "rb") as stdin:
-            proc = subprocess.Popen(list(cmd), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+            proc = subprocess.Popen(list(cmd), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged,
+                                    start_new_session=True)
     else:
         proc = subprocess.Popen(list(cmd), stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged, start_new_session=True)
     pending = input
     while True:
         left = remaining()
         if left <= 0:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:  # the group has gone already
+                pass
             proc.kill()
-            proc.communicate()
+            try:
+                proc.communicate(timeout=KILLED_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                proc.wait()
             raise subprocess.TimeoutExpired(list(cmd), 0)
         try:
             # Input goes on the first call only; Popen refuses it on a retry
