@@ -105,7 +105,7 @@ func requestBoard(ctx context.Context, nc *nats.Conn) (*lib.Board, error) {
 	if b.Error != "" {
 		return nil, fmt.Errorf("board: the bridge could not read it: %s", b.Error)
 	}
-	return &b, nil
+	return b, nil
 }
 
 // decodeBoard reads a board answer. The dial section is decoded on its own,
