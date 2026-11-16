@@ -8,7 +8,7 @@
 #
 # Planted defect required: none. Needs the sized fleet (bench/tf/sized-fleet/)
 # in the install's project. Every size has at least four clusters, named
-# sized-<size>-01 onward, so the checks name the first four of any size. The
+# sized-<size>-01 onward, so the checks need the first four of any size, by name or as a range. The
 # fixture is not on the eval pool; FIXTURE_NOT_READY holds it until the pool
 # carries the fleet (the design's rollout, stage 2).
 # Isolation class: read-only.
@@ -41,9 +41,10 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      # The first cluster by name, and either the next three by name or a range that starts at
+      # the first ("sized-l-01 through sized-l-16"): a range is a correct answer for a fleet of
+      # 16 clusters, and an answer that lists them is too.
       required_patterns:
         - "sized-[sml]-01"
-        - "sized-[sml]-02"
-        - "sized-[sml]-03"
-        - "sized-[sml]-04"
+        - '(?s)(?=.*sized-[sml]-02)(?=.*sized-[sml]-03)(?=.*sized-[sml]-04)|sized-[sml]-01`?\s*(?:through|to|thru|-|–|—|\.\.)\s*`?sized-[sml]-(?:0[4-9]|[1-9]\d)\b'
         - '(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d)'
