@@ -73,6 +73,9 @@ _IMAGE_ENV_NAMES = (
 # the test.
 _CALL_SITES = (
     'check_toggle githubMinter "${MINTER_VALUES[@]}"',
+    "\ncheck_toggle webConsole --set webConsole.enabled=true\n",
+    "\ncheck_toggle profiles.cluster --set profiles.cluster.enabled=true\n",
+    "\ncheck_toggle hindsight --set hindsight.enabled=true\n",
     "--set githubMinter.enabled=true",
     'check_chart_image_env_rendered "$LABEL_DEFAULT" "$default_render"',
 )
@@ -386,7 +389,7 @@ class CheckToggleTest(unittest.TestCase):
 
 
 class CheckThreeWiringTest(unittest.TestCase):
-    def test_script_puts_the_minter_through_check_toggle(self):
+    def test_script_puts_every_toggle_through_check_toggle(self):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
