@@ -1148,12 +1148,22 @@ def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
     return Path(path) in _default_kubeconfig_candidates()
 
 
+def _caller_owns_folder(folder: Path) -> bool:
+    """Whether the caller owns `folder`. A default kubeconfig is created only in a folder that its
+    caller owns. Only a kubeconfig's owner registers a context in it, so the agent can never add a
+    cluster to a file that root made in the agent's folder. The question is about the folder that
+    holds the file, not the one above it. A worker's home can be a mount that root owns, and the
+    worker makes `.kube` in it."""
+    return folder.stat().st_uid == os.geteuid()
+
+
 def _ensure_host_kubeconfig_initialized(
     proxy_url: str,
     ca_file: str,
     token_file: str,
 ) -> None:
-    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent."""
+    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent, in a
+    folder that the caller owns."""
     host_context = os.environ.get("KUBE_PROXY_HOST_CONTEXT", "").strip()
     if not host_context:
         return
@@ -1164,6 +1174,8 @@ def _ensure_host_kubeconfig_initialized(
         return
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not _caller_owns_folder(path.parent):
+            return
         content = build_kube_proxy_kubeconfig(
             host_context,
             proxy_url=proxy_url,
@@ -1233,6 +1245,8 @@ def _merge_context_into_kubeconfig_file(
             else:
                 return
         if not path.exists() and not path.is_symlink() and path == _caller_default_kubeconfig_path():
+            if not _caller_owns_folder(path.parent):
+                return
             _replace_file(
                 path,
                 build_kube_proxy_kubeconfig(
