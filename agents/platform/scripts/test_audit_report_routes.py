@@ -154,6 +154,7 @@ class RoutesTestCase(unittest.TestCase):
         self.token_file.write_text(STORE_TOKEN + "\n", encoding="utf-8")
         self.state_dir = self.tmp / "gitops"
         self.state_dir.mkdir()
+        self.addCleanup(setattr, credential_proxy, "_managed_repository_cache", None)
         self.set_gitops(MANAGED, GITOPS)
         patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state_dir / "managed_repos")})
         patcher.start()
@@ -210,6 +211,8 @@ class RoutesTestCase(unittest.TestCase):
         )
 
     def set_gitops(self, managed, gitops):
+        # managed_repositories() caches for 30 s; a state change here is read at once.
+        credential_proxy._managed_repository_cache = None
         (self.state_dir / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
         path = self.state_dir / "gitops_repo"
         if gitops is None:
@@ -405,13 +408,29 @@ class RefusalTest(RoutesTestCase):
         CredentialProxyHandler.profile_gate = None
         self.assert_refused(self.request("GET", f"{STREAM}/latest"), credential_proxy.RULE_REPORT_NO_TASK)
 
-    def test_the_shell_writing_to_a_non_gitops_key(self):
+    def test_the_shell_writing_to_an_unregistered_key(self):
         self.authenticator.principal = self.shell
-        for key in ("acme%2Fterraform", "no_forge%2Flocal", "ACME%2Fgitops"):
+        for key in ("other%2Frepo", "acme%2Fremoved", "no_forge%2Flocal"):
             for method in ("PUT", "DELETE"):
                 with self.subTest(key=key, method=method):
                     path = f"/v1/audit-reports/{AUDIT}/{key}/latest"
                     self.assert_refused(self.request(method, path), credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+
+    def test_a_spelling_that_normalises_to_a_registered_repo_is_refused(self):
+        # Canonical spelling only: the listener would map each of these to a
+        # registered repository's directory, and the broker still refuses.
+        self.authenticator.principal = self.shell
+        for key in ("ACME%2Fgitops", "acme%2fgitops", "github.com%2Facme%252Fgitops", "Acme%2FTerraform",
+                    "acme%252Fterraform", "github.com%2Facme%252fterraform"):
+            with self.subTest(key=key):
+                path = f"/v1/audit-reports/{AUDIT}/{key}/runs/{RUN}"
+                self.assert_refused(self.request("PUT", path), credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+
+    def test_the_shell_writes_a_second_registered_repo_and_a_profile_does_not(self):
+        path = f"/v1/audit-reports/{AUDIT}/acme%2Fterraform/runs/{RUN}"
+        self.assert_refused(self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", path, self.request("PUT", path), BODY)
 
     def test_the_shell_writes_only_no_forge_with_no_gitops_repo(self):
         self.authenticator.principal = self.shell
@@ -480,14 +499,27 @@ class RefusalTest(RoutesTestCase):
         self.assert_refused(self.request("PUT", f"{STREAM}/latest", token=REPORT["token"]), status=503,
                             code="AUDIT_REPORT_STORE_UNAVAILABLE")
 
-    def test_an_unreadable_or_unmanaged_gitops_repo_refuses_writes(self):
+    def test_a_stale_gitops_key_leaves_only_no_forge_to_a_profile(self):
+        # Two managed repositories and a gitops_repo naming neither: finish
+        # writes its no-repository-chosen envelope under no_forge.
         self.set_gitops(MANAGED, {"type": "github", "url": "https://github.com/acme/removed"})
-        self.assert_refused(self.request("PUT", f"{STREAM}/latest", token=REPORT["token"]), status=503,
-                            code="GITOPS_REPO_UNAVAILABLE")
-        self.assert_refused(self.request("PUT", f"{NO_FORGE_STREAM}/latest", token=REPORT["token"]), status=503,
-                            code="GITOPS_REPO_UNAVAILABLE")
-        # A read needs no repository.
-        self.assert_relayed("GET", f"{STREAM}/latest", self.request("GET", f"{STREAM}/latest", token=REPORT["token"]))
+        self.assert_refused(self.request("PUT", f"{STREAM}/latest", token=REPORT["token"]),
+                            credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+        self.assert_relayed("PUT", f"{NO_FORGE_STREAM}/latest",
+                            self.request("PUT", f"{NO_FORGE_STREAM}/latest", token=REPORT["token"]), BODY)
+
+    def test_unreadable_state_refuses_writes_and_not_reads(self):
+        for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
+            with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
+                credential_proxy._managed_repository_cache = None
+                for principal, token in ((self.profile, REPORT["token"]), (self.shell, None)):
+                    self.authenticator.principal = principal
+                    for path in (f"{STREAM}/latest", f"{NO_FORGE_STREAM}/latest"):
+                        self.assert_refused(self.request("PUT", path, token=token), status=503,
+                                            code="GITOPS_REPO_UNAVAILABLE")
+                self.authenticator.principal = self.profile
+                self.assert_relayed("GET", f"{STREAM}/latest", self.request("GET", f"{STREAM}/latest", token=REPORT["token"]))
+                self.store.seen.clear()
 
     def test_a_path_the_routes_do_not_match(self):
         self.authenticator.principal = self.shell
@@ -517,9 +549,12 @@ class ListenerFaultTest(RoutesTestCase):
         for status in (401, 403):
             with self.subTest(status=status):
                 self.store.answer = (status, b'{"error":"the token is not the broker"}')
+                self.records.clear()
                 got, answer = self.request("GET", f"{STREAM}/latest", token=REPORT["token"])
                 self.assertEqual(502, got, answer)
                 self.assertNotIn("token is not the broker", json.dumps(answer))
+                # The log names the broker's credential, so nobody chases the caller.
+                self.assertTrue(any("refused the broker's own store credential" in r for r in self.records), self.records)
 
     def test_an_answer_over_the_cap(self):
         self.store.answer = (200, b"x" * (credential_proxy.AUDIT_REPORT_MAX_BYTES + 1))
@@ -681,9 +716,20 @@ class WriteDecisionTest(unittest.TestCase):
 
     def test_the_shell(self):
         shell = credential_proxy.CALLER_ROLE_SHELL
+        registered = frozenset({GITOPS_KEY, "acme%2Fterraform"})
         self.assertIsNone(self.write(role=shell, profile=None, trigger=None, audit_id="any-audit"))
         self.assertEqual(credential_proxy.RULE_REPORT_REPOSITORY_KEY,
                          self.write(role=shell, profile=None, trigger=None, key="acme%2Fterraform"))
+        write = credential_proxy.report_write_permitted
+        self.assertIsNone(write(shell, None, None, AUDIT, "acme%2Fterraform", GITOPS_KEY, self.ALLOW, registered))
+        for key in ("other%2Frepo", "ACME%2Fterraform", "no_forge%2Flocal"):
+            with self.subTest(key=key):
+                self.assertEqual(credential_proxy.RULE_REPORT_REPOSITORY_KEY,
+                                 write(shell, None, None, AUDIT, key, GITOPS_KEY, self.ALLOW, registered | {"no_forge%2Flocal"}))
+        # A profile task gets the publish target alone, whatever is registered.
+        self.assertEqual(credential_proxy.RULE_REPORT_REPOSITORY_KEY, write(
+            credential_proxy.CALLER_ROLE_PROFILE, "fleet-audit", self.trigger(), AUDIT, "acme%2Fterraform", GITOPS_KEY,
+            self.ALLOW, registered))
         self.assertIsNone(credential_proxy.report_read_permitted(shell, None, frozenset()))
 
     def test_reads(self):
@@ -758,50 +804,90 @@ class StoreKeyTest(unittest.TestCase):
                 self.assertIsNone(credential_proxy.report_store_key(repo))
 
 
-class GitopsKeyTest(unittest.TestCase):
+class PublishKeyTest(unittest.TestCase):
+    """report_publish_store_key: audit_report's publish target for the install, as a store key."""
+
+    TERRAFORM = {"type": "github", "url": "https://github.com/acme/terraform"}
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
-        patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.tmp / "managed_repos")})
+        patcher = mock.patch.dict(os.environ, {
+            "GITOPS_STATE_PATH": str(self.tmp / "managed_repos"),
+            "GITOPS_WORKSPACE": str(self.tmp / "workspaces"),
+        })
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.addCleanup(setattr, credential_proxy, "_managed_repository_cache", None)
 
     def state(self, managed, gitops=None, github_host=None):
+        credential_proxy._managed_repository_cache = None
         (self.tmp / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
-        (self.tmp / "gitops_repo").unlink(missing_ok=True)
-        if gitops is not None:
-            (self.tmp / "gitops_repo").write_text(json.dumps(gitops), encoding="utf-8")
-        if github_host is not None:
-            (self.tmp / "github_host").write_text(github_host, encoding="utf-8")
+        for name, value in (("gitops_repo", gitops), ("github_host", github_host)):
+            (self.tmp / name).unlink(missing_ok=True)
+            if value is not None:
+                (self.tmp / name).write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
 
-    def test_github(self):
-        self.state(MANAGED, GITOPS)
-        self.assertEqual("acme%2Fgitops", credential_proxy.report_gitops_store_key())
+    CASES = {
+        "two, gitops set": ([GITOPS, TERRAFORM], GITOPS, None, GITOPS_KEY),
+        "two, no gitops": ([GITOPS, TERRAFORM], None, None, None),
+        "two, a stale gitops key": ([GITOPS, TERRAFORM], {"type": "github", "url": "https://github.com/acme/removed"}, None, None),
+        "one, no gitops role": ([TERRAFORM], None, None, "acme%2Fterraform"),
+        "one, gitops naming another": ([TERRAFORM], GITOPS, None, "acme%2Fterraform"),
+        "none": ([], None, None, None),
+        "GHES, mixed case": ([{"type": "github", "url": "https://ghe.example.com/Acme/GitOps"}], None, "ghe.example.com",
+                             "ghe.example.com%2Facme%252Fgitops"),
+        "GitLab, two, gitops set": ([{"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}, TERRAFORM],
+                                    {"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}, None,
+                                    "gitlab.example.com%2Fplatform%252Finfra%252Fgitops"),
+    }
 
-    def test_github_enterprise_server(self):
-        gitops = {"type": "github", "url": "https://ghe.example.com/Acme/GitOps"}
-        self.state([gitops], gitops, github_host="ghe.example.com")
-        self.assertEqual("ghe.example.com%2Facme%252Fgitops", credential_proxy.report_gitops_store_key())
+    def test_each_case(self):
+        for name, (managed, gitops, host, want) in self.CASES.items():
+            with self.subTest(name):
+                self.state(managed, gitops, host)
+                self.assertEqual(want, credential_proxy.report_publish_store_key())
 
-    def test_gitlab(self):
-        gitops = {"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}
-        self.state([gitops], gitops)
-        self.assertEqual("gitlab.example.com%2Fplatform%252Finfra%252Fgitops", credential_proxy.report_gitops_store_key())
+    def test_each_case_matches_audit_reports_resolution(self):
+        # audit_report's own answer for the same state: resolve_repo_or_no_forge,
+        # with NoGitOpsRepo (several repositories, no usable key) read as the
+        # no-repository-chosen envelope under no_forge, as finish writes it.
+        audit_report = _load_audit_report()
+        root = self.tmp / "reports"
+        for name, (managed, gitops, host, _) in self.CASES.items():
+            with self.subTest(name), mock.patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": str(root)}), \
+                    mock.patch("subprocess.run", side_effect=AssertionError("no kubectl")):
+                self.state(managed, gitops, host)
+                try:
+                    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+                except audit_report.NoGitOpsRepo:
+                    repo = audit_report.NO_FORGE_REPO
+                relative = audit_report.reports_dir_for(AUDIT, repo).relative_to(root / AUDIT)
+                expected = urllib.parse.quote("/".join(relative.parts), safe="")
+                got = credential_proxy.report_publish_store_key() or credential_proxy.REPORT_NO_FORGE_STORE_KEY
+                self.assertEqual(expected, got)
 
-    def test_no_key_is_none(self):
-        # Even with one managed repository: only no_forge is writable then.
-        self.state(MANAGED[:1])
-        self.assertIsNone(credential_proxy.report_gitops_store_key())
+    def test_the_registered_keys_are_every_managed_repository(self):
+        self.state([GITOPS, self.TERRAFORM])
+        self.assertEqual(
+            frozenset({GITOPS_KEY, "acme%2Fterraform"}),
+            credential_proxy.report_install_store_keys()[1],
+        )
 
-    def test_a_key_naming_no_managed_repository_raises(self):
-        self.state(MANAGED, {"type": "github", "url": "https://github.com/acme/removed"})
-        with self.assertRaises(credential_proxy.ReportStoreUnavailable):
-            credential_proxy.report_gitops_store_key()
+    def test_unreadable_state_raises(self):
+        self.state([GITOPS, self.TERRAFORM], GITOPS)
+        for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
+            with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
+                credential_proxy._managed_repository_cache = None
+                with self.assertRaises(credential_proxy.ReportStoreUnavailable):
+                    credential_proxy.report_publish_store_key()
 
-    def test_an_unreadable_key_raises(self):
-        with mock.patch("gitops_workspace.gitops_repo_key_text", side_effect=RuntimeError("unreadable")):
-            with self.assertRaises(credential_proxy.ReportStoreUnavailable):
-                credential_proxy.report_gitops_store_key()
+    def test_the_pure_rule(self):
+        rule = credential_proxy.report_publish_store_key_for
+        self.assertIsNone(rule([], "acme/gitops"))
+        self.assertEqual("acme%2Fterraform", rule(["github:github.com/acme/terraform"], None))
+        self.assertIsNone(rule(["github:github.com/acme/gitops", "github:github.com/acme/terraform"], None))
+        self.assertEqual(GITOPS_KEY, rule(["github:github.com/acme/gitops", "github:github.com/acme/terraform"], "acme/gitops"))
 
 
 class ConfigurationTest(unittest.TestCase):

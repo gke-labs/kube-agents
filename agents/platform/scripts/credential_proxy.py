@@ -2587,8 +2587,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The audit-report store (#5619), relayed to its listener on the gateway
     # pod. The shell writes today's file store directly, so it reads every
-    # stream and writes the install's own repository keys; a profile worker
-    # reads with an allowlisted profile and writes only the stream its
+    # stream and writes the keys of the repositories the install manages; a
+    # profile worker reads with an allowlisted profile and writes only the stream its
     # schedule's trigger binds (report_read_permitted, report_write_permitted).
     # No trailing slash: the stream list is the prefix itself, and the handler
     # answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match whole.
@@ -2898,16 +2898,19 @@ def report_write_permitted(
     key: Any,
     gitops_key: str | None,
     allowlist: frozenset[str],
+    registered_keys: frozenset[str] = frozenset(),
 ) -> str | None:
     """The rule a write to the store breaks, or None when the caller may write.
 
     A write is a ring entry, latest, or dropping latest. ``key`` is the
     request's raw store-key segment, compared whole with the install's own:
-    ``gitops_key`` (report_store_key of the gitops_repo), or, when the install
-    names no GitOps repository (``gitops_key`` None), REPORT_NO_FORGE_STORE_KEY.
+    ``gitops_key``, the key `finish` publishes to (report_publish_store_key),
+    or, when that rule yields no repository (``gitops_key`` None),
+    REPORT_NO_FORGE_STORE_KEY.
 
-    - The shell may write any stream, to the install's key alone: exactly what
-      it writes to the file store today.
+    - The shell may write any stream, to the install's key or to the key of any
+      repository in ``registered_keys`` (managed_repos as the broker reads it,
+      never the request): what `finish --repo` writes to the file store today.
     - A profile caller needs all of: a task credential whose profile is in
       ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
       whose stream is ``audit_id`` (so only that schedule's grant writes that
@@ -2936,9 +2939,13 @@ def report_write_permitted(
         ):
             return RULE_REPORT_TRIGGER_STREAM
     writable = gitops_key if gitops_key is not None else REPORT_NO_FORGE_STORE_KEY
-    if not isinstance(key, str) or not isinstance(writable, str) or not writable or key != writable:
+    if not isinstance(key, str) or not isinstance(writable, str) or not writable:
         return RULE_REPORT_REPOSITORY_KEY
-    return None
+    if key == writable:
+        return None
+    if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:
+        return None
+    return RULE_REPORT_REPOSITORY_KEY
 
 
 class ReportStoreUnavailable(Exception):
@@ -2949,29 +2956,83 @@ class ReportStoreFault(Exception):
     """The listener failed or answered something the broker will not pass on: a 502."""
 
 
-def report_gitops_store_key() -> str | None:
-    """The install's own store key: the gitops_repo's, or None when it names none.
+class ReportStoreCredentialRefused(ReportStoreFault):
+    """The listener refused the broker's own store token (401 or 403): a 502, never the caller's."""
 
-    Read on every call from the gitops-state ConfigMap the broker mounts at
-    /etc/gitops (GITOPS_STATE_PATH names its managed_repos file), through
-    gitops_workspace, so a repository change takes effect with the mount.
-    Raises ReportStoreUnavailable when the key cannot be read, or names a
-    repository this install does not manage: a write is then refused, rather
-    than checked against a guess.
+
+def report_publish_store_key_for(managed_keys: Sequence[str], gitops_repo: str | None) -> str | None:
+    """The store key audit_report's `finish` publishes to, for these inputs; None for no_forge.
+
+    A mirror of audit_report.resolve_repo's install-level rule (the explicit
+    `--repo`, workspace and lease steps are a run's own, not the install's):
+
+    - no managed repository: None (`finish` keeps its report under no_forge);
+    - exactly one: that repository, whatever its role (the operator renders
+      `gitops_repo` only when a repository has role gitops);
+    - more than one: ``gitops_repo`` when it is set and registered, else None
+      (`finish` writes its no-repository-chosen envelope under no_forge).
+
+    ``managed_keys`` are managed_repositories()'s `provider:host/path` keys;
+    ``gitops_repo`` is gitops_workspace.get_gitops_repo's name, which that
+    function only returns for a registered repository. Raises
+    ReportStoreUnavailable for a name no store key can be made of.
+    """
+    keys = sorted(set(managed_keys))
+    if not keys:
+        return None
+    if len(keys) == 1:
+        repo: str | None = keys[0].split(":", 1)[-1]
+    else:
+        repo = gitops_repo or None
+        if repo is None:
+            return None
+    key = report_store_key(repo)
+    if key is None:
+        raise ReportStoreUnavailable("the install's publish repository has no store key")
+    return key
+
+
+def report_registered_store_keys(managed_keys: Sequence[str]) -> frozenset[str]:
+    """The store keys of every managed repository (managed_repositories()'s keys)."""
+    keys = (report_store_key(key.split(":", 1)[-1]) for key in managed_keys)
+    return frozenset(key for key in keys if key)
+
+
+def report_install_store_keys() -> tuple[str | None, frozenset[str]]:
+    """(report_publish_store_key's answer, every managed repository's store key), one read."""
+    publish, managed = _report_publish_store_key_and_managed()
+    return publish, report_registered_store_keys(managed)
+
+
+def report_publish_store_key() -> str | None:
+    """The install's own store key, as `finish` would publish to it; None for no_forge."""
+    return _report_publish_store_key_and_managed()[0]
+
+
+def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]:
+    """report_publish_store_key, with the managed keys it read.
+
+    Read per call: managed_repos through managed_repositories() (its cache and
+    refresh, the list the broker's forge gates read), and with more than one
+    repository the gitops_repo key from the gitops-state ConfigMap the broker
+    mounts at /etc/gitops (GITOPS_STATE_PATH names its managed_repos file).
+    Raises ReportStoreUnavailable when either cannot be read: a write is then
+    refused, rather than checked against a guess.
     """
     import gitops_workspace
 
     try:
-        text = gitops_workspace.gitops_repo_key_text()
+        managed = managed_repositories()
     except Exception as exc:  # noqa: BLE001 - every failure is the one answer
-        raise ReportStoreUnavailable(f"the gitops_repo key could not be read ({type(exc).__name__})") from None
-    if not text:
-        return None
-    repo = gitops_workspace.get_gitops_repo()
-    key = report_store_key(repo) if repo else None
-    if key is None:
-        raise ReportStoreUnavailable("the gitops_repo key names no repository this install manages")
-    return key
+        raise ReportStoreUnavailable(f"managed_repos could not be read ({type(exc).__name__})") from None
+    gitops_repo = None
+    if len(managed) > 1:
+        try:
+            text = gitops_workspace.gitops_repo_key_text()
+        except Exception as exc:  # noqa: BLE001 - every failure is the one answer
+            raise ReportStoreUnavailable(f"the gitops_repo key could not be read ({type(exc).__name__})") from None
+        gitops_repo = gitops_workspace.get_gitops_repo() if text else None
+    return report_publish_store_key_for(managed, gitops_repo), managed
 
 
 def report_profiles_from_env() -> frozenset[str]:
@@ -3055,7 +3116,7 @@ class ReportStoreRelay:
         if len(payload) > AUDIT_REPORT_MAX_BYTES:
             raise ReportStoreFault("the store's answer is over the size cap")
         if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
-            raise ReportStoreFault(f"the store refused the broker (status {status})")
+            raise ReportStoreCredentialRefused(f"status {status}")
         if not 200 <= status <= 599:
             raise ReportStoreFault(f"the store answered status {status}")
         return status, payload
@@ -14140,16 +14201,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # The install's key is read only for a caller that could pass: a
             # role refused anyway is refused without the ConfigMap read.
             gitops_key: str | None = None
+            registered: frozenset[str] = frozenset()
             if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):
                 try:
-                    gitops_key = report_gitops_store_key()
+                    gitops_key, registered = report_install_store_keys()
                 except ReportStoreUnavailable as exc:
                     LOGGER.warning("audit-report write refused: %s", exc)
                     self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "gitops-repo-unavailable")
                     self._refuse_audit_report(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         {
-                            "error": "the install's GitOps repository could not be read, so no write is checked",
+                            "error": "the install's repositories could not be read, so no write is checked",
                             "code": "GITOPS_REPO_UNAVAILABLE",
                         },
                     )
@@ -14162,6 +14224,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 segments[4],
                 gitops_key,
                 self.report_profiles,
+                registered,
             )
         else:
             rule = report_read_permitted(role, profile, self.report_profiles)
@@ -14198,6 +14261,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "the audit-report store is unavailable", "code": "AUDIT_REPORT_STORE_UNAVAILABLE"},
+            )
+            return
+        except ReportStoreCredentialRefused as exc:
+            # The broker's credential, not the caller's: the caller was
+            # authorized, and the listener refused the token the broker read
+            # from AUDIT_REPORT_STORE_TOKEN_FILE.
+            LOGGER.warning(
+                "the audit-report store refused the broker's own store credential (%s, from %s); "
+                "the caller was authorized and is not at fault",
+                exc,
+                AUDIT_REPORT_STORE_TOKEN_FILE_ENV,
+            )
+            self._log_audit_report(HTTPStatus.BAD_GATEWAY, "store-refused-broker-credential")
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the audit-report store failed", "code": "AUDIT_REPORT_STORE_FAILED"},
             )
             return
         except ReportStoreFault as exc:
