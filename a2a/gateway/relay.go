@@ -749,11 +749,23 @@ func terminalNotice(state lib.TaskState, reason string) string {
 	case lib.StateFailed:
 		return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)
 	case lib.StateCanceled:
+		// A cancel is bare: the requester asked for it. One an
+		// administrator caused says so (canceledReasonShown).
+		if canceledReasonShown[reasonToken(reason)] {
+			return noticeWithReason(noticeCanceled, noticeCanceled, text, shaped)
+		}
 		return noticeCanceled
 	case lib.StateRejected:
 		return noticeWithReason(noticeRejected, noticeRejected, text, shaped)
 	}
 	return string(state)
+}
+
+// canceledReasonShown lists the tokens a canceled terminal names in its
+// notice: cancels the requester didn't ask for. Every other cancel reads as
+// the bare noticeCanceled.
+var canceledReasonShown = map[string]bool{
+	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
