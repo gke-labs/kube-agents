@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 import audit_report  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import no_live_google_auth  # noqa: E402
 import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
 import vcs_broker  # noqa: E402
@@ -64,15 +65,28 @@ def setUpModule():
     # the module.
     global _NO_KUBECTL
     _NO_KUBECTL = no_live_kubectl.install()
+    # Nor does one load google.auth. The collectors that this module starts as child processes
+    # open a Cloud Monitoring session with `google.auth.default()`. In a child that has the
+    # library, the guard's variable makes that fail at once; a child without it fails at the import.
+    global _NO_GOOGLE_AUTH
+    _NO_GOOGLE_AUTH = no_live_google_auth.install()
 
 
 def tearDownModule():
-    _NO_KUBECTL.uninstall()
+    try:
+        _NO_GOOGLE_AUTH.uninstall()
+    finally:
+        _NO_KUBECTL.uninstall()
 
 
 class TestNoLiveKubectl(unittest.TestCase):
     def test_no_test_in_this_module_can_reach_a_cluster(self):
         no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
+
+
+class TestNoLiveGoogleAuth(unittest.TestCase):
+    def test_no_test_in_this_module_can_load_google_auth(self):
+        no_live_google_auth.assert_in_force(self, _NO_GOOGLE_AUTH)
 
 
 def skill_text() -> str:

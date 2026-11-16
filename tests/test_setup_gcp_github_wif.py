@@ -7,8 +7,10 @@ Asserts that required GCP APIs and IAM roles (for both standard CI and extended
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
+from tests.testing import no_live_gcloud
 from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -45,6 +47,22 @@ _ADMIN_ROLES = [
 ]
 
 
+def setUpModule():
+    # No test here runs the real gcloud: a gcloud call that a test leaves
+    # unstubbed goes to a stand-in, and the stand-in fails the module.
+    global _NO_GCLOUD
+    _NO_GCLOUD = no_live_gcloud.install()
+
+
+def tearDownModule():
+    _NO_GCLOUD.uninstall()
+
+
+class TestNoLiveGcloud(unittest.TestCase):
+    def test_no_test_in_this_module_can_run_the_real_gcloud(self):
+        no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
+
+
 class SetupGcpGithubWifTest(unittest.TestCase):
     def setUp(self):
         self.assertTrue(_WIF_SCRIPT.is_file(), f"WIF script not found at {_WIF_SCRIPT}")
@@ -63,19 +81,25 @@ class SetupGcpGithubWifTest(unittest.TestCase):
 
     def test_missing_required_env_vars_fails(self):
         """Executing the script without required env vars should fail with an informative message."""
-        env = get_isolated_test_env(
-            overrides={
-                "PROJECT_ID": "",
-                "SA_NAME": "",
-                "GITHUB_REPO": "",
-            }
-        )
-        proc = subprocess.run(
-            ["bash", str(_WIF_SCRIPT)],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            # The script asks gcloud for a default project; one with no login has none.
+            gcloud = pathlib.Path(tmp) / "gcloud"
+            gcloud.write_text("#!/bin/sh\nexit 1\n")
+            gcloud.chmod(0o755)
+            env = get_isolated_test_env(
+                overrides={
+                    "PROJECT_ID": "",
+                    "SA_NAME": "",
+                    "GITHUB_REPO": "",
+                },
+                bin_dir=tmp,
+            )
+            proc = subprocess.run(
+                ["bash", str(_WIF_SCRIPT)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("Please set the required variables", proc.stdout)
 
