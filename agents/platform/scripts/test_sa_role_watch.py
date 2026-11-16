@@ -186,6 +186,17 @@ class DriftIsReportedOnChange(WatchTest):
         checked = {c[3] for c in sandbox.calls if c[:3] == ["gcloud", "projects", "get-iam-policy"]}
         self.assertEqual({MANAGEMENT, SCOPED}, checked)
 
+    def test_next_mode_reads_projects_from_the_scope_reader_and_never_walks_the_profiles(self):
+        # #5621: the watch reads IAM per project and lists no cluster, so under
+        # spec.mode: next it changes nothing; it must not walk the profiles.
+        self.scoped(SCOPED)
+        sandbox = FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: read_only_policy()})
+        with patch.dict(os.environ, {fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(Path(self.tmp.name) / "resolved-scope.json")}), patch.object(
+            fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")
+        ):
+            self.assertEqual([], self.tick(sandbox))
+        self.assertEqual({MANAGEMENT, SCOPED}, set(self.checked(sandbox)))
+
     def test_a_scoped_project_the_reconcile_could_not_read_is_still_checked(self):
         self.scoped(unread=[(SCOPED, "denied"), (fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "unresolved")])
         sandbox = FakeSandbox(policies={MANAGEMENT: read_only_policy(), SCOPED: self.admin_policy("roles/owner")})

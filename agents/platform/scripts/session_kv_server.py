@@ -65,6 +65,9 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# Joins the per-platform no-route refusals when the gateway holds more than one
+# backend with no home channel; chat_delivery_watch reads refusals joined by it.
+NO_CHAT_ROUTE_JOIN = "; "
 
 # The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
 # per session, written once under ORIGIN_KEY in its metadata, with the chat
@@ -2969,15 +2972,17 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform ``chat_notify.routed_platform()``
-    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
-    ``spec.mode: next`` the
-    managed scope says that platform's Hermes consumer is off because the A2A
-    gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to, with a home channel or
-    (when it is the only chat platform) without one, the gateway keeping the
-    refused posts for a digest. The operator renders the variable only then,
-    and it is reserved against every other source.
+    One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
+    names, from ``A2A_NOTIFY_PLATFORM``, ``A2A_NOTIFY_CONVERSATIONS`` and the
+    projected home-channel file. The managed scope says each such
+    platform's Hermes consumer is off because the
+    A2A gateway holds its backend, and posts to it go through the gateway
+    instead, so each is still a platform this install posts to. The operator
+    lists the armed routes with a CR home channel; ``routed_platforms()`` adds
+    Slack when the file names a channel, and takes every armed route when no
+    platform has a home, the gateway keeping the refused posts for a digest.
+    The alert takes the first of them. The variables are the operator's, and
+    they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -3022,8 +3027,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
-    projected home-channel file) resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM`, the
+    projected home-channel file, or with neither, the `A2A_NOTIFY_CONVERSATIONS`
+    fallback) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -3077,17 +3083,21 @@ def _no_chat_route_error() -> str:
     It reaches `last_delivery_error` through the relay adapter and the 502, and
     from there the dashboard, `hermes cron list`, the cronjob tool's reply in
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
-    backend whether or not a home channel is set, so with one named the cause is
-    the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither. A pod the operator has routed
-    never reaches this: its send goes to the gateway, whose refusal says the
-    post is kept.
+    backends whether or not a home channel is set, so with any named the cause
+    is the missing home channel, one sentence per platform; without one this
+    cannot tell no chat from a misconfigured one, so it guesses at neither.
+    :func:`relay_cron_report` never reaches the per-platform branch:
+    ``chat_notify.routed_platforms()`` is empty only when no route is armed, and
+    then ``gateway_platforms()`` is empty too. The branch stays because
+    ``chat_delivery_watch.platforms_from`` reads its wording from ledger rows
+    that older pods wrote.
     """
-    platform = chat_notify.gateway_platform()
-    setting = HOME_CHANNEL_SETTINGS.get(platform)
-    if setting:
-        return f"composed but not delivered to {platform} (no home channel: set {setting})"
-    return NO_CHAT_ROUTE_ERROR
+    refusals = [
+        f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
+        for platform in chat_notify.gateway_platforms()
+        if platform in HOME_CHANNEL_SETTINGS
+    ]
+    return NO_CHAT_ROUTE_JOIN.join(refusals) or NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -6477,12 +6487,10 @@ def relay_cron_report(
 
     An install with no chat route gets no send at all, where the fallback to
     DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
-    with neither platform, or a pod rendered before the operator routed its only
-    platform without a home channel (a routed pod sends, and the gateway refuses
-    and keeps the post). The error
-    names the platform and the setting that arms it, in the wording
-    `chat_delivery_watch` reads the platform from; see
-    :func:`_no_chat_route_error`.
+    with no armed route. An armed route with no home channel is routed through
+    the fallback, sends, and the gateway refuses and keeps the post. The
+    platform-naming wording of :func:`_no_chat_route_error` is reached only
+    with no armed route, so this path never produces it; see that function.
 
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line

@@ -1,6 +1,6 @@
 # This template renders the built-in optional `tse` (GKE Support Agent)
-# AgentProfile custom resource for `spec.mode: next` installations when both
-# `.Values.platformAgent.enabled` and `.Values.profiles.tse.enabled` are true.
+# AgentProfile custom resource when both `.Values.platformAgent.enabled` and
+# `.Values.profiles.tse.enabled` are true.
 # Its persona is agents/tse/persona, published as the persona-tse image. The
 # parameters are the persona's own (agents/tse/persona/persona.yaml), in its
 # order, for the same reason as the cluster profile's below; the gateway routes
