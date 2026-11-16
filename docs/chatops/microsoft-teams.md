@@ -43,7 +43,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: platform-agent-credentials
-  namespace: kube-agents-system
+  namespace: kubeagents-system
 type: Opaque
 stringData:
   TEAMS_APP_ID: "00000000-0000-0000-0000-000000000000"
@@ -80,7 +80,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
   name: platform-agent
-  namespace: kube-agents-system
+  namespace: kubeagents-system
 spec:
   credentialsSecretRef:
     name: platform-agent-credentials

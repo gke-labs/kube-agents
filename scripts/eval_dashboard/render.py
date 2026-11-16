@@ -121,12 +121,13 @@ import urllib.parse
 import yaml
 
 try:
-    from . import classify, forge_lane, links, nightly, post_health, tiers, trend
+    from . import classify, forge_lane, ghcli, links, nightly, post_health, tiers, trend
     from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
     import forge_lane
+    import ghcli
     import links
     import nightly
     import post_health
@@ -770,7 +771,8 @@ def history_incidents(ticks: list[dict]) -> list[dict]:
             if case not in open_incident["failing_cases"]:
                 open_incident["failing_cases"].append(case)
         for issue in tick["tracking_issues"]:
-            if issue not in open_incident["tracking_issues"]:
+            # One issue once, whether a tick wrote it "#N" or as its URL.
+            if not ghcli.has_issue(open_incident["tracking_issues"], issue) and issue not in open_incident["tracking_issues"]:
                 open_incident["tracking_issues"].append(issue)
     return incidents
 

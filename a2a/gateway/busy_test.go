@@ -168,6 +168,7 @@ func TestBusyNoticeWording(t *testing.T) {
 // TestBusyNoticeBelowTheThresholdPostsNothing: two ahead of a threshold of
 // three is not busy; the turn starts and nothing else is said.
 func TestBusyNoticeBelowTheThresholdPostsNothing(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withBusyNoticeAt(3))
 	seedFixedRouteTask(t, r, "discord:g1/busy-a", 0)
 	seedFixedRouteTask(t, r, "discord:g1/busy-b", 0)
@@ -190,6 +191,7 @@ func TestBusyNoticeBelowTheThresholdPostsNothing(t *testing.T) {
 // (the placeholder, edited) says how many tasks are ahead of it. Nothing is
 // posted beside the placeholder.
 func TestBusyNoticeAtTheThresholdSaysHowManyAndStillSubmits(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withBusyNoticeAt(3))
 	for _, c := range []string{"a", "b", "c"} {
 		seedFixedRouteTask(t, r, "discord:g1/busy-"+c, 0)
@@ -355,6 +357,7 @@ func startBusyRig(t *testing.T, at int) *rig {
 // session-state, not in the gateway's memory, so a gateway that has just
 // started counts the tasks the previous one submitted.
 func TestBusyCountIsRebuiltFromSessionStateAfterARestart(t *testing.T) {
+	t.Parallel()
 	r := startBusyRig(t, 2)
 	busyTurn(r, "discord:g1/r-a", discordBackend, "first")
 	busyTurn(r, "discord:g1/r-b", discordBackend, "second")
@@ -373,6 +376,7 @@ func TestBusyCountIsRebuiltFromSessionStateAfterARestart(t *testing.T) {
 // TestBusyCountFallsWhenATaskEnds: a terminal deletes the active task from
 // its record, and the count drops with it.
 func TestBusyCountFallsWhenATaskEnds(t *testing.T) {
+	t.Parallel()
 	r := startBusyRig(t, 2)
 	busyTurn(r, "discord:g1/e-a", discordBackend, "first")
 	busyTurn(r, "discord:g1/e-b", discordBackend, "second")
@@ -392,6 +396,7 @@ func TestBusyCountFallsWhenATaskEnds(t *testing.T) {
 // one is back, so the count a restarted gateway reads does not stay inflated
 // by a task that ended during the gap.
 func TestBusyCountFallsWithTerminalsPublishedWhileTheGatewayWasDown(t *testing.T) {
+	t.Parallel()
 	r := startBusyRig(t, 2)
 	busyTurn(r, "discord:g1/d-a", discordBackend, "first")
 	busyTurn(r, "discord:g1/d-b", discordBackend, "second")
@@ -497,6 +502,7 @@ func awaitLastEdit(t *testing.T, r *rig, messageID, want string) {
 // replace it, so the finished turn's line reads completed and the notice is
 // nowhere in the thread.
 func TestBusyLineIsReplacedByTheRelaysLaterEdits(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withBusyNoticeAt(1))
 	seedFixedRouteTask(t, r, "discord:g1/over-a", 0)
 
@@ -542,6 +548,7 @@ func TestBusyLineIsReplacedByTheRelaysLaterEdits(t *testing.T) {
 // the line already past it, the race the guard is for if that ordering ever
 // changes.
 func TestBusyLinePastSubmittedIsLeftAlone(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withBusyNoticeAt(100))
 	conv := "discord:g1/race-turn"
 	busyTurn(r, conv, discordBackend, "anything")

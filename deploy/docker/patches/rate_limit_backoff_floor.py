@@ -10,16 +10,16 @@ three falls to ``jittered_backoff(base_delay=2.0, max_delay=60.0)``: the
 default three retries land roughly 2-3 s, 4-6 s and 8-12 s after each failure,
 about 20 s end to end.
 
-gemini-4-argon on Vertex's dynamic shared quota sends exactly that 429. Its
+A model on Vertex's dynamic shared quota sends exactly that 429. Its
 body reads "TPM quota exhausted. No spare capacity is currently available to
 serve over-limit requests" with no header, no ``retry_after`` field and no
 ``RetryInfo`` (0 of 16 such errors in one gateway log carried a delay). The
 quota is a per-minute window, so a worker that spends its three retries
 inside 20 s finds it still closed, exits 75 (``quiet_rate_limit_exit``), and
 the bridge reports the rep as ``hermes-rate-limited``: an infrastructure
-loss the harness never grades. On the first Argon day (2026-10-29) that was
+loss the harness never grades. On the newer model's first day (2026-10-29) that was
 36 reps, three in a row on one case, and one presubmit verdict lost to it
-(gke-labs/kube-agents#4238). No Claude day had any.
+(gke-labs/kube-agents#4238). No day on the earlier model had any.
 
 What it does
 ------------

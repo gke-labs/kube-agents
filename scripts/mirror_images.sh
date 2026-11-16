@@ -11,8 +11,8 @@
 #
 # Destination naming is flat: "<prefix>/<the inventory entry's .name>".
 #
-#   quay.io/jetstack/cert-manager-controller:v1.21.2
-#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.2
+#   quay.io/jetstack/cert-manager-controller:v1.21.3
+#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.3
 #
 # The name, not the repository's trailing segment. For most entries they are
 # the same word, which is why this is easy to state wrong; where they are not,
@@ -137,8 +137,9 @@ if [ "$COPY_TOOL" = "docker" ] && [ "$DRY_RUN" -ne 1 ]; then
 fi
 
 # Drop the tag from a reference that carries both a tag and a digest, leaving
-# "repo@sha256:...". Four inventory entries pin that way — both Hindsight
-# images, busybox, and the Hermes base (through tags.env) — and skopeo's
+# "repo@sha256:...". Six inventory entries pin that way — both Hindsight
+# images, busybox, the NATS config reloader, the NATS metrics exporter, and
+# the Hermes base (through tags.env) — and skopeo's
 # docker:// transport refuses the combined form outright ("Docker references
 # with both a tag and digest are currently not supported"), so a skopeo host
 # would fail exactly those copies and mirror everything else. The digest half

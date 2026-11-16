@@ -261,7 +261,7 @@ kubectl explain rootsync.spec.helm --api-version=configsync.gke.io/v1beta1
 
 Submit through **submit-suggestion** `submit` with the branch from Step 1.
 Use this shape for the `--body-file` document, after the skill's standard
-header:
+header, and pass the `--evidence-file` its Step 3 requires:
 
 ```
 ### Helm chart

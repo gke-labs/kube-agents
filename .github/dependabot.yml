@@ -133,10 +133,11 @@ updates:
   # images this repository builds interpolate two ARGs each
   # (`FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}`), which the Docker updater cannot
   # resolve; images.json and `make mirror-images` own those pins. The
-  # agentplugins Dockerfiles are `FROM busybox:musl@sha256:…`, a literal digest
-  # the updater could move, and are left out because images.json owns that pin
-  # (its `busybox` entry) and `make images-check` holds the three copies in
-  # step; a bump lands in all of them at once, by hand. Naming the
+  # agentplugins and `a2a/Dockerfile.persona-*` Dockerfiles are
+  # `FROM busybox:musl@sha256:…`, a literal digest the updater could move, and
+  # are left out because images.json owns that pin (its `busybox` entry) and
+  # `make images-check` holds every copy in step; a bump lands in all of them
+  # at once, by hand. Naming the
   # directory, rather than globbing, is what keeps this from recreating #763.
   - package-ecosystem: "docker"
     directories:

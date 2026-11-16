@@ -42,6 +42,21 @@ const (
 	// streak covers about one poll (a tick's own work lengthens it, the wake
 	// nudge can shorten it); a failure the next tick undoes does not set it.
 	kanbanDispatcherFailingTicks = int64(usageCountersPollInterval / (kanbanDispatchIntervalSeconds * time.Second))
+	// kanbanDispatcherFailingAge and kanbanDispatcherMinFailingTicks are the
+	// other way a board sets it, from the plugin's streak age: a streak at least
+	// one poll old with at least this many failures. On a locked board each tick
+	// waits out the SQLite busy timeout (120 s) before it fails, so 60 ticks take
+	// two hours while the age reaches a poll in three. The minimum keeps one slow
+	// failure, or one failure before a tick that hangs, from setting it.
+	kanbanDispatcherFailingAge      = usageCountersPollInterval
+	kanbanDispatcherMinFailingTicks = int64(3)
+	// The third way: a board the plugin reports stuck, whose tick ran past
+	// its limit (two and a half SQLite busy timeouts, 300 s; STUCK_TICK_SECONDS in the
+	// chat_metrics plugin) or failed on a database lock after a full busy
+	// timeout (STUCK_LOCK_WAIT_SECONDS). A fully locked board fails only every
+	// 20 to 36 minutes, so the streak rules take about an hour there; a stuck
+	// board shows within a poll.
+	kanbanDispatcherStuckLimit = 300 * time.Second
 
 	kanbanDispatcherReasonTicksFailing = "TicksFailing"
 	kanbanDispatcherReasonTicking      = "Ticking"
@@ -50,6 +65,9 @@ const (
 	// quotes, both label values off the listener.
 	kanbanDispatcherLabelMax    = 128
 	kanbanDispatcherFailingHint = "Cards on that board are not dispatched. Check the data volume (the DataVolumeNearlyFull condition) and the gateway's log for \"kanban dispatcher: tick failed\"."
+	// kanbanDispatcherStuckHint is the hint for a stuck board, which may not
+	// have logged a failed tick yet.
+	kanbanDispatcherStuckHint = "Cards on that board are not dispatched while it is locked. Look for another process that holds the board's kanban.db open, and check the data volume (the DataVolumeNearlyFull condition)."
 )
 
 // usageDispatcherForPoll is the dispatcher reading this poll projects: the
@@ -69,28 +87,69 @@ func kanbanDispatcherLabel(value string) string {
 	return truncateForCondition(value, kanbanDispatcherLabelMax)
 }
 
+// kanbanDispatcherBoardFailing reports whether one board's streak sets the
+// condition: 60 ticks in a row, or, where the plugin serves the streak's age,
+// at least one poll old with at least the minimum ticks.
+func kanbanDispatcherBoardFailing(f usageDispatcherFailure) bool {
+	if f.Ticks >= kanbanDispatcherFailingTicks {
+		return true
+	}
+	return f.HasAge && f.Ticks >= kanbanDispatcherMinFailingTicks && f.Seconds >= int64(kanbanDispatcherFailingAge/time.Second)
+}
+
 // kanbanDispatcherCondition is the condition a reading calls for, given the
-// one the CR carries. True while a board's streak is at the threshold; False
-// once every streak is below it, but only on a CR that carried the
-// condition, so an agent whose dispatcher never failed gets none. nil means
-// leave the CR as it is.
+// one the CR carries. True while a board's streak meets a streak rule or a
+// board is stuck; False once no board does, but only on a CR that carried the
+// condition, so an agent whose dispatcher never failed or stuck gets none. nil
+// means leave the CR as it is.
 func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usageDispatcherReading) *metav1.Condition {
 	var worst *usageDispatcherFailure
 	failing := 0
 	for i := range reading.Failing {
 		f := &reading.Failing[i]
-		if f.Ticks < kanbanDispatcherFailingTicks {
+		if !kanbanDispatcherBoardFailing(*f) {
 			continue
 		}
 		failing++
-		if worst == nil || f.Ticks > worst.Ticks || (f.Ticks == worst.Ticks && f.Board < worst.Board) {
+		if worst == nil || f.Seconds > worst.Seconds || (f.Seconds == worst.Seconds && f.Ticks > worst.Ticks) ||
+			(f.Seconds == worst.Seconds && f.Ticks == worst.Ticks && f.Board < worst.Board) {
 			worst = f
 		}
 	}
+	var stuck *usageDispatcherStuck
+	failingBoards := map[string]bool{}
+	for i := range reading.Failing {
+		if kanbanDispatcherBoardFailing(reading.Failing[i]) {
+			failingBoards[reading.Failing[i].Board] = true
+		}
+	}
+	for i := range reading.Stuck {
+		s := &reading.Stuck[i]
+		if !failingBoards[s.Board] {
+			failing++
+			failingBoards[s.Board] = true
+		}
+		if stuck == nil || s.Seconds > stuck.Seconds || (s.Seconds == stuck.Seconds && s.Board < stuck.Board) {
+			stuck = s
+		}
+	}
 	cond := &metav1.Condition{Type: kanbanDispatcherFailingCondition, ObservedGeneration: agent.Generation}
+	if worst == nil && stuck != nil {
+		msg := fmt.Sprintf("A kanban dispatcher tick on board %q waited on its database (it ran past %s, or failed on a lock after a busy timeout), and no good tick has followed in the %s since it began; the board may be locked.",
+			kanbanDispatcherLabel(stuck.Board), kanbanDispatcherStuckLimit, time.Duration(stuck.Seconds)*time.Second)
+		if failing > 1 {
+			msg += fmt.Sprintf(" %d boards are failing.", failing)
+		}
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionTrue, kanbanDispatcherReasonTicksFailing, msg+" "+kanbanDispatcherStuckHint
+		return cond
+	}
 	if worst != nil {
-		msg := fmt.Sprintf("The kanban dispatcher failed %d ticks in a row on board %q (last error %s).",
-			worst.Ticks, kanbanDispatcherLabel(worst.Board), kanbanDispatcherLabel(worst.Error))
+		over := ""
+		if worst.HasAge {
+			over = " over " + (time.Duration(worst.Seconds) * time.Second).String()
+		}
+		msg := fmt.Sprintf("The kanban dispatcher failed %d ticks in a row%s on board %q (last error %s).",
+			worst.Ticks, over, kanbanDispatcherLabel(worst.Board), kanbanDispatcherLabel(worst.Error))
 		if failing > 1 {
 			msg += fmt.Sprintf(" %d boards are failing.", failing)
 		}
@@ -101,7 +160,8 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 		return nil
 	}
 	cond.Status, cond.Reason = metav1.ConditionFalse, kanbanDispatcherReasonTicking
-	cond.Message = fmt.Sprintf("No board's kanban dispatcher has failed %d ticks in a row.", kanbanDispatcherFailingTicks)
+	cond.Message = fmt.Sprintf("No board's kanban dispatcher has failed %d ticks in a row, or %d in a streak %s old, and no board is stuck on its database.",
+		kanbanDispatcherFailingTicks, kanbanDispatcherMinFailingTicks, kanbanDispatcherFailingAge)
 	return cond
 }
 

@@ -10,6 +10,7 @@ import json
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -151,6 +152,105 @@ class TestScrubStepText(unittest.TestCase):
         other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
         self.assertEqual(_scrub("tool_call", other_arg), other_arg)
 
+    def test_only_an_odd_backslash_run_folds_as_a_continuation(self):
+        # Bash removes a backslash-newline and adds nothing; it reads an odd run
+        # before a newline as a continuation and an even run as literal
+        # backslashes, so the newline still ends the command. A backslash
+        # before a CR escapes the CR, so CRLF is no continuation.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a\\\n  b"), "a  b")
+        self.assertEqual(fold("kube\\\nctl"), "kubectl")
+        self.assertEqual(fold("a\\\\\n  b"), "a\\\\\n  b")
+        self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\  b")
+        self.assertEqual(fold("a\\\\\\\\\n  b"), "a\\\\\\\\\n  b")
+        self.assertEqual(fold("a\\\r\nb"), "a\\\r\nb")
+        # The masking fold joins an even run's lines with a space, as the file
+        # did before it counted backslashes, so the stored call shows `\ `.
+        stored = json.loads(_scrub("tool_call", json.dumps({"command": "grep -rn\\\\\nU=x\ncurl \"$U\""})))["command"]
+        self.assertEqual(stored, "grep -rn\\ U=x\ncurl \"$U\"")
+
+    def test_masking_joins_an_even_run_or_a_crlf_as_before(self):
+        # A nested `bash -c "…"` halves an even run inside double quotes and
+        # continues the line, so the credential rules read every run joined;
+        # an extra mask is harmless, and a missed one is not.
+        for cmd in (
+            'bash -c "mysql -h db --password \\\\\nhunter2"',
+            "curl -u \\\\\nadmin:hunter2 https://x",
+            "mysql --password \\\r\nhunter2",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("hunter2", _scrub("tool_call", json.dumps({"command": cmd})))
+        # Detection still reads only an odd run before an LF as a continuation.
+        self.assertTrue(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get secret db -o yaml"))
+        # Runs of 5 and 6 backslashes, past the pairs the other tests cover.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a" + "\\" * 5 + "\nb"), "a" + "\\" * 4 + "b")
+        self.assertEqual(fold("a" + "\\" * 6 + "\nb"), "a" + "\\" * 6 + "\nb")
+
+    def test_the_scan_folds_exactly_as_the_regexes_it_replaced(self):
+        # The two folds were regexes until CodeQL flagged them as polynomial;
+        # the one-pass scan must give the same result on every input. The old
+        # regexes live here only, as the reference.
+        import itertools
+        import random
+        import re
+
+        old_continuation = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+        old_break_run = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
+
+        def old_detect(command):
+            return old_continuation.sub(lambda m: m.group(1), command)
+
+        def old_mask(command):
+            def one(m):
+                run, line_break, indent = m.groups()
+                if len(run) % 2 and line_break == "\n":
+                    return run[:-1] + indent
+                return run[:-1] + " "
+            return old_break_run.sub(one, command).replace("\\ ", "\ue000")
+
+        inputs = []
+        for head, run, line_break, tail in itertools.product(
+            ("a", 'bash -c "mysql --password', "echo 'q", "x\t", ""),
+            range(9),
+            ("\n", "\r\n", ""),
+            (" b", "\tb", "  \t b", '"', "'", "", "\\"),
+        ):
+            inputs.append(head + "\\" * run + line_break + tail)
+        rng = random.Random(5450)
+        alphabet = ["\\", "\\", "\n", "\r", " ", "\t", '"', "'", "a", "-c "]
+        inputs += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16))) for _ in range(3000)]
+        for command in inputs:
+            with self.subTest(command=command):
+                self.assertEqual(worker_transcript.fold_shell_continuations(command), old_detect(command))
+                self.assertEqual(worker_transcript.fold_shell_command(command), old_mask(command))
+
+    def test_a_continuation_inside_a_word_joins_the_word(self):
+        # The fold used to put a space where bash puts nothing, so a word split
+        # by a continuation hid a secret read or a credential flag.
+        for cmd in (
+            "kube\\\nctl get secret db -o yaml",
+            "kubectl get sec\\\nret db -o yaml",
+            "gcl\\\noud secrets versions access latest --secret=db",
+            "cat /var/run/sec\\\nrets/kubernetes.io/serviceaccount/token",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+        for cmd in ("mysql --pass\\\nword=hunter2", "curl -u admin:hun\\\nter2 https://x"):
+            with self.subTest(cmd=cmd):
+                out = _scrub("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn("hunter2", out)
+                self.assertNotIn("ter2", out)
+
+    def test_a_secret_read_after_an_even_backslash_run_is_detected(self):
+        # The even run used to fold the newline, so the read joined the line
+        # above and was not seen.
+        for cmd in ("echo done\\\\\nkubectl get secret db -o yaml", "echo done\\\\\\\\\ncat /var/run/secrets/token"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+                self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get pods"))
+
     def test_unquoted_value_after_a_credential_key_is_masked_to_the_line_end(self):
         for line in ("password: one two three", "DB_PASSWORD=one two three", "DB_PASSWORD:  my secret phrase here"):
             with self.subTest(line=line):
@@ -201,6 +301,130 @@ class TestScrubStepText(unittest.TestCase):
         # An escaped space the rules do not mask is given back as written.
         plain = "ls my\\ dir -n prod"
         self.assertEqual(_scrub("tool_call", plain), plain)
+
+    def test_a_value_after_an_even_backslash_run_is_masked_by_every_rule(self):
+        # #5460: bash ends a word at `a\\ ` (the pair is one literal
+        # backslash), but `eval`, `ssh host …`, `watch` and a nested
+        # `bash -c "…"` read the words again and halve the run, so the value
+        # rules read it as part of the word before it and mask it either way.
+        # Runs 1-4, plain and re-read, in the JSON and the bare form.
+        shapes = (
+            "export DB_PASSWORD=pre{run} S3cretValue9",
+            "kubectl create secret generic db --from-literal=password=pre{run} S3cretValue9",
+            "mysql --password pre{run} S3cretValue9",
+            "mysql --password=pre{run} S3cretValue9",
+            "curl -u admin:pre{run} S3cretValue9 https://x",
+            "mysql -ppre{run} S3cretValue9",
+            "redis-cli -a pre{run} S3cretValue9",
+            "curl https://admin:pre{run} S3cretValue9@host/x",
+        )
+        # Known limits, the same on main and pinned so a fix flips them: the
+        # URL userinfo rules stop at a literal backslash (run 2 and more
+        # leaves one), and inside a quoted `bash -c "…"` script the short and
+        # user:pass flag rules do not run (`sub_shell_segments`).
+        def known_limit(shape, run, wrapper):
+            if "https://admin:" in shape and run > 1:
+                return True
+            return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
+
+        for shape in shapes:
+            for run in range(1, 5):
+                plain = shape.format(run="\\" * run)
+                for wrapper, cmd in (("", plain), ("eval", "eval " + plain), ("bash -c", f'bash -c "{plain}"')):
+                    for text in (json.dumps({"command": cmd}), cmd):
+                        with self.subTest(cmd=cmd, form=text[:1]):
+                            out = _scrub("tool_call", text)
+                            if known_limit(shape, run, wrapper):
+                                self.assertIn("S3cretValue9", out)
+                            else:
+                                self.assertNotIn("S3cretValue9", out)
+
+    def test_a_flag_after_an_even_backslash_run_starts_a_word(self):
+        # The fold joins `a\\ --password` into one token, where bash reads the
+        # flag as a new word; the flag rules read a flag after the fold mark as
+        # a new word in a second pass, so the value after the flag is masked
+        # (it leaked before #5460).
+        for cmd in (
+            "ls a\\\\ --password S3cretValue9",
+            "mysql -h db a\\\\ -pS3cretValue9",
+            "curl x\\\\ -u admin:S3cretValue9 https://x",
+            "redis-cli x\\\\ -a S3cretValue9",
+            "echo \\\\ --password S3cretValue9",
+        ):
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    out = _scrub("tool_call", text)
+                    self.assertNotIn("S3cretValue9", out)
+                    self.assertIn("\\\\ -", out)
+
+    def test_every_escaped_space_folds_and_unmasked_text_comes_back(self):
+        # The issue's two examples: an escaped space folds, and so does one
+        # after an even run, by design (the re-read reasons above).
+        fold = worker_transcript.fold_shell_command
+        mark = worker_transcript.SHELL_ESCAPED_SPACE_FOLD
+        self.assertEqual(fold("ls my\\ file"), f"ls my{mark}file")
+        self.assertEqual(fold("ls a\\\\ b"), f"ls a\\{mark}b")
+        # Text no rule masks comes back as written, the mark unfolded.
+        for run in range(9):
+            for after in (" b", "\tb", "\nb", "", " --verbose x", " -n prod"):
+                cmd = "ls a" + "\\" * run + after
+                for text in (json.dumps({"command": cmd}), cmd):
+                    with self.subTest(cmd=cmd, form=text[:1]):
+                        out = _scrub("tool_call", text)
+                        served = json.loads(out)["command"] if text.startswith("{") else out
+                        self.assertNotIn(mark, served)
+                        if "\n" not in after:
+                            self.assertEqual(served, cmd)
+
+    def test_a_match_at_the_mark_never_takes_a_real_flags_value(self):
+        # The flags after the mark are a second pass, so a flag letter inside
+        # an escaped file name (`my\\ -prod.cnf`) cannot take the text the
+        # real flag's match needs; it may mask a file-name tail too, which is
+        # harmless.
+        for cmd in (
+            "mysql --defaults-file=/etc/my\\ -prod.cnf -p S3cretValue9",
+            "redis-cli --tls-cert my\\ -app.pem -a S3cretValue9",
+            "mysql -h db -u root my\\ -abc -pS3cretValue9",
+            "mytool my\\ --draft --password S3cretValue9",
+            "curl a\\ -u 'x:-y -u admin:S3cretValue9'",
+        ):
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    self.assertNotIn("S3cretValue9", _scrub("tool_call", text))
+
+    def test_a_run_of_escaped_user_flags_scrubs_in_linear_time(self):
+        # The second pass's `user:pass` user part stops at the mark; without
+        # that, 20000 `\\ -u` took seconds.
+        import time
+
+        start = time.monotonic()
+        _scrub("tool_call", "curl " + "\\ -u" * 20000)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_the_flag_rules_mask_every_value_the_old_rules_masked(self):
+        # A property check: with the second pass off (the rules as before
+        # #5460), no command masks a value the two passes do not.
+        import random
+        import re
+
+        never = re.compile(r"(?!)")
+        before = {
+            "CLI_LONG_FLAG_AT_FOLD_RE": never,
+            "CLI_USERPASS_ARG_AT_FOLD_RE": never,
+            "CLI_SHORT_P_AT_FOLD_RE": never,
+        }
+        rng = random.Random(5460)
+        words = ["mysql ", "curl ", "redis-cli ", "ls ", "--password ", "-p", "-u ", "-a ", "admin:", "x",
+                 "\\", "\\\\", "\\ ", "\\\\ ", " ", "=", "S3cretValue9", '"', "eval ", "-n prod",
+                 "-prod.cnf ", "--draft ", "'x:-y ", "my\\ "]
+        commands = ["".join(rng.choice(words) for _ in range(rng.randint(2, 12))) for _ in range(4000)]
+        for cmd in commands:
+            new_out = _scrub("tool_call", cmd)
+            with mock.patch.multiple(worker_transcript, **before):
+                old_out = _scrub("tool_call", cmd)
+            with self.subTest(cmd=cmd):
+                if "S3cretValue9" not in old_out:
+                    self.assertNotIn("S3cretValue9", new_out)
 
     def test_a_tool_calls_prose_argument_keeps_its_diagnosis(self):
         # A worker reports through `kanban_complete(result=...)`: prose, as a reply is.

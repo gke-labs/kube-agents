@@ -274,7 +274,11 @@ STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
 KILLED_COMMAND_DRAIN_SECONDS = 5
 # How often a command that has closed both its pipes but is still running is
 # looked at: nothing can wake that wait, so the deadline and the caller's
-# hang-up are checked in steps this long.
+# hang-up are checked in steps this long. Within a step the child is reaped
+# with `_reap`'s short poll, so an exit is seen within milliseconds: a child
+# closes its pipes a moment before it can be reaped (a multithreaded kubectl
+# or a Python gcloud only after every thread exits), and on a busy pod one
+# look then a sleep cost about a third of the calls a whole step (#5540).
 PIPES_CLOSED_POLL_SECONDS = 0.5
 # How often a command's `stop` check is asked while it runs (`_capture_output`).
 STOP_POLL_SECONDS = 0.5
@@ -441,7 +445,8 @@ WATERMARK_LEAVE_BAND_PCT = 3
 PERCENT = 100
 # The scratch volumes' caps, in bytes, as the operator renders their emptyDir
 # sizeLimits (credential_proxy_manifests.go, credentialProxyStateLimitEnv and
-# credentialProxyTmpLimitEnv; tests/test_credential_proxy_sizing_parity.py
+# credentialProxyTmpLimitEnv; on an exec pod, the tier's fixed caps from
+# credential_proxy_exec_tier.go; tests/test_credential_proxy_sizing_parity.py
 # holds the names equal). An emptyDir is a directory on the node's filesystem,
 # so statvfs on it reports the node's fill, not the cap the kubelet evicts on,
 # and the kubelet's image GC keeps a busy node's fill between its own
@@ -654,6 +659,21 @@ SHUTDOWN_DRAIN_SECONDS = 30
 # credentialProxyExecTierTerminationGraceSeconds (380 s) are literals too, and a
 # drain that followed a longer timeout would outlast them.
 EXEC_SHUTDOWN_DRAIN_SECONDS = 360
+# The variable that stops gcloud writing a log file for each command, set in
+# the commands an exec pod runs. gcloud logs under CLOUDSDK_CONFIG on the
+# state volume and keeps 30 days; at the tier's 8-slot cap that measured about
+# 386 KiB a command, some 3.3 GiB a day, past any emptyDir the pod could carry
+# (#4536). The caller still gets the command's stderr and the audit line; only
+# the pod's own log files, for debugging a gcloud failure on the pod, are lost.
+GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
+# kubectl's disk cache under the command HOME (discovery and HTTP responses),
+# which kubectl rebuilds on the next command. On an exec pod nothing else
+# frees it: a sweep reaches every cluster on every replica, at about 0.3 MiB a
+# cluster (1.9 MiB with the OpenAPI schemas), so it is the soft watermark's
+# reclaimer there (CommandExecutor.reclaim_kubectl_cache).
+KUBECTL_CACHE_DIR_NAME = "cache"
+# The prefix a reclaimed cache is renamed to before it is removed.
+KUBECTL_CACHE_RECLAIMED_PREFIX = "cache.reclaimed-"
 # After the drain, how long the stop waits for the requests whose commands it
 # ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
 # the process group, the poll that notices the stop, and the write. A request
@@ -789,6 +809,15 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+# The header the shim's get-credentials check sends on its one relay read
+# (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
+# It only narrows: with it, a clusters-get for a cluster that
+# spec.scope.exclude.clusters names is refused, so the shim sends the command
+# on to /v1/exec and that route's excluded-cluster refusal answers (#5305).
+# Without it the read is unchanged, so the reconcile's existence check and
+# every other control-plane read stay allowed. A caller that sets it can only
+# be refused more, never reach more.
+GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -1411,6 +1440,7 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 )
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
+RULE_VCS_WRITE_MODE = "vcs.write-mode"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -2146,6 +2176,9 @@ DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE = "kubeagents-credential-proxy-scope"
 SCOPE_AUDIENCE_ENV = "CREDENTIAL_PROXY_SCOPE_AUDIENCE"
 SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
+DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
+CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
+CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -2187,6 +2220,10 @@ CALLER_ROLE_PROFILE = "profile"
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
+# The OKF memory curator pod. Version-control snapshot route only, on a
+# managed repository only, so the curator can verify active and superseded
+# records from Git without holding a forge credential of its own.
+CALLER_ROLE_CURATOR = "curator"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2213,6 +2250,7 @@ CALLER_ROLES = (
     CALLER_ROLE_MCP,
     CALLER_ROLE_PROFILE,
     CALLER_ROLE_SCOPE,
+    CALLER_ROLE_CURATOR,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -2309,6 +2347,7 @@ def executable_refusal_message(role: str, executable: str) -> str:
 # `snapshot` reads repositories this install does not manage).
 ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
     CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+    CALLER_ROLE_CURATOR: frozenset({"snapshot"}),
 }
 
 
@@ -2346,11 +2385,12 @@ def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
             raise ValueError(
                 f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unknown))} is not a vcs verb"
             )
-    writes = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.WRITE_VERBS
-    if writes:
-        raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
-        )
+    for read_only_role in (CALLER_ROLE_MCP, CALLER_ROLE_CURATOR):
+        writes = table.get(read_only_role, frozenset()) & vcs_broker.WRITE_VERBS
+        if writes:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{read_only_role!r}]: {', '.join(sorted(writes))} writes to the forge"
+            )
     # A role-selected verb reads repositories nobody registered and clones into
     # the broker on the caller's say-so, which is wider than a read of a managed
     # repository.
@@ -2559,9 +2599,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    # The MCP pod reaches this family and no other; which verbs within it is
-    # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
-    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
+    # The MCP and curator pods reach this family and no other; which verbs
+    # within it is ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_CURATOR)),
 )
 
 # The failure kind a 5xx on a route family counts under, keyed by the family
@@ -4466,6 +4506,7 @@ class ServiceAccountAuthenticator:
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
         scope_callers: frozenset[str] = frozenset(),
+        curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
@@ -4479,6 +4520,7 @@ class ServiceAccountAuthenticator:
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
+        self.curator_callers = curator_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -4622,6 +4664,10 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a scope caller may present only the scope audience")
         if role == CALLER_ROLE_SCOPE and username not in self.scope_callers:
             raise AuthenticationError("the scope audience is only for scope callers")
+        if username in self.curator_callers and role != CALLER_ROLE_CURATOR:
+            raise AuthenticationError("a curator caller may present only the curator audience")
+        if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
+            raise AuthenticationError("the curator audience is only for curator callers")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
@@ -4836,6 +4882,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(SCOPE_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    curator_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -4920,6 +4971,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the scope role is bound to the callers named there, so every "
                     "caller presenting the scope audience is refused"
                 )
+        curator_audience = os.getenv(CURATOR_AUDIENCE_ENV, "").strip()
+        if curator_audience and curator_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_CURATOR_AUDIENCE equals the %s audience; the curator "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[curator_audience] or CALLER_ROLE_SHELL,
+            )
+        elif curator_audience:
+            audience_roles[curator_audience] = CALLER_ROLE_CURATOR
+            if not curator_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_CURATOR_AUDIENCE is set but CREDENTIAL_PROXY_CURATOR_CALLERS "
+                    "is not; the curator role is bound to the callers named there, so every "
+                    "caller presenting the curator audience is refused"
+                )
         # The profile workers' audience (#3889), read raw for the same reason,
         # and refused on a collision for the mcp one's. Its callers come from
         # the identity map rather than a list of their own: one rendering
@@ -4995,6 +5061,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         session_callers=session_callers,
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
+        curator_callers=curator_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -8887,7 +8954,9 @@ def _capture_output(
                 elif stop is not None and stop():
                     abandoned = stopped = True
                 else:
-                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    # Reaped within this step if it exits within it; the
+                    # loop's own look then returns at once.
+                    _reap(process, min(PIPES_CLOSED_POLL_SECONDS, remaining))
                     continue
                 _kill_process_group(process)
                 _reap(process, None)
@@ -8942,6 +9011,7 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
+        gcloud_file_logging: bool = True,
         exclusions: "scope_exclude.Exclusions | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
@@ -9234,6 +9304,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # After the forwarded names, so the pod's environment cannot turn it
+        # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
+        if not gcloud_file_logging:
+            self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
         # Read here rather than forwarded into `self.environment`: this decides
         # which kubeconfig a request resolves to, and a subprocess has no
         # business reading it or overriding it.
@@ -9337,6 +9411,28 @@ class CommandExecutor:
         slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
+
+    def reclaim_kubectl_cache(self) -> int:
+        """Remove kubectl's disk cache under the command HOME: an exec pod's
+        reclaimer for the resource watermark gate. The cache is renamed first
+        and the renamed folder removed, so a kubectl reading it on another
+        slot keeps its open files and the next command builds a new cache.
+        A renamed folder an earlier call left behind goes too. Returns how
+        many folders this call removed."""
+        kube_dir = self.home_dir / ".kube"
+        removed = 0
+        cache = kube_dir / KUBECTL_CACHE_DIR_NAME
+        if cache.is_dir():
+            target = kube_dir / f"{KUBECTL_CACHE_RECLAIMED_PREFIX}{uuid.uuid4().hex}"
+            try:
+                cache.rename(target)
+            except FileNotFoundError:
+                pass
+        if kube_dir.is_dir():
+            for stale in kube_dir.glob(f"{KUBECTL_CACHE_RECLAIMED_PREFIX}*"):
+                shutil.rmtree(stale, ignore_errors=True)
+                removed += not stale.exists()
+        return removed
 
     def admission_snapshot(self) -> "AdmissionSnapshot":
         """What is in use against each cap, read under the lock at scrape time:
@@ -14417,6 +14513,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+            # The route's pattern has fixed the path's shape:
+            # v1/projects/<project>/locations/<location>/clusters/<cluster>.
+            segments = path.split("/")
+            try:
+                self.exclusions.check(segments[2], segments[4], segments[6])
+            except scope_exclude.ExcludedCluster as exc:
+                LOGGER.warning("api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": exc.rule, "message": str(exc)},
+                )
+                return
         if self.api_relay is None:
             LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
             self._json(
@@ -15404,6 +15513,32 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return TOOL_STATUS_BLOCKED
+        # The install's write mode (`vcs_broker.write_mode`), here for the same
+        # reason as the role check: ahead of anything that spends, and in the
+        # one process that can push. At `none` a branch or proposal write is
+        # refused whoever asks. The refusal states the fact and instructs
+        # nothing: what the agent says instead is the dial eval's to decide.
+        if verb in vcs_broker.PROPOSE_VERBS:
+            mode, raw = vcs_broker.write_mode()
+            if mode == vcs_broker.WRITE_MODE_NONE:
+                LOGGER.warning(
+                    "vcs verb refused by the write mode verb=%s rule=%s",
+                    _sanitize_for_logging(verb),
+                    RULE_VCS_WRITE_MODE,
+                )
+                refusal = {
+                    "status": "blocked",
+                    "error": (
+                        "this install is explain-only (writeMode: none): kube-agents does not push "
+                        "branches or open, update or comment on pull requests here."
+                    ),
+                    "code": "WRITE_MODE_NONE",
+                    "rule": RULE_VCS_WRITE_MODE,
+                }
+                if detail := vcs_broker.write_mode_detail(raw):
+                    refusal["detail"] = detail
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,
@@ -15481,10 +15616,21 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         )
                         return TOOL_STATUS_BLOCKED
                     payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
-                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
+                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS and role != CALLER_ROLE_CURATOR
                 named, outside = payload.get("repository"), None
                 if role_selected:
                     named, outside = self.vcs.snapshot_source(named)
+                elif verb == "snapshot" and role == CALLER_ROLE_CURATOR:
+                    named, outside = self.vcs.snapshot_source(named)
+                    if outside is not None:
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "the curator caller may snapshot only managed repositories",
+                                "code": "REPOSITORY_NOT_MANAGED",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 resolves = verb not in vcs_broker.UNGATED_VERBS and outside is None
                 if resolves:
                     try:
@@ -16553,6 +16699,9 @@ def serve(args: argparse.Namespace) -> None:
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
         metrics=CredentialProxyHandler.metrics,
+        # An exec pod's state volume is sized for no gcloud log files
+        # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
+        gcloud_file_logging=role != EXEC_ROLE,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     memory_reader = MemoryReader(executor.child_peaks)
@@ -16609,11 +16758,14 @@ def serve(args: argparse.Namespace) -> None:
             pinned_bases=CredentialProxyHandler.pinned_bases,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
-    # process holds (the vcs broker swept a dead process's at start). An exec
-    # pod has none.
+    # process holds (the vcs broker swept a dead process's at start), and on
+    # an exec pod, whose state volume is sized for the command HOME alone,
+    # kubectl's disk cache (KUBECTL_CACHE_DIR_NAME).
     reclaimers: list[Callable[[], int]] = []
     if CredentialProxyHandler.vcs is not None:
         reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
+    if role == EXEC_ROLE:
+        reclaimers.append(executor.reclaim_kubectl_cache)
     gate.set_reclaimers(reclaimers)
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -58,7 +59,7 @@ func TestAttributionRoundTripsWithoutGrants(t *testing.T) {
 	if len(back.Audience.Roster) != 1 || back.Audience.Roster[0] != "h1" || !back.Audience.RosterComplete {
 		t.Fatalf("round trip lost the roster: %+v", back.Audience)
 	}
-	if back.Via == nil || *back.Via != *a.Via {
+	if back.Via == nil || !reflect.DeepEqual(*back.Via, *a.Via) {
 		t.Fatalf("round trip lost via: %+v", back.Via)
 	}
 	if back.Grants != nil {

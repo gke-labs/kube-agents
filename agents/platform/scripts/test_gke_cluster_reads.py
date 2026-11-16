@@ -51,17 +51,18 @@ class GkeClusterReadsTest(unittest.TestCase):
 
     def test_a_list_names_each_cluster_and_keeps_missing_zones(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
-        out, _ = self._run({url: (200, {"clusters": [{"name": "a", "location": "us-central1"},
+        out, _ = self._run({url: (200, {"clusters": [{"name": "a", "location": "us-central1", "status": "RUNNING"},
                                                        {"name": "b", "location": "us-east1-b"}],
                                           "missingZones": ["europe-west1-b"]})},
                            {"projects": ["p1"]})
+        # The statuses sit beside the rows, in the same order; a row with none reads "".
         self.assertEqual({"status": 200, "clusters": [["a", "us-central1"], ["b", "us-east1-b"]],
-                          "missingZones": ["europe-west1-b"]}, out["lists"]["p1"])
+                          "statuses": ["RUNNING", ""], "missingZones": ["europe-west1-b"]}, out["lists"]["p1"])
 
     def test_an_empty_project_lists_no_clusters(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
         out, _ = self._run({url: (200, {})}, {"projects": ["p1"]})
-        self.assertEqual({"status": 200, "clusters": []}, out["lists"]["p1"])
+        self.assertEqual({"status": 200, "clusters": [], "statuses": []}, out["lists"]["p1"])
 
     def test_an_error_is_reported_with_its_body_not_decided(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"

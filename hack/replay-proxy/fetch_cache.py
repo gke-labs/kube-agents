@@ -39,6 +39,26 @@ refused, or the records could not be listed (`error: list_failed_<class>`, the
 class as collect_shadow.error_class names it, never gcloud's own text), so the
 lane stops before it spends a cluster on nothing. A bucket with no records
 lists empty (`records: 0`), not as a failure.
+
+`--print-commit` downloads nothing but records, and prints the commit the
+newest recording night ran (each record's `job.commit`, publish_cache.py), so
+the lane's Prow job can check it out before anything else runs and replay the
+code that recorded. It lists as a fetch does and takes the same records: young
+enough to fetch, of the lane's mode and forge, at any normalizer version
+(main's can differ from the recording's, which is the point). A night is one
+run of the nightly schedule: its builds all start together from the same main
+and publish over the next hours. A build's start is the creation time of its
+first record, and the newest night is every such build that started within
+NIGHT_SPAN_HOURS of the newest one. A build's records all name its job, so it
+reads the newest record of each build; only when the night's builds name more
+than one commit does it read all their records, and print the commit whose
+records confirmed the most answers, saying so on stderr. Any listed key
+outside the layout, and any record it reads that names an object outside the
+layout or a commit that is not one, refuses as in a fetch. It prints nothing
+and exits 1 when no build of that night names a commit (records written
+before publish_cache.py wrote one), when it refuses, or when the listing
+fails; the caller then stays on main. Its counts go to stderr, so stdout is
+the commit or nothing.
 """
 
 from __future__ import annotations
@@ -73,6 +93,17 @@ LS_TOTAL_PREFIX = "TOTAL:"
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 SECONDS_PER_HOUR = 3600
 DEFAULT_MAX_AGE_HOURS = 30.0
+# How far before the newest build's start a build may have started and still
+# be the same night (--print-commit). A build's start is its first record, and
+# a night's shards all start from the 00:00 UTC schedule: their first records
+# land within the first hour or so (00:27-00:47 UTC on 2026-11-11 and -12),
+# a shard that waited for a pool project somewhat later. Four hours covers that
+# and leaves out a nightly rerun from Deck later in the day, which records too
+# and would otherwise compete for the night with a day-old commit.
+NIGHT_SPAN_HOURS = 4.0
+# --print-commit's staging: each build's newest record, then a contested night's records.
+NEWEST_RECORDS_DIR = "newest"
+NIGHT_RECORDS_DIR = "night"
 # The bucket's lifecycle rule deletes an object this long after it was written
 # (docs/ci-pool-projects.md, "The replay cache bucket"), so an answer the lane
 # serves can have been first written by a night this old. Runs, for the verdict
@@ -97,6 +128,21 @@ GCLOUD_ENV = {"CLOUDSDK_CORE_DISABLE_PROMPTS": "1"}
 PRIORITY = (P.ANSWERS, P.SLOTS, P.VARIANTS, P.MESSAGES)
 
 Run = Callable[..., Optional[subprocess.CompletedProcess]]
+
+
+@dataclass
+class NightCommit:
+    """--print-commit's answer: the newest night's commit, and what it was chosen from."""
+
+    commit: str = ""
+    records: int = 0
+    other_job_records: int = 0
+    builds: List[str] = field(default_factory=list)
+    # The night's builds that name no commit, and the others by the commit they name.
+    uncommitted_builds: int = 0
+    commit_builds: Dict[str, List[str]] = field(default_factory=dict)
+    # Per commit, the answers its records confirmed: counted only when the night names more than one.
+    answers: Dict[str, int] = field(default_factory=dict)
 
 
 class Refused(Exception):
@@ -207,11 +253,11 @@ class Fetcher:
         self._gcloud(kind, ["cp", "--continue-on-error", "-I", into + os.sep],
                      input=("\n".join(urls) + "\n").encode())
 
-    def _confirmed(self, record: Dict[str, object]) -> List[Tuple[str, int, str]]:
-        """(name, bytes, slot target) of every object a record confirms at this version; Refused on any outside the layout."""
+    def _confirmed(self, record: Dict[str, object], version: Optional[str] = None) -> List[Tuple[str, int, str]]:
+        """(name, bytes, slot target) of every object a record confirms at a version (default this one); Refused on any outside the layout."""
         out = []
         objects = (record.get(P.RECORD_OBJECTS) or {}) if isinstance(record.get(P.RECORD_OBJECTS), dict) else {}
-        for item in objects.get(self.version) or []:
+        for item in objects.get(self.version if version is None else version) or []:
             name = item.get(P.OBJECT_NAME) if isinstance(item, dict) else None
             size = item.get(P.OBJECT_BYTES) if isinstance(item, dict) else None
             if not isinstance(name, str) or not P.OBJECT_NAME_RE.match(name):
@@ -228,6 +274,112 @@ class Fetcher:
         """Whether a record's job graded the lane's own mode on its forge; a record naming no job doesn't."""
         job = record.get(P.RECORD_JOB)
         return isinstance(job, dict) and job.get(P.JOB_MODE) == self.mode and job.get(P.JOB_FORGE) == self.forge
+
+    def _commit(self, record: Dict[str, object]) -> str:
+        """The commit a record's job names, or empty for none; Refused on one that is not a commit."""
+        job = record.get(P.RECORD_JOB)
+        commit = job.get(P.JOB_COMMIT, "") if isinstance(job, dict) else ""
+        if commit and not (isinstance(commit, str) and P.COMMIT_RE.match(commit)):
+            raise Refused("a record names a commit that is not one")
+        return commit or ""
+
+    def _read_records(self, keys: Sequence[str], stage: str) -> Dict[str, object]:
+        """Each record's content by key, downloaded in as few copies as their names allow.
+
+        A copy lands every object in one directory by its base name, which is
+        unique within a build only, so keys whose names collide go in later copies.
+        """
+        out: Dict[str, object] = {}
+        pending = list(keys)
+        copy = 0
+        while pending:
+            batch: List[str] = []
+            names: Set[str] = set()
+            rest: List[str] = []
+            for key in pending:
+                name = os.path.basename(key)
+                if name in names:
+                    rest.append(key)
+                else:
+                    names.add(name)
+                    batch.append(key)
+            into = os.path.join(stage, str(copy))
+            self._download("fetch_records", [f"gs://{self.bucket}/{CACHE_ROOT}/{k}" for k in batch], into)
+            for key in batch:
+                out[key] = P.read_json(os.path.join(into, os.path.basename(key)))
+            pending, copy = rest, copy + 1
+        return out
+
+    def _checked(self, record: Dict[str, object]) -> str:
+        """A record's commit, after the checks a fetch makes of every version's names (Refused on any)."""
+        objects = record.get(P.RECORD_OBJECTS)
+        for version in (objects if isinstance(objects, dict) else {}):
+            self._confirmed(record, version)
+        return self._commit(record)
+
+    def night_commit(self) -> NightCommit:
+        """The commit the newest night of the lane's mode and forge ran (module docstring, --print-commit).
+
+        A build's records all carry its job, so its newest record says its
+        mode, forge and commit: one small object per build. Only when the
+        night's builds name more than one commit are all their records read,
+        to count the answers each commit's records confirmed.
+        """
+        result = NightCommit()
+        listed = self.listed()
+        now = self.clock()
+        started: Dict[str, float] = {}
+        newest_key: Dict[str, str] = {}
+        by_build: Dict[str, List[str]] = {}
+        for created, key in listed:  # oldest first: a build's first record sets its start
+            build = RECORD_KEY_RE.match(key).group(1)  # type: ignore[union-attr]
+            started.setdefault(build, created)
+            if created >= now - self.max_age_seconds:
+                newest_key[build] = key
+                by_build.setdefault(build, []).append(key)
+        stage = tempfile.mkdtemp(prefix=STAGING_PREFIX)
+        try:
+            commits: Dict[str, str] = {}
+            for key, record in self._read_records(sorted(newest_key.values()), os.path.join(stage, NEWEST_RECORDS_DIR)).items():
+                if not isinstance(record, dict):
+                    continue
+                result.records += 1
+                commit = self._checked(record)
+                if not self._same_job(record):
+                    result.other_job_records += 1
+                    continue
+                commits[RECORD_KEY_RE.match(key).group(1)] = commit  # type: ignore[union-attr]
+            if not commits:
+                return result
+            newest = max(started[build] for build in commits)
+            result.builds = sorted(b for b in commits if started[b] >= newest - NIGHT_SPAN_HOURS * SECONDS_PER_HOUR)
+            for build in result.builds:
+                if commits[build]:
+                    result.commit_builds.setdefault(commits[build], []).append(build)
+                else:
+                    result.uncommitted_builds += 1
+            if len(result.commit_builds) == 1:
+                result.commit = next(iter(result.commit_builds))
+            if len(result.commit_builds) <= 1:
+                return result
+            night_keys = [k for b in result.builds if commits[b] for k in by_build[b]]
+            answers: Dict[str, Set[Tuple[str, str]]] = {c: set() for c in result.commit_builds}
+            for key, record in self._read_records(night_keys, os.path.join(stage, NIGHT_RECORDS_DIR)).items():
+                if not isinstance(record, dict):
+                    continue
+                self._checked(record)
+                build = RECORD_KEY_RE.match(key).group(1)  # type: ignore[union-attr]
+                objects = record.get(P.RECORD_OBJECTS)
+                for version in (objects if isinstance(objects, dict) else {}):
+                    answers[commits[build]].update((version, name) for name, _, _ in self._confirmed(record, version)
+                                                   if name.startswith(P.ANSWERS + "/"))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        result.answers = {commit: len(names) for commit, names in answers.items()}
+        latest = {c: max(started[b] for b in builds) for c, builds in result.commit_builds.items()}
+        # The most answers; then the latest build to start; then by name, so the choice is stable.
+        result.commit = max(answers, key=lambda c: (len(answers[c]), latest[c], c))
+        return result
 
     def _plan(self, confirmed: List[Tuple[str, int, str]], result: Fetched) -> Dict[str, List[Tuple[str, int, str]]]:
         """What fits under max_bytes, by kind in PRIORITY order; the rest counted as left out."""
@@ -370,10 +522,39 @@ def default_run(kind: str, cmd: Sequence[str], timeout: float, input: Optional[b
     return proc
 
 
+def print_commit(fetcher: Fetcher) -> int:
+    """--print-commit: the newest night's commit on stdout and 0, or nothing on stdout and 1; counts on stderr."""
+    summary: Dict[str, object] = {"event": "print_commit"}
+    try:
+        night = fetcher.night_commit()
+    except Refused as exc:
+        summary.update(error="refused", reason=str(exc))
+        print(json.dumps(summary, sort_keys=True), file=sys.stderr)
+        return 1
+    except ListFailed as exc:
+        summary["error"] = str(exc)
+        print(json.dumps(summary, sort_keys=True), file=sys.stderr)
+        return 1
+    summary.update(records=night.records, other_job_records=night.other_job_records, builds=night.builds,
+                   uncommitted_builds=night.uncommitted_builds, commit_builds=night.commit_builds,
+                   answers=night.answers)
+    print(json.dumps(summary, sort_keys=True), file=sys.stderr)
+    if not night.commit:
+        print("no record of the newest night names a commit; the lane stays on main", file=sys.stderr)
+        return 1
+    if len(night.answers) > 1:
+        print(f"the newest night's records name {len(night.answers)} commits; printing {night.commit},"
+              f" whose records confirmed the most answers ({night.answers[night.commit]})", file=sys.stderr)
+    print(night.commit)
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--bucket", required=True)
-    parser.add_argument("--dest", required=True, help="the cache directory to fill (replay_cache.py's layout)")
+    parser.add_argument("--dest", default="", help="the cache directory to fill (replay_cache.py's layout)")
+    parser.add_argument("--print-commit", action="store_true",
+                        help="print the commit the newest recording night ran, and download nothing else")
     parser.add_argument("--runs-out", default="", help=f"where to write the records' runs per build ({RUNS_FILE})")
     parser.add_argument("--version", default=normalizer.NORMALIZER_VERSION,
                         help="the normalizer version to fetch (default: this checkout's)")
@@ -382,15 +563,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--eval-mode-next", default="", help="the lane's EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="the lane's EVAL_FORGE (empty is github)")
     args = parser.parse_args(argv)
+    if not args.print_commit and not args.dest:
+        parser.error("--dest is required unless --print-commit")
     summary: Dict[str, object] = {"event": "fetch", "version": args.version}
     if not P.valid_bucket(args.bucket) or not P.NORMALIZER_VERSION_RE.match(args.version):
         summary["error"] = "bad_arguments"
-        print(json.dumps(summary, sort_keys=True))
+        # --print-commit keeps stdout for the commit alone.
+        print(json.dumps(summary, sort_keys=True), file=sys.stderr if args.print_commit else sys.stdout)
         return 1
     job = P.job_identity("", args.eval_mode_next, args.forge)
     fetcher = Fetcher(bucket=args.bucket, version=args.version, run=default_run,
                       max_age_hours=args.max_age_hours, max_bytes=args.max_bytes,
                       mode=job[P.JOB_MODE], forge=job[P.JOB_FORGE])
+    if args.print_commit:
+        return print_commit(fetcher)
     try:
         result = fetcher.fetch(args.dest, args.runs_out or None)
     except Refused as exc:

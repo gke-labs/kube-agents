@@ -1,0 +1,52 @@
+{
+  "profiles": [
+    {
+      "name": "alpha",
+      "tiers": [
+        "read",
+        "unattended"
+      ]
+    },
+    {
+      "name": "beta",
+      "tiers": [
+        "read"
+      ]
+    },
+    {
+      "name": "gone",
+      "draining": true
+    }
+  ],
+  "publish": [
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-alpha-read-top",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-alpha-read-top",
+    "$JS.ACK.PROFILE_SUBMITS.profile-alpha-read-top.>",
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-alpha-read-child",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-alpha-read-child",
+    "$JS.ACK.PROFILE_SUBMITS.profile-alpha-read-child.>",
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-alpha-unattended-top",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-alpha-unattended-top",
+    "$JS.ACK.PROFILE_SUBMITS.profile-alpha-unattended-top.>",
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-alpha-unattended-child",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-alpha-unattended-child",
+    "$JS.ACK.PROFILE_SUBMITS.profile-alpha-unattended-child.>",
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-beta-read-top",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-beta-read-top",
+    "$JS.ACK.PROFILE_SUBMITS.profile-beta-read-top.>",
+    "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-beta-read-child",
+    "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-beta-read-child",
+    "$JS.ACK.PROFILE_SUBMITS.profile-beta-read-child.>",
+    "a2a.tasks.alpha.*.supervisor",
+    "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.alpha.*",
+    "a2a.tasks.beta.*.supervisor",
+    "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.beta.*",
+    "a2a.tasks.gone.*.supervisor",
+    "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.gone.*"
+  ],
+  "subscribe": [
+    "a2a.stop.alpha.*",
+    "a2a.stop.beta.*",
+    "a2a.stop.gone.*"
+  ]
+}

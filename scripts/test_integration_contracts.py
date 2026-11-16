@@ -104,6 +104,8 @@ FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
 FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # A title edit legitimately turns it green without a commit.
     "Validate PR Title",
+    # Likewise a body edit: adding the screenshot is the fix, not a re-run.
+    "UX Evidence",
     # The advisory database moves between attempts.
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
