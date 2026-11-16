@@ -377,7 +377,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	case errors.Is(postErr, errPostOutcomeUnknown):
 		report.Status, report.LastError = scheduledPostUnknown, postErr.Error()
 		g.log.Warn("scheduled report post outcome unknown; not posting again", append(logArgs, "err", postErr)...)
-	case !try.redeliverable || max(uint64(report.Attempts), try.delivery) >= scheduledPostAttempts:
+	case !try.redeliverable || report.Attempts >= scheduledPostAttempts || try.delivery >= scheduledPostAttempts:
 		report.Status, report.LastError = scheduledPostFailed, postErr.Error()
 		g.log.Warn("scheduled report not posted; giving up", append(logArgs, "attempts", report.Attempts, "err", postErr)...)
 	default:
