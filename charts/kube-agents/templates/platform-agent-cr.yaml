@@ -273,6 +273,7 @@ spec:
     {{- /* The session pods' requests and limits go through the sizing overrides' helpers, so a
       values file's `cpu: 0.5` reaches the CRD as a quoted quantity and a null or empty leaf is
       dropped (kube-agents.resourcesOverrideQuantities). */}}
+    {{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") }}
     {{- $sessionQuantities := include "kube-agents.resourcesOverrideQuantities" $tuning.sessionResources | fromJson }}
     {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:

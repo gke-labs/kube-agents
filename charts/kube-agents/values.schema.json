@@ -1385,10 +1385,12 @@
                       "additionalProperties": false,
                       "properties": {
                         "cpu": {
-                          "type": ["string", "number", "null"]
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
                         },
                         "memory": {
-                          "type": ["string", "number", "null"]
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
                         }
                       }
                     },
@@ -1397,10 +1399,12 @@
                       "additionalProperties": false,
                       "properties": {
                         "cpu": {
-                          "type": ["string", "number", "null"]
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
                         },
                         "memory": {
-                          "type": ["string", "number", "null"]
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
                         }
                       }
                     }
