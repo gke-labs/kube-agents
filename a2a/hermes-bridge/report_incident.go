@@ -212,7 +212,7 @@ func (b *Bridge) hostsIncidentChat(platform, chatID string) bool {
 // readHomeFile is the projected home channel, "" when the file is absent,
 // unreadable or empty.
 func readHomeFile(path string) string {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the operator-projected home file (A2A_BRIDGE_SLACK_HOME_FILE), not task data
 	if err != nil {
 		return ""
 	}
