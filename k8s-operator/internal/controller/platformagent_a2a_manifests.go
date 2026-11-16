@@ -6803,6 +6803,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	// The report reader's token and the broker's address, on every install
+	// (a2a_report_reader.go).
+	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
+	env = append(env, reportEnv...)
 
 	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -6871,10 +6875,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), append(injectMounts, reportMounts...)...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), append(injectVolumes, reportVolumes...)...),
 				},
 			},
 		},

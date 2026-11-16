@@ -174,6 +174,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	// The A2A report reader's audience: the store routes are the stateful
+	// broker's, so an exec pod confers no a2a-reports role. Its callers
+	// binding stays, holding the gateway's account to its own audiences.
+	credentialProxyA2AReportsAudienceEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

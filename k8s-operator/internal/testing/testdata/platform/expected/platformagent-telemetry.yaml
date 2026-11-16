@@ -1453,11 +1453,15 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
+              value: kubeagents-credential-proxy-a2a-reports
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1679,6 +1683,9 @@ spec:
         - podSelector:
             matchLabels:
               app: platformagent-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
       ports:
         - port: 8765
           protocol: TCP

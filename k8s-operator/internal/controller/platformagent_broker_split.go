@@ -231,12 +231,12 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, gatewayServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}
-	// The A2A gateway, only while it is a caller: its Google Chat adapter
-	// pulls the relay hosted here, and a next install that gives it no Chat
-	// backend has no reason to widen the broker's callers by one.
-	if a2aChatArmed(agent) {
-		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent)))
-	}
+	// The A2A gateway, on every install: its report reader reads finished
+	// audit reports through the store routes (a2a_report_reader.go), and its
+	// Google Chat adapter, when armed, pulls the relay hosted here. Held by
+	// CREDENTIAL_PROXY_A2A_REPORTS_CALLERS to the a2a-reports and a2a-chat
+	// audiences, so it reaches no other role.
+	callers = append(callers, a2aGatewayBrokerCaller(agent))
 	// The third caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
 	// buildCredentialProxyEnv renders beside it: the broker refuses this
