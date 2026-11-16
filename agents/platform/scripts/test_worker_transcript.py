@@ -226,32 +226,74 @@ class TestScrubStepText(unittest.TestCase):
                 self.assertEqual(worker_transcript.fold_shell_command(command), old_mask(command))
 
     def test_large_single_and_multi_line_commands_fold_identically(self):
-        import re
+        import time
 
-        old_continuation = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
-        old_break_run = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
-
-        def old_detect(command):
-            return old_continuation.sub(lambda m: m.group(1), command)
-
-        def old_mask(command):
-            def one(m):
-                run, line_break, indent = m.groups()
-                if len(run) % 2 and line_break == "\n":
-                    return run[:-1] + indent
-                return run[:-1] + " "
-            return old_break_run.sub(one, command).replace("\\ ", "\ue000")
-
-        for command in (
-            "echo " + "a" * 50000,
-            "curl " + "\\ -u a:b " * 5000 + "https://x",
-            ("echo " + "a" * 500 + "\n") * 100,
-            "curl " + "a" * 10000 + " \\\n  -H x " + "b" * 10000 + " \\\\\n  echo " + "c" * 10000,
-            "echo " + "a" * 10000 + " \\\r\n  next " + "b" * 10000 + "\\\\\\\n\tend " + "c" * 10000,
+        mark = worker_transcript.SHELL_ESCAPED_SPACE_FOLD
+        for case, command, want_detect, want_mask in (
+            (
+                "single-line-plain",
+                "echo " + "a" * 50000,
+                "echo " + "a" * 50000,
+                "echo " + "a" * 50000,
+            ),
+            (
+                "single-line-escaped-space",
+                "curl " + "\\ -u a:b " * 5000 + "https://x",
+                "curl " + "\\ -u a:b " * 5000 + "https://x",
+                "curl " + (mark + "-u a:b ") * 5000 + "https://x",
+            ),
+            (
+                "multi-line-no-backslash",
+                ("echo " + "a" * 500 + "\n") * 100,
+                ("echo " + "a" * 500 + "\n") * 100,
+                ("echo " + "a" * 500 + "\n") * 100,
+            ),
+            (
+                "multi-line-lf-odd-and-even",
+                "curl " + "a" * 10000 + " \\\n  -H x " + "b" * 10000 + " \\\\\n  echo " + "c" * 10000,
+                "curl " + "a" * 10000 + "   -H x " + "b" * 10000 + " \\\\\n  echo " + "c" * 10000,
+                "curl " + "a" * 10000 + "   -H x " + "b" * 10000 + f" {mark}echo " + "c" * 10000,
+            ),
+            (
+                "multi-line-crlf-and-odd",
+                "echo " + "a" * 10000 + " \\\r\n  next " + "b" * 10000 + "\\\\\\\n\tend " + "c" * 10000,
+                "echo " + "a" * 10000 + " \\\r\n  next " + "b" * 10000 + "\\\\\tend " + "c" * 10000,
+                "echo " + "a" * 10000 + "  next " + "b" * 10000 + "\\\\\tend " + "c" * 10000,
+            ),
         ):
-            with self.subTest(command=command[:40]):
-                self.assertEqual(worker_transcript.fold_shell_continuations(command), old_detect(command))
-                self.assertEqual(worker_transcript.fold_shell_command(command), old_mask(command))
+            with self.subTest(case=case):
+                self.assertEqual(worker_transcript.fold_shell_continuations(command), want_detect)
+                self.assertEqual(worker_transcript.fold_shell_command(command), want_mask)
+                if "\\" not in command or "\n" not in command:
+                    self.assertIs(worker_transcript._fold_line_breaks(command, masking=False), command)
+                    self.assertIs(worker_transcript._fold_line_breaks(command, masking=True), command)
+
+        # Advancing with str.find keeps multi-line folding in C across long spans;
+        # a character-by-character Python loop over 2 MB of spans takes ~0.3s CPU.
+        with self.subTest(case="multi-line-span-cpu-time"):
+            multi_span = ("echo " + "a" * 500000 + " \\\n  ok\n") * 4
+            start = time.process_time()
+            self.assertEqual(
+                worker_transcript.fold_shell_continuations(multi_span),
+                ("echo " + "a" * 500000 + "   ok\n") * 4,
+            )
+            self.assertEqual(
+                worker_transcript.fold_shell_command(multi_span),
+                ("echo " + "a" * 500000 + "   ok\n") * 4,
+            )
+            self.assertLess(time.process_time() - start, 0.1)
+
+        # Without an escaped-space fold marker, blank_named_values skips the
+        # second-pass segment scans (`_mask_userpass_segment_at_fold`, `CLI_SHORT_P_AT_FOLD_RE`).
+        with self.subTest(case="no-escaped-space-skips-second-pass"):
+            with mock.patch.object(
+                worker_transcript, "sub_shell_segments", wraps=worker_transcript.sub_shell_segments
+            ) as segment_spy:
+                out = worker_transcript.blank_named_values(
+                    REDACTOR, "curl -u admin:S3cretValue9 https://x", worker_transcript.VALUE_SPAN_SHELL
+                )
+            self.assertNotIn("S3cretValue9", out)
+            self.assertEqual(segment_spy.call_count, 2)
 
     def test_a_continuation_inside_a_word_joins_the_word(self):
         # The fold used to put a space where bash puts nothing, so a word split
