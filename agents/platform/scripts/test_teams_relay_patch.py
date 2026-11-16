@@ -328,6 +328,8 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "Summary complete."
         )
         card = markdown_to_adaptive_card(text, title="Audit Results")
+        # Full width: Teams otherwise draws the card in a narrow column.
+        self.assertEqual(card["msteams"], {"width": "Full"})
         self.assertEqual(card["type"], "AdaptiveCard")
         self.assertEqual(card["version"], "1.5")
         body = card["body"]

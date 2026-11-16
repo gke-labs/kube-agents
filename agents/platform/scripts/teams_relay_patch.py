@@ -30,6 +30,9 @@ DEFAULT_RELAY_READY_TIMEOUT = 120.0
 # (with a marker) that escapes to more than four bytes a character.
 TEAMS_MAX_MESSAGE_LENGTH = 7000
 TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
+# The card width Teams is asked for: "Full" spans the pane; the default is a
+# fixed narrow column that squeezes tables.
+TEAMS_CARD_WIDTH = "Full"
 TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
 # Where the bot posts when an activity did not say: the public Bot Framework
 # endpoint. TEAMS_DEFAULT_SERVICE_URL overrides it in a hand-run gateway only.
@@ -354,6 +357,10 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
         "type": "AdaptiveCard",
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.5",
+        # Teams renders a card at a fixed narrow width unless the card asks
+        # for the full pane; a five-column table wrapped to three characters
+        # a cell without it (live run, 2026-11-15).
+        "msteams": {"width": TEAMS_CARD_WIDTH},
         "body": (
             body_elements
             if body_elements
