@@ -191,9 +191,9 @@ class FenceCardsTest(unittest.TestCase):
             conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?)", rows)
 
     def test_the_arm_scope_archives_every_card_the_live_arm_filed_newest_first(self):
-        # 2122208205344870400: the replayed chat-routing-fleet-question answered from a
-        # finished upgrades-fleet-rollout-stall card. Finished cards go too; the install's
-        # own (before the arm, a cron run's, a script's) and archived ones stay.
+        # Replay lane build 2122208205344870400 read a finished live-arm card off the board.
+        # Finished cards go too; the install's own (before the arm, a cron run's, a script's)
+        # and archived ones stay.
         self._session_cards([
             ("t_fleet", "done", SINCE + 10, "api-turn-1"),
             ("t_child", "blocked", SINCE + 20, "api-turn-1"),
@@ -211,6 +211,18 @@ class FenceCardsTest(unittest.TestCase):
         self.assertIn("archived 3 card(s) the live arm filed: t_running (running), t_child (blocked), t_fleet (done)", done.stdout)
         for card, status in (("t_audit", "done"), ("t_sweep", "done"), ("t_blank", "running"), ("t_earlier", "done")):
             self.assertEqual(self._status(card), status, card)
+
+    def test_the_arm_scope_archives_a_child_before_its_parent_filed_in_the_same_second(self):
+        # Whole-second created_at and random ids: an id order could archive the parent first
+        # and promote its child to the dispatcher before the child is reached.
+        self._session_cards([
+            ("t_zzzzzzzz", "done", SINCE + 10, "api-turn-1"),
+            ("t_aaaaaaaa", "todo", SINCE + 10, "api-turn-1"),
+        ])
+        self._hermes()
+        done = self._fence(PASSES, BUDGET, "arm")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["t_aaaaaaaa", "t_zzzzzzzz"])
 
     def test_the_arm_scope_with_nothing_filed_says_so(self):
         self._session_cards([("t_earlier", "done", SINCE - 1, "api-turn-0")])

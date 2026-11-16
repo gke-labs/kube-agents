@@ -31,15 +31,17 @@ With ``arm`` (the replay lane's live arm, run_replay_lane_live_arm), finished ca
 every card not yet archived that was created at or after <since-epoch> and carries a chat or
 inject session, newest first so an archived parent promotes no child that is still to go. The
 replayed arm reads the board through ``kanban_list`` and the board summaries, which leave
-archived cards out, so it no longer finds the live arm's answers there (2122208205344870400:
-``chat-routing-fleet-question`` answered from a finished ``upgrades-fleet-rollout-stall`` card
-instead of delegating). Cards with no session (filed by a script or the CLI, as the onboarding
-hand-off files its sweep) and cards from a Hermes cron run (the install's clock-started and
-first-run audits, which children inherit) are the install's own and are left alone.
+archived cards out, so it no longer finds the live arm's answers there (replay lane build
+2122208205344870400 read a finished live-arm card off the board). Cards with no session (filed by a script or the CLI, as the onboarding
+hand-off files its sweep) and cards from a Hermes cron run whose session is still the run's own
+(``cron_<job>_<time>``, the install's clock-started and first-run audits, which children
+inherit) are left alone. A cron run whose conversation was compressed has a new session id, and
+the install's event-triage cards carry a chat session, so a card either files during the live
+arm is archived too.
 
-Prints one line. Exits 0 when nothing live is left (none found, or every one archived), and
-EXIT_LEFT_LIVE (3) when the board could not be read, the budget ran out, or a card is still
-live after the last pass. That code is the helper's own verdict, told apart from kubectl's exit
+Prints one line. Exits 0 when nothing in scope is left (none found, or every one archived), and
+EXIT_LEFT_LIVE (3) when the board could not be read, the budget ran out, or a card in scope is
+still unarchived after the last pass (a live one, or with ``arm`` any one). That code is the helper's own verdict, told apart from kubectl's exit
 1 for an exec that never reached the container, or for a helper that did not run to its verdict:
 the runner retries those and not this (EVAL_FENCE_DECIDED_EXIT in hack/ci-eval-pr.sh).
 """
@@ -90,7 +92,8 @@ def left():
 
 def live_cards():
     """``[(id, status)]`` of the cards to archive created since <since-epoch>: live ones oldest
-    first, or in the arm scope every unarchived one with a non-cron session, newest first."""
+    first, or in the arm scope every unarchived one with a non-cron session, newest first (by
+    insertion within one second: ``created_at`` is whole seconds and ids are random)."""
     room = left()
     if room <= 0:
         raise BudgetSpent()
@@ -101,7 +104,7 @@ def live_cards():
             return conn.execute(
                 f"SELECT id, status FROM tasks WHERE status NOT IN ({marks}) AND COALESCE(created_at, 0) >= ? "
                 "AND COALESCE(session_id, '') != '' AND substr(session_id, 1, ?) != ? "
-                "ORDER BY created_at DESC, id DESC",
+                "ORDER BY created_at DESC, rowid DESC",
                 (*ARCHIVED, since, len(CRON_SESSION_PREFIX), CRON_SESSION_PREFIX),
             ).fetchall()
         marks = ",".join("?" * len(SETTLED))

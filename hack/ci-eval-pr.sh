@@ -3590,9 +3590,8 @@ run_replay_lane_live_arm() {
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
     launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
     wait
-    # The replayed arm must not read the live arm's answers off the board: its
-    # front door was served a recorded "read the board first" turn and answered
-    # from a finished live-arm card (2122208205344870400). Since
+    # The replayed arm must not read the live arm's answers off the board (replay
+    # lane build 2122208205344870400 read a finished live-arm card). Since
     # EVAL_FANOUT_STARTED_EPOCH, set right before this is called. A failed clear
     # only warns.
     fence_live_cards "replay lane live arm" "" "" arm
