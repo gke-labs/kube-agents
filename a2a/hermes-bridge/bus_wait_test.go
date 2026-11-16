@@ -1,12 +1,10 @@
 package hermesbridge
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -174,16 +172,16 @@ func TestARefusedBridgeIsSaidAtErrorAndWaited(t *testing.T) {
 	}
 	t.Cleanup(s.Shutdown)
 
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	cfg := busWaitConfig(fmt.Sprintf("nats://127.0.0.1:%d", port))
 	cfg.NATSOptions = []nats.Option{nats.UserInfo("bridge", "wrong")}
-	cfg.Logger = slog.New(slog.NewTextHandler(&syncWriter{w: &logs}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	if _, err := New(ctx, cfg); err == nil {
 		t.Fatal("New succeeded with the wrong password")
 	}
-	out := (&syncWriter{w: &logs}).String()
+	out := logs.String()
 	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "the bus refused this bridge") {
 		t.Fatalf("a refused bridge was not said at Error with the troubleshooting words:\n%s", out)
 	}
@@ -205,22 +203,4 @@ func TestBusRefusedTellsARefusalFromAnAbsence(t *testing.T) {
 			t.Errorf("busRefused(%v) = %v, want %v", err, got, want)
 		}
 	}
-}
-
-// syncWriter serializes writes from the bridge's goroutines to one buffer.
-type syncWriter struct {
-	mu sync.Mutex
-	w  *bytes.Buffer
-}
-
-func (s *syncWriter) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.Write(p)
-}
-
-func (s *syncWriter) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.String()
 }

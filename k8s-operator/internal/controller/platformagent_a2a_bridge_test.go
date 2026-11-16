@@ -36,8 +36,9 @@ func bridgeTestPod(agent *agentv1alpha1.PlatformAgent) corev1.PodTemplateSpec {
 	return buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
 }
 
-// provisionedAgent is a next agent whose bus has been provisioned once, which
-// is when the rendered bridge enters the pod.
+// provisionedAgent is a next agent whose bus has been provisioned once. The
+// rendered bridge is in the pod before that too (#5962); tests use this for
+// the settled state.
 func provisionedAgent() *agentv1alpha1.PlatformAgent {
 	agent := a2aTestAgent()
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
