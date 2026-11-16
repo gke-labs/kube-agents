@@ -497,6 +497,12 @@ class GateTest(unittest.TestCase):
                     WEB_CONSOLE_PF_LOG=f'"{self.tmp.name}/pf.log"',
                 ),
                 shell_function(_CI_DEPLOY, "report_cr_status"),
+                # The one-replacement tolerance (#6040); its constants come in
+                # with constants_block. The stub's `get pods` prints nothing,
+                # so no replacement is seen here; the connectivity check's
+                # test drives a replacement.
+                shell_function(_CI_DEPLOY, "gateway_pod_uids"),
+                shell_function(_CI_DEPLOY, "await_gateway_replacement"),
                 lifted(*_GATE_SECTION),
                 'echo "REACHED 6b"',
             ]

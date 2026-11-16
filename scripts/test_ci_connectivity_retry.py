@@ -42,8 +42,22 @@ case "$1" in
     exec sleep 60
     ;;
   get)
-    # `get secret ... -o jsonpath=...` -> base64("test-key")
-    echo "dGVzdC1rZXk="
+    if [ "$2" = "pods" ]; then
+      # The gateway's Running pod: "uid-1", or "uid-2" once the curl stub has
+      # failed GATEWAY_REPLACED_AFTER times (unset: never replaced).
+      n=$(cat "${STUB_LOG}/curl.count" 2>/dev/null || echo 0)
+      if [ -n "${GATEWAY_REPLACED_AFTER:-}" ] && [ "$n" -ge "${GATEWAY_REPLACED_AFTER}" ]; then
+        echo "uid-2"
+      else
+        echo "uid-1"
+      fi
+    else
+      # `get secret ... -o jsonpath=...` -> base64("test-key")
+      echo "dGVzdC1rZXk="
+    fi
+    ;;
+  rollout)
+    exit "${ROLLOUT_EXIT:-0}"
     ;;
 esac
 exit "${KUBECTL_EXIT:-0}"
@@ -128,6 +142,24 @@ def gateway_collector() -> str:
     return "\n".join([*constants, *functions])
 
 
+def gateway_replacement_helpers() -> str:
+    """AGENT_DEPLOYMENT_NAME, GATEWAY_REPLACEMENT_WAIT_TIMEOUT, gateway_pod_uids()
+    and await_gateway_replacement() as written, lifted from the script (#6040)."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    parts = []
+    for pattern in (
+        r"^readonly AGENT_DEPLOYMENT_NAME=[^\n]*$",
+        r"^readonly GATEWAY_REPLACEMENT_WAIT_TIMEOUT=[^\n]*$",
+        r"^gateway_pod_uids\(\) \{\n.*?^\}$",
+        r"^await_gateway_replacement\(\) \{\n.*?^\}$",
+    ):
+        match = re.search(pattern, src, re.S | re.M)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{pattern} not found in {DEPLOY_SCRIPT}")
+        parts.append(match.group(0))
+    return "\n".join(parts)
+
+
 def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     path = directory / name
     path.write_text(body, encoding="utf-8")
@@ -157,6 +189,7 @@ def run_check(succeed_on: int, env_overrides: dict[str, str] | None = None) -> t
         [
             "set -euo pipefail",
             "NAMESPACE=test-ns",
+            "PLATFORM_AGENT_CR_NAME=platform-agent",
             "STEP_START=0",
             "dump_prow_artifacts_on_failure() { :; }",
             # The section's EXIT traps chain to the deploy's exit function and
@@ -164,6 +197,7 @@ def run_check(succeed_on: int, env_overrides: dict[str, str] | None = None) -> t
             "stop_deploy_heartbeat() { :; }",
             "deploy_exit() { dump_prow_artifacts_on_failure; }",
             gateway_retry_knobs(),
+            gateway_replacement_helpers(),
             connectivity_section(),
             'echo "SECTION COMPLETED"',
         ]
@@ -201,6 +235,30 @@ class ConnectivityRetryTest(unittest.TestCase):
             len([l for l in kubectl_args.splitlines() if l.startswith("port-forward")]),
             2,
         )
+
+    def test_one_gateway_replacement_is_waited_for_without_spending_an_attempt(self):
+        """#6040: a ScaleDown replaced the single gateway mid-check. The check
+        waits for the replacement's rollout once and keeps all its attempts."""
+        result, tmp = run_check(succeed_on=999, env_overrides={"GATEWAY_REPLACED_AFTER": "1"})
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.count("the agent gateway pod was replaced during the API connectivity check"), 1)
+        self.assertIn("connectivity attempt 1/5 failed: empty response after port-forward drop; the replacement is up", result.stdout)
+        kubectl_args = (tmp / "kubectl.args").read_text(encoding="utf-8")
+        self.assertEqual(len([l for l in kubectl_args.splitlines() if l.startswith("rollout status deployment/platform-agent-gateway")]), 1)
+        # The waited-for attempt is not spent: six tunnels for five attempts.
+        self.assertEqual(len([l for l in kubectl_args.splitlines() if l.startswith("port-forward")]), 6)
+        self.assertIn("connectivity attempt 5/5 failed", result.stdout)
+
+    def test_a_replacement_that_never_rolls_out_spends_the_attempt(self):
+        result, tmp = run_check(succeed_on=999, env_overrides={"GATEWAY_REPLACED_AFTER": "1", "ROLLOUT_EXIT": "1"})
+        self.assertEqual(result.returncode, 1)
+        kubectl_args = (tmp / "kubectl.args").read_text(encoding="utf-8")
+        self.assertEqual(len([l for l in kubectl_args.splitlines() if l.startswith("port-forward")]), 5)
+
+    def test_a_replacement_then_a_success_passes(self):
+        result, _ = run_check(succeed_on=2, env_overrides={"GATEWAY_REPLACED_AFTER": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("✓ Agent API Server responded successfully", result.stdout)
 
     def test_exhausted_attempts_hard_fail_with_the_tunnel_log_echoed(self):
         result, tmp = run_check(succeed_on=999)
