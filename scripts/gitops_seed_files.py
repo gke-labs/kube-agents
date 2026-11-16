@@ -25,14 +25,14 @@ import hashlib
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, declared-zonal-pool's single zone, and declared-orphan-snap-seeded's retention, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, declared-zonal-pool's single zone, declared-orphan-snap-seeded's retention, and the mtu-peer-declared peering's MTU mismatch, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a and the declared-orphan-snap-seeded snapshot carry seven postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -55,6 +55,9 @@ declares:
   - check: orphaned-snapshots
     namespace: ""
     object: Snapshot/declared-orphan-snap-seeded
+  - check: mtu-packet-fragmentation
+    namespace: ""
+    object: NetworkPeering/default--mtu-peer-declared
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -68,8 +71,11 @@ design: it is sized for an ingest burst the measured week does not show. `declar
 `seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
 pool stays empty until a zonal batch needs it. The `declared-orphan-snap-seeded` snapshot is kept
 after its source disk was deleted by design: it is the retained copy of a retired disk, held until
-an operator reviews it. The obtainability, compliance, upgrade readiness, waste, capacity and GCE
-compute audits list the seven postures under Declared intent rather than as findings."""
+an operator reviews it. The `mtu-peer-declared` network stays at MTU 8896 beside `default` at 1460 by
+design: it carries jumbo frames for storage, the traffic that crosses the peering is TCP, and the VMs
+on `default` cannot all restart to adopt a new MTU. The obtainability, compliance, upgrade readiness,
+waste, capacity, GCE compute and networking audits list the eight postures under Declared intent rather
+than as findings."""
 # checkout-gateway's declaration, which provisioning seeds beside the note
 # (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
 # remediation cases propose a PodDisruptionBudget beside it; in a repository
