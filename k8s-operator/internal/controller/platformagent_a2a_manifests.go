@@ -791,7 +791,7 @@ const (
 	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
 	// The broker admits the a2a-chat role on its Teams routes only while
 	// this reads "true": the gateway's teams backend is the queue's consumer.
-	credentialProxyTeamsA2ACallerEnvVar = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
+	credentialProxyTeamsA2ACallerEnvVar = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld
