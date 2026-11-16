@@ -350,6 +350,7 @@ func main() {
 		DNSClusterIPOverride:     dnsClusterIP,
 		MetadataDaemonIPOverride: metadataDaemonIP,
 		OperatorNamespace:        operatorNamespace,
+		UniverseDomainDetector:   controller.ProbeGCEUniverseDomain,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
