@@ -70,7 +70,11 @@ verification_spec:
       # (every run outside [a-z0-9] becomes one hyphen). The target segment
       # before it names the project and varies per pool project, so the id is
       # matched on the object alone. Nothing else in this stream names the
-      # pair.
+      # pair. The id is 76 characters plus the project id, and `_shorten_id`
+      # clips its longest segment, this object, past 100: the phrase holds
+      # whole for a project id of at most 24 characters (every pool project's
+      # is at most 20); a dev install with a longer id has to grade through
+      # `scope: finding` with `finding_check` instead.
       type: ledger_issue_contains
       audit: gcp-networking-fabric-audit
       scope: finding_ids

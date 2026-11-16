@@ -1444,7 +1444,7 @@
       "cluster_slot": null,
       "namespace": null,
       "probes": ["network/mtu-peer-declared*", "network/default*"],
-      "fixture": "mtu-peer-declared, a custom-mode VPC at MTU 8896 with no subnet, peered both ways with `default` (MTU 1460): the networking SOP's 2.4 peered-MTU mismatch (object NetworkPeering/default--mtu-peer-declared), a posture an owner can keep on purpose. Project-scoped, as world-open-ingress is; the second probe is the project's own `default` network, which the stack peers with rather than plants. The name carries no cluster_prefix so a declaration can spell the object without knowing it. Inert for the audit until the stream's declared-intent slice lands: until then the finding publishes and no case grades it",
+      "fixture": "mtu-peer-declared, a custom-mode VPC at MTU 8896 with no subnet, peered both ways with `default` (MTU 1460): the networking SOP's 2.4 peered-MTU mismatch (object NetworkPeering/default--mtu-peer-declared), a posture an owner can keep on purpose. Project-scoped, as world-open-ingress is; the second probe is the project's own `default` network, which the stack peers with rather than plants. The name carries no cluster_prefix so a declaration can spell the object without knowing it: the pool project's GitOps knowledge/ note declares the pair on purpose, and the networking audit lists it under Declared intent rather than as a finding",
       "state": [
         {
           "subject": "network/mtu-peer-declared*",
