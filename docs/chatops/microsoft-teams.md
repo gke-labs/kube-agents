@@ -110,3 +110,10 @@ A reference Microsoft Teams app manifest template is included at [`docs/samples/
 1. Replace `${TEAMS_APP_ID}` with your Microsoft Application (Client) ID.
 2. Package `manifest.json` together with your `color.png` (192x192) and `outline.png` (32x32) icons into a ZIP archive.
 3. In Microsoft Teams, navigate to **Apps** -> **Manage your apps** -> **Upload an app** to install the bot into the target team or conversation so the bot is authorized to post outbound activities to that `conversation.id`.
+
+---
+
+## Step 5: Talk to the Bot
+
+- **Personal chat**: every message you send to the bot reaches it; no mention is needed.
+- **Channels and group chats**: Teams delivers to a bot only the messages that mention it. Type `@` and pick the bot from the suggestion list so the name becomes a mention chip; plain text that merely reads `@Kage` is not a mention, and a reply inside a thread needs its own mention too. A message without one is never sent to the bot, so nothing in the gateway or broker logs will show it. The adapter strips the bot's own mention before the agent reads the text, and a thread reply reaches the same conversation session as the post that started it.
