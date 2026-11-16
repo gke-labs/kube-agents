@@ -165,12 +165,6 @@ func incidentThread(key string) (incidentAddress, bool) {
 			return incidentAddress{}, false
 		}
 		return incidentAddress{chatID: channel, threadID: ts}, true
-	case strings.HasPrefix(key, incidentTeamsPrefix):
-		// A Teams channel thread is its own conversation id, and the relay
-		// stores its post under that id as both chat and thread: there is
-		// no chat to split off a Teams id.
-		id := key[len(incidentTeamsPrefix):]
-		return incidentAddress{chatID: id, threadID: id}, true
 	case strings.HasPrefix(key, incidentGchatPrefix):
 		// A thread in a DM home is keyed gchat:dm/<thread name>; the relay
 		// stores it by the thread name alone, as in any space.
@@ -180,6 +174,15 @@ func incidentThread(key string) (incidentAddress, bool) {
 			return incidentAddress{}, false
 		}
 		return incidentAddress{chatID: space, threadID: thread}, true
+	case strings.HasPrefix(key, incidentTeamsPrefix):
+		// A Teams channel thread is its own conversation id; the relay
+		// stores the row under (thread, thread), since _thread_chat_id has
+		// no chat to split off a Teams id.
+		thread := key[len(incidentTeamsPrefix):]
+		if !strings.Contains(strings.ToLower(thread), lib.TeamsThreadToken) {
+			return incidentAddress{}, false
+		}
+		return incidentAddress{chatID: thread, threadID: thread}, true
 	}
 	return incidentAddress{}, false
 }

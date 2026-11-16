@@ -5201,7 +5201,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		// And its callers: one that could set them would choose who holds
-		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
@@ -5210,6 +5210,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyA2AReportsCallersEnvVar,
 		a2aReportStoreURLEnvVar,
 		a2aReportStoreTokenFileEnvVar,
+		// One that could set the Teams caller word would open the broker's
+		// Teams routes to the a2a-chat role on an install whose Teams stays
+		// on Hermes, which is the reach the word exists to close.
+		credentialProxyTeamsA2ACallerEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",

@@ -282,7 +282,7 @@ func TestTeamsJoinsTheNotifyPlatforms(t *testing.T) {
 	}
 	// A home the gateway refuses (NewTeamsNotifier: whitespace inside, or a
 	// URL) drops the whole route there, so the agent is told of neither.
-	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD"} {
+	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2"} {
 		agent.Spec.Integration.Teams.HomeChannel = malformed
 		if got := a2aNotifyPlatforms(agent); len(got) != 0 {
 			t.Errorf("notify platforms %v with home %q, which the gateway refuses", got, malformed)
@@ -362,5 +362,14 @@ func TestTheBrokerLearnsTheTeamsConsumerFromTheOperator(t *testing.T) {
 	t.Setenv(a2aTeamsBackendEnvVar, "")
 	if _, ok := brokerEnvOf(teamsTestAgent(true))[credentialProxyTeamsA2ACallerEnvVar]; ok {
 		t.Errorf("%s rendered while Teams is on Hermes", credentialProxyTeamsA2ACallerEnvVar)
+	}
+}
+
+// TestTheExecTierDropsTheTeamsCallerWord: the exec tier runs no relay and
+// refuses the Teams routes, so the word that opens them to the gateway is not
+// copied onto its pods, and flipping the Teams switch rolls no exec replica.
+func TestTheExecTierDropsTheTeamsCallerWord(t *testing.T) {
+	if !credentialProxyExecTierEnvDropped[credentialProxyTeamsA2ACallerEnvVar] {
+		t.Fatalf("%s is copied onto exec-tier pods", credentialProxyTeamsA2ACallerEnvVar)
 	}
 }

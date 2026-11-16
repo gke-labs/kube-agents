@@ -52,6 +52,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -720,13 +721,15 @@ const (
 	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
 	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
 	// The gateway's rule for a Teams home conversation id
-	// (a2a/gateway/teams.go, teamsIsConversationID): no whitespace inside,
-	// and one of the two shapes Teams issues, "19:…" (a channel, group or
-	// meeting chat) or "a:…" (a personal chat); a Chat space name, a Slack
-	// channel id or a URL is neither.
-	a2aTeamsHomeWhitespace     = " \t\r\n"
+	// (a2a/gateway/teams.go, teamsIsConversationID): one of the two shapes
+	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
+	// personal chat), with something after the prefix, no whitespace of any
+	// script inside, and none of the characters the broker's activity path
+	// refuses (a decoded channel link carries "/General?groupId=…"); a Chat
+	// space name, a Slack channel id or a URL is none of these.
 	a2aTeamsHomeGroupPrefix    = "19:"
 	a2aTeamsHomePersonalPrefix = "a:"
+	a2aTeamsHomeRefused        = "/?#%\\"
 	a2aTeamsTokenPathEnvVar    = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
@@ -1752,13 +1755,15 @@ func a2aTeamsHomeConversation(agent *agentv1alpha1.PlatformAgent) string {
 		return ""
 	}
 	home := strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel)
-	if home == "" || strings.ContainsAny(home, a2aTeamsHomeWhitespace) {
+	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
 		return ""
 	}
-	if !strings.HasPrefix(home, a2aTeamsHomeGroupPrefix) && !strings.HasPrefix(home, a2aTeamsHomePersonalPrefix) {
-		return ""
+	for _, prefix := range []string{a2aTeamsHomeGroupPrefix, a2aTeamsHomePersonalPrefix} {
+		if body, ok := strings.CutPrefix(home, prefix); ok && body != "" {
+			return home
+		}
 	}
-	return home
+	return ""
 }
 
 // a2aTeamsHasHome is whether Teams' chat.notify route is armed with a home
@@ -7248,8 +7253,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		chatMounts, chatVolumes = a2aChatRelayToken()
 	}
 	// The Teams backend, beside Chat's or alone: the same relay token, the
-	// Teams relay URL, and the CR's gates on Chat's terms (a2aAllowlist,
-	// allowAllUsers). The tenant and home channel render only when set; the
+	// Teams relay URL, the CR's allowlist on Chat's terms (a2aAllowlist) and
+	// its allow-all switch as the CRD defines it (an empty list with the
+	// switch off admits nobody). The tenant and home channel render only when set; the
 	// card switch only when off, so a default CR renders nothing extra.
 	if a2aTeamsArmed(agent) {
 		teams := agent.Spec.Integration.Teams

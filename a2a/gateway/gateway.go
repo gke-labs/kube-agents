@@ -502,14 +502,14 @@ func New(o Options) (*Gateway, error) {
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
 		if o.Config.A2ADoorArmed() {
-			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the two doors and the console can reach this install (the read route still reports inject-only)")
 		} else {
-			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the eval door can reach this install (inject-only)")
 		}
 	} else if backend == a2aBackend {
-		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair or Chat relay is armed, " +
+		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 			"so nothing but the A2A door and the console can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the

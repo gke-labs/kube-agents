@@ -393,7 +393,7 @@ func TestIncidentAddresses(t *testing.T) {
 		{"gchat:dm/spaces/DDD/threads/TTT", "", []incidentAddress{{"spaces/DDD", "spaces/DDD/threads/TTT"}, {"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
 		{"slack:C0HOME", "", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
 		// Teams: a personal chat and a group chat are one conversation each;
-		// a channel thread is keyed by its own id, stored as (id, id).
+		// a channel thread is looked up by the (thread, thread) row the relay stores.
 		{"teams:a:1UxxASmI", "", nil},
 		{"teams:19:group@thread.v2", "", nil},
 		{"teams:19:chan@thread.tacv2", "", nil},

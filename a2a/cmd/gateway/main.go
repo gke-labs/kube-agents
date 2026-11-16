@@ -1,4 +1,4 @@
-// The a2a chatops gateway: chat in (every armed backend of Google Chat, Slack
+// The a2a chatops gateway: chat in (every armed backend of Google Chat, Slack, Teams
 // and Discord, behind one mux beside the console), tasks on the bus out.
 //
 // PLAYGROUND POSTURE: bot token as a plain Secret, no exporter, no breaker,

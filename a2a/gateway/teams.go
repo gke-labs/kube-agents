@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // The Microsoft Teams backend rides the credential proxy's Teams relay, the
@@ -47,10 +48,14 @@ const (
 	teamsChannelSuffix       = "@thread.tacv2"
 	teamsLegacyChannelSuffix = "@thread.skype"
 	// The two shapes a Teams conversation id takes: "19:…" for a channel,
-	// a group chat or a meeting chat, "a:…" for a personal chat. The operator
-	// applies the same rule to teams.homeChannel (a2aTeamsHomeConversation).
+	// a group chat or a meeting chat, "a:…" for a personal chat; something
+	// must follow the prefix, no whitespace of any script may sit inside,
+	// and the characters the broker's activity path refuses are out. The
+	// operator applies the same rule to teams.homeChannel
+	// (a2aTeamsHomeConversation).
 	teamsGroupConversationPrefix    = "19:"
 	teamsPersonalConversationPrefix = "a:"
+	teamsConversationRefused        = "/?#%\\"
 
 	// teamsDefaultServiceURL is where a reply goes when the conversation's
 	// own regional serviceUrl is not known; Microsoft routes it.
@@ -77,6 +82,7 @@ const (
 	teamsCardColumnWidth = 1
 	teamsCardBullet      = "• "
 	teamsCodeFence       = "```"
+	teamsCodeTick        = "`"
 	teamsBulletDash      = "- "
 	teamsBulletStar      = "* "
 	teamsPipe            = "|"
@@ -647,10 +653,15 @@ func (a *TeamsAdapter) PostNotify(space, thread, text string) (message, landed s
 // a Slack channel id pasted into teams.homeChannel is refused here rather
 // than at every post.
 func teamsIsConversationID(id string) bool {
-	if id == "" || strings.ContainsAny(id, " \t\r\n") {
+	if id == "" || strings.ContainsAny(id, teamsConversationRefused) || strings.IndexFunc(id, unicode.IsSpace) >= 0 {
 		return false
 	}
-	return strings.HasPrefix(id, teamsGroupConversationPrefix) || strings.HasPrefix(id, teamsPersonalConversationPrefix)
+	for _, prefix := range []string{teamsGroupConversationPrefix, teamsPersonalConversationPrefix} {
+		if body, ok := strings.CutPrefix(id, prefix); ok && body != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // teamsIsChannelID reports a channel conversation id with no thread suffix:
@@ -705,6 +716,21 @@ func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, e
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the activity messageID in the thread when one is
+// named, else in home, edited in place, so a keyed home post (an alert its
+// triage updates) stays one message rather than one per update.
+func (a *TeamsAdapter) EditNotifyMessage(home, thread, messageID string, m OutMessage) error {
+	conversation := strings.TrimSpace(thread)
+	if conversation == "" {
+		conversation = strings.TrimSpace(home)
+	}
+	if !teamsIsConversationID(conversation) {
+		return fmt.Errorf("teams: not a conversation id: %q", conversation)
+	}
+	return a.EditMessage(teamsConversationID(conversation), messageID, m)
 }
 
 // Roster reports an incomplete, empty membership: the passthrough serves no
@@ -807,19 +833,24 @@ func teamsActivitySummary(text string) string {
 
 // teamsTableStart reports whether header and the line after it open a
 // pipe table by GitHub's rule: the next line is a delimiter row (one or
-// more dashes per cell, optional alignment colons; slackTableSepRE), it
-// carries a pipe unless the table has one column, and its cell count is the
-// header's. A pipe-led line followed by a thematic break is text.
+// more dashes per cell, optional alignment colons; slackTableSepRE) that
+// carries a pipe, as Slack's scanner requires, and its cell count is the
+// header's. A line followed by a bare thematic break is text, whatever
+// pipes it carries.
 func teamsTableStart(header, next string) bool {
 	next = strings.TrimSpace(next)
-	if !slackTableSepRE.MatchString(next) {
+	if !strings.Contains(next, teamsPipe) || !slackTableSepRE.MatchString(next) {
 		return false
 	}
-	cells := len(teamsTableCells(header))
-	if !strings.Contains(next, teamsPipe) && cells != 1 {
-		return false
-	}
-	return len(teamsTableCells(next)) == cells
+	return len(teamsTableCells(next)) == len(teamsTableCells(header))
+}
+
+// teamsIsFence reports a fenced-code delimiter line: the fence with no
+// backtick after it (CommonMark), so a line that opens and closes an inline
+// triple-backtick span is a paragraph, not a block boundary.
+func teamsIsFence(stripped string) bool {
+	rest, ok := strings.CutPrefix(stripped, teamsCodeFence)
+	return ok && !strings.Contains(rest, teamsCodeTick)
 }
 
 // teamsTableCells is Slack's tableCells (one border pipe off each end, an
@@ -887,7 +918,25 @@ func teamsMarkdownToCard(text string) map[string]any {
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		stripped := strings.TrimSpace(line)
-		if !inCode && strings.Contains(stripped, teamsPipe) {
+		if fence := teamsIsFence(stripped); fence || inCode {
+			// A fence opens or closes a block before any table rule runs, so
+			// a fence line with a pipe in its info string is never a row.
+			if fence {
+				flushTable()
+				if inCode {
+					inCode = false
+					body = append(body, textBlock(strings.Join(code, "\n"), map[string]any{"fontType": teamsCardMonospace}))
+					code = nil
+				} else {
+					inCode = true
+					code = nil
+				}
+				continue
+			}
+			code = append(code, line)
+			continue
+		}
+		if strings.Contains(stripped, teamsPipe) {
 			switch {
 			case len(table) > 0:
 				// A row of a running table; a stray delimiter row is skipped.
@@ -904,21 +953,6 @@ func teamsMarkdownToCard(text string) map[string]any {
 			}
 		}
 		flushTable()
-		if strings.HasPrefix(stripped, teamsCodeFence) {
-			if inCode {
-				inCode = false
-				body = append(body, textBlock(strings.Join(code, "\n"), map[string]any{"fontType": teamsCardMonospace}))
-				code = nil
-			} else {
-				inCode = true
-				code = nil
-			}
-			continue
-		}
-		if inCode {
-			code = append(code, line)
-			continue
-		}
 		if stripped == "" {
 			continue
 		}

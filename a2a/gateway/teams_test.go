@@ -200,6 +200,23 @@ func TestTeamsMarkdownTableRules(t *testing.T) {
 	if b := body("| a | b |\n---\nrule"); len(b) != 3 || b[0]["type"] != teamsCardTextBlock {
 		t.Fatalf("thematic break read as a table: %v", b)
 	}
+	// Prose with an escaped pipe, or a one-cell pipe line, followed by a
+	// rule: text, not a one-column table.
+	if b := body(`Run cmd_a \| cmd_b` + "\n---\nnext"); len(b) != 3 || b[0]["type"] != teamsCardTextBlock {
+		t.Fatalf("escaped pipe + rule read as a table: %v", b)
+	}
+	if b := body("| note |\n---"); b[0]["type"] != teamsCardTextBlock {
+		t.Fatalf("one-cell line + rule read as a table: %v", b)
+	}
+	// A fence is a line of backticks with no backtick after it: an inline
+	// triple-backtick span at the start of a line is text, and a fence
+	// whose info string carries a pipe, right after a table, is a fence.
+	if b := body("```kubectl get pods``` lists the pods\nnext line"); len(b) != 2 || b[0]["type"] != teamsCardTextBlock || b[0]["text"] != "```kubectl get pods``` lists the pods" {
+		t.Fatalf("inline triple-backtick span opened a block: %v", b)
+	}
+	if b := body("| a | b |\n|--|--|\n| 1 | 2 |\n```sh | head\nls\n```\nafter"); len(b) != 3 || b[0]["type"] != teamsCardTable || b[1]["fontType"] != teamsCardMonospace || b[1]["text"] != "ls" || b[2]["text"] != "after" {
+		t.Fatalf("fence after a table: %v", b)
+	}
 	if b := body("| a | b |\n| - |\n| 1 | 2 |"); b[0]["type"] != teamsCardTextBlock {
 		t.Fatalf("cell-count mismatch read as a table: %v", b)
 	}
@@ -207,6 +224,30 @@ func TestTeamsMarkdownTableRules(t *testing.T) {
 	// across a cut arrives as "a | b" rows.
 	if b := body("a | b\n--|--\n1 | 2"); len(b) != 1 || b[0]["type"] != teamsCardTable || len(b[0]["rows"].([]map[string]any)) != 2 {
 		t.Fatalf("borderless table: %v", b)
+	}
+}
+
+// TestTeamsEditNotifyMessageEditsInPlace: a keyed home post (an alert its
+// triage updates) is one activity edited through the relay's PUT, in the
+// thread when one is named and in home otherwise, never a new post.
+func TestTeamsEditNotifyMessageEditsInPlace(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	var editor notifyChatEditor = a
+	home := "19:11fb65f1e6c941b382a410dd0e383724@thread.tacv2"
+	if err := editor.EditNotifyMessage(home, home+";messageid=1794603936403", "act-9", OutMessage{Text: "triage: resolved"}); err != nil {
+		t.Fatalf("edit in thread: %v", err)
+	}
+	if err := editor.EditNotifyMessage(home, "", "act-7", OutMessage{Text: "still looking"}); err != nil {
+		t.Fatalf("edit in home: %v", err)
+	}
+	if err := editor.EditNotifyMessage("spaces/AAA", "", "act-1", OutMessage{Text: "x"}); err == nil {
+		t.Fatal("a non-Teams home accepted")
+	}
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	if len(relay.apiCall) != 2 || relay.apiCall[0]["method"] != http.MethodPut || relay.apiCall[0]["endpoint"] != "v3/conversations/"+home+";messageid=1794603936403/activities/act-9" || relay.apiCall[1]["endpoint"] != "v3/conversations/"+home+"/activities/act-7" {
+		t.Fatalf("api calls %v", relay.apiCall)
 	}
 }
 
@@ -574,7 +615,7 @@ func TestTeamsNotifyRoutePostsIntoTheConversation(t *testing.T) {
 	}
 	// The home must be a Teams conversation id: another backend's key or a
 	// URL is refused at start, not at every post.
-	for _, bad := range []string{"spaces/AAA", "C0123ABCD", "https://teams.microsoft.com/l/channel/x", "gchat:spaces/AAA"} {
+	for _, bad := range []string{"spaces/AAA", "C0123ABCD", "https://teams.microsoft.com/l/channel/x", "gchat:spaces/AAA", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", `19:abc\x@thread.tacv2`} {
 		if _, err := NewTeamsNotifier(a, bad, nil); err == nil {
 			t.Fatalf("home %q accepted", bad)
 		}
