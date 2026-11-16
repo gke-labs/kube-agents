@@ -3591,7 +3591,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
 		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
-		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
+		"chat.board.reply.gateway.>",
+		// Attested trigger ingress (#5617): every source's submissions and
+		// status queries, read only.
+		"a2a.trigger.*.submit", "a2a.trigger.*.status",
+		"_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -3614,6 +3618,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// itself, so a hop grant here would be authority with no caller.
 		"$KV.cap.root.*",
 		"chat.board",
+		// The answers to trigger submissions and status queries, in the
+		// trigger reply namespace and never a source's _INBOX (#5617).
+		"a2a.trigger.reply.>",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read: the directory's subject list and a

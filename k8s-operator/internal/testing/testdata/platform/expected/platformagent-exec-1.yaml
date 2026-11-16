@@ -3873,6 +3873,7 @@ stringData:
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
+                  "a2a.trigger.reply.>",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
                   "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3926,6 +3927,8 @@ stringData:
                   "chat.notify.slack",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
+                  "a2a.trigger.*.submit",
+                  "a2a.trigger.*.status",
                   "_INBOX.gateway.>"
                 ]
                 deny = [

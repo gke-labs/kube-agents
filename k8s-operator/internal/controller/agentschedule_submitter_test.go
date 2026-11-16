@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,5 +208,142 @@ func TestTheSubmitterNeedsExactlyOnePlatformAgent(t *testing.T) {
 	sub := newNATSScheduleSubmitter(newNATSCardPublisher(reader), reader)
 	if _, err := sub.Submit(context.Background(), submitterSubmission()); !errors.Is(err, ErrScheduleGatewayUnavailable) {
 		t.Fatalf("err = %v, want gateway unavailable with no PlatformAgent", err)
+	}
+}
+
+// The schedule source's grants (#5617, six approved): with schedules on, the
+// operator publishes the schedule source's submit and status subjects and
+// reads its reply namespace; the gateway reads every source's two subjects
+// and answers in the reply namespace. With schedules off the operator holds
+// none of them.
+func TestTheTriggerGrantsFollowTheScheduleSwitch(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	id, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("no operator identity")
+	}
+	for _, g := range append(append([]string(nil), id.publish...), id.subscribe...) {
+		if strings.HasPrefix(g, "a2a.trigger.") {
+			t.Errorf("with schedules off the operator holds %q", g)
+		}
+	}
+	t.Setenv(AgentSchedulesEnvVar, "true")
+	id, _ = operatorIdentity()
+	for _, want := range []string{triggerSubmitSubject, triggerStatusSubject} {
+		if !slices.Contains(id.publish, want) {
+			t.Errorf("operator publish lacks %q", want)
+		}
+	}
+	if !slices.Contains(id.subscribe, triggerReplyPrefix+">") {
+		t.Errorf("operator subscribe lacks %q", triggerReplyPrefix+">")
+	}
+	gw := gatewayIdentity(a2aTestAgent(), "kubeagents-system")
+	for _, want := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+		if !slices.Contains(gw.subscribe, want) {
+			t.Errorf("gateway subscribe lacks %q", want)
+		}
+	}
+	if !slices.Contains(gw.publish, "a2a.trigger.reply.>") {
+		t.Error("gateway publish lacks a2a.trigger.reply.>")
+	}
+}
+
+// Under the rendered grants of both sides, on a real server: the operator's
+// submitter round-trips a submission and a status query with a gateway, and
+// may not publish another source's subjects or read another source's
+// replies.
+func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(AgentSchedulesEnvVar, "true")
+	op, _ := operatorIdentity()
+	gw := gatewayIdentity(a2aTestAgent(), "kubeagents-system")
+	s, err := natsserver.NewServer(&natsserver.Options{Port: -1, Users: []*natsserver.User{
+		{Username: "operator", Password: "operator", Permissions: &natsserver.Permissions{
+			Publish:   &natsserver.SubjectPermission{Allow: op.publish},
+			Subscribe: &natsserver.SubjectPermission{Allow: op.subscribe},
+		}},
+		{Username: "gateway", Password: "gateway", Permissions: &natsserver.Permissions{
+			Publish:   &natsserver.SubjectPermission{Allow: gw.publish, Deny: gw.denyPublish},
+			Subscribe: &natsserver.SubjectPermission{Allow: gw.subscribe, Deny: gw.denySubscribe},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(5 * time.Second) {
+		t.Fatal("nats server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+
+	var mu sync.Mutex
+	var violations []string
+	operator, err := nats.Connect(s.ClientURL(), nats.UserInfo("operator", "operator"), nats.CustomInboxPrefix("_INBOX."+a2aOperatorBusUser),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			mu.Lock()
+			violations = append(violations, err.Error())
+			mu.Unlock()
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(operator.Close)
+	gateway, err := nats.Connect(s.ClientURL(), nats.UserInfo("gateway", "gateway"), nats.CustomInboxPrefix("_INBOX.gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gateway.Close)
+	answer := func(m *nats.Msg) {
+		var data []byte
+		if m.Subject == triggerSubmitSubject {
+			data, _ = json.Marshal(triggerSubmitReplyWire{TaskID: "task-1"})
+		} else {
+			data, _ = json.Marshal(triggerStatusReplyWire{Found: true, State: "working"})
+		}
+		_ = m.Respond(data)
+	}
+	for _, subject := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+		if _, err := gateway.Subscribe(subject, answer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gateway.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Namespace: "kubeagents-system", Name: "platform-agent"}}
+	reader := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).Build()
+	bus := newNATSCardPublisher(reader)
+	bus.conns["kubeagents-system/platform-agent"] = operator
+	sub := newNATSScheduleSubmitter(bus, reader)
+	if task, err := sub.Submit(context.Background(), submitterSubmission()); err != nil || task != "task-1" {
+		t.Fatalf("submit under the rendered grants: task %q, %v", task, err)
+	}
+	if st, err := sub.State(context.Background(), submitterSchedule(), "task-1"); err != nil || !st.Found {
+		t.Fatalf("status under the rendered grants: %+v, %v", st, err)
+	}
+
+	_ = operator.Publish("a2a.trigger.drift-detector.submit", []byte("{}"))
+	if _, err := operator.SubscribeSync("a2a.trigger.reply.drift-detector.>"); err != nil {
+		t.Fatal(err)
+	}
+	_ = operator.FlushTimeout(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(violations)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	joined := strings.Join(violations, "\n")
+	for _, s := range []string{"a2a.trigger.drift-detector.submit", "a2a.trigger.reply.drift-detector.>"} {
+		if !strings.Contains(joined, s) {
+			t.Errorf("the operator was not refused on %q; got:\n%s", s, joined)
+		}
 	}
 }
