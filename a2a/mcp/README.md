@@ -90,6 +90,15 @@ Names are this server's memory only, and they're shared:
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
 
+## Sending a turn to an AgentProfile
+
+`send_message` takes two optional fields that send the turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can:
+
+- `addressee`: the profile's name, for example `cluster`. It must be one subject token: no spaces, dots or wildcards.
+- `parameters`: the profile's task parameters, an object of string values, for `cluster` its `project`, `location` and `cluster`. They are refused without an `addressee`.
+
+Both go into the console frame as the gateway's `ConsoleInFrame` reads them (`addressee`, `parameters`). Without them the frame is the same as before. A stop or a bare `/session` with an `addressee` is refused, since those are commands for the conversation rather than tasks. Everything else is the gateway's to check: it refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards on `DIRECTORY` by profile.
+
 ## Card reports and poll_events
 
 On the Hermes bridge's `api` executor, a console or MCP turn that files Kanban cards holds the turn open while its cards run (`waitForKanbanCards`), streams card `subtask` steps (`steps` artifact) and `progress` updates in turn, and folds settled card results directly into the task's `result` artifact, clearing `cardsFiled` so no `handoff` artifact or `cardsPending: true` result flag is emitted when the cards settle in turn. When a turn instead ends with unsettled cards (under the `cli` executor, when a card is still open at turn exit), the card's report arrives on the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card in `replyTo`. A delegation chain's terminal result is posted there too, as a `result` frame; the server doesn't keep those, since the chain's tasks hold the result and `send_message` and `task_control` read it there. A turn in progress reads one flag off its own result frame, below.
