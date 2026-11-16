@@ -1,6 +1,6 @@
 ---
 title: Upgrade
-description: Moving an existing install to a newer release with upgrade.sh — its modes, how the target version is resolved, and what a run refuses before any of the new release is applied.
+description: Moving an existing install to a newer release with upgrade.sh — its upgrade modes, how the target version is resolved, and what a run refuses before any of the new release is applied.
 ---
 
 `upgrade.sh` is the Day-2 engine for an install `install.sh` created. It re-applies the same
@@ -37,7 +37,7 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 helm history kube-agents -n kubeagents-system
 ```
 
-The third command prints the install's `spec.mode`; an empty line means `today`.
+The third command prints the install's `spec.mode` as the release you run now stores it. An empty line or `today` means the install runs without the A2A stack, and the upgrade adds it: read [Moving to the A2A stack](#moving-to-the-a2a-stack) first. `next` means it already has the stack.
 
 Read the release notes for every release between the one you run and the one you are moving to.
 
@@ -120,7 +120,6 @@ Each path is a `jq` path on `values.json`.
 | `CLUSTER_NAME`                                   | `.platformAgent.harness.clusterName`                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `REGION`                                         | `.platformAgent.harness.location`                                                     | Copy it exactly. It can be a zone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `NAMESPACE`                                      | the release namespace                                                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `PLATFORM_AGENT_MODE`                            | `.platformAgent.mode`                                                                 | Empty means `today`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `PLATFORM_AGENT_STORAGE_SIZE`                    | `.platformAgent.storage.size`                                                         | Empty means the operator default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `MODEL_PROVIDER`                                 | `.litellm.modelProvider`                                                              |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `MODEL_DEFAULT_NAME`                             | `.litellm.modelDefaultName`                                                           |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -261,8 +260,9 @@ A row labelled `pending` is for a change that had not shipped in a release when 
 | Release | Change                                                                     | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | pending | session pods request less, and the requests are configurable               | Each A2A session pod requests 150m CPU and 320Mi of memory, down from 250m and 512Mi: a heavy-turn run peaked at 180Mi. At the default cap of 10 that reserves 1.5 CPU and 3.2Gi, not 2.5 and 5Gi. An install whose sessions need more sets `spec.harness.tuning.sessionResources` (chart: `platformAgent.harness.tuning.sessionResources`); each key it sets replaces its default, and a request set alone above its default limit raises the limit to match. On Autopilot without Pod bursting, its per-pod minimums of 250m and 512Mi still apply, so nothing changes there.                                                                                                                                                                                                                                                                                                                                                  |
+| pending | `system-metadata` and sandbox `sshd` claims request `4Gi` on new installs  | New `system-metadata` and `sshd-<agent>-shell-0` claims request `4Gi` instead of `1Gi` so C3-only clusters using `hyperdisk-balanced` meet its 4 GB minimum. Existing claims keep `1Gi`; the operator orphan-recreates `<agent>-shell` once for its `volumeClaimTemplates` update while leaving the running sandbox pod in place. The chart's `quotaPreflight` counts `6Gi` more `requests.storage` (`228Gi` default, `148Gi` at one NATS server, `236Gi` with Hindsight): raise a tight namespace storage `ResourceQuota` by `6Gi` before `helm upgrade`.                                                                                                                                                                                                                                                                                                                                                                       |
 | pending | the A2A bus's NATS image is pinned by version and digest                   | The bus runs `nats:2.10.29-alpine` pinned by digest, the image the floating `2.10-alpine` tag has pointed at since 2026-01-28, so no server version changes. The upgrade rolls every bus once because the image reference changes: a three-server bus one server at a time while R3 streams keep serving, and a one-server bus with a brief restart. An install that sets `a2aBus.images.nats` or `A2A_NATS_IMAGE` keeps its own image.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 0.33.0  | Slack joins Google Chat on the A2A gateway                                 | Google Chat and Slack both enabled. An operator upgrade alone moves Slack to the gateway: the broker drops the Slack tokens and the Hermes Slack platform turns off. Slash commands return Slack's timeout error. A `/sethome` home channel does not carry over. See [After the switch: the Slack app](#after-the-switch-the-slack-app). A full upgrade refuses an email in the Slack allowlist, a home channel that is no channel id, and several bot tokens, and warns on an empty home channel; `operator` and `harness` runs do neither. The gateway serves one Slack workspace: install one bot token from one workspace, or turn Slack off. An alert goes to one platform with a home channel, Chat first; with none, Google Chat's digest keeps it.                                                                                                                                                                       |
+| 0.33.0  | Slack joins Google Chat on the A2A gateway                                 | Google Chat and Slack both enabled. An operator upgrade alone moves Slack to the gateway: the broker drops the Slack tokens and the Hermes Slack platform turns off. Slash commands return Slack's timeout error. A `/sethome` home channel does not carry over. See [After the switch: the Slack app](#after-the-upgrade-the-slack-app). A full upgrade refuses an email in the Slack allowlist, a home channel that is no channel id, and several bot tokens, and warns on an empty home channel; `operator` and `harness` runs do neither. The gateway serves one Slack workspace: install one bot token from one workspace, or turn Slack off. An alert goes to one platform with a home channel, Chat first; with none, Google Chat's digest keeps it.                                                                                                                                                                      |
 | 0.32.0  | a newly bound AgentProfile waits until the bus has loaded it               | On a three-server bus the upgrade rolls the servers once, one at a time, as the profile list joins their pod template; R3 streams keep serving through it. After that, a newly bound profile's card and dispatch wait until every bus server has loaded its config: about a minute on one server, one roll on three. On one server, two profile changes inside one kubelet sync end in a restart of the bus pod about four minutes later (a Normal `BusConfigReloadFolded` Event), which drops bus connections as any bus restart does. `CardPublished` reports the wait as `False` with reason `BusConfigPending`. Rolling back the operator rolls a three-server bus once more.                                                                                                                                                                                                                                                |
 | 0.32.0  | every install runs the A2A stack                                           | `spec.mode` is deprecated and ignored. An install that ran `today`, or no mode, gets the A2A stack: the NATS bus, the A2A gateway, callout, verifier, console, `hermes-bridge` container and the `<release namespace>-profiles` Namespace. Three NATS servers need three nodes: a Standard cluster that cannot reach three sets `platformAgent.harness.tuning.busReplicas: 1` before this upgrade, since an existing bus keeps its count. Google Chat moves to the gateway; for Slack, see the row "Slack joins Google Chat on the A2A gateway". Before upgrading, check that `SLACK_ALLOWED_USERS` holds member IDs, not emails, that `SLACK_BOT_TOKEN` is one workspace's, and that a `/sethome` home channel is in `GOOGLE_CHAT_HOME_CHANNEL`. The footprint grows ([Footprint](/kube-agents/install/prerequisites/#footprint)); an existing bus restarts once. No switch back exists.                                        |
 | 0.31.0  | the A2A bus caps `TASKS` and `TOPICS-JOURNAL` lower                        | `spec.mode: next` only. A new bus creates `TASKS` at 8 GiB and `TOPICS-JOURNAL` at 1 GiB. An existing bus keeps 20 and 5 GiB, since provisioning does not edit a stream: the operator records a `Warning` Event, reason `A2ABusStreamCapAboveRender`, with the `nats stream edit` that lowers each and whether applying it now is safe. Run it with your own NATS credentials.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -277,7 +277,7 @@ A row labelled `pending` is for a change that had not shipped in a release when 
 | 0.26.0  | requests rise for the Autopilot clamp                                      | The operator requests 100m CPU and 256Mi (from 50m and 128Mi). A `next` agent pod's `hermes-bridge` container requests 250m and 512Mi, limits 1 CPU and 1Gi; the web console and the `next` console 100m and 128Mi, limits 500m and 256Mi; hindsight-api 500m and 2Gi (from 250m and 1Gi). Autopilot without bursting sets limits equal to requests, so each now fits the request it runs under. Autopilot bills the requests; the chart's quota check counts the operator, the web console and hindsight-api, and under `platformAgent.mode: next` the bridge and the `next` console as well. The bridge and both consoles set their Go soft memory limit from the admitted limit, and a `cli` bridge refuses an answer over 8 MiB.                                                                                                                                                                                             |
 | 0.26.0  | a workload's repeat events fold into one incident by default               | `INCIDENT_WORKLOAD_DEDUP_SECONDS` is on at `3600` on every install: within an hour of an alert, a later Warning event for the same workload, or a later Critical after a Critical, posts nothing and starts no triage turn ([one incident per workload](/kube-agents/concepts/chatops/#one-incident-per-workload)). The chart renders the entry into the CR's `spec.deployment.env`, so the agent pod and the credential-proxy pod restart once, and entries added to that list by hand are replaced on the first apply; move them to `platformAgent.deployment.env` first. `platformAgent.deployment.incidentWorkloadDedupSeconds: 0` turns it off.                                                                                                                                                                                                                                                                             |
 | 0.26.0  | Google Chat answers can be rated under `spec.mode: next`                   | `spec.mode: next` only. The final answer to each ask on Google Chat ends with 👍 and 👎. A 👎 opens a card only the rater sees for an optional note, and each rating keeps the question and answer in the install's `feedback` bucket for its max age. To turn it off, set `spec.integration.googleChat.answerFeedback: false` (the chart's `platformAgent.integration.googleChat.answerFeedback`). See [Answer feedback](/kube-agents/concepts/chatops/#answer-feedback).                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| 0.25.0  | the A2A bus separates control-plane, console and worker accounts           | `spec.mode: next` only. The bus places control-plane services in the `TRUSTED` account, the web console and its MCP server (`console-mcp`) in `CONSOLE`, and agent and session workers in `APP`. On first start the bus moves its existing JetStream file store from `/data/jetstream/APP` to `/data/jetstream/TRUSTED` before `nats-server` opens it, so existing streams and key-value buckets stay in place. A rollback goes through `today` and moves `/data/jetstream/TRUSTED` back to `/data/jetstream/APP` before returning to `next`: the earlier bus cannot resolve the `TRUSTED` folder and never becomes Ready. `upgrade.sh` refuses a direct rollback without `--allow-breaking-downgrade`; [the rollback page](/kube-agents/deploy/rollback/#a-bus-left-down-by-a-rollback-under-next) has the steps.                                                                                                               |
+| 0.25.0  | the A2A bus separates control-plane, console and worker accounts           | `spec.mode: next` only. The bus places control-plane services in the `TRUSTED` account, the web console and its MCP server (`console-mcp`) in `CONSOLE`, and agent and session workers in `APP`. On first start the bus moves its existing JetStream file store from `/data/jetstream/APP` to `/data/jetstream/TRUSTED` before `nats-server` opens it, so existing streams and key-value buckets stay in place. A rollback goes through `today` and moves `/data/jetstream/TRUSTED` back to `/data/jetstream/APP` before returning to `next`: the earlier bus cannot resolve the `TRUSTED` folder and never becomes Ready. `upgrade.sh` refuses a direct rollback without `--allow-breaking-downgrade`; [the rollback page](/kube-agents/deploy/rollback/#a-bus-left-down-by-a-rollback) has the steps.                                                                                                                          |
 | 0.24.0  | the identity map is sharded and minter policies name one repository        | `spec.mode: next`: the callout's identity map moves from ConfigMap `<agent>-a2a-authmap` to `<agent>-a2a-authmap-0` (and `-1`, `-2`, … where it would not fit one), the old object is deleted, and the callout rolls once. Anything you read by hand reads `-0`. Under GitHub, every managed repository's `<repo>.yaml` in `github-token-minter-config` is rewritten to list that repository alone, and a run that writes to two managed repositories mints a token for each.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | 0.24.0  | the profile ceiling follows `maxInProgress`                                | `spec.mode: next` only. With `spec.harness.tuning.profiles.ceiling` unset, the install-wide AgentProfile ceiling now defaults to `maxInProgress` instead of 8. The ceiling and the profile namespace's pod quota move by `maxInProgress` minus 8. That is down 2 at the default of 6, and down 5 where the stockout investigator sets `maxInProgress: 3`. Above 8 they go up, to the ceiling's maximum of 1000. To keep 8, set `spec.harness.tuning.profiles.ceiling: 8` (the chart's `platformAgent.harness.tuning.profiles.ceiling`). See [`spec.harness.tuning`](/kube-agents/operator/platformagent-crd/#specharnesstuning).                                                                                                                                                                                                                                                                                                 |
 | 0.24.0  | the credential proxy may use 2 CPU                                         | The proxy's CPU limit rises from 1 to 2 CPU, so it no longer waits on a full core from about six clusters. A namespace ResourceQuota on `limits.cpu` needs 1 CPU more. On GKE Autopilot its requests rise to 2 CPU and 2Gi: without bursting, Autopilot sets limits equal to requests, and with bursting, a pod only bursts into capacity that other pods leave unused. Autopilot bills the requests, so this adds about 1.5 vCPU and 1 GiB per install, and a ResourceQuota needs room for them. The chart's quota check counts them. On Standard the requests stay 500m and 1Gi. A `credentialProxy.resources` that set a lower `limits.cpu` or `limits.memory` alone keeps working: the request follows the limit down.                                                                                                                                                                                                       |
@@ -331,8 +331,7 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
   through the install engine: every image tag moves, and every setting in `install.env` is
-  re-rendered. It is the only mode that applies `PLATFORM_AGENT_MODE`, so it is the one that
-  [switches `spec.mode`](#switching-specmode).
+  re-rendered.
 
 The operator moves before the harness because the operator owns the resources the harness runs as.
 Every mode needs the `kube-agents` Helm release to exist in the target namespace; an install
@@ -441,98 +440,92 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 
 ### Slack
 
-On an install with Slack enabled, check that Slack still answers. Which process holds the Slack
-connection depends on `spec.mode` (the third command under [Before you start](#before-you-start)):
+On an install with Slack enabled, check that Slack still answers. The A2A gateway holds the
+connection, with or without Google Chat:
 
-- **Empty or `today`**: the credential broker.
+```bash
+kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system \
+  | grep -E 'slack connected|chat backend stopped'
+```
 
-  ```bash
-  kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
-    | grep -E 'Slack relay enabled|Slack relay initialization failed|Slack bot token authentication failed'
-  ```
+The last line contains `"msg":"slack connected"` and names the bot user and the workspace
+(`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
+and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
+connection failed. One with no `slack connected` before it means the gateway's first call to
+Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
+(a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
+way.
 
-  The pattern matches exactly three kinds of line. `Slack relay enabled workspaces=1` as the last line is
-  the healthy reading: the number counts the bot tokens Slack accepted, one per workspace.
-  `Slack bot token authentication failed` means Slack refused one of the bot tokens; it gives the
-  error type and Slack's error, not which token. `Slack relay initialization failed; retrying`
-  means no bot token was accepted or the Socket Mode connection failed, and the broker tries again
-  every 30 seconds. No output has no reading of its own (on a broker that has run for a while the
-  startup lines may have rotated out of the log): go by the DM test below.
-
-- **`next`**: the A2A gateway.
-
-  ```bash
-  kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system \
-    | grep -E 'slack connected|chat backend stopped'
-  ```
-
-  The last line contains `"msg":"slack connected"` and names the bot user and the workspace
-  (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
-  and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
-  connection failed. One with no `slack connected` before it means the gateway's first call to
-  Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
-  (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
-  way.
-
-  No output means the gateway has not tried Slack yet: it first joins the bus and binds its event
-  relay, and until the provisioning Job has created the `TASKS` stream it waits, logging `waiting
+No output means the gateway has not tried Slack yet: it first joins the bus and binds its event
+relay, and until the provisioning Job has created the `TASKS` stream it waits, logging `waiting
 for the stream to be created`, with the pod reading `0/1` ready. Wait a minute and run the
-  command again. If the pod's restart count is climbing instead, `kubectl logs ... --previous`
-  shows why the last run exited.
+command again. If the pod's restart count is climbing instead, `kubectl logs ... --previous`
+shows why the last run exited.
 
-Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
+Then DM the app a question such as `what clusters can you see?` and wait for the answer (an
 AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
 nothing comes back, [Slack app setup → Verify](/kube-agents/install/slack-app/#verify) has the next
 checks.
 
-## Switching `spec.mode`
+<a id="switching-specmode"></a>
 
-`PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `next`, which a first install
-gets, or `today`, the previous stack, kept as a rollback. A file with no such line means `today` in
-`upgrade.sh`, so upgrading an install made before `next` became the default leaves it on `today`.
-`install.sh` keeps the mode the cluster runs and records it there, and a full `upgrade.sh` over such
-a file is refused when the install may run `next`. Of `upgrade.sh`'s modes only
-full applies the key; a re-run of `install.sh` applies it too.
-[`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
-has the rules for the key, and
+## Moving to the A2A stack
+
+Every install runs the A2A stack: the NATS bus, the A2A gateway, the auth callout, the capability
+verifier, the A2A console and the `hermes-bridge` container in the agent pod. The chart also creates the `<release namespace>-profiles` Namespace for
+profile pods, with its ResourceQuota and NetworkPolicy. Earlier releases rendered it only for `spec.mode: next`, and an install made
+before `next` became the default ran without it, as `spec.mode: today`. The upgrade moves such an
+install with no action of yours.
+
+`spec.mode` is deprecated and ignored. The CRD defaults an absent field to `next`, and the admission
+webhook rewrites `today` to `next` on the next write. The operator patches a stored `today` to
+`next` on its first pass, and records an Event with reason `ModeMigrated` on the `PlatformAgent`.
+`PLATFORM_AGENT_MODE` in `install.env` is read and ignored, with one notice; delete the line. There
+is no switch back: the way back is the previous release
+([Rolling back a release](/kube-agents/deploy/rollback/)).
+
 [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md)
-what a switch changes inside the install. This section covers what a switch does: the bus first, then Google Chat, then Slack.
+is the design of record for the stack. This section covers what the move does to an install that
+ran without the stack: the bus first, then Google Chat, then Slack. An install already on `next`
+meets none of it.
 
 ### The A2A bus
 
-A `today` install has no A2A bus, so its first switch to `next` creates one, and a new bus runs three
-NATS servers on separate nodes ([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
+An install that ran without the stack has no A2A bus, so the upgrade creates one, and a new bus
+runs three NATS servers on separate nodes, each with a 40Gi JetStream claim
+([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
 cluster that cannot grow to three nodes, set the chart value
-`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before this upgrade: once the
-bus exists, its server count cannot change.
+`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the upgrade:
+once the bus exists, its server count cannot change. The chart's quota check counts the whole stack
+([Footprint](/kube-agents/install/prerequisites/#footprint)); under a namespace quota sized for the
+previous stack, `helm upgrade` is refused until the quota has room.
 
-With Google Chat or Slack on, a full run prints the chat setup checklist for the mode it applied
-after "Upgrade Complete!", so the app steps that mode needs are on the screen after the switch.
+With Google Chat or Slack on, a full run prints the chat setup checklist after "Upgrade
+Complete!", so the app steps the gateway needs are on the screen after the move.
 
 ### Google Chat
 
 With Google Chat enabled, the A2A gateway takes Google Chat. Each top-level
 message you send the app in a DM is then its own conversation, answered in its own thread, as on
 Slack ([ChatOps → Google Chat](/kube-agents/concepts/chatops/#google-chat)). The thing to set for
-it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
+it is the home channel, where alerts and scheduled reports land. The gateway posts them
 only to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
 `spec.integration.googleChat.homeChannel`), and it must be a space name, `spaces/<id>`. A home
-channel set from chat with `/sethome`, or by the install's first chat message, is kept in the
-Planning Agent's profile and does not count. With the key unset or not a space name, the agent posts
-nothing to Google Chat unprompted.
+channel set from chat with `/sethome`, or by the install's first chat message, before the move is
+kept in the Planning Agent's profile and does not count. With the key unset or not a space name,
+the agent posts nothing to Google Chat unprompted.
 
-Before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in the same `install.env` as
-`PLATFORM_AGENT_MODE`, so the one full run applies both
-([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
-that a scheduled report or an alert reaches that space.
+Before the upgrade, set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, so the full run applies it
+([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After it, check that
+a scheduled report or an alert reaches that space.
 
 With Slack enabled too, the same gateway takes Slack. The Slack steps below apply as they do
 with Google Chat off.
 
-### Before the switch
+### Before the upgrade
 
 1. Check that Slack answers now, as in [Checking the result](#slack).
-2. Check the Slack settings `next` depends on. A full upgrade refuses a switch to `next` that
+2. Check the Slack settings the gateway depends on. A full upgrade refuses a run that
    would hand the gateway a setting it cannot use, and names it
    ([When an upgrade is refused](#when-an-upgrade-is-refused)); `--plan` warns of the same
    ones. Checking first saves a refused run:
@@ -552,7 +545,7 @@ with Google Chat off.
    - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
-     reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
+     reports: `C…`, or `G…` for some private channels. The gateway posts the agent's
      proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
      default), to the channel of the first top-level mention of the agent. A `/sethome` home
      channel does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
@@ -582,38 +575,16 @@ with Google Chat off.
 
    Wait until neither command lists a card: answer each blocked card in its Slack thread, and let
    running ones finish ([What carries over](#what-carries-over) says why). If scheduled jobs keep
-   filing cards, switch between their runs.
+   filing cards, upgrade between their runs.
 
-4. Switch when nobody is using the agent, and tell its users that Slack will not answer for a
+4. Upgrade when nobody is using the agent, and tell its users that Slack will not answer for a
    while.
 
-### The switch
+Then [run the upgrade](#run-the-upgrade) in the default full mode: pass no `--upgrade-mode`. An
+operator run moves the install too, since the operator renders the stack whatever the chart says,
+but only a full run re-renders `install.env`'s Slack and Google Chat settings onto the resource.
 
-Edit the `install.env` the upgrade reads ([Before you start](#before-you-start) says where it
-looks). Set the key, adding the line if the file has none:
-
-```bash
-PLATFORM_AGENT_MODE=next
-```
-
-[Run the upgrade](#run-the-upgrade) again at the release the install runs, in the default full
-mode: pass no `--upgrade-mode`. Before it applies anything, the run warns:
-
-```text
-This apply switches the install from spec.mode today to next (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.
-```
-
-It does not stop to ask. To stay on `today`, press Ctrl-C at that warning and set the key back.
-
-`--upgrade-mode=harness` and `--upgrade-mode=operator` leave the mode as it is and say that a full
-upgrade would switch it. If the run says instead that the `PlatformAgent` carries a `spec.mode` set
-outside the installer, the resource was patched by hand with `kubectl patch`. That
-mode survives upgrades, because Helm sees no change in a value the release already renders, so the
-run leaves the resource as it is. To bring the two together, patch `spec.mode` on the resource to
-the mode you want, or apply once with `PLATFORM_AGENT_MODE` set to the mode the resource carries and
-then again with the one you want.
-
-### During the switch
+### During the upgrade
 
 The operator moves Slack in three steps:
 
@@ -634,7 +605,7 @@ The operator moves Slack in three steps:
    naming it. It then checks the bot token with Slack, logs `slack connected`, and opens the
    Socket Mode connection.
 
-The broker's connection stops when the switch starts, and the gateway exists only once the bus is
+The broker's connection stops when the move starts, and the gateway exists only once the bus is
 up, so in practice the two never take the same message. How long Slack goes unanswered depends on
 how fast the cluster schedules and pulls the new pods. Slack has no connection to deliver a message
 sent in that gap to, and nothing in kube-agents fetches it later: treat it as lost, and ask its
@@ -661,7 +632,7 @@ If the loop prints nothing, the `Ready` condition's message names what the
 operator is waiting on, and
 [Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops)
 has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
-you [switch back](#switching-back-to-today).
+you roll back to the previous release.
 
 ```bash
 kubectl get platformagent platform-agent -n kubeagents-system \
@@ -672,10 +643,10 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 
 - **The same app, tokens and allowlist.** The gateway reads the tokens from the same Secret.
 - **The board and the agent's data volume.** The new pod mounts the same volume.
-- **Not the conversations.** Under `next` the agent starts every Slack conversation with no
-  history from `today`. In a channel, a reply without a mention in a thread started before the
-  switch gets no answer: mention the app.
-- **Not the cards in flight, outside the home channel.** A card filed before this upgrade from a
+- **Not the conversations.** The agent starts every Slack conversation with no history from
+  before the move. In a channel, a reply without a mention in a thread started before the
+  upgrade gets no answer: mention the app.
+- **Not the cards in flight, outside the home channel.** A card filed before the upgrade from a
   DM or from any channel other than the home channel posts nothing after it: the gateway refuses
   the post and, with a home channel set, logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
   in a home-channel thread still posts its progress and report there. Either way its buttons stop
@@ -683,63 +654,27 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 - **The home channel only from `install.env`**, as in step 2 above.
 
 Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
-[ChatOps → What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today).
+[ChatOps → What the gateway changes on Slack](/kube-agents/concepts/chatops/#what-the-gateway-changes-on-slack).
 
-### After the switch: the Slack app
+### After the upgrade: the Slack app
 
 Once a DM gets an answer as in [Checking the result](#slack), edit the app as
-[Slack app setup → Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+[Slack app setup → Moving an app made for the Hermes listener](/kube-agents/install/slack-app/#moving-an-app-made-for-the-hermes-listener)
 describes. Delete the slash commands from its manifest and leave interactivity on, since the gateway
-answers the buttons it draws. Edit the app rather than pasting the `next` manifest over it: a
-manifest replaces the app's whole configuration, including its name. Do it after the switch rather
-than before, because the `today` listener answers slash commands until then. Until you do, a slash
+answers the buttons it draws. Edit the app rather than pasting the gateway's manifest over it: a
+manifest replaces the app's whole configuration, including its name. Do it after the upgrade rather
+than before, because the Hermes listener answers slash commands until then. Until you do, a slash
 command gets Slack's timeout error.
 
-### Switching back to `today`
-
-This section applies to releases before the one that retires `spec.mode`. On that release and
-later, the webhook rewrites `today` to `next` and nothing switches.
-
-1. Set `PLATFORM_AGENT_MODE=today` in `install.env`, or delete the line, and run the upgrade again
-   in full mode. The run warns
-   `This apply switches the install from spec.mode next to today (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.`
-2. The operator restarts the credential broker with the Slack tokens and deletes the A2A stack,
-   the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
-   connection, and a message the stopping gateway takes gets no answer. The bus volume and its
-   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
-   says how to remove them. The CR keeps `status.busReplicas`, the server count the bus ran, so a
-   switch back to `next` brings the bus back at that count while its volume is still there. Wait for
-   the broker, for up to 5 minutes:
-
-   ```bash
-   for i in $(seq 30); do
-     kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system 2>/dev/null \
-       | grep -q 'Slack relay enabled' && { echo connected; break; }
-     sleep 10
-   done
-   ```
-
-   It prints `connected` once the broker has connected to Slack. If it prints nothing, read the
-   broker's log as in [Checking the result](#slack).
-
-3. Put the slash commands back. Print the `today` manifest:
-
-   ```bash
-   kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
-     hermes slack manifest
-   ```
-
-   Before you paste it into the app's **App Manifest** page, change its `name`, `description` and
-   `display_name` to the app's current values: the manifest replaces the app's whole
-   configuration. [Slack app setup](/kube-agents/install/slack-app/#create-the-app) covers its
-   options; read its warning about agent view first. Reinstall the app if Slack asks.
-
-4. Check Slack as in [Checking the result](#slack).
-
-Conversations and cards started under `next` do not carry back, for the same reasons as above.
-
-To roll back to an older release, switch to `today` first:
-[Rolling back a release](/kube-agents/deploy/rollback/#before-you-start) says why.
+A rollback to a release before the stack was unconditional keeps the stack: that release's
+operator reads `spec.mode: next` on the migrated object ([Rolling back a release](/kube-agents/deploy/rollback/)).
+Slack returns to the credential broker and the Hermes listener only after that release's own
+switch back. A full run with `PLATFORM_AGENT_MODE=today` alone renders no field and changes
+nothing, so patch `spec.mode` to `today` first (the rollback page has the command). They answer
+the slash commands again then, so put the `commands` block back in the app's manifest. Conversations and cards started on the gateway do not carry back,
+for the same reasons as above. The bus volume and its credentials Secret stay;
+[Uninstall](/kube-agents/install/uninstall/#what-the-a2a-stack-leaves-behind) says how to remove
+them.
 
 ## The gateway's own ServiceAccount
 
@@ -812,8 +747,7 @@ change of the new release.
   `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
-- **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
-  `install.env`. With Slack on, the A2A gateway takes Slack, with or without Google Chat. The run
+- **A Slack setting the A2A gateway cannot use.** With Slack on, the A2A gateway takes Slack, with or without Google Chat. The run
   refuses three settings it cannot use, naming each one:
   - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
     email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
@@ -863,18 +797,17 @@ change of the new release.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
-
 At the default of one replica, the agent gateway and the credential broker each run one pod with
-the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops
-until the new pods are ready. The operator and LiteLLM keep serving. The operator starts its new
+the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so a turn the
+agent pod was running stops with it and gets no answer, and chat stops until the new pods are
+ready. The operator and LiteLLM keep serving. The operator starts its new
 pod first, and LiteLLM runs two replicas and keeps one serving.
 
-| Mode       | What restarts                                                                                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `operator` | The operator. The agent gateway also restarts if the run added keys to `platform-agent-secrets`. The agent gateway, the credential broker and the shell sandbox restart if the new operator renders them differently. |
-| `harness`  | The agent gateway, the credential broker, whose image tag follows the agent's, and the shell sandbox.                                                                                                                 |
-| `full`     | The workloads of both other modes, and each object that a changed setting touches.                                                                                                                                    |
+| Mode       | What restarts                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator` | The operator, and the A2A gateway, callout, verifier and console, whose images derive from the operator's; chat through the A2A gateway pauses until its new pod is ready. The agent gateway also restarts if the run added keys to `platform-agent-secrets`. The agent gateway, the credential broker and the shell sandbox restart if the new operator renders them differently. |
+| `harness`  | The agent gateway, the credential broker, whose image tag follows the agent's, and the shell sandbox.                                                                                                                                                                                                                                                                              |
+| `full`     | The workloads of both other modes, and each object that a changed setting touches.                                                                                                                                                                                                                                                                                                 |
 
 In each mode, a chart workload such as LiteLLM also restarts if the target release's chart changed
 it. In CI runs, a harness upgrade made the agent unavailable for 41 seconds to about 3 minutes. A
@@ -885,13 +818,8 @@ the script can end before chat is back.
 
 During the restart:
 
-- **Slack.** The broker confirms each Slack event to Slack when it arrives, and keeps it in memory
-  until the agent takes it. If the broker restarts, the events it holds are lost. If only the agent
-  restarts, the broker gives its events to the new agent. The sender must send an event again in
-  two cases: the old agent took it but did not finish it, or it arrived up to 20 seconds after
-  the old agent stopped.
-- **Google Chat.** A message stays in the Pub/Sub subscription until the agent confirms it. If the
-  agent took a message but did not confirm it, Pub/Sub delivers it again after 60 seconds.
+- **Google Chat.** Google Chat retries a message the gateway did not acknowledge, so a message sent while the gateway pod restarts arrives once the new pod answers. A turn the gateway's session pod was running ends without an answer.
+- **Slack.** The gateway confirms each Slack event when it arrives, and nothing retries one it could not confirm. While the gateway pod restarts, Slack has no connection to deliver to: a message sent in that gap is lost, so ask its sender to send it again. A turn the gateway's session pod was running ends without an answer.
 - **Board cards.** The board is on the agent's volume, so the cards stay. A card that was running
   usually goes back to `ready` soon after the new pod starts, and runs again from the start. This
   does not count against the card's retries. If the old worker's process ID is in use in the new

@@ -85,16 +85,7 @@ metadata:
   {{- end }}
 spec:
   {{- /*
-    `with`, so the null default renders no field. The operator ignores the
-    value: the CRD defaults spec.mode to next and the webhook rewrites today
-    to next. Rendered while the deprecated key exists, so Helm's patch of an
-    install that set it is unchanged.
-  */}}
-  {{- with .Values.platformAgent.mode }}
-  mode: {{ . | quote }}
-  {{- end }}
-  {{- /*
-    `with`, as for mode: the null default renders no field, and the operator
+    `with`, so the null default renders no field, and the operator
     sizes both data claims from its own default. The schema checks the
     quantity's grammar only, so the range fails here, as the webhook (off by
     default) would refuse it. Zero passes the grammar, and the operator would
@@ -149,6 +140,10 @@ spec:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
     projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
+    {{- with .Values.platformAgent.harness.universeDomain }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.universeDomain" "path" (list "harness") "field" "universeDomain") }}
+    universeDomain: {{ . | quote }}
+    {{- end }}
     {{- /*
       Every optional field below goes through kube-agents.compactFields, which
       drops null and "" but keeps `false` and `0`, and which renders nothing at

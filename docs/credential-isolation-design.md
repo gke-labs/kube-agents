@@ -1226,7 +1226,8 @@ gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespa
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
 
 The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
-the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+the envelope keys and, on the records of the exec route, the Cloud API relay and the feedback
+route, the `tool_execution_audit` fields the site's
 [observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
