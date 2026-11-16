@@ -628,6 +628,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   post_merge_stepdown.py opens the revert and the rules-file pull request for an
 #                          auto-merged fix still broken after merge; imports
 #                          automation_rules, kubeagents_switches and vcs_client
+#   automerge_switch.py    the autonomy dial's per-kind switch: the rules-file pull
+#                          request that turns auto-merge on or off for a kind of
+#                          fix in one repository; imports automation_rules and
+#                          post_merge_stepdown
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -717,6 +721,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/post_merge_stepdown.py \
+     agents/platform/scripts/automerge_switch.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \
