@@ -250,11 +250,12 @@ audience-bound projected ServiceAccount token (one hour; the audience is per
 caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
-broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
+audit-report reader on every install and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
-consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
 with an `AgentProfile` bound, each profile tier's (bound to the audience

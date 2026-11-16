@@ -2675,7 +2675,7 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
+the same listener, on every install the A2A gateway's, under the
 operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
@@ -2715,7 +2715,15 @@ admits `proposal-view` only, checked on the normalised verb before the body is r
 verb's managed-repository check still applying. It is bound the same way:
 `CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
 the mcp audience, and no other caller may present it; with the list empty, nobody holds the
-role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. On
+every install, `a2a-reports` is the A2A gateway's audit-report reader: its token is minted for
+`kubeagents-credential-proxy-a2a-reports`, it reaches `/v1/audit-reports` alone, and there only
+`GET .../latest` and `GET .../runs/{ts}` of any audit on the install's publish key
+(`no_forge%2Flocal` when there is none); listing, the run index, writes and deletes are refused. It
+is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
+other caller may present the audience, and that account may present only this audience or the
+`a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)
+§3). Under
 `mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag

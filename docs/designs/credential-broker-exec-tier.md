@@ -109,7 +109,7 @@ and each caller routes to the right one.**
   sweep can hold that cap when the clamp arrives, and the admission it keeps for background
   work holds nothing while the clamp admits background work one at a time.
 - **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
-  learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
+  learns the workload and a role (shell, chat, a2a-chat, a2a-reports, session, watcher, mcp, scope, profile) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
   reaches the broker as the shell role, the same as an interactive command:
   - the fleet audits are agent cron jobs (`agents/platform/cron/jobs.json`, skill `fleet-audit`).
