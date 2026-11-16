@@ -5,7 +5,8 @@
 #
 # Run by release-publish.yml after it tags RELEASE_VERSION, from a full clone of main with the tags
 # fetched. scripts/relabel_upgrade_table_pending.py rewrites each `pending` row a release contains to
-# that release, by the rule `make docs-check-upgrade-releases` checks, so the check on main is not left
+# that release, by the rule `make docs-check-upgrade-releases` checks, and puts the table back in newest-first
+# order, so the check on main is not left
 # failing until someone relabels the rows by hand. With nothing to relabel it changes nothing. Otherwise
 # it pushes the relabel to one fixed branch and opens a pull request against main, or updates the branch
 # of the one already open (a re-run, or a later release while the first is unmerged). The pull request still needs a reviewer: this
@@ -77,7 +78,7 @@ These rows of the upgrade page's breaking-changes table still said \`pending\`, 
 
 ${rows}
 
-Until they're relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main. This change only rewrites their Release cells, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`). Approving it turns main's docs check green again.
+Until they're relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main. This change only rewrites their Release cells, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and puts the table's rows back in newest-first order, which the check also holds it to. Approving it turns main's docs check green again.
 
 Opened by the release workflow after it tagged ${RELEASE_VERSION} (#5673). A later release updates this pull request, rather than opening another, while it is open.
 EOF
