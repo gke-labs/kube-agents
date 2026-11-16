@@ -10,3 +10,6 @@ cluster-agent-crashloop-fix-request
 vcs-spent-branch-reuse
 cluster-setting-request-proposes-pr
 provisioning-kcc-cluster-without-crds-stops
+# Added 2026-11-13 when the case joined the writers part: writers-c then
+# held five cases to the other thirds' six.
+fleet-audit-manifest-fix-names-stalled-config-connector

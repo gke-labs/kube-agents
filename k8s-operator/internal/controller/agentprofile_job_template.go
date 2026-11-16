@@ -80,7 +80,12 @@ func profileWorkerPodSpecForJob(agent *agentv1alpha1.PlatformAgent, p *agentv1al
 // break the policy's exact comparison), with the worker labels for the
 // profile's unattended tier.
 func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool) *corev1.PodTemplateSpec {
-	tier := agentv1alpha1.AgentProfileTierUnattended
+	// The profile's one unattended-mode tier (unattendedTierOf): unattended
+	// itself, or a Tier resource whose mode is unattended (#3659).
+	tier := unattendedTierOf(p)
+	if tier == "" {
+		tier = agentv1alpha1.AgentProfileTierUnattended
+	}
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
 	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
@@ -193,7 +198,7 @@ const (
 // whatever the cluster: the operator can't tell an Autopilot cluster apart,
 // and the condition says where it matters.
 func autopilotRatioProblem(p *agentv1alpha1.AgentProfile) string {
-	if !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+	if unattendedTierOf(p) == "" {
 		return ""
 	}
 	cpu := p.Spec.Resources.Requests.CPU.AsApproximateFloat64()
@@ -234,7 +239,7 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
-		if resolved[p.Name].refused != nil || !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) ||
+		if resolved[p.Name].refused != nil || unattendedTierOf(p) == "" ||
 			profileWorkerToolsProblem(p, imageVolumes) != "" {
 			continue
 		}
@@ -254,7 +259,7 @@ func dispatchJobToolsProblems(agent *agentv1alpha1.PlatformAgent, profiles []age
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
-		if resolved[p.Name].refused != nil || !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+		if resolved[p.Name].refused != nil || unattendedTierOf(p) == "" {
 			continue
 		}
 		if problem := profileWorkerToolsProblem(p, imageVolumes); problem != "" {
