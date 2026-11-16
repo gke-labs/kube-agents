@@ -1008,21 +1008,20 @@ The Kubernetes Operator requires `cert-manager` (version `1.13.0+`) to generate 
   ```bash
   helm repo add jetstack https://charts.jetstack.io
   helm repo update
-  helm install cert-manager jetstack/cert-manager \
+  helm install cert-manager jetstack/cert-manager --version v1.21.3 \
     --namespace cert-manager \
     --create-namespace \
-    --set installCRDs=true
+    --set crds.enabled=true
   ```
 
 - **GKE Autopilot Cluster (Leader Election Workaround)**:
-  GKE Autopilot restricts coordination Leases in `kube-system`. Disable leader election during install:
+  GKE Autopilot restricts coordination Leases in `kube-system`. Move the leader-election Leases to the `cert-manager` namespace during install:
   ```bash
-  helm install cert-manager jetstack/cert-manager \
+  helm install cert-manager jetstack/cert-manager --version v1.21.3 \
     --namespace cert-manager \
     --create-namespace \
-    --set installCRDs=true \
-    --set controller.leaderElection.enabled=false \
-    --set cainjector.leaderElection.enabled=false
+    --set crds.enabled=true \
+    --set global.leaderElection.namespace=cert-manager
   ```
 
 ### Step 2: Create API Key & Access Secrets

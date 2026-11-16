@@ -241,25 +241,24 @@ The Helm chart on its own is the one path that never installs cert-manager: a ch
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true
+  --set crds.enabled=true
 ```
 
 ### GKE Autopilot install
 
-Autopilot blocks leader-election Leases in `kube-system`. Disable leader election during install:
+Autopilot blocks leader-election Leases in `kube-system`. Move them to the `cert-manager` namespace during install:
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
-helm install cert-manager jetstack/cert-manager \
+helm install cert-manager jetstack/cert-manager --version v1.21.3 \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true \
-  --set controller.leaderElection.enabled=false \
-  --set cainjector.leaderElection.enabled=false
+  --set crds.enabled=true \
+  --set global.leaderElection.namespace=cert-manager
 ```
 
 ### Manifest fallback
