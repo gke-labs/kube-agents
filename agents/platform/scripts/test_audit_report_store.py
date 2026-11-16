@@ -725,5 +725,35 @@ class JWKSRequestTests(unittest.TestCase):
         self.assertIn("application/jwk-set+json", dict(seen)["https://api.example/openid/v1/jwks"])
 
 
+# The suite's stamps are in November 2026; pin the store's clock past them so the
+# future-stamp refusal judges them as written, not against the wall clock.
+FIXED_NOW = 1798761600.0  # 2027-01-01T00:00:00Z
+
+
+def setUpModule():
+    setUpModule.original = store._now
+    store._now = lambda: FIXED_NOW
+
+
+def tearDownModule():
+    store._now = setUpModule.original
+
+
+class FutureStampTests(StoreTestCase):
+    """A run stamped far ahead of the store's clock would never leave the ring."""
+
+    def test_a_far_future_stamp_is_refused(self):
+        self.assertEqual(400, self.put_run("99991231T235959.999999Z").status_code)
+        self.assertFalse(any(self.root.rglob("*.json")))
+
+    def test_a_stamp_inside_the_skew_is_written(self):
+        inside = time.strftime("%Y%m%dT%H%M%S.000000Z", time.gmtime(FIXED_NOW + store.RUN_STAMP_MAX_FUTURE_SECONDS - 5))
+        self.assertEqual(204, self.put_run(inside).status_code)
+
+    def test_a_stamp_past_the_skew_is_refused(self):
+        past = time.strftime("%Y%m%dT%H%M%S.000000Z", time.gmtime(FIXED_NOW + store.RUN_STAMP_MAX_FUTURE_SECONDS + 5))
+        self.assertEqual(400, self.put_run(past).status_code)
+
+
 if __name__ == "__main__":
     unittest.main()
