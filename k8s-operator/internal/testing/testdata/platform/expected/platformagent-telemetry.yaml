@@ -329,7 +329,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 4Gi
 status: {}
 ---
 apiVersion: v1
@@ -1247,7 +1247,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 1Gi
+            storage: 4Gi
       status: {}
 status:
   availableReplicas: 0
@@ -3543,6 +3543,7 @@ stringData:
                 allow = [
                   "a2a.tasks.*.*.events",
                   "a2a.tasks.*.*.supervisor",
+                  "a2a.tasks.p.*.*.supervisor",
                   "a2a.agents.>",
                   "agents.hb.>",
                   "$KV.session-state.>",

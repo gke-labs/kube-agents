@@ -63,12 +63,16 @@ _ALLOWLIST_RE = re.compile(
 )
 _ALLOWLIST_ENTRY_RE = re.compile(r'^\s*"(?P<name>[A-Z0-9_]+)":\s*\{\}', re.MULTILINE)
 _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]+)"')
-# The two process tunables the page and the example say are left out. The agent
-# container's allowlist above drops them; the credential-proxy and agent-api-auth
+# The process tunable the page and the example say is left out. The agent
+# container's allowlist above drops it; the credential-proxy and agent-api-auth
 # containers take spec.deployment.env through mergeCredentialProxyEnv, a denylist
 # of the names the operator itself sets or lists as sensitive, so a name the
 # operator source never spells as a string reaches those two containers.
-_LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
+_LEFT_OUT_ENV_NAMES = ("MALLOC_ARENA_MAX",)
+# The name the page and the example say has no effect on gcloud when a values
+# file sets it: the credential proxy does not pass the pod's value to the
+# commands it runs (GCLOUD_FILE_LOGGING_OFF_ENV in credential_proxy.py).
+_NO_EFFECT_ENV_NAME = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
 # The env names the CR template renders from a chart key (incidentWorkloadDedupSeconds,
 # alertDailyLimits.<bucket>). The template skips the key whenever env carries the name,
 # so an example entry for one would win over the key, its 0 included.
@@ -256,7 +260,7 @@ class ExampleShapeTest(unittest.TestCase):
                 self.assertFalse(entry["name"].startswith(tuple(prefixes)), "alertDailyLimits is the route")
 
     def test_the_names_the_maintainers_left_out_stay_out(self):
-        """The page says the two names reach the proxy pod and not the agent container."""
+        """The page says the name reaches the proxy pod and not the agent container."""
         names = {entry["name"] for entry in self.values["platformAgent"]["deployment"]["env"]}
         forwarded = _forwarded_env_names()
         source = _operator_source()
@@ -265,6 +269,11 @@ class ExampleShapeTest(unittest.TestCase):
                 self.assertNotIn(name, names)
                 self.assertNotIn(name, forwarded, f"{name} reaches the agent container now; re-read the page's sentence on it")
                 self.assertNotIn(f'"{name}"', source, f"the operator names {name} now; re-read which container it reaches")
+
+    def test_the_name_with_no_effect_stays_out(self):
+        """The page says the example leaves the name out."""
+        names = {entry["name"] for entry in self.values["platformAgent"]["deployment"]["env"]}
+        self.assertNotIn(_NO_EFFECT_ENV_NAME, names)
 
     def test_the_operator_memory_request_matches_its_limit(self):
         # Autopilot without bursting sets limits equal to requests; the file
@@ -342,7 +351,7 @@ class DeclaredColumnTest(unittest.TestCase):
         return matches[0]
 
     def _declared(self):
-        """Every table row's block, replica count and persistent GiB, in the page's order."""
+        """Every table row's block and replica count, in the page's order."""
         agent = self.footprint["agentPod"]
         base = _footprint_block(agent["base"])
         # The dashboard container rides in the gateway pod when hermes.dashboardEnabled is
@@ -350,22 +359,21 @@ class DeclaredColumnTest(unittest.TestCase):
         # it apart (pods: 0) so the quota preflight can leave it out.
         dashboard = _footprint_block(agent["dashboard"])
         gateway = tuple(b + d for b, d in zip(base, dashboard))
-        data_claim_gi = self.footprint["storage"]["dataClaimBytesRequest"] / (1024 ** 3)
         # The footprint sums the kube-proxy's replicas; the row reads per replica, "each".
         kube_proxy = self.footprint["kubeProxy"]
         kube_proxy_each = tuple(part / kube_proxy["pods"] for part in _footprint_block(kube_proxy))
         return {
-            _PAGE_ROW_PROXY: (_footprint_block(self.footprint["credentialProxy"]), 1, 0),
-            _PAGE_ROW_GATEWAY: (gateway, 1, data_claim_gi + 1),
-            _PAGE_ROW_SANDBOX: (_footprint_block(self.footprint["shellSandbox"]), 1, data_claim_gi + 1),
-            _PAGE_ROW_KUBE_PROXY: (kube_proxy_each, kube_proxy["pods"], 0),
-            _PAGE_ROW_OPERATOR: (_values_block(self.values["operator"]["resources"]), self.values["operator"]["replicaCount"], 0),
-            _PAGE_ROW_LITELLM: (_values_block(self.values["litellm"]["resources"]), self.values["litellm"]["replicaCount"], 0),
-            _PAGE_ROW_MINTER: (_values_block(self.values["githubMinter"]["resources"]), self.values["githubMinter"]["replicaCount"], 0),
+            _PAGE_ROW_PROXY: (_footprint_block(self.footprint["credentialProxy"]), 1),
+            _PAGE_ROW_GATEWAY: (gateway, 1),
+            _PAGE_ROW_SANDBOX: (_footprint_block(self.footprint["shellSandbox"]), 1),
+            _PAGE_ROW_KUBE_PROXY: (kube_proxy_each, kube_proxy["pods"]),
+            _PAGE_ROW_OPERATOR: (_values_block(self.values["operator"]["resources"]), self.values["operator"]["replicaCount"]),
+            _PAGE_ROW_LITELLM: (_values_block(self.values["litellm"]["resources"]), self.values["litellm"]["replicaCount"]),
+            _PAGE_ROW_MINTER: (_values_block(self.values["githubMinter"]["resources"]), self.values["githubMinter"]["replicaCount"]),
         }
 
     def test_each_row_carries_the_declared_requests_and_limits(self):
-        for label, (block, replicas, _) in self._declared().items():
+        for label, (block, replicas) in self._declared().items():
             with self.subTest(row=label):
                 cells = self._row(label)
                 self.assertEqual(cells[1], str(replicas))
@@ -386,9 +394,9 @@ class DeclaredColumnTest(unittest.TestCase):
 
     def test_the_total_row_sums_the_declared_rows(self):
         declared = self._declared()
-        pods = sum(replicas for _, replicas, _ in declared.values())
+        pods = sum(replicas for _, replicas in declared.values())
         total = [0.0] * 5
-        for block, replicas, _ in declared.values():
+        for block, replicas in declared.values():
             for i, part in enumerate(block):
                 total[i] += part * replicas
         cells = self._row(_PAGE_ROW_TOTAL)
@@ -398,7 +406,7 @@ class DeclaredColumnTest(unittest.TestCase):
 
     def test_the_autopilot_bullet_names_the_largest_declared_ephemeral_limit(self):
         declared = self._declared()
-        largest = max(block[4] for block, _, _ in declared.values())
+        largest = max(block[4] for block, _ in declared.values())
         self.assertEqual(largest, declared[_PAGE_ROW_PROXY][0][4])
         self.assertLessEqual(largest, _AUTOPILOT_EPHEMERAL_CEILING_MI)
         page = " ".join(_SITE_PAGE.read_text().split())
@@ -415,9 +423,17 @@ class DeclaredColumnTest(unittest.TestCase):
             self._row(_PAGE_ROW_TOTAL)[6],
             f"**{_decimal(default_gi)} GiB default, {_decimal(fleet_gi)} GiB fleet**",
         )
+        small_claim_match = re.search(r'systemMetadataStorageSize\s*=\s*"(\d+)Gi"', _AGENT_MANIFESTS.read_text())
+        self.assertIsNotNone(small_claim_match)
+        small_claim_gi = small_claim_match.group(1)
         gateway = self._row(_PAGE_ROW_GATEWAY)[6]
         self.assertIn(f"{_decimal(data_claim_gi)} GiB default", gateway)
         self.assertIn(f"{_decimal(example_gi)} GiB fleet", gateway)
+        self.assertIn(f"{small_claim_gi} GiB metadata", gateway)
+        sandbox = self._row(_PAGE_ROW_SANDBOX)[6]
+        self.assertIn(f"{small_claim_gi} GiB for `sshd`", sandbox)
+        page = " ".join(_SITE_PAGE.read_text().split())
+        self.assertIn(f"plus {_decimal(fleet_gi)} GiB of `pd-balanced`", page)
 
     def test_the_hindsight_bullet_carries_the_declared_figures(self):
         page = _SITE_PAGE.read_text()

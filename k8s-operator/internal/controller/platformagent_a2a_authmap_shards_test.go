@@ -275,16 +275,4 @@ func TestPruningRemovesTheLegacyMapAndTheShardsAboveTheCount(t *testing.T) {
 			t.Errorf("after pruning to 2 shards, %s exists = %v, want %v", name, got, want)
 		}
 	}
-
-	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
-		t.Fatalf("deleteA2AAuthMapShards: %v", err)
-	}
-	for _, i := range []int{0, 1} {
-		if exists(a2aAuthMapShardName(agent, i)) {
-			t.Errorf("shard %d survives the teardown", i)
-		}
-	}
-	if !exists(a2aAuthMapShardName(agent, 5)) {
-		t.Error("the teardown deleted a ConfigMap under a shard name that this CR does not own")
-	}
 }

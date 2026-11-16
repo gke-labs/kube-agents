@@ -21,7 +21,7 @@ const triggerScheduleSource = "schedule"
 // <source>/<name>, each a single subject token; origin is builtin; stream is
 // empty or the schedule's own name, so a trigger can bind no report stream but
 // its own: a stream is allowed only on schedule/<stream>.
-func ValidateTrigger(name, origin, stream string) error {
+func ValidateTrigger(name, origin, stream, script string) error {
 	source, rest, hasRest := strings.Cut(name, "/")
 	if !ValidSubjectToken(source) || (hasRest && !ValidSubjectToken(rest)) {
 		return fmt.Errorf("trigger name %q is not <source> or <source>/<name> of dot-free DNS-1123 labels", name)
@@ -31,6 +31,15 @@ func ValidateTrigger(name, origin, stream string) error {
 	}
 	if stream != "" && (source != triggerScheduleSource || rest != stream) {
 		return fmt.Errorf("trigger stream %q is not the trigger's own schedule name (%s/<stream>)", stream, triggerScheduleSource)
+	}
+	// script names a profile script for a built-in schedule's run (#5622):
+	// a DNS-1123 label, never a path, and only on one schedule's trigger,
+	// schedule/<name>, as with stream: never a bare schedule.
+	if script != "" && !ValidSubjectToken(script) {
+		return fmt.Errorf("trigger script %q is not a DNS-1123 label", script)
+	}
+	if script != "" && (source != triggerScheduleSource || !hasRest) {
+		return fmt.Errorf("trigger script %q is on a %q trigger; only a %s/<name> trigger names one", script, source, triggerScheduleSource)
 	}
 	return nil
 }

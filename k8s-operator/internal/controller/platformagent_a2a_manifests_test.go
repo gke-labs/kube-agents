@@ -1755,6 +1755,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
+	curator := buildA2ACuratorDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1769,6 +1770,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"verifier", "buildA2AVerifierDeployment", verifier.Spec.Template.Spec},
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
+		{"curator", "buildA2ACuratorDeployment", curator.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1842,6 +1844,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
+	curator := buildA2ACuratorDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1914,6 +1917,10 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// the same reasoning: it reads its token and credential files by
 		// absolute path and writes nothing.
 		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The OKF memory curator runs from the console image too, writing only
+		// to its mounted /var/lib/curator emptyDir by absolute path.
+		{render: "curator", builder: "buildA2ACuratorDeployment", container: a2aCuratorContainer, spec: curator.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -3592,7 +3599,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
-		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
+		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.p.*.*.supervisor", "a2a.agents.>",
 		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
@@ -4517,6 +4524,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
+		"curator Deployment": buildA2ACuratorDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {

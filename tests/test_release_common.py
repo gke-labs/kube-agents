@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.testing.common import (
     FALSY_BOOLEAN_INPUTS,
@@ -949,25 +950,41 @@ source "{_COMMON_SH}"
     def test_release_fetch_tags_is_a_no_op_outside_ci(self):
         """It must not reach the network on a developer machine.
 
-        The CI arm cannot be exercised hermetically — it fetches a real URL — so
-        what is pinned here is the guard in front of it. Without the guard, every
-        script that calls this would try to hit github.com from a unit test.
+        What is pinned here is the guard in front of the fetch. Without the guard,
+        every script that calls this would try to hit github.com from a unit test.
+        The function is silent either way, so git's own trace says whether a fetch
+        ran. The release repository's https URL is rewritten onto a path that does
+        not exist, so neither arm can leave the machine.
         """
-        temp_dir, repo_dir, _ = create_mock_git_repo()
+        temp_dir, repo_dir, git = create_mock_git_repo()
         try:
-            proc = self._run_common_func("release_fetch_tags", env={"CI": ""}, cwd=repo_dir)
+            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+            git(
+                "config",
+                f"url.{unreachable}.insteadOf",
+                f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+            )
+            outside_ci = pathlib.Path(repo_dir).parent / "outside-ci.trace"
+            proc = self._run_common_func(
+                "release_fetch_tags",
+                env={"CI": "", "GIT_TRACE": str(outside_ci), **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "")
+            self.assertNotIn("fetch", outside_ci.read_text() if outside_ci.exists() else "", "a fetch ran outside CI")
 
             # And it stays quiet rather than failing when the fetch cannot work:
             # a fetch that could not run is not itself the error, the caller's
             # own lookup afterwards is.
+            in_ci = pathlib.Path(repo_dir).parent / "in-ci.trace"
             proc = self._run_common_func(
                 "release_fetch_tags",
-                env={"CI": "true", "GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"},
+                env={"CI": "true", "GIT_TRACE": str(in_ci), **self._FAKE_RELEASE_REPO},
                 cwd=repo_dir,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("fetch", in_ci.read_text())
         finally:
             temp_dir.cleanup()
 
@@ -1281,6 +1298,37 @@ source "{_COMMON_SH}"
         self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", proc.stdout)
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
         self.assertEqual(git("--git-dir", str(bare_dir), "rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip(), head)
+
+    def test_ensure_ga_release_refs_ignores_the_developers_push_rewrite(self):
+        """A developer's global `pushInsteadOf` must not take the push off the local stand-in.
+
+        Git applies `pushInsteadOf` to a push before `insteadOf`, so a global rule for
+        https://github.com/ (a common way to push over SSH) would send this push to GitHub
+        with the developer's key. The rule planted here, once as the global file and once as
+        the system file, points at a second local repository: a child that reads it pushes
+        there, and no host is asked either way.
+        """
+        for planted_as in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            with self.subTest(planted_as=planted_as):
+                temp_dir, repo_dir, git = create_mock_git_repo()
+                self.addCleanup(temp_dir.cleanup)
+                bare_dir = self._bare_remote_for(git, repo_dir)
+                decoy_root = pathlib.Path(repo_dir).parent / "decoy"
+                decoy_dir = decoy_root / self._FAKE_RELEASE_REPO["GH_ORG"] / f"{self._FAKE_RELEASE_REPO['GH_REPO']}.git"
+                git("init", "--bare", str(decoy_dir))
+                developer_config = pathlib.Path(repo_dir).parent / "developer.gitconfig"
+                developer_config.write_text(f'[url "{decoy_root}/"]\n\tpushInsteadOf = https://github.com/\n')
+                head = git("rev-parse", "HEAD").stdout.strip()
+
+                with mock.patch.dict(os.environ, {planted_as: str(developer_config)}):
+                    proc = self._run_common_func(
+                        f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+                        env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                        cwd=repo_dir,
+                    )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(git("--git-dir", str(decoy_dir), "tag", "--list").stdout.strip(), "", "the push followed the planted rule")
+                self.assertEqual(git("--git-dir", str(bare_dir), "rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip(), head)
 
     def test_ensure_ga_release_refs_in_ci_skips_when_the_remote_already_has_it(self):
         """A re-run of the release job must find its first attempt's branch on the remote.
