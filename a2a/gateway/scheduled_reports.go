@@ -355,9 +355,10 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
 	}
 
-	// One message per run; the thread is the day's in a later change.
+	// Into the schedule's thread for the UTC day, or a new one
+	// (schedule_threads.go).
 	postCtx, cancel := context.WithTimeout(ctx, postTimeout)
-	post, postErr := reporter.postHomeReport(postCtx, home, "", report.Text)
+	post, postErr := g.postScheduledReport(postCtx, reporter, home, report)
 	cancel()
 	report.Attempts++
 	report.PostStartedAt = time.Time{}
@@ -419,24 +420,34 @@ func (g *Gateway) scheduledRecordFailed(store scheduledStore, key string, try te
 // on its own scheduledKVTimeout off ctx's values but not its cancellation,
 // retried as the relay's record writes are.
 type scheduledStore struct {
-	g   *Gateway
-	ctx context.Context
+	g      *Gateway
+	ctx    context.Context
+	bucket string
 }
 
 func (g *Gateway) scheduledStore(ctx context.Context) scheduledStore {
-	return scheduledStore{g: g, ctx: context.WithoutCancel(ctx)}
+	return scheduledStore{g: g, ctx: context.WithoutCancel(ctx), bucket: lib.ScheduledReportsBucket}
 }
 
 func (st scheduledStore) do(f func(ctx context.Context, kv jetstream.KeyValue) error) error {
-	return withRetry(kvRetryAttempts, func() error {
+	var err error
+	for attempt := 0; attempt < kvRetryAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(kvRetryPause)
+		}
 		ctx, cancel := context.WithTimeout(st.ctx, scheduledKVTimeout)
-		defer cancel()
-		kv, err := st.g.client.KV(ctx, lib.ScheduledReportsBucket)
-		if err != nil {
+		var kv jetstream.KeyValue
+		if kv, err = st.g.client.KV(ctx, st.bucket); err == nil {
+			err = f(ctx, kv)
+		}
+		cancel()
+		// A create on a key that exists and an update of a revision that
+		// moved are answers, not outages: trying again changes nothing.
+		if err == nil || errors.Is(err, jetstream.ErrKeyExists) || isMintedAlready(err) {
 			return err
 		}
-		return f(ctx, kv)
-	})
+	}
+	return err
 }
 
 // get reads key's record and its revision, nil when there is none.
@@ -550,6 +561,14 @@ func (n *Notifier) homeChannel() string {
 // owns the route's state.
 func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string) (homePost, error) {
 	answers := make(chan lib.NotifyReply, 1)
+	// A thread is held to the home channel and put in the form the poster
+	// takes, as validate does for a chat.notify request's.
+	if thread != "" && n.threadOK != nil && !n.threadOK(thread, home) {
+		return homePost{}, fmt.Errorf("thread %q is not a thread of the home channel", thread)
+	}
+	if thread != "" && n.threadTS != nil {
+		thread = n.threadTS(thread)
+	}
 	job := notifyJob{req: lib.NotifyRequest{Text: text, Thread: thread}, home: home, dropLate: true,
 		answer: func(r lib.NotifyReply) { answers <- r }}
 	if dl, ok := ctx.Deadline(); ok {

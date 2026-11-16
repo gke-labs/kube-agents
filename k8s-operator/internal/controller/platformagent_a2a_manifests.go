@@ -126,7 +126,10 @@ const (
 	// a2aScheduledReportsBucket is lib.ScheduledReportsBucket: a schedule
 	// trigger's finished runs, written by the gateway alone.
 	a2aScheduledReportsBucket = "SCHEDULED_REPORTS"
-	a2aKVStreamPrefix         = "KV_"
+	// a2aScheduleThreadsBucket is lib.ScheduleThreadsBucket: each
+	// schedule's home-channel thread for a UTC day, the gateway's alone.
+	a2aScheduleThreadsBucket = "SCHEDULE_THREADS"
+	a2aKVStreamPrefix        = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
 	// under a2aProfileSubmitPrefix (lib.ProfileSubmitStream and
@@ -1913,6 +1916,7 @@ var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
 	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS", "KV_SCHEDULED_REPORTS",
+	"KV_SCHEDULE_THREADS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2190,6 +2194,12 @@ func a2aAgentJetStreamGrants() []string {
 //     lists no keys. Create and Update are publishes on
 //     $KV.SCHEDULED_REPORTS.>.
 //
+//   - KV_SCHEDULE_THREADS, each schedule's home-channel thread for a UTC
+//     day (a2a/gateway/schedule_threads.go): the same two verbs, STREAM.INFO
+//     to bind it and DIRECT.GET for the day's entry. Its claim's create,
+//     the thread's update and a failed claim's delete are publishes on
+//     $KV.SCHEDULE_THREADS.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -2273,6 +2283,7 @@ func a2aGatewayJetStreamGrants() []string {
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	kvScheduledReports := a2aKVStreamPrefix + a2aScheduledReportsBucket
+	kvScheduleThreads := a2aKVStreamPrefix + a2aScheduleThreadsBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -2295,6 +2306,8 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
 		"$JS.API.STREAM.INFO." + kvScheduledReports,
 		"$JS.API.DIRECT.GET." + kvScheduledReports + ".>",
+		"$JS.API.STREAM.INFO." + kvScheduleThreads,
+		"$JS.API.DIRECT.GET." + kvScheduleThreads + ".>",
 	}
 }
 
@@ -3937,6 +3950,15 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # 25KB, so 256MiB holds about ten thousand, over a hundred runs a day for the
 # 90 days.
 $NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h
+
+# SCHEDULE_THREADS: the home-channel thread each schedule posts into for one
+# UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;
+# docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read
+# only by the gateway, so a failover keeps posting into the day's thread.
+# History 1; a 48h max age keeps a day's entry past its day and then drops
+# it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a
+# value is capped at 4KiB.
+$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1 || $NATS kv add SCHEDULE_THREADS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and

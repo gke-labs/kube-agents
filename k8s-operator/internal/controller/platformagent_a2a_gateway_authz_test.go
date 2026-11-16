@@ -290,6 +290,22 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	_, err = reports.Update(ctx, reportKey, []byte(`{"status":"posted"}`), rev)
 	allowed("$KV.SCHEDULED_REPORTS update (putScheduledReport)", err)
 
+	// A schedule's thread for the day (a2a/gateway/schedule_threads.go):
+	// bound, read (absent), claimed, filled in, and a claim released.
+	threads, err := js.KeyValue(ctx, a2aScheduleThreadsBucket)
+	allowed("STREAM.INFO KV_SCHEDULE_THREADS (threadStore js.KeyValue)", err)
+	const threadKey = "compliance-audit.2026-11-16"
+	_, err = threads.Get(ctx, threadKey)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET KV_SCHEDULE_THREADS (getScheduleThread)", err)
+	trev, err := threads.Create(ctx, threadKey, []byte(`{"claim":"task-1"}`))
+	allowed("$KV.SCHEDULE_THREADS create, the day's claim (putScheduleThread)", err)
+	trev, err = threads.Update(ctx, threadKey, []byte(`{"threadId":"t1"}`), trev)
+	allowed("$KV.SCHEDULE_THREADS update, the day's thread (putScheduleThread)", err)
+	allowed("$KV.SCHEDULE_THREADS delete, a released claim", threads.Delete(ctx, threadKey, jetstream.LastRevision(trev)))
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))

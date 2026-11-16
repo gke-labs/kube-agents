@@ -2963,7 +2963,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "8b554d7cb19a5f30",
+      "version": "a8dccfedfe98a676",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2993,6 +2993,7 @@ data:
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
               "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3006,6 +3007,7 @@ data:
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
               "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3106,7 +3108,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 8b554d7cb19a5f30
+    kubeagents.x-k8s.io/a2a-authmap-version: a8dccfedfe98a676
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3700,7 +3702,8 @@ stringData:
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
           # answer ratings, and on KV_people, one hashed key per chat person;
-          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs.
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,
+          # and on KV_SCHEDULE_THREADS, a schedule's thread for the day.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3721,6 +3724,7 @@ stringData:
                   "$KV.feedback.>",
                   "$KV.people.>",
                   "$KV.SCHEDULED_REPORTS.>",
+                  "$KV.SCHEDULE_THREADS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
@@ -3744,6 +3748,8 @@ stringData:
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
                   "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
                   "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -3842,6 +3848,8 @@ stringData:
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
                   "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
                   "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -5579,7 +5587,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-2b58d421
+  name: platformagent-a2a-provision-a2140fc1
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5827,6 +5835,15 @@ spec:
               runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
               2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
               --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
+              SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
+              UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
+              only by the gateway, so a failover keeps posting into the day's thread.\n#
+              History 1; a 48h max age keeps a day's entry past its day and then drops\n#
+              it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
+              value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
+              || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
               PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>),
               published by the gateway and\n# held by the dispatcher on the operator's
               durables (contract on #3655). It is\n# its own stream so that the operator

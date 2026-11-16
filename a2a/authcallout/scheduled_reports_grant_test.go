@@ -22,12 +22,6 @@ import (
 // carries asked by publishing the real subjects, which a wildcard grant would
 // let through as surely as a named one.
 
-// scheduledReportsKey is a run's record key: <jobKey>.<taskID>.
-const scheduledReportsKey = "compliance-audit.task-0123456789abcdef"
-
-// scheduledReportsStream is the bucket's stream.
-const scheduledReportsStream = "KV_" + lib.ScheduledReportsBucket
-
 // scheduledReportsPrincipal is one principal the render carries, connected.
 type scheduledReportsPrincipal struct {
 	name string
@@ -88,6 +82,22 @@ func connectEveryRenderedPrincipal(t *testing.T) (*harness, []scheduledReportsPr
 // script's info-then-add guard, asserted as allowed so that losing it fails
 // here; it returns stream state, never a record.
 func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
+	assertGatewayOnlyBucket(t, lib.ScheduledReportsBucket, "compliance-audit.task-0123456789abcdef")
+}
+
+// TestTheScheduleThreadsBucketIsTheGatewaysAlone is the same measurement for
+// SCHEDULE_THREADS (a2a/gateway/schedule_threads.go): a principal that could
+// write a day's thread would steer every later report of that schedule into
+// a thread of its choosing, and one that could read it would learn where.
+func TestTheScheduleThreadsBucketIsTheGatewaysAlone(t *testing.T) {
+	assertGatewayOnlyBucket(t, lib.ScheduleThreadsBucket, "compliance-audit.2026-11-16")
+}
+
+// assertGatewayOnlyBucket holds bucket, at key, to the gateway alone: see
+// TestTheScheduledReportsBucketIsTheGatewaysAlone.
+func assertGatewayOnlyBucket(t *testing.T, bucket, key string) {
+	t.Helper()
+	stream := "KV_" + bucket
 	h, others := connectEveryRenderedPrincipal(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -105,8 +115,8 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pjs.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.ScheduledReportsBucket, History: 1}); err != nil {
-		t.Fatalf("the provision principal could not create %s: %v", lib.ScheduledReportsBucket, err)
+	if _, err := pjs.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: bucket, History: 1}); err != nil {
+		t.Fatalf("the provision principal could not create %s: %v", bucket, err)
 	}
 
 	// The gateway: bind, create, update in place, put, and read back.
@@ -115,29 +125,29 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kv, err := gjs.KeyValue(ctx, lib.ScheduledReportsBucket)
+	kv, err := gjs.KeyValue(ctx, bucket)
 	if err != nil {
-		t.Fatalf("the gateway could not bind %s: %v", lib.ScheduledReportsBucket, err)
+		t.Fatalf("the gateway could not bind %s: %v", bucket, err)
 	}
-	rev, err := kv.Create(ctx, scheduledReportsKey, []byte(`{"status":"posting"}`))
+	rev, err := kv.Create(ctx, key, []byte(`{"status":"posting"}`))
 	if err != nil {
 		t.Fatalf("the gateway could not create a record: %v", err)
 	}
-	if _, err := kv.Update(ctx, scheduledReportsKey, []byte(`{"status":"posted"}`), rev); err != nil {
+	if _, err := kv.Update(ctx, key, []byte(`{"status":"posted"}`), rev); err != nil {
 		t.Fatalf("the gateway could not update its record: %v", err)
 	}
-	if _, err := kv.Put(ctx, scheduledReportsKey, []byte(`{"status":"posted","attempts":1}`)); err != nil {
+	if _, err := kv.Put(ctx, key, []byte(`{"status":"posted","attempts":1}`)); err != nil {
 		t.Fatalf("the gateway could not put its record: %v", err)
 	}
-	e, err := kv.Get(ctx, scheduledReportsKey)
+	e, err := kv.Get(ctx, key)
 	if err != nil || string(e.Value()) != `{"status":"posted","attempts":1}` {
 		t.Fatalf("the gateway read back %v (%v)", e, err)
 	}
 	last := e.Revision()
 
-	write := "$KV." + lib.ScheduledReportsBucket + "." + scheduledReportsKey
-	read := "$JS.API.DIRECT.GET." + scheduledReportsStream + "." + write
-	bind := "$JS.API.STREAM.INFO." + scheduledReportsStream
+	write := "$KV." + bucket + "." + key
+	read := "$JS.API.DIRECT.GET." + stream + "." + write
+	bind := "$JS.API.STREAM.INFO." + stream
 	for _, p := range others {
 		if p.name == "sys" {
 			continue // its own account; asked below
@@ -148,7 +158,7 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 				want[bind] = false
 			}
 			checkPublish(t, p.nc, p.v, want)
-			if !subscribeRefused(t, p.nc, p.v, "$KV."+lib.ScheduledReportsBucket+".>") {
+			if !subscribeRefused(t, p.nc, p.v, "$KV."+bucket+".>") {
 				t.Errorf("%s may subscribe to the bucket's subjects; it would see every report as it is written", p.name)
 			}
 		})
@@ -176,7 +186,7 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 			}
 			// Subscribed after its own publish, so only the gateway's
 			// write below could arrive.
-			sub, err := p.nc.SubscribeSync("$KV." + lib.ScheduledReportsBucket + ".>")
+			sub, err := p.nc.SubscribeSync("$KV." + bucket + ".>")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -184,7 +194,7 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 			if err := p.nc.Flush(); err != nil {
 				t.Fatal(err)
 			}
-			if last, err = kv.Put(ctx, scheduledReportsKey, []byte(`{"status":"posted","attempts":2}`)); err != nil {
+			if last, err = kv.Put(ctx, key, []byte(`{"status":"posted","attempts":2}`)); err != nil {
 				t.Fatal(err)
 			}
 			if msg, err := sub.NextMsg(500 * time.Millisecond); err == nil {
@@ -194,7 +204,7 @@ func TestTheScheduledReportsBucketIsTheGatewaysAlone(t *testing.T) {
 	}
 
 	// Nothing above landed: the record is the gateway's last write.
-	e, err = kv.Get(ctx, scheduledReportsKey)
+	e, err = kv.Get(ctx, key)
 	if err != nil || e.Revision() != last {
 		t.Fatalf("the record moved past the gateway's write: %v (%v)", e, err)
 	}

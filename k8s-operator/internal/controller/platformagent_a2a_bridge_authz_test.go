@@ -306,6 +306,12 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	}); err != nil {
 		t.Fatalf("provision bucket SCHEDULED_REPORTS as seed: %v", err)
 	}
+	// `nats kv add SCHEDULE_THREADS --max-value-size=4096 --ttl=48h`: a schedule's thread for the day.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "SCHEDULE_THREADS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 8388608, MaxValueSize: 4096, TTL: 48 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket SCHEDULE_THREADS as seed: %v", err)
+	}
 }
 
 // TestBridgeJetStreamGrantOnARealServer is the refusal proof for the bridge's

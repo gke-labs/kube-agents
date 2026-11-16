@@ -243,6 +243,13 @@ type Gateway struct {
 	// to post waits before it is redelivered: scheduledPostRetryDelay, per
 	// gateway so a test can shorten it on its own.
 	scheduledRetry time.Duration
+	// scheduleClock is what a schedule's thread day is read from
+	// (schedule_threads.go): time.Now, unless a test steps it.
+	scheduleClock func() time.Time
+	// reportIncidents keeps each posted report against the thread it
+	// landed in, for a reply there to be answered with it
+	// (schedule_threads.go); nil keeps nothing.
+	reportIncidents reportIncidentWriter
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -618,6 +625,7 @@ func New(o Options) (*Gateway, error) {
 		peoplePurgeRetry: peopleRetryInterval,
 		feedbackRetry:    feedbackRetryInterval,
 		scheduledRetry:   scheduledPostRetryDelay,
+		scheduleClock:    time.Now,
 		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,
