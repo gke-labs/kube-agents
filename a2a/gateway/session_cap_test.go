@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // capRig is a gateway with a session cap over a fake cluster holding the
@@ -66,7 +67,14 @@ func livePods(t *testing.T, cs *k8sfake.Clientset) int {
 // slot and 2 are refused. Before #6033 every one counted the same live pods
 // and all 5 passed.
 func TestABurstAtTheSessionCapDoesNotOvershootIt(t *testing.T) {
-	g, _, _ := capRig(t, 3)
+	g, cs, _ := capRig(t, 3)
+	// A pod list that takes a moment, as a real one does, so checks that
+	// weren't serialized would all read the same holds before any of them
+	// records its own.
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(20 * time.Millisecond)
+		return false, nil, nil
+	})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	granted := 0
@@ -207,5 +215,46 @@ func TestAReplacingSlotIsNotCountedBesideThePodItReplaces(t *testing.T) {
 	}
 	if n := livePods(t, cs); n != 1 {
 		t.Errorf("%d pods left; the replaced pod was evicted as if counted twice", n)
+	}
+}
+
+// A turn whose context ends while another conversation's check holds the
+// cap's lock is refused with its own notice, posted after the wait, rather
+// than waiting past its budget.
+func TestATurnThatWaitsOutItsContextForTheCapIsToldSo(t *testing.T) {
+	g, _, adapter := capRig(t, 3)
+	if !g.acquireCapCheck(context.Background()) {
+		t.Fatal("could not hold the cap check")
+	}
+	defer g.releaseCapCheck()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	rec := &SessionRecord{Key: "discord:g1/t-waited"}
+	if !g.refuseAtSessionCap(ctx, rec, false) {
+		t.Fatal("granted a slot without the cap check")
+	}
+	const want = "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment"
+	if posts := adapter.postTextsFor(rec.Key); len(posts) != 1 || posts[0] != want {
+		t.Errorf("posts %q; want the waited-too-long notice", posts)
+	}
+}
+
+// A slot a turn holds ends with the turn even when the turn never reaches a
+// spawn (a retire or a publish that fails first): the conversation's locked
+// turn releases it as it ends. Here a held slot is released by a turn that
+// starts no pod at all.
+func TestAHeldCapSlotEndsWithATurnThatNeverSpawns(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	conv := "discord:g1/t-held-nospawn"
+	r.g.holdCapSlot(conv, "")
+	say(r, conv, "m-stop", "stop")
+	waitFor(t, "the turn's slot released", func() bool {
+		r.g.capMu.Lock()
+		defer r.g.capMu.Unlock()
+		_, held := r.g.capHolds[conv]
+		return !held
+	})
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns; a stop with nothing running should start no pod", n)
 	}
 }

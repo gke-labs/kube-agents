@@ -74,7 +74,8 @@ func (g *Gateway) nextIncarnation(ctx context.Context, rec *SessionRecord) bool 
 // session pods that have been idle longest: live pods whose conversations
 // have no task at all, oldest last user message first. It reports how many
 // went, and hands each evicted conversation's notice to notify, which the
-// caller posts once it has finished.
+// caller posts once it has finished. pods is the caller's list of live
+// session pods.
 //
 // Idle is read off each conversation's own record, under that
 // conversation's lock, and re-checked there, because the lock is what orders
@@ -87,12 +88,7 @@ func (g *Gateway) nextIncarnation(ctx context.Context, rec *SessionRecord) bool 
 //
 // The evicted conversation is told in one line. Its next message finds no
 // pod and spawns cold with the primer, as after a reap.
-func (g *Gateway) evictIdleSessions(ctx context.Context, requester *SessionRecord, n int, notify func(key, text string)) int {
-	pods, err := g.spawner.SessionPods(ctx)
-	if err != nil {
-		g.log.Error("session cap: pod list for eviction failed", "err", err)
-		return 0
-	}
+func (g *Gateway) evictIdleSessions(ctx context.Context, requester *SessionRecord, pods []sessionPod, n int, notify func(key, text string)) int {
 	type candidate struct {
 		pod       sessionPod
 		idleSince time.Time

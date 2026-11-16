@@ -1412,7 +1412,14 @@ func (s *fakeSpawner) setReusable(pods ...string) {
 func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]sessionPod(nil), s.sessionPods...), nil
+	if s.liveErr != nil {
+		return nil, s.liveErr
+	}
+	out := append([]sessionPod(nil), s.sessionPods...)
+	for i := len(out); i < s.live; i++ {
+		out = append(out, sessionPod{PodName: fmt.Sprintf("fake-live-%d", i)})
+	}
+	return out, nil
 }
 
 func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
