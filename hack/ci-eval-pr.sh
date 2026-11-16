@@ -1305,16 +1305,25 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
 # own credential, which already lists the same clusters above, a `gcloud
-# compute ... list` of a project-scoped role's objects, or a `gcloud compute
+# compute ... list` of a project-scoped role's objects, a `gcloud compute
 # instances get-serial-port-output` of the startup-fail VM, on the same
-# credential.
+# credential, or one GET of the leased repository's declared-intent note
+# (the catalog's `repository/...` assertions, #5827) with the grading read
+# token the preflight minted (mint_ledger_token "preflight":
+# LEDGER_GRADING_MINT_BODY, contents: read among its reads), handed to the
+# scan as GH_TOKEN in a subshell, never argv. Without the App key or under the
+# gitlab kind there is none: the note is not asserted that pass, the roles
+# rest on their cluster assertions, and nothing is excused on the note. The
+# call site is below the ledger credential section, after that mint.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
 # case whose grade depends on a role the scan positively saw drifted, and the
 # hourly scan saw drifted on its last two scans (a role a
 # check reads, or the case's single `fixtures:` role), and
 # run_one_unit records that case's repetitions as infrastructure under
-# `fixture-drift:<role>` instead of running them. A role the scan could not read
+# `fixture-drift:<role>` instead of running them. A drift read in the pool
+# repository needs no hourly confirmation: the hourly scan has no credential
+# for the repository, and a file's content does not flap. A role the scan could not read
 # is not drift, and a scan that fails or times out leaves no report: either way
 # every case is graded as usual and the log says why. Never fatal.
 scan_lease_fixtures() { # <report path> <published copy path>
@@ -1330,26 +1339,36 @@ scan_lease_fixtures() { # <report path> <published copy path>
     bound=(timeout "$(( wait + EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS ))")
   fi
   gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
-  # Only a role the fresh hourly scan already holds drifted twice can be
-  # excused, so wait for convergence only then; otherwise one pass is enough.
+  # A cluster drift is excused only when the fresh hourly scan already holds
+  # the role drifted twice, so wait for convergence only then; otherwise one
+  # pass is enough. A note drift (the repository subject) is excused on this
+  # read alone and never holds the wait, so it does not enter the decision.
   if ! PYTHONPATH="${GRADER_BENCH_DIR:-${SCRIPT_DIR}/../bench}" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
     wait=0
   fi
-  ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
-    --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
-    --wait "${wait}" --report "${report}" || status=$?
+  # A subshell: GH_TOKEN, the grading token under the name the scan's reader
+  # takes it by, lives in the scan's environment and nowhere else.
+  (
+    if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -n "${EVAL_LEDGER_APP_KEY_FILE:-}" ] && [ -n "${BENCH_GITHUB_TOKEN:-}" ]; then
+      export GH_TOKEN="${BENCH_GITHUB_TOKEN}"
+    else
+      echo "WARNING: no grading token for the lease-time fixture scan (the gitlab kind, or no ledger App key), so the declared-intent note is not asserted this lease; the cases on it are graded as usual." >&2
+    fi
+    ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
+      --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
+      --wait "${wait}" --report "${report}"
+  ) || status=$?
   if [ "${status}" -ne 0 ]; then
     rm -f "${report}"
     echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
   fi
 }
-profile_begin "fleet-fixture-state: the leased project's fixtures"
-STEP_START=$SECONDS
+# The call is below, past the ledger credential section (the declared-intent
+# note's read uses the grading token the preflight mints there); the report
+# and the published copy land here.
 mkdir -p "${ARTIFACTS:-/tmp/artifacts}"
 EVAL_LEASE_FIXTURE_REPORT_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_LEASE_FIXTURE_REPORT}"
 EVAL_FIXTURE_STATE_PUBLISHED_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_FIXTURE_STATE_PUBLISHED_COPY}"
-scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
-echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
 # own manual sweep had already raised all 30 projects and main.tf declares the same
@@ -2910,6 +2929,17 @@ if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
 else
   EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 fi
+
+# ─── The leased project's fixtures, in their designed state? ─────────────────
+# scan_lease_fixtures (section 2, beside the fleet kubeconfigs it reads); run
+# here because the declared-intent note's read uses the grading token the
+# preflight above minted.
+profile_begin "fleet-fixture-state: the leased project's fixtures"
+STEP_START=$SECONDS
+scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
+echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
+
+profile_begin "lease resets: ledgers, agent pulls, scope exclusion, scheduled audits"
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
 probe_gitlab_ledger_path "lease" || exit 1

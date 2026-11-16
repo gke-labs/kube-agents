@@ -39,7 +39,9 @@ neither excuses the case, and it is graded as usual.
 The change under test cannot widen any of this. On a pull request or a Tide batch
 ``hack/ci-eval-pr.sh`` passes the files it changes (``--changed-files``): a
 change to what decides drift (the catalog, the scan, the runner that
-addresses the clusters, this module) excuses nothing, and a case whose own
+addresses the clusters, the seeded content a repository assertion reads
+against and the verifier that reads the repository, this module) excuses
+nothing, and a case whose own
 directory the change edits is never excused.
 
 Only positive, sustained evidence counts. A role is excused only when the
@@ -47,8 +49,13 @@ lease-time scan READ it out of shape after waiting for it to converge AND the
 published hourly scan (``fixture-state.json``, ``--published``) holds it
 drifted on the same project in its last two scans, the rule ``health.py``'s
 ``fixture_drift`` condition uses: a pod rescheduling, or the crashloop's
-restart lag after a node repair, reads drifted once and is not excused. A
-published document that cannot be read excuses nothing. ``drifted`` is the
+restart lag after a node repair, reads drifted once and is not excused. One
+drift needs no second scan: a line on the scan's ``repository/<path>``
+subject, the declared-intent note in the pool project's GitOps repository
+read against what provisioning seeds. The hourly scan holds no credential for
+that repository and never reads the note, and a file's content does not flap,
+so the lease-time read alone excuses the cases on the role. A
+published document that cannot be read excuses nothing else. ``drifted`` is the
 only lease-time verdict that can excuse; ``unchecked`` (the read failed), ``unpublished`` (the
 runner wrote no kubeconfig for it) and ``no_state`` say nothing about the
 fixture, and the case is graded as usual. A report that is missing, will
@@ -78,6 +85,11 @@ FIXTURE_DRIFT_LABEL = "fixture-drift"
 #: verdict that is evidence of drift.
 REPORT_SCHEMA_VERSION = 1
 VERDICT_DRIFTED = "drifted"
+#: ``hack/fleet-fixture-state.py``'s ``REPOSITORY_SUBJECT``: a drift line that
+#: starts with it (``repository/<path> as_seeded: ...``) was read in the pool
+#: project's GitOps repository, where the hourly scan never reads, so it is
+#: excused on the lease-time read alone. A test holds the two names together.
+REPOSITORY_SUBJECT = "repository"
 
 #: The task.yaml keys a case names its fixtures under.
 FIXTURES_KEY = "fixtures"
@@ -109,6 +121,11 @@ DRIFT_DECIDING_PATHS = frozenset(
         "hack/fleet-fixture-state.py",
         "hack/fleet-kubeconfigs.sh",
         "bench/kube_agents_bench/fixture_drift.py",
+        # The seeded content a `repository/<path>` assertion holds the pool
+        # repository's file to, and the verifier the scan reads the file
+        # through: the change under test supplies both, as it does the scan.
+        "scripts/gitops_seed_files.py",
+        "scripts/verify_ci_pool_project.py",
     }
 )
 #: Where a case's own files live, relative to the repository root.
@@ -172,6 +189,13 @@ def sustained_roles(path: Path, project: str, now: datetime | None = None) -> se
     if scanned_at.tzinfo is None or (now or datetime.now(timezone.utc)) - scanned_at > PUBLISHED_MAX_AGE:
         raise ScanUnusable(f"the published hourly scan {path} is from {doc['scanned_at']}, older than {PUBLISHED_MAX_AGE}: the scan job is not publishing")
     return {r for r, v in roles.items() if isinstance(v, dict) and v.get("state") == VERDICT_DRIFTED and r in before}
+
+
+def repository_drift_roles(scan: LeaseScan) -> set[str]:
+    """The drifted roles with a line read in the pool repository, which the
+    lease-time read alone excuses (module docstring)."""
+    prefix = f"{REPOSITORY_SUBJECT}/"
+    return {role for role, detail in scan.drifted.items() if any(line.startswith(prefix) for line in detail)}
 
 
 def _check_roles(node: Any, found: set[str]) -> None:
@@ -277,15 +301,24 @@ def main(argv: list[str] | None = None) -> int:
     if not scan.drifted:
         print(f"Fixture drift: the lease-time scan of {scan.project} saw no drifted role; every case is graded as usual.", file=sys.stderr)
         return 0
-    try:
-        sustained = sustained_roles(Path(args.published), scan.project)
-    except ScanUnusable as exc:
-        print(f"Fixture drift: {exc}; every case is graded as usual.", file=sys.stderr)
-        return 0
-    passing = sorted(set(scan.drifted) - sustained)
+    # A drift read in the pool repository is settled by the lease-time read;
+    # every other drifted role needs the hourly scan's last two passes.
+    settled = repository_drift_roles(scan)
+    pending = set(scan.drifted) - settled
+    sustained: set[str] = set()
+    if pending:
+        try:
+            sustained = sustained_roles(Path(args.published), scan.project)
+        except ScanUnusable as exc:
+            if not settled:
+                print(f"Fixture drift: {exc}; every case is graded as usual.", file=sys.stderr)
+                return 0
+            print(f"Fixture drift: {exc}; only {', '.join(sorted(settled))}, read drifted in the pool repository, can be excused.", file=sys.stderr)
+    passing = sorted(pending - sustained)
     if passing:
         print(f"Fixture drift: {', '.join(passing)} read drifted at lease time but not on the last two hourly scans of {scan.project}; not excused.", file=sys.stderr)
-    scan = LeaseScan(project=scan.project, drifted={r: d for r, d in scan.drifted.items() if r in sustained})
+    excused = settled | (pending & sustained)
+    scan = LeaseScan(project=scan.project, drifted={r: d for r, d in scan.drifted.items() if r in excused})
     marked = mark([Path(t) for t in args.tasks], scan, Path(args.out_dir), edited_cases)
     print(
         f"Fixture drift: the lease-time scan of {scan.project} saw {', '.join(sorted(scan.drifted))} drifted; "

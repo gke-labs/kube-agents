@@ -386,7 +386,16 @@ The chain, end to end:
    peering's two halves sit on two network documents). The `startup-fail-vm` role also
    asserts that the VM's serial port 1 output still holds the failure line
    (`serial_contains`, read with `gcloud compute instances get-serial-port-output`), so a
-   buffer that has rotated past the boot reads as drift, not as a healthy fixture.
+   buffer that has rotated past the boot reads as drift, not as a healthy fixture. A role
+   whose case grades a declaration asserts the note itself: the five `declared-*` roles
+   carry a `repository/knowledge/notification-relay-no-pdb.md` subject with op
+   `as_seeded`, the file's git blob sha against the content provisioning seeds, read
+   through `scripts/verify_ci_pool_project.py` (the content lives in
+   `scripts/gitops_seed_files.py`; the presubmit and the nightly read the note with their
+   grading token; the hourly scan has no credential for the pool repositories and leaves
+   the assertion out, judging the roles on their cluster assertions), so a stale or
+   missing note is drift and the cases on it are recorded as infrastructure rather than
+   failing on a correct report.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the

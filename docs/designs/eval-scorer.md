@@ -279,7 +279,10 @@ A case not run because the lease-time seeded-fleet scan saw a fixture it needs d
 `kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
 not a wiped case for the floor either: a role is excused only when the lease-time read, after
 the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
-so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+so it is not weather a rerun clears, and nothing in the change can repair it. One drift needs no
+second scan: the declared-intent note in the pool's GitOps repository (the scan's
+`repository/<path>` subject), which the hourly scan has no credential to read and which no rerun
+changes. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
 named in a note. It still counts toward the all-cases guard, and a case with even one repetition
 lost some other way is weather as before.
 A blocking case outranks the
