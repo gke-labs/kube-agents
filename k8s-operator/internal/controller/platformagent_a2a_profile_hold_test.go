@@ -554,8 +554,9 @@ func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
 // grant leaves out its supervisor subjects until it is dispatchable.
 // The unbucketed shape, where the dispatcher entry carries every profile's
 // subjects. With bucketed grants the callout derives each bucket's grants
-// from the profile entries, and a held profile's are not yet left out
-// (gke-labs/kube-agents#5935); the dispatch config leaves it out either way.
+// from the profile entries and skips the ones the entry lists as held
+// (TestABucketedDispatcherEntryListsTheHeldProfiles); the dispatch config
+// leaves it out either way.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	withDispatcher(t)
 	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since #5577
