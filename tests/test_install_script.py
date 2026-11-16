@@ -2786,6 +2786,11 @@ verify_local_source_ref() {
   echo "VERIFIED_IMAGE_TAG=$2"
   exit 0
 }
+# The panel reads gVisor from the live install when install.env is silent
+# (resolve_existing_install_gvisor), and it sources installer_common.sh
+# itself, so a function stub would be overwritten. An explicit value wins
+# and keeps that read off the gcloud on PATH (#5893's guard).
+export ENABLE_GVISOR="false"
 PROJECT_ID="test-project"
 PARAM_IMAGE_TAG="0.4.0"
 run_menu_system "."
@@ -2816,6 +2821,7 @@ gcloud() { return 1; }
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2867,6 +2873,7 @@ EOF
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2897,6 +2904,7 @@ PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
 CHAT_SUB_NAME="platform-agent-chat-events-sub"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -13649,6 +13657,7 @@ prompt_menu() {{
     3) printf -v "$var" '%s' "6" ;;
   esac
 }}
+export ENABLE_GVISOR="false"
 run_menu_system "{repo_tmp}"
 """,
                         source_common=False,
