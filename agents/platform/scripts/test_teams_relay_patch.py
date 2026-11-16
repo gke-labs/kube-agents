@@ -147,6 +147,12 @@ def _register_fake_modules():
         check_fn: object = None
         is_connected: object = None
         standalone_sender_fn: object = None
+        # The four fields install()'s fallback entry sets when the real
+        # dataclass declares them; declared here so that branch runs.
+        max_message_length: int = 0
+        allowed_users_env: str = ""
+        allow_all_env: str = ""
+        cron_deliver_env_var: str = ""
 
     class PlatformRegistry:
         def __init__(self):
@@ -401,8 +407,26 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             teams_relay_patch.strip_bot_mentions("<at>Kage</at> hello <at>Ann</at>!", activity),
             "hello <at>Ann</at>!",
         )
-        # No entities (a personal chat): the text is only trimmed.
+        # No entities (a personal chat): the text is only trimmed, and keeps
+        # its shape: a pasted manifest arrives with its line breaks.
         self.assertEqual(teams_relay_patch.strip_bot_mentions("  hi  ", {"recipient": {"id": bot}}), "hi")
+        pasted = "apply this:\n```yaml\nkind: Pod\nmetadata:\n  name: x\n```"
+        self.assertEqual(teams_relay_patch.strip_bot_mentions(pasted, {"recipient": {"id": bot}}), pasted)
+        self.assertEqual(
+            teams_relay_patch.strip_bot_mentions("<at>Kage</at> " + pasted, activity), pasted)
+        # Fields of the wrong type read as absent; the message is not failed
+        # (a failure nacks it and the broker redelivers the same activity).
+        for bad in ({"recipient": "28:x"}, {"recipient": {"id": bot}, "entities": 7},
+                    {"recipient": {"id": bot}, "entities": [{"type": "mention", "mentioned": "x", "text": "<at>Kage</at>"}]},
+                    {"recipient": None, "entities": None}):
+            self.assertEqual(teams_relay_patch.strip_bot_mentions("<at>Kage</at> hi", bad), "<at>Kage</at> hi")
+
+    def test_split_table_row_keeps_empty_edge_cells(self):
+        split = teams_relay_patch._split_table_row
+        self.assertEqual(split("| a | b | c |"), ["a", "b", "c"])
+        self.assertEqual(split("|| node-1 | Running |"), ["", "node-1", "Running"])
+        self.assertEqual(split("| pod-a |||"), ["pod-a", "", ""])
+        self.assertEqual(split("a | b"), ["a", "b"])
 
     def test_markdown_table_becomes_an_adaptive_card_table(self):
         text = (
@@ -522,7 +546,14 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         from gateway.platform_registry import PlatformRegistry, platform_registry
 
         teams_relay_patch.install()
-        self.assertIsNotNone(platform_registry.get("teams"))
+        entry = platform_registry.get("teams")
+        self.assertIsNotNone(entry)
+        # The fallback entry carries what Hermes' authorizer, cron scheduler
+        # and splitter read, the same values as the plugin registration.
+        self.assertEqual(entry.max_message_length, teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
+        self.assertEqual(entry.allowed_users_env, "TEAMS_ALLOWED_USERS")
+        self.assertEqual(entry.allow_all_env, "TEAMS_ALLOW_ALL_USERS")
+        self.assertEqual(entry.cron_deliver_env_var, "TEAMS_HOME_CHANNEL")
 
         registry = PlatformRegistry()
         adapter = registry.create_adapter(

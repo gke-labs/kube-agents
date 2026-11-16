@@ -45,7 +45,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             method=method or ("POST" if body is not None else "GET"),
         )
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
             return exc.status, json.load(exc)
@@ -96,7 +96,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_pull_and_settle_ack_and_nack(self):
-        self._call(
+        seeded = self._call(
             "/v1/chat/teams/events",
             {
                 "type": "message",
@@ -105,6 +105,8 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             },
             method="POST",
         )
+        # A refused enqueue would otherwise surface 20 s later as an empty pull.
+        self.assertEqual(seeded, (202, {"status": "accepted"}))
         status, body = self._call("/v1/chat/teams/events", method="GET")
         self.assertEqual(status, 200)
         self.assertEqual(body["event"]["event"]["text"], "audit cluster")

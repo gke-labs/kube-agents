@@ -183,7 +183,10 @@ def _is_table_separator(stripped: str) -> bool:
 
 
 def _split_table_row(stripped: str) -> list[str]:
-    return [cell.strip() for cell in stripped.strip("|").split("|")]
+    # One border pipe off each end, not every pipe: ``|| a |`` has an empty
+    # first cell, and stripping both pipes would shift the row's columns.
+    inner = stripped.removeprefix("|").removesuffix("|")
+    return [cell.strip() for cell in inner.split("|")]
 
 
 def strip_bot_mentions(text: str, activity: dict[str, Any]) -> str:
@@ -191,17 +194,24 @@ def strip_bot_mentions(text: str, activity: dict[str, Any]) -> str:
 
     A channel message reaches the bot only when it is @mentioned, and Teams
     leaves the mention markup in ``text``; the agent should see the words
-    after it. Mentions of other people stay (entities name whom).
+    after it. Mentions of other people stay (entities name whom), and so does
+    the rest of the text as typed, line breaks included: a pasted manifest or
+    log must reach the agent in its own shape. A ``recipient``, ``entities``
+    or ``mentioned`` field of the wrong type is read as absent rather than
+    failing the message (which would nack it and have the broker redeliver it).
     """
-    recipient_id = str((activity.get("recipient") or {}).get("id") or "")
-    for entity in activity.get("entities") or []:
+    recipient = activity.get("recipient")
+    recipient_id = str(recipient.get("id") or "") if isinstance(recipient, dict) else ""
+    entities = activity.get("entities")
+    for entity in entities if isinstance(entities, list) else []:
         if not isinstance(entity, dict) or entity.get("type") != "mention":
             continue
-        mentioned_id = str((entity.get("mentioned") or {}).get("id") or "")
+        mentioned = entity.get("mentioned")
+        mentioned_id = str(mentioned.get("id") or "") if isinstance(mentioned, dict) else ""
         marker = entity.get("text")
         if recipient_id and mentioned_id == recipient_id and isinstance(marker, str) and marker:
-            text = text.replace(marker, " ")
-    return " ".join(text.split()).strip()
+            text = text.replace(marker, "")
+    return text.strip()
 
 
 # Hermes' splitter (gateway/platforms/base.py) appends " (i/n)" to every piece of
