@@ -89,7 +89,7 @@ MUTATIONS: list[Mutation] = [
         "agents/platform/scripts/credential_proxy.py",
         ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
          '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
+        "test_A3_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone",
         "let a profile worker read a proposal the way the MCP pod does -- a "
         "forge read no task target confines",
     ),
@@ -102,6 +102,66 @@ MUTATIONS: list[Mutation] = [
         "let a report credential reach every route, since a fleet audit only "
         "ever calls the store -- until its model output calls /v1/exec with "
         "no target to confine it",
+    ),
+    Mutation(
+        "A3-report-write-any-stream",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            or stream != audit_id\n",
+         ""),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "let any builtin schedule's grant write any audit's baseline, since every "
+        "builtin audit runs on the fleet-audit profile -- one audit's model output "
+        "then rewrites another's memory and hides its findings",
+    ),
+    Mutation(
+        "A3-report-write-no-trigger",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if trigger is None:\n            return RULE_REPORT_NO_TRIGGER\n",
+         "        if False:\n            return RULE_REPORT_NO_TRIGGER\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "let a fleet-audit task with no trigger write the store, so a chat-started "
+        "run keeps its report too -- a task anyone can start then rewrites the "
+        "scheduled audits' baselines",
+    ),
+    Mutation(
+        "A3-report-write-any-origin",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if getattr(trigger, \"origin\", None) != REPORT_TRIGGER_ORIGIN:\n",
+         "        if False:\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "leave the origin to the verifier, which admits only builtin today -- "
+        "until user schedules land and a user's schedule named like a builtin "
+        "audit writes its baseline",
+    ),
+    Mutation(
+        "A3-report-any-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return isinstance(profile, str) and bool(profile) and profile in allowlist\n",
+         "    return isinstance(profile, str) and bool(profile)\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "let every profile's task use the store, since only fleet-audit tasks "
+        "carry a schedule trigger -- any profile a schedule names then writes "
+        "and reads the fleet's audit memory",
+    ),
+    Mutation(
+        "A3-report-write-any-key",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if not isinstance(key, str) or not isinstance(writable, str) or not writable or key != writable:\n",
+         "    if not isinstance(key, str):\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "trust the request's repository key, since the listener validates its "
+        "shape -- a task then writes a baseline under a repository this install "
+        "does not manage, which the next run reads as its own",
+    ),
+    Mutation(
+        "A3-report-no-role-is-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL:\n        pass\n",
+         "    if role in (CALLER_ROLE_SHELL, \"\"):\n        pass\n"),
+        "test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline",
+        "treat a caller with no role as the shell, as the role table does for a "
+        "Unix-socket broker -- a broker with no audience split then hands every "
+        "caller the shell's writes",
     ),
     Mutation(
         "A3-profile-reaches-gke-mcp",

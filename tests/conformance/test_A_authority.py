@@ -472,10 +472,53 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
+    def test_A3_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone(self) -> None:
+        # The audit-report routes (#5619) hold a profile caller to the report
+        # rules (the next row) inside the handler.
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
-        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+        self.assertEqual(
+            sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX, h.credential_proxy.AUDIT_REPORTS_PREFIX]), reached
+        )
+
+    def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
+        # The broker's write rule for the audit-report store (#5619), driven
+        # with stand-in claims: the verdict on a real credential's shape is
+        # task_credential's, pinned by the golden fixtures in the Python suite
+        # (that module needs `cryptography`, which this suite doesn't import).
+        cp = h.credential_proxy
+        audit, key = "compliance-audit", "acme%2Fgitops"
+        allowlist = frozenset({"fleet-audit", "platform"})
+
+        def trigger(stream: str = audit, origin: str = "builtin", name: str | None = None) -> object:
+            return types.SimpleNamespace(name=name or f"schedule/{stream}", origin=origin, stream=stream)
+
+        def write(role: str = cp.CALLER_ROLE_PROFILE, profile: object = "fleet-audit", grant: object = "match",
+                  request_key: str = key, gitops_key: str | None = key) -> str | None:
+            return cp.report_write_permitted(
+                role, profile, trigger() if grant == "match" else grant, audit, request_key, gitops_key, allowlist
+            )
+
+        self.assertIsNone(write())
+        self.assertIsNone(write(request_key="no_forge%2Flocal", gitops_key=None))
+        for name, rule in (
+            ("another schedule's trigger", write(grant=trigger("obtainability-audit"))),
+            ("a trigger named for another source", write(grant=trigger(name="stall-watch"))),
+            ("a trigger that binds no stream", write(grant=trigger(stream=""))),
+            ("no trigger", write(grant=None)),
+            ("a user origin", write(grant=trigger(origin="user"))),
+            ("a profile outside the allowlist", write(profile="auditor")),
+            ("no task credential", write(profile=None)),
+            ("the wrong repository key", write(request_key="acme%2Fterraform")),
+            ("no_forge beside a GitOps repository", write(request_key="no_forge%2Flocal")),
+            ("a caller with no role", write(role="")),
+            ("another role", write(role=cp.CALLER_ROLE_SESSION)),
+        ):
+            with self.subTest(name):
+                self.assertIsNotNone(rule)
+        # The shell writes any audit, but only to the install's own key.
+        self.assertIsNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None))
+        self.assertIsNotNone(write(role=cp.CALLER_ROLE_SHELL, profile=None, grant=None, request_key="acme%2Fterraform"))
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no
