@@ -49,6 +49,7 @@ RUNNER_CONSTANTS = (
     "EVAL_GATEWAY_HOME",
     "EVAL_FENCE_CARD_PASSES",
     "EVAL_FENCE_TIMEOUT_SECONDS",
+    "EVAL_ARM_CLEAR_TIMEOUT_SECONDS",
     "EVAL_FENCE_BUDGET_MARGIN_SECONDS",
     "EVAL_FENCE_DECIDED_EXIT",
     "EVAL_FENCE_ATTEMPTS",
@@ -103,9 +104,9 @@ class FenceCardsTest(unittest.TestCase):
         )
         hermes.chmod(0o755)
 
-    def _fence(self, passes: int = PASSES, budget: int = BUDGET) -> subprocess.CompletedProcess:
+    def _fence(self, passes: int = PASSES, budget: int = BUDGET, *scope: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["python3", "-", str(self.home), str(SINCE), str(passes), str(budget)],
+            ["python3", "-", str(self.home), str(SINCE), str(passes), str(budget), *scope],
             stdin=SCRIPT.open(), capture_output=True, text=True, check=False, timeout=60,
             env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}"},
         )
@@ -184,6 +185,47 @@ class FenceCardsTest(unittest.TestCase):
         done = self._fence()
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "nothing live"), done.stdout)
 
+    def _session_cards(self, rows):
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER, session_id TEXT)")
+            conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?)", rows)
+
+    def test_the_arm_scope_archives_every_card_the_live_arm_filed_newest_first(self):
+        # 2122208205344870400: the replayed chat-routing-fleet-question answered from a
+        # finished upgrades-fleet-rollout-stall card. Finished cards go too; the install's
+        # own (before the arm, a cron run's, a script's) and archived ones stay.
+        self._session_cards([
+            ("t_fleet", "done", SINCE + 10, "api-turn-1"),
+            ("t_child", "blocked", SINCE + 20, "api-turn-1"),
+            ("t_running", "running", SINCE + 30, "inject-turn-2"),
+            ("t_gone", "archived", SINCE + 40, "api-turn-1"),
+            ("t_audit", "done", SINCE + 50, "cron_fleet-audit_20261116_062000"),
+            ("t_sweep", "done", SINCE + 60, None),
+            ("t_blank", "running", SINCE + 70, ""),
+            ("t_earlier", "done", SINCE - 1, "api-turn-0"),
+        ])
+        self._hermes()
+        done = self._fence(PASSES, BUDGET, "arm")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["t_running", "t_child", "t_fleet"])
+        self.assertIn("archived 3 card(s) the live arm filed: t_running (running), t_child (blocked), t_fleet (done)", done.stdout)
+        for card, status in (("t_audit", "done"), ("t_sweep", "done"), ("t_blank", "running"), ("t_earlier", "done")):
+            self.assertEqual(self._status(card), status, card)
+
+    def test_the_arm_scope_with_nothing_filed_says_so(self):
+        self._session_cards([("t_earlier", "done", SINCE - 1, "api-turn-0")])
+        self._hermes()
+        done = self._fence(PASSES, BUDGET, "arm")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "nothing the live arm filed"), done.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_an_unknown_scope_is_refused(self):
+        self._cards([("t_a", "running", SINCE + 1)])
+        self._hermes()
+        done = self._fence(PASSES, BUDGET, "everything")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.calls.exists())
+
     def test_a_budget_spent_mid_list_stops_and_names_the_cards_not_reached(self):
         # The runner's timeout stops kubectl, not the helper in the pod; a helper that kept
         # going could archive the card of the unit launched after it (#4702 review).
@@ -256,7 +298,23 @@ class FenceCardsTest(unittest.TestCase):
         constants = dict(line.split("=", 1) for line in runner_constants())
         budget = int(constants["EVAL_FENCE_TIMEOUT_SECONDS"]) - int(constants["EVAL_FENCE_BUDGET_MARGIN_SECONDS"])
         self.assertGreater(budget, 0)
-        self.assertRegex(argv, rf" - /opt/data 1000 {constants['EVAL_FENCE_CARD_PASSES']} {budget}\n?$")
+        self.assertRegex(argv, rf" - /opt/data 1000 {constants['EVAL_FENCE_CARD_PASSES']} {budget} live\n?$")
+
+    def test_the_arm_clear_passes_its_scope_and_its_own_bound_and_only_warns(self):
+        constants = dict(line.split("=", 1) for line in runner_constants())
+        budget = int(constants["EVAL_ARM_CLEAR_TIMEOUT_SECONDS"]) - int(constants["EVAL_FENCE_BUDGET_MARGIN_SECONDS"])
+        self.assertGreater(budget, int(constants["EVAL_FENCE_TIMEOUT_SECONDS"]))
+        done = self._runner('echo "archived 2 card(s) the live arm filed: t_a (done), t_b (done)"', unit=' "" "" arm')
+        self.assertIn("Card fence (pdb-remediation-pr rep 3): archived 2 card(s) the live arm filed", done.stdout, done.stderr)
+        self.assertRegex((self.home / "argv").read_text(), rf" - /opt/data 1000 {constants['EVAL_FENCE_CARD_PASSES']} {budget} arm\n?$")
+        # A clear that cannot run warns, returns 0, and marks no unit or latch.
+        for f in ("argv", "waits"):
+            (self.home / f).unlink(missing_ok=True)
+        done = self._runner('echo "error: pod not running"; exit 1', unit=' "" "" arm')
+        self.assertIn("returned 0", done.stdout, done.stderr)
+        self.assertIn("the replayed arm may read the live arm's cards on the board", done.stderr)
+        self.assertNotIn("not launched", done.stderr)
+        self.assertFalse(self.unfenced.exists())
 
     def test_a_failed_exec_is_tried_again_once_the_gateway_is_ready(self):
         # The first exec meets a gateway with no container (a preemption mid-phase,
