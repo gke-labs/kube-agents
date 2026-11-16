@@ -9006,6 +9006,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
         "webhook-backend-unreachable", "serviceentry-host-collision", "webhook-ca-bundle-expired",
+        "wi-gsa-iam-binding-unverifiable",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",

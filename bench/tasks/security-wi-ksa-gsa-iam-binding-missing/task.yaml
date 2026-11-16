@@ -1,17 +1,15 @@
 # Security, Workload Identity, RBAC and CVEs (compliance-audit): the planted
 # ServiceAccount carries the `iam.gke.io/gcp-service-account` annotation and
-# a Deployment runs under it, but the Google service account the annotation
-# names grants `roles/iam.workloadIdentityUser` to no member for this
-# namespace and account (its project id is longer than GCP allows, so the
-# account exists nowhere), so every token exchange the workload attempts is refused. The
-# compliance audit reads whether Workload Identity is on (2.8) and never the
-# binding behind an annotation. A declared gap: expected_fail until the check
-# lands (gke-labs/kube-agents#5027).
+# a Deployment runs under it, while the Google service account the annotation
+# names sits in a project the install cannot read (its project id is longer
+# than GCP allows, so `gcloud projects describe` is refused on every host).
+# Check 2.21 (`wi-gsa-iam-binding-unverifiable`, arm A of
+# gke-labs/kube-agents#5027) names `ServiceAccount/kms-signer-sa` at `minor`
+# severity on the rolling ledger.
 id: security-wi-ksa-gsa-iam-binding-missing
 name: "Workload Identity Annotation With No workloadIdentityUser Binding Behind It (KSA-to-GSA binding check)"
 domain: security
 suite: validated-capabilities
-expected_fail: true
 audit_streams:
   - compliance-audit
 fixtures: []
@@ -56,6 +54,7 @@ verification_spec:
       scope: finding
       finding_check:
         [
+          "wi-gsa-iam-binding-unverifiable",
           "wi-gsa-iam-binding-missing",
           "workload-identity-iam-mismatch",
           "ksa-gsa-binding-broken",
