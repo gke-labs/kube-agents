@@ -670,6 +670,24 @@ func TierAccessDenied(c *RBACChecker) []string {
 	return out
 }
 
+// AgentScheduleAccessDenied returns the boot probe's denials on
+// agentschedules, as TierAccessDenied does for tiers: an operator image
+// deployed ahead of its ClusterRole skips the AgentSchedule controller rather
+// than crashloop.
+func AgentScheduleAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if (tuple.resource == "agentschedules" || tuple.resource == "agentschedules/status") && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
 // Start re-probes every interval until ctx is cancelled. It satisfies
 // manager.Runnable; main.go adds the checker to the manager after the boot
 // probe.

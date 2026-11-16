@@ -626,6 +626,18 @@ func (r *AgentScheduleReconciler) schedulesInNamespace(ctx context.Context, obj 
 }
 
 func (r *AgentScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The bus side, unless a test injected its own: submissions and status
+	// queries to the gateway's trigger ingress on the operator's own bus
+	// connection (agentschedule_submitter.go).
+	if r.Submitter == nil || r.Tracker == nil {
+		bus := newNATSScheduleSubmitter(newNATSCardPublisher(mgr.GetClient()), mgr.GetClient())
+		if r.Submitter == nil {
+			r.Submitter = bus
+		}
+		if r.Tracker == nil {
+			r.Tracker = bus
+		}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentSchedule{}).
 		// Only spec changes matter here (a profile's tiers, an install

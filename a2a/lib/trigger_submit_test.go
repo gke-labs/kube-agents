@@ -1,6 +1,9 @@
 package lib
 
 import (
+	"bytes"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -112,5 +115,26 @@ func TestATriggerReplyIsOnlyInItsSourcesNamespace(t *testing.T) {
 		if ValidTriggerReplySubject("schedule", bad) {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit: the bytes the
+// operator sends for a built-in schedule's run (written by its
+// TestTheTriggerSubmitFixtureIsWhatTheOperatorSends, since the modules can't
+// import each other) decode strictly into lib.TriggerSubmit and pass the
+// gateway's check, so the two spellings can't drift apart.
+func TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit(t *testing.T) {
+	raw, err := os.ReadFile("testdata/rendered-trigger-submit.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s TriggerSubmit
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&s); err != nil {
+		t.Fatalf("the operator's submission doesn't decode as lib.TriggerSubmit: %v", err)
+	}
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err != nil {
+		t.Fatalf("the operator's submission fails the gateway's check: %v", err)
 	}
 }
