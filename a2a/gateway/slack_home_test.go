@@ -285,6 +285,24 @@ func TestSlackHomeTheCapNeverHidesAnUnlistedRow(t *testing.T) {
 	}
 }
 
+// A board of unlisted rows only (#3658: a project listed live that no profile
+// names yet, an unread member) has no cluster it can count, but it is not a
+// fleet of none: the header never says "0 clusters" beside those rows.
+func TestSlackHomeUnlistedRowsAloneAreNeverZeroClusters(t *testing.T) {
+	b := &lib.Board{GeneratedAt: homeNow, Clusters: []lib.BoardCluster{{Name: "mgmt (clusters not listed here)", Unlisted: true}}}
+	a, api, _ := homeAdapter(t, b, nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	if strings.Contains(got, "0 clusters") {
+		t.Errorf("unlisted rows drawn under \"0 clusters\"; got:\n%s", got)
+	}
+	for _, want := range []string{"context: " + slackHomeNoListedClusters + " ·", "*mgmt (clusters not listed here)*  " + slackHomeUnlisted} {
+		if !strings.Contains(got, want) {
+			t.Errorf("view lacks %q; got:\n%s", want, got)
+		}
+	}
+}
+
 // Under allow-all, a users.info failure decides nothing: the tab is left as
 // it was, never told it is not allowed; and a republish to a member who was
 // admitted when they opened it asks users.info nothing again.

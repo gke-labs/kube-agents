@@ -84,17 +84,20 @@ const (
 
 	slackHomeClusterCount = "%d cluster%s"
 	slackHomeMoreClusters = "%d more cluster%s"
-	slackHomeBoardUnread  = "Could not read the board at %s."
-	slackHomeMoreFindings = " · %d more finding%s"
-	slackHomeNoFindings   = "no open findings"
-	slackHomeNotYet       = "no findings registered yet"
-	slackHomeFirstReport  = "Send me a message to get your first report and findings."
-	slackHomeAuditCounts  = "*%s:* %d finding%s, %d critical"
-	slackHomeAuditClean   = "*%s:* clean"
-	slackHomeUpdated      = "updated "
-	slackHomeAsked        = "asked "
-	slackHomeStarted      = "started "
-	slackHomeOpened       = "opened "
+	// slackHomeNoListedClusters heads a fleet of unlisted rows only (#3658),
+	// which is not a fleet of no clusters.
+	slackHomeNoListedClusters = "No clusters listed"
+	slackHomeBoardUnread      = "Could not read the board at %s."
+	slackHomeMoreFindings     = " · %d more finding%s"
+	slackHomeNoFindings       = "no open findings"
+	slackHomeNotYet           = "no findings registered yet"
+	slackHomeFirstReport      = "Send me a message to get your first report and findings."
+	slackHomeAuditCounts      = "*%s:* %d finding%s, %d critical"
+	slackHomeAuditClean       = "*%s:* clean"
+	slackHomeUpdated          = "updated "
+	slackHomeAsked            = "asked "
+	slackHomeStarted          = "started "
+	slackHomeOpened           = "opened "
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
 
@@ -499,16 +502,23 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 	} else {
 		// An unlisted row (lib.BoardCluster.Unlisted) stands for projects, not
 		// a cluster: the cap and both counts are clusters, and an unlisted row
-		// is drawn wherever it sits, so the cap never hides it.
-		real := 0
+		// is drawn wherever it sits, so the cap never hides it. Nor is it no
+		// clusters: with only unlisted rows the header says none are listed,
+		// never "0 clusters".
+		real, unlisted := 0, 0
 		for _, c := range b.Clusters {
-			if !c.Unlisted {
+			if c.Unlisted {
+				unlisted++
+			} else {
 				real++
 			}
 		}
 		total := max(b.ClusterCount, real)
-		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
-			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
+		count := fmt.Sprintf(slackHomeClusterCount, total, plural(total))
+		if total == 0 && unlisted > 0 {
+			count = slackHomeNoListedClusters
+		}
+		note(count, slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
 		if b.FirstReportPending && b.FirstMessagePending {
 			note(slackHomeFirstReport)
 		}
