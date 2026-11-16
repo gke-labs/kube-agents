@@ -305,7 +305,8 @@ def decide(runner, project="p", cluster="c", location="us-central1"):
     """Run the flag-only decision with a clean cache, no own-cluster identity in
     the environment, and stderr swallowed."""
     gke_endpoint.reset_cache()
-    scrubbed = {k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV}
+    scrubbed = {k: v for k, v in os.environ.items()
+                if k not in OWN_CLUSTER_ENV and k not in gke_endpoint.KUBE_PROXY_ENVS}
     with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), \
             redirect_stderr(io.StringIO()):
         return gke_endpoint.dns_endpoint_args(project, cluster, location, run=runner)
@@ -348,6 +349,47 @@ class PredicateTest(unittest.TestCase):
             }
         }
         self.assertEqual(decide(FakeRunner(shape)), [])
+
+
+class KubeProxySkipTest(unittest.TestCase):
+    """Under the kube-api proxy the endpoint flags never reach the kubeconfig, so
+    nothing is run to choose them."""
+
+    DESCRIBE = {"controlPlaneEndpointsConfig": {"dnsEndpointConfig": {"endpoint": "x.gke.goog", "allowExternalTraffic": True}}}
+
+    def flags_with(self, name, value, env=None):
+        runner = FakeRunner(describe=self.DESCRIBE)
+        gke_endpoint.reset_cache()
+        scrubbed = {k: v for k, v in os.environ.items() if k not in gke_endpoint.KUBE_PROXY_ENVS}
+        if name:
+            scrubbed[name] = value
+        with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), redirect_stderr(io.StringIO()):
+            return gke_endpoint.dns_endpoint_args("p", "c", "us-central1", env=env, run=runner), runner
+
+    def test_either_proxy_env_gives_no_flags_and_runs_nothing(self):
+        for name in gke_endpoint.KUBE_PROXY_ENVS:
+            with self.subTest(name):
+                flags, runner = self.flags_with(name, "https://kube-proxy.ns.svc.cluster.local:8443")
+                self.assertEqual(flags, [])
+                self.assertEqual(runner.calls, [])
+
+    def test_without_it_the_flags_are_chosen_as_before(self):
+        flags, runner = self.flags_with(None, "")
+        self.assertEqual(flags, [gke_endpoint.DNS_ENDPOINT_FLAG])
+        self.assertTrue(runner.describe_calls)
+
+    def test_an_empty_value_or_an_unexpanded_placeholder_is_not_the_proxy(self):
+        # Hermes hands an MCP server the literal `${NAME}` for an unset variable,
+        # which is what platform_control gets under an operator older than the env.
+        for value in ("  ", "${KUBE_PROXY_IN_USE_URL}"):
+            with self.subTest(value):
+                flags, runner = self.flags_with("KUBE_PROXY_IN_USE_URL", value)
+                self.assertEqual(flags, [gke_endpoint.DNS_ENDPOINT_FLAG])
+                self.assertTrue(runner.describe_calls)
+
+    def test_a_passed_env_is_read_rather_than_the_process_env(self):
+        flags, runner = self.flags_with(None, "", env={"KUBE_PROXY_IN_USE_URL": "https://kube-proxy.ns.svc.cluster.local:8443"})
+        self.assertEqual((flags, runner.calls), ([], []))
 
 
 class DegradesQuietlyTest(unittest.TestCase):

@@ -787,10 +787,15 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 			provider = strings.ToLower(strings.TrimSpace(existingList[0].Provider))
 		}
 	}
-	if provider == "" && forge != "" {
+	// A declared forge decides its own provider (an empty one reads as
+	// github); the request's provider only matters for a forge not declared.
+	if forge != "" {
 		for _, f := range forges {
-			if f.Name == forge && f.Provider != "" {
+			if f.Name == forge {
 				provider = strings.ToLower(strings.TrimSpace(f.Provider))
+				if provider == "" {
+					provider = "github"
+				}
 				break
 			}
 		}

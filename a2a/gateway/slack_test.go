@@ -394,6 +394,15 @@ func TestEmptyPrincipalMapBootNotice(t *testing.T) {
 				IdleTTL:          30 * time.Minute,
 				AttributionSalt:  []byte("test-salt"),
 			}
+			// The notices follow the armed backend's credential, not Options.Backend.
+			switch tc.backend {
+			case slackBackend:
+				cfg.SlackBotToken, cfg.SlackAppToken = "xoxb-test", "xapp-test"
+			case discordBackend:
+				cfg.DiscordToken = "x"
+			case gchatBackend:
+				cfg.GchatRelayURL, cfg.GchatAllowAllUsers = "http://relay.invalid", true
+			}
 			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -2631,6 +2640,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 // A mentioned ask starts a task again and the thread is back. And a task
 // that keeps running keeps the thread past any TTL.
 func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -2877,6 +2887,7 @@ func slackAuthorityOf(t *testing.T, r *rig) Authority {
 // TestSlackMappedAndAllowedSenderIsAdmitted: the sender passes both gates
 // and resolves through the map, as before the allowlist was carried.
 func TestSlackMappedAndAllowedSenderIsAdmitted(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
 	auth := slackAuthorityOf(t, r)
@@ -2891,6 +2902,7 @@ func TestSlackMappedAndAllowedSenderIsAdmitted(t *testing.T) {
 // once-per-sender notice, naming the sender's id), and no task is published.
 // Member ids compare exactly: "u2" is not "U2".
 func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1", "u2"}, false)
 	for _, id := range []string{"1.0", "2.0"} {
 		r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: id, Text: "do a thing"}
@@ -2920,6 +2932,7 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 // gateway drops rewrites nothing, and an admitted one's does. A click is a
 // message like any other here: same path, same allowlist.
 func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U2", MessageID: "60.1", Text: "Option A: restart"}
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.2", Text: "Option A: restart"}
@@ -2935,6 +2948,7 @@ func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
 // attributed slack:<member id>, with the verifiedBy that says no map was
 // consulted, and they are in their own audience under that same principal.
 func TestSlackListedUnmappedSenderIsAttributedByMemberID(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D9", Kind: "dm", AuthorID: "U9", MessageID: "1.0", Text: "do a thing"}
 	auth := slackAuthorityOf(t, r)
@@ -2954,6 +2968,7 @@ func TestSlackListedUnmappedSenderIsAttributedByMemberID(t *testing.T) {
 // and not U9, U1 is attributed by the map and U9 by member id, and each
 // authority block says which.
 func TestSlackPartialMapAttributesEachSenderItsOwnWay(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
 	for _, tc := range []struct{ id, principal, verifiedBy string }{
 		{"U1", "test:one", slackVerifiedBy},
@@ -3031,6 +3046,7 @@ func TestSlackRosterRefusesTheReservedPrefixSilently(t *testing.T) {
 // gate: a mapped sender is attributed by the map, an unmapped one by member
 // id.
 func TestSlackAllowAllAdmitsEverySender(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, nil, true)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: "1.0", Text: "hello"}
 	auth := slackAuthorityOf(t, r)
@@ -3071,6 +3087,7 @@ func TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone(t *testing.T) {
 // the same gate as the requester, so a mapped member the allowlist refuses
 // is recorded by backend id, not named by the principal the map would give.
 func TestSlackRosterDoesNotAttributeADisallowedMember(t *testing.T) {
+	t.Parallel()
 	r := startSlackGateRig(t, []string{"U1"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/1.0", Kind: "group", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
 	auth := slackAuthorityOf(t, r)

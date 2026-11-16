@@ -23,7 +23,7 @@ passes without a GitHub read.
 
 These tests run the case's entries as the inject lane copies them
 (``lane.copy_task`` over the real lane file). The replies are reps 1 and 2 of
-nightly-main-b 2115594709677117440 (2026-10-29, gemini-4-argon): rep 1
+nightly-main-b 2115594709677117440 (2026-10-29): rep 1
 stopped; rep 2 opened #359 and linked it, which ``main``'s spec charged as
 an unrequested write. GitHub is a fake listing built from what that run's
 github_writes check and the pull request's own API record say (#359, its

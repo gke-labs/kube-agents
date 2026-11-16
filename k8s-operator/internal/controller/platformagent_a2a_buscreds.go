@@ -113,11 +113,9 @@ const (
 // updateStatusReady and updateStatusDegraded, so it is not racing either of
 // them for the object's resourceVersion.
 //
-// wantNext decides only the absent case: a next install with no callout says
-// so, a today install carries no condition at all. It deliberately does not
-// decide the present case. A CR flipped to today whose refusal also withheld
-// cleanupA2A still has a callout running, and removing the condition there
-// would report a component gone while it is still authenticating the bus.
+// wantNext decides only the absent case: an install with no callout says so.
+// Every install wants the callout now; the parameter stays so the one caller
+// says what it asks for. It deliberately does not decide the present case.
 //
 // mapVersion is what this reconcile rendered, or empty on a pass that returned
 // before rendering -- in which case the version is read back off the ConfigMap
@@ -270,9 +268,8 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 	return r.Status().Update(ctx, agent)
 }
 
-// clearBusCredentialsReady removes the condition. A today install must not
-// carry a condition that describes a component it does not have — the darkness
-// property reaches status, not just objects.
+// clearBusCredentialsReady removes the condition: an install must not carry a
+// condition that describes a component it does not have.
 func (r *PlatformAgentReconciler) clearBusCredentialsReady(agent *agentv1alpha1.PlatformAgent) bool {
 	return meta.RemoveStatusCondition(&agent.Status.Conditions, busCredentialsReadyCondition)
 }

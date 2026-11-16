@@ -85,12 +85,18 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
-# The certification suite's file: a case there is registered too, on a lane
-# of its own, and its task file must say so with `suite: certification`.
-CERTIFICATION_CASES_FILE = eval_rosters.CERTIFICATION_CASES_FILE
-ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE, CERTIFICATION_CASES_FILE)
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The certification suite has no roster file: the bare line
+# `suite: certification` in a task file registers the case on that lane, and
+# `certification_part: N` puts it in section N. hack/ci-eval-pr.sh reads the
+# two lines with grep, so the lines must be those exact spellings; the YAML
+# read below catches any other, since a case the YAML parse registers and the
+# grep cannot see would be a case the lane never runs.
 SUITE_KEY = "suite"
 CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
+CERTIFICATION_SUITE_LINE_RE = eval_rosters.CERTIFICATION_SUITE_LINE_RE
+CERTIFICATION_PART_KEY = eval_rosters.CERTIFICATION_PART_KEY
+CERTIFICATION_PART_LINE_RE = eval_rosters.CERTIFICATION_PART_LINE_RE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -189,13 +195,20 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # Grades whom a /session turn delegated to (delegated_to); the cluster child
-    # it delegates to only runs where the AgentProfile dispatcher does, which the
-    # CI next lane turns on, with profiles.cluster, in the dispatcher flip (#5394). That pull request
-    # registers the case in hack/eval/nightly-cases.txt and on
-    # hack/eval/api-lane-exclusions.txt, and removes this entry.
-    "session-delegates-to-the-profile-asked-for": (
-        "#5394: needs the AgentProfile dispatcher, which the CI next lane gets from #5394; registered there"
+    # Parked from hack/eval/nightly-cases.txt by the dispatcher flip (#5394):
+    # its tse profile's persona image is a placeholder a dispatched worker can't
+    # stage, so the CI next lane stops enabling tse until #3842 gives it a real
+    # one. #3842 re-enables tse on the lane, puts the case back and removes this.
+    "tse-node-notready-pleg-probe": (
+        "#3842: the CI next lane enables tse again once #3842 gives it a real persona image"
+    ),
+    # The cluster agent as a dispatched profile diagnosing a fleet fixture
+    # (#3658). Like the case above, its child runs only where the dispatcher
+    # does; it is registered in hack/eval/nightly-cases.txt and on
+    # hack/eval/api-lane-exclusions.txt once #5394 turns the dispatcher on in
+    # the CI next lane, and this entry goes then.
+    "cluster-profile-names-the-oom-kill": (
+        "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI next lane gets from #5394"
     ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
@@ -326,6 +339,19 @@ FIXTURE_NOT_READY = {
         "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
         "whose auto-creation is off; the lane's host clusters are Autopilot"
     ),
+    # Needs a pool with a live node whose surge node, or green pool, draws more
+    # of a regional quota than the project has left. GKE bounds the surge by
+    # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
+    # fixture rules forbid a quota edit; and the smallest honest shape, one
+    # live c3-standard-176 against C3_CPUS 300, costs about $9 an hour
+    # standing or about $7 a repetition on a per-run cluster that depends on
+    # each project's family quota. #2567 item 2 proposes the check and owns
+    # the gap; the fixture is the cost decision its case header states.
+    "upgrade-surge-bluegreen-gce-quota-exhaustion": (
+        "#2567 item 2: needs a pool with a live node whose surge node or green pool exceeds a "
+        "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
+        "$9 an hour standing or about $7 a run on a per-run cluster"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -360,14 +386,6 @@ FIXTURE_NOT_READY = {
     ),
     "terraform-new-cluster-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
-    ),
-    # Needs a cluster that runs Config Connector in the audited fleet of a
-    # pool project; no pool project runs it (provisioning-kcc-cluster-without-
-    # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
-    # plants the stalled object on such a cluster and removes it.
-    "fleet-audit-manifest-fix-names-stalled-config-connector": (
-        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
-        "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
     ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
@@ -463,15 +481,6 @@ FIXTURE_NOT_READY = {
         "install's context_repos, as the case's header gives; no pool install "
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
-    ),
-    "remediation-context-repository-owns-the-fix": (
-        "#5213: needs the three-part fixture its fixture/README.md describes in each "
-        "pool install: a context repository holding the payments chart, registered "
-        "in context_repos at a pinned ref (the registration #4243 also waits for), "
-        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
-        "GitOps repository, and the rendered workload on the agent host; no pool "
-        "install carries them, so the objective fails with the chart repository "
-        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
@@ -933,6 +942,66 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
+# `{{FLEET_CLUSTER_PROJECT|LOCATION|NAME:<role>}}` in a prompt, as
+# bench/kube_agents_bench/harness.py's _FLEET_CLUSTER_PLACEHOLDER reads it
+# (restated, as CLUSTER_PLACEHOLDER is; the harness owns it).
+FLEET_PROMPT_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9]+(?:-[a-z0-9]+)*)\}\}")
+# Any spelling an author may have meant as one (one brace, inner spaces, any
+# case), as CLUSTER_PLACEHOLDER_LOOSE reads `{cluster:`: the opener a
+# malformed placeholder and one outside the prompt are caught by.
+FLEET_PLACEHOLDER_LOOSE = re.compile(r"\{+\s*fleet_cluster", re.IGNORECASE)
+
+
+def _strings_outside_prompt(node: Any, path: str, out: list[tuple[str, str]]) -> None:
+    """Every string in a case spec but its top-level prompt, with where it is."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if path == "" and key == "prompt":
+                continue
+            _strings_outside_prompt(value, f"{path}.{key}" if path else str(key), out)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            _strings_outside_prompt(value, f"{path}[{i}]", out)
+    elif isinstance(node, str):
+        out.append((path, node))
+
+
+def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
+    """Every `{{FLEET_CLUSTER_*:<role>}}` in the prompt is well-formed, names a
+    role the case lists in `fixtures:`, and (unless parked) a catalogue role.
+    A misspelled one reaches the model as literal text and is graded as the
+    model's failure; a role the runner doesn't provision fails every run as
+    infrastructure."""
+    # Only the prompt is expanded (harness.py's run()); anywhere else the
+    # placeholder stays literal text.
+    elsewhere: list[tuple[str, str]] = []
+    _strings_outside_prompt(spec, "", elsewhere)
+    for where, value in elsewhere:
+        if FLEET_PLACEHOLDER_LOOSE.search(value):
+            problems.append(f"{where} carries a fleet placeholder, which only the prompt expands")
+    prompt = spec.get("prompt")
+    if not isinstance(prompt, str) or not FLEET_PLACEHOLDER_LOOSE.search(prompt):
+        return
+    if FLEET_PLACEHOLDER_LOOSE.search(FLEET_PROMPT_PLACEHOLDER.sub("", prompt)):
+        problems.append(
+            "prompt carries a malformed fleet placeholder; the form is "
+            "{{FLEET_CLUSTER_PROJECT:<role>}}, ..._LOCATION or ..._NAME, with a lowercase role"
+        )
+    raw_fixtures = spec.get("fixtures")
+    fixtures = {f for f in raw_fixtures if isinstance(f, str)} if isinstance(raw_fixtures, list) else set()
+    # A project-scoped role (cluster_slot: null) has no cluster for the
+    # runner to record, so a placeholder naming it fails every run.
+    slot_roles = _catalog_slot_roles()
+    for role in sorted({m.group(2) for m in FLEET_PROMPT_PLACEHOLDER.finditer(prompt)}):
+        if role not in fixtures:
+            problems.append(f"prompt names fleet role {role!r}, which the case's 'fixtures:' doesn't list")
+        if not parked and role not in slot_roles:
+            problems.append(
+                f"prompt names fleet role {role!r}, which has no cluster slot in bench/tf/fleet/fixtures.json; "
+                "the runner records no cluster for it"
+            )
+
+
 def _catalog_roles() -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
     try:
@@ -1020,20 +1089,23 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names the eval runs: the presubmit, nightly and certification files.
+    """Case names the eval runs: the presubmit and nightly files, and the
+    certification suite's task files.
 
-    An entry in any of them is registered; the presubmit one runs on every
+    An entry in either file is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh), the certification one on its own lane
-    (EVAL_TIER=certification). A commented-out path counts for nothing -- that
-    parking state is retired; a case whose fixture does not exist waits in
-    FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
-    comment as a finding.
+    hack/ci-eval-pr.sh). A case whose task file carries the bare line
+    `suite: certification` is registered on the certification lane
+    (EVAL_TIER=certification) and sits in no file. A commented-out path counts
+    for nothing -- that parking state is retired; a case whose fixture does
+    not exist waits in FIXTURE_NOT_READY instead, and
+    commented_out_registrations() reports the comment as a finding.
 
     The files are read with the same parse the script applies
     (scripts/eval_rosters.py). Returns None when a file is missing or holds a
     line that is not a ./tasks/<id>/task.yaml path, so a broken roster fails
-    loudly rather than calling every case an orphan.
+    loudly rather than calling every case an orphan; a task file that cannot
+    be read is left out of the suite set and keeps its own finding.
     """
     names: set[str] = set()
     for path in ROSTER_FILES:
@@ -1041,15 +1113,26 @@ def registered_cases() -> set[str] | None:
             names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             return None
+    return names | certification_cases()
+
+
+def certification_cases() -> set[str]:
+    """Case names whose task file carries the bare `suite: certification` line,
+    as the lane reads them."""
+    return set(eval_rosters.certification_cases())
+
+
+def roster_file_cases() -> set[str]:
+    """Case names in the presubmit and nightly files, the lanes a certification
+    case must stay off; empty when a file cannot be read (registered_cases()
+    reports that)."""
+    names: set[str] = set()
+    for path in ROSTER_FILES:
+        try:
+            names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return set()
     return names
-
-
-def certification_cases() -> set[str] | None:
-    """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
-    try:
-        return set(eval_rosters.certification_cases())
-    except (OSError, ValueError):
-        return None
 
 
 def commented_out_registrations() -> dict[str, str]:
@@ -1321,36 +1404,59 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
 def validate_case(
     name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
 ) -> list[str]:
-    """Every problem with one case file, as reader-facing sentences."""
+    """Every problem with one case file, as reader-facing sentences.
+
+    ``certification`` is the set of case names the presubmit and nightly files
+    hold, which a suite case must stay off; None skips that rule."""
     problems: list[str] = []
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+    _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
 
-    # The suite. A certification case says so in its file and sits in the
-    # certification roster; one without the other is a case on the wrong lane.
+    # The suite. The bare line `suite: certification` is the registration on
+    # the certification lane: hack/ci-eval-pr.sh greps for that exact line,
+    # so the YAML key and the text must agree, or the validator would register
+    # a case the lane never runs. The part line is held the same way.
     suite = spec.get(SUITE_KEY)
+    # newline="" keeps a CRLF file's `\r`, so the bare-line regex misses it
+    # the way the lane's grep does and the spelling rule below reports it.
+    with path.open(encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    suite_line = CERTIFICATION_SUITE_LINE_RE.search(text) is not None
     if suite is not None and suite != CERTIFICATION_SUITE:
         problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
-    if certification is not None:
-        if name in certification and suite != CERTIFICATION_SUITE:
+    if suite == CERTIFICATION_SUITE and not suite_line:
+        problems.append(
+            f"declares the certification suite in a spelling the lane does not read; write the bare "
+            f"line '{SUITE_KEY}: {CERTIFICATION_SUITE}' (no quotes, no trailing comment), which is what "
+            f"hack/ci-eval-pr.sh greps for"
+        )
+    part = spec.get(CERTIFICATION_PART_KEY)
+    if part is not None:
+        if suite != CERTIFICATION_SUITE:
+            problems.append(f"sets '{CERTIFICATION_PART_KEY}:' without '{SUITE_KEY}: {CERTIFICATION_SUITE}'; the part is a section of that lane")
+        if not isinstance(part, int) or isinstance(part, bool) or part < 1:
+            problems.append(f"'{CERTIFICATION_PART_KEY}:' {part!r} is not a whole number from 1; write the bare integer")
+        elif not CERTIFICATION_PART_LINE_RE.search(text):
             problems.append(
-                f"is in {_display(CERTIFICATION_CASES_FILE)} but declares no "
-                f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
+                f"sets '{CERTIFICATION_PART_KEY}:' in a spelling the lane does not read; write the bare line "
+                f"'{CERTIFICATION_PART_KEY}: {part}', which is what hack/ci-eval-pr.sh greps for"
             )
-        # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
-        # suite line before its roster line lands; the registration check
-        # below leaves a suite case to this finding, so the two never ask for
-        # a nightly line and a certification line at once.
-        if (
-            name not in certification
-            and suite == CERTIFICATION_SUITE
-            and name not in KNOWN_UNREGISTERED
-            and name not in FIXTURE_NOT_READY
-        ):
+    if suite_line:
+        # One lane: a case the lane runs sits in no roster file and in no
+        # parking list, since the lane would run a parked case without its
+        # fixture.
+        if name in KNOWN_UNREGISTERED or name in FIXTURE_NOT_READY:
             problems.append(
-                f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
-                f"{_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is parked in KNOWN_UNREGISTERED or "
+                f"FIXTURE_NOT_READY; the lane would run it, so drop the line until the case can run"
+            )
+        if certification is not None and name in certification:
+            problems.append(
+                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is also in "
+                f"{_display(PRESUBMIT_CASES_FILE)} or {_display(NIGHTLY_CASES_FILE)}; a certification case "
+                f"runs on that lane only, or it holds two records under one name"
             )
 
     # The id key. devops-bench accepts task_id as an alias for id
@@ -1701,10 +1807,10 @@ def validate_case(
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt, and on the certification tier those in
-    # hack/eval/certification-cases.txt -- and only those. A `suite:
-    # certification` case is reported by the suite check above instead,
-    # which names the right file.
+    # hack/eval/nightly-cases.txt, and on the certification tier every task
+    # file with the bare suite line -- and only those. A `suite:
+    # certification` case is registered by its line; the suite checks above
+    # hold the line's spelling.
     if (
         registered is not None
         and name not in registered
@@ -1715,10 +1821,11 @@ def validate_case(
         problems.append(
             "is registered nowhere and never runs. Add it to "
             "hack/eval/nightly-cases.txt (where a new case lands; a presubmit "
-            "seat is earned on its record), or, if its fixture does not exist "
-            "yet, add a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py "
-            "naming the issue that plants it, or a reviewed KNOWN_UNREGISTERED "
-            "entry with the reason it must not run"
+            "seat is earned on its record), or, for a certification case, give "
+            "its task file the bare line 'suite: certification', or, if its "
+            "fixture does not exist yet, add a FIXTURE_NOT_READY entry in "
+            "scripts/validate_bench_cases.py naming the issue that plants it, or "
+            "a reviewed KNOWN_UNREGISTERED entry with the reason it must not run"
         )
 
     return problems
@@ -1769,14 +1876,14 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     findings that matter.
     """
     registered = registered_cases()
-    certification = certification_cases()
+    other_lanes = roster_file_cases()
     out: dict[str, list[str]] = {}
     for path in paths:
         resolved = path.resolve()
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
         out[name] = validate_case(
-            name, resolved, registered=registered if in_tree else None, certification=certification if in_tree else None
+            name, resolved, registered=registered if in_tree else None, certification=other_lanes if in_tree else None
         )
     return out
 
@@ -1787,27 +1894,27 @@ def validate_all() -> dict[str, list[str]]:
     if registered is None:
         return {
             ROSTER_PARSE_KEY: [
-                "could not read hack/eval/presubmit-cases.txt, "
-                "hack/eval/nightly-cases.txt and hack/eval/certification-cases.txt "
-                "as case lists -- a file is missing or holds a line that is not a "
-                "./tasks/<id>/task.yaml path"
+                "could not read hack/eval/presubmit-cases.txt and "
+                "hack/eval/nightly-cases.txt as case lists -- a file is missing or "
+                "holds a line that is not a ./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
         return {
             ROSTER_PARSE_KEY: [
-                "hack/eval/presubmit-cases.txt, hack/eval/nightly-cases.txt and "
-                "hack/eval/certification-cases.txt parsed to no cases -- either "
-                "all three are empty or this parse has drifted"
+                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt parsed "
+                "to no cases and no task file carries 'suite: certification' -- either "
+                "everything is empty or this parse has drifted"
             ]
         }
     results: dict[str, list[str]] = {}
     cases = bench_cases()
-    certification = certification_cases()
+    # The one-lane rule: a suite case named in a roster file runs on two lanes.
+    other_lanes = roster_file_cases()
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered, certification=certification)
+            results[name] = validate_case(name, path, registered=registered, certification=other_lanes)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():
@@ -2011,11 +2118,12 @@ def stale_allowlist_entries() -> list[str]:
         ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):
         stale += [f"{label}: {name}" for name in sorted(entries) if name not in existing]
-    # A FIXTURE_NOT_READY entry that a roster file also names is a case that
-    # runs: the fixture landed and the entry outlived it.
+    # A FIXTURE_NOT_READY entry that is also registered (a roster file names
+    # it, or its task file carries the suite line) is a case that runs: the
+    # fixture landed and the entry outlived it.
     registered = registered_cases() or set()
     stale += [
-        f"FIXTURE_NOT_READY: {name} (also in a roster file)"
+        f"FIXTURE_NOT_READY: {name} (also registered: a roster file or the suite line)"
         for name in sorted(FIXTURE_NOT_READY)
         if name in registered
     ]

@@ -282,6 +282,24 @@ def test_the_plant_writes_the_object_and_the_declaration():
     assert json.loads(forge.files[DECLARATION]) == cluster.applied[1]
 
 
+def test_the_namespace_is_exempt_from_the_stall_watch_and_the_object_is_not_hidden():
+    """The planted object stays Ready=False for the whole run; the install's
+    stall watch must not raise an alert on it, and the audits the case grades
+    must still read it."""
+    cluster, forge = Cluster(), Forge()
+    new_plant(cluster, forge).plant()
+    namespace, node_pool = cluster.applied
+    assert namespace["metadata"]["annotations"][plant.STALL_WATCH_ANNOTATION] == plant.STALL_WATCH_EXEMPT
+    assert plant.STALL_WATCH_ANNOTATION not in node_pool["metadata"]["annotations"]
+    assert plant.STALL_WATCH_ANNOTATION not in forge.files[DECLARATION]
+    stall_watch = (REPO / "agents" / "platform" / "scripts" / "stall_watch.py").read_text()
+    assert f'EXEMPT_ANNOTATION = "{plant.STALL_WATCH_ANNOTATION}"' in stall_watch
+    assert f'EXEMPT_VALUE = "{plant.STALL_WATCH_EXEMPT}"' in stall_watch
+    for audit in ("kcc_health.py", "fleet_stockout.py"):
+        source = (REPO / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / audit).read_text()
+        assert plant.STALL_WATCH_ANNOTATION not in source, audit
+
+
 def test_a_failed_plant_removes_what_it_wrote():
     """Terraform skips the destroy provisioner of a resource whose create
     failed, so the plant removes the object and the namespace itself."""

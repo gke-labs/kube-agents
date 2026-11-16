@@ -81,7 +81,9 @@ class SubmittedPayloadTestCase(unittest.TestCase):
             captured["payload"] = json.loads(request.data.decode("utf-8"))
             return RecordingResponse(json.dumps(body).encode("utf-8"))
 
-        with patch.dict("os.environ", environ, clear=False):
+        # An empty KUBECONFIG unless the test names one: the ambient value is
+        # not the test's input, and the shim refuses a file with no context.
+        with patch.dict("os.environ", {"KUBECONFIG": "", **environ}, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                     captured["exit_code"] = credential_proxy_client.execute(endpoint, argv)
@@ -879,6 +881,35 @@ class TestShellAncestry(unittest.TestCase):
         )
 
 
+class TestClusterTargetRecord(unittest.TestCase):
+    """`ClusterTarget` keeps the frozen dataclass's behaviour it replaced (#5578)."""
+
+    def test_it_is_an_immutable_value(self):
+        import copy
+        import pickle
+
+        target = credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-a")
+        same = credential_proxy_client.ClusterTarget(cluster="cluster-a", project="proj-a", location="us-central1")
+        self.assertEqual(target, same)
+        self.assertEqual(hash(target), hash(same))
+        self.assertEqual(1, len({target, same}))
+        self.assertNotEqual(target, credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-b"))
+        self.assertNotEqual(target, ("proj-a", "us-central1", "cluster-a"))
+        self.assertEqual(
+            "ClusterTarget(project='proj-a', location='us-central1', cluster='cluster-a')", repr(target)
+        )
+        self.assertEqual("gke_proj-a_us-central1_cluster-a", target.context_name)
+        for name in ("project", "context_name", "other"):
+            with self.subTest(name=name), self.assertRaises(AttributeError):
+                setattr(target, name, "x")
+        with self.assertRaises(AttributeError):
+            del target.project
+        for clone in (copy.copy(target), copy.deepcopy(target), pickle.loads(pickle.dumps(target))):
+            self.assertEqual(target, clone)
+        with self.assertRaises(TypeError):
+            credential_proxy_client.ClusterTarget("proj-a", "us-central1")
+
+
 class TestContextGrammar(unittest.TestCase):
     """The grammar both sides hold the name to, tested where it now lives."""
 
@@ -960,7 +991,8 @@ class StdinGateTest(unittest.TestCase):
             captured["body"] = json.loads(request.data)
             return RecordingResponse(json.dumps({"exitCode": 0}).encode())
 
-        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+        with patch.dict("os.environ", {"KUBECONFIG": ""}, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open):
             credential_proxy_client.execute(
                 "http://127.0.0.1:8765", ["kubectl", "apply", "-f", "-"], stdin="kind: X\n"
             )
@@ -1053,7 +1085,7 @@ class TestCallerCredential(SubmittedPayloadTestCase):
             return RecordingResponse(b"{}")
 
         stderr = io.StringIO()
-        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token"}
+        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token", "KUBECONFIG": ""}
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stderr", new=stderr):
@@ -1125,7 +1157,9 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual("a.b.next", sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_no_header_outside_a_task_or_after_it(self):
-        sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        sent = self.run_shim(
+            ["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": ""}
+        )
         self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
         # The adapter removed the file at the task's end: no task, no header,
         # and the broker answers local-only commands only.
@@ -2203,6 +2237,133 @@ class TestShimEntryRouting(unittest.TestCase):
         )
         self.assertEqual(1, named.returncode)
         self.assertIn("credential proxy unavailable", named.stderr, "no fallback for a named endpoint")
+
+    def test_a_call_through_a_tool_name_does_not_import_what_it_does_not_use(self):
+        """Each import is on every brokered call's clock (#5578)."""
+        completed = self.run_shim(
+            ["-I", "-X", "importtime", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines() if line.startswith("import time:")}
+        self.assertIn("http.client", imported, "the check reads the import list")
+        for module in ("argparse", "dataclasses", "inspect"):
+            with self.subTest(module=module):
+                self.assertNotIn(module, imported)
+
+    def test_the_explicit_form_still_parses_its_arguments(self):
+        """`argparse` is imported in `parse_args`, the explicit form's only use of it."""
+        completed = self.run_shim(
+            [str(self.shim), "--endpoint", self.live, "gcloud", "config", "get-value", "project"],
+            {},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["gcloud", "config", "get-value", "project"], self.requests[-1]["argv"])
+        refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
+        self.assertEqual(2, refused.returncode)
+        self.assertIn("invalid choice", refused.stderr)
+
+
+class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
+    """The images install a launcher that imports the client as a module, so
+    the client starts from bytecode the build compiled. Every case of
+    `TestShimEntryRouting` runs again here through the launcher, laid out as
+    the images lay it out; the cases below compare it with the single file."""
+
+    LAUNCHER = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "credential-proxy-exec.py"
+
+    def setUp(self):
+        super().setUp()
+        self.single = self.root / "single" / "credential-proxy-exec"
+        self.single.parent.mkdir()
+        self.shim.rename(self.single)
+        (self.root / "kubectl").unlink()
+        (self.single.parent / "gcloud").symlink_to(self.single)
+        libexec = self.root.resolve() / "libexec"
+        libexec.mkdir()
+        self.launcher = libexec / "credential-proxy-exec"
+        shutil.copy(self.LAUNCHER, self.launcher)
+        self.module = libexec / "credential_proxy_client.py"
+        shutil.copy(credential_proxy_client.__file__, self.module)
+        # The same bare environment as `run_shim`: a PYTHONPYCACHEPREFIX or
+        # PYTHONOPTIMIZE of the caller's would put the bytecode where the shim
+        # does not look.
+        subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", "--invalidation-mode", "unchecked-hash", str(self.module)],
+            env={"PATH": os.environ["PATH"]}, check=True, capture_output=True, timeout=60,
+        )
+        self.bytecode = libexec / "__pycache__" / f"credential_proxy_client.{sys.implementation.cache_tag}.pyc"
+        self.assertTrue(self.bytecode.is_file())
+        # As the sandbox image links it: a name on PATH, to the launcher's name
+        # in another folder, to the launcher.
+        self.shim.symlink_to(self.launcher)
+        for name in ("kubectl", "gcloud"):
+            (self.root / name).symlink_to(self.shim)
+
+    def both(self, flags, name, args, environ):
+        """The same command through the single file and through the launcher."""
+        return [
+            self.run_shim([*flags, str(folder / name), *args], {"PYTHONDONTWRITEBYTECODE": "1", **environ})
+            for folder in (self.single.parent, self.root)
+        ]
+
+    def test_the_client_is_loaded_from_the_bytecode_the_build_compiled(self):
+        completed = self.run_shim(
+            ["-v", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr[-2000:])
+        self.assertIn(f"code object from {str(self.bytecode)!r}", completed.stderr)
+
+    def test_the_bytecode_is_loaded_without_a_look_at_the_source(self):
+        """`unchecked-hash`: no stat and no hash of the source at a start. The
+        price is that an edit of the module does nothing until it is compiled
+        again."""
+        with open(self.module, "a") as source:
+            source.write("\nraise SystemExit(99)\n")
+        completed = self.run_shim([str(self.root / "kubectl"), "get", "pods"], {"CREDENTIAL_PROXY_URL": self.live})
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+
+    def test_without_the_bytecode_the_launcher_still_runs_the_client(self):
+        shutil.rmtree(self.bytecode.parent)
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertFalse(self.bytecode.parent.exists(), "and it writes none")
+
+    def test_it_answers_as_the_single_file_does(self):
+        cases = {
+            "a tool name with no broker": ([], "gcloud", ["config", "get-value", "project"], {}),
+            "a tool name": ([], "gcloud", ["config", "get-value", "project"], {"CREDENTIAL_PROXY_URL": self.live}),
+            "the help": ([], "credential-proxy-exec", ["--help"], {}),
+            "the explicit form": ([], "credential-proxy-exec", ["--endpoint", self.live, "kubectl", "get", "pods"], {}),
+            "a tool that is not supported": ([], "credential-proxy-exec", ["--endpoint", self.live, "rm", "-rf", "/"], {}),
+            "an unreachable endpoint": ([], "credential-proxy-exec", ["--endpoint", self.closed, "kubectl", "get", "pods"], {}),
+            "the kubectl wrapper's isolated call": (["-I"], "credential-proxy-exec", ["--ensure-kubectl-context", "get", "pods"], {}),
+        }
+        for label, (flags, name, args, environ) in cases.items():
+            with self.subTest(label):
+                single, launched = self.both(flags, name, args, environ)
+                self.assertEqual(
+                    (single.returncode, single.stdout, single.stderr),
+                    (launched.returncode, launched.stdout, launched.stderr),
+                )
+
+    def test_stdin_reaches_the_broker_as_it_does_from_the_single_file(self):
+        for folder in (self.single.parent, self.root):
+            completed = subprocess.run(
+                [sys.executable, str(folder / "credential-proxy-exec"), "--endpoint", self.live, "kubectl", "apply", "-f", "-"],
+                env={"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home")},
+                input="kind: ConfigMap\n", capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+        single, launched = self.requests[-2:]
+        self.assertEqual("kind: ConfigMap\n", launched["stdin"])
+        self.assertEqual(single["stdin"], launched["stdin"])
+        self.assertEqual(single["argv"], launched["argv"])
 
 
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")

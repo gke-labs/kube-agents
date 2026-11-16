@@ -397,7 +397,7 @@ The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `ee
 
 ## Findings filed
 
-- [#3932](https://github.com/gke-labs/kube-agents/issues/3932): the event watcher reads its watch set once, at start. Clusters registered later, every cluster after a reset of the agent's data volume, and clusters removed from scope stay as they were until the gateway pod restarts. The runner restarts the gateway to measure with the fleet watched; the onboarding runs measure the gap as shipped.
+- [#3932](https://github.com/gke-labs/kube-agents/issues/3932): the event watcher reads its watch set once, at start. Clusters registered later, every cluster after a reset of the agent's data volume, and clusters removed from scope stay as they were until the gateway pod restarts. The runner restarted the gateway to measure with the fleet watched; the onboarding runs measure the gap as shipped. Fixed since by #4496 (the watcher re-reads its profiles every minute), and the runner no longer restarts the gateway.
 - [#3933](https://github.com/gke-labs/kube-agents/issues/3933): a fleet audit cancels, claiming every managed cluster is excluded, when as many clusters are excluded as are managed.
 - The measured session storm and run-slot refusals are on [#3567](https://github.com/gke-labs/kube-agents/issues/3567) and [#3724](https://github.com/gke-labs/kube-agents/issues/3724).
 
@@ -408,7 +408,7 @@ The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `ee
 - **The churn fixture fell short.** It achieved about 260 Pods per minute of the planned 1,000: one `kubectl apply` per batch takes longer than the batch interval. Records carry the achieved rate, and the page plots churn at it.
 - **The project's IAM was rewritten from outside.** An organization IAM automation removed the install's service-account bindings about every 2 hours. Runs that overlapped a removal before a guard existed were deleted and re-run; after it, the bindings came back within 2 minutes, and the three records that overlapped a short gap say how many seconds (from the project's audit log, added after the runs).
 - **Soaks and onboarding ran once per point,** so their points have no spread, and the prompt operations' response times varied by up to 4.8 times between runs of one point.
-- **The runner restarts the gateway** when the watcher does not watch exactly the test fleet ([#3932](https://github.com/gke-labs/kube-agents/issues/3932)), so each such run starts on a fresh agent process.
+- **The runner restarted the gateway** when the watcher did not watch exactly the test fleet ([#3932](https://github.com/gke-labs/kube-agents/issues/3932)), so each such run in this document started on a fresh agent process. Since #4496 the runner waits for the watcher's profile rescan instead.
 - **The admission wait is a histogram bucket bound,** not an exact time: 15 s means between 10 and 15 s.
 
 # Phase 2 and Phase 3 results
@@ -468,12 +468,12 @@ The 2-hour Phase 2 window at 22 clusters, with the audits one after another, sho
 A new install at the L container size (agent 8 CPU and 16 GB, credential proxy 8 CPU and 8 GB, event watcher 2 CPU and 4 GB) ran on 40 to 42 test clusters of about 6 nodes, 435 Pods and 42 namespaces each for about 40 hours: the first-run flow, heavy questions alone and up to 8 at once, a gateway restart, 20 and 100 failing Pods, Pod churn up to 800 per minute, a 12-hour soak, and a red test at the S size. [`bench/scale/real-install-results.md`](../../bench/scale/real-install-results.md) has the results; [`bench/scale/real-install-test-plan.md`](../../bench/scale/real-install-test-plan.md) is the plan. What it changes here:
 
 - **The L size has room at 40 clusters.** No container that the L size sets passed half of its limit, and no container was killed for memory. At fair use no command was refused; at 5 questions at once the credential proxy refused 2.
-- **Stall Watch is the limit, and its cost follows namespaces.** Each run stops at its 25-minute budget (`TICK_BUDGET_SECONDS` in `agents/platform/scripts/stall_watch.py`). A run with no other load read 70 namespaces, about 21 seconds per namespace, and moved its cursor about 3 clusters on, so a full pass of 1,683 namespaces in 42 clusters takes about 7 to 12 hours (derived from one run). The Phase 4 rate of 52 to 60 seconds per cluster holds only for clusters with few namespaces.
+- **Stall Watch is the limit, and its cost follows namespaces.** (Measured before the watch read each kind once per cluster, four clusters at a time; [stall-watch-inject.md](stall-watch-inject.md) §3.10 has what changed, and the figures here predate it.) Each run stops at its 25-minute budget (`TICK_BUDGET_SECONDS` in `agents/platform/scripts/stall_watch.py`). A run with no other load read 70 namespaces, about 21 seconds per namespace, and moved its cursor about 3 clusters on, so a full pass of 1,683 namespaces in 42 clusters takes about 7 to 12 hours (derived from one run). The Phase 4 rate of 52 to 60 seconds per cluster holds only for clusters with few namespaces.
 - **The sandbox shell is the next limit.** Its memory reached 93 to 94% of its fixed 2 GiB at 5 and 8 questions at once.
 - **The S size slows down instead of crashing.** The first-run flow finished in 56 minutes, but brokered commands waited up to 60 seconds and the audits took up to 3.6 times as long.
 - **Model tokens cost about $400 a day** for one install at 42 clusters in steady operation, at a flash-class model's list price at the time.
 - **The fleet sizes count small clusters.** The test clusters had about 6 nodes each. Kube-agents' load follows Pods and namespaces more than clusters, so a fleet of larger clusters reaches these limits at fewer clusters. A cluster of 1,000 nodes (20,000 to 40,000 Pods) is not measured; at the growth the `listing_pods` runs show, listing it in full would bring the sandbox shell near its fixed 2 GiB.
-- **The event watcher watches only the clusters registered before it starts.** On a new install that is none, until the gateway restarts, so the first-run measurements in this document and in the real-install test hold none of the event watcher's load.
+- **The event watcher watches only the clusters registered before it starts.** On a new install that is none, until the gateway restarts, so the first-run measurements in this document and in the real-install test hold none of the event watcher's load. (Fixed since by #4496.)
 
 # Data to collect next
 

@@ -129,6 +129,7 @@ func documentedDownPayload(t *testing.T, taskID string) json.RawMessage {
 // that task's answer is kept in the feedback bucket, counted, and opens the
 // note box.
 func TestSlackClicksThroughThePumpBecomeATurnAndARating(t *testing.T) {
+	t.Parallel()
 	c := startSlackClickRig(t)
 	ctx := context.Background()
 

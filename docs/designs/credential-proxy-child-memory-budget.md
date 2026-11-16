@@ -177,7 +177,9 @@ At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB
 output allowance, 176 MiB, against 832 MiB after the resident reserve: four requests that run
 commands are in flight at once (4 × 176 = 704, and a fifth would need 880), whatever order they arrive in, where the slot cap
 alone admitted eight. The reconciler's and the stall watch's listing pools are four wide (§2.6),
-the admitted count; at eight wide each listing budget, sized for eight at a time, would have run
+the admitted count, and the stall watch now keeps that width for its whole tick, the cluster reads
+included ([stall-watch-inject.md](stall-watch-inject.md) §3.10), so its overlap with an hourly
+reconcile lasts the tick rather than one listing; at eight wide each listing budget, sized for eight at a time, would have run
 out with about forty of a hundred projects unlisted at a 10-second listing. When the hourly
 reconcile and a stall-watch tick coincide the two pools together submit eight against four
 admitted, and the second wave waits one listing: over two hours on the install above, 414

@@ -64,7 +64,9 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// `verifier` is the one entry here whose grants include a read that no
 	// other principal on the bus holds, so its arrival or departure from this
 	// list is worth a deliberate edit rather than a fixture regeneration.
-	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true}
+	// `dispatcher`, the AgentProfile dispatcher, which the operator renders by
+	// default: its grants name each profile durable it reads on PROFILE_SUBMITS.
+	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true, "dispatcher": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)

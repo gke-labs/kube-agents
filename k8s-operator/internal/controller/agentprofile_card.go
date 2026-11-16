@@ -124,6 +124,8 @@ type a2aAgentCard struct {
 	Tiers       []string           `json:"tiers,omitempty"`
 	ClusterRef  *a2aCardClusterRef `json:"clusterRef,omitempty"`
 	Parameters  []a2aCardParameter `json:"parameters,omitempty"`
+	// YieldToPinned is lib.AgentCard.YieldToPinned, from spec.yieldToPinned.
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 }
 
 // a2aCardClusterRef is lib.ClusterRef.
@@ -146,7 +148,7 @@ func agentCardSubject(profile string) string {
 
 // desiredAgentCard is the card the profile's spec renders.
 func desiredAgentCard(p *agentv1alpha1.AgentProfile) a2aAgentCard {
-	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: p.AllowedTierList()}
+	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: liveTiersOf(p), YieldToPinned: p.Spec.YieldToPinned}
 	if ref := p.Spec.ClusterRef; ref != nil {
 		card.ClusterRef = &a2aCardClusterRef{ProjectID: ref.ProjectID, Location: ref.Location, Cluster: ref.Cluster}
 	}
@@ -210,7 +212,7 @@ type cardPublisher interface {
 	Publish(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, card *a2aAgentCard) error
 	// SyncDurables makes the profile's shared durables exactly want, and
 	// deletes the rest this operator made (agentprofile_durables.go).
-	SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error
+	SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, probe []string) error
 }
 
 // natsCardPublisher holds one bus connection per PlatformAgent, opened on first

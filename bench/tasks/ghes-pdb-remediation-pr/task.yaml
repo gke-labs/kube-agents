@@ -134,7 +134,7 @@
 #       export PROJECT_ID=<project> CLUSTER_NAME=<agent cluster>
 #       export AGENT_CLUSTER_CONTEXT=<kubeconfig context of the agent cluster>
 #       export GCP_PROJECT_ID=<project> BENCH_TF_ROOT=./tf
-#       export JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview
+#       export JUDGE_PROVIDER=google JUDGE_MODEL=<judge model>
 #       export PLATFORM_AGENT_TOKEN=<API_SERVER_KEY of the platform-agent-secrets Secret>
 #       export BENCH_FORGE=github BENCH_GITHUB_HOST=ghes.eval.internal
 #       export BENCH_GITHUB_TOKEN=<a token that reads the repository's pull requests>

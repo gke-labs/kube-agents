@@ -290,6 +290,11 @@ class NightlyIssueTest(unittest.TestCase):
         self.assertTrue(clean(action.body), action.body)
         self.assertEqual(scrub_bot_posts.plan_issue(issue(3960, "t", action.body)).verb, "skip")
 
+    def test_a_group_issue_is_skipped_not_rewritten_to_one_case(self):
+        body = nightly_bugs.GROUP_MARKER.format(date="2026-10-06") + "\n" + nightly_bugs.MARKER.format(case="case-red") + "\n" + nightly_bugs.MARKER.format(case="case-maint")
+        action = scrub_bot_posts.plan_issue(issue(3970, "Nightly: cases red together since 2026-10-06 need triage", body))
+        self.assertEqual((action.verb, action.kind), ("skip", scrub_bot_posts.KIND_OTHER))
+
     def test_a_pull_request_and_a_human_issue_are_skipped(self):
         self.assertEqual(scrub_bot_posts.plan_issue(issue(1, "t", OLD_RED_BODY, pull_request=True)).reason, scrub_bot_posts.REASON_PULL_REQUEST)
         action = scrub_bot_posts.plan_issue(issue(2, "case-red fails on main", "see the nightly"))

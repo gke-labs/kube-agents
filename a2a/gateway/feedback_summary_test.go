@@ -48,6 +48,7 @@ func summaryCR() map[string]any {
 				"proposalsFromChat": int64(3), "proposalsFromConsole": int64(0), "proposalsFromApi": int64(0),
 				"proposalsFromEvent": int64(0), "proposalsFromDrift": int64(1), "proposalsFromAudit": int64(0),
 				"proposalsFromScheduled": int64(0), "proposalsFromIssue": int64(0), "proposalsFromOther": int64(0),
+				"inputTokensTotal": int64(1200100), "outputTokensTotal": int64(34000), "spendMicrosUSDTotal": int64(3030457),
 				"lastActiveTime":      "2026-10-21T11:34:06Z",
 				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
 				"activeInterfaces":    []any{"slack", "googlechat"},
@@ -151,7 +152,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
 		"  lastActive: 2026-10-21T11:34:06Z\n  lastHumanActive: 2026-10-20T09:15:00Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
-		"performance: " + usageSummaryPerformanceNote,
+		"performance:\n  tokens (since install): in 1200100 / out 34000\n  spend (since install): 3.03 USD\n" + usageSummaryLatencyNote + "\n",
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
 	} {
 		if !strings.Contains(text, want) {
@@ -271,7 +272,7 @@ func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testin
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: next", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -329,7 +330,7 @@ func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
 // TestUsageSummaryWithoutFixedLinesDropsTheModelLine: the audit's input is
 // the block less the model line; every other line stays audited.
 func TestUsageSummaryWithoutFixedLinesDropsTheModelLine(t *testing.T) {
-	text := "```\n  mode: today\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	text := "```\n  mode: next\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
 	got := usageSummaryWithoutFixedLines(text)
 	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
 		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
@@ -401,7 +402,7 @@ func TestUsageIdentifiersAreTheNamingSubtreesStringsButNotSettings(t *testing.T)
 }
 
 func TestAuditUsageSummaryMatchesWholeTokensAndSkipsTheTemplate(t *testing.T) {
-	if got := auditUsageSummary("on prod-eu-1 today", []string{"prod-eu-1", "today", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
+	if got := auditUsageSummary("on prod-eu-1 next", []string{"prod-eu-1", "next", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
 		t.Fatalf("audit = %v, want [prod-eu-1]", got)
 	}
 	if got := auditUsageSummary("version: 0.14.0-rc", []string{"0.14.0"}); len(got) != 0 {
@@ -419,7 +420,7 @@ func TestAuditSkipsTheBlocksOwnVocabulary(t *testing.T) {
 			t.Fatalf("fixture: %q is not in the block", word)
 		}
 	}
-	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "today", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
+	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "next", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
 	if leaked := auditUsageSummary(text, vocabulary); len(leaked) != 0 {
 		t.Fatalf("the audit refused the block's own words: %v", leaked)
 	}
@@ -504,6 +505,7 @@ func (f fakeUsageSource) ServerVersion(context.Context) (string, error) { return
 // gateway's own answer, like the bare form: one fenced block, no task, no
 // change to the conversation's state.
 func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{cr: summaryCR(), version: "v1.33.4-gke.1234000"}
 	conv := "discord:g1/thread-fbs1"
@@ -571,6 +573,7 @@ func TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName(t *testi
 }
 
 func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{err: errors.New("platformagents.kubeagents.x-k8s.io is forbidden")}
 	conv := "discord:g1/thread-fbs3"
@@ -612,7 +615,7 @@ func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
 	cr := summaryCR()
 	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = rows
 	text := renderUsageSummary(summaryNow, cr, "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
-	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\nperformance: "
+	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\n" + usageSummaryPerformanceHeader + "\n"
 	if !strings.Contains(text, block) {
 		t.Fatalf("block lacks the fixture's tools lines in place:\n%s", text)
 	}
@@ -630,7 +633,7 @@ func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
 func TestRenderUsageSummaryTopToolsDegrade(t *testing.T) {
 	cr := summaryCR()
 	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
-	if want := "\ntools (top 5, since broker start): unavailable\nperformance: "; !strings.Contains(text, want) {
+	if want := "\ntools (top 5, since broker start): unavailable\n" + usageSummaryPerformanceHeader + "\n"; !strings.Contains(text, want) {
 		t.Errorf("block lacks %q:\n%s", want, text)
 	}
 	usage := cr["status"].(map[string]any)["usage"].(map[string]any)

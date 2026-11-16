@@ -7,12 +7,10 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -86,24 +84,19 @@ func a2aGatewayImageFromRelease() bool {
 // holder's pod gone, a read that failed), so the caller keeps what the CR
 // already records rather than dropping replicas on a transient miss.
 func (r *PlatformAgentReconciler) observeA2AGatewayElection(ctx context.Context, agent *agentv1alpha1.PlatformAgent) *string {
-	lease := &coordinationv1.Lease{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayLeaseName(agent)}, lease); err != nil {
+	// The holder's pod through the same lookup the TASKS wait reads
+	// (a2aGatewayLeader): only a live pod of this gateway's Deployment
+	// counts, since a Lease taken by something else proves nothing about the
+	// image the operator renders.
+	leader, err := r.a2aGatewayLeader(ctx, agent)
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info("the A2A gateway Lease holder could not be read", "err", err.Error())
 		return nil
 	}
-	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+	if leader == nil {
 		return nil
 	}
-	pod := &corev1.Pod{}
-	if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: *lease.Spec.HolderIdentity}, pod); err != nil {
-		logf.FromContext(ctx).V(1).Info("the A2A gateway Lease holder's pod could not be read", "pod", *lease.Spec.HolderIdentity, "err", err.Error())
-		return nil
-	}
-	// Only a pod of this gateway's Deployment counts: a Lease taken by
-	// something else proves nothing about the image the operator renders.
-	if pod.Labels["app"] != a2aGatewayName(agent) {
-		return nil
-	}
-	for _, c := range pod.Spec.Containers {
+	for _, c := range leader.Pod.Spec.Containers {
 		if c.Name == a2aGatewayContainerName {
 			return ptr.To(c.Image)
 		}
@@ -114,11 +107,11 @@ func (r *PlatformAgentReconciler) observeA2AGatewayElection(ctx context.Context,
 // gatewayElectedImage is the image the GatewayElected condition should
 // name, or "" for none. observed is what observeA2AGatewayElection read this
 // pass (nil when it couldn't tell, or didn't run). The condition describes
-// the gateway that's running: it's cleared under today, with the election
-// off, and when the gateway rolls to an image outside the operator's release
+// the gateway that's running: it's cleared with the election off, and when
+// the gateway rolls to an image outside the operator's release
 // that no elected pod has run yet.
 func gatewayElectedImage(agent *agentv1alpha1.PlatformAgent, observed *string) string {
-	if !a2aStackRendering(agent) || !a2aGatewayElectionEnabled() {
+	if !a2aGatewayElectionEnabled() {
 		return ""
 	}
 	elected := ""
@@ -234,7 +227,7 @@ func a2aGatewayTopologySpread(agent *agentv1alpha1.PlatformAgent) []corev1.Topol
 // election. No golden renders the scale-out (no pod holds the Lease there), so
 // it's counted apart, as the MCP server is.
 func a2aGatewayStandbyPods(agent *agentv1alpha1.PlatformAgent) int64 {
-	if !a2aStackRendering(agent) || !a2aGatewayElectionEnabled() {
+	if !a2aGatewayElectionEnabled() {
 		return 0
 	}
 	replicas := int64(a2aGatewayReplicas(agent))

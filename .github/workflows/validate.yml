@@ -355,7 +355,6 @@ jobs:
             "kind: Deployment" \
             "kind: StatefulSet" \
             "kind: NetworkPolicy" \
-            "kind: PodMonitoring" \
             "name: hindsight-api" \
             "name: hindsight-postgresql"; do
             if ! grep -qF "$expected" <<<"$hindsight"; then
@@ -363,6 +362,18 @@ jobs:
               exit 1
             fi
           done
+          if grep -qF "kind: PodMonitoring" <<<"$hindsight"; then
+            echo "hindsight rendered PodMonitoring without monitoring.googleapis.com/v1/PodMonitoring in Capabilities" >&2
+            exit 1
+          fi
+          hindsight_gmp=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --api-versions monitoring.googleapis.com/v1/PodMonitoring \
+            --set platformAgent.harness.memory.provider=kube_agents_memory \
+            --show-only templates/hindsight.yaml)
+          if ! grep -qF "kind: PodMonitoring" <<<"$hindsight_gmp"; then
+            echo "hindsight render is missing 'kind: PodMonitoring' when monitoring.googleapis.com/v1/PodMonitoring is served" >&2
+            exit 1
+          fi
           if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --set platformAgent.harness.memory.provider=hindsight \
             --set hindsight.enabled=false \

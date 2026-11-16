@@ -85,7 +85,7 @@ type busVerifier struct {
 	log  *slog.Logger
 }
 
-func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
+func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope, trigger *capability.Trigger) error {
 	nc := v.conn()
 	if nc == nil {
 		return fmt.Errorf("%w: the dispatcher is not connected to the bus", dispatch.ErrVerifierUnreachable)
@@ -95,7 +95,7 @@ func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, pr
 		return err
 	}
 	c.Log = v.log
-	err = c.CheckProfileRun(ctx, ref, profile, tier, target)
+	err = c.CheckProfileRun(ctx, ref, profile, tier, target, trigger)
 	if capability.IsUnreachable(err) {
 		return fmt.Errorf("%w: %w", dispatch.ErrVerifierUnreachable, err)
 	}
