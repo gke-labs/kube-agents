@@ -100,6 +100,7 @@ var reasonSentences = map[string]string{
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
 	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	"tier-ended":                         "an administrator ended this kind of request on this agent, so the task was stopped",
 	// The dispatcher's re-check of a profile task's child (#5686). The
 	// gateway refuses the same at mint, so these reach the room only from a
 	// child an older gateway sent, or one that broke a rule anyway.

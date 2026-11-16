@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -125,12 +126,15 @@ type AgentProfileReconciler struct {
 	// TiersUnreadable is set when the role can't read Tiers: the tier
 	// catalog is then the built-ins alone (agentprofile_tiers.go).
 	TiersUnreadable bool
+	// Recorder records the end-tier-drain lever's events on the profile
+	// (consumeEndTierDrain). Nil records none (tests).
+	Recorder record.EventRecorder
 }
 
 // Every verb has a caller (tests/test_operator_secrets_grant.py names them): the reads are the
-// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch,
-// the one write to the profile itself (an Update would drop spec fields a newer CRD added,
-// which is why there is no `update` here); the status is written with Status().Update. There
+// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch
+// and consumeEndTierDrain's, the writes to the profile itself (an Update would drop spec
+// fields a newer CRD added, which is why there is no `update` here); the status is written with Status().Update. There
 // is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
 // reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
 // owner-references admission never asks for it, and the finalizer itself is a field of the
@@ -196,6 +200,11 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	verdict := verdicts[profile.Name]
+	// The end-tier-drain lever, consumed once the applied dispatch config
+	// carries it (agentprofile_tier_drain.go, #5850).
+	if err := r.consumeEndTierDrain(ctx, &profile, verdict); err != nil {
+		return ctrl.Result{}, err
+	}
 	bound, err := withoutForeignServiceAccounts(ctx, r.Client, renderable)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -741,6 +750,7 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		fitOn = p.DeepCopy()
 		delete(fitOn.Annotations, renderedTierModesAnnotation)
 		delete(fitOn.Annotations, drainingTiersAnnotation)
+		delete(fitOn.Annotations, endingTiersAnnotation)
 	}
 	if problem := autopilotRatioProblem(fitOn); problem != "" {
 		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem

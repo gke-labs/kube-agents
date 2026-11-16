@@ -205,8 +205,9 @@ NAMESPACED_VERBS_BY_KIND = {
 #                             map's List; get: the read half (the reconciler's
 #                             Get is served by the informer; its uncached
 #                             reader reads ServiceAccounts only); patch:
-#                             patchFinalizers' merge patch (an Update would
-#                             drop spec fields a newer CRD added).
+#                             patchFinalizers' merge patch and
+#                             consumeEndTierDrain's (an Update would drop
+#                             spec fields a newer CRD added).
 #   agentprofiles/status      update: Status().Update (writeStatus); get: the
 #                             read half.
 #   (no agentprofiles/finalizers: nothing the operator renders carries an

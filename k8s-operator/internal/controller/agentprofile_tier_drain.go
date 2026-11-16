@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,7 +43,8 @@ import (
 // profile already had, never grants a tier anew.
 //
 // Not a revoke: work running at a removed tier carries on until the drain
-// ends. The emergency path is the stop and the breaker.
+// ends. An administrator ends a drain early with endTierDrainAnnotation
+// (#5850).
 //
 // Not drained: a profile left with no live tier, which leaves the install
 // and drains as a removed profile does; and a profile on a named
@@ -54,6 +56,48 @@ import (
 // in-memory copies renderableAgentProfiles makes, never written to the API
 // server.
 const drainingTiersAnnotation = "kubeagents.x-k8s.io/internal-draining-tiers"
+
+// endingTiersAnnotation carries a narrowed copy's ending tiers (decideDrains,
+// #5850) to the dispatch config, comma-separated. Set only on the in-memory
+// copies renderableAgentProfiles makes, never written to the API server.
+const endingTiersAnnotation = "kubeagents.x-k8s.io/internal-ending-tiers"
+
+// endTierDrainAnnotation is the administrator's lever on an AgentProfile
+// (#5850): "<tier>[,<tier>]" ends the drain of each listed tier the profile is
+// draining. The dispatcher ends the tasks it holds there (canceled
+// tier-ended) and the tier is torn down after endTierDrainGrace. Anyone who
+// can update the AgentProfile can set it, the same people who can drop the
+// tier or delete the profile. The operator consumes it: once the applied
+// dispatch config marks a tier ending, that tier leaves the annotation, and a
+// listed tier that is live or not draining is stripped with a Warning event,
+// so a leftover never cuts a later drain.
+const endTierDrainAnnotation = "kubeagents.x-k8s.io/end-tier-drain"
+
+// endTierDrainGrace is how long after the lever a tier's drain ends at the
+// latest: the dispatcher's refresh and its abandon, with room to spare.
+const endTierDrainGrace = 2 * time.Minute
+
+// endTierDrainRequested is the tier names p's endTierDrainAnnotation lists.
+func endTierDrainRequested(p *agentv1alpha1.AgentProfile) map[string]bool {
+	out := map[string]bool{}
+	for _, tier := range strings.Split(p.Annotations[endTierDrainAnnotation], ",") {
+		if tier = strings.TrimSpace(tier); tier != "" {
+			out[tier] = true
+		}
+	}
+	return out
+}
+
+// endingTiersOf is a narrowed copy's ending tiers, from endingTiersAnnotation.
+func endingTiersOf(p *agentv1alpha1.AgentProfile) map[string]bool {
+	out := map[string]bool{}
+	for _, tier := range strings.Split(p.Annotations[endingTiersAnnotation], ",") {
+		if tier != "" {
+			out[tier] = true
+		}
+	}
+	return out
+}
 
 // appliedDispatchProfiles is the applied dispatch config's profiles by name.
 // None applied (NotFound, or a dispatcher that is off and removed it) drains
@@ -102,6 +146,14 @@ func decideDrains(p *agentv1alpha1.AgentProfile, v *tierVerdict, prev *a2aDispat
 		return
 	}
 	ceiling := now.Add(a2aDrainingWindow)
+	requested := endTierDrainRequested(p)
+	prevEnding := map[string]bool{}
+	for _, d := range prev.DrainingTiers {
+		if d.Ending {
+			prevEnding[d.Tier] = true
+		}
+	}
+	v.appliedEnding = prevEnding
 	add := func(tier string, until time.Time) {
 		recorded, ours := owned[tier]
 		if slices.Contains(v.renderable, tier) || !ours || !allowedTierNameRE.MatchString(tier) {
@@ -121,6 +173,20 @@ func decideDrains(p *agentv1alpha1.AgentProfile, v *tierVerdict, prev *a2aDispat
 			until = ceiling.Truncate(time.Second).UTC()
 		} else if !now.Before(until) {
 			return
+		}
+		// Ended by an administrator: this pass, or carried from the applied
+		// config once the annotation is consumed. The drain then ends at
+		// most endTierDrainGrace from now, long enough for the dispatcher
+		// to end the tasks it holds before the teardown removes their pods.
+		ending := requested[tier] || prevEnding[tier]
+		if ending {
+			if short := now.Add(endTierDrainGrace).Truncate(time.Second).UTC(); short.Before(until) {
+				until = short
+			}
+			if v.ending == nil {
+				v.ending = map[string]bool{}
+			}
+			v.ending[tier] = true
 		}
 		if v.draining == nil {
 			v.draining = map[string]time.Time{}
@@ -190,5 +256,74 @@ func liveTiersOf(p *agentv1alpha1.AgentProfile) []string {
 			out = append(out, tier)
 		}
 	}
+	return out
+}
+
+// consumeEndTierDrain keeps p's endTierDrainAnnotation to the tiers it may
+// still act on: draining, and not yet marked ending in the applied dispatch
+// config. A tier the applied config already marks ending is consumed (the
+// config carries the end from here, decideDrains); a listed tier that is live,
+// or that p isn't draining, is stripped with a Warning, so a leftover entry
+// can never cut a drain that starts later. The patch carries p's
+// resourceVersion, so an edit made since this pass read p is never lost; on a
+// conflict the next pass tries again.
+func (r *AgentProfileReconciler) consumeEndTierDrain(ctx context.Context, p *agentv1alpha1.AgentProfile, v tierVerdict) error {
+	requested := endTierDrainRequested(p)
+	if len(requested) == 0 {
+		return nil
+	}
+	var keep, consumed, live, notDraining []string
+	for _, tier := range endTierDrainSorted(requested) {
+		_, draining := v.draining[tier]
+		switch {
+		case v.appliedEnding[tier]:
+			consumed = append(consumed, tier)
+		case draining:
+			keep = append(keep, tier)
+		case slices.Contains(v.renderable, tier):
+			live = append(live, tier)
+		default:
+			notDraining = append(notDraining, tier)
+		}
+	}
+	if len(keep) == len(requested) {
+		return nil
+	}
+	base := p.DeepCopy()
+	if len(keep) == 0 {
+		delete(p.Annotations, endTierDrainAnnotation)
+	} else {
+		p.Annotations[endTierDrainAnnotation] = strings.Join(keep, ",")
+	}
+	if err := r.Patch(ctx, p, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		if apierrors.IsConflict(err) {
+			*p = *base
+			return nil // the next pass reads the newer object and tries again
+		}
+		return fmt.Errorf("consume the %s annotation: %w", endTierDrainAnnotation, err)
+	}
+	if r.Recorder != nil {
+		if len(consumed) > 0 {
+			r.Recorder.Eventf(p, corev1.EventTypeNormal, "TierDrainEnded",
+				"ended the drain of tier(s) %s: the dispatcher ends their running tasks, and the tier goes within %s", strings.Join(consumed, ", "), endTierDrainGrace)
+		}
+		if len(live) > 0 {
+			r.Recorder.Eventf(p, corev1.EventTypeWarning, "EndTierDrainIgnored",
+				"%s lists tier(s) %s, which this profile runs (not draining); removed from the annotation, nothing ended", endTierDrainAnnotation, strings.Join(live, ", "))
+		}
+		if len(notDraining) > 0 {
+			r.Recorder.Eventf(p, corev1.EventTypeWarning, "EndTierDrainIgnored",
+				"%s lists tier(s) %s, which this profile isn't draining; removed from the annotation, nothing ended", endTierDrainAnnotation, strings.Join(notDraining, ", "))
+		}
+	}
+	return nil
+}
+
+func endTierDrainSorted(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
 	return out
 }
