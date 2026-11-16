@@ -288,9 +288,16 @@ def broker_url() -> str:
     That is the container's, as the operator rendered it: the entrypoint
     starts session-kv without reading the agent-writable PVC .env, which
     Hermes alone applies, so a line the agent wrote cannot point the gateway
-    container's broker token somewhere else.
+    container's broker token somewhere else. The operator renders
+    ``CREDENTIAL_PROXY_URL`` empty on the agent container, so the broker's
+    address comes from ``KUBE_AGENTS_MCP_RELAY_URL`` (the broker's ``/v1/mcp``)
+    unless ``CREDENTIAL_PROXY_URL`` is set.
     """
-    return os.environ.get("CREDENTIAL_PROXY_URL", "").strip().rstrip("/")
+    url = os.environ.get("CREDENTIAL_PROXY_URL", "").strip().rstrip("/")
+    if url:
+        return url
+    relay = os.environ.get("KUBE_AGENTS_MCP_RELAY_URL", "").strip().rstrip("/")
+    return relay.removesuffix("/v1/mcp")
 
 
 def report_level(level: str) -> bool:
@@ -315,10 +322,15 @@ def report_level(level: str) -> bool:
     return answer.get("level") == level
 
 
+#: sandbox_exec logs in as hermes, which cannot write the agent's own VCS
+#: tree; the switch clones under hermes's home instead.
+SWITCH_ENV = {"KUBE_AGENTS_VCS_ROOT": "/home/hermes/kube-agents-vcs"}
+
+
 def run_switch(argv: list[str], timeout: float) -> Any:
     import sandbox_exec
 
-    return sandbox_exec.run(argv, timeout=timeout)
+    return sandbox_exec.run(argv, timeout=timeout, remote_env=SWITCH_ENV)
 
 
 def _switch_results(done: Any) -> list[dict]:
@@ -341,14 +353,16 @@ def refresh_pending_async(state: dict) -> None:
         if entry.get("state") == SWITCH_PROPOSED and type(entry.get("number")) is int and entry.get("url")
     ]
     now = time.monotonic()
+    global _checking
+    # One lock block: an entry is stamped as checked only when its check starts.
     with _check_lock:
+        if _checking:
+            return
         due = [p for p in pending if now - _last_checked.get(p[1] + p[0], -CHECK_EVERY_SECONDS) >= CHECK_EVERY_SECONDS]
+        if not due:
+            return
         for kind, key, _entry in due:
             _last_checked[key + kind] = now
-    global _checking
-    with _check_lock:
-        if not due or _checking:
-            return
         _checking = True
     _spawn(_refresh_then_clear, due)
 
@@ -465,7 +479,11 @@ def _set_level(user: str, level: str) -> dict:
         return _answer(ACTION_LEVEL, False, NOT_SAVED)
     logger.info("dial: level set to %s by %s", level, user)
     confirmed = report_level(level)
-    return _answer(ACTION_LEVEL, True, f"Set to {LEVEL_TITLES[level]}." + ("" if confirmed else " " + NOT_REPORTED))
+    answer = _answer(ACTION_LEVEL, True, f"Set to {LEVEL_TITLES[level]}." + ("" if confirmed else " " + NOT_REPORTED))
+    # Whether the broker confirmed it before this answer, for a caller that
+    # reads the broker's write mode straight after (the dial eval).
+    answer["reported"] = confirmed
+    return answer
 
 
 def _switch(action: str, user: str, payload: dict) -> dict:
@@ -476,8 +494,9 @@ def _switch(action: str, user: str, payload: dict) -> dict:
         return _answer(action, False, UNKNOWN_KIND)
     try:
         urls = {clean_merges.repo_key(url): url for url in managed_repos()}
-    except Exception as exc:  # noqa: BLE001 — refused, said why
-        return _answer(action, False, SWITCH_FAILED.format(reason=f"the managed repositories could not be read ({exc})"))
+    except Exception as exc:  # noqa: BLE001 — refused, said why; the detail stays in the log
+        logger.warning("dial: could not read the managed repositories for %s: %s", action, exc)
+        return _answer(action, False, SWITCH_FAILED.format(reason="the managed repositories could not be read"))
     url = urls.get(key)
     if not key or url is None:
         return _answer(action, False, NOT_MANAGED)

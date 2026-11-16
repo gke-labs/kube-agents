@@ -20,6 +20,7 @@ KEY = "github.com/org/infra"
 ADMIN = "U0ADMIN01"
 REAL_REFRESH_ASYNC = dial_state.refresh_pending_async
 REAL_REPORT = dial_state.report_level
+REAL_RUN_SWITCH = dial_state.run_switch
 
 
 def done(results, code=0):
@@ -145,7 +146,7 @@ class LevelTest(DialCase):
 
     def test_an_admin_pick_is_recorded_and_reported(self):
         answer = self.act("dial.level", level="explain")
-        self.assertEqual(answer, {"action": "dial.level", "ok": True, "message": "Set to Explain."})
+        self.assertEqual(answer, {"action": "dial.level", "ok": True, "message": "Set to Explain.", "reported": True})
         section = self.section()
         self.assertEqual((section["level"], section["set_by"]), ("explain", ADMIN))
         self.assertGreater(section["set_at"], 0)
@@ -153,7 +154,9 @@ class LevelTest(DialCase):
 
     def test_an_unconfirmed_report_says_so(self):
         with mock.patch.object(dial_state, "report_level", lambda level: False):
-            self.assertIn(dial_state.NOT_REPORTED, self.act("dial.level", level="automerge")["message"])
+            answer = self.act("dial.level", level="automerge")
+        self.assertIn(dial_state.NOT_REPORTED, answer["message"])
+        self.assertFalse(answer["reported"])
 
     def test_an_unknown_level_or_unreadable_record_changes_nothing(self):
         self.assertFalse(self.act("dial.level", level="yolo")["ok"])
@@ -293,8 +296,44 @@ class RefreshTest(DialCase):
             REAL_REFRESH_ASYNC(dial_state.read_state())
         self.assertEqual(len(started), 1)
 
+    def test_a_check_in_flight_does_not_stamp_a_due_entry(self):
+        started = []
+        with mock.patch.object(dial_state, "_spawn", lambda target, *args: started.append(args)):
+            dial_state._last_checked.clear()
+            dial_state._checking = True
+            REAL_REFRESH_ASYNC(dial_state.read_state())
+            self.assertEqual(dial_state._last_checked, {})
+            dial_state._checking = False
+            REAL_REFRESH_ASYNC(dial_state.read_state())
+        self.assertEqual(len(started), 1)
+
 
 class ReporterTest(DialCase):
+    def test_the_broker_url_falls_back_to_the_mcp_relay(self):
+        relay = "http://broker.ns.svc:8765/v1/mcp"
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "", "KUBE_AGENTS_MCP_RELAY_URL": relay}):
+            self.assertEqual(dial_state.broker_url(), "http://broker.ns.svc:8765")
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://explicit:1/", "KUBE_AGENTS_MCP_RELAY_URL": relay}):
+            self.assertEqual(dial_state.broker_url(), "http://explicit:1")
+
+    def test_an_unreadable_repository_list_keeps_the_error_out_of_the_answer(self):
+        self.act("dial.level", level="automerge")
+        boom = mock.Mock(side_effect=RuntimeError("secret path /opt/data/x"))
+        with mock.patch.object(dial_state, "managed_repos", boom):
+            answer = self.act(dial_state.ACTION_REQUEST, kind=dial_state.FIX_KINDS[0][0],
+                              environment=dial_state.FIX_KINDS[0][2], repo_key=KEY)
+        self.assertFalse(answer["ok"])
+        self.assertNotIn("secret", answer["message"])
+
+    def test_the_switch_runs_with_a_vcs_root_hermes_can_write(self):
+        import types
+
+        calls = []
+        fake = types.SimpleNamespace(run=lambda argv, **kw: calls.append(kw) or done([]))
+        with mock.patch.dict(sys.modules, {"sandbox_exec": fake}):
+            REAL_RUN_SWITCH(["python3", "x"], 5)
+        self.assertEqual(calls, [{"timeout": 5, "remote_env": {"KUBE_AGENTS_VCS_ROOT": "/home/hermes/kube-agents-vcs"}}])
+
     def test_the_recorded_level_or_the_default_is_reported(self):
         self.assertTrue(dial_state.report_recorded())
         self.act("dial.level", level="explain")
