@@ -624,7 +624,10 @@ that misses on the exact key can still be served from the second one, but only i
 
 - every earlier answer in it is one the model really gave to that same point in a recording, and
   that the proxy itself recorded and could have stored: never one the client wrote into the history,
-  and never an answer from a fallback;
+  and never an answer from a fallback. That point is read as of when the proxy first saw it whole
+  (the settings and every message up to it), as the recording read it. When the proxy first saw its
+  last message would not do: a skill's text is the same in every conversation, so that time can be
+  another conversation's, minutes earlier, and this run's timestamps before it would read as future;
 - the agent did the same things: every tool call matches by name, and by arguments unless the tool
   only reads. A different action that happened to get the same output (`{"ok": true}` from
   completing a card rather than commenting on it) is still a miss, and so is any other tool called

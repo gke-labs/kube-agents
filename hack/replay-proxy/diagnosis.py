@@ -11,7 +11,8 @@ the model generated in the conversation (the evidence its replayed estimates
 rest on), never as part of a cache key or the replayed key itself.
 
 The proxy remembers when it first saw each raw message (one float per distinct
-message, oldest dropped past FIRST_SEEN_CAPACITY). A request's messages are
+message, and in record and replay mode one per distinct prefix, oldest dropped past
+FIRST_SEEN_CAPACITY). A request's messages are
 normalized in order with a fresh mapping; each uses its own first-seen time as
 "now", and IPs stay literal only if a CIDR appeared in that message or an
 earlier one. The settings (tools, model, parameters) get their own hash with a
@@ -19,11 +20,13 @@ fresh mapping, IPs kept literal only for a CIDR in the settings themselves,
 and the conversation's first-seen time (its first message's) as "now". This
 runs on the proxy's background analysis thread, off the agent's path.
 
-Replay mode also reads the first-seen times to decide a match: before a
-lookup, on the request's path, it notes each message's (first_seen_times),
-and checks a slot's recorded answer against the slot's prefix normalized as
-of when the prefix's last message arrived, as record mode normalized that
-request (normalizer.answer_variant).
+Replay mode keeps a second kind of first-seen time to decide a match: when
+it first saw each whole prefix of a request (the settings and every message
+up to a point, note()), and checks a slot's recorded answer against the
+slot's prefix normalized as of then, as record mode normalized that request
+(normalizer.answer_variant). A message's own first sighting is no stand-in:
+a static message (a skill's text) arrives in every conversation, so it would
+carry the time another conversation sent it.
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ FIRST_SEEN_CAPACITY = 1_000_000
 TEXT_ENCODING = "utf-8"
 # A lone surrogate is valid in a JSON string but not in UTF-8.
 ENCODING_ERRORS = "surrogatepass"
+# Marks a note() key, so it never names the same entry as a message's digest.
+PREFIX_KEY_TAG = "prefix:"
 
 
 def _digest(text: str) -> str:
@@ -54,6 +59,10 @@ class DiagnosisHasher:
 
     def _first_seen(self, raw: str, now: float) -> float:
         return self._first_seen_digest(_digest(raw), now)
+
+    def note(self, key: str, now: float) -> float:
+        """When this proxy first saw `key`, noting `now` if it has not; `key` must not be a message digest."""
+        return self._first_seen_digest(PREFIX_KEY_TAG + key, now)
 
     def _first_seen_digest(self, key: str, now: float) -> float:
         with self._lock:
