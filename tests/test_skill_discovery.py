@@ -64,12 +64,11 @@ on-demand loading. Two ways that fails silently:
 Scope is this repository's own skills and rules, under `.agents/skills/` and
 `.agents/rules/`. The skills
 baked into the agent images (`agents/<profile>/skills/`) are loaded by Hermes
-from a profile home, not discovered from a checkout, and
-`scripts/check_prompt_assets.py` already holds their manifests -- though with
-a line-scanning reader rather than a YAML one, so the loadability check below
-has no counterpart on the skills that ship. Closing that is a change to a gate
-covering fifty-odd bundles and turns on whether Hermes rejects the same block,
-which needs a running image to answer; it is not this suite's to make.
+from a profile home, not discovered from a checkout.
+`scripts/check_prompt_assets.py` holds their manifests with a line-scanning
+reader, and `tests/test_shipped_skill_frontmatter.py` holds their frontmatter
+to a YAML parser, which is the loadability check below for the skills that
+ship.
 Nothing reads the frontmatter here: `scripts/generate_docs.py` builds the
 published skill catalogue from `agents/platform/skills` and
 `agents/cluster/skills` alone, so these blocks reach no generated page and

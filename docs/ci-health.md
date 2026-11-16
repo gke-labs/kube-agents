@@ -84,7 +84,9 @@ the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
 ([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
 domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
-`data.json` ([The weekly health email](#the-weekly-health-email)), and appends
+`data.json` ([The weekly health email](#the-weekly-health-email)), once a week
+cross-checks the Slack lane's overhead against `autopush` and `staging`
+([The Slack cross-check](#the-slack-cross-check)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
@@ -1473,6 +1475,40 @@ Locally,
 renders against any downloaded pair (it reads the issues with `gh`), and
 `python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
 prints the message body it would post.
+
+## The Slack cross-check
+
+The Slack lane's overhead is measured on a quiet CI channel, so the nightly
+pages' estimated Slack times are a floor. Once a week the tick checks that
+floor against real traffic: `scripts/eval_dashboard/slack_crosscheck.py`
+reads the A2A gateway's Slack histograms (delivery lag, a post's time, time
+to first ack) on `autopush` and `staging`'s host clusters over the last seven
+days, from each environment's Managed Service for Prometheus, and sets them
+beside the lane's nightly values for the same days in `data.json`. It is
+published as `slack-crosscheck.json` beside `data.json`: `lane` (`nights` and
+the four values), `environments.<name>` (`project`, the four values,
+`deliveries` and each value's `ratio` to the lane's, or `error`), `complete`,
+`window_days` and `generated_at`. The lane's quantiles are the mean of its
+nightly quantiles, not pooled ones. A metric an environment does not serve
+yet reads as `null`. A complete run within the last seven days skips with one
+log line.
+
+It reads as the publisher, which needs `roles/monitoring.viewer` on the two
+environments' projects, `kube-agents-autopush` (autopush) and
+`kube-agents-gkedemos` (staging):
+
+```bash
+for p in kube-agents-autopush kube-agents-gkedemos; do
+  gcloud projects add-iam-policy-binding "$p" --role=roles/monitoring.viewer \
+    --member=serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+done
+```
+
+An environment whose project refuses the read is skipped with one log line
+naming the role, and any other failure is logged and recorded as its `error`.
+A run that reads no environment publishes nothing; one that reads only some
+publishes with `complete: false`, which does not count as the week's run, so
+each tick reads again and a grant takes effect on the next one.
 
 ## The seeded-fleet scan
 
