@@ -45,18 +45,20 @@ The PlatformAgent's `spec.tiers.membership` lists the people whose profile tasks
 spec:
   tiers:
     membership:
-      - backend: slack # gchat, slack, discord, a2a or a2a-google
-        user: U0ABC123 # the id the backend's allowedUsers takes
+      - backend: slack # gchat, slack, discord or a2a-google
+        user: U0ABC123 # an email on gchat and a2a-google, a user id on slack and discord
         tier: oncall
 ```
 
-- **Anyone not listed runs at `read`.** The console runs at `read` whatever the list says, since everyone on it shares one principal.
+- **Anyone not listed runs at `read`.** The console runs at `read` whatever the list says, since everyone on it shares one principal. So does the A2A door's shared-token caller, which names itself.
 - **The tier must be `interactive`.** Admission refuses a member mapped to an `unattended`-mode tier or a legacy tier, and a person listed twice. Google Chat ids are compared without case, as the gateway compares them.
 - **A tier no `Tier` defines yet is allowed.** That member's profile tasks are refused with a notice until the `Tier` exists. They don't fall back to `read`.
-- **A thread runs at one tier.** A profile task runs at its authors' tier: the requester's, everyone who has written in the thread, and anyone who has steered the task. If they're at different tiers, the turn is refused with a notice naming the tiers. A steer from an author at another tier than the running task's is refused the same way, and isn't sent.
-- **The tier must stay inside the gateway's authority.** Apart from running a profile, everything a tier permits must be in the gateway's own authority tier, or its tasks are refused.
+- **A thread runs at one tier.** A profile task runs at its authors' tier: the requester's, and the other authors the gateway has on record for the conversation (its current session's writers, or the requesters and steer authors of its recent tasks). If they're at different tiers, the turn is refused with a notice naming the tiers. A steer from an author at another tier than the running task's is refused the same way, and isn't sent.
+- **The tier must stay inside the gateway's authority.** Apart from running a profile, everything a tier permits must be in the gateway's own authority tier, or its tasks are refused. Today every interactive tier permits the same and passes; this binds once tiers differ in what they permit.
 - The profile must also list the tier in `allowedTiers`, or the task is refused as before.
 
 Groups aren't supported yet: list each person. A change to the list rolls the gateway.
 
-**Rolling back** to a release without membership runs everyone at `read` again.
+Changing someone's tier, or removing them, applies to their next task: a task already running keeps the tier it started at.
+
+**Rolling back** to a release without membership runs everyone at `read` again, and a task already running at a custom tier can then be steered by anyone in its thread until it ends.

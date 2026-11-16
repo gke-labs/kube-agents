@@ -12161,20 +12161,22 @@ spec:
                         refused. A member whose tier no Tier defines is refused profile tasks
                         until one does; they don't fall back to read. The tier must be
                         interactive: the admission webhook refuses an unattended-mode Tier.
+                        At most 200 entries, so the list fits the one environment variable the
+                        gateway reads it from (TestTheLargestMembershipFitsOneEnvString).
                       items:
                         description:
                           TierMember maps one person on one chat backend
                           to a tier.
                         properties:
                           backend:
-                            description:
-                              Backend is the chat surface the person writes
-                              from.
+                            description: |-
+                              Backend is the surface the person writes from: one whose requester is
+                              one verified person. The a2a door isn't one: its callers name
+                              themselves under a shared token.
                             enum:
                               - gchat
                               - slack
                               - discord
-                              - a2a
                               - a2a-google
                             type: string
                           tier:
@@ -12184,10 +12186,10 @@ spec:
                             type: string
                           user:
                             description: |-
-                              User is the person's id on that backend, as the backend's allowedUsers
-                              lists take it: a Google Chat users/<id> or email (case-blind), a Slack
-                              or Discord user id.
-                            maxLength: 256
+                              User is the person's id on that backend: their email on Google Chat
+                              (compared without case) and on a2a-google (as their Google token
+                              carries it), their user id on Slack or Discord.
+                            maxLength: 128
                             minLength: 1
                             pattern: ^[^,=\s]+$
                             type: string
@@ -12196,7 +12198,7 @@ spec:
                           - tier
                           - user
                         type: object
-                      maxItems: 1000
+                      maxItems: 200
                       type: array
                       x-kubernetes-list-map-keys:
                         - backend

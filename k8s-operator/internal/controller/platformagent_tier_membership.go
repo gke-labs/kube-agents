@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -27,16 +28,27 @@ const gchatMemberBackend = "gchat"
 // A tier no Tier defines yet is allowed: the gateway refuses that member's
 // profile tasks until one does, and never falls back to read. A Tier's mode
 // can't change (the Tier CRD), so the mode read here stays true. The Tiers
-// are read from the agent's namespace; with the Tier CRD absent there are
-// none to check.
-func ValidateTierMembership(ctx context.Context, c client.Reader, agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, error) {
+// are read from the agent's namespace; with the Tier CRD absent, or a role
+// that can't read them, there are none to check, and the gateway refuses
+// such a member anyway.
+//
+// On an update (old non-nil) only the entries the edit adds or changes are
+// checked, so a Tier created unattended after a member named it doesn't
+// block every later edit to the PlatformAgent.
+func ValidateTierMembership(ctx context.Context, c client.Reader, old, agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, error) {
 	if agent.Spec.Tiers == nil || len(agent.Spec.Tiers.Membership) == 0 {
 		return nil, nil
+	}
+	unchanged := map[agentv1alpha1.TierMember]bool{}
+	if old != nil && old.Spec.Tiers != nil {
+		for _, m := range old.Spec.Tiers.Membership {
+			unchanged[m] = true
+		}
 	}
 	modes := map[string]string{agentv1alpha1.AgentProfileTierUnattended: tierModeUnattended}
 	if c != nil {
 		var list agentv1alpha1.TierList
-		if err := c.List(ctx, &list, client.InNamespace(agent.Namespace)); err != nil && !isCRDNotInstalledError(err) {
+		if err := c.List(ctx, &list, client.InNamespace(agent.Namespace)); err != nil && !isCRDNotInstalledError(err) && !apierrors.IsForbidden(err) {
 			return nil, fmt.Errorf("list Tiers to check spec.tiers.membership: %w", err)
 		}
 		for _, t := range list.Items {
@@ -49,6 +61,15 @@ func ValidateTierMembership(ctx context.Context, c client.Reader, agent *agentv1
 	seen := map[string]bool{}
 	for i, m := range agent.Spec.Tiers.Membership {
 		p := path.Index(i)
+		key := tierMemberKey(m)
+		repeat := seen[key]
+		seen[key] = true
+		if unchanged[m] {
+			continue
+		}
+		if repeat {
+			errs = append(errs, field.Duplicate(p, m.Backend+":"+m.User))
+		}
 		switch {
 		case slices.Contains(legacyTierNames, m.Tier):
 			errs = append(errs, field.Invalid(p.Child("tier"), m.Tier,
@@ -57,14 +78,16 @@ func ValidateTierMembership(ctx context.Context, c client.Reader, agent *agentv1
 			errs = append(errs, field.Invalid(p.Child("tier"), m.Tier,
 				"an unattended-mode tier, which runs Jobs nobody steers; a person's tier must be interactive"))
 		}
-		key := m.Backend + ":" + strings.TrimSpace(m.User)
-		if m.Backend == gchatMemberBackend {
-			key = strings.ToLower(key)
-		}
-		if seen[key] {
-			errs = append(errs, field.Duplicate(p, m.Backend+":"+m.User))
-		}
-		seen[key] = true
 	}
 	return errs, nil
+}
+
+// tierMemberKey is the person a member names, as the gateway matches turns:
+// a Google Chat email without case.
+func tierMemberKey(m agentv1alpha1.TierMember) string {
+	key := m.Backend + ":" + strings.TrimSpace(m.User)
+	if m.Backend == gchatMemberBackend {
+		key = strings.ToLower(key)
+	}
+	return key
 }

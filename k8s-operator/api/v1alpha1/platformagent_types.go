@@ -86,23 +86,27 @@ type PlatformAgentTiersSpec struct {
 	// +listType=map
 	// +listMapKey=backend
 	// +listMapKey=user
-	// +kubebuilder:validation:MaxItems=1000
+	// At most 200 entries, so the list fits the one environment variable the
+	// gateway reads it from (TestTheLargestMembershipFitsOneEnvString).
+	// +kubebuilder:validation:MaxItems=200
 	// +optional
 	Membership []TierMember `json:"membership,omitempty"`
 }
 
 // TierMember maps one person on one chat backend to a tier.
 type TierMember struct {
-	// Backend is the chat surface the person writes from.
-	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a;a2a-google
+	// Backend is the surface the person writes from: one whose requester is
+	// one verified person. The a2a door isn't one: its callers name
+	// themselves under a shared token.
+	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google
 	// +required
 	Backend string `json:"backend"`
 
-	// User is the person's id on that backend, as the backend's allowedUsers
-	// lists take it: a Google Chat users/<id> or email (case-blind), a Slack
-	// or Discord user id.
+	// User is the person's id on that backend: their email on Google Chat
+	// (compared without case) and on a2a-google (as their Google token
+	// carries it), their user id on Slack or Discord.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:MaxLength=128
 	// +kubebuilder:validation:Pattern=`^[^,=\s]+$`
 	// +required
 	User string `json:"user"`

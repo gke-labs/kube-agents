@@ -2,12 +2,18 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -75,7 +81,7 @@ func TestTierMembershipAdmission(t *testing.T) {
 		{"one id on two backends is two people", []agentv1alpha1.TierMember{m("slack", "1", "read"), m("discord", "1", "oncall")}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			errs, err := ValidateTierMembership(context.Background(), c, withMembers(a2aTestAgent(), tc.members...), field.NewPath("spec", "tiers", "membership"))
+			errs, err := ValidateTierMembership(context.Background(), c, nil, withMembers(a2aTestAgent(), tc.members...), field.NewPath("spec", "tiers", "membership"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -86,5 +92,82 @@ func TestTierMembershipAdmission(t *testing.T) {
 				t.Fatalf("errs = %v, want one containing %q", errs, tc.want)
 			}
 		})
+	}
+}
+
+// On an update only what the edit adds or changes is checked: a member whose
+// Tier became unattended after it was listed doesn't block an unrelated
+// edit, but listing someone new at it does, and so does a new repeat.
+func TestTierMembershipAdmissionOnUpdateChecksTheEdit(t *testing.T) {
+	ns := a2aTestAgent().Namespace
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(
+		&agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: ns}, Spec: agentv1alpha1.TierSpec{Mode: tierModeUnattended}}).Build()
+	stale := agentv1alpha1.TierMember{Backend: "slack", User: "U1", Tier: "nightly"}
+	old := withMembers(a2aTestAgent(), stale)
+	path := field.NewPath("spec", "tiers", "membership")
+	for _, tc := range []struct {
+		name    string
+		members []agentv1alpha1.TierMember
+		refused bool
+	}{
+		{"the stale entry left as it was", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U2", Tier: "read"}}, false},
+		{"someone new at the unattended tier", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U2", Tier: "nightly"}}, true},
+		{"a new repeat of a listed person", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U1", Tier: "read"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs, err := ValidateTierMembership(context.Background(), c, old, withMembers(a2aTestAgent(), tc.members...), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(errs) > 0) != tc.refused {
+				t.Fatalf("errs = %v, refused want %v", errs, tc.refused)
+			}
+		})
+	}
+}
+
+// A person listed twice, which a cluster without the webhook admits, renders
+// once, so the gateway, which refuses a repeat at boot, still starts.
+func TestTheMembershipRenderDropsARepeat(t *testing.T) {
+	agent := withMembers(a2aTestAgent(),
+		agentv1alpha1.TierMember{Backend: "gchat", User: "Alice@x.com", Tier: "oncall"},
+		agentv1alpha1.TierMember{Backend: "gchat", User: "alice@x.com", Tier: "read"})
+	env := a2aTierMembershipEnv(agent)
+	if len(env) != 1 || env[0].Value != "gchat:Alice@x.com=oncall" {
+		t.Fatalf("env = %+v", env)
+	}
+}
+
+// The largest list the schema admits (MaxItems 200, user 128, tier 63, the
+// longest backend) renders well under the kernel's limit on one environment
+// string (MAX_ARG_STRLEN, 128 KiB): past it the gateway can't start.
+func TestTheLargestMembershipFitsOneEnvString(t *testing.T) {
+	const maxArgStrlen = 128 * 1024
+	members := make([]agentv1alpha1.TierMember, 200)
+	for i := range members {
+		members[i] = agentv1alpha1.TierMember{Backend: "a2a-google", User: fmt.Sprintf("%03d", i) + strings.Repeat("u", 125), Tier: strings.Repeat("t", 63)}
+	}
+	env := a2aTierMembershipEnv(withMembers(a2aTestAgent(), members...))
+	if n := len(env[0].Value); n >= maxArgStrlen/2 {
+		t.Errorf("the largest admitted list renders %d bytes; want well under %d", n, maxArgStrlen)
+	}
+}
+
+// A role that can't read Tiers checks what it can (repeats, legacy names)
+// and lets the rest through: the gateway refuses an unattended member anyway.
+func TestTierMembershipAdmissionWithoutTierAccess(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return apierrors.NewForbidden(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "tiers"}, "", errors.New("no"))
+		},
+	}).Build()
+	path := field.NewPath("spec", "tiers", "membership")
+	errs, err := ValidateTierMembership(context.Background(), c, nil, withMembers(a2aTestAgent(), agentv1alpha1.TierMember{Backend: "slack", User: "U1", Tier: "oncall"}), path)
+	if err != nil || len(errs) != 0 {
+		t.Fatalf("errs = %v, err = %v", errs, err)
+	}
+	errs, _ = ValidateTierMembership(context.Background(), c, nil, withMembers(a2aTestAgent(), agentv1alpha1.TierMember{Backend: "slack", User: "U1", Tier: "developer-team"}), path)
+	if len(errs) != 1 {
+		t.Fatalf("a legacy tier passed without Tier access: %v", errs)
 	}
 }

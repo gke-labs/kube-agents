@@ -369,7 +369,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// 7. Tier membership (#3659): no unattended or legacy tier for a person,
 	// and no person listed twice. A tier nothing defines yet is let through:
 	// the gateway refuses that member's profile tasks until it exists.
-	memberErrs, err := controller.ValidateTierMembership(ctx, v.Client, platformAgent, field.NewPath("spec", "tiers", "membership"))
+	memberErrs, err := controller.ValidateTierMembership(ctx, v.Client, oldObj, platformAgent, field.NewPath("spec", "tiers", "membership"))
 	if err != nil {
 		return nil, err
 	}

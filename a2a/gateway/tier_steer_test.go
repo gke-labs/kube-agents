@@ -118,3 +118,25 @@ func TestASameTierSteerGoes(t *testing.T) {
 		t.Fatal("a same-tier steer was refused")
 	}
 }
+
+// A thread whose authors are at different tiers can't start a profile task:
+// 1001 (oncall) asked for a task here before, now 1002 (read) asks for one,
+// and nothing is submitted.
+func TestAMixedTierThreadIsRefused(t *testing.T) {
+	r := startTierRig(t, "1001")
+	conv := "discord:1/mixed"
+	earlier := TaskRequester{Backend: discordBackend, Subject: requesterSubject(r.g.ps, discordBackend, "1001")}
+	if err := r.g.reg.Put(context.Background(), &SessionRecord{
+		Key: conv, ContextID: "ctx-mixed", Kind: "group",
+		Tasks: []TaskRef{{ID: "task-earlier", Requester: &earlier}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	turn := profileTurn(conv, "cluster", targetParams("p1", "us-east1", "prod"))
+	turn.AuthorID = "1002"
+	r.adapter.inbox <- turn
+	waitFor(t, "the notice", postedContaining(r, fmt.Sprintf(noticeProfileTiersDiffer, "oncall, read")))
+	if got := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(got) != 0 {
+		t.Fatalf("a mixed-tier thread submitted %d tasks", len(got))
+	}
+}

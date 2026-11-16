@@ -34,9 +34,10 @@ const (
 )
 
 // tierMemberBackends are the backends membership can name: the ones whose
-// requester is one person. Not the console, whose principal everyone on it
-// shares (#5557), and not inject, the eval transport.
-var tierMemberBackends = []string{gchatBackend, slackBackend, discordBackend, a2aBackend, a2aGoogleBackend}
+// requester is one verified person. Not the console, whose principal
+// everyone on it shares (#5557); not inject, the eval transport; and not the
+// a2a door, whose caller names itself under a shared token.
+var tierMemberBackends = []string{gchatBackend, slackBackend, discordBackend, a2aGoogleBackend}
 
 // parseTierMembership reads A2A_TIER_MEMBERSHIP. An entry that isn't
 // backend:user=tier, names an unknown backend or a tier that isn't a subject
@@ -81,7 +82,12 @@ func parseTierMembership(raw string) ([]TierMember, error) {
 func buildTierMembers(members []TierMember, ps *Pseudonymizer) map[TaskRequester]capability.Tier {
 	out := make(map[TaskRequester]capability.Tier, len(members))
 	for _, m := range members {
-		if subject := requesterSubject(ps, m.Backend, m.User); subject != "" {
+		id := m.User
+		if m.Backend == a2aGoogleBackend {
+			// The door's caller for a verified email, as its turns carry it.
+			id = a2aGoogleCaller(strings.TrimSpace(id))
+		}
+		if subject := requesterSubject(ps, m.Backend, id); subject != "" {
 			out[TaskRequester{Backend: m.Backend, Subject: subject}] = m.Tier
 		}
 	}

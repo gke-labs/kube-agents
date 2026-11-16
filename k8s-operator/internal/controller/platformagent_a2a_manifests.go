@@ -1528,15 +1528,22 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 
 // a2aTierMembershipEnv renders spec.tiers.membership for the gateway
 // (#3659), and nothing when it's empty, so an install without it renders as
-// before. The schema keeps commas, equals signs and spaces out of a user and
-// the webhook refuses repeats, so the list joins as it is.
+// before. The schema keeps commas, equals signs and spaces out of a user, so
+// the list joins as it is. A person listed twice (two cases of one Google
+// Chat email, which the schema's keys tell apart and the webhook refuses, but
+// a cluster without the webhook admits) keeps the first entry: the gateway
+// refuses a repeat at boot, and one bad entry mustn't stop it.
 func a2aTierMembershipEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	if agent.Spec.Tiers == nil || len(agent.Spec.Tiers.Membership) == 0 {
 		return nil
 	}
 	entries := make([]string, 0, len(agent.Spec.Tiers.Membership))
+	seen := map[string]bool{}
 	for _, m := range agent.Spec.Tiers.Membership {
-		entries = append(entries, m.Backend+":"+m.User+"="+m.Tier)
+		if key := tierMemberKey(m); !seen[key] {
+			seen[key] = true
+			entries = append(entries, m.Backend+":"+m.User+"="+m.Tier)
+		}
 	}
 	return []corev1.EnvVar{{Name: a2aTierMembershipEnvVar, Value: strings.Join(entries, ",")}}
 }
