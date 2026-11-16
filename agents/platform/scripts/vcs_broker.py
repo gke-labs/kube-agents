@@ -2525,8 +2525,8 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
 
 # The Slack autonomy dial's level, the runtime source write_mode() reads beside
 # the env, set through set_dial_level(), so a new level applies with no pod
-# restart. Nothing in the broker calls set_dial_level() yet; the Slack adapter's
-# report is its intended caller. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# restart. The credential proxy's dial route calls it when the Slack adapter
+# reports a level. Only while `KUBEAGENTS_DIAL` is `on` (the broker
 # gets spec.deployment.env); off, the dial is not a source at all. On, a broker
 # with no level set since it started reads the level it last stored on its
 # state emptyDir (kept across a container restart, not a new Pod), and with none
@@ -2610,8 +2610,8 @@ def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, s
 
     Compared folded and stripped: a forge matches label names that way, so a
     spelling that differs only in case is the same label to the pipeline. Each
-    value is also split on commas, because the GitLab adapter joins the list
-    with commas and GitLab reads that as several labels. Removing it is always
+    value is also split on commas, because an adapter may join the list with
+    commas and its forge reads that as several labels. Removing it is always
     allowed, and a read (a list filter) never comes here.
     """
     if dial_allows_automerge(environ):
