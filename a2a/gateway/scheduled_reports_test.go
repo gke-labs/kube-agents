@@ -602,3 +602,29 @@ func TestAScheduledRunUsesItsOwnDelivery(t *testing.T) {
 		t.Fatalf("%d posts, want 1", len(posts))
 	}
 }
+
+// The status reader resolves the job key the writer recorded under, for each
+// of the run's own delivery, the conversation's, and none.
+func TestScheduledRunJobKeyMatchesTheWriter(t *testing.T) {
+	own := &lib.ScheduleDelivery{Mode: lib.ScheduleDeliveryChat, JobKey: "own-job"}
+	conv := &lib.ScheduleDelivery{Mode: lib.ScheduleDeliveryChat, JobKey: "conv-job"}
+	cases := []struct {
+		name string
+		rec  *SessionRecord
+		want string
+	}{
+		{"the run's own delivery wins", &SessionRecord{Key: "trigger:schedule/ns/x", Delivery: conv,
+			Tasks: []TaskRef{{ID: "t1", Delivery: own}}}, "own-job"},
+		{"the conversation's for an older entry", &SessionRecord{Key: "trigger:schedule/ns/x", Delivery: conv,
+			Tasks: []TaskRef{{ID: "t1"}}}, "conv-job"},
+		{"no delivery: the conversation key", &SessionRecord{Key: "trigger:schedule/ns/x",
+			Tasks: []TaskRef{{ID: "t1"}}}, scheduledJobKeyFromTrigger("schedule/ns/x")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := scheduledRunJobKey(c.rec, "t1"); got != c.want {
+				t.Errorf("scheduledRunJobKey = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

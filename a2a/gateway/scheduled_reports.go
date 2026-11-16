@@ -281,17 +281,17 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	}
 	switch {
 	case d == nil:
-		report.JobKey, report.Status = scheduledJobKeyFromTrigger(report.TriggerName), scheduledNoDelivery
+		report.Status = scheduledNoDelivery
 	case d.Mode == lib.ScheduleDeliveryLocal:
-		report.JobKey, report.Status = d.JobKey, scheduledLocal
+		report.Status = scheduledLocal
 	case d.SilentWhenClean && silent:
-		report.JobKey, report.Status = d.JobKey, scheduledSilent
+		report.Status = scheduledSilent
 	default:
-		report.JobKey, report.Status = d.JobKey, scheduledPosting
+		report.Status = scheduledPosting
 	}
-	if report.JobKey == "" {
-		report.JobKey = scheduledJobKeyFromTrigger(strings.TrimPrefix(rec.Key, triggerConversationPrefix))
-	}
+	// One resolution for the writer here and the status reader
+	// (scheduledRunStatus), so the reader finds this record.
+	report.JobKey = scheduledRunJobKey(rec, taskID)
 	key := scheduledReportKey(report.JobKey, taskID)
 	logArgs := []any{"jobKey", report.JobKey, "taskId", taskID, "conversation", rec.Key}
 	store := g.scheduledStore(ctx)
@@ -506,6 +506,33 @@ func (g *Gateway) scheduledReportStatus(ctx context.Context, jobKey, taskID stri
 		return "", err
 	}
 	return r.Status, nil
+}
+
+// scheduledRunJobKey is the job key a run of rec's schedule is recorded
+// under: the run's own delivery (TaskRef.Delivery, set at submit), else the
+// conversation's for an entry from before that field, else the trigger name.
+// The same resolution deliverScheduledReport uses, so a status reader finds
+// the record the relay wrote.
+func scheduledRunJobKey(rec *SessionRecord, taskID string) string {
+	ref, _ := rec.TaskRefFor(taskID)
+	d := ref.Delivery
+	if d == nil {
+		d = rec.Delivery
+	}
+	if d != nil && d.JobKey != "" {
+		return d.JobKey
+	}
+	if ref.Requester != nil && ref.Requester.Subject != "" {
+		return scheduledJobKeyFromTrigger(ref.Requester.Subject)
+	}
+	return scheduledJobKeyFromTrigger(strings.TrimPrefix(rec.Key, triggerConversationPrefix))
+}
+
+// scheduledRunStatus is the delivery status of rec's run taskID, "" when no
+// record exists yet: the value a trigger status reply carries (the
+// operator records it on the AgentSchedule's recent runs).
+func (g *Gateway) scheduledRunStatus(ctx context.Context, rec *SessionRecord, taskID string) (string, error) {
+	return g.scheduledReportStatus(ctx, scheduledRunJobKey(rec, taskID), taskID)
 }
 
 // homeChannel is the channel a home post goes to now, "" for none: the
