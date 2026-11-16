@@ -27,8 +27,27 @@ import (
 // API server, that every non-optional Secret ref in its template already
 // resolves, and that the template is the same on every later pass.
 func TestTheAgentDeploymentIsAppliedOnlyOnceItsSecretRefsResolve(t *testing.T) {
+	t.Run("the rendered bridge", func(t *testing.T) {
+		checkFirstRenderSecretRefs(t, secretHashTestAgent(), true)
+	})
+	// A CR that declares its own api bridge gets no rendered one, but the
+	// agent still holds the activity-hook key from the creds Secret.
+	t.Run("a declared api bridge", func(t *testing.T) {
+		agent := secretHashTestAgent()
+		if agent.Spec.Deployment == nil {
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+		}
+		agent.Spec.Deployment.Sidecars = append(agent.Spec.Deployment.Sidecars, corev1.Container{
+			Name: a2aBridgeContainerName, Image: "example.com/hermes-bridge:dev",
+			Env: []corev1.EnvVar{{Name: "API_SERVER_KEY", Value: "k"}, {Name: "BRIDGE_EXECUTOR", Value: "api"}, {Name: "BRIDGE_CONCURRENCY", Value: "2"}},
+		})
+		checkFirstRenderSecretRefs(t, agent, false)
+	})
+}
+
+func checkFirstRenderSecretRefs(t *testing.T, agent *agentv1alpha1.PlatformAgent, rendered bool) {
+	t.Helper()
 	scheme := setupScheme()
-	agent := secretHashTestAgent()
 	secret := secretHashTestSecret("platform-agent-secrets", map[string][]byte{
 		"API_SERVER_KEY": []byte("k"), "SESSION_KV_API_KEY": []byte("s"), "SESSION_KV_SALT": []byte("t"),
 	})
@@ -67,6 +86,9 @@ func TestTheAgentDeploymentIsAppliedOnlyOnceItsSecretRefsResolve(t *testing.T) {
 		}
 		if len(containersNamed(dep.Spec.Template, a2aBridgeContainerName)) != 1 {
 			t.Fatalf("pass %d: the agent Deployment has no %s container", pass, a2aBridgeContainerName)
+		}
+		if !hasEnv(dep.Spec.Template.Spec.Containers[0].Env, a2aActivitySecretEnvVar) {
+			t.Fatalf("pass %d: the agent holds no %s, so this case reads nothing from the creds Secret (rendered=%v)", pass, a2aActivitySecretEnvVar, rendered)
 		}
 		if first == nil {
 			first = dep.Spec.Template.DeepCopy()

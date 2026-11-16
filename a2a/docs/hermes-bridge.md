@@ -104,7 +104,8 @@ condition says the bus isn't there yet. The operator ensures the bus creds Secre
 bridge reads its password from, before it applies the agent Deployment. So the pod template is
 the same before and after provisioning, and a fresh install rolls the agent pod once. The TASKS
 consumer reserve counts the bridge from the first render too, so the one provisioning Job is
-already sized for it.
+already sized for it. A bridge image from before this wait, pinned under a newer operator, exits instead of waiting,
+so on a fresh install it restarts until the bus is provisioned.
 
 **It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
 CPU and 512Mi, with limits of 1 CPU and 1Gi. This paragraph is the one statement of that

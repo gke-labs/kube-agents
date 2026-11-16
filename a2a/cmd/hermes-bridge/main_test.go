@@ -45,8 +45,8 @@ func TestRunMapsUsageErrorToExitUsage(t *testing.T) {
 // A bus that is not there yet is waited for, not exited on (#5962): the
 // operator renders the bridge from the first pass, before the provisioning Job
 // has run, and a bridge that exited would crash-loop the agent pod. realMain
-// keeps trying until its context ends, and that end is the failure exit, not
-// the usage exit and not a clean zero.
+// keeps trying until its context ends, and an end there (SIGTERM on a pod
+// deleted before the bus came up) is a clean stop, not an init failure.
 func TestRealMainWaitsForAnUnreachableBusUntilItsContextEnds(t *testing.T) {
 	t.Setenv("NATS_URL", unreachableNATSURL)
 	t.Setenv("NATS_USER", "")
@@ -56,14 +56,11 @@ func TestRealMainWaitsForAnUnreachableBusUntilItsContextEnds(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	err := realMain(ctx, log)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("realMain against %s returned %v, want it to wait until its context ended", unreachableNATSURL, err)
+	if err != nil {
+		t.Fatalf("realMain against %s returned %v, want a clean stop once its context ended", unreachableNATSURL, err)
 	}
 	if waited := time.Since(start); waited < time.Second {
 		t.Fatalf("realMain gave up on the bus after %s; it must wait for it", waited)
-	}
-	if got := exitCode(err); got != exitFailure {
-		t.Errorf("exitCode(%v) = %d, want %d", err, got, exitFailure)
 	}
 }
 
@@ -104,8 +101,8 @@ func TestRunAPIExecutorWithoutKey(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		err := realMain(ctx, log)
 		cancel()
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("realMain with %s=%q and no key returned %v, want it to reach the bus and wait for it", executorEnv, executor, err)
+		if err != nil {
+			t.Fatalf("realMain with %s=%q and no key returned %v, want it to reach the bus, wait, and stop cleanly", executorEnv, executor, err)
 		}
 	}
 }

@@ -412,7 +412,7 @@ that the operator renders under `next` (a CR may declare its own on `spec.deploy
 instead) and whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
-with no bridge in the pod - before the bus is provisioned, or with the bridge failing - has a bus
+whose bridge is not consuming - still waiting for the bus to be provisioned, or failing - has a bus
 with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
@@ -677,10 +677,9 @@ image overrides) and waits for the door's Service and token Secret. The bridge i
 operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
 way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
 the TASKS budget counts its workers from the first `next` render, so the mode change is the only
-change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
-pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
-Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step waits for the
+change and the one provisioning Job is already sized for the bridge. The bridge is in the agent
+pod from the first render and waits for the bus, so the agent Deployment rolls once, and the
+step's gates for a second, bridge-adding roll pass at once. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
 console under `next` (the same read routes and chat turn the deploy gated under `today`, through

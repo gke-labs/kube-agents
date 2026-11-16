@@ -182,6 +182,12 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 
 	b, err := hermesbridge.New(ctx, cfg)
 	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			// Stopped (SIGTERM) while waiting for the bus: a clean stop, not
+			// an init failure.
+			log.Info("stopped while waiting for the bus")
+			return nil
+		}
 		log.Error("bridge init failed", "err", err)
 		return err
 	}

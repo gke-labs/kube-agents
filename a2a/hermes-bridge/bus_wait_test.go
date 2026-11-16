@@ -1,8 +1,12 @@
 package hermesbridge
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,4 +154,73 @@ func TestAConfigErrorIsNotWaitedOn(t *testing.T) {
 	if time.Since(start) > time.Second {
 		t.Fatalf("a config error took %s; it must fail before any wait", time.Since(start))
 	}
+}
+
+// A bus that is up but refuses the bridge's credentials is said at Error, in
+// the words the troubleshooting guide keys on, and still waited on: the
+// password or grant may be fixed without restarting the pod.
+func TestARefusedBridgeIsSaidAtErrorAndWaited(t *testing.T) {
+	port := int(testPort.Add(1))
+	s, err := natsserver.NewServer(&natsserver.Options{
+		Host: "127.0.0.1", Port: port, JetStream: true, StoreDir: t.TempDir(), NoLog: true, NoSigs: true,
+		Username: "bridge", Password: "right",
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+
+	var logs bytes.Buffer
+	cfg := busWaitConfig(fmt.Sprintf("nats://127.0.0.1:%d", port))
+	cfg.NATSOptions = []nats.Option{nats.UserInfo("bridge", "wrong")}
+	cfg.Logger = slog.New(slog.NewTextHandler(&syncWriter{w: &logs}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	if _, err := New(ctx, cfg); err == nil {
+		t.Fatal("New succeeded with the wrong password")
+	}
+	out := (&syncWriter{w: &logs}).String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "the bus refused this bridge") {
+		t.Fatalf("a refused bridge was not said at Error with the troubleshooting words:\n%s", out)
+	}
+	if strings.Count(out, "the bus refused this bridge") < 2 {
+		t.Fatalf("a refused bridge stopped waiting after one attempt:\n%s", out)
+	}
+}
+
+func TestBusRefusedTellsARefusalFromAnAbsence(t *testing.T) {
+	for err, want := range map[error]bool{
+		nats.ErrAuthorization:                       true,
+		fmt.Errorf("kv: %w", nats.ErrAuthorization): true,
+		nats.ErrPermissionViolation:                 true,
+		nats.ErrNoServers:                           false,
+		jetstream.ErrBucketNotFound:                 false,
+		context.DeadlineExceeded:                    false,
+	} {
+		if got := busRefused(err); got != want {
+			t.Errorf("busRefused(%v) = %v, want %v", err, got, want)
+		}
+	}
+}
+
+// syncWriter serializes writes from the bridge's goroutines to one buffer.
+type syncWriter struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+func (s *syncWriter) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.String()
 }

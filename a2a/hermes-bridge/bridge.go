@@ -567,6 +567,18 @@ const DefaultBusWaitMax = 30 * time.Second
 // up to Config.BusWaitMax.
 const busWaitStart = time.Second
 
+// busWaitWarnAfter is how long the bridge waits for the bus before it says so
+// at Warn: past a fresh install's provisioning, which takes a few minutes.
+const busWaitWarnAfter = 5 * time.Minute
+
+// busRefused reports whether err is the bus refusing this bridge's
+// credentials or grants, as opposed to the bus or its bucket not being there.
+func busRefused(err error) bool {
+	return errors.Is(err, nats.ErrAuthorization) || errors.Is(err, nats.ErrAuthExpired) ||
+		errors.Is(err, nats.ErrAuthRevoked) || errors.Is(err, nats.ErrPermissionViolation) ||
+		errors.Is(err, nats.ErrAccountAuthExpired)
+}
+
 // waitForBus connects to the bus and opens the runtime-state bucket,
 // retrying with a capped backoff until both succeed or ctx ends. On a fresh
 // install the bridge starts before the provisioning Job has created the
@@ -578,18 +590,30 @@ const busWaitStart = time.Second
 // PlatformAgent's BusProvisioned condition says the bus is not there yet.
 func (b *Bridge) waitForBus(ctx context.Context) error {
 	wait := busWaitStart
+	start := time.Now()
 	for attempt := 1; ; attempt++ {
 		err := b.connectBus(ctx)
 		if err == nil {
 			if attempt > 1 {
-				b.cfg.Logger.Info("reached the bus", "attempts", attempt)
+				b.cfg.Logger.Info("reached the bus", "attempts", attempt, "waited", time.Since(start).Round(time.Second))
 			}
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		b.cfg.Logger.Info("the bus is not ready yet; waiting", "attempt", attempt, "retryIn", wait, "err", err)
+		switch {
+		case busRefused(err):
+			// A wrong password or a missing user or grant: the bus is up and
+			// says no, which waiting alone won't fix. Said at Error, in the
+			// words the troubleshooting guide keys on, every attempt.
+			b.cfg.Logger.Error("the bus refused this bridge; waiting for its credentials or grants to be fixed",
+				"attempt", attempt, "retryIn", wait, "err", err, "profile", b.cfg.Profile, "session", b.from.Session)
+		case time.Since(start) >= busWaitWarnAfter:
+			b.cfg.Logger.Warn("the bus is still not ready; waiting", "attempt", attempt, "waited", time.Since(start).Round(time.Second), "retryIn", wait, "err", err)
+		default:
+			b.cfg.Logger.Info("the bus is not ready yet; waiting", "attempt", attempt, "retryIn", wait, "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
