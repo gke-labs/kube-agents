@@ -127,6 +127,16 @@ SEEDED_INSTALLER_ENV_KEYS = (
 )
 
 
+#: Git in the child reads neither the global nor the system configuration file, only the
+#: repository's own. A developer's global rule such as
+#: `url.git@github.com:.pushInsteadOf https://github.com/` is applied to a push before a
+#: repository's `insteadOf`, so without this a script's push to the test's local stand-in for the
+#: release repository goes to GitHub, with the developer's key. Configuration that arrives in the
+#: environment (GIT_CONFIG_COUNT) still applies, and git before 2.32 does not know
+#: GIT_CONFIG_GLOBAL.
+HERMETIC_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
 def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     """Returns a sanitized environment for hermetic script execution, free of CI runner pollution.
 
@@ -134,6 +144,7 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     see even when the developer's shell exports them: a test that relies on a
     variable being unset has to be insulated from os.environ. Popped before the
     overrides, so a caller can name a key in `overrides` and the override wins.
+    `HERMETIC_GIT_ENV` is set before the overrides for the same reason.
     """
     env = {
         k: v
@@ -144,6 +155,7 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
         env.pop(key, None)
     for key in absent:
         env.pop(key, None)
+    env.update(HERMETIC_GIT_ENV)
     if bin_dir:
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if overrides:
