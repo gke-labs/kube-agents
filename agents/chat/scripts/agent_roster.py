@@ -139,6 +139,20 @@ IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
 IDENTITY_WHERE = "; {places}"
 IDENTITY_PLACE = "{key} {value}"
 
+# Profile-targeted AgentPlugins mounted by the operator and symlinked into
+# <profile>/plugins by deploy/shared/profile_plugins.py (DEFAULT_MOUNT_ROOT).
+# Mirrored rather than imported because this module runs ahead of every
+# front-door turn; test_agent_roster.py holds the mount root equal.
+AGENT_PLUGINS_MOUNT_ROOT = Path("/opt/agent-plugins")
+PLUGINS_DIR_NAME = "plugins"
+PLUGIN_MANIFEST_FILE = "plugin.yaml"
+PLUGIN_NAME_KEY = "name"
+PLUGIN_SKILLS_KEY = "provides_skills"
+PLUGINS_FIELD = "installed_plugins"
+PLUGINS_NOTE = " (installed plugins: {plugins})"
+PLUGIN_SKILL_SEPARATOR = ":"
+YAML_LIST_PREFIX = "- "
+
 # The cluster this pod runs on. The operator sets these on the agent container
 # outside kind (platformagent_manifests.go); the router MCP child gets them
 # through its `env:` block in agents/chat/config.yaml.
@@ -275,6 +289,118 @@ def _cluster_identity(home: Path) -> dict[str, str]:
     return identity if identity.get(IDENTITY_NAME_KEY) else {}
 
 
+def _mounted_plugin_profiles(mount_root: Path) -> set[str]:
+    """Profile names that have a mounted AgentPlugin directory, or set() when none exist."""
+    try:
+        if not mount_root.is_dir():
+            return set()
+        return {entry.name for entry in mount_root.iterdir() if entry.is_dir()}
+    except OSError as e:
+        log(f"cannot list agent plugin mounts at {mount_root}: {e}")
+        _note_degraded()
+        return set()
+
+
+def _links_into(link: Path, profile_mount: Path) -> bool:
+    """True when `link` is a symlink whose normalized target sits under `profile_mount`."""
+    if not link.is_symlink():
+        return False
+    raw_target = os.readlink(link)
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = link.parent / target
+    normalized = Path(os.path.normpath(str(target)))
+    normalized_mount = Path(os.path.normpath(str(profile_mount)))
+    return normalized_mount in normalized.parents
+
+
+def _strip_yaml_comment(value: str) -> str:
+    """Drop an unquoted trailing `# ...` comment from a YAML scalar or inline list."""
+    quote = ""
+    for idx, ch in enumerate(value):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in YAML_QUOTES:
+            quote = ch
+        elif ch == "#" and (idx == 0 or value[idx - 1].isspace()):
+            return value[:idx].strip()
+    return value.strip()
+
+
+def _read_plugin_entries(plugin_dir: Path) -> list[str]:
+    """`<plugin>:<skill>` entries from `plugin.yaml`, or `[plugin_name]` without skills."""
+    manifest = plugin_dir / PLUGIN_MANIFEST_FILE
+    plugin_name = plugin_dir.name
+    skills: list[str] = []
+    try:
+        lines = manifest.read_text(encoding="utf-8", errors="replace").splitlines() if manifest.is_file() else []
+    except OSError as e:
+        log(f"cannot read plugin manifest {manifest}: {e}")
+        _note_degraded()
+        return [plugin_name]
+    in_skills = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if in_skills:
+            if stripped.startswith(YAML_LIST_PREFIX):
+                item = _strip_yaml_comment(stripped[len(YAML_LIST_PREFIX):]).strip(YAML_QUOTES)
+                if item:
+                    skills.append(item)
+                continue
+            in_skills = False
+        if line[:1].isspace():
+            continue
+        key, sep, raw_value = stripped.partition(":")
+        if not sep:
+            continue
+        value = _strip_yaml_comment(raw_value)
+        if key == PLUGIN_NAME_KEY:
+            cleaned = value.strip(YAML_QUOTES)
+            if cleaned:
+                plugin_name = cleaned
+        elif key == PLUGIN_SKILLS_KEY:
+            if value.startswith("[") and value.endswith("]"):
+                for part in value[1:-1].split(","):
+                    cleaned = part.strip().strip(YAML_QUOTES)
+                    if cleaned:
+                        skills.append(cleaned)
+            elif not value:
+                in_skills = True
+    if skills:
+        return [f"{plugin_name}{PLUGIN_SKILL_SEPARATOR}{skill}" for skill in skills]
+    return [plugin_name]
+
+
+def _profile_plugins(home: Path, mount_root: Path) -> str:
+    """Comma-separated mounted AgentPlugin skills linked into `home/plugins`, or ""."""
+    plugins_dir = home / PLUGINS_DIR_NAME
+    profile_mount = mount_root / home.name
+    try:
+        if not plugins_dir.is_dir():
+            return ""
+        entries = sorted(plugins_dir.iterdir())
+    except OSError as e:
+        log(f"cannot list plugins for {home.name}: {e}")
+        _note_degraded()
+        return ""
+    found: list[str] = []
+    for entry in entries:
+        try:
+            if not _links_into(entry, profile_mount) or not entry.is_dir():
+                continue
+        except OSError as e:
+            log(f"cannot inspect plugin entry {entry}: {e}")
+            _note_degraded()
+            continue
+        for label in _read_plugin_entries(entry):
+            if label not in found:
+                found.append(label)
+    return ", ".join(found)
+
+
 def discover(base: Path | None = None) -> list[dict[str, str]] | None:
     """Enumerate every routable specialist profile (all profiles except `default`).
 
@@ -291,6 +417,8 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
     is still honoured.
     """
     root = PROFILES_BASE if base is None else base
+    mount_root = AGENT_PLUGINS_MOUNT_ROOT
+    mounted_profiles = _mounted_plugin_profiles(mount_root)
     agents: list[dict[str, str]] = []
     try:
         entries = sorted(root.iterdir()) if root.is_dir() else []
@@ -303,6 +431,10 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
                 continue
             agent = {"name": p.name, "responsibilities": _responsibilities(p)}
             agent.update({IDENTITY_FIELD_PREFIX + k: v for k, v in _cluster_identity(p).items()})
+            if p.name in mounted_profiles:
+                installed = _profile_plugins(p, mount_root)
+                if installed:
+                    agent[PLUGINS_FIELD] = installed
             agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
@@ -366,8 +498,8 @@ def format_roster(
     # named specialist far more often than to a specific cluster. The undescribed trail
     # both: they are the least useful entries to route from.
     # The name a person reads beside the assignee id, when the profile records
-    # its cluster (a Cluster Agent does): "the <cluster> cluster agent".
-    shown = {a["name"]: _identity_note(a) for a in agents}
+    # its cluster (a Cluster Agent does) or mounted AgentPlugins (e.g. platform).
+    shown = {a["name"]: _profile_note(a) for a in agents}
 
     by_name = {a["name"]: a for a in agents}
     blocks: list[str] = []
@@ -455,6 +587,13 @@ def format_matches(
     if len(matched) > len(shown):
         parts.append(FILTER_MORE.format(more=len(matched) - len(shown)))
     return "\n".join(parts)
+
+
+def _profile_note(agent: dict[str, str]) -> str:
+    """Identity note plus installed AgentPlugin note beside a profile's assignee id."""
+    plugins = agent.get(PLUGINS_FIELD, "")
+    plugins_note = PLUGINS_NOTE.format(plugins=plugins) if plugins else ""
+    return f"{_identity_note(agent)}{plugins_note}"
 
 
 def _identity_note(agent: dict[str, str]) -> str:
@@ -702,9 +841,12 @@ def _cache_key_for(root: Path) -> tuple | None:
 
     The profiles directory's mtime (an add, remove, rename or archive), the
     scope snapshot's and the scope render's when named (the reconcile rewrites
-    the snapshot in place; the render is a mounted ConfigMap), and the summary
+    the snapshot in place; the render is a mounted ConfigMap), the mounted
+    AgentPlugin root (``AGENT_PLUGINS_MOUNT_ROOT``) plus each mounted profile's
+    directory and ``<profile>/plugins`` mtimes when present, and the summary
     threshold. ``None`` when the directory cannot be stat'ed (discover decides
-    what that means) or any of them changed within CACHE_RACY_SECONDS.
+    what that means), ``mount_root`` cannot be inspected, or any stamp changed
+    within CACHE_RACY_SECONDS.
     """
     stamps = [_mtime_ns(root)]
     if stamps[0] is None:
@@ -719,9 +861,20 @@ def _cache_key_for(root: Path) -> tuple | None:
         render_path = os.environ.get(reader.SCOPE_FILE_ENV, "")
         if render_path and not render_path.startswith(UNEXPANDED_PLACEHOLDER_PREFIX):
             stamps.append(_mtime_ns(Path(render_path)))
+    mount_root = AGENT_PLUGINS_MOUNT_ROOT
+    stamps.append(_mtime_ns(mount_root))
+    mounted_names: tuple[str, ...] = ()
+    try:
+        if mount_root.is_dir():
+            mounted_names = tuple(sorted(e.name for e in mount_root.iterdir() if e.is_dir()))
+            for name in mounted_names:
+                stamps.append(_mtime_ns(mount_root / name))
+                stamps.append(_mtime_ns(root / name / PLUGINS_DIR_NAME))
+    except OSError:
+        return None
     if _racy(stamps):
         return None
-    return (str(root), *stamps, summary_threshold())
+    return (str(root), str(mount_root), mounted_names, *stamps, summary_threshold())
 
 
 def _unstamped(agents: list[dict[str, str]]) -> list[str]:

@@ -101,6 +101,10 @@ class HelmPluginsTemplatingTest(unittest.TestCase):
             "Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,",
             proc.stdout,
         )
+        self.assertIn(
+            "and if it is real, diagnose it and propose a GitOps remediation PR (or post a chat-only diagnostic report if no GitOps repository is configured).",
+            proc.stdout,
+        )
         self.assertIn("ghcr.io/gke-labs/kube-agents/gke-stockout-investigator:", proc.stdout)
 
     def test_stockout_investigator_route_prompt_matches_subchart(self):
@@ -115,7 +119,7 @@ class HelmPluginsTemplatingTest(unittest.TestCase):
         expected_prompt = (
             "prompt: 'GKE Scale-up Failure Alert.\n\n"
             "                Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,\n"
-            "                and if it is real, diagnose it and propose a GitOps remediation PR.\n\n"
+            "                and if it is real, diagnose it and propose a GitOps remediation PR (or post a chat-only diagnostic report if no GitOps repository is configured).\n\n"
             "                Alert Details:\n"
             "                {__raw__}'"
         )

@@ -598,5 +598,48 @@ class KubeDnsAutoscalingDiagnosticsTest(unittest.TestCase):
                 self.assertIn(expected, content, f"{rel} missing {expected!r}")
 
 
+class PlatformPluginSkillRoutingTest(unittest.TestCase):
+    @staticmethod
+    def _h2_section(markdown: str, heading: str) -> str:
+        marker = f"\n## {heading}\n"
+        start = markdown.index(marker) + 1
+        next_heading = markdown.find("\n## ", start + len(marker))
+        return markdown[start:] if next_heading == -1 else markdown[start:next_heading]
+
+    def test_platform_soul_loads_plugin_skills_before_delegating(self):
+        soul_text = (REPO_ROOT / "agents/platform/SOUL.md").read_text(encoding="utf-8")
+        agents_text = (REPO_ROOT / "agents/platform/AGENTS.md").read_text(encoding="utf-8")
+        chat_soul_text = (REPO_ROOT / "agents/chat/SOUL.md").read_text(encoding="utf-8")
+
+        soul_delegation = self._h2_section(soul_text, "6. Delegation & Cluster-Agent Lifecycle")
+        agents_delegation = self._h2_section(agents_text, "Delegation")
+        chat_routing = self._h2_section(chat_soul_text, "3. What Lives Behind You")
+
+        self.assertNotIn("the exception is a cluster that has no Cluster Agent", soul_delegation)
+        self.assertNotIn("non-alert scheduling or autoscaling failures", soul_delegation)
+        self.assertIn("observability gaps, scheduling or autoscaling failures", soul_delegation)
+        for section in (soul_delegation, agents_delegation):
+            self.assertIn("skill_view", section)
+            self.assertIn("GKE Scale-up Failure Alert", section)
+            self.assertIn("noScaleUp", section)
+            self.assertIn("gkestockoutinvestigator:gke-stockout-investigator", section)
+            self.assertIn("platform-scoped plugin skill", section)
+            self.assertIn("Cluster Agents lack platform-scoped plugins", section)
+        self.assertIn("gitops_preflight.py --list", agents_delegation)
+        self.assertIn("No GitOps repository is configured, so no pull request was opened.", agents_delegation)
+        self.assertIn(
+            "No pull request was opened because this request asked for diagnosis only; <repo> is registered if you want a remediation PR.",
+            agents_delegation,
+        )
+        self.assertIn("[next: open a remediation PR", agents_delegation)
+        self.assertIn("MANAGED: none usable", agents_delegation)
+        self.assertIn("GKE Scale-up Failure Alert", chat_routing)
+        self.assertIn("installed plugins:", chat_routing)
+        self.assertIn("gkestockoutinvestigator:gke-stockout-investigator", chat_routing)
+        self.assertIn("skill's report format", chat_routing)
+        self.assertIn("if `platform` does not list `gkestockoutinvestigator`", chat_routing)
+        self.assertIn("Cluster Agents do not have platform-scoped plugins", chat_routing)
+
+
 if __name__ == "__main__":
     unittest.main()

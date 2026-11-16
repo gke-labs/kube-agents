@@ -71,7 +71,7 @@ spec:
 The plugins that ship in the repository live under [`agentplugins/`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins), each a Helm chart that creates an `AgentPlugin` plus the OCI image it mounts:
 
 - [`pubsub-platform`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/pubsub-platform) — a Pub/Sub ingress adapter that pulls filtered Cloud Logging alerts from a subscription, deduplicates them, and turns what survives into agent work.
-- [`gke-stockout-investigator`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/gke-stockout-investigator) — a skill, installed into the `platform` profile, that diagnoses GKE scale-up failures and proposes a GitOps remediation pull request. Its alerts arrive through the adapter.
+- [`gke-stockout-investigator`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/gke-stockout-investigator) — a skill, installed into the `platform` profile, that diagnoses GKE scale-up failures and proposes a GitOps remediation pull request (or posts a chat diagnostic report when no GitOps repository is configured). Its alerts arrive through the adapter.
 
 `install.sh --enable-pubsub-platform --enable-stockout-investigator` (`enable_pubsub_platform` and `enable_stockout_investigator` in `terraform.tfvars` on the Terraform + Helm method) has the chart render both resources and Terraform create the Pub/Sub topic, subscription and logging sink. Each plugin's README covers its standalone developer install.
 

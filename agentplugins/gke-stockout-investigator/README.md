@@ -3,7 +3,8 @@
 Diagnoses GKE scale-up failures. When the cluster autoscaler cannot place a workload, this
 judges whether the alert is a real, active capacity constraint or scale-up failure or a stale duplicate; if it is real, it
 inspects the live cluster — pending pods, ComputeClasses, quotas, capacity advice — and
-proposes a GitOps remediation PR.
+proposes a GitOps remediation PR, or posts a read-only diagnostic report in chat when no
+GitOps repository is configured.
 
 The diagnosis is not in the alert. The alert carries only a cluster, a namespace and a
 controller name; everything else comes from the agent looking at the cluster afterwards.
