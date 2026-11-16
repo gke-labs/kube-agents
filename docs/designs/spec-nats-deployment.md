@@ -479,8 +479,8 @@ Layout:
   which have no validator - a side left empty beside a populated one renders an explicit
   `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
   ships, still gets no permissions block at all. A principal that must not publish cannot be
-  expressed by omission - there is no deny list in the map
-  - so it has to be left unrendered rather than rendered empty.
+  expressed by omission - the map's deny lists (#5301) only subtract from an allow and never
+  stand in for an empty one - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
