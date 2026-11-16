@@ -11,7 +11,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
+The A2A stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar. Each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
@@ -25,9 +25,9 @@ release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s o
 `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE`, `A2A_CONSOLE_IMAGE` and `A2A_DISPATCHER_IMAGE` on the operator
 override one at a time.
 
-The AgentProfile dispatcher runs by default under `spec.mode: next`, from the release set's image, which on a mirror is the mirror's copy. `A2A_DISPATCHER_IMAGE` overrides the image, and the chart's `operator.profileDispatcher.enabled: false` switches the dispatcher off.
+The AgentProfile dispatcher runs by default, from the release set's image, which on a mirror is the mirror's copy. `A2A_DISPATCHER_IMAGE` overrides the image, and the chart's `operator.profileDispatcher.enabled: false` switches the dispatcher off.
 
-The Hermes bridge sidecar the operator renders into the agent pod under `next` is built from the
+The Hermes bridge sidecar the operator renders into the agent pod is built from the
 `platform-agent` image of the same commit. The operator therefore takes its registry and tag from
 the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent`
 that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
@@ -35,15 +35,22 @@ resource names.
 
 NATS, nats-box, the NATS config reloader and its metrics exporter are ordinary third-party pins,
 in the table as `nats`, `nats-box`, `nats-server-config-reloader` and `prometheus-nats-exporter`,
-so `make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
-install still points `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and
-`A2A_NATS_EXPORTER_IMAGE` at the copies itself, through the operator's environment
-([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
+so `make mirror-images` copies them. The chart sets their env vars (`A2A_NATS_IMAGE`,
+`A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and `A2A_NATS_EXPORTER_IMAGE`) from its
+`a2aBus.images` values, the same way it sets `FLUENT_BIT_IMAGE`. One exception: `operator.extraEnv` that sets `A2A_NATS_IMAGE` and not `A2A_NATS_EXPORTER_IMAGE` keeps the chart's exporter pin out of the operator's environment, so an install set up before the exporter existed stays without the sidecar (below). Under
+`global.thirdPartyImageRegistry` they render from the mirror, so a mirrored chart install pulls
+the four with nothing more to do. The two pinned by digest render under the prefix by tag alone,
+which is the copy `make mirror-images` pushes.
 
-If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a mirrored install set up
-before the exporter existed, the operator renders the NATS pods without the exporter. It records
-an `A2ABusMetricsExporterOmitted` Warning event on the `PlatformAgent`. The bus keeps running, and
-its metrics are absent until the variable names the mirrored copy.
+A kustomize install (`make deploy`) renders the operator without the chart, so there the operator
+runs on its compiled defaults, the same pins on Docker Hub, until the four env vars are set by
+hand on the controller manager.
+
+If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a kustomize install whose
+operator environment was written before the exporter existed, the operator renders the NATS pods
+without the exporter. It records an `A2ABusMetricsExporterOmitted` Warning event on the
+`PlatformAgent`. The bus keeps running, and its metrics are absent until the variable names the
+mirrored copy.
 `A2A_NATS_EXPORTER_IMAGE` has to name a copy of the upstream image, not a rebuild: the operator
 runs `/prometheus-nats-exporter` under the image's `/bin/sh`, in a loop that restarts the exporter
 if it exits.
@@ -280,7 +287,7 @@ one for the images it does not.
 The rows are one path in three coats: `install.sh` generates the Terraform composition's
 `terraform.tfvars` from its flags, and the composition passes both values to the chart's
 `global.*` keys. So "third party" covers the same set everywhere: LiteLLM, fluent-bit, the
-GitHub token minter, and Hindsight.
+NATS bus's four images, the GitHub token minter, and Hindsight.
 
 The chart row's exception is cert-manager: the chart never renders it, and expects one to be
 present already. The composition installs it as a separate
@@ -316,7 +323,7 @@ when a prefix is in effect:
 
 `CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing on a mirror. The operator derives
 the credential proxy from each agent's own image by swapping the trailing name (`platform-agent` to
-`credential-proxy`). It derives `kube-proxy`, and the A2A `next` images it renders (`a2a-gateway`,
+`credential-proxy`). It derives `kube-proxy`, and the A2A images it renders (`a2a-gateway`,
 `a2a-worker`, `a2a-authcallout`, `a2a-verifier`, `a2a-console`, `a2a-dispatcher`), from `OPERATOR_IMAGE`, else
 `PLATFORM_AGENT_IMAGE`, the same way. The sandbox follows `AGENT_SANDBOX_IMAGE`, else
 `OPERATOR_IMAGE` with the repository swapped to `agent-sandbox`, else the ghcr.io default; the
