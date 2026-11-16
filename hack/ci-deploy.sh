@@ -565,6 +565,11 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
+# nats-server debug logging on the bus (k8s-operator a2aNATSDebugEnvVar): on for
+# the lane only, so a failing run's bus logs carry the meta group's raft votes,
+# terms and peer updates (#5708). Debug, never trace: trace logs payloads.
+readonly A2A_NATS_DEBUG_ENV_VAR="A2A_NATS_DEBUG"
+readonly A2A_NATS_DEBUG_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -1996,6 +2001,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # The A2A door, for the card-wait stopped ask (above).
     --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
     --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
+    # The bus's debug logging, for #5708 (above).
+    --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
+    --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
   )
 fi
 
@@ -2445,6 +2453,56 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   exit 1
 fi
 
+# The gateway's second roll on a fresh install (#5962). The operator adds the
+# bridge sidecar to the agent pod only once it has recorded the bus
+# provisioned (a2aBridgeInPod), a reconcile or two after the provisioning
+# Job, so the rollout above can pass on the first ReplicaSet and the gateway
+# then restarts under whatever check runs next (the web console's, below).
+# Wait for the template to carry the bridge, then for that rollout, as step
+# 6b does for the mode upgrade. Not a gate: an operator that renders no
+# bridge (one before the A2A stack always rendered) never adds it, and that
+# is not this deploy's failure, so the wait is skipped (no callout
+# Deployment) or ends, and the deploy carries on.
+# Once the operator renders the bridge from the first pass, the template
+# already carries it and this costs one read.
+BRIDGE_ROLL_START=$SECONDS
+bridge_in_template=false
+bridge_polls="${MODE_NEXT_GENERATION_ATTEMPTS}"
+# No callout Deployment means this operator rendered no A2A stack, and so no
+# bridge: skip the wait rather than spend its whole budget. Only a NotFound
+# says that; a read that fails any other way waits, since skipping on a
+# transient API error would bring back the restart this wait is for. (The
+# operator holds the gateway until the callout serves, so by the rollout
+# above an operator that renders the stack has created the callout.)
+callout_read="$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -n "${NAMESPACE}" -o name 2>&1)" || {
+  case "${callout_read}" in
+    *NotFound*) bridge_polls=0 ;;
+  esac
+}
+for ((poll = 0; poll < bridge_polls; poll++)); do
+  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
+    *" ${BRIDGE_SIDECAR_NAME} "*)
+      bridge_in_template=true
+      break
+      ;;
+  esac
+  sleep "${MODE_NEXT_POLL_SECONDS}"
+done
+if [ "${bridge_in_template}" = true ]; then
+  if ! kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: ${AGENT_DEPLOYMENT_NAME} rollout with the ${BRIDGE_SIDECAR_NAME} sidecar failed"
+    kubectl describe "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" || true
+    kubectl get pods -n "${NAMESPACE}" || true
+    kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
+    exit 1
+  fi
+  echo "✓ ${AGENT_DEPLOYMENT_NAME} rolled out with the ${BRIDGE_SIDECAR_NAME} sidecar ($((SECONDS - BRIDGE_ROLL_START))s after the first rollout)"
+elif [ "${bridge_polls}" -eq 0 ]; then
+  echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar: there is no second roll to wait for"
+else
+  echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} sidecar after $((SECONDS - BRIDGE_ROLL_START))s (bus not provisioned yet?); carrying on without the second-roll wait"
+fi
+
 # The shell sandbox is the other half of the agent: everything the model runs
 # executes there over ssh, so a gateway that is Ready against a StatefulSet
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
@@ -2687,7 +2745,11 @@ gate_web_console today
 # created, so the refusal #2077 guarded against cannot arise. The bridge
 # enters the agent pod only once the bus is provisioned (BusProvisioned), so
 # the agent Deployment rolls twice: once for the mode upgrade and once, after
-# the Job, for the bridge. The step gates both rolls. Then the step ends on the bridge's own word that it is
+# the Job, for the bridge. The step gates both rolls. On an operator that
+# renders the A2A stack from its first pass whatever the mode, both rolls
+# already happened before step 6's web console check, which waits for the
+# second (#5962), so here the bridge is in the template on the first read and
+# both gates pass at once. Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
