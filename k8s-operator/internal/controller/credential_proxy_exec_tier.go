@@ -169,6 +169,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// the store routes are the stateful broker's.
 	auditReportStoreURLEnv:       true,
 	auditReportStoreTokenFileEnv: true,
+	// The A2A gateway's Chat relay settings: the exec tier runs no relay, and
+	// a subscription change must not roll every exec replica.
+	a2aGoogleChatSubscriptionEnvVar:      true,
+	credentialProxyA2AChatAudienceEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

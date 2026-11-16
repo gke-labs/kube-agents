@@ -31,7 +31,7 @@ import (
 const (
 	// A2ABusTokenAudience is the audience every A2A bus token is bound to. The
 	// operator projects a ServiceAccount token for it into the platform-agent
-	// container under `mode: next`, and the auth callout accepts no other
+	// container, and the auth callout accepts no other
 	// audience. It lives here rather than in the controller because the
 	// validating webhook needs the same value: a user-authored volume that
 	// projects a token for this audience under any name is the bus credential
@@ -56,7 +56,7 @@ const (
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
-// PlatformAgent under `mode: next`, and the stem of A2ACredsSecretName.
+// PlatformAgent, and the stem of A2ACredsSecretName.
 func A2ANATSName(agentName string) string { return agentName + a2aNATSNameSuffix }
 
 // A2ACredsSecretName is the Secret holding the bus's static passwords
@@ -141,7 +141,7 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
-	// The A2A bus wiring the operator renders under `mode: next`. The agent
+	// The A2A bus wiring the operator renders. The agent
 	// container's credential is a projected ServiceAccount token since A5, not
 	// a password, but the address is still the thing that decides who receives
 	// it: a CR-set NATS_URL would send the bearer token to a server of the
@@ -176,13 +176,16 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. The operator renders it exactly when
-	// the next stack holds the chat backend; an override either way leaves
-	// posts going to a platform that is not there.
+	// the gateway's chat.notify route. It holds every platform whose route is
+	// armed under the next stack with a home channel set on the CR,
+	// comma-separated, Chat first; the agent adds a learned Slack channel and
+	// sends home posts to every armed route when no platform has a home. An
+	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
-	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route, and names
-	// the platform in the cron relay's refusal when no home channel is set.
+	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
+	// comma-separated. The kanban notifier reports back on it to the gateway
+	// conversation a card was filed in, and the agent sends home posts to
+	// every armed route when no platform has a home channel.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS":     {},
 	"KUBE_AGENTS_ENABLED_PROFILES": {},
@@ -250,7 +253,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // route that is cheaper than it.
 //
 // Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
-// platform-agent container presents to the bus under `mode: next`, and it is
+// platform-agent container presents to the bus, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the
 // agent's bus identity. One that also holds bridge-password would hold the
@@ -945,8 +948,7 @@ type TuningSpec struct {
 	Admission *AdmissionSpec `json:"admission,omitempty"`
 
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
-	// It only means something under mode: next - a today install renders neither
-	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+	// "Delegate:" makes pod
 	// creation user-triggerable from chat and threads are free, so the principal
 	// map bounds WHO can spawn and this bounds HOW MANY.
 	//
@@ -1018,7 +1020,7 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
-	// BusReplicas is how many NATS servers run the A2A bus under mode: next,
+	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node
 	// drain, upgrade or eviction that moves one server; 1 runs a single
@@ -1027,9 +1029,8 @@ type TuningSpec struct {
 	// that outage; it saves two NATS pods and two 40Gi volumes.
 	//
 	// Unset, an install keeps the count its bus already runs, so an install
-	// whose next-mode bus predates the three-server default stays on one
-	// server, and a new bus gets three, including the one a today install's
-	// first switch to next creates (status.busReplicas shows which applies).
+	// whose bus predates the three-server default stays on one
+	// server, and a new bus gets three (status.busReplicas shows which applies).
 	//
 	// Set, it decides the count of a bus that does not exist yet. An existing
 	// bus keeps the count it runs: NATS cannot carry a single server's streams
@@ -1709,7 +1710,7 @@ type AvailabilitySpec struct {
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 
-	// A2AGateway is the A2A gateway's availability, under mode next.
+	// A2AGateway is the A2A gateway's availability.
 	// +optional
 	A2AGateway *A2AGatewayAvailabilitySpec `json:"a2aGateway,omitempty"`
 }
@@ -2468,7 +2469,7 @@ type TelemetrySpec struct {
 	// PeopleSeen keeps one hashed key and a last-active time per verified
 	// chat person in the gateway's people bucket, for 30 days after their
 	// last turn, and serves the people seen in the last 7 and 30 days as
-	// kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+	// kubeagents_a2a_gateway_people_seen. False writes no
 	// key, deletes every key the bucket holds at the gateway's next start,
 	// and serves no sample.
 	// +kubebuilder:default=true
@@ -2753,6 +2754,12 @@ type AgentStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ObservedVersion is the image tag or digest from the reconciled gateway
+	// workload's platform-agent container (for example, "v0.12.3", "sha-abc1234",
+	// or "sha256:..."), stripped of any registry host and repository path.
+	// +optional
+	ObservedVersion string `json:"observedVersion,omitempty"`
+
 	// Address is the fully qualified domain name (FQDN) of the agent service.
 	// +optional
 	Address string `json:"address,omitempty"`
@@ -2791,14 +2798,12 @@ type AgentStatus struct {
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
-	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+	// BusReplicas is the A2A bus's NATS server count:
 	// the count the bus already runs, which spec.harness.tuning.busReplicas
 	// does not change; for a new bus, that field, or 3. Re-derived on every
-	// reconcile under next, so it is a reading of the bus rather than a
-	// setting. Under spec.mode: today it is left at the count the bus last
-	// ran, so that a flip back returns the bus at that count rather than the
-	// count its kept data claims imply; it is not a claim that a bus is
-	// running, and with the claims deleted it no longer decides anything.
+	// reconcile, so it is a reading of the bus rather than a setting; it is
+	// not a claim that a bus is running, and with the claims deleted it no
+	// longer decides anything.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 
@@ -2866,7 +2871,7 @@ type AgentStatus struct {
 // SessionsTotal, ChatSessionsTotal, RemediationsProposedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
 // ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
-// plugin's and, on a next install, the A2A gateway's metrics
+// plugin's and the A2A gateway's metrics
 // listeners, InputTokensTotal, OutputTokensTotal and SpendMicrosUSDTotal from
 // the inference gateway's (LiteLLM's), and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
@@ -2883,8 +2888,8 @@ type AgentUsageStatus struct {
 	// delivered (its k8s_event_watcher_triage_sessions_total; a session
 	// whose inject was filtered, suppressed or failed is not counted) plus
 	// the chat conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus the
-	// A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total). A
 	// chat conversation that resumes after the session store's retention
 	// window (seven days by default) counts again. Read every five minutes
 	// and kept monotonic across restarts, like toolExecutionsTotal.
@@ -2893,9 +2898,9 @@ type AgentUsageStatus struct {
 
 	// ChatSessionsTotal is the chat half of SessionsTotal: the chat
 	// conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus
-	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
-	// install), without the event watcher's triage sessions. A re-seed from
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total), without the event watcher's
+	// triage sessions. A re-seed from
 	// a status that carries no chatSessionsTotal (an install with triage
 	// sessions and no chat yet, or a served CRD that holds the field back)
 	// seeds those triage sessions into the chat half, and the counter keeps
@@ -2980,8 +2985,8 @@ type AgentUsageStatus struct {
 	// does. Read every five minutes from the chat_metrics plugin's
 	// kubeagents_chat_messages_inbound_total on the platform-agent container
 	// of the gateway pod that runs Hermes (above one replica, the leader
-	// alone), summed across the pods that have led, and, on a next-mode
-	// install, from the A2A gateway's
+	// alone), summed across the pods that have led, and from the A2A
+	// gateway's
 	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
 	// ingress is that gateway's there; kept monotonic the same way as
 	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
@@ -3034,10 +3039,10 @@ type AgentUsageStatus struct {
 	// connection error, the gateway timeout) or a provider authentication
 	// failure, counted by the chat_metrics plugin's
 	// kubeagents_chat_turns_errored_total on the gateway pod that runs
-	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// Hermes; and an A2A task that ended failed or
 	// rejected, read from the A2A gateway's
 	// kubeagents_a2a_gateway_task_terminals_total under those two states.
-	// That family carries no platform, so on next it counts every A2A task's
+	// That family carries no platform, so it counts every A2A task's
 	// terminal, a door's program-to-program task included, not chat alone;
 	// rejected is a task the executor refused, counted as the design asks.
 	// Read every five minutes and kept monotonic the same way as
@@ -3069,7 +3074,7 @@ type AgentUsageStatus struct {
 	// counts again, and a reaction before the first inbound message after a
 	// start is not counted), into the chat_metrics plugin's
 	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
-	// reaction events. On a next-mode install the A2A gateway's
+	// reaction events. The A2A gateway's
 	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
 	// it: one count each time a verified sender's rating of one of its
 	// answers becomes Bad answer, so a repeated tap adds nothing. Read every
@@ -3083,8 +3088,8 @@ type AgentUsageStatus struct {
 	// so a repeated tap adds nothing:
 	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
 	// over its other labels; read every five minutes and kept monotonic the
-	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
-	// install this stays at 0. Does not move LastActiveTime: the message the
+	// same way as ToolExecutionsTotal. The Hermes gateway counts no thumbs-up,
+	// so only ratings through the A2A gateway move it. Does not move LastActiveTime: the message the
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
@@ -3157,13 +3162,13 @@ type AgentUsageStatus struct {
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
-	// wrote on the chat platform it serves within the last 7 days:
+	// wrote on the chat platforms it serves within the last 7 days:
 	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
-	// chat platform the install enables is served through Hermes (Google Chat
-	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// chat platform the install enables is served through Hermes (Microsoft
+	// Teams), and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

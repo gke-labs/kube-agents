@@ -45,6 +45,12 @@ rules:
   - apiGroups:
       - apps
     resources:
+      - controllerrevisions
+    verbs:
+      - get
+  - apiGroups:
+      - apps
+    resources:
       - daemonsets
       - deployments
       - replicasets
@@ -114,29 +120,24 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins/status
-      - agentprofiles/status
-      - tiers/status
     verbs:
       - get
       - patch
-      - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
       - agentprofiles
-      - platformagents/status
     verbs:
       - get
       - list
       - patch
-      - update
       - watch
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - agentprofiles/finalizers
-      - platformagents/finalizers
+      - agentprofiles/status
     verbs:
+      - get
       - update
   - apiGroups:
       - kubeagents.x-k8s.io
@@ -149,14 +150,27 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - platformagents
+      - platformagents/status
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
       - update
       - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - platformagents/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - tiers/status
+    verbs:
+      - get
+      - patch
+      - update
   - apiGroups:
       - kustomize.toolkit.fluxcd.io
     resources:
