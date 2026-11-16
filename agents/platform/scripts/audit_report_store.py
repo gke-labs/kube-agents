@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""The audit-report store's broker-only listener (#5619), next mode only.
+"""The audit-report store's broker-only listener (#5619).
 
 The fleet-audit report store (docs/designs/fleet-audit-report-store.md) is a
-tree on the agent's PVC that `audit_report.py finish` writes in place. Under
-`mode: next` a profile worker runs in a pod of its own with no PVC, so it
+tree on the agent's PVC that `audit_report.py finish` writes in place. A
+profile worker runs in a pod of its own with no PVC, so it
 reaches the store through the credential broker, and the broker reaches it
 here: an HTTP listener in the gateway pod over the same tree.
 

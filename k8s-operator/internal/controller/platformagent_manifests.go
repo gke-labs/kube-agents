@@ -4553,8 +4553,8 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			{Name: "proxy-api", ContainerPort: 8643},
 			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
 			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
-			// And under next the audit-report store listener's, which the
-			// Service <agent>-report-store targets by name.
+			// And the audit-report store listener's, which the Service
+			// <agent>-report-store targets by name.
 		}, auditReportStoreSidecarPorts(agent)...),
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
@@ -4648,7 +4648,7 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
 		)
 	}
-	// The audit-report store listener's switch and subject, under next only
+	// The audit-report store listener's switch and subject
 	// (audit_report_store.go). This container runs it: the PVC and the pod's
 	// API-audience token, which the listener reads the JWKS with, are here.
 	envVars = append(envVars, auditReportStoreSidecarEnv(agent)...)
@@ -5210,7 +5210,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's four, in every mode (auditReportStoreEnvNames).
+	// The audit-report store's names (auditReportStoreEnvNames).
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
@@ -7108,14 +7108,12 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
-	// Under next, the audit-report store listener on agent-api-auth: the
-	// broker's pods alone, to its port (auditReportStoreIngressRule). Here
-	// rather than in a policy of its own, so a rollback to an operator that
-	// renders this policy without it drops it, and spec.networkPolicy.enabled
-	// false takes it with the policy. Today renders this policy unchanged.
-	if auditReportStoreRendered(agent) {
-		ingressRules = append(ingressRules, auditReportStoreIngressRule(agent))
-	}
+	// The audit-report store listener on agent-api-auth: the broker's pods
+	// alone, to its port (auditReportStoreIngressRule). Here rather than in a
+	// policy of its own, so a rollback to an operator that renders this policy
+	// without it drops it, and spec.networkPolicy.enabled false takes it with
+	// the policy.
+	ingressRules = append(ingressRules, auditReportStoreIngressRule(agent))
 
 	// The managed-Prometheus collector, scraping the event watcher's metrics
 	// port on the agent-api-auth sidecar. A rule of its own rather than a port

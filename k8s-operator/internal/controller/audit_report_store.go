@@ -16,7 +16,7 @@ limitations under the License.
 
 package controller
 
-// The audit-report store's broker-only listener (#5619), under mode: next.
+// The audit-report store's broker-only listener (#5619).
 //
 // A profile worker runs in a pod with no PVC, so it reaches the fleet-audit
 // report store (docs/designs/fleet-audit-report-store.md) through the
@@ -24,7 +24,7 @@ package controller
 // HTTP listener (agents/platform/scripts/audit_report_store.py) on port 8700
 // of the gateway pod, over the tree audit_report.py writes on the agent PVC.
 //
-// What this file renders, all of it next mode only:
+// What this file renders, with the A2A stack on every install:
 //
 //   - on the gateway pod's agent-api-auth container, the switch that starts
 //     the listener (start-services.sh), the subject it accepts, and the port.
@@ -44,10 +44,10 @@ package controller
 //     of that policy lacks the rule, drops it with no orphan left isolating
 //     the pod, and spec.networkPolicy.enabled false takes it with the policy.
 //
-// Today mode renders none of it, and a flip back to today deletes the
-// Service. The data stays on the PVC either way. A rollback to an operator
-// before this change leaves the Service behind: it is inert, since nothing
-// listens on 8700 without this change.
+// There is no mode gate: spec.mode is retired and the A2A stack renders on
+// every install (mode_migration.go), so the store does too. A rollback to an
+// operator before this change leaves the Service behind: it is inert, since
+// nothing listens on 8700 without this change. The data stays on the PVC.
 
 import (
 	"context"
@@ -96,10 +96,9 @@ const (
 	auditReportStoreTokenFileEnv = "AUDIT_REPORT_STORE_TOKEN_FILE" // #nosec G101 -- Environment variable name, not a credential
 )
 
-// auditReportStoreEnvNames are reserved in mergeCredentialProxyEnv in every
-// mode: rendered only under next, a CR could otherwise set them on a today
-// install and start a listener nobody declared, or point the broker's token at
-// a listener of its choosing.
+// auditReportStoreEnvNames are reserved in mergeCredentialProxyEnv: a CR
+// could otherwise override them, start a listener with a subject of its
+// choosing, or point the broker's token at a listener of its choosing.
 //
 // The last three are names the listener no longer reads, reserved anyway: an
 // image or a hand edit that read them would let a CR move the store's root,
@@ -114,13 +113,6 @@ var auditReportStoreEnvNames = []string{
 	"FLEET_AUDIT_REPORTS_DIR",
 	"AUDIT_REPORT_STORE_API_SERVER",
 	"AUDIT_REPORT_STORE_SA_DIR",
-}
-
-// auditReportStoreRendered is whether the listener and its objects render:
-// mode next. Fail-closed on version skew (renderMode), where the pod drops the
-// listener and the reconcile leaves the two objects as they are.
-func auditReportStoreRendered(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "audit-report-store") == ModeNext
 }
 
 func auditReportStoreName(agent *agentv1alpha1.PlatformAgent) string {
@@ -139,11 +131,8 @@ func auditReportStoreAllowedSubject(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // auditReportStoreSidecarEnv is the listener's switch and subject on
-// agent-api-auth, or nothing outside next mode.
+// agent-api-auth.
 func auditReportStoreSidecarEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	if !auditReportStoreRendered(agent) {
-		return nil
-	}
 	return []corev1.EnvVar{
 		{Name: auditReportStoreEnabledEnv, Value: "1"},
 		{Name: auditReportStoreAllowedSubjectEnv, Value: auditReportStoreAllowedSubject(agent)},
@@ -153,9 +142,6 @@ func auditReportStoreSidecarEnv(agent *agentv1alpha1.PlatformAgent) []corev1.Env
 
 // auditReportStoreSidecarPorts is the listener's port on agent-api-auth.
 func auditReportStoreSidecarPorts(agent *agentv1alpha1.PlatformAgent) []corev1.ContainerPort {
-	if !auditReportStoreRendered(agent) {
-		return nil
-	}
 	return []corev1.ContainerPort{{Name: auditReportStorePortName, ContainerPort: auditReportStorePort}}
 }
 
@@ -165,9 +151,6 @@ func auditReportStoreSidecarPorts(agent *agentv1alpha1.PlatformAgent) []corev1.C
 // (credential_proxy_exec_tier.go): an exec pod runs brokered commands and
 // never calls the store.
 func auditReportStoreBrokerVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
-	if !auditReportStoreRendered(agent) {
-		return nil
-	}
 	return []corev1.Volume{{Name: auditReportStoreTokenVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 		DefaultMode: ptr.To(int32(0400)),
 		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
@@ -177,16 +160,10 @@ func auditReportStoreBrokerVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.
 }
 
 func auditReportStoreBrokerMounts(agent *agentv1alpha1.PlatformAgent) []corev1.VolumeMount {
-	if !auditReportStoreRendered(agent) {
-		return nil
-	}
 	return []corev1.VolumeMount{{Name: auditReportStoreTokenVolume, MountPath: auditReportStoreTokenMountPath, ReadOnly: true}}
 }
 
 func auditReportStoreBrokerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	if !auditReportStoreRendered(agent) {
-		return nil
-	}
 	return []corev1.EnvVar{
 		{Name: auditReportStoreURLEnv, Value: auditReportStoreURL(agent)},
 		{Name: auditReportStoreTokenFileEnv, Value: auditReportStoreTokenMountPath + "/token"},
@@ -213,8 +190,8 @@ func buildAuditReportStoreService(agent *agentv1alpha1.PlatformAgent) *corev1.Se
 	return svc
 }
 
-// auditReportStoreIngressRule is the rule <agent>-gateway-netpol carries under
-// next: the broker's pods, by the selector its Deployment's pods carry
+// auditReportStoreIngressRule is the rule <agent>-gateway-netpol carries: the
+// broker's pods, by the selector its Deployment's pods carry
 // (credentialProxySelector), to the listener's port, and nothing else to it.
 // The exec tier's pods carry another app label and are not admitted. The
 // listener verifies the broker's token as well (audience, issuer, subject and
@@ -229,22 +206,13 @@ func auditReportStoreIngressRule(agent *agentv1alpha1.PlatformAgent) networkingv
 	}
 }
 
-// reconcileAuditReportStore applies the Service under next and deletes it
-// (owned only) under today. On version skew it does neither, as the A2A
-// stack's mode gate does: modeOK is false there.
-//
-// In every mode it also deletes an owned NetworkPolicy <agent>-report-store:
-// an earlier build of this change rendered the store's rule as a policy of
-// its own, which an install that ran it still has.
-func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent, modeOK bool) error {
-	if !modeOK {
-		return nil
-	}
+// reconcileAuditReportStore applies the Service. It also deletes an owned
+// NetworkPolicy <agent>-report-store: an earlier build of this change rendered
+// the store's rule as a policy of its own, which an install that ran it still
+// has.
+func (r *PlatformAgentReconciler) reconcileAuditReportStore(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if err := r.deleteAuditReportStoreObject(ctx, agent, &networkingv1.NetworkPolicy{}); err != nil {
 		return err
-	}
-	if !auditReportStoreRendered(agent) {
-		return r.deleteAuditReportStoreObject(ctx, agent, &corev1.Service{})
 	}
 	svc := buildAuditReportStoreService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {

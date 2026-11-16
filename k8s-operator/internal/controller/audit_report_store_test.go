@@ -33,13 +33,13 @@ func storeEnvValue(env []corev1.EnvVar, name string) (string, bool) {
 	return "", false
 }
 
-// The listener's switch, subject and port are on agent-api-auth under next
-// alone, and never on platform-agent.
-func TestAuditReportStoreSidecarRendersUnderNextOnly(t *testing.T) {
+// The listener's switch, subject and port are on agent-api-auth whatever the
+// retired spec.mode says, as the A2A stack is, and never on platform-agent.
+func TestAuditReportStoreSidecarRendersOnEveryInstall(t *testing.T) {
 	for _, tc := range []struct {
 		mode string
 		want bool
-	}{{"", false}, {"today", false}, {"next", true}, {"later", false}} {
+	}{{"", true}, {"today", true}, {"next", true}} {
 		agent := reportStoreAgent(tc.mode)
 		sidecar := buildAgentAPIAuthSidecar(agent, "/opt/data")
 		enabled, hasEnabled := storeEnvValue(sidecar.Env, auditReportStoreEnabledEnv)
@@ -52,6 +52,11 @@ func TestAuditReportStoreSidecarRendersUnderNextOnly(t *testing.T) {
 		}
 		if hasEnabled != tc.want || hasSubject != tc.want || port != tc.want {
 			t.Errorf("mode %q: enabled=%v subject=%v port=%v, want all %v", tc.mode, hasEnabled, hasSubject, port, tc.want)
+		}
+		for _, c := range buildDeployment(agent, "", "", "", "", nil, renderOptions{}).Spec.Template.Spec.Containers {
+			if _, ok := storeEnvValue(c.Env, auditReportStoreEnabledEnv); ok && c.Name != agentAPIAuthContainerName {
+				t.Errorf("mode %q: container %s carries %s", tc.mode, c.Name, auditReportStoreEnabledEnv)
+			}
 		}
 		if tc.want {
 			if enabled != "1" {
@@ -79,15 +84,9 @@ func TestAuditReportStoreSubjectIsTheBrokersServiceAccount(t *testing.T) {
 	}
 }
 
-// A CR cannot set the store's names through spec.deployment.env in any mode.
+// A CR cannot set the store's names through spec.deployment.env.
 func TestAuditReportStoreEnvIsReserved(t *testing.T) {
-	for _, mode := range []string{"today", "next"} {
-		testAuditReportStoreEnvIsReservedIn(t, mode)
-	}
-}
-
-func testAuditReportStoreEnvIsReservedIn(t *testing.T, mode string) {
-	agent := reportStoreAgent(mode)
+	agent := reportStoreAgent("")
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
 		{Name: auditReportStoreEnabledEnv, Value: "1"},
 		{Name: auditReportStoreAllowedSubjectEnv, Value: "system:serviceaccount:test-ns:attacker"},
@@ -106,18 +105,18 @@ func testAuditReportStoreEnvIsReservedIn(t *testing.T, mode string) {
 				}
 				if e.Value == "/etc" || e.Value == "https://attacker.example" || e.Value == "/tmp/sa" ||
 					e.Value == "http://elsewhere" || e.Value == "/tmp/x" || e.Value == "test-agent-credential-proxy-exec-" ||
-					e.Value == "system:serviceaccount:test-ns:attacker" || (mode == "today" && name == auditReportStoreEnabledEnv) {
-					t.Errorf("mode %s: spec.deployment.env set %s=%q", mode, name, e.Value)
+					e.Value == "system:serviceaccount:test-ns:attacker" {
+					t.Errorf("spec.deployment.env set %s=%q", name, e.Value)
 				}
 			}
 		}
 	}
 }
 
-// The broker carries the store token and address under next only, and the
+// The broker carries the store token and address on every install, and the
 // exec tier derived from it drops both.
 func TestAuditReportStoreBrokerTokenAndExecTierDrop(t *testing.T) {
-	for _, mode := range []string{"today", "next"} {
+	for _, mode := range []string{"", "today", "next"} {
 		agent := reportStoreAgent(mode)
 		broker := buildCredentialProxyDeployment(agent, "hash")
 		spec := broker.Spec.Template.Spec
@@ -129,12 +128,8 @@ func TestAuditReportStoreBrokerTokenAndExecTierDrop(t *testing.T) {
 		}
 		_, hasURL := storeEnvValue(spec.Containers[0].Env, auditReportStoreURLEnv)
 		tokenFile, hasFile := storeEnvValue(spec.Containers[0].Env, auditReportStoreTokenFileEnv)
-		want := mode == "next"
-		if (volume != nil) != want || hasURL != want || hasFile != want {
-			t.Fatalf("mode %s: volume=%v url=%v file=%v, want %v", mode, volume != nil, hasURL, hasFile, want)
-		}
-		if !want {
-			continue
+		if volume == nil || !hasURL || !hasFile {
+			t.Fatalf("mode %q: volume=%v url=%v file=%v, want all", mode, volume != nil, hasURL, hasFile)
 		}
 		token := volume.Projected.Sources[0].ServiceAccountToken
 		if token == nil || token.Audience != auditReportStoreAudience {
@@ -193,44 +188,36 @@ func admits(rule networkingv1.NetworkPolicyIngressRule, protocol corev1.Protocol
 	return false
 }
 
-// Under next the gateway policy carries exactly one more ingress rule than
-// under today, the broker's pods to 8700, and nothing else in it admits that
-// port. Today's ingress is what an operator before this change renders in
-// both modes (its ingress rules did not turn on mode), so the rule is the only
-// thing an older operator's rewrite of the policy changes, and it drops it.
-func TestGatewayNetpolCarriesTheStoreRuleUnderNextOnly(t *testing.T) {
+// The gateway policy carries the store rule, the broker's pods to 8700,
+// exactly once, and nothing else in it admits that port. Without the rule its
+// ingress is what main renders (the goldens' gateway-netpol differs from
+// main's by this rule alone), so an older operator's rewrite of the policy
+// changes nothing but dropping it. spec.networkPolicy.enabled false renders no
+// policy, and so no rule.
+func TestGatewayNetpolCarriesTheStoreRule(t *testing.T) {
 	profile := netpolProfile{Generated: true, OperatorNamespace: "kubeagents-system"}
-	today := buildNetworkPolicy(reportStoreAgent("today"), nil, profile, false, "", false)
-	next := buildNetworkPolicy(reportStoreAgent("next"), nil, profile, false, "", false)
-	want := auditReportStoreIngressRule(reportStoreAgent("next"))
-	var extra []networkingv1.NetworkPolicyIngressRule
-	remaining := append([]networkingv1.NetworkPolicyIngressRule{}, next.Spec.Ingress...)
-	for i, rule := range remaining {
+	agent := reportStoreAgent("")
+	np := buildNetworkPolicy(agent, nil, profile, false, "", false)
+	want := auditReportStoreIngressRule(agent)
+	var count int
+	for _, rule := range np.Spec.Ingress {
 		if reflect.DeepEqual(rule, want) {
-			extra = append(extra, rule)
-			remaining = append(remaining[:i:i], remaining[i+1:]...)
-			break
+			count++
+			continue
 		}
-	}
-	if len(extra) != 1 {
-		t.Fatalf("the next gateway policy does not carry the store rule: %+v", next.Spec.Ingress)
-	}
-	if !reflect.DeepEqual(remaining, today.Spec.Ingress) {
-		t.Errorf("next's ingress differs from today's by more than the store rule:\nnext-minus-rule %+v\ntoday %+v", remaining, today.Spec.Ingress)
-	}
-	for _, rule := range today.Spec.Ingress {
 		if admits(rule, corev1.ProtocolTCP, auditReportStorePort) {
-			t.Errorf("today's gateway policy admits 8700: %+v", rule)
-		}
-	}
-	for _, rule := range next.Spec.Ingress {
-		if admits(rule, corev1.ProtocolTCP, auditReportStorePort) && !reflect.DeepEqual(rule, want) {
 			t.Errorf("a rule other than the broker's admits 8700: %+v", rule)
 		}
 	}
-	broker := credentialProxySelector(reportStoreAgent("next"))
+	if count != 1 {
+		t.Fatalf("the gateway policy carries the store rule %d times, want 1: %+v", count, np.Spec.Ingress)
+	}
+	broker := credentialProxySelector(agent)
 	if got := want.From[0].PodSelector.MatchLabels; !reflect.DeepEqual(got, broker) || len(want.From) != 1 {
 		t.Errorf("the store rule admits %+v, want the broker's pods alone", want.From)
+	}
+	if len(want.Ports) != 1 || want.Ports[0].Port.IntVal != auditReportStorePort {
+		t.Errorf("the store rule admits ports %+v, want %d alone", want.Ports, auditReportStorePort)
 	}
 }
 
@@ -249,58 +236,44 @@ func leftoverStorePolicy(t *testing.T, agent *agentv1alpha1.PlatformAgent) *netw
 	return np
 }
 
-// Under next the reconcile renders the Service and no NetworkPolicy for the
-// store, and deletes the one an earlier build of this change left; under
-// today it deletes the Service too; under skew it touches nothing; and it
-// never deletes a same-named object it does not own.
+// The reconcile renders the Service and no NetworkPolicy for the store,
+// deletes the one an earlier build of this change left, and never deletes a
+// same-named policy it does not own.
 func TestReconcileAuditReportStore(t *testing.T) {
 	ctx := context.Background()
 	key := types.NamespacedName{Namespace: "test-ns", Name: "test-agent-report-store"}
-	for _, tc := range []struct {
-		mode, name  string
-		modeOK      bool
-		wantService bool
-		wantPolicy  bool
-	}{
-		{"next", "next renders the Service and clears the old policy", true, true, false},
-		{"today", "today deletes both", true, false, false},
-		{"later", "skew touches nothing", false, true, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, mode := range []string{"", "today", "next"} {
+		t.Run("mode "+mode, func(t *testing.T) {
 			scheme := setupScheme()
-			owner := reportStoreAgent("next")
-			svc := buildAuditReportStoreService(owner)
-			if err := ctrl.SetControllerReference(owner, svc, scheme); err != nil {
-				t.Fatal(err)
-			}
-			agent := reportStoreAgent(tc.mode)
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, svc, leftoverStorePolicy(t, owner)).
+			agent := reportStoreAgent(mode)
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, leftoverStorePolicy(t, agent)).
 				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-			if err := r.reconcileAuditReportStore(ctx, agent, tc.modeOK); err != nil {
+			if err := r.reconcileAuditReportStore(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
-			if err := cl.Get(ctx, key, &corev1.Service{}); (err == nil) != tc.wantService {
-				t.Errorf("Service present=%v, want %v (%v)", err == nil, tc.wantService, err)
+			svc := &corev1.Service{}
+			if err := cl.Get(ctx, key, svc); err != nil {
+				t.Errorf("Service not rendered: %v", err)
+			} else if !metav1.IsControlledBy(svc, agent) {
+				t.Errorf("Service is not controlled by the agent")
 			}
-			if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); (err == nil) != tc.wantPolicy {
-				t.Errorf("store NetworkPolicy present=%v, want %v (%v)", err == nil, tc.wantPolicy, err)
+			if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); err == nil {
+				t.Errorf("the leftover store NetworkPolicy survived")
 			}
 		})
 	}
 
 	scheme := setupScheme()
+	agent := reportStoreAgent("")
 	foreign := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
-	foreignSvc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign, foreignSvc).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, foreign).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileAuditReportStore(ctx, reportStoreAgent("today"), true); err != nil {
+	if err := r.reconcileAuditReportStore(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); err != nil {
 		t.Errorf("deleted a NetworkPolicy it does not own: %v", err)
-	}
-	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
-		t.Errorf("deleted a Service it does not own: %v", err)
 	}
 }

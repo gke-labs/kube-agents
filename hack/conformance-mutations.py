@@ -2329,7 +2329,7 @@ Mutation(
     ),
     Mutation(
         "C1-report-store-admits-every-pod",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("    - from:\n        - podSelector:\n            matchLabels:\n"
          "              app: platformagent-credential-proxy\n"
          "              kubeagents.x-k8s.io/component: credential-proxy\n"
@@ -2343,7 +2343,7 @@ Mutation(
     ),
     Mutation(
         "C1-report-store-range-takes-in-8700",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      ports:\n        - port: 8700\n          protocol: TCP\n",
          "      ports:\n        - port: 8700\n          protocol: TCP\n"
          "    - ports:\n        - endPort: 65535\n          port: 1\n          protocol: TCP\n"),
@@ -2354,7 +2354,7 @@ Mutation(
     ),
     Mutation(
         "C1-report-store-separate-policy",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n",
          "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n"
          "  name: platformagent-report-store\n  namespace: kubeagents-system\nspec:\n"
@@ -2384,18 +2384,6 @@ Mutation(
         "test_C1_the_report_store_listener_reads_only_reserved_env",
         "let an install point the JWKS fetch at a proxy -- a CR then points it at "
         "a server of its own, hands it the pod's token, and signs broker tokens",
-    ),
-    Mutation(
-        "C1-report-store-renders-under-today",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("---\napiVersion: v1\nkind: Service\n",
-         "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: platformagent-report-store\n"
-         "  namespace: kubeagents-system\nspec:\n  ports:\n    - port: 8700\n"
-         "  selector:\n    app: platformagent-gateway\n"
-         "---\napiVersion: v1\nkind: Service\n"),
-        "test_C1_today_renders_no_audit_report_store",
-        "render the report-store Service in every mode, since it is inert "
-        "without the listener -- until a today pod's port answers on it",
     ),
     Mutation(
         "C1-session-pod-gets-a-second-token",

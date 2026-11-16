@@ -1386,9 +1386,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The audit-report store's Service, under next (audit_report_store.go);
-	// its ingress rule is in the gateway policy above.
-	if err := r.reconcileAuditReportStore(ctx, instance, modeErr == nil); err != nil {
+	// The audit-report store's Service (audit_report_store.go); its ingress
+	// rule is in the gateway policy above.
+	if err := r.reconcileAuditReportStore(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {

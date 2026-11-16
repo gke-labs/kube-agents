@@ -1040,11 +1040,10 @@ class C1IsolationIsStructural(unittest.TestCase):
                         "a peer is admitted to a port other than the metrics listener's",
                     )
 
-    # The audit-report store listener (#5619): its port, the Service and
-    # NetworkPolicy it renders under, and the audience its token is bound to.
+    # The audit-report store listener (#5619): its port and the name of it,
+    # which the Service targets.
     _REPORT_STORE_PORT = 8700
     _REPORT_STORE_PORT_NAME = "report-store"
-    _REPORT_STORE_AUDIENCE = "kubeagents-audit-report-store"
 
     @staticmethod
     def _rule_reaches(rule: dict, port: int, port_name: str) -> bool:
@@ -1067,7 +1066,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         return False
 
     def test_C1_only_the_broker_reaches_the_audit_report_store_listener(self) -> None:
-        """Under next, the store's port on the gateway pod admits the broker's pods alone.
+        """The store's port on the gateway pod admits the broker's pods alone.
 
         The listener reads and writes the fleet-audit report store, which is a
         profile worker's memory of what the last run found. It checks the
@@ -1084,11 +1083,18 @@ class C1IsolationIsStructural(unittest.TestCase):
         and no policy of the store's own is rendered: an operator rollback
         rewrites the gateway policy without the rule, where a separate policy
         would be left behind isolating the pod to the broker alone.
+
+        The store renders with the A2A stack, on every install, so this holds
+        on every golden.
         """
-        documents = h.yaml_documents("golden_next")
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self._assert_only_the_broker_reaches_the_store(documents)
+
+    def _assert_only_the_broker_reaches_the_store(self, documents: tuple[dict, ...]) -> None:
         port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
         services = [s for s in h.objects_of_kind(documents, "Service") if s["metadata"]["name"].endswith("-report-store")]
-        self.assertEqual(len(services), 1, "the next golden renders no report-store Service")
+        self.assertEqual(len(services), 1, "the golden renders no report-store Service")
         selector = services[0]["spec"]["selector"]
         self.assertTrue(selector, "the report-store Service selects every pod")
         # The pod behind the Service: the Hermes gateway, not the A2A gateway.
@@ -1097,7 +1103,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             if selector == {k: d["spec"]["template"]["metadata"]["labels"].get(k) for k in selector}
         ]
         self.assertEqual(
-            [d["metadata"]["name"] for d in gateways], ["platformagent-gateway"],
+            [d["metadata"]["name"] for d in gateways], [services[0]["metadata"]["name"].removesuffix("-report-store") + "-gateway"],
             "the report-store Service does not select the gateway pod alone",
         )
         gateway = gateways[0]
@@ -1114,7 +1120,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             d for d in h.objects_of_kind(documents, "Deployment")
             if d["metadata"]["name"].endswith("-credential-proxy")
         ]
-        self.assertEqual(len(brokers), 1, "the next golden no longer renders one broker Deployment")
+        self.assertEqual(len(brokers), 1, "the golden no longer renders one broker Deployment")
         broker_labels = brokers[0]["spec"]["template"]["metadata"]["labels"]
         broker_selector = {
             "app": brokers[0]["metadata"]["name"],
@@ -1139,7 +1145,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                     reaching.append((policy["metadata"]["name"], rule.get("from")))
         self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
         self.assertEqual(
-            {name for name, _ in reaching}, {"platformagent-gateway-netpol"},
+            {name for name, _ in reaching}, {gateway["metadata"]["name"] + "-netpol"},
             "the store's rule is not in the gateway policy",
         )
         self.assertEqual(
@@ -1201,39 +1207,6 @@ class C1IsolationIsStructural(unittest.TestCase):
         for name in ("FLEET_AUDIT_REPORTS_DIR", "AUDIT_REPORT_STORE_API_SERVER", "AUDIT_REPORT_STORE_SA_DIR"):
             self.assertNotIn(name, read, f"the listener takes {name} from the environment")
             self.assertIn(name, reserved, f"{name} is not reserved, so an image that read it would let a CR set it")
-
-    def test_C1_today_renders_no_audit_report_store(self) -> None:
-        """Under today the listener, its Service, its policy and its token are absent.
-
-        The store listener is next-mode only. A today install that rendered its
-        port, switch or token would run a listener nothing fences, and a
-        today install with the Service would publish the gateway pod on a port
-        its policy does not expect.
-        """
-        for fixture, documents in h.golden_documents().items():
-            with self.subTest(fixture=fixture):
-                named = [
-                    (d["kind"], d["metadata"]["name"]) for d in documents
-                    if d.get("kind") in ("Service", "NetworkPolicy")
-                    and d["metadata"]["name"].endswith("-report-store")
-                ]
-                self.assertEqual(named, [], "a today golden renders the report store's objects")
-                for workload in h.objects_of_kind(documents, "Deployment"):
-                    spec = workload["spec"]["template"]["spec"]
-                    audiences = {
-                        (source.get("serviceAccountToken") or {}).get("audience")
-                        for v in spec.get("volumes", [])
-                        for source in (v.get("projected") or {}).get("sources", [])
-                    }
-                    self.assertNotIn(self._REPORT_STORE_AUDIENCE, audiences, workload["metadata"]["name"])
-                    for container in h.containers_of(workload):
-                        ports = {(p.get("name"), p.get("containerPort")) for p in container.get("ports") or []}
-                        self.assertFalse(
-                            {p for p in ports if self._REPORT_STORE_PORT_NAME in p or self._REPORT_STORE_PORT in p},
-                            "%s/%s declares the store's port" % (workload["metadata"]["name"], container["name"]),
-                        )
-                        env = [e["name"] for e in container.get("env") or [] if e["name"].startswith("AUDIT_REPORT_STORE_")]
-                        self.assertEqual(env, [], "%s/%s" % (workload["metadata"]["name"], container["name"]))
 
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
