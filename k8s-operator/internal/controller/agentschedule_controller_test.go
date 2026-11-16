@@ -724,6 +724,17 @@ func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
 			t.Fatalf("post_failed: want it recorded and counted once; status = %+v", s.Status)
 		}
 	})
+	t.Run("post_unknown counts apart", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPostUnknown)
+		f.at(t, hourAt(1, 21))
+		f.at(t, hourAt(1, 22))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPostUnknown || s.Status.PostUnknown != 1 || s.Status.PostFailed != 0 {
+			t.Fatalf("status = %+v", s.Status)
+		}
+	})
 	t.Run("unknown, then past the window", func(t *testing.T) {
 		f := newScheduleFixture(t, nil)
 		f.at(t, hourAt(0, 45))

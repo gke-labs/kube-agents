@@ -57,12 +57,13 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `skipCounts.gatewayUnavailable` | `integer` | yes |  |  | GatewayUnavailable: the gateway did not accept the run within the starting deadline. |
 | `skipCounts.rateLimited` | `integer` | yes |  |  | RateLimited: the gateway refused the run under the trigger's cap. |
 | `postFailed` | `integer` | no |  |  | PostFailed counts runs whose report the gateway couldn't post to chat after its redeliveries (Delivery post_failed). |
+| `postUnknown` | `integer` | no |  |  | PostUnknown counts runs whose report post started or timed out with no outcome (Delivery post_unknown): it may be in the channel, and the gateway never posts it again. |
 | `recentRuns` | `[]object` | no |  | max items `10` | RecentRuns are the last ten runs, newest first. |
 | `recentRuns[].taskID` | `string` | yes |  |  | TaskID is the run's task. |
 | `recentRuns[].slotTime` | `metav1.Time` | yes |  |  | SlotTime is the slot it ran for. |
 | `recentRuns[].completionTime` | `metav1.Time` | no |  |  | CompletionTime is when it ended. |
 | `recentRuns[].outcome` | `string` | yes |  |  | Outcome is how it ended. |
-| `recentRuns[].delivery` | `string` | no |  | one of `no_delivery`, `local`, `silent`, `stored_no_home`, `posted`, `post_failed` | Delivery is how its report was delivered, once that is final: posted, stored for want of a home channel, kept local, silent when clean, not delivered, or post_failed when the gateway gave up posting it. Empty until the gateway reports a final value, and on a run it never does. |
+| `recentRuns[].delivery` | `string` | no |  | one of `no_delivery`, `local`, `silent`, `stored_no_home`, `posted`, `post_failed`, `post_unknown` | Delivery is how its report was delivered, once that is final: posted, stored for want of a home channel, kept local, silent when clean, not delivered, post_failed when the gateway gave up posting it, or post_unknown when a post started or timed out with no outcome, so it may be in the channel and is never retried. Empty until the gateway reports a final value, and on a run it never does. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions are the latest observations of the schedule. |
 
 <!-- prettier-ignore-end -->

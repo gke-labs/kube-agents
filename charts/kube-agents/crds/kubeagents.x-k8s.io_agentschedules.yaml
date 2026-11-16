@@ -316,6 +316,13 @@ spec:
                     after its redeliveries (Delivery post_failed).
                   format: int64
                   type: integer
+                postUnknown:
+                  description: |-
+                    PostUnknown counts runs whose report post started or timed out with no
+                    outcome (Delivery post_unknown): it may be in the channel, and the
+                    gateway never posts it again.
+                  format: int64
+                  type: integer
                 recentRuns:
                   description: RecentRuns are the last ten runs, newest first.
                   items:
@@ -329,8 +336,10 @@ spec:
                         description: |-
                           Delivery is how its report was delivered, once that is final: posted,
                           stored for want of a home channel, kept local, silent when clean, not
-                          delivered, or post_failed when the gateway gave up posting it. Empty
-                          until the gateway reports a final value, and on a run it never does.
+                          delivered, post_failed when the gateway gave up posting it, or
+                          post_unknown when a post started or timed out with no outcome, so it
+                          may be in the channel and is never retried. Empty until the gateway
+                          reports a final value, and on a run it never does.
                         enum:
                           - no_delivery
                           - local
@@ -338,6 +347,7 @@ spec:
                           - stored_no_home
                           - posted
                           - post_failed
+                          - post_unknown
                         type: string
                       outcome:
                         description: Outcome is how it ended.

@@ -68,6 +68,7 @@ const (
 	AgentScheduleReportPosting      = "posting"
 	AgentScheduleReportPosted       = "posted"
 	AgentScheduleReportPostFailed   = "post_failed"
+	AgentScheduleReportPostUnknown  = "post_unknown"
 )
 
 // AgentScheduleProfileRef names the AgentProfile a schedule's runs go to.
@@ -221,9 +222,11 @@ type AgentScheduleRun struct {
 	Outcome string `json:"outcome"`
 	// Delivery is how its report was delivered, once that is final: posted,
 	// stored for want of a home channel, kept local, silent when clean, not
-	// delivered, or post_failed when the gateway gave up posting it. Empty
-	// until the gateway reports a final value, and on a run it never does.
-	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed
+	// delivered, post_failed when the gateway gave up posting it, or
+	// post_unknown when a post started or timed out with no outcome, so it
+	// may be in the channel and is never retried. Empty until the gateway
+	// reports a final value, and on a run it never does.
+	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed;post_unknown
 	// +optional
 	Delivery string `json:"delivery,omitempty"`
 }
@@ -273,6 +276,11 @@ type AgentScheduleStatus struct {
 	// after its redeliveries (Delivery post_failed).
 	// +optional
 	PostFailed int64 `json:"postFailed,omitempty"`
+	// PostUnknown counts runs whose report post started or timed out with no
+	// outcome (Delivery post_unknown): it may be in the channel, and the
+	// gateway never posts it again.
+	// +optional
+	PostUnknown int64 `json:"postUnknown,omitempty"`
 	// RecentRuns are the last ten runs, newest first.
 	// +kubebuilder:validation:MaxItems=10
 	// +optional

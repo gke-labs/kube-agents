@@ -315,7 +315,8 @@ type TriggerStatusReply struct {
 	Refused *TriggerRefusal `json:"refused,omitempty"`
 	// Delivery is how the run's report was delivered, from the gateway's
 	// scheduled-reports store: no_delivery, local, silent, stored_no_home,
-	// posting (still in flight), posted or post_failed. Omitted while there
+	// posting (still in flight), posted, post_failed or post_unknown (a post
+	// started or timed out with no outcome, never retried). Omitted while there
 	// is no record. The reconciler keeps asking while it reads posting.
 	Delivery string `json:"delivery,omitempty"`
 }

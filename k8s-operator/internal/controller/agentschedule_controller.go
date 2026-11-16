@@ -513,20 +513,24 @@ func (r *AgentScheduleReconciler) trackDeliveries(ctx context.Context, sched *ag
 }
 
 // recordDelivery stores delivery on taskID's run when it is final and one the
-// status's enum admits, once, counting post_failed. posting, empty or an
+// status's enum admits, once, counting post_failed and post_unknown. posting, empty or an
 // unknown spelling leaves the run as it was.
 func recordDelivery(st *agentv1alpha1.AgentScheduleStatus, taskID, delivery string) {
 	switch delivery {
 	case agentv1alpha1.AgentScheduleReportNone, agentv1alpha1.AgentScheduleReportLocal, agentv1alpha1.AgentScheduleReportSilent,
-		agentv1alpha1.AgentScheduleReportStoredNoHome, agentv1alpha1.AgentScheduleReportPosted, agentv1alpha1.AgentScheduleReportPostFailed:
+		agentv1alpha1.AgentScheduleReportStoredNoHome, agentv1alpha1.AgentScheduleReportPosted, agentv1alpha1.AgentScheduleReportPostFailed,
+		agentv1alpha1.AgentScheduleReportPostUnknown:
 	default:
 		return
 	}
 	for i := range st.RecentRuns {
 		if st.RecentRuns[i].TaskID == taskID && st.RecentRuns[i].Delivery == "" {
 			st.RecentRuns[i].Delivery = delivery
-			if delivery == agentv1alpha1.AgentScheduleReportPostFailed {
+			switch delivery {
+			case agentv1alpha1.AgentScheduleReportPostFailed:
 				st.PostFailed++
+			case agentv1alpha1.AgentScheduleReportPostUnknown:
+				st.PostUnknown++
 			}
 		}
 	}
