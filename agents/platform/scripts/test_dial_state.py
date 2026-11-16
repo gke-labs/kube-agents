@@ -334,6 +334,15 @@ class ReporterTest(DialCase):
             REAL_RUN_SWITCH(["python3", "x"], 5)
         self.assertEqual(calls, [{"timeout": 5, "remote_env": {"KUBE_AGENTS_VCS_ROOT": "/home/hermes/kube-agents-vcs"}}])
 
+    def test_the_reporter_starts_while_the_switch_is_off(self):
+        started = []
+        fake = mock.Mock(side_effect=lambda **kw: mock.Mock(start=lambda: started.append(kw["name"])))
+        with mock.patch.object(dial_state, "enabled", lambda: False), \
+                mock.patch.object(dial_state, "_reporter_started", False), \
+                mock.patch.object(dial_state.threading, "Thread", fake):
+            dial_state.start_reporter()
+        self.assertEqual(started, ["dial-report"])
+
     def test_the_recorded_level_or_the_default_is_reported(self):
         self.assertTrue(dial_state.report_recorded())
         self.act("dial.level", level="explain")

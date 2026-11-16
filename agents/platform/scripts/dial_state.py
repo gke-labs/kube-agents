@@ -392,14 +392,16 @@ def report_recorded() -> bool:
 
 
 def start_reporter() -> None:
-    """Report the level now and every minute while the switch is on, once per process.
+    """Report the level every minute while the switch is on, once per process.
 
     The broker treats an install that has not reported as Explain, and loses
     what it heard when its pod restarts; this keeps it on the dial's level.
+    The thread starts whatever the switch says and reads it each minute, so
+    turning the dial on later needs no restart.
     """
     global _reporter_started
     with _check_lock:
-        if _reporter_started or not enabled():
+        if _reporter_started:
             return
         _reporter_started = True
 
