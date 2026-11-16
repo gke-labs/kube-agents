@@ -80,8 +80,8 @@ func TestTerminalNoticeCarriesNoToken(t *testing.T) {
 		{"rejected with plain text", lib.StateRejected, "no capability", "🚫 the executor rejected the task: no capability"},
 		{"rejected with nothing", lib.StateRejected, "", "🚫 the executor rejected the task"},
 		{"canceled ignores the reason", lib.StateCanceled, "reason: canceled-by-request", "🛑 canceled"},
-		{"canceled ignores a known sentence the requester didn't cause", lib.StateCanceled, "reason: tier-withdrawn", "🛑 canceled"},
-		{"canceled by an ended tier says so (#5850)", lib.StateCanceled, "reason: tier-ended - profile tse's tier oncall was ended by end-tier-drain",
+		{"canceled ignores a sentence outside canceledReasonShown", lib.StateCanceled, "reason: tier-withdrawn", "🛑 canceled"},
+		{"canceled by an ended tier says so (#5850)", lib.StateCanceled, "reason: tier-ended - an administrator ended tier oncall's drain on profile tse",
 			"🛑 canceled — " + reasonSentences["tier-ended"]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

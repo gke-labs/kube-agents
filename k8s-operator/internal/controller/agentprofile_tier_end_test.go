@@ -315,28 +315,56 @@ func TestTheProfilePassComesBackSoonWhileTheLeverIsSet(t *testing.T) {
 
 // The AgentProfile pass, which tears a tier's ServiceAccounts and durables
 // down, comes back just after its profile's earliest drain end rather than at
-// the 5-minute resync: an ended drain is minutes long, not hours.
+// the 5-minute resync: an ended drain is minutes long, not hours. A profile
+// with no drain, or one whose drain has passed, comes back at the resync: a
+// past end mustn't become a loop.
 func TestTheProfilePassComesBackAtItsDrainEnd(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	cat := catalogWith(map[string]string{"oncall": tierModeInteractive})
-	oncall := &agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: "oncall", Namespace: agent.Namespace}, Spec: agentv1alpha1.TierSpec{Mode: tierModeInteractive}}
-	was := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "oncall"} })
-	cm := appliedConfig(t, agent, cat, func(c *a2aDispatchConfig) {
-		for i := range c.Profiles {
-			c.Profiles[i].Tiers = []string{"read"}
-			c.Profiles[i].DrainingTiers = []a2aDrainingTier{{Tier: "oncall", Mode: tierModeInteractive, Until: time.Now().Add(90 * time.Second), Ending: true}}
-		}
-	}, &was)
-	is := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
-	ownSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
-		Name: "agentprofile-tse-oncall", Namespace: profileNamespaceName(agent),
-		Labels:      map[string]string{agentProfileNameLabel: "tse", agentProfileTierLabel: "oncall", agentProfileTierModeLabel: tierModeInteractive},
-		Annotations: map[string]string{agentProfileUIDAnnotation: string(is.UID)},
-	}}
-	h := newProfileHarness(t, agent, &is, oncall, cm, ownSA)
-	res := h.reconcile(agent.Namespace, "tse")
-	if res.RequeueAfter < 60*time.Second || res.RequeueAfter > 95*time.Second {
-		t.Errorf("RequeueAfter %s with a drain ending in 90s, want about 90s", res.RequeueAfter)
+	type drain struct {
+		tier string
+		in   time.Duration
+	}
+	for _, tc := range []struct {
+		name     string
+		drains   []drain
+		min, max time.Duration
+	}{
+		{"one drain ending in 90s", []drain{{"oncall", 90 * time.Second}}, 60 * time.Second, 95 * time.Second},
+		{"the earliest of two drains", []drain{{"oncall", 90 * time.Second}, {"night", 30 * time.Minute}}, 60 * time.Second, 95 * time.Second},
+		{"no drain: the resync", nil, agentProfileResync, agentProfileResync},
+		{"a drain already past its end: the resync", []drain{{"oncall", -time.Minute}}, agentProfileResync, agentProfileResync},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withOperatorBusPrincipal(t)
+			agent := a2aTestAgent()
+			cat := catalogWith(map[string]string{"oncall": tierModeInteractive, "night": tierModeInteractive})
+			objs := []client.Object{}
+			for _, name := range []string{"oncall", "night"} {
+				objs = append(objs, &agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}, Spec: agentv1alpha1.TierSpec{Mode: tierModeInteractive}})
+			}
+			was := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "oncall", "night"} })
+			cm := appliedConfig(t, agent, cat, func(c *a2aDispatchConfig) {
+				for i := range c.Profiles {
+					c.Profiles[i].Tiers = []string{"read"}
+					c.Profiles[i].DrainingTiers = nil
+					for _, d := range tc.drains {
+						c.Profiles[i].DrainingTiers = append(c.Profiles[i].DrainingTiers, a2aDrainingTier{Tier: d.tier, Mode: tierModeInteractive, Until: time.Now().Add(d.in), Ending: true})
+					}
+				}
+			}, &was)
+			is := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
+			for _, d := range tc.drains {
+				// The tier's own ServiceAccount, which a drain requires.
+				objs = append(objs, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+					Name: "agentprofile-tse-" + d.tier, Namespace: profileNamespaceName(agent),
+					Labels:      map[string]string{agentProfileNameLabel: "tse", agentProfileTierLabel: d.tier, agentProfileTierModeLabel: tierModeInteractive},
+					Annotations: map[string]string{agentProfileUIDAnnotation: string(is.UID)},
+				}})
+			}
+			h := newProfileHarness(t, append([]client.Object{agent, &is, cm}, objs...)...)
+			res := h.reconcile(agent.Namespace, "tse")
+			if res.RequeueAfter < tc.min || res.RequeueAfter > tc.max {
+				t.Errorf("RequeueAfter %s, want between %s and %s", res.RequeueAfter, tc.min, tc.max)
+			}
+		})
 	}
 }
