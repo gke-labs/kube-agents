@@ -93,7 +93,20 @@ The credential proxy and the shell grow with the fleet: their peaks roughly doub
 
 S's record predates the per-capability split for most audits: the empty cells were summed into an "Other" row of 7.6 M.
 
-The first-run flow dominates and varies from run to run. At M, one Cluster Agent session on `sized-m-03` made 500 model calls in 31 minutes and used 62 M tokens. It wrote about 230 scripts that printed nothing, until the turn limit stopped it. Without that session, M's Cluster Agents used about 7.6 M a cluster; L's used 2.2 M a cluster. One run of each size does not show a trend.
+L used fewer tokens than M, on twice the clusters, for two reasons.
+
+The first reason is a cap. The first-run flow gives a Cluster Agent inventory card to the first 6 clusters by name only (`FIRST_RUN_CLUSTER_CARDS = 6` in `agents/chat/scripts/bootstrap_handoff.py`: the board's worker concurrency, so the cards finish in one wave). A sweep in the Platform Agent covers every other cluster at a smaller cost. So M and L each had 6 Cluster Agent cards. L's other 10 clusters added about 2 M tokens of sweep work, and M's other 2 clusters less.
+
+The second reason is variance at M. One Cluster Agent session on `sized-m-03` made 500 model calls in 31 minutes and used 62 M tokens. It wrote about 230 scripts that printed nothing, until the turn limit stopped it. M's other 5 inventory cards used about 12 M each; L's 6 used about 6 M each, for the same work on the same model. One run of each size cannot separate the size from chance.
+
+|                                                               |                                            M |          L |
+| ------------------------------------------------------------- | -------------------------------------------: | ---------: |
+| Clusters                                                      |                                            8 |         16 |
+| Clusters with a Cluster Agent inventory card                  |                                            6 |          6 |
+| Clusters the sweep covered                                    |                                            2 |         10 |
+| The 6 Cluster Agent cards                                     | 123.3 M, the looping session's 62 M included |     35.7 M |
+| The first-run flow's Platform Agent share, the sweep included |                                        6.3 M |      8.3 M |
+| The 10 audits                                                 |                                   about 15 M | about 22 M |
 
 ## Proof: the session records against the model's own counters
 
