@@ -858,7 +858,7 @@ session, or a task that ended without its terminal reaching the bus, ends the pr
 waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the
 next turn starts cold with the primer.
 
-**Reap.** Idle TTL since the last user message (30 minutes, config-backed). The record's
+**Reap.** Idle TTL since the last user message (30 minutes, config-backed; `spec.harness.tuning.sessionIdleMinutes`). A single-turn DM, a `dm` conversation whose current pod has taken at most one human turn (a delegation's wake is not one), is reaped at the shorter DM idle TTL instead (5 minutes, `dmSessionIdleMinutes`, never longer than the idle TTL; #2371): under sessions by default most DMs are one question, and each would otherwise hold a pod and a cap slot for the full TTL after its answer. The record's
 `lastUserMessage` is the clock: every verified turn moves it, and the answer to that turn does
 not. Reaping is deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
@@ -3285,7 +3285,7 @@ Calls for [@bnaylor]:
 
 - ~~**Payload spec amendment.**~~ Ratified 8/24; the payload spec has carried it since
   0.3.
-- ~~**Idle TTL.**~~ Decided 8/24: 30 minutes, config-backed.
+- ~~**Idle TTL.**~~ Decided 8/24: 30 minutes, config-backed. Amended 11/16 (#2371): 5 minutes for a single-turn DM, also config-backed.
 - ~~**Rehydration horizon.**~~ Decided 8/24: retention is the horizon. The compacted
   transcript topic stays the named fix if real users disagree.
 - ~~**Discord test tenancy.**~~ Decided 8/24: I own the test server; the bot token is a

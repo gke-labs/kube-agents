@@ -316,6 +316,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String(),
+		"dmIdleTTL", cfg.DMIdleTTL.String(),
 		"elected", cfg.Elected())
 	if !cfg.Elected() {
 		return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {

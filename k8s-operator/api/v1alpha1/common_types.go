@@ -1089,6 +1089,31 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// SessionIdleMinutes is how long a session pod is kept after the last
+	// message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+	// A running task always keeps its pod, and the next message after a reap
+	// gets a new pod with the conversation's history. Unset, the gateway's
+	// default of 30 applies. It also bounds how long a Slack thread stays live
+	// without a fresh mention after its last task. A session pod also ends at
+	// its 4-hour maximum lifetime, so above 240 the value only lengthens that
+	// Slack thread liveness.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	SessionIdleMinutes *int32 `json:"sessionIdleMinutes,omitempty"`
+
+	// DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+	// with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+	// question, and a session pod held for the full idle time after its answer
+	// takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+	// count as a message. A second message puts the conversation back
+	// on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+	// value above SessionIdleMinutes has no effect beyond it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	DMSessionIdleMinutes *int32 `json:"dmSessionIdleMinutes,omitempty"`
+
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node

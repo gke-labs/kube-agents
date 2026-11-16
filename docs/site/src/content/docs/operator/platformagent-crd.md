@@ -444,9 +444,9 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, the session pods' idle times `sessionIdleMinutes` and `dmSessionIdleMinutes`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+`maxSessions` renders `10`, the gateway reaps an idle session pod after 30 minutes (5 for a DM conversation with one message so far), `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

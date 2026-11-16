@@ -1376,6 +1376,16 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "sessionIdleMinutes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10080
+                },
+                "dmSessionIdleMinutes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10080
+                },
                 "busReplicas": {
                   "type": "integer",
                   "enum": [1, 3]
