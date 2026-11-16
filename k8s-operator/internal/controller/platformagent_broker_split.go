@@ -261,6 +261,9 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if scopePublisherMayRun(agent, owned.scope) {
 		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
+	if a2aCuratorEnabled() {
+		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
 }
 

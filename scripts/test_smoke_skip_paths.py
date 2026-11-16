@@ -304,6 +304,11 @@ class SkipListTest(unittest.TestCase):
 
 
 class ProwCopyTest(unittest.TestCase):
+    """Needs the network, on purpose: Prow's copy of the skip pattern lives in another repository
+    (PROW_YAML_URL), and only the live file shows that the two copies are still equal. The read is
+    one anonymous GET. Where the file cannot be read (the host is unreachable, or it answers with
+    an error) the test is skipped, with the reason."""
+
     def test_prow_skips_the_same_paths(self):
         try:
             with urllib.request.urlopen(PROW_YAML_URL, timeout=20) as response:

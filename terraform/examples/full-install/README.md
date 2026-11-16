@@ -61,12 +61,6 @@ install without the interview.
   `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
   the gateway spends per period, and `install.sh` sets it from
   `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
-  `platform_agent_mode` (default `"today"`, which passes the
-  chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
-  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
-  which a first install records as `"next"`. Changing it on a running install is a mode switch
-  ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
   `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
   so the CR carries no `storage` field) sets the `PlatformAgent`'s
   `spec.storage.size`, the size of the agent's data volume and the shell
@@ -567,7 +561,7 @@ agent Deployment and shell sandbox StatefulSet the operator resolves at reconcil
 time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
 [chart README](../../../charts/kube-agents/README.md) explains how.
 Add `third_party_image_registry` to mirror third-party images (cert-manager,
-LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight); empty leaves them on
 their upstream registries.
 
 `IMAGE_TAG` is not optional here. The first-party images take whatever tag
@@ -1078,9 +1072,9 @@ leaves the ingress running, still exporting and still billing.
   (if it stays blank, Chat silently delivers no events). That address is the
   Workspace Add-ons service agent,
   `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
-  the agent's own GSA. Then DM the bot; on
-  first contact, optionally approve the pairing code via
-  `hermes pairing approve google_chat <CODE>` in the gateway pod.
+  the agent's own GSA. Then DM the bot. The A2A gateway has no pairing: it
+  answers the addresses in `google_chat_allowed_users`, or everyone the app is
+  visible to when that list is empty.
 - **Slack:** create the Slack app and its tokens as the site's Slack app setup
   page describes (`docs/site/src/content/docs/install/slack-app.md`), pass the
   tokens as `slack_bot_token` / `slack_app_token`, and set

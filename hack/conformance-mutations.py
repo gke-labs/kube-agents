@@ -87,8 +87,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-reaches-vcs",
         "agents/platform/scripts/credential_proxy.py",
-        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
-         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_CURATOR)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_CURATOR, CALLER_ROLE_PROFILE)),\n'),
         "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
         "let a profile worker read a proposal the way the MCP pod does -- a "
         "forge read no task target confines",
@@ -1443,6 +1443,18 @@ Mutation(
         "loopback sentinel got there in the first place",
     ),
     Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -2465,12 +2477,41 @@ Mutation(
     Mutation(
         "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "drop the gateway's call to lib.ValidateDelegateRequest: an "
         "over-length text, or a malformed batch, that reached the bus without "
         "the adapter would then be minted, and the gateway's line of defence "
         "is gone (#5682 moved the cap check into the shared validator)",
+    ),
+    Mutation(
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
+    ),
+    Mutation(
+        "C1-delegate-gateway-validates-only-some-requests",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "condition the gateway's validator call so it guards only batches: "
+        "the call still appears, but a single over-length task that reached "
+        "the bus without the adapter is minted",
     ),
     Mutation(
         "C1-delegate-validator-cap-hand-spelled",
@@ -2493,11 +2534,63 @@ Mutation(
     Mutation(
         "C1-delegate-validator-skips-batch-entries",
         "a2a/lib/payload.go",
-        ("validateDelegateText(e.Text)", "validateDelegateText(r.Text)"),
+        ("validateDelegateText(e.Text)", "error(nil)"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "cap the request's top-level text inside the batch loop instead of "
-        "each entry's: every batch entry then goes uncapped, through the "
-        "adapter and the gateway alike",
+        "stop checking each batch entry's text in lib's shared validator: the "
+        "gateway then mints a batch entry of any length that reached the bus "
+        "without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-batch-entries",
+        "a2a/worker-adapter/delegate.go",
+        ('if why := validateDelegate(lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}); why != "" {',
+         'if why := ""; why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating each batch entry in the worker-adapter's "
+        "validateDelegateFor: the adapter then publishes a batch whose "
+        "entries it never capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-checks-the-wrong-batch-text",
+        "a2a/worker-adapter/delegate.go",
+        ("Text: e.Text, Parameters: e.Parameters}); why", 'Text: "ok", Parameters: e.Parameters}); why'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "validate each batch entry with a fixed text instead of its own: the "
+        "per-entry call still runs, but no entry's real text is capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-batch-refusal-neutered",
+        "a2a/worker-adapter/delegate.go",
+        ('Parameters: e.Parameters}); why != "" {', 'Parameters: e.Parameters}); false {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the per-entry validateDelegate call but never act on its answer: "
+        "the call is still there, and every batch entry is published unchecked",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-refusal-neutered",
+        "a2a/worker-adapter/adapter.go",
+        ('validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'validateDelegateFor(ask.req, a.delegateWidth); false && why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the adapter's validateDelegateFor call but never refuse on it: "
+        "an over-length request is published to the bus",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-check-commented-out",
+        "a2a/worker-adapter/adapter.go",
+        ('if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'if why := ""; why != "" { // validateDelegateFor(ask.req, a.delegateWidth)'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "drop the adapter's check and leave its call in a comment on the same "
+        "line: only a pin that reads code without comments sees it gone",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-the-single-request",
+        "a2a/worker-adapter/delegate.go",
+        ("\t\treturn validateDelegate(req)\n", "\t\treturn \"\"\n"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating a single (non-batch) request in the worker-adapter's "
+        "entry point: validateDelegate then guards nothing the adapter publishes",
     ),
     Mutation(
         "C1-delegate-validator-skips-the-single-text",

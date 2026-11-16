@@ -80,6 +80,20 @@ const (
 	a2aCuratorMemoryLimit   = "256Mi"
 
 	a2aCuratorFenceIndex = 2
+
+	// credentialProxyCuratorAudience is the curator pod's audience for
+	// calling POST /v1/vcs/snapshot on credential-proxy.
+	credentialProxyCuratorAudience       = "kubeagents-credential-proxy-curator" // #nosec G101 -- Token audience name, not a credential
+	credentialProxyCuratorAudienceEnvVar = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"   // #nosec G101 -- Env var name, not a credential
+	credentialProxyCuratorCallersEnvVar  = "CREDENTIAL_PROXY_CURATOR_CALLERS"    // #nosec G101 -- Env var name, not a credential
+
+	a2aCuratorBrokerTokenVolume   = "curator-broker-token"                         // #nosec G101 -- Volume name, not a credential
+	a2aCuratorBrokerTokenMountDir = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- Mount path, not a credential
+	a2aCuratorBrokerTokenKey      = "token"                                        // #nosec G101 -- Projected file name, not a credential
+	a2aCuratorBrokerTokenTTL      = 3600
+
+	a2aCuratorBrokerURLEnvVar       = "CREDENTIAL_PROXY_URL"
+	a2aCuratorBrokerTokenFileEnvVar = "CREDENTIAL_PROXY_TOKEN_FILE" // #nosec G101 -- Env var name, not a credential
 )
 
 // a2aCuratorGoMemLimit returns 85 percent of the curator memory limit in bytes.
@@ -117,6 +131,32 @@ func a2aCuratorNATSPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.Netw
 	return []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
 		MatchLabels: a2aCuratorPodSelector(agent),
 	}}}
+}
+
+// a2aCuratorBrokerCaller returns the TokenReview username for the curator pod's ServiceAccount.
+func a2aCuratorBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aCuratorName(agent))
+}
+
+// a2aCuratorBrokerPeers returns the curator pod peer for credential-proxy ingress when A2A_CURATOR is enabled.
+func a2aCuratorBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	if !a2aCuratorEnabled() {
+		return nil
+	}
+	return []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
+		MatchLabels: a2aCuratorPodSelector(agent),
+	}}}
+}
+
+// a2aCuratorBrokerEnv returns the credential-proxy environment variables conferring the curator role when A2A_CURATOR is enabled.
+func a2aCuratorBrokerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if !a2aCuratorEnabled() {
+		return nil
+	}
+	return []corev1.EnvVar{
+		{Name: credentialProxyCuratorAudienceEnvVar, Value: credentialProxyCuratorAudience},
+		{Name: credentialProxyCuratorCallersEnvVar, Value: a2aCuratorBrokerCaller(agent)},
+	}
 }
 
 // buildA2ACuratorServiceAccount builds the dedicated ServiceAccount for the
@@ -173,6 +213,17 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						a2aBusTokenVolumeSource(),
 						a2aNATSCABundleVolume(agent),
 						{
+							Name: a2aCuratorBrokerTokenVolume,
+							VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+								DefaultMode: ptr.To(int32(0400)),
+								Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+									Audience:          credentialProxyCuratorAudience,
+									ExpirationSeconds: ptr.To(int64(a2aCuratorBrokerTokenTTL)),
+									Path:              a2aCuratorBrokerTokenKey,
+								}}},
+							}},
+						},
+						{
 							Name: a2aCuratorStateVolume,
 							VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 								SizeLimit: ptr.To(resource.MustParse(a2aCuratorStateSizeLimit)),
@@ -190,6 +241,8 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: a2aBusUserEnv, Value: a2aCuratorUser},
 							{Name: "CURATOR_STATUS_LISTEN", Value: fmt.Sprintf(":%d", a2aCuratorStatusPort)},
 							{Name: "CURATOR_REPO_DIR", Value: a2aCuratorRepoDir},
+							{Name: a2aCuratorBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+							{Name: a2aCuratorBrokerTokenFileEnvVar, Value: a2aCuratorBrokerTokenMountDir + "/" + a2aCuratorBrokerTokenKey},
 							{Name: "HINDSIGHT_API_URL", Value: fmt.Sprintf("http://hindsight-api.%s.svc.cluster.local:%d", agent.Namespace, a2aCuratorHindsightPort)},
 							{Name: "LITELLM_BASE_URL", Value: fmt.Sprintf("http://inference-gateway.%s.svc.cluster.local/v1", agent.Namespace)},
 							{Name: a2aCuratorEnvGoMemLimit, Value: a2aCuratorGoMemLimit()},
@@ -198,6 +251,7 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						VolumeMounts: []corev1.VolumeMount{
 							a2aBusTokenVolumeMount(),
 							a2aNATSCABundleMount(),
+							{Name: a2aCuratorBrokerTokenVolume, MountPath: a2aCuratorBrokerTokenMountDir, ReadOnly: true},
 							{Name: a2aCuratorStateVolume, MountPath: a2aCuratorStateMountPath},
 						},
 						StartupProbe:    probe(a2aCuratorHealthPath, a2aCuratorStartupPeriod, a2aCuratorStartupFailure),
@@ -259,6 +313,12 @@ func buildA2ACuratorNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 					"app.kubernetes.io/name":      "hindsight",
 					"app.kubernetes.io/component": "api",
 				}),
+			},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
 			},
 		},
 	}

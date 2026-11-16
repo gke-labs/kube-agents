@@ -30,12 +30,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from command_policy import Decision
+import credential_proxy_client
 
 # The one method this version relays. The reads that are POST -- Logging
 # `entries:list`, Monitoring `timeSeries:query` for MQL -- carry a body the
 # policy would have to inspect, and a body cap plus a schema per entry is a
 # second design (`gcp-api-relay.md`, "The decision").
 API_READ_METHOD = "GET"
+DEFAULT_UNIVERSE_DOMAIN = credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
 
 # Rule ids, in the order `evaluate` answers. Each names one line of the
 # security argument, and the audit line and the 403 carry them verbatim.
@@ -71,7 +73,7 @@ REFUSED_HOSTS = frozenset(
 # constrain *which* project; the `gcloud` allowlist takes the same position and
 # its comment says why. IAM bounds the project set, this table bounds the
 # operation.
-PROJECT = r"(?:[a-z][a-z0-9-]{4,28}[a-z0-9]|[1-9][0-9]{0,18})"
+PROJECT = r"(?:(?:[a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]|[1-9][0-9]{0,18})"
 
 # A Cloud Trace v1 trace id as the API returns it: a 128-bit value as 32
 # lower-case hex characters. Constraining the segment is what keeps the
@@ -80,12 +82,12 @@ PROJECT = r"(?:[a-z][a-z0-9-]{4,28}[a-z0-9]|[1-9][0-9]{0,18})"
 TRACE_ID = r"[0-9a-f]{32}"
 
 # A GKE location as the API takes it: `-` (every location, the list's wildcard), a
-# region (`us-central1`) or a zone (`us-central1-a`). A cluster name as GKE allows
+# region (`us-central1` or sovereign `u-region-north1`) or a zone (`us-central1-a`). A cluster name as GKE allows
 # it: lower-case letters, digits and hyphens, starting with a letter, ending with a
 # letter or digit, at most 40 characters. Constraining both segments is what keeps
 # the cluster routes from admitting a child (`clusters/<c>/nodePools`), a custom
 # method spelt into a segment, or a second segment through either position.
-GKE_LOCATION = r"(?:-|[a-z]+-[a-z]+[0-9]{1,2}(?:-[a-z])?)"
+GKE_LOCATION = r"(?:-|(?:u-)?[a-z]+-[a-z]+[0-9]{1,2}(?:-[a-z])?)"
 GKE_CLUSTER = r"[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?"
 
 # What a host may look like, in the table and in a request: a lower-case DNS
@@ -299,16 +301,27 @@ def response_projection(rule_id: str) -> Callable[[bytes], bytes | None] | None:
     return _PROJECTIONS.get(rule_id)
 
 
-def evaluate(method: str, host: str, path: str, query: str) -> Decision:
+def evaluate(
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    *,
+    universe_domain: str = DEFAULT_UNIVERSE_DOMAIN,
+) -> Decision:
     """Allow or refuse one relayed request.
 
     Answers in this order, and the order is the security argument:
 
     1. Method not ``API_READ_METHOD`` -> ``gcp.api.method``.
-    2. Host in ``REFUSED_HOSTS`` -> ``gcp.api.host-refused``. Listed apart from
-       an unknown host so the log distinguishes "asked for a token endpoint"
-       from "asked for a service nobody has added".
-    3. Host in no route -> ``gcp.api.host``.
+    2. Host in ``REFUSED_HOSTS`` (in either ``googleapis.com`` or ``universe_domain``) ->
+       ``gcp.api.host-refused``. Listed apart from an unknown host so the log
+       distinguishes "asked for a token endpoint" from "asked for a service
+       nobody has added".
+    3. Host in no route for ``universe_domain`` -> ``gcp.api.host``. When
+       ``universe_domain`` is not ``googleapis.com``, commercial ``*.googleapis.com``
+       hosts are absent from this set and refused so custom-universe tokens
+       never cross a universe boundary.
     4. Host known, path matching no route -> ``gcp.api.path``, naming the rule
        ids that host does have.
     5. Otherwise allowed, carrying the matching ``rule_id`` for the audit line.
@@ -334,7 +347,20 @@ def evaluate(method: str, host: str, path: str, query: str) -> Decision:
                 f"a write or carries a body the policy cannot inspect."
             ),
         )
-    if host in REFUSED_HOSTS:
+    try:
+        universe = credential_proxy_client.normalize_universe_domain(universe_domain)
+    except ValueError:
+        return Decision(
+            allowed=False,
+            rule_id=RULE_HOST,
+            message="The configured universe domain is malformed; the credential proxy refuses every API relay.",
+        )
+    refused_hosts = (
+        REFUSED_HOSTS
+        if universe == DEFAULT_UNIVERSE_DOMAIN
+        else REFUSED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in REFUSED_HOSTS)
+    )
+    if host in refused_hosts:
         return Decision(
             allowed=False,
             rule_id=RULE_HOST_REFUSED,
@@ -343,7 +369,12 @@ def evaluate(method: str, host: str, path: str, query: str) -> Decision:
                 f"the credential proxy never relays it."
             ),
         )
-    if host not in _ROUTED_HOSTS:
+    routed_hosts = (
+        _ROUTED_HOSTS
+        if universe == DEFAULT_UNIVERSE_DOMAIN
+        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)
+    )
+    if host not in routed_hosts:
         return Decision(
             allowed=False,
             rule_id=RULE_HOST,
@@ -356,9 +387,14 @@ def evaluate(method: str, host: str, path: str, query: str) -> Decision:
         # `fullmatch` on top of the textual anchors: `$` also matches before a
         # trailing newline, so `match` would admit `timeSeries\n`. The
         # validator holds the anchors for the reader; this holds the door.
-        if route.host == host and route.method == method and route.path.fullmatch(path):
+        route_host = credential_proxy_client.rewrite_google_api_host(route.host, universe)
+        if route_host == host and route.method == method and route.path.fullmatch(path):
             return Decision(allowed=True, rule_id=route.rule_id, message="")
-    permitted = ", ".join(route.rule_id for route in API_READ_ROUTES if route.host == host)
+    permitted = ", ".join(
+        route.rule_id
+        for route in API_READ_ROUTES
+        if credential_proxy_client.rewrite_google_api_host(route.host, universe) == host
+    )
     return Decision(
         allowed=False,
         rule_id=RULE_PATH,
