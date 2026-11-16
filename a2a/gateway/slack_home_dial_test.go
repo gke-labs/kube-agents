@@ -88,7 +88,6 @@ func TestSlackHomeDialGivesAnAdminTheLevelRepoPickerAndRequest(t *testing.T) {
 	got := dialText(t, blocks)
 	for _, want := range []string{
 		`"type":"radio_buttons"`, `"action_id":"kage_dial.level"`,
-		`"initial_option":{"text":{"type":"mrkdwn","text":"*Propose fixes*"}`,
 		`"type":"static_select"`, `"action_id":"kage_dial.repo"`,
 		`"value":"no-pdb|dev|github.com/org/infra"`, `"value":"no-pdb|dev|github.com/org/apps"`,
 		"org/infra · 3 of 5 clean merges · off",
@@ -101,6 +100,28 @@ func TestSlackHomeDialGivesAnAdminTheLevelRepoPickerAndRequest(t *testing.T) {
 	}
 	if strings.Contains(got, "kage_dial.stop") {
 		t.Errorf("an off repository drew Stop:\n%s", got)
+	}
+	// The radio starts at the stored level.
+	var initial string
+	for _, b := range blocks {
+		if acc, ok := b["accessory"].(map[string]any); ok && acc["type"] == "radio_buttons" {
+			initial, _ = acc["initial_option"].(map[string]any)["value"].(string)
+		}
+	}
+	if initial != lib.DialLevelPropose {
+		t.Errorf("the radio starts at %q, want %q", initial, lib.DialLevelPropose)
+	}
+}
+
+func TestSlackHomeDialLeavesATooLongRepositoryOutOfThePicker(t *testing.T) {
+	b := dialBoard("U1")
+	long := "github.com/" + strings.Repeat("o", 39) + "/" + strings.Repeat("r", 100)
+	b.Dial.Kinds[0].Repos = append(b.Dial.Kinds[0].Repos, lib.BoardDialRepo{Repo: "long", RepoKey: long, Needed: 5})
+	a, api, _ := homeAdapter(t, b, nil)
+	openHome(a, "U1")
+	got := dialText(t, dialBlocks(t, api))
+	if strings.Contains(got, long) || !strings.Contains(got, "static_select") {
+		t.Errorf("a value over Slack's 150 characters must be left out of the picker, the rest kept:\n%s", got)
 	}
 }
 
@@ -182,7 +203,7 @@ func TestSlackHomeDialLevelTapGoesOverTheBoardRouteAndShowsTheAnswer(t *testing.
 	if len(actor.sent) != 1 {
 		t.Fatalf("sent %d actions, want 1", len(actor.sent))
 	}
-	if want := (lib.BoardAction{Action: lib.DialActionLevel, Level: lib.DialLevelAutomerge, By: "U1"}); !boardActionEqual(actor.sent[0], want) {
+	if want := (lib.BoardAction{Action: lib.DialActionLevel, Level: lib.DialLevelAutomerge, User: "U1", By: actor.sent[0].By}); !boardActionEqual(actor.sent[0], want) {
 		t.Errorf("sent %+v, want %+v", actor.sent[0], want)
 	}
 	if got := dialText(t, dialBlocks(t, api)); !strings.Contains(got, "Set to Auto-merge proven fixes.") {
@@ -202,13 +223,14 @@ func TestSlackHomeDialRequestAndStopNameTheirRow(t *testing.T) {
 	a.dialClick(dialClickPayload("U1", "2.1"), slackDialActionReq, "no-pdb|dev|github.com/org/infra", "")
 	a.dialClick(dialClickPayload("U1", "2.2"), slackDialActionStop, "no-pdb|dev|github.com/org/apps", "")
 	want := []lib.BoardAction{
-		{Action: lib.DialActionRequest, Kind: "no-pdb", Environment: "dev", RepoKey: "github.com/org/infra", By: "U1"},
-		{Action: lib.DialActionStop, Kind: "no-pdb", Environment: "dev", RepoKey: "github.com/org/apps", By: "U1"},
+		{Action: lib.DialActionRequest, Kind: "no-pdb", Environment: "dev", RepoKey: "github.com/org/infra", User: "U1"},
+		{Action: lib.DialActionStop, Kind: "no-pdb", Environment: "dev", RepoKey: "github.com/org/apps", User: "U1"},
 	}
 	if len(actor.sent) != len(want) {
 		t.Fatalf("sent %d actions, want %d", len(actor.sent), len(want))
 	}
 	for i := range want {
+		want[i].By = actor.sent[i].By
 		if !boardActionEqual(actor.sent[i], want[i]) {
 			t.Errorf("action %d: sent %+v, want %+v", i, actor.sent[i], want[i])
 		}

@@ -165,11 +165,13 @@ const (
 type BoardAction struct {
 	// Action is chatmsg.RowActionRetry or chatmsg.RowActionDrop.
 	Action string `json:"action"`
-	// Tasks are the row's card ids.
-	Tasks []string `json:"tasks"`
-	// By is who pressed, for session-kv's log line; a dial action carries the
-	// Slack member id, which session-kv checks against the dial's admins.
+	// Tasks are the row's card ids; a dial action has none.
+	Tasks []string `json:"tasks,omitempty"`
+	// By is who pressed, by name, for session-kv's log line.
 	By string `json:"by,omitempty"`
+	// User is a dial action's presser as a Slack member id, from the verified
+	// interaction payload; session-kv checks it against the dial's admins.
+	User string `json:"user,omitempty"`
 	// Level is a DialActionLevel's new level.
 	Level string `json:"level,omitempty"`
 	// Kind, Environment and RepoKey name the row a DialActionRequest or

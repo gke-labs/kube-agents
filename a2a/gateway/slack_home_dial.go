@@ -51,8 +51,10 @@ const (
 	slackDialKindsMax = 6
 	slackDialReposMax = 50
 	// slackDialOptionMax keeps a select option's text, and firstLine's "…",
-	// inside Slack's 75 characters.
+	// inside Slack's 75 characters; slackDialValueMax is Slack's cap on an
+	// option's value, past which views.publish refuses the whole tab.
 	slackDialOptionMax = 74
+	slackDialValueMax  = 150
 
 	slackDialTitle      = "Autonomy dial"
 	slackDialIntro      = "What the agent may change on its own."
@@ -223,15 +225,23 @@ func (s *SlackAdapter) homeDialKind(member string, admin bool, k lib.BoardDialKi
 		var options []*slack.OptionBlockObject
 		var initial *slack.OptionBlockObject
 		for _, r := range repos {
-			o := slack.NewOptionBlockObject(slackDialRowValue(k.Kind, k.Environment, r.RepoKey), plain(firstLine(slackDialRepoName(r), slackDialOptionMax)), nil)
+			value := slackDialRowValue(k.Kind, k.Environment, r.RepoKey)
+			if len(value) > slackDialValueMax {
+				// A repository key too long for Slack is left out of the
+				// picker rather than blanking the whole tab.
+				continue
+			}
+			o := slack.NewOptionBlockObject(value, plain(firstLine(slackDialRepoName(r), slackDialOptionMax)), nil)
 			options = append(options, o)
 			if r.RepoKey == picked.RepoKey {
 				initial = o
 			}
 		}
-		sel := slack.NewOptionsSelectBlockElement(slack.OptTypeStatic, plain(slackDialRepoPrompt), slackDialActionRepo, options...)
-		sel.InitialOption = initial
-		accessory = slack.NewAccessory(sel)
+		if len(options) > 1 {
+			sel := slack.NewOptionsSelectBlockElement(slack.OptTypeStatic, plain(slackDialRepoPrompt), slackDialActionRepo, options...)
+			sel.InitialOption = initial
+			accessory = slack.NewAccessory(sel)
+		}
 	}
 	blocks := []slack.Block{slack.NewSectionBlock(mrk(title), nil, accessory)}
 	blocks = append(blocks, slack.NewContextBlock("", mrk(strings.Join([]string{
@@ -353,7 +363,7 @@ func (s *SlackAdapter) dialClick(p slackClickPayload, actionID, value, selected 
 		s.log.Warn("slack: dropping a dial tap: no board route is wired", "member", member)
 		return
 	}
-	action.By = member
+	action.User = member
 	s.goSession(func() { s.runDialTap(member, action, actor) })
 }
 
@@ -374,6 +384,7 @@ func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor B
 		s.publishHome(member, false)
 		return
 	}
+	action.By = s.slackUserName(member)
 	ctx, cancel := context.WithTimeout(context.Background(), slackDialTimeout)
 	defer cancel()
 	res, err := actor(ctx, action)

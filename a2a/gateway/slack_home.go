@@ -376,6 +376,11 @@ func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
 			delete(s.home.dialStatuses, m)
 		}
 	}
+	for m := range s.home.dialPicks {
+		if _, viewing := s.home.viewers[m]; !viewing {
+			delete(s.home.dialPicks, m)
+		}
+	}
 }
 
 // noteAsker records who asked in a conversation, so its open question is
