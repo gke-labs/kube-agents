@@ -169,7 +169,7 @@ The A2A stack, per pod:
 | `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 4Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
 | MCP server | 1 | 100m | 128Mi | 500m | 256Mi | — | With the operator's `A2A_MCP_DOOR=true` |
 | Scope publisher Job | 1 | 50m | 192Mi | 500m | 512Mi | — | One pod at a time, every 15 minutes, where `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope |
-| `a2a-worker` session pod | up to `maxSessions` | 250m | 512Mi | 2 | 2Gi | 1088Mi / 1088Mi | One per `delegate:` from chat and per conversation moved to `/session` |
+| `a2a-worker` session pod | up to `maxSessions` | 150m | 320Mi | 2 | 2Gi | 1088Mi / 1088Mi | One per `delegate:` from chat and per conversation moved to `/session` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: install-footprint -->

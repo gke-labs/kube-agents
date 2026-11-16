@@ -1371,6 +1371,36 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "sessionResources": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requests": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number"]
+                        },
+                        "memory": {
+                          "type": ["string", "number"]
+                        }
+                      }
+                    },
+                    "limits": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number"]
+                        },
+                        "memory": {
+                          "type": ["string", "number"]
+                        }
+                      }
+                    }
+                  }
+                },
                 "busReplicas": {
                   "type": "integer",
                   "enum": [1, 3]
