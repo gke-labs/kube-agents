@@ -83,6 +83,7 @@ func TestFromEnvReadsTheSlackTestUsers(t *testing.T) {
 // name is refused with the unverified-sender notice, and no task is published.
 // The list lifts the adapter's bot_id drop and widens nothing past it.
 func TestSlackTestUserOffTheAllowlistIsRefused(t *testing.T) {
+	t.Parallel()
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.SetTestUsers([]string{"U2"})
 	msg, ok := a.inbound(context.Background(), appPost("U2", "300.1"))

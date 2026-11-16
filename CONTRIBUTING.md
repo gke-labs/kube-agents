@@ -41,6 +41,7 @@ human contributors and AI coding agents:
   self-review, live-validation, and bug-fix recurrence sections the pull request template asks
   for.
 - [`docs/testing-map.md`](docs/testing-map.md) says where a new test goes and what runs it.
+- [`docs/contributing-domain-expertise.md`](docs/contributing-domain-expertise.md) covers how domain experts contribute operational scenarios (as lightweight GitHub issues or end-to-end validated pull requests) across the 2x2 autonomy matrix.
 - [`docs/designs/live-test-lease.md`](docs/designs/live-test-lease.md) is the lease to take before
   mutating an installation your team shares.
 

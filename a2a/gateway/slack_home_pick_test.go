@@ -554,6 +554,7 @@ func TestSlackHomePickCloseEndsTheFollowUpAtOnce(t *testing.T) {
 // a move the operator did not apply. A move superseded by a later one that
 // the file then follows reports nothing.
 func TestSlackHomePickNotAppliedSurvivesARedraw(t *testing.T) {
+	t.Parallel()
 	a, api, cs, dir := newHomePickAdapter(t, nil)
 	a.homeLearn.followUp = 400 * time.Millisecond
 	writeHomeFile(t, dir, "")

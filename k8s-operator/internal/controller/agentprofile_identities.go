@@ -21,6 +21,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -256,6 +257,12 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 	case foreignPublishTopic(p) != "":
 		return agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name), reason: reasonAgentProfileInvalid}
+	case a2aDispatcherEnabled() && a2aDispatcherBucketedGrants() && isDispatcherBucketUser(p.Name):
+		// With bucketed grants, the dispatcher's bucket users are names no
+		// profile may hold (validateA2AAuthMapIdentities' set rule): one
+		// profile named for one would fail the whole map. Refused here so
+		// it is isolated with a condition instead (#5553, round 1).
+		return agentProfileResolution{refused: fmt.Errorf("profile name %q is one of the dispatcher's bucket users (%s-b0 to %s-b%d)", p.Name, a2aDispatcherUser, a2aDispatcherUser, a2aDispatcherBuckets-1), reason: reasonAgentProfileInvalid}
 	case p.Name == a2aBridgeAddressee:
 		// The CRD refuses this name too; the operator does not rely on
 		// admission alone, because CRD validation can be bypassed by an
@@ -456,4 +463,15 @@ func operatorServiceAccountNames(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// isDispatcherBucketUser reports whether name is one of the dispatcher's
+// bucket users, <a2aDispatcherUser>-b<n> for n below a2aDispatcherBuckets.
+func isDispatcherBucketUser(name string) bool {
+	rest, ok := strings.CutPrefix(name, a2aDispatcherUser+"-b")
+	if !ok || rest == "" || (len(rest) > 1 && rest[0] == '0') {
+		return false
+	}
+	n, err := strconv.Atoi(rest)
+	return err == nil && n >= 0 && n < a2aDispatcherBuckets
 }
