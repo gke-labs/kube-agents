@@ -366,6 +366,15 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// for another count is refused here as the operator refuses it.
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
 
+	// 7. Tier membership (#3659): no unattended or legacy tier for a person,
+	// and no person listed twice. A tier nothing defines yet is let through:
+	// the gateway refuses that member's profile tasks until it exists.
+	memberErrs, err := controller.ValidateTierMembership(ctx, v.Client, platformAgent, field.NewPath("spec", "tiers", "membership"))
+	if err != nil {
+		return nil, err
+	}
+	allErrs = append(allErrs, memberErrs...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},

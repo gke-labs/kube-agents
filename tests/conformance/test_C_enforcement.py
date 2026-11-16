@@ -1742,6 +1742,29 @@ class C1IsolationIsStructural(unittest.TestCase):
             "compiled list does not name",
         )
 
+    def test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary(self) -> None:
+        """Tier membership crosses the same boundary (#3659).
+
+        The operator renders spec.tiers.membership onto the gateway as
+        A2A_TIER_MEMBERSHIP, and the gateway reads it to pick the tier a
+        person's profile task runs at. A rename on either side leaves the
+        gateway with no membership, so everyone runs at read and both Go
+        suites stay green: a mapped person silently loses their tier. The two
+        spellings are pinned equal here.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        membership = h.text("a2a_gateway_tier_membership")
+        rendered = self._one_match(r'a2aTierMembershipEnvVar\s*=\s*"([^"]+)"', a2a_manifests, "the operator's a2aTierMembershipEnvVar")
+        read = self._one_match(r'EnvTierMembership\s*=\s*"([^"]+)"', membership, "the gateway's EnvTierMembership")
+        self.assertEqual(
+            rendered,
+            read,
+            "the operator renders %r and the gateway reads %r: every person runs at "
+            "read on an install whose Go suites are green" % (rendered, read),
+        )
+        self._one_match(r"Name:\s*a2aTierMembershipEnvVar,", a2a_manifests, "the operator's render of a2aTierMembershipEnvVar")
+        self._one_match(r"os\.(?:Getenv|LookupEnv)\(EnvTierMembership\)", h.text("a2a_gateway_config"), "the gateway's read of EnvTierMembership")
+
     def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
         """The reserved artifact name crosses a module boundary in two places.
 

@@ -12146,6 +12146,63 @@ spec:
                         and serves no sample.
                       type: boolean
                   type: object
+                tiers:
+                  description:
+                    Tiers says which tier each person's profile tasks run
+                    at.
+                  properties:
+                    membership:
+                      description: |-
+                        Membership lists the people whose profile tasks run at a tier other
+                        than read. Anyone not listed runs at read, and the console runs at
+                        read whatever this says, since everyone on it shares one principal. A
+                        thread whose authors are at different tiers can't start a profile task,
+                        and a steer from an author at another tier than the running task's is
+                        refused. A member whose tier no Tier defines is refused profile tasks
+                        until one does; they don't fall back to read. The tier must be
+                        interactive: the admission webhook refuses an unattended-mode Tier.
+                      items:
+                        description:
+                          TierMember maps one person on one chat backend
+                          to a tier.
+                        properties:
+                          backend:
+                            description:
+                              Backend is the chat surface the person writes
+                              from.
+                            enum:
+                              - gchat
+                              - slack
+                              - discord
+                              - a2a
+                              - a2a-google
+                            type: string
+                          tier:
+                            description: Tier is the name of an interactive-mode Tier.
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          user:
+                            description: |-
+                              User is the person's id on that backend, as the backend's allowedUsers
+                              lists take it: a Google Chat users/<id> or email (case-blind), a Slack
+                              or Discord user id.
+                            maxLength: 256
+                            minLength: 1
+                            pattern: ^[^,=\s]+$
+                            type: string
+                        required:
+                          - backend
+                          - tier
+                          - user
+                        type: object
+                      maxItems: 1000
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - backend
+                        - user
+                      x-kubernetes-list-type: map
+                  type: object
               required:
                 - harness
               type: object
