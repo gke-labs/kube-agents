@@ -415,7 +415,7 @@ class ExtractFootprintTest(unittest.TestCase):
         # The agent's data claim, the image-tree cache, the shell's two claims and one
         # JetStream claim per NATS server.
         self.assertEqual(self.op["storage"]["persistentVolumeClaims"], 7)
-        self.assertEqual(self.op["storage"]["storageBytesRequest"], 222 * _GIB)
+        self.assertEqual(self.op["storage"]["storageBytesRequest"], 228 * _GIB)
 
     def test_the_two_data_claims_and_their_default_size_are_recorded(self):
         """The agent's data claim and the sandbox's, which spec.storage.size sizes together."""
@@ -450,12 +450,12 @@ class ExtractFootprintTest(unittest.TestCase):
         self.assertEqual(shell["pods"], 2)
         self.assertEqual(shell["cpuMillisRequest"], baseline_shell["cpuMillisRequest"] * 2)
         self.assertEqual(shell["memoryBytesRequest"], baseline_shell["memoryBytesRequest"] * 2)
-        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=1Gi), so scaling from
-        # 1 to 2 replicas adds 2 claims (baseline 7 -> 9) and 51Gi storage (baseline 222Gi -> 273Gi).
+        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=4Gi), so scaling from
+        # 1 to 2 replicas adds 2 claims (baseline 7 -> 9) and 54Gi storage (baseline 228Gi -> 282Gi).
         self.assertEqual(data["operatorRendered"]["storage"]["persistentVolumeClaims"], 9)
         self.assertEqual(
             data["operatorRendered"]["storage"]["storageBytesRequest"],
-            self.op["storage"]["storageBytesRequest"] + 51 * _GIB,
+            self.op["storage"]["storageBytesRequest"] + 54 * _GIB,
         )
         # Each sandbox replica's data claim follows spec.storage.size too.
         self.assertEqual(data["operatorRendered"]["storage"]["dataClaims"], 3)
@@ -581,7 +581,7 @@ class A2AStackFootprintTest(unittest.TestCase):
         self.assertEqual(storage["busClaimBytesRequest"], 3 * 40 * _GIB)
         self.assertEqual(storage["busClaimRequest"], "120Gi")
         self.assertEqual(storage["persistentVolumeClaims"], 4 + 3)
-        self.assertEqual(storage["storageBytesRequest"], 102 * _GIB + 3 * 40 * _GIB)
+        self.assertEqual(storage["storageBytesRequest"], 108 * _GIB + 3 * 40 * _GIB)
         # The data claims are the two spec.storage.size sizes, not the bus's.
         self.assertEqual(storage["dataClaims"], 2)
 

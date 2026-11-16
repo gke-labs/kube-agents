@@ -237,8 +237,8 @@ operatorRendered:
     pods: 1
   storage:
     persistentVolumeClaims: 7
-    storageRequest: 222Gi
-    storageBytesRequest: 238370684928
+    storageRequest: 228Gi
+    storageBytesRequest: 244813135872
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200

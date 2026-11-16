@@ -158,7 +158,7 @@ class FootprintSummaryTest(unittest.TestCase):
         # words the notes use, so a wording change is a deliberate one here too.
         self.assertIn("CPU requests:        4.436 cores", notes)
         self.assertIn("Memory requests:     14.77 GiB", notes)
-        self.assertIn("Persistent storage:  222 GiB over 7 claims", notes)
+        self.assertIn("Persistent storage:  228 GiB over 7 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)
         self.assertIn("$0.10/GiB-month", notes)
@@ -175,15 +175,15 @@ class FootprintSummaryTest(unittest.TestCase):
         for key in ("requestsCpu", "requestsMemory", "requestsStorage", "pods", "persistentVolumeClaims"):
             self.assertGreater(req[key], defaults[key], key)
         # 200Gi on two data claims (150Gi over the default each), the three 40Gi JetStream
-        # claims, the 2Gi image-tree cache and Hindsight's 8Gi claim.
-        self.assertIn("Persistent storage:  530 GiB over 8 claims", notes)
+        # claims, the 4Gi system-metadata and sandbox sshd claims, and Hindsight's 8Gi claim.
+        self.assertIn("Persistent storage:  536 GiB over 8 claims", notes)
 
     def test_storage_size_alone_moves_the_ssd_line_and_the_total(self) -> None:
         default_notes, default_req = self._render()
         notes, req = self._render(["platformAgent.storage.size=80Gi"])
         self.assertEqual(req["requestsCpu"], default_req["requestsCpu"])
         self.assertEqual(req["requestsStorage"], default_req["requestsStorage"] + 2 * 30 * _GIB)
-        self.assertIn("Persistent storage:  282 GiB over 7 claims", notes)
+        self.assertIn("Persistent storage:  288 GiB over 7 claims", notes)
         self.assertIn(_expected_lines(req)["total"], notes)
         self.assertNotEqual(_expected_lines(req)["total"], _expected_lines(default_req)["total"])
         self.assertIn(_expected_lines(default_req)["total"], default_notes)

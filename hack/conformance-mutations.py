@@ -1443,6 +1443,18 @@ Mutation(
         "loopback sentinel got there in the first place",
     ),
     Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',

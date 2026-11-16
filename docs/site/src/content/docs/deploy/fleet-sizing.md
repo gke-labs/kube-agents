@@ -48,13 +48,13 @@ declared column from the two files and fails when the page falls behind them.
 | Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
 | ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 4 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 4 GiB for `sshd`       |
 | Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.5 then 1 / 1, each          | unchanged                                      | none declared            | none                                                     |
 | Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **222 GiB default, 322 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **228 GiB default, 328 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -121,7 +121,7 @@ table above means there:
   proxy's 8 GiB is the largest declared; raising `limits.ephemeral-storage` past 10 GiB leaves
   the pod unschedulable.
 
-Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 322 GiB of `pd-balanced`
+Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 328 GiB of `pd-balanced`
 (modeled, without bursting). At `us-central1` list prices that is about $400 to $500 a month
 including the cluster fee; modeled, so check the pricing calculator against your region.
 
@@ -235,11 +235,15 @@ caveat beside it:
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it. A process tunable such
-as `MALLOC_ARENA_MAX` is not on the agent container's allowlist: a values file that sets it
-renders a proxy pod that carries it, where `gcloud` and `kubectl` run, and an agent container
-that does not. The example leaves it out. Setting `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` has no
-effect on `gcloud`: the credential proxy does not pass the pod's value to its commands. The
+containers. The name in the example reaches the container that reads it.
+
+A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values
+file that sets it renders credential proxy and `agent-api-auth` containers that carry it, and an
+agent container that does not. In those two containers it reaches the container's own process,
+and not the `gcloud` and `kubectl` commands. The credential proxy passes a fixed list of names
+from its environment to the commands it runs, and this name is not on the list.
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is not on it either, so setting it has no effect on
+`gcloud`. The example leaves both out. The
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#sizing-for-a-fleet-examplesvalues-fleetyaml)
 has the chart-side detail.
 

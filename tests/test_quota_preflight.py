@@ -168,7 +168,7 @@ _WEB_CONSOLE_REQUEST_MEMORY_BYTES = 128 * 1024**2
 # Two operator-rendered claims, two from the shell StatefulSet's volumeClaimTemplates and
 # one 40Gi JetStream claim per NATS server, three by default.
 _OPERATOR_PVC_COUNT = 7
-_OPERATOR_STORAGE_BYTES = 222 * 1024**3
+_OPERATOR_STORAGE_BYTES = 228 * 1024**3
 # The two claims platformAgent.storage.size sizes (the agent's data claim and the shell
 # sandbox's), at the operator default each.
 _DATA_CLAIMS = 2
@@ -190,7 +190,7 @@ _EPHEMERAL_SET_GIB = 3
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 51
+_RETAINED_STORAGE_GIB = 54
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
@@ -331,7 +331,7 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_a_data_volume_size_moves_both_data_claims(self) -> None:
         """platformAgent.storage.size resizes two claims, so each GiB counts twice.
 
-        80Gi is 30Gi over the default on each claim: 222Gi + 2 x 30Gi = 282Gi. A size
+        80Gi is 30Gi over the default on each claim: 228Gi + 2 x 30Gi = 288Gi. A size
         below the default lowers the total the same way, and no claim is added.
         """
         base = self._requirements()
@@ -347,21 +347,21 @@ class PreflightDecisionTest(unittest.TestCase):
                     _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (size_bytes - _DATA_CLAIM_DEFAULT_BYTES),
                 )
                 self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
-        self.assertEqual(totals["80Gi"], 282 * 1024**3)
+        self.assertEqual(totals["80Gi"], 288 * 1024**3)
 
     def test_an_expected_profile_count_raises_the_agent_claim_alone(self) -> None:
         """expectedClusterProfiles raises the agent's data claim to 8Gi + N x 400Mi, rounded
         up to whole GiB, and only when that is above the size; the sandbox claim stays.
 
-        200 profiles is 87Gi: 222Gi + (87 - 50)Gi = 259Gi. 10 profiles is under the
+        200 profiles is 87Gi: 228Gi + (87 - 50)Gi = 265Gi. 10 profiles is under the
         default and adds nothing. With size 20Gi, both claims drop 30Gi and the agent's
-        rises back to 87Gi: 222 - 60 + 67 = 229Gi.
+        rises back to 87Gi: 228 - 60 + 67 = 235Gi.
         """
         gib = 1024**3
         for sets, want in (
-            (["platformAgent.storage.expectedClusterProfiles=200"], 259 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200"], 265 * gib),
             (["platformAgent.storage.expectedClusterProfiles=10"], _OPERATOR_STORAGE_BYTES),
-            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 229 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 235 * gib),
             (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=500Gi"],
              _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (500 - 50) * gib),
         ):
@@ -371,11 +371,11 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)
 
     def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
-        # The default fits a 222Gi requests.storage quota exactly; 80Gi does not.
+        # The default fits a 228Gi requests.storage quota exactly; 80Gi does not.
         quota = [{
             "metadata": {"name": "storage-quota"},
-            "spec": {"hard": {"requests.storage": "222Gi"}},
-            "status": {"hard": {"requests.storage": "222Gi"}, "used": {"requests.storage": "0"}},
+            "spec": {"hard": {"requests.storage": "228Gi"}},
+            "status": {"hard": {"requests.storage": "228Gi"}, "used": {"requests.storage": "0"}},
         }]
         fits = self._render({"probe": {"quotas": quota}})
         self.assertEqual(fits.returncode, 0, fits.stderr)
@@ -2419,7 +2419,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"222Gi"', res.stderr)
+        self.assertIn('"storage":"228Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""
