@@ -150,6 +150,13 @@ def test_a_from_mode_needs_both_sets():
     assert "1 of 2" in got["result"]["error"]
 
 
+@pytest.mark.parametrize("initial, restored", [("explain", "explain"), ("propose", "explain")])
+def test_the_entry_refuses_a_dial_level_where_a_broker_mode_belongs(initial, restored):
+    got = write_mode.entry(write_mode.WriteMode(ASK, "none"), initial, [{"set": "none", "read": "none"}], restored, (PODS, PODS))
+    assert got["status"] == "error"
+    assert "not broker modes" in got["result"]["error"]
+
+
 class _SessionKV:
     """A stand-in for session-kv's board routes, recording each dial.level it is sent."""
 
@@ -173,7 +180,10 @@ class _SessionKV:
 
             def do_POST(self):
                 assert self.path == "/v1/board/actions", self.path
-                stub.posts.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                stub.posts.append(body)
+                if stub.answer.get("ok"):
+                    stub.dial["level"] = body["level"]
                 self._reply(stub.answer)
 
             def log_message(self, *args):
@@ -234,6 +244,17 @@ def test_a_set_that_does_not_take_is_unavailable_and_carries_the_level_found(ses
     assert raised.value.previous == previous
     if dial is not None:
         assert stub.posts == []
+
+
+def test_a_from_ask_puts_back_the_level_found_before_the_first_set(session_kv):
+    stub = session_kv()
+    first = write_mode.set_mode(stub.shell, "none", 30)
+    assert write_mode.set_mode(stub.shell, "propose", 30) == "explain"
+    assert write_mode.set_mode(stub.shell, "none", 30, keep=first) == "propose"
+    stub.answer = {"action": "dial.level", "ok": False, "message": "No."}
+    with pytest.raises(write_mode.ModeUnavailable) as raised:
+        write_mode.set_mode(stub.shell, "propose", 30, keep=first)
+    assert raised.value.previous == "propose"
 
 
 def test_a_set_that_never_ran_is_unavailable():

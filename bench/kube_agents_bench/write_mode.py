@@ -263,19 +263,29 @@ def _set(shell: Callable[[str, float], str], level: str, timeout: float) -> str:
     return previous
 
 
-def set_mode(shell: Callable[[str, float], str], mode: str, timeout: float) -> str:
+def set_mode(shell: Callable[[str, float], str], mode: str, timeout: float, keep: str | None = None) -> str:
     """Move the dial to ``mode``'s level through session-kv's board action, as an
-    admin's tap does, and return the dial level it was at, for :func:`restore`.
+    admin's tap does, and return the dial level to put back with :func:`restore`.
+
+    That is the level the dial was at, unless ``keep`` names one: pass the level
+    an earlier set returned, as the second set of a ``from=`` ask must, and that
+    level comes back instead of the one the first set made. The return is a dial
+    level (``explain``/``propose``), never a broker mode: :func:`entry` takes
+    :func:`read_mode` readings.
 
     The set acts as the first name on the admin list, so the Home tab shows that
-    admin as the last to set the level until the put-back. With a ``from=`` ask,
-    put back the level the first set returned: the second set returns the level
-    the first one made.
+    admin as the last to set the level until the put-back.
 
     Raises :class:`ModeUnavailable` when the set never ran, session-kv refused
-    it, or the broker did not confirm it.
+    it, or the broker did not confirm it; its ``previous`` honours ``keep`` too.
     """
-    return _set(shell, DIAL_LEVELS[mode], timeout)
+    try:
+        previous = _set(shell, DIAL_LEVELS[mode], timeout)
+    except ModeUnavailable as exc:
+        if keep is not None:
+            exc.previous = keep
+        raise
+    return previous if keep is None else keep
 
 
 def restore(shell: Callable[[str, float], str], previous: str, timeout: float) -> None:
@@ -316,6 +326,8 @@ def entry(
     saw. A put-back that failed is one too: the next case would run at the
     wrong mode."""
     before, after = pods
+    if not error and (initial_mode not in MODES or restored_mode not in (*MODES, None)):
+        error = f"the entry got {initial_mode!r} and {restored_mode!r}, which are not broker modes (a dial level from set_mode?)"
     wanted = 2 if asked.from_mode else 1
     first = asked.from_mode or asked.mode
     if not error and initial_mode == first:
