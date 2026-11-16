@@ -106,6 +106,11 @@ type slackClickPayload struct {
 		// SelectedConversation is a conversations_select's pick: the Home
 		// tab's channel picker (slack_home_pick.go).
 		SelectedConversation string `json:"selected_conversation"`
+		// SelectedOption is a radio button's or a static select's pick:
+		// the Home tab dial's level and repository (slack_home_dial.go).
+		SelectedOption struct {
+			Value string `json:"value"`
+		} `json:"selected_option"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
 	// TriggerID opens a modal for the clicker (a 👎's note,
@@ -472,6 +477,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
 		// A board-health row's Retry or Drop: never a turn (slack_board.go).
 		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
+	if strings.HasPrefix(action.ActionID, slackDialActionPrefix) {
+		// The Home tab's autonomy dial: never a turn (slack_home_dial.go).
+		s.dialClick(p, action.ActionID, action.Value, action.SelectedOption.Value)
 		return InboundMessage{}, false
 	}
 	if action.ActionID == slackHomePickAction {

@@ -169,6 +169,10 @@ type slackHome struct {
 	// superseded once the count has moved past its own.
 	moves uint64
 	picks map[string]slackHomePickStatus
+	// dialPicks is each member's picked repository per dial row, and
+	// dialStatuses the answer to their last dial tap (slack_home_dial.go).
+	dialPicks    map[string]map[string]string
+	dialStatuses map[string]slackHomePickStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -224,6 +228,7 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			board = &lib.Board{Error: err.Error()}
 		}
 		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		blocks = append(blocks, s.homeDialBlocks(member, board.Dial)...)
 		blocks = append(blocks, s.homeChannelBlocks(member)...)
 		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
@@ -364,6 +369,11 @@ func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
 	for m, st := range s.home.picks {
 		if now.Sub(st.at) > slackHomeViewerTTL {
 			delete(s.home.picks, m)
+		}
+	}
+	for m, st := range s.home.dialStatuses {
+		if now.Sub(st.at) > slackHomeViewerTTL {
+			delete(s.home.dialStatuses, m)
 		}
 	}
 }
