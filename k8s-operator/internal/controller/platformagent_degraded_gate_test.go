@@ -101,8 +101,10 @@ func TestAParkedRefusalDoesNotWriteStatusEveryPass(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("first Reconcile failed: %v", err)
 	}
-	if counter.writes != 1 {
-		t.Fatalf("the parking pass made %d status writes, want 1", counter.writes)
+	// Two writes: the park itself, and the deferred BusCredentialsReady
+	// condition the A2A stack writes once on a namespace with no callout yet.
+	if counter.writes != 2 {
+		t.Fatalf("the parking pass made %d status writes, want 2", counter.writes)
 	}
 	parked := &agentv1alpha1.PlatformAgent{}
 	if err := r.Get(ctx, req.NamespacedName, parked); err != nil {

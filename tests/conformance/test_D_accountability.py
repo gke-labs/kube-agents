@@ -103,12 +103,10 @@ class D1Attributable(unittest.TestCase):
         ClusterRole it mints grants write verbs on `secrets`, names `secrets` on
         a non-minimal Role, or uses a wildcard that would.
 
-        This reads every Role in the five goldens, which is the legacy product
-        set. The two Roles the next stack adds (`buildA2AGatewayRole`,
-        `buildA2ACalloutRole`) are read structurally by Go's
-        `TestNoRenderedRoleReachesASecret` in `platformagent_a2a_slack_test.go`,
-        because the rendered `mode: next` object set is in no golden (C5's
-        auth-delegator test records that gap).
+        This reads every Role in the five goldens, the A2A gateway's and
+        callout's (`buildA2AGatewayRole`, `buildA2ACalloutRole`) included;
+        Go's `TestNoRenderedRoleReachesASecret` in
+        `platformagent_a2a_slack_test.go` reads the same two structurally.
 
         Outside this assertion: the operator's own ClusterRole holds
         `secrets` write by design (it mints the bus credentials, the callout
@@ -395,7 +393,7 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         parser-differential class -- and it only works while the audience is
         set.
 
-        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
+        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, is rendered only with Google Chat on, which no golden enables; seeing it needs such a golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
         the exec audience for the agent, and a `-chat` one for the gateway, so
         the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
         `/v1/exec`. A third, `-watcher`, is the gateway's agent-api-auth
