@@ -650,9 +650,12 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
 			return false
 		}
-		try := terminalTry{redeliverable: true}
+		// Only a delivery off the durable can go back with a count the
+		// server keeps; an item requeued in memory has none, so its try is
+		// final, as the heal's is.
+		var try terminalTry
 		if item.d != nil {
-			try.delivery = item.d.NumDelivered()
+			try = terminalTry{redeliverable: true, delivery: item.d.NumDelivered()}
 		}
 		return g.applyStatus(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject), render, try)
 	case lib.KindArtifactUpdate:

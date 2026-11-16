@@ -309,6 +309,11 @@ type TaskRequester struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+	// Delivery is a schedule trigger's run's delivery, recorded at submit
+	// (publishTriggerRun): the conversation's own Delivery is the newest
+	// submission's, and a later run's must not route this one's report.
+	// nil on every other task.
+	Delivery *lib.ScheduleDelivery `json:"delivery,omitempty"`
 	// RelayedSeqs are the stream sequences of this task's most recent
 	// events the relay rendered (at most relayedSeqCap), written with the
 	// render. A redelivered event found here was rendered by a gateway that

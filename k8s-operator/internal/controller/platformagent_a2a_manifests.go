@@ -3932,8 +3932,11 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # last is read. It is the durable record later readers enumerate, so the max
 # age is long, 90 days, rather than none: KV is discard=new, and a bucket with
 # no age would fill and refuse every later run's record, which posts nothing.
-# 256MiB holds about ten thousand reports at 25KB.
-$NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456 --ttl=2160h
+# The gateway cuts a report at 24KiB, and a value is capped at 256KiB, room
+# for that report's JSON escaping at its worst; a full-size record is about
+# 25KB, so 256MiB holds about ten thousand, over a hundred runs a day for the
+# 90 days.
+$NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and

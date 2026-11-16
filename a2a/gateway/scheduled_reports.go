@@ -1,12 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -16,7 +18,7 @@ import (
 // Unattended delivery (#5618, Track 3; docs/designs/scheduling-on-profiles.md
 // section 4): when a schedule trigger's top-level task ends, the relay
 // records the run in SCHEDULED_REPORTS and, per the delivery the trigger
-// ingress recorded on the conversation (SessionRecord.Delivery), posts the
+// ingress recorded on the run's entry (TaskRef.Delivery), posts the
 // report to the install's home channel or keeps it. The record is written
 // before any post, so a run that never posts is still on record, and a
 // redelivered terminal reads it back rather than posting twice.
@@ -41,6 +43,10 @@ const (
 	scheduledPosted = "posted"
 	// scheduledPostFailed: every attempt failed; nothing more is tried.
 	scheduledPostFailed = "post_failed"
+	// scheduledPostUnknown: a post was started and its outcome never came
+	// back (it timed out, or the gateway stopped mid-post); it may be in
+	// the channel, so it is not tried again.
+	scheduledPostUnknown = "post_unknown"
 )
 
 const (
@@ -69,6 +75,29 @@ const (
 	// task-<hex>, so neither carries a '.'; one derived from a trigger name
 	// has its '.' and '/' replaced (scheduledJobKeyFromTrigger).
 	scheduledKeySeparator = "."
+	// scheduledPostTimeout bounds one post: the wait for the notify route's
+	// answer, and the age past which a post started with no outcome
+	// recorded is read as post_unknown. It is cut shorter when the relay
+	// batch's own budget (turnTimeout) has less left, less
+	// scheduledKVReserve for the outcome's write.
+	scheduledPostTimeout = 20 * time.Second
+	// scheduledKVReserve is what a post leaves of the batch's budget for
+	// the record writes after it.
+	scheduledKVReserve = 10 * time.Second
+	// scheduledKVTimeout bounds each record read or write. The writes run
+	// off the batch's context (WithoutCancel), so a post that used up the
+	// batch's time still records its outcome.
+	scheduledKVTimeout = 5 * time.Second
+	// scheduledTextMax bounds a record's report, in bytes: the report is
+	// model output, and a record over the bucket's max value size would
+	// fail every write and leave the run unrecorded. 24KiB holds a fleet
+	// audit's report; past it the text is cut at a rune boundary and
+	// scheduledTruncatedNote says so. JSON escaping can grow the stored
+	// value (control characters six-fold), which the bucket's
+	// --max-value-size allows for.
+	scheduledTextMax = 24 << 10
+	// scheduledTruncatedNote ends a cut report.
+	scheduledTruncatedNote = "\n\n[report truncated: %d bytes not shown; the task's full result is on its stream]"
 	// scheduledJobKeyFill replaces the characters of a trigger's name that
 	// can't stand in one key token. '_' is in no DNS-1123 name, so a derived
 	// key can't collide with a schedule's own job key.
@@ -93,6 +122,23 @@ type ScheduledReport struct {
 	// LastError and Attempts are the post's failures so far.
 	LastError string `json:"lastError,omitempty"`
 	Attempts  int    `json:"attempts,omitempty"`
+	// PostStartedAt is when the post in flight began, written before it
+	// and cleared with its outcome: a record still posting with one older
+	// than scheduledPostTimeout lost its outcome, and is post_unknown.
+	PostStartedAt time.Time `json:"postStartedAt,omitzero"`
+}
+
+// truncateReport cuts text to scheduledTextMax bytes at a rune boundary and
+// says how much was cut.
+func truncateReport(text string) string {
+	if len(text) <= scheduledTextMax {
+		return text
+	}
+	cut := scheduledTextMax
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + fmt.Sprintf(scheduledTruncatedNote, len(text)-cut)
 }
 
 // settled reports whether the record's status is final: a redelivered
@@ -194,19 +240,25 @@ func (g *Gateway) homeReporter() (homeReporter, string) {
 }
 
 // terminalTry is what relayTerminal knows of the delivery that brought the
-// terminal: whether it can be handed back for a later try (one off the relay
-// durable or the in-memory queue; not the heal's), and which delivery of the
-// event this is (0 when unknown).
+// terminal: whether it can be handed back for a later try (only one off the
+// relay durable, whose server counts its deliveries; not one requeued in
+// memory, nor the heal's), and which delivery of the event this is.
 type terminalTry struct {
 	redeliverable bool
 	delivery      uint64
 }
 
 // deliverScheduledReport records a schedule trigger's finished top-level run
-// and delivers it per the conversation's Delivery. It reports true when the
-// terminal should be handed back to the relay for another try: the record
-// could not be written, or the post failed short of its last attempt. The
-// caller then ends the terminal there, so its redelivery runs it again.
+// and delivers it per the run's Delivery. It reports true when the terminal
+// should be handed back to the relay for another try: the record could not
+// be written, or the post failed short of its last attempt. The caller then
+// ends the terminal there, so its redelivery runs it again.
+//
+// The post and the record writes have their own clocks: the post at most
+// scheduledPostTimeout and never past the batch's budget less
+// scheduledKVReserve, the writes off the batch's context. A post that timed
+// out may still land (its job can be in the route's worker), so it is
+// recorded post_unknown and never handed back.
 func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord, ref TaskRef, taskID string, s lib.StatusUpdate, result string, try terminalTry) (redeliver bool) {
 	reason := ""
 	if s.Status.Message != nil {
@@ -215,12 +267,18 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	text, silent := scheduledReportFrom(s.Status.State, result, reason)
 	report := ScheduledReport{
 		TaskID: taskID, Profile: ref.Addressee, FinishedAt: time.Now().UTC(),
-		State: s.Status.State, Silent: silent, Text: text,
+		State: s.Status.State, Silent: silent, Text: truncateReport(text),
 	}
 	if ref.Requester != nil {
 		report.TriggerName = ref.Requester.Subject
 	}
-	d := rec.Delivery
+	// The run's own delivery, recorded on its entry at submit; the
+	// conversation's is the newest submission's, read only for an entry
+	// from before the field.
+	d := ref.Delivery
+	if d == nil {
+		d = rec.Delivery
+	}
 	switch {
 	case d == nil:
 		report.JobKey, report.Status = scheduledJobKeyFromTrigger(report.TriggerName), scheduledNoDelivery
@@ -236,15 +294,11 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	}
 	key := scheduledReportKey(report.JobKey, taskID)
 	logArgs := []any{"jobKey", report.JobKey, "taskId", taskID, "conversation", rec.Key}
+	store := g.scheduledStore(ctx)
 
-	kv, err := g.client.KV(ctx, lib.ScheduledReportsBucket)
-	var have *ScheduledReport
-	var rev uint64
-	if err == nil {
-		have, rev, err = getScheduledReport(ctx, kv, key)
-	}
+	have, rev, err := store.get(key)
 	if err != nil {
-		return g.scheduledRecordFailed(report, try, err, logArgs)
+		return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
 	}
 	if have != nil && have.settled() {
 		// A redelivered terminal whose run is already settled: posted,
@@ -253,8 +307,20 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		return false
 	}
 	if have != nil {
-		// A post that failed before, tried again.
 		report = *have
+		if !report.PostStartedAt.IsZero() {
+			// A post began and its outcome never came back.
+			if time.Since(report.PostStartedAt) < scheduledPostTimeout && try.redeliverable {
+				// It may still be in flight: look again later.
+				return true
+			}
+			report.Status, report.PostStartedAt = scheduledPostUnknown, time.Time{}
+			if _, err := store.put(key, report, rev); err != nil {
+				g.log.Error("scheduled report outcome not recorded", append(logArgs, "status", report.Status, "err", err)...)
+			}
+			g.log.Warn("scheduled report post outcome unknown; not posting again", logArgs...)
+			return false
+		}
 	}
 	var reporter homeReporter
 	var home string
@@ -263,18 +329,38 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 			report.Status = scheduledStoredNoHome
 		}
 	}
-	// The record first, whatever comes next.
-	if rev, err = putScheduledReport(ctx, kv, key, report, rev); err != nil {
-		return g.scheduledRecordFailed(report, try, err, logArgs)
-	}
 	if report.Status != scheduledPosting {
+		if _, err := store.put(key, report, rev); err != nil {
+			return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
+		}
 		g.log.Info("scheduled report recorded", append(logArgs, "status", report.Status)...)
 		return false
 	}
 
+	postTimeout := scheduledPostTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		postTimeout = min(postTimeout, time.Until(dl)-scheduledKVReserve)
+	}
+	if postTimeout <= 0 {
+		// No time left in this batch to post and record the outcome: the
+		// record goes first, then the terminal goes back untried.
+		if _, err := store.put(key, report, rev); err != nil {
+			return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
+		}
+		return try.redeliverable
+	}
+	// The record first, saying a post is starting.
+	report.PostStartedAt = time.Now().UTC()
+	if rev, err = store.put(key, report, rev); err != nil {
+		return g.scheduledRecordFailed(store, key, try, err, logArgs, report.Status)
+	}
+
 	// One message per run; the thread is the day's in a later change.
-	post, postErr := reporter.postHomeReport(ctx, home, "", report.Text)
+	postCtx, cancel := context.WithTimeout(ctx, postTimeout)
+	post, postErr := reporter.postHomeReport(postCtx, home, "", report.Text)
+	cancel()
 	report.Attempts++
+	report.PostStartedAt = time.Time{}
 	switch {
 	case postErr == nil:
 		report.Status, report.LastError = scheduledPosted, ""
@@ -282,7 +368,10 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		if report.ThreadID == "" {
 			report.ThreadID = post.MessageID
 		}
-	case !try.redeliverable || report.Attempts >= scheduledPostAttempts:
+	case errors.Is(postErr, errPostOutcomeUnknown):
+		report.Status, report.LastError = scheduledPostUnknown, postErr.Error()
+		g.log.Warn("scheduled report post outcome unknown; not posting again", append(logArgs, "err", postErr)...)
+	case !try.redeliverable || max(uint64(report.Attempts), try.delivery) >= scheduledPostAttempts:
 		report.Status, report.LastError = scheduledPostFailed, postErr.Error()
 		g.log.Warn("scheduled report not posted; giving up", append(logArgs, "attempts", report.Attempts, "err", postErr)...)
 	default:
@@ -291,10 +380,10 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		g.log.Info("scheduled report post failed; the terminal goes back for another try",
 			append(logArgs, "attempts", report.Attempts, "err", postErr)...)
 	}
-	if _, err := putScheduledReport(ctx, kv, key, report, rev); err != nil {
-		// Posted with the record still saying posting: a redelivery would
-		// post it again, so the terminal is not handed back for that; a
-		// failed post is handed back as it would have been.
+	if _, err := store.put(key, report, rev); err != nil {
+		// The record still says a post started: a redelivery reads it as
+		// post_unknown once scheduledPostTimeout has passed, and posts
+		// nothing.
 		g.log.Error("scheduled report outcome not recorded", append(logArgs, "status", report.Status, "err", err)...)
 	}
 	if report.Status == scheduledPosted {
@@ -305,15 +394,69 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 
 // scheduledRecordFailed decides a terminal whose record could not be read or
 // written: nothing is posted without one, so the terminal goes back while it
-// has deliveries left, and is given up on (logged) past them. A run with no
-// delivery has nothing to post and is not handed back.
-func (g *Gateway) scheduledRecordFailed(report ScheduledReport, try terminalTry, err error, logArgs []any) bool {
-	if report.Status != scheduledNoDelivery && try.redeliverable && try.delivery < scheduledRecordAttempts {
+// has deliveries left (only one off the relay durable can go back). Past
+// them it is given up on, logged, with a best-effort post_failed on a record
+// left posting. A run with no delivery has nothing to post and is not
+// handed back.
+func (g *Gateway) scheduledRecordFailed(store scheduledStore, key string, try terminalTry, err error, logArgs []any, status string) bool {
+	if status != scheduledNoDelivery && try.redeliverable && try.delivery < scheduledRecordAttempts {
 		g.log.Warn("scheduled report record unavailable; the terminal goes back for another try", append(logArgs, "delivery", try.delivery, "err", err)...)
 		return true
 	}
-	g.log.Error("scheduled report not recorded; nothing posted", append(logArgs, "status", report.Status, "err", err)...)
+	g.log.Error("scheduled report not recorded; nothing posted", append(logArgs, "status", status, "err", err)...)
+	if have, rev, gerr := store.get(key); gerr == nil && have != nil && have.Status == scheduledPosting {
+		// A post that started and recorded no outcome may have landed.
+		have.Status, have.LastError = scheduledPostFailed, err.Error()
+		if !have.PostStartedAt.IsZero() {
+			have.Status, have.PostStartedAt = scheduledPostUnknown, time.Time{}
+		}
+		_, _ = store.put(key, *have, rev)
+	}
 	return false
+}
+
+// scheduledStore reads and writes SCHEDULED_REPORTS records, each operation
+// on its own scheduledKVTimeout off ctx's values but not its cancellation,
+// retried as the relay's record writes are.
+type scheduledStore struct {
+	g   *Gateway
+	ctx context.Context
+}
+
+func (g *Gateway) scheduledStore(ctx context.Context) scheduledStore {
+	return scheduledStore{g: g, ctx: context.WithoutCancel(ctx)}
+}
+
+func (st scheduledStore) do(f func(ctx context.Context, kv jetstream.KeyValue) error) error {
+	return withRetry(kvRetryAttempts, func() error {
+		ctx, cancel := context.WithTimeout(st.ctx, scheduledKVTimeout)
+		defer cancel()
+		kv, err := st.g.client.KV(ctx, lib.ScheduledReportsBucket)
+		if err != nil {
+			return err
+		}
+		return f(ctx, kv)
+	})
+}
+
+// get reads key's record and its revision, nil when there is none.
+func (st scheduledStore) get(key string) (r *ScheduledReport, rev uint64, err error) {
+	err = st.do(func(ctx context.Context, kv jetstream.KeyValue) error {
+		var e error
+		r, rev, e = getScheduledReport(ctx, kv, key)
+		return e
+	})
+	return r, rev, err
+}
+
+// put writes r at key over revision rev (0: a create).
+func (st scheduledStore) put(key string, r ScheduledReport, rev uint64) (next uint64, err error) {
+	err = st.do(func(ctx context.Context, kv jetstream.KeyValue) error {
+		var e error
+		next, e = putScheduledReport(ctx, kv, key, r, rev)
+		return e
+	})
+	return next, err
 }
 
 // getScheduledReport reads key's record and its revision, nil when there is
@@ -335,11 +478,15 @@ func getScheduledReport(ctx context.Context, kv jetstream.KeyValue, key string) 
 
 // putScheduledReport writes r at key: a create when rev is 0, else an update
 // of that revision, so a second writer's record is never overwritten blind.
+// HTML escaping is off: it would grow a report's '<', '>' and '&' six-fold.
 func putScheduledReport(ctx context.Context, kv jetstream.KeyValue, key string, r ScheduledReport, rev uint64) (uint64, error) {
-	data, err := json.Marshal(r)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(r); err != nil {
 		return 0, err
 	}
+	data := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 	if rev == 0 {
 		return kv.Create(ctx, key, data)
 	}
@@ -376,7 +523,7 @@ func (n *Notifier) homeChannel() string {
 // owns the route's state.
 func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string) (homePost, error) {
 	answers := make(chan lib.NotifyReply, 1)
-	job := notifyJob{req: lib.NotifyRequest{Text: text, Thread: thread}, home: home,
+	job := notifyJob{req: lib.NotifyRequest{Text: text, Thread: thread}, home: home, dropLate: true,
 		answer: func(r lib.NotifyReply) { answers <- r }}
 	if dl, ok := ctx.Deadline(); ok {
 		job.deadline = dl
@@ -391,9 +538,14 @@ func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string
 		}
 		return homePost{Platform: n.backend, ChatID: home, ThreadID: r.ThreadID, MessageID: r.MessageID}, nil
 	case <-ctx.Done():
-		return homePost{}, fmt.Errorf("no answer from the notify route: %w", ctx.Err())
+		return homePost{}, fmt.Errorf("%w: %w", errPostOutcomeUnknown, ctx.Err())
 	}
 }
+
+// errPostOutcomeUnknown is postHomeReport's answer when it stopped waiting:
+// the job may yet be posted by the route's worker (one already posting runs
+// to its end), so whether the report is in the channel is not known.
+var errPostOutcomeUnknown = errors.New("no answer from the notify route in time; the post may still land")
 
 // enqueue hands job to the worker without waiting, or says why it can't:
 // the route is stopping, not started, or full.

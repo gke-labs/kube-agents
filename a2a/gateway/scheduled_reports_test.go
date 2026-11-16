@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -158,7 +160,12 @@ func TestAScheduledRunWithNoDeliveryIsRecordedAndNotPosted(t *testing.T) {
 	tr.g.setHomeReporters(home)
 	s := goodScheduleSubmit()
 	s.Delivery.JobKey = "daily-audit"
-	taskID := runScheduled(t, tr, s, "Two findings.", func(rec *SessionRecord) { rec.Delivery = nil })
+	taskID := runScheduled(t, tr, s, "Two findings.", func(rec *SessionRecord) {
+		rec.Delivery = nil
+		for i := range rec.Tasks {
+			rec.Tasks[i].Delivery = nil
+		}
+	})
 	rep := waitForScheduledReport(t, tr.rig, "compliance-audit", taskID, "the no_delivery record", func(r *ScheduledReport) bool { return true })
 	if rep.Status != scheduledNoDelivery || rep.JobKey != "compliance-audit" {
 		t.Fatalf("record = %+v, want no_delivery under compliance-audit", rep)
@@ -404,5 +411,194 @@ func TestPostHomeReportGoesThroughTheNotifyWorker(t *testing.T) {
 	}
 	if none.homeChannel() != "" {
 		t.Fatal("a route with no home names one")
+	}
+}
+
+// countingBlockingPoster holds every post until release closes, and counts
+// the posts that landed.
+type countingBlockingPoster struct {
+	release chan struct{}
+	mu      sync.Mutex
+	landed  int
+}
+
+func (b *countingBlockingPoster) PostNotify(space, thread, text string) (string, string, error) {
+	<-b.release
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.landed++
+	return space + "/messages/1", space + "/threads/1", nil
+}
+
+func (b *countingBlockingPoster) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.landed
+}
+
+// scheduledChatRun is a chat-delivery run's record and entry, for the cases
+// that call deliverScheduledReport directly.
+func scheduledChatRun(taskID string) (*SessionRecord, TaskRef, lib.StatusUpdate) {
+	d := &lib.ScheduleDelivery{Mode: lib.ScheduleDeliveryChat, JobKey: "compliance-audit"}
+	rec := &SessionRecord{Key: scheduleConversation, Delivery: d}
+	ref := TaskRef{ID: taskID, Addressee: "fleet-audit", Delivery: d,
+		Requester: &TaskRequester{Backend: triggerRequesterBackend, Subject: "schedule/compliance-audit"}}
+	return rec, ref, lib.StatusUpdate{TaskID: taskID, Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}
+}
+
+// TestAScheduledPostThatOutlastsItsTimeIsUnknownAndNotRetried: a post the
+// notify route does not answer in time (here, a backend that hangs) is
+// recorded post_unknown and not handed back, so no second post is queued;
+// a post still waiting in the route's queue past its time is dropped
+// unposted, and only the one already posting lands.
+func TestAScheduledPostThatOutlastsItsTimeIsUnknownAndNotRetried(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	poster := &countingBlockingPoster{release: make(chan struct{})}
+	n, err := NewGchatNotifier(poster, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.jobs, n.done = make(chan notifyJob, notifyQueueDepth), make(chan struct{})
+	go n.work()
+	t.Cleanup(func() { close(n.jobs) })
+	r.g.setHomeReporters(n)
+
+	// The batch's budget leaves the post half a second past the outcome's
+	// reserve.
+	ctx, cancel := context.WithTimeout(context.Background(), scheduledKVReserve+500*time.Millisecond)
+	defer cancel()
+	try := terminalTry{redeliverable: true, delivery: 1}
+	for _, taskID := range []string{"task-00000000000000a1", "task-00000000000000a2"} {
+		rec, ref, s := scheduledChatRun(taskID)
+		start := time.Now()
+		if r.g.deliverScheduledReport(ctx, rec, ref, taskID, s, "Two findings.", try) {
+			t.Fatalf("%s: a post whose outcome is unknown was handed back", taskID)
+		}
+		if waited := time.Since(start); waited > 5*time.Second {
+			t.Fatalf("%s: the post waited %s, past its own timeout", taskID, waited)
+		}
+		rep := readScheduledReport(t, r, "compliance-audit", taskID)
+		if rep == nil || rep.Status != scheduledPostUnknown || rep.Attempts != 1 || !rep.PostStartedAt.IsZero() {
+			t.Fatalf("%s: record = %+v, want post_unknown after one attempt", taskID, rep)
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), scheduledKVReserve+500*time.Millisecond)
+		defer cancel()
+	}
+	// A redelivery of the first posts nothing more.
+	rec, ref, s := scheduledChatRun("task-00000000000000a1")
+	if r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "Two findings.", terminalTry{redeliverable: true, delivery: 2}) {
+		t.Fatal("the redelivery of an unknown post was handed back")
+	}
+	close(poster.release)
+	time.Sleep(300 * time.Millisecond)
+	if got := poster.count(); got != 1 {
+		t.Fatalf("%d posts landed, want only the one already posting", got)
+	}
+}
+
+// TestAScheduledPostLeftStartedIsUnknownOnRedelivery: a record still saying
+// a post started, older than a post's timeout (the outcome's write failed,
+// or the gateway stopped mid-post), is post_unknown on redelivery and is not
+// posted again.
+func TestAScheduledPostLeftStartedIsUnknownOnRedelivery(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	home := &fakeHomeReporter{home: "C0HOME"}
+	r.g.setHomeReporters(home)
+	rec, ref, s := scheduledChatRun("task-00000000000000b1")
+	kv, err := r.client.KV(context.Background(), lib.ScheduledReportsBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := putScheduledReport(context.Background(), kv, scheduledReportKey("compliance-audit", ref.ID), ScheduledReport{
+		JobKey: "compliance-audit", TaskID: ref.ID, Status: scheduledPosting, Text: "Two findings.",
+		PostStartedAt: time.Now().Add(-2 * scheduledPostTimeout),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, "Two findings.", terminalTry{redeliverable: true, delivery: 2}) {
+		t.Fatal("handed back")
+	}
+	if rep := readScheduledReport(t, r, "compliance-audit", ref.ID); rep == nil || rep.Status != scheduledPostUnknown {
+		t.Fatalf("record = %+v, want post_unknown", rep)
+	}
+	if posts := home.calls(); len(posts) != 0 {
+		t.Fatalf("posted %q again", posts)
+	}
+}
+
+// TestAFailedScheduledPostWithNoRedeliveryLeftIsFinal: a post that fails on
+// a try that can't go back (the heal's, or an item requeued in memory), or
+// on the durable's fifth delivery whatever the record counted, is the last.
+func TestAFailedScheduledPostWithNoRedeliveryLeftIsFinal(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.g.setHomeReporters(&fakeHomeReporter{home: "C0HOME", fail: func(int) bool { return true }})
+	for taskID, try := range map[string]terminalTry{
+		"task-00000000000000c1": {},
+		"task-00000000000000c2": {redeliverable: true, delivery: scheduledPostAttempts},
+	} {
+		rec, ref, s := scheduledChatRun(taskID)
+		if r.g.deliverScheduledReport(context.Background(), rec, ref, taskID, s, "Two findings.", try) {
+			t.Fatalf("%s (%+v): handed back", taskID, try)
+		}
+		if rep := readScheduledReport(t, r, "compliance-audit", taskID); rep == nil || rep.Status != scheduledPostFailed || rep.Attempts != 1 {
+			t.Fatalf("%s: record = %+v, want post_failed after one attempt", taskID, rep)
+		}
+	}
+}
+
+// TestALongScheduledReportIsCutAndStoredUnescaped: a report past
+// scheduledTextMax is cut with a note saying so, and the record keeps '<',
+// '>' and '&' as they are rather than HTML-escaped.
+func TestALongScheduledReportIsCutAndStoredUnescaped(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	home := &fakeHomeReporter{home: ""}
+	r.g.setHomeReporters(home)
+	rec, ref, s := scheduledChatRun("task-00000000000000d1")
+	long := strings.Repeat("<a&b> é", 20000)
+	if r.g.deliverScheduledReport(context.Background(), rec, ref, ref.ID, s, long, terminalTry{redeliverable: true, delivery: 1}) {
+		t.Fatal("handed back")
+	}
+	kv, err := r.client.KV(context.Background(), lib.ScheduledReportsBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := kv.Get(context.Background(), scheduledReportKey("compliance-audit", ref.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(e.Value()), `\u003c`) || !strings.Contains(string(e.Value()), "<a&b>") {
+		t.Fatal("the stored report is HTML-escaped")
+	}
+	rep := readScheduledReport(t, r, "compliance-audit", ref.ID)
+	if !utf8.ValidString(rep.Text) || len(rep.Text) > scheduledTextMax+len(scheduledTruncatedNote)+16 ||
+		!strings.Contains(rep.Text, "[report truncated:") || rep.Status != scheduledStoredNoHome {
+		t.Fatalf("record text is %d bytes (valid %v), status %s", len(rep.Text), utf8.ValidString(rep.Text), rep.Status)
+	}
+	if got := truncateReport("short"); got != "short" {
+		t.Fatalf("a short report was changed: %q", got)
+	}
+}
+
+// TestAScheduledRunUsesItsOwnDelivery: the delivery a run was submitted with
+// routes its report, though a later submission has since rewritten the
+// conversation's.
+func TestAScheduledRunUsesItsOwnDelivery(t *testing.T) {
+	t.Parallel()
+	tr := startTriggerRig(t, nil)
+	home := &fakeHomeReporter{home: "C0HOME"}
+	tr.g.setHomeReporters(home)
+	taskID := runScheduled(t, tr, goodScheduleSubmit(), "Two findings.", func(rec *SessionRecord) {
+		rec.Delivery = &lib.ScheduleDelivery{Mode: lib.ScheduleDeliveryLocal, JobKey: "compliance-audit"}
+	})
+	rep := waitForScheduledReport(t, tr.rig, "compliance-audit", taskID, "the run's record", func(r *ScheduledReport) bool { return r.Status == scheduledPosted })
+	if rep.ChatID != "C0HOME" {
+		t.Fatalf("record = %+v", rep)
+	}
+	if posts := home.calls(); len(posts) != 1 {
+		t.Fatalf("%d posts, want 1", len(posts))
 	}
 }

@@ -260,7 +260,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Six KV buckets ride the same JetStream deployment:
+Seven KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -326,11 +326,12 @@ Six KV buckets ride the same JetStream deployment:
 - `SCHEDULED_REPORTS` - one record per finished run of a schedule trigger, keyed
   `<jobKey>.<taskID>`: the report, its delivery status, and where it was posted. The gateway
   writes it before any post and is its only writer by grant, with STREAM.INFO and DIRECT.GET
-  on `KV_SCHEDULED_REPORTS` and no consumer verb. A 90-day max age (`--ttl=2160h`) and a
-  256MiB cap: it is the durable record later readers enumerate, and without the age a full
-  bucket would refuse every later run's record. Provision and seed hold CREATE and INFO on
-  it for the info-then-add guard. The
-  [scheduling design](scheduling-on-profiles.md) owns what a record holds (section 4).
+  on `KV_SCHEDULED_REPORTS` and no consumer verb. A 90-day max age (`--ttl=2160h`), a
+  256KiB value cap (the gateway cuts a report at 24KiB) and a 256MiB bucket cap: it is the
+  durable record later readers enumerate, and without the age a full bucket would refuse
+  every later run's record. Provision and seed hold CREATE and INFO on it for the
+  info-then-add guard. The [scheduling design](scheduling-on-profiles.md) owns what a
+  record holds (section 4).
 
 ## Accounts and connection-time authorization
 

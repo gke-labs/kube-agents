@@ -300,9 +300,9 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	}); err != nil {
 		t.Fatalf("provision bucket PROFILE_LEASES as seed: %v", err)
 	}
-	// `nats kv add SCHEDULED_REPORTS --ttl=2160h`: a schedule's runs.
+	// `nats kv add SCHEDULED_REPORTS --max-value-size=262144 --ttl=2160h`: a schedule's runs.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket: "SCHEDULED_REPORTS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 268435456, TTL: 2160 * time.Hour,
+		Bucket: "SCHEDULED_REPORTS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 268435456, MaxValueSize: 262144, TTL: 2160 * time.Hour,
 	}); err != nil {
 		t.Fatalf("provision bucket SCHEDULED_REPORTS as seed: %v", err)
 	}

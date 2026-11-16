@@ -261,7 +261,8 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
 	prevActive, prevTasks := rec.ActiveTask, rec.Tasks
 	now := time.Now()
-	rec.Delivery = &s.Delivery
+	delivery := s.Delivery
+	rec.Delivery = &delivery
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: run.CorrelationID, Ask: truncateRunes(s.Prompt, askCap),
 		SubmittedAt: now, Capability: run.Capability}
 	if !rec.hasTask(taskID) {
@@ -269,6 +270,7 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
 			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
 			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+			Delivery: &delivery,
 		})
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
