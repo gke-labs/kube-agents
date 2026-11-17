@@ -2499,29 +2499,39 @@ these have passed.
 {{- range $name, $quantity := $quantities | default dict -}}
 {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
 {{- $raw := toString $quantity | trim -}}
-{{- if not (regexMatch $quantityPattern (trimPrefix "-" (trimPrefix "+" $raw))) -}}
+{{- $abs := regexReplaceAll "^[-+]" $raw "" -}}
+{{- if not (regexMatch $quantityPattern $abs) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- /* The magnitude bounds containerResourcesCheck holds a quantity to, on the value
        without its sign (the resolver reads a negative as unset, but the operator must
        still decode it): 15 significant digits, and nothing past int64 in bytes or in
        millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
-{{- $abs := trimPrefix "-" (trimPrefix "+" $raw) -}}
+{{- /* resource.ParseQuantity reads an exponent into an int32 (strconv.ParseInt, then
+       int32()): past int64 it refuses the quantity, and between int32 and int64 it
+       truncates it to another value. So no exponent past int32, either sign. */ -}}
+{{- $exp := regexFind "[eE][-+]?[0-9]+$" $abs -}}
+{{- if $exp -}}
+{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
+{{- if or (gt (len $digits) 10) (and (eq (len $digits) 10) (gt (int64 $digits) 2147483647)) -}}
+{{- fail (printf "%s.%s.%s is %s, whose exponent is past the int32 the operator reads it into: past int64 the operator cannot decode the PlatformAgent, and below that it truncates the exponent to another value" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
-{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits; write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits, more than the chart compares exactly (the bound the CR's other resource overrides hold to); write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $abs -}}
-{{- fail (printf "%s.%s.%s is %s, which is past the range a quantity can hold, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is past the range the chart and the operator's int64 readers hold" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $abs) -}}
-{{- fail (printf "%s.%s.%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, the most the operator's readers take" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if eq $name "cpu" -}}
 {{- $cores := include "kube-agents.quantityExact" (dict "raw" $abs "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
 {{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
-{{- fail (printf "%s.%s.%s is %s, whose millicore value exceeds the 9223372036854775807 an int64 holds, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, whose millicore value exceeds the 9223372036854775807 an int64 holds, the most the scheduler represents" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
