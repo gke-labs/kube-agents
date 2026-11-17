@@ -722,7 +722,7 @@ const (
 	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
 	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
 	// The gateway's rule for a Teams home conversation id
-	// (a2a/gateway/teams.go, teamsIsConversationID): one of the two shapes
+	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
 	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
 	// personal chat), with something after the prefix, no whitespace of any
 	// script inside, and none of the characters the broker's activity path
@@ -1766,7 +1766,7 @@ func a2aTeamsHomeConversation(agent *agentv1alpha1.PlatformAgent) string {
 		return ""
 	}
 	home := strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel)
-	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.Contains(home, a2aTeamsHomeThreadToken) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
+	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.Contains(strings.ToLower(home), a2aTeamsHomeThreadToken) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
 		return ""
 	}
 	for _, prefix := range []string{a2aTeamsHomeGroupPrefix, a2aTeamsHomePersonalPrefix} {

@@ -615,7 +615,7 @@ func TestTeamsNotifyRoutePostsIntoTheConversation(t *testing.T) {
 	}
 	// The home must be a Teams conversation id: another backend's key or a
 	// URL is refused at start, not at every post.
-	for _, bad := range []string{"spaces/AAA", "C0123ABCD", "https://teams.microsoft.com/l/channel/x", "gchat:spaces/AAA", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", `19:abc\x@thread.tacv2`, home + ";messageid=1794603936403"} {
+	for _, bad := range []string{"spaces/AAA", "C0123ABCD", "https://teams.microsoft.com/l/channel/x", "gchat:spaces/AAA", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", `19:abc\x@thread.tacv2`, home + ";messageid=1794603936403", home + ";messageId=1794603936403"} {
 		if _, err := NewTeamsNotifier(a, bad, nil); err == nil {
 			t.Fatalf("home %q accepted", bad)
 		}

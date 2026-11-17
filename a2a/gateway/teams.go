@@ -670,14 +670,21 @@ func teamsIsConversationID(id string) bool {
 // report under it and the bridge splice the last one into every turn there;
 // the operator applies the same rule (a2aTeamsHomeConversation).
 func teamsIsHomeConversationID(id string) bool {
-	return teamsIsConversationID(id) && !strings.Contains(id, teamsThreadToken)
+	return teamsIsConversationID(id) && !teamsHasThreadToken(id)
+}
+
+// teamsHasThreadToken reports a thread suffix in any spelling: Bot Framework
+// writes ";messageid=", Microsoft's deep links and Graph spell it
+// "messageId", and an operator may paste either into teams.homeChannel.
+func teamsHasThreadToken(id string) bool {
+	return strings.Contains(strings.ToLower(id), teamsThreadToken)
 }
 
 // teamsIsChannelID reports a channel conversation id with no thread suffix:
 // the one place a top-level post starts a thread.
 func teamsIsChannelID(id string) bool {
 	return (strings.HasSuffix(id, teamsChannelSuffix) || strings.HasSuffix(id, teamsLegacyChannelSuffix)) &&
-		!strings.Contains(id, teamsThreadToken)
+		!teamsHasThreadToken(id)
 }
 
 // teamsThreadInHome reports a thread the home conversation holds: the home

@@ -282,7 +282,7 @@ func TestTeamsJoinsTheNotifyPlatforms(t *testing.T) {
 	}
 	// A home the gateway refuses (NewTeamsNotifier: whitespace inside, or a
 	// URL) drops the whole route there, so the agent is told of neither.
-	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", teamsTestHome + ";messageid=1794603936403"} {
+	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", teamsTestHome + ";messageid=1794603936403", teamsTestHome + ";messageId=1794603936403"} {
 		agent.Spec.Integration.Teams.HomeChannel = malformed
 		if got := a2aNotifyPlatforms(agent); len(got) != 0 {
 			t.Errorf("notify platforms %v with home %q, which the gateway refuses", got, malformed)

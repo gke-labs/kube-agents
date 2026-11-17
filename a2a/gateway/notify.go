@@ -164,8 +164,8 @@ type notifyPostFeedback interface {
 }
 
 // notifyPoster is the backend half: post text into a space, new thread or
-// reply, and say where it landed. GoogleChatAdapter and SlackAdapter
-// implement it; the Notifier, not the poster, holds the home-only bound.
+// reply, and say where it landed. GoogleChatAdapter, SlackAdapter and
+// TeamsAdapter implement it; the Notifier, not the poster, holds the home-only bound.
 type notifyPoster interface {
 	PostNotify(space, thread, text string) (message, landed string, err error)
 }
@@ -199,8 +199,8 @@ var errNotifyNoTextEdit = errors.New("the layout did not land and the text does 
 
 // notifyChatEditor is the optional half a backend that edits a home-channel
 // message in place adds: the message a keyed home request last posted on a
-// thread, laid out or as text. SlackAdapter and GoogleChatAdapter implement
-// it; a keyed home request to any other backend posts anew.
+// thread, laid out or as text. SlackAdapter, GoogleChatAdapter and
+// TeamsAdapter implement it; a keyed home request to any other backend posts anew.
 type notifyChatEditor interface {
 	EditNotifyMessage(home, thread, message string, m OutMessage) error
 }
