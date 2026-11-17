@@ -58,6 +58,7 @@ from __future__ import annotations
 import fnmatch
 import http.client
 import json
+import math
 import os
 import re
 import shlex
@@ -4415,6 +4416,9 @@ def _rate_limit_wait(status: int, payload: Any, headers: Any) -> float | None:
         try:
             value = float(str(headers.get(name)).strip())
         except ValueError:
+            continue
+        if not math.isfinite(value):
+            # float() takes "nan", "inf" and "1e400"; none of them is a window.
             continue
         # One second past the reset, so the read lands in the new window.
         return max(1.0, value - time.time() + 1.0 if since_now else value)

@@ -5270,6 +5270,8 @@ def test_a_rate_limit_is_waited_out_for_the_window_the_forge_names(monkeypatch):
         (403, b'{"message": "Resource not accessible"}', {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1009"}, [10.0]),
         (429, b"{}", {"Retry-After": "30"}, [30.0]),
         (403, limited, {}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
+        (429, b"{}", {"Retry-After": "nan", "X-RateLimit-Reset": "1020"}, [21.0]),
+        (429, b"{}", {"Retry-After": "inf", "X-RateLimit-Reset": "1e400"}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
     ]
     def in_check(budget=verifiers._RATE_LIMIT_WAIT_BUDGET_SEC):
         cell = [budget]
