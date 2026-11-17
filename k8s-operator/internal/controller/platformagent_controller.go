@@ -1419,6 +1419,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The bus creds Secret before the agent Deployment, which can read keys of
+	// it from the first render: the rendered bridge's password, and the
+	// activity-hook key the agent holds beside any bridge, rendered or declared
+	// (a2aActivityHookWanted). The A2A stack below ensures it as well, but runs
+	// after the workload, so on a fresh install the first render would digest
+	// the Secret as absent (secretEnvHash) and the next pass, finding it, would
+	// change the pod template and roll the agent a second time (#5962). The
+	// stack ensures it on every pass, so ensuring it here first changes when,
+	// not whether; the ensure is idempotent and returns the Secret when it is
+	// there.
+	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
+	}
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1441,6 +1454,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, renderAgent, netpolProf); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The audit-report store's Service (audit_report_store.go); its ingress
+	// rule is in the gateway policy above.
+	if err := r.reconcileAuditReportStore(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, renderAgent); err != nil {

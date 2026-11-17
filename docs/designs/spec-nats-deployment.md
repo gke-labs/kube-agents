@@ -500,8 +500,8 @@ Layout:
   which have no validator - a side left empty beside a populated one renders an explicit
   `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
   ships, still gets no permissions block at all. A principal that must not publish cannot be
-  expressed by omission - there is no deny list in the map
-  - so it has to be left unrendered rather than rendered empty.
+  expressed by omission - the map's deny lists (#5301) only subtract from an allow and never
+  stand in for an empty one - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -852,7 +852,11 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+janitor yet. **Amended 11/16 (#5301):** the gateway has an entry too, keyed on its own
+ServiceAccount. Its grants carry deny lists, a shape the map gained for it: the only thing
+keeping its consumer-create wildcard on `TASKS` off the pre-created durables is a publish
+deny naming them. It uses the entry only at `A2A_GATEWAY_BUS_AUTH=token`; its static user
+stays until a release after that flip, so rolling back across it is the flag. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
 `a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
