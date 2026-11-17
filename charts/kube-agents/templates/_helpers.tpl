@@ -2009,7 +2009,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $n) $mult)) -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $out "" -}}
@@ -2019,7 +2019,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $n) $mult)) -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2027,7 +2027,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $raw) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (ceil (float64 $raw)) -}}
+{{- $out = include "kube-agents.clampInt64" (float64 $raw) -}}
 {{- end -}}
 {{- $out -}}
 {{- end -}}
@@ -3551,13 +3551,13 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          has a margin for that, and this check does not. */ -}}
   {{- $session = include "kube-agents.quotaSessionShare" . | fromJson -}}
   {{- if eq (include "kube-agents.quotaCountsSessions" .) "true" -}}
-    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" ($session.pods | int64)) | int64 -}}
-    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($session.requestsCpu | int64)) | int64 -}}
-    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($session.limitsCpu | int64)) | int64 -}}
-    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($session.requestsMemory | int64)) | int64 -}}
-    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($session.limitsMemory | int64)) | int64 -}}
-    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($session.requestsEphemeral | int64)) | int64 -}}
-    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($session.limitsEphemeral | int64)) | int64 -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.clampInt64" $session.pods | int64)) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.clampInt64" $session.requestsCpu | int64)) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.clampInt64" $session.limitsCpu | int64)) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.clampInt64" $session.requestsMemory | int64)) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.clampInt64" $session.limitsMemory | int64)) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.clampInt64" $session.requestsEphemeral | int64)) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.clampInt64" $session.limitsEphemeral | int64)) | int64 -}}
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
          #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
@@ -3744,11 +3744,11 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       "surgeRequestsMemory" $surgeMemReq "surgeLimitsMemory" $surgeMemLim
       "surgeRequestsEphemeral" $surgeEphReq "surgeLimitsEphemeral" $surgeEphLim
       "chartSurgePods" $chartSurgePods
-      "maxSessions" ($session.maxSessions | default 0 | int64)
-      "sessionPods" ($session.pods | default 0 | int64)
-      "sessionRequestsCpu" ($session.requestsCpu | default 0 | int64) "sessionLimitsCpu" ($session.limitsCpu | default 0 | int64)
-      "sessionRequestsMemory" ($session.requestsMemory | default 0 | int64) "sessionLimitsMemory" ($session.limitsMemory | default 0 | int64)
-      "sessionRequestsEphemeral" ($session.requestsEphemeral | default 0 | int64) "sessionLimitsEphemeral" ($session.limitsEphemeral | default 0 | int64)
+      "maxSessions" (include "kube-agents.clampInt64" ($session.maxSessions | default 0) | int64)
+      "sessionPods" (include "kube-agents.clampInt64" ($session.pods | default 0) | int64)
+      "sessionRequestsCpu" (include "kube-agents.clampInt64" ($session.requestsCpu | default 0) | int64) "sessionLimitsCpu" (include "kube-agents.clampInt64" ($session.limitsCpu | default 0) | int64)
+      "sessionRequestsMemory" (include "kube-agents.clampInt64" ($session.requestsMemory | default 0) | int64) "sessionLimitsMemory" (include "kube-agents.clampInt64" ($session.limitsMemory | default 0) | int64)
+      "sessionRequestsEphemeral" (include "kube-agents.clampInt64" ($session.requestsEphemeral | default 0) | int64) "sessionLimitsEphemeral" (include "kube-agents.clampInt64" ($session.limitsEphemeral | default 0) | int64)
    | toJson -}}
 {{- end }}
 
@@ -4045,8 +4045,8 @@ true
       {{- end -}}
       {{- /* Name the session share when the totals carry it, so a quota sized for the
              standing release reads why it no longer fits, and what scales it. */ -}}
-      {{- if and (eq (include "kube-agents.quotaCountsSessions" $ctx) "true") (gt ($r.sessionPods | default 0 | int64) 0) -}}
-        {{- $ephNote = printf "%s\n(required includes the session pods at the cap: %d pods, %dm CPU and %dMi memory requested%s; platformAgent.harness.tuning.maxSessions and sessionResources scale them)" $ephNote ($r.sessionPods | int64) ($r.sessionRequestsCpu | int64) (div ($r.sessionRequestsMemory | int64) 1048576) (ternary ", at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request" "" (eq (include "kube-agents.gkeAutopilot" $ctx) "true")) -}}
+      {{- if and (eq (include "kube-agents.quotaCountsSessions" $ctx) "true") (gt (include "kube-agents.clampInt64" ($r.sessionPods | default 0) | int64) 0) -}}
+        {{- $ephNote = printf "%s\n(required includes the session pods at the cap: %d pods, %dm CPU and %dMi memory requested%s; platformAgent.harness.tuning.maxSessions and sessionResources scale them)" $ephNote (include "kube-agents.clampInt64" $r.sessionPods | int64) (include "kube-agents.clampInt64" $r.sessionRequestsCpu | int64) (div (include "kube-agents.clampInt64" $r.sessionRequestsMemory | int64) 1048576) (ternary ", at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request" "" (eq (include "kube-agents.gkeAutopilot" $ctx) "true")) -}}
       {{- end -}}
       {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
       {{- $quotaReports = append $quotaReports $report -}}
@@ -4119,9 +4119,9 @@ us-central1
 {{- $counted := eq (include "kube-agents.quotaCountsSessions" .) "true" -}}
 {{- if $counted -}}
   {{- $r = merge (dict
-        "requestsCpu" (sub ($r.requestsCpu | int64) ($r.sessionRequestsCpu | int64))
-        "requestsMemory" (sub ($r.requestsMemory | int64) ($r.sessionRequestsMemory | int64))
-        "pods" (sub ($r.pods | int64) ($r.sessionPods | int64))) $r -}}
+        "requestsCpu" (sub ($r.requestsCpu | int64) (include "kube-agents.clampInt64" $r.sessionRequestsCpu | int64))
+        "requestsMemory" (sub ($r.requestsMemory | int64) (include "kube-agents.clampInt64" $r.sessionRequestsMemory | int64))
+        "pods" (sub ($r.pods | int64) (include "kube-agents.clampInt64" $r.sessionPods | int64))) $r -}}
 {{- end -}}
 {{- $bytesPerGiB := 1073741824.0 -}}
 {{- $millisPerCore := 1000.0 -}}
