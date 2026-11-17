@@ -17733,6 +17733,8 @@ def open_remediation_pr(
             {"number": int(number), "title": title, "body": body},
         )
         sync_remediation_labels(repo, number, audit_id, highest)
+        if safety or carries_practice_label(existing):
+            request_practice_label(repo, number)
         return str(existing.get("url") or "")
     # Labelled in a second call because creating a proposal takes none; `gh pr
     # create --label` made the same two requests. Not best-effort: an unlabelled
@@ -17768,7 +17770,45 @@ def open_remediation_pr(
                     ),
                 },
             )
+    if safety and number is not None:
+        request_practice_label(repo, number)
     return str(created.get("url") or "") or None
+
+
+# The broker verb that judges a disruption-budget fix and applies the reserved
+# auto-merge label itself (vcs_broker.VcsBroker.proposal_practice_label), and
+# its labels (automerge_eligibility.RESERVED_LABELS).
+PRACTICE_LABEL_VERB = "proposal-practice-label"
+PRACTICE_LABELS = ("kube-agents:would-auto-merge", "kube-agents:auto-merge")
+
+
+def carries_practice_label(pr: dict | None) -> bool:
+    """Whether a pull request record carries one of the broker's auto-merge labels: a
+    refresh then asks the broker again even with no section to write, so a
+    label from an earlier `practice` or `on`, or from a group that has since
+    changed, comes off."""
+    return any(
+        str((label or {}).get("name") or "").casefold() in PRACTICE_LABELS
+        for label in (pr or {}).get("labels") or []
+    )
+
+
+def request_practice_label(repo: str, number: int | str) -> None:
+    """Ask the broker to judge pull request `number` for the auto-merge label.
+
+    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    holding a disruption-budget fix), and on a refresh of a pull request that
+    already carries the label. The broker reads everything itself and decides;
+    this sends the number and logs the answer. A refusal is logged and nothing
+    more: the pull request is open either way. A broker that does not answer
+    raises `BrokerUnavailable`, as every forge call here does.
+    """
+    try:
+        answer = forge(PRACTICE_LABEL_VERB, repo, {"number": int(number)})
+    except (ForgeError, ValueError) as exc:
+        log(f"WARNING: #{number}: the auto-merge label was not judged: {exc}")
+        return
+    log(f"PRACTICE LABEL: #{number}: labelled={answer.get('labelled')} ({answer.get('reason')})")
 
 
 def open_proposal_on(repo: str, branch: str) -> dict | None:

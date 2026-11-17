@@ -343,5 +343,27 @@ class SwitchTest(unittest.TestCase):
             self.assertEqual(audit_report.automerge_switch(), "off")
 
 
+class PracticeLabelRequestTest(unittest.TestCase):
+    def test_the_broker_is_asked_with_the_number_only(self):
+        with mock.patch.object(audit_report, "forge", return_value={"labelled": True, "reason": "eligible"}) as call:
+            audit_report.request_practice_label("acme/infra", "7")
+        call.assert_called_once_with("proposal-practice-label", "acme/infra", {"number": 7})
+
+    def test_a_refusal_is_logged_and_the_pull_request_stands(self):
+        with mock.patch.object(audit_report, "forge", side_effect=audit_report.ForgeError("unknown verb")):
+            audit_report.request_practice_label("acme/infra", 7)
+
+    def test_a_label_from_an_earlier_run_is_seen_in_any_case(self):
+        self.assertTrue(audit_report.carries_practice_label({"labels": [{"name": "Kube-Agents:Auto-Merge"}]}))
+        self.assertFalse(audit_report.carries_practice_label({"labels": [{"name": "audit:remediation"}]}))
+        self.assertFalse(audit_report.carries_practice_label(None))
+
+    def test_the_label_names_are_the_brokers(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import automerge_eligibility
+
+        self.assertEqual(audit_report.PRACTICE_LABELS, automerge_eligibility.RESERVED_LABELS)
+
+
 if __name__ == "__main__":
     unittest.main()

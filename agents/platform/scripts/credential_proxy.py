@@ -12138,6 +12138,21 @@ def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path, purpose: 
         )
 
 
+def _cluster_read(executor: CommandExecutor, argv: list[str], context: str) -> tuple[int, str, str]:
+    """`(exit code, stdout, stderr)` of one read the broker runs for itself.
+
+    A refusal or a failure to start is an answer with a non-zero code, so the
+    caller reads it as "not read" rather than as an error of its own.
+    """
+    try:
+        result = executor.execute(argv, kubeconfig_context=context or None)
+    except (ValueError, RuntimeError, OSError) as error:
+        return 1, "", str(error)
+    if result.truncated or result.timed_out:
+        return 1, "", "the read was cut short"
+    return result.exit_code, result.stdout, result.stderr
+
+
 def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
@@ -12174,6 +12189,10 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
+        # The reads `proposal-practice-label` makes for itself: a gcloud
+        # describe and a namespaced kubectl get, through the same executor,
+        # kubeconfig selection and output cap as a caller's.
+        cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",

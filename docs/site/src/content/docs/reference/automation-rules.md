@@ -86,6 +86,36 @@ cannot be caught this way: it is a valid label value that matches no cluster.
 - A rule is missing `fix` or `environments`, names a fix kind kube-agents does not open, has an
   environment that is not a label value, or is an allow rule that uses `*`.
 
+## The auto-merge labels
+
+With the switch `practice` or `on`, each time the fleet audit opens or refreshes a pull request for a
+`no-pdb` fix, kube-agents' credential broker judges it. When all of these hold it adds a label,
+`kube-agents:would-auto-merge` under `practice` and `kube-agents:auto-merge` under `on`:
+
+1. The pull request is open and was opened by kube-agents.
+2. It adds one file and changes nothing else, and that file is, byte for byte, the
+   PodDisruptionBudget the audit generates: `maxUnavailable: 1` over the workload's own selector. The
+   file sits in its cluster's own directory, `clusters/<cluster>/`, as in the reference layout.
+3. The pull request targets the repository's base branch, and this file, read from that branch,
+   allows `no-pdb` in the cluster's environment.
+4. The cluster, read at that moment, passes three safety checks. The workload has at least two
+   replicas and all of them are Ready. No other PodDisruptionBudget selects its pods or has the new
+   one's name. The new budget's selector is the workload's live selector and selects no other
+   workload's pods.
+
+A pull request that carries a label and no longer qualifies loses it the next time the audit
+refreshes it, which includes after the switch is turned back to `off`. A change of switch value swaps
+one label for the other. A push to its branch normally takes the label off at once. The broker reads
+all of this itself. No request from the agent can add, remove or create either label, so neither
+rests on anything the agent reports. The pull request's body shows the same safety checks under
+**Safety checks**.
+
+The labels are never applied on GitLab, where a `/label` line in a comment or a description sets a
+label, so no label there is kube-agents' alone. Under `practice` the label is the whole effect:
+compare the pull requests that carry it with the ones your team merged. Under `on` your pipeline may
+merge a pull request that carries `kube-agents:auto-merge`. kube-agents merges nothing in either
+mode.
+
 ## Check a file
 
 In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:
