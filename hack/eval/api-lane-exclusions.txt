@@ -54,3 +54,7 @@ chat-reply-under-pushed-report
 # whom the session delegated to; the api transport can't report it. Leaves this
 # list when the api lane can read a turn's delegations.
 session-delegates-to-the-profile-asked-for
+
+# #3842: graded by delegated_to, as the case above; the api transport can't
+# report whom a session delegated to.
+tse-profile-names-the-oom-kill

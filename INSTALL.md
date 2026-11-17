@@ -972,8 +972,8 @@ helm upgrade kube-agents ./charts/kube-agents \
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
 On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
-first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
-re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+first install writes it as true; a file without the key is read from the live install (the
+Terraform state, then the node pools), and a re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
 `install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
 `agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
 set only on the Helm release or only in `terraform.tfvars` is reverted.
@@ -1623,7 +1623,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
   ```
-  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, the operator restarts both readers once it's back, provided it saw the stream missing on three five-minute polls in a row, or re-ran the provision Job itself while it was missing (`A2ABusClientsRestarted` names them). After a quicker fix, restart them yourself, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
   ```bash
   kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
   ```

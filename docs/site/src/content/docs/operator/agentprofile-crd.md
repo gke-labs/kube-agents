@@ -73,8 +73,6 @@ A profile binds to the PlatformAgent in its own namespace. The operator renders 
 
 When a bound `AgentProfile`'s name matches a built-in optional specialist template baked into the `platform-agent` image (`tse`), the operator also sets `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment (which triggers a gateway pod rollout when `tse` is added or removed so the entrypoint scaffolds or archives `$HERMES_HOME/profiles/tse`). Ordinary `AgentProfile` resources (such as `chat` or `auditor`) do not touch `KUBE_AGENTS_ENABLED_PROFILES` and do not roll the gateway pod.
 
-The chart's `tse` profile still ships a placeholder persona image with no persona payload. With the profile dispatcher on, its default, a bound `tse` gets a warm worker that crash-loops at its persona step until a real `tse` persona image ships. Handing work to `tse` through Kanban still works, since that runs in the scaffolded Hermes profile.
-
 Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every reconciled profile carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory), and then delete its ServiceAccounts in the profile namespace, which carry no owner reference and so outlive it. Left there, they'd make a profile re-created under the same name find them foreign and be refused:
 
 ```bash
@@ -98,11 +96,19 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 
 - **A name with no tier** renders nothing (reason `TierUnknown`). The profile's other tiers render as usual, and a profile left with none renders nothing at all.
 - **At most one unattended-mode tier** per profile, because unattended tasks run as Jobs from one template per profile. If a profile lists a second one, the one it already serves keeps serving and the newcomer renders nothing (reason `TierModeConflict`). A new profile listing two renders neither until one is removed.
-- **A tier dropped from the list drains.** That covers one whose `Tier` is deleted, and one that stops rendering. The card stops advertising it, and nothing new starts at it at once. A task already queued at it is refused with the reason `tier-withdrawn`. A task already running at it keeps its ServiceAccount, queues and pool, and finishes. The tier drains for the longest deadline a task can carry plus 15 minutes, then everything it rendered is removed within a few minutes. `TiersRendered` names each draining tier and when its drain ends.
+- **A tier dropped from the list drains.** That covers one whose `Tier` is deleted, and one that stops rendering. The card stops advertising it, and nothing new starts at it at once. A task already queued at it is refused with the reason `tier-withdrawn`. A task already running at it keeps its ServiceAccount, queues and pool, and finishes. The tier drains for the longest deadline a task can carry plus 15 minutes, then everything it rendered is removed within seconds. `TiersRendered` names each draining tier and when its drain ends.
 
   Listing the tier again ends the drain once it renders again: not while its `Tier` is missing, and not while it conflicts with the profile's live unattended-mode tier. A running task that delegates to its own profile at the draining tier is refused like any new task; delegating to another profile still works. A profile left with no tier that renders drains as a removed profile does. A profile on a named ServiceAccount (`spec.identity`) serves one tier, so its tier is replaced at once rather than drained.
 
-  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. There's no lever yet to end a whole tier's running work at once. Stop is the requester's, and an unattended Job has no chat. For now, delete a running task's worker pod, or its Job for an unattended task, in the profile namespace: that ends the one task, which the dispatcher fails `lease-expired`.
+  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. To end a drain now, annotate the profile:
+
+  ```sh
+  kubectl -n <namespace> annotate agentprofile <name> kubeagents.x-k8s.io/end-tier-drain=<tier>[,<tier>]
+  ```
+
+  The dispatcher ends each task it holds at a listed tier: the task ends `canceled` with reason `tier-ended`, and its worker drops it. The tier is then removed within two minutes, with its ServiceAccount, pool and Jobs.
+
+  The annotation acts only on a tier the profile is draining. The operator removes each tier from the annotation once it has acted, and removes a listed tier that the profile runs or isn't draining, with a Warning event, so a leftover entry never ends a later drain. Anyone who can update the AgentProfile can set it. It ends one tier's drain on a profile that still runs another tier; a profile left with no tier drains as a whole, which this annotation doesn't end. A task still being handed to a worker when you set it is ended once it starts.
 
 `status.renderedTiers` records what the last pass rendered. The operator uses it to tell the tier a profile already serves from a newcomer. If status is lost (a restore, a GitOps apply), it reads the profile's own ServiceAccounts once instead.
 

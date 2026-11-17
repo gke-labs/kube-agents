@@ -547,6 +547,11 @@ type PlatformAgentReconciler struct {
 	// Cleared by an echo that carries the field, and when the CR is deleted;
 	// a restart of the operator after the CRD is applied clears it too.
 	prunedBusMigrationStatus sync.Map
+	// singleServerBusWarned holds, per CR, the UID of the one-server bus pod
+	// the A2ABusSingleServer Event last named (noteA2ABusSingleServer), so
+	// the Event is written once per pod, not on every pass. Cleared when the
+	// bus is not one server, and when the CR is deleted.
+	singleServerBusWarned sync.Map
 	// prunedObservedVersion records, per CR, when a status write was last
 	// seen to come back without status.observedVersion: an operator rolled
 	// ahead of the CRD that adds the field. While fresh, updateStatusReady
@@ -1430,6 +1435,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The bus creds Secret before the agent Deployment, which can read keys of
+	// it from the first render: the rendered bridge's password, and the
+	// activity-hook key the agent holds beside any bridge, rendered or declared
+	// (a2aActivityHookWanted). The A2A stack below ensures it as well, but runs
+	// after the workload, so on a fresh install the first render would digest
+	// the Secret as absent (secretEnvHash) and the next pass, finding it, would
+	// change the pod template and roll the agent a second time (#5962). The
+	// stack ensures it on every pass, so ensuring it here first changes when,
+	// not whether; the ensure is idempotent and returns the Secret when it is
+	// there.
+	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
+	}
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1452,6 +1470,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, renderAgent, netpolProf); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The audit-report store's Service (audit_report_store.go); its ingress
+	// rule is in the gateway policy above.
+	if err := r.reconcileAuditReportStore(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, renderAgent); err != nil {
@@ -1599,6 +1622,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
+		// And a tier drain's end (#5850), which nothing watched marks.
+		if a2aState.drainEndRequeue > 0 {
+			requeue = min(requeue, a2aState.drainEndRequeue)
+		}
 		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1666,6 +1693,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// config: a single server's reload landing moves nothing watched.
 	if a2aState.profileHoldRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
+	}
+	// A tier drain ending: its teardown is the pass after its end.
+	if a2aState.drainEndRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.drainEndRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -5628,6 +5659,7 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusMigrationStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.singleServerBusWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
@@ -6110,7 +6142,8 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the A2A stack renders — one per reconcile while the exec tier is short
 // of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
 // pod per reconcile while a bus replica is not on the StatefulSet's update
-// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
+// revision (replaceStuckA2ANATSPod), and one Get of the bus pod per reconcile
+// on a one-server bus with no migration in flight (noteA2ABusSingleServer). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
@@ -6799,7 +6832,10 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				// also picks the incumbent unattended tier, but it changes
 				// only on a pass that a spec or Tier change started, which
 				// enqueues this controller too.
-				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+				// The end-tier-drain annotation too (#5850): it changes no
+				// generation, and the dispatch config this pass writes is
+				// where the end takes effect.
+				builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, endTierDrainChanged())),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
 				// operator-created ServiceAccounts (a foreign one under
