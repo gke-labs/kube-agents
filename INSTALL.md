@@ -972,8 +972,8 @@ helm upgrade kube-agents ./charts/kube-agents \
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
 On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
-first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
-re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+first install writes it as true; a file without the key is read from the live install (the
+Terraform state, then the node pools), and a re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
 `install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
 `agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
 set only on the Helm release or only in `terraform.tfvars` is reverted.
@@ -1309,7 +1309,8 @@ absent the operator uses `platform-agent-secrets` / `API_SERVER_KEY` as an optio
 the gateway starts even before that entry exists. This step is for a first install. On an existing
 install keep the CR you have: the webhook admits one per cluster ("only one PlatformAgent is
 allowed per cluster"), so re-applying under a new name is refused, and the upgrade note in Step 2
-derives its names from whichever CR exists.
+derives its names from whichever CR exists. The webhook also admits the CR in the operator's
+namespace only (`kubeagents-system` here), where the operator's write Role is bound.
 
 ```bash
 sed -e 's/^  name: platformagent$/  name: platform-agent/' \
