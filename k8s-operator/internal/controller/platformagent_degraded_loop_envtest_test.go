@@ -284,7 +284,15 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 	// of whether anything wrote it.
 	reconcilesBefore := platformAgentReconcileTotal(t)
 	writesBefore := counting.writes.Load()
-	rvBefore := current.ResourceVersion
+	// Read the object again as the window opens, after the writes counter:
+	// `current` is the first read that satisfied parked, and the parking pass
+	// writes status several times within a few milliseconds, so a poll that
+	// lands between two of them parks one write early. That last write then
+	// lands during the quiesce, counted before writesBefore, and a
+	// resourceVersion taken from `current` would blame it on the window
+	// (#6219). Reading after the counter keeps every write the window
+	// doesn't count out of rvBefore too.
+	rvBefore := fetch().ResourceVersion
 	time.Sleep(degradedLoopMeasureWindow)
 	reconciles := platformAgentReconcileTotal(t) - reconcilesBefore
 	writes := counting.writes.Load() - writesBefore
