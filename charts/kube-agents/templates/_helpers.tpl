@@ -2502,6 +2502,28 @@ these have passed.
 {{- if not (regexMatch $quantityPattern (trimPrefix "-" (trimPrefix "+" $raw))) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
+{{- /* The magnitude bounds containerResourcesCheck holds a quantity to, on the value
+       without its sign (the resolver reads a negative as unset, but the operator must
+       still decode it): 15 significant digits, and nothing past int64 in bytes or in
+       millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
+{{- $abs := trimPrefix "-" (trimPrefix "+" $raw) -}}
+{{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
+{{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
+{{- if gt (len $significand) 15 -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits; write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $abs -}}
+{{- fail (printf "%s.%s.%s is %s, which is past the range a quantity can hold, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $abs) -}}
+{{- fail (printf "%s.%s.%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if eq $name "cpu" -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $abs "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
+{{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
+{{- fail (printf "%s.%s.%s is %s, whose millicore value exceeds the 9223372036854775807 an int64 holds, and the operator could not decode the PlatformAgent" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
