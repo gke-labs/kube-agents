@@ -228,9 +228,11 @@ func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
 	if mainFn == nil || len(mainFn.Body.List) == 0 {
 		t.Fatalf("%s has no main function with a body", mainSourceFile)
 	}
-	// The last statement is `if err := mgr.Start(...); err != nil { ... }`,
-	// and its body only logs and exits: that body is the one place code can
-	// run after Start returns.
+	// The last statement is exactly `if err := mgr.Start(...); err != nil {
+	// ... }` with no else, and its body only logs and exits. Start returns
+	// nil on a graceful stop, so an else would run on every shutdown, after
+	// the lease is gone; the condition and the body's arguments are the only
+	// other places code could run then.
 	last, ok := mainFn.Body.List[len(mainFn.Body.List)-1].(*ast.IfStmt)
 	startsManager := false
 	if ok {
@@ -243,6 +245,12 @@ func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
 	if !startsManager {
 		t.Fatalf("main's last statement isn't `if err := %s(...); err != nil {...}`: something runs after the manager stops, and with the lease released another operator may already be leading", managerStartCall)
 	}
+	if last.Else != nil {
+		t.Errorf("the %s statement has an else (%s): Start returns nil on a graceful stop, so it runs on every shutdown with the lease already released", managerStartCall, fset.Position(last.Else.Pos()))
+	}
+	if got := types.ExprString(last.Cond); got != "err != nil" {
+		t.Errorf("the %s statement's condition is %q, want \"err != nil\": anything else in it runs after Start returns", managerStartCall, got)
+	}
 	for _, stmt := range last.Body.List {
 		expr, isExpr := stmt.(*ast.ExprStmt)
 		call, isCall := (*ast.CallExpr)(nil), false
@@ -251,6 +259,16 @@ func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
 		}
 		if !isCall || (literalTypeName(call.Fun) != "setupLog.Error" && literalTypeName(call.Fun) != "os.Exit") {
 			t.Errorf("the branch after %s returns does more than log and exit (%s): it runs with the lease already released", managerStartCall, fset.Position(stmt.Pos()))
+			continue
+		}
+		for _, arg := range call.Args {
+			ast.Inspect(arg, func(n ast.Node) bool {
+				if _, nested := n.(*ast.CallExpr); nested {
+					t.Errorf("an argument at %s calls something: it runs after %s returns, with the lease already released", fset.Position(n.Pos()), managerStartCall)
+					return false
+				}
+				return true
+			})
 		}
 	}
 	if _, set := literalField(file, managerOptionsType, "GracefulShutdownTimeout"); set {
@@ -261,23 +279,27 @@ func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reading %s: %v", manifest, err)
 		}
-		m := regexp.MustCompile(`terminationGracePeriodSeconds:\s*(\d+)`).FindSubmatch(raw)
-		if m == nil {
+		// Only uncommented lines, every one of them, and the whole value: a
+		// commented-out field, a second one, or a value like 10_000 can't pass.
+		matches := regexp.MustCompile(`(?m)^[ \t]*terminationGracePeriodSeconds:[ \t]*(\S+)`).FindAllSubmatch(raw, -1)
+		if len(matches) == 0 {
 			t.Errorf("%s sets no terminationGracePeriodSeconds: Kubernetes' default 30 s lets a stop reach controller-runtime's 30 s timeout, which releases the lease while a reconcile may still run", manifest)
 			continue
 		}
-		if n, _ := strconv.Atoi(string(m[1])); n > operatorMaxTerminationGraceSeconds {
-			t.Errorf("%s gives the operator %d s to stop, want at most %d: past controller-runtime's 30 s default the lease is released while a reconcile may still run", manifest, n, operatorMaxTerminationGraceSeconds)
+		for _, m := range matches {
+			if n, err := strconv.Atoi(string(m[1])); err != nil || n < 1 || n > operatorMaxTerminationGraceSeconds {
+				t.Errorf("%s gives the operator %q s to stop, want 1..%d: 0 kills it with no graceful stop, and past controller-runtime's 30 s default the lease is released while a reconcile may still run", manifest, m[1], operatorMaxTerminationGraceSeconds)
+			}
 		}
 	}
+	// Closures inside main are scanned too: one that main calls itself (the
+	// webhook setup funcs, say) could start a goroutine just as main could.
 	ast.Inspect(mainFn.Body, func(n ast.Node) bool {
 		switch n.(type) {
 		case *ast.DeferStmt:
 			t.Errorf("main has a defer at %s: it runs after mgr.Start returns, when the lease is already released", fset.Position(n.Pos()))
 		case *ast.GoStmt:
 			t.Errorf("main starts a goroutine at %s: it can still be running after mgr.Start returns and the lease is released", fset.Position(n.Pos()))
-		case *ast.FuncLit:
-			return false // a closure handed to something else isn't main's own statement
 		}
 		return true
 	})
