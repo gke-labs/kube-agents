@@ -302,6 +302,7 @@ WATCHED_WORKFLOWS = (
     "Documentation Freshness Check",
     "GHES Proxy Tests",
     "Installer Cross-OS Validation Matrix",
+    "Installer tests on bash 3.2",
     "Operator Tests",
     "Prettier Check",
     "Python Unit Tests",

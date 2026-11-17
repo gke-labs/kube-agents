@@ -63,6 +63,7 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **GitOps Repository**: Asks where the GitOps repository lives (GitHub, a GitHub Enterprise Server, or GitLab; for Bitbucket, pass `--gitops-forge` instead), or **Nowhere yet** to install without one; a later re-run of `install.sh` connects one. Without a repository the agent runs and the scheduled audits run, but an audit opens no ledger issue or pull request ([Each morning: the scheduled audits](#each-morning-the-scheduled-audits)).
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, selects Vertex AI (no key — Workload Identity), or points the gateway at an OpenAI-compatible server you run (model name, base URL, the egress it needs, and an optional key).
+- **GKE Stockout Investigator**: Prompts on interactive runs to enable automated cluster-autoscaler `noScaleUp` diagnostics, defaulting to Yes when a Google Chat or Slack home channel is configured and No otherwise; non-interactive runs leave it off unless `--enable-stockout-investigator` or `ENABLE_STOCKOUT_INVESTIGATOR=true` is set. Also changeable from the Day-2 Control Panel (`./install.sh --menu`).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Engine Execution**: Generates `terraform/examples/full-install/terraform.tfvars` from the loaded configuration, records that configuration in `install.env` when a first install has none, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
@@ -1308,7 +1309,8 @@ absent the operator uses `platform-agent-secrets` / `API_SERVER_KEY` as an optio
 the gateway starts even before that entry exists. This step is for a first install. On an existing
 install keep the CR you have: the webhook admits one per cluster ("only one PlatformAgent is
 allowed per cluster"), so re-applying under a new name is refused, and the upgrade note in Step 2
-derives its names from whichever CR exists.
+derives its names from whichever CR exists. The webhook also admits the CR in the operator's
+namespace only (`kubeagents-system` here), where the operator's write Role is bound.
 
 ```bash
 sed -e 's/^  name: platformagent$/  name: platform-agent/' \
