@@ -52,6 +52,9 @@ const (
 	abandonWithdrawn    = "offer withdrawn: the accept came after the dispatcher stopped waiting"
 	abandonTimedOut     = "offer withdrawn: no accept within the accept window"
 	abandonLeaseExpired = "lease expired: the dispatcher heard no renewal in time"
+	// abandonTierEnded is the abandon reason sent a worker whose task's tier
+	// an administrator ended the drain of (#5850).
+	abandonTierEnded    = "the tier's drain was ended by an administrator"
 	abandonStopping     = "offer withdrawn: the dispatcher is stopping"
 	abandonUnrecorded   = "offer withdrawn: the dispatcher could not record the lease"
 	abandonNoCredential = "offer withdrawn: the dispatcher could not mint the task's credentials"
@@ -135,6 +138,9 @@ type holding struct {
 	// when hold starts, wakes hold for it.
 	stopRequested bool
 	stopc         chan struct{}
+	// tierEnded is an administrator ending the drain of this task's tier
+	// (syncEndingTiers, #5850): the hold ends the task at once.
+	tierEnded bool
 
 	renewals chan renewal
 	done     chan struct{}
@@ -385,7 +391,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
 		d.grantedProfiles[p.Name] = true
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			d.granted[dur.Name] = true
 		}
 	}
@@ -405,6 +411,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 	d.syncBindings(ctx)
 	d.syncStops()
+	d.syncEndingTiers()
 	defer d.stopAllStops()
 	refresh := time.NewTicker(d.cfg.RefreshInterval)
 	defer refresh.Stop()
@@ -421,6 +428,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-refresh.C:
 			d.syncBindings(ctx)
 			d.syncStops()
+			d.syncEndingTiers()
 			// The stream reads run off the loop, one pass at a time.
 			if rechecking.CompareAndSwap(false, true) {
 				d.bg.Add(1)
@@ -498,7 +506,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 		if !d.grantedProfiles[p.Name] {
 			addedProfiles[slot] = append(addedProfiles[slot], p.Name)
 		}
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
 				added[slot] = append(added[slot], dur.Name)
@@ -1433,10 +1441,19 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 	if h.stopRequested {
 		stopAt = stopDeadline(d.src.Config(), d.now())
 	}
+	ended := h.tierEnded
 	d.mu.Unlock()
+	if ended { // marked before the hold began, or a re-adopted task
+		d.endTierHeld(ctx, log, del, h, key, rec)
+		return
+	}
 	for {
 		select {
 		case <-h.stopc:
+			if d.tierEndedOn(h) {
+				d.endTierHeld(ctx, log, del, h, key, rec)
+				return
+			}
 			if stopAt.IsZero() {
 				stopAt = stopDeadline(d.src.Config(), d.now())
 				log.Info("stop requested; the executor has a grace to end the task", "until", stopAt)
@@ -2043,14 +2060,14 @@ func submitRetention(cfg lib.DispatchConfig) time.Duration {
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
-// config lists is bound. Callers hold d.mu.
+// config derives is bound. Callers hold d.mu.
 func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier string) bool {
 	prof, ok := profileOf(cfg, profile)
 	if !ok {
 		return false
 	}
 	n := 0
-	for _, dur := range prof.Durables {
+	for _, dur := range prof.DerivedDurables() {
 		if dur.Tier != tier {
 			continue
 		}

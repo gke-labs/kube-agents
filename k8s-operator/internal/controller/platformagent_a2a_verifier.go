@@ -205,6 +205,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// Two replicas on two nodes, so that the drain the budget
 					// rate-limits is a drain of one of them. Advisory

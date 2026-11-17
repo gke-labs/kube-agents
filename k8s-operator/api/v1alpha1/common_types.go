@@ -53,7 +53,44 @@ const (
 	a2aNATSCASuffix      = "-ca"
 
 	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
+
+	// DefaultUniverseDomain is Google Cloud's commercial API universe domain.
+	DefaultUniverseDomain = "googleapis.com"
+	// MaxUniverseDomainLength is the DNS hostname length cap enforced on
+	// Google Cloud universe domain values across spec, metadata, and env inputs.
+	MaxUniverseDomainLength = 253
+	// GoogleCloudUniverseDomainEnv is the Google Cloud client-library
+	// environment variable naming the active API universe domain.
+	GoogleCloudUniverseDomainEnv = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+	// CloudSDKUniverseDomainEnv is the Google Cloud SDK environment variable
+	// naming the active core/universe_domain property.
+	CloudSDKUniverseDomainEnv = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+	// KubeProxyUniverseDomainEnv is the k8s-api-proxy environment variable
+	// naming the active Google Cloud universe domain.
+	KubeProxyUniverseDomainEnv = "KUBE_PROXY_UNIVERSE_DOMAIN"
+	// CloudSDKEndpointOverridesEnvPrefix is the prefix for gcloud per-service
+	// API endpoint overrides (CLOUDSDK_API_ENDPOINT_OVERRIDES_<SERVICE>).
+	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
+
+var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
+// lowercases the candidate, and validates it as a multi-label DNS hostname of
+// at most MaxUniverseDomainLength bytes.
+func NormalizeUniverseDomain(raw string) (string, bool) {
+	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// IsValidUniverseDomain reports whether raw is already a canonical lower-case
+// multi-label DNS hostname within MaxUniverseDomainLength.
+func IsValidUniverseDomain(raw string) bool {
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+}
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
 // PlatformAgent, and the stem of A2ACredsSecretName.
@@ -198,6 +235,23 @@ var SensitiveEnvVars = map[string]struct{}{
 	"NATS_USER":         {},
 	"NATS_PASSWORD":     {},
 	"VCS_FORGES_CONFIG": {},
+	// Universe-domain variables decide which Google API host receives the
+	// credential proxy's cloud-platform access token and which universe the
+	// watchers and relays address. Only spec.harness.universeDomain (or the
+	// operator's metadata-server detection) may set them; a spec.deployment.env
+	// entry would redirect Google tokens outside the install's universe.
+	GoogleCloudUniverseDomainEnv: {},
+	CloudSDKUniverseDomainEnv:    {},
+	KubeProxyUniverseDomainEnv:   {},
+}
+
+// IsSensitiveEnvVar reports whether name is reserved in SensitiveEnvVars or
+// carries a reserved Cloud SDK endpoint-override prefix.
+func IsSensitiveEnvVar(name string) bool {
+	if _, ok := SensitiveEnvVars[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, CloudSDKEndpointOverridesEnvPrefix)
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -436,6 +490,21 @@ type HarnessSpec struct {
 	// localhost:8080. See buildCredentialProxyEnv.
 	// +required
 	ProjectID string `json:"projectId,omitempty"`
+
+	// UniverseDomain is the Google Cloud API universe domain for this install
+	// (for example, "googleapis.com" on standard Google Cloud, or a custom API
+	// domain on Google Cloud Dedicated / Sovereign Cloud). When omitted, the
+	// operator probes the GKE metadata server
+	// (/computeMetadata/v1/universe/universe-domain) and falls back to
+	// "googleapis.com" outside GCE/GKE. One PlatformAgent spans a single
+	// universe domain: when set and the host metadata server reports a
+	// different universe domain, the operator refuses the mismatch and marks
+	// the CR Degraded with reason UniverseDomainMismatch rather than sending
+	// tokens across universe boundaries.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`
+	// +optional
+	UniverseDomain string `json:"universeDomain,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
@@ -953,9 +1022,9 @@ type TuningSpec struct {
 	// map bounds WHO can spawn and this bounds HOW MANY.
 	//
 	// Unset means 10, the operator's default - a "busy day" sizing: at the
-	// session-pod shape (250m CPU / 512Mi requests) ten concurrent sessions
-	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
-	// preemption.
+	// session-pod shape's default requests (150m CPU / 320Mi, SessionResources)
+	// ten concurrent sessions hold 1.5 CPU / 3.2Gi, which a small dev cluster
+	// absorbs without preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
@@ -1020,6 +1089,24 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// SessionResources are the A2A session pods' CPU and memory requests and
+	// limits (#2371). Each of requests.cpu, requests.memory, limits.cpu and
+	// limits.memory is this field's if set to a positive quantity, else its
+	// default (150m, 320Mi, 2 and 2Gi), independently; a zero or negative key
+	// keeps its default. A request set alone above its default limit raises
+	// the limit to match; otherwise a request above its limit is lowered to
+	// it (ResolveSessionResources). Only cpu and memory are read. Ephemeral
+	// storage isn't set here. What it costs: the session cap multiplies the
+	// requests, and on Autopilot the requests are billed (on Autopilot
+	// without Pod bursting, its per-pod minimums of 250m and 512Mi apply
+	// instead). A change rolls the gateway; session pods already running keep
+	// their shape until they respawn.
+	// +kubebuilder:validation:XValidation:rule="!has(self.requests) || self.requests.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.requests may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.limits) || self.limits.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.limits may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.claims) || size(self.claims) == 0",message="sessionResources may not set claims"
+	// +optional
+	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
+
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node
@@ -1032,12 +1119,13 @@ type TuningSpec struct {
 	// whose bus predates the three-server default stays on one
 	// server, and a new bus gets three (status.busReplicas shows which applies).
 	//
-	// Set, it decides the count of a bus that does not exist yet. An existing
-	// bus keeps the count it runs: NATS cannot carry a single server's streams
-	// into a cluster or a cluster's into a single server, and the migration
-	// that would keep them is not here yet, so a count that differs is refused
-	// (the A2ABusConversionRefused condition; the admission webhook refuses the
-	// edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+	// Set, it decides the count of a bus that does not exist yet. On an
+	// existing bus, a change between 1 and 3 starts a migration that keeps
+	// the bus's data (status.busMigration, the A2ABusMigrating condition):
+	// the bus keeps the count it runs until the migration converts it, and
+	// the admission webhook refuses another change while one runs. One server
+	// to three freezes writes for the window, since it copies the streams
+	// (docs/designs/spec-nats-deployment.md).
 	// +kubebuilder:validation:Enum=1;3
 	// +optional
 	BusReplicas *int `json:"busReplicas,omitempty"`
@@ -2798,13 +2886,21 @@ type AgentStatus struct {
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
 	// BusReplicas is the A2A bus's NATS server count:
-	// the count the bus already runs, which spec.harness.tuning.busReplicas
-	// does not change; for a new bus, that field, or 3. Re-derived on every
-	// reconcile, so it is a reading of the bus rather than a setting; it is
-	// not a claim that a bus is running, and with the claims deleted it no
-	// longer decides anything.
+	// the count the bus runs, which only a migration changes (BusMigration);
+	// for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived on
+	// every reconcile, so it is a reading of the bus rather than a setting;
+	// it is not a claim that a bus is running, and with the claims deleted it
+	// no longer decides anything.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
+
+	// BusMigration is the A2A bus's server-count migration under spec.mode:
+	// next, while one runs or since the last one ended: setting
+	// spec.harness.tuning.busReplicas to another count on an existing bus
+	// starts one, and it converts the bus without emptying it. Unset when no
+	// migration has run.
+	// +optional
+	BusMigration *BusMigrationStatus `json:"busMigration,omitempty"`
 
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
@@ -2846,6 +2942,21 @@ type AgentStatus struct {
 	// +optional
 	Inference *InferenceStatus `json:"inference,omitempty"`
 
+	// ResolvedUniverseDomain is the Google Cloud API universe domain the
+	// operator resolved for this install from spec.harness.universeDomain or
+	// from the GKE metadata server (/computeMetadata/v1/universe/universe-domain).
+	// Written by the Ready status update; absent before a pass reaches it, when
+	// spec.harness.universeDomain is unset and the metadata server did not
+	// answer (for example on kind), and while the served CRD predates the field.
+	// +optional
+	ResolvedUniverseDomain string `json:"resolvedUniverseDomain,omitempty"`
+
+	// UniverseDomainSource reports how ResolvedUniverseDomain was determined
+	// ("Spec" when spec.harness.universeDomain is set, "Discovered" when read
+	// from the GKE metadata server). Absent alongside ResolvedUniverseDomain.
+	// +optional
+	UniverseDomainSource string `json:"universeDomainSource,omitempty"`
+
 	// ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age,
 	// in seconds, when the A2A provision Job last found it longer than this
 	// operator creates the stream with (0 when the stream has no age limit).
@@ -2858,6 +2969,121 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+}
+
+// BusMigrationRetry is one retry of a Failed bus migration run: when it was
+// asked for, and the failure it retried.
+type BusMigrationRetry struct {
+	// At is when the retry was asked for.
+	At metav1.Time `json:"at"`
+	// FailedIn is the phase the retried attempt failed in.
+	FailedIn string `json:"failedIn"`
+	// Cause is why the retried attempt failed.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+}
+
+// BusMigrationStatus is one migration of the A2A bus between one NATS server
+// and three.
+type BusMigrationStatus struct {
+	// Leg is the direction: OneToThree (snapshot and restore, behind a write
+	// freeze) or ThreeToOne (in place).
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	Leg string `json:"leg"`
+
+	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+	// principals.
+	RunID string `json:"runID"`
+
+	// Phase is where the migration is. Done converted the bus with its data;
+	// Abandoned left it at its old count with its data; Failed stopped where
+	// a person has to act, and Message says what.
+	Phase string `json:"phase"`
+
+	// Abandoning is set once the migration is on its way back to the old
+	// count.
+	// +optional
+	Abandoning bool `json:"abandoning,omitempty"`
+
+	// StartedAt is when the migration began.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Deadline is the deadline of the stretch the run is on: when an
+	// unfinished phase counts as failed, and when the migration's bus
+	// credentials stop working. Its Jobs stop a few minutes before it. A
+	// run that turns back gets one fresh deadline for its way back
+	// (ForwardDeadline keeps the first), and a retry another.
+	Deadline metav1.Time `json:"deadline"`
+
+	// Message is the manual step a Failed migration names.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Cause is why the run turned back: the phase that failed, and whether
+	// it was still running at Deadline. Set at the first failure and kept
+	// until a retry, which moves it into Retries.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+
+	// ForwardDeadline is the deadline the run went forward under, kept once
+	// it turned back and Deadline became its way back's.
+	// +optional
+	ForwardDeadline *metav1.Time `json:"forwardDeadline,omitempty"`
+
+	// PhaseDeadline is a deadline the current phase has of its own, shorter
+	// than Deadline, which applies as well: the one to three leg's
+	// Converting phase has 15 minutes to get three servers Ready, since the
+	// bus is write-frozen and its only copy is on the staging claim while it
+	// waits. Unset in every other phase.
+	// +optional
+	PhaseDeadline *metav1.Time `json:"phaseDeadline,omitempty"`
+
+	// FailedIn is the phase a Failed run failed in. A run that failed inside
+	// the one to three leg's write freeze keeps the freeze, with its
+	// snapshot, until a person retries it or gives it up, each with an
+	// annotation on the PlatformAgent naming this run (the A2ABusMigrating
+	// condition says which). A Failed run blocks any new migration until
+	// then.
+	// +optional
+	FailedIn string `json:"failedIn,omitempty"`
+
+	// Retries records each retry of a Failed run, oldest first, at most
+	// three.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	Retries []BusMigrationRetry `json:"retries,omitempty"`
+
+	// GivenUp is set when a person gave a Failed run up: its freeze is
+	// lifted, and streams it did not put back are recreated empty.
+	// +optional
+	GivenUp bool `json:"givenUp,omitempty"`
+
+	// Cleared lists the provisioned streams the latest Clearing phase has
+	// deleted, ahead of the conversion or of the rollback after a failed
+	// restore (a failed conversion rolls back on the forward clear's
+	// record). A restore starts only once it names every one.
+	// +optional
+	Cleared []string `json:"cleared,omitempty"`
+
+	// FreezeConfirmed is set once every callout replica serves the write
+	// freeze's identity map, and only then does the bus render without its
+	// static application users and restart into the freeze.
+	// +optional
+	FreezeConfirmed bool `json:"freezeConfirmed,omitempty"`
+
+	// Warnings are what the restore found and restored anyway: a stream
+	// lacking a subject a fresh install has, or a field outside the
+	// restore's policy that differs from a fresh install. Together they are
+	// reported once, in one Warning Event. At most 4 KiB of them; the last says
+	// how many more there were.
+	// +optional
+	Warnings []string `json:"warnings,omitempty"`
+
+	// ObservedGeneration is the PlatformAgent generation that started this
+	// migration. A migration that ended without converting is not started
+	// again until busReplicas asks for another count, or the
+	// bus-migration-start annotation names the run.
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static

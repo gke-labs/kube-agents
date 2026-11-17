@@ -123,7 +123,9 @@ WORKDIR /workspace
 COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
 # tirith joins a2a in /workspace/bin, so agent-base copies both with the one
 # COPY it already has and the image gains no layer. The download is verified
@@ -2498,8 +2500,9 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
-# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+# Copy the GKE Support Agent (tse) profile TEMPLATE (SOUL, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
@@ -2546,7 +2549,7 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 #
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2577,6 +2580,7 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
         agents/cluster/skills=/opt/cluster-template/skills \
         agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
+        agents/tse/persona/skills=/opt/tse-template/persona/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
 
