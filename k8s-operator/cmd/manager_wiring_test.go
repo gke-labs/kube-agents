@@ -5,6 +5,9 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -51,6 +54,9 @@ const (
 	memoryLimitCallShareArg  = "operatorMemoryLimitFraction"
 	managerConstructorCall   = "ctrl.NewManager"
 	managerStartCall         = "mgr.Start"
+	// Below controller-runtime's 30 s default graceful-shutdown timeout, so
+	// the kubelet kills a slow stop before the timeout releases the lease.
+	operatorMaxTerminationGraceSeconds = 20
 	// The webhook's namespace rule reaches the validator through this one
 	// call's second argument. Every webhook test builds the validator by
 	// hand, so a call that passed "" or another name would switch the rule
@@ -222,15 +228,47 @@ func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
 	if mainFn == nil || len(mainFn.Body.List) == 0 {
 		t.Fatalf("%s has no main function with a body", mainSourceFile)
 	}
+	// The last statement is `if err := mgr.Start(...); err != nil { ... }`,
+	// and its body only logs and exits: that body is the one place code can
+	// run after Start returns.
+	last, ok := mainFn.Body.List[len(mainFn.Body.List)-1].(*ast.IfStmt)
 	startsManager := false
-	ast.Inspect(mainFn.Body.List[len(mainFn.Body.List)-1], func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok && literalTypeName(call.Fun) == managerStartCall {
-			startsManager = true
+	if ok {
+		if assign, isAssign := last.Init.(*ast.AssignStmt); isAssign && len(assign.Rhs) == 1 {
+			if call, isCall := assign.Rhs[0].(*ast.CallExpr); isCall && literalTypeName(call.Fun) == managerStartCall {
+				startsManager = true
+			}
 		}
-		return !startsManager
-	})
+	}
 	if !startsManager {
-		t.Errorf("main's last statement doesn't call %s: something runs after the manager stops, and with the lease released another operator may already be leading", managerStartCall)
+		t.Fatalf("main's last statement isn't `if err := %s(...); err != nil {...}`: something runs after the manager stops, and with the lease released another operator may already be leading", managerStartCall)
+	}
+	for _, stmt := range last.Body.List {
+		expr, isExpr := stmt.(*ast.ExprStmt)
+		call, isCall := (*ast.CallExpr)(nil), false
+		if isExpr {
+			call, isCall = expr.X.(*ast.CallExpr)
+		}
+		if !isCall || (literalTypeName(call.Fun) != "setupLog.Error" && literalTypeName(call.Fun) != "os.Exit") {
+			t.Errorf("the branch after %s returns does more than log and exit (%s): it runs with the lease already released", managerStartCall, fset.Position(stmt.Pos()))
+		}
+	}
+	if _, set := literalField(file, managerOptionsType, "GracefulShutdownTimeout"); set {
+		t.Errorf("%s sets GracefulShutdownTimeout: the release is safe because the pod's %d s grace period kills a slow stop before controller-runtime's default 30 s timeout releases the lease mid-reconcile; recheck that before changing it", managerOptionsType, operatorMaxTerminationGraceSeconds)
+	}
+	for _, manifest := range []string{"../../charts/kube-agents/templates/operator-deployment.yaml", "../config/manager/manager.yaml"} {
+		raw, err := os.ReadFile(manifest)
+		if err != nil {
+			t.Fatalf("reading %s: %v", manifest, err)
+		}
+		m := regexp.MustCompile(`terminationGracePeriodSeconds:\s*(\d+)`).FindSubmatch(raw)
+		if m == nil {
+			t.Errorf("%s sets no terminationGracePeriodSeconds: Kubernetes' default 30 s lets a stop reach controller-runtime's 30 s timeout, which releases the lease while a reconcile may still run", manifest)
+			continue
+		}
+		if n, _ := strconv.Atoi(string(m[1])); n > operatorMaxTerminationGraceSeconds {
+			t.Errorf("%s gives the operator %d s to stop, want at most %d: past controller-runtime's 30 s default the lease is released while a reconcile may still run", manifest, n, operatorMaxTerminationGraceSeconds)
+		}
 	}
 	ast.Inspect(mainFn.Body, func(n ast.Node) bool {
 		switch n.(type) {
