@@ -1346,6 +1346,20 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionResources are the session pods' CPU and memory requests and
+      # limits; only cpu and memory are read. Each key you set to a positive
+      # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
+      # the rest keep theirs. A request set alone above its default limit
+      # raises the limit to match; otherwise a request above its limit is
+      # lowered to it. A change rolls the gateway, and running session pods
+      # keep their shape until they respawn. The session cap multiplies the
+      # requests. On
+      # Autopilot without Pod bursting, its per-pod minimums (250m / 512Mi)
+      # apply whatever is set lower.
+      # sessionResources:
+      #   requests:
+      #     cpu: 150m
+      #     memory: 384Mi
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
