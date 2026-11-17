@@ -91,6 +91,7 @@ domains:
     backup: stalhaali
     meaning: Checks that the agent answers a question whose obvious read does not fit the sandbox shell, without crashing it.
     journey: A question whose fleet-wide list exceeds the shell's memory is answered from a narrower read
+    new: true
   - slug: cost
     name: Cost (fleet-wide-cost-analysis)
     owner: Fuxiao-Gao
