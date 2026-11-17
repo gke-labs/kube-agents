@@ -74,6 +74,12 @@ readonly FORGE_DENY_RULES="all"
 readonly FORGE_NETWORK_TAG="forge"
 readonly FORGE_VM_SA_ID="forge-vm"
 readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+# A project-level binding on a service account created a moment earlier is
+# refused with "does not exist" until IAM has seen the account; evals-43, -49
+# and -50 each stopped there on 2026-11-13..15 and passed on the rerun. The
+# binding is retried for about a minute before the step gives up.
+readonly FORGE_VM_BIND_ATTEMPTS=6
+readonly FORGE_VM_BIND_DELAY_S=10
 readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
@@ -197,6 +203,15 @@ HOST_CLUSTER_NAME="platform-agent-host"
 # host cluster lacks this exact value and its tests pin the two copies equal
 # (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
 readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+# GKE runs one cluster operation at a time, and right after the apply an
+# Autopilot host is still creating node pools for the pods Helm installed:
+# evals-48's update was refused CLUSTER_ALREADY_HAS_OPERATION on 2026-11-16.
+# Step 2.1 waits for the cluster's running operations before the update,
+# polling every HOST_OTEL_WAIT_DELAY_S for up to the attempt count (about
+# twenty minutes), then updates with the same retry if an operation slipped
+# in between the poll and the call.
+readonly HOST_OTEL_WAIT_ATTEMPTS=40
+readonly HOST_OTEL_WAIT_DELAY_S=30
 
 usage() {
   cat <<EOF
@@ -707,7 +722,23 @@ FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
 fi
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+bound=false
+for attempt in $(seq 1 "${FORGE_VM_BIND_ATTEMPTS}"); do
+  if gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null 2>/tmp/forge-vm-bind.err; then
+    bound=true
+    break
+  fi
+  if ! grep -q "does not exist" /tmp/forge-vm-bind.err; then
+    cat /tmp/forge-vm-bind.err >&2
+    break
+  fi
+  echo "  ⚠ ${FORGE_VM_SA} is not visible to IAM yet (attempt ${attempt}/${FORGE_VM_BIND_ATTEMPTS}); waiting ${FORGE_VM_BIND_DELAY_S}s..."
+  sleep "${FORGE_VM_BIND_DELAY_S}"
+done
+if [ "${bound}" != "true" ]; then
+  echo "FATAL: could not bind ${FORGE_VM_SA_ROLE} to ${FORGE_VM_SA} after ${FORGE_VM_BIND_ATTEMPTS} attempts." >&2
+  exit 1
+fi
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
@@ -861,11 +892,35 @@ fi
 # set -e: a pool project without the scope passes every lease and exports no
 # traces, and the verifier in Step 5 would fail it anyway.
 echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
-gcloud container clusters update "${HOST_CLUSTER_NAME}" \
-  --project="${PROJECT_ID}" \
-  --location="${REGION}" \
-  --managed-otel-scope="${HOST_OTEL_SCOPE}" \
-  --quiet
+scope_set=false
+for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
+  running="$(gcloud container operations list --project="${PROJECT_ID}" --location="${REGION}" \
+    --filter="status!=DONE AND targetLink~/clusters/${HOST_CLUSTER_NAME}\$" --format="value(name,operationType)" 2>/dev/null || true)"
+  if [ -n "${running}" ]; then
+    echo "  ⏳ ${HOST_CLUSTER_NAME} is running an operation (${running//$'\n'/; }); waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+    sleep "${HOST_OTEL_WAIT_DELAY_S}"
+    continue
+  fi
+  if gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+      --project="${PROJECT_ID}" \
+      --location="${REGION}" \
+      --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+      --quiet 2>/tmp/otel-scope.err; then
+    scope_set=true
+    break
+  fi
+  if ! grep -q "CLUSTER_ALREADY_HAS_OPERATION" /tmp/otel-scope.err; then
+    cat /tmp/otel-scope.err >&2
+    break
+  fi
+  echo "  ⏳ an operation started between the poll and the update; waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+  sleep "${HOST_OTEL_WAIT_DELAY_S}"
+done
+if [ "${scope_set}" != "true" ]; then
+  echo "FATAL: could not set the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}: the cluster kept running operations for $((HOST_OTEL_WAIT_ATTEMPTS * HOST_OTEL_WAIT_DELAY_S))s, or the update failed (above)." >&2
+  echo "       Re-run with --skip-host-cluster once \`gcloud container operations list --project=${PROJECT_ID} --filter=status!=DONE\` is empty." >&2
+  exit 1
+fi
 echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 
 if [ "${SKIP_FLEET}" != "true" ]; then

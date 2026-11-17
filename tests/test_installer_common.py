@@ -2400,6 +2400,54 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("Could not probe cluster", proc.stderr)
 
+    _API_DISABLED_IN = (
+        'echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, '
+        "message=Kubernetes Engine API has not been used in project {project} before or it is disabled. "
+        'Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry." >&2; exit 1'
+    )
+
+    def test_tfvars_reads_a_disabled_gke_api_in_the_target_project_as_absence(self):
+        # A fresh project's first install: the Kubernetes Engine API is off, so
+        # no cluster can exist there, and the apply enables the API before it
+        # creates one. The generator must not refuse this as an unreadable
+        # cluster (the pool's new projects and a fresh standalone project both
+        # stopped here on 2026-11-13 and 2026-11-16).
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="test-project"),
+        )
+        # The harness stubs print_info, so the absence line is not readable
+        # here; the exit code and the missing refusal are the assertion.
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_project_number_as_absence(self):
+        # gcloud names the project by number in the ErrorInfo consumer line.
+        stub = (
+            'echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; '
+            'echo "  consumer: projects/123456789" >&2; exit 1'
+        )
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_when_the_disabled_gke_api_is_another_projects(self):
+        # The refusal names the caller's quota project, not the target: it says
+        # nothing about whether the target holds a cluster, so the generator
+        # keeps refusing to guess.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="someone-elses-quota-project"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
     def test_tfvars_generation_recovers_credentials_from_live_secret(self):
         # PERSIST_SECRETS_ON_DISK=false leaves install.env without the keys; the
         # live Secret is their home, so the generator reads them back from it.
