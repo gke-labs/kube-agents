@@ -340,7 +340,7 @@ steps:
   # empty default the step prints one line and exits, and it pushes from
   # inside itself for the reason the a2a step gives. Stdlib Python on a slim
   # base, from the repository root because it carries the install's scrubbers
-  # from agents/; nothing here waits for it.
+  # from agents/ and their shell reader from bench/; nothing here waits for it.
   - id: replay-shadow-proxy
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
