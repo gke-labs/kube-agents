@@ -2980,9 +2980,10 @@ ENVELOPE_STARTED_KEY = "started_at"
 # writer stamp beside the envelope, never this object, for whose run it is.
 ENVELOPE_REPORT_KEY = "report"
 ENVELOPE_REPORT_SCHEMA = "kube-agents.report/v1"
-# Bounds that keep the envelope well under the store's 1 MiB cap whatever the
-# findings: the gateway cuts the text at the same 24 KiB and drops a card over
-# 32 KiB, so nothing past these would reach a channel.
+# Bounds on what the report adds to the envelope, measured as `write_report`
+# writes it, against the store's 1 MiB cap (the findings `document` is the
+# envelope's unbounded part): the gateway cuts the text at the same 24 KiB and
+# drops a card over 32 KiB, so nothing past these would reach a channel.
 ENVELOPE_REPORT_TEXT_MAX = 24 * 1024
 ENVELOPE_REPORT_CARD_MAX = 32 * 1024
 # `report_envelope`'s default for `started_at`: read the run start when the
@@ -5029,14 +5030,29 @@ def since_scheduled_line(payload: dict, delta_known: bool = True) -> str | None:
     return CHAT_REPORT_SINCE_SCHEDULED_LINE.format(changes=HEADLINE_CLAUSE_SEPARATOR.join(changes))
 
 
-def _clip_utf8(text: str, limit: int) -> str:
-    """`text` cut to at most `limit` UTF-8 bytes on a character boundary.
+def _encodable(text: str) -> str:
+    """`text` with each lone surrogate (a broken escape in the findings JSON),
+    which has no UTF-8 form, as "?"."""
+    return text.encode("utf-8", errors="replace").decode("utf-8")
 
-    A lone surrogate (a broken escape in the findings JSON) has no UTF-8 form
-    and becomes "?" rather than failing the run.
+
+def _clip_as_written(text: str, limit: int) -> str:
+    """The longest prefix of `text` whose JSON string, as `write_report`
+    writes it (ASCII escapes), is at most `limit` bytes, quotes left out.
+
+    An escaped character is never shorter than its UTF-8 form, so the
+    gateway's own UTF-8 cut at the same size leaves the prefix whole.
     """
-    raw = text.encode("utf-8", errors="replace")
-    return raw[:limit].decode("utf-8", errors="ignore")
+    if len(json.dumps(text)) - 2 <= limit:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if len(json.dumps(text[:mid])) - 2 <= limit:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low]
 
 
 def _summary_chat_card(text: str) -> dict | None:
@@ -5048,7 +5064,7 @@ def _summary_chat_card(text: str) -> dict | None:
     card from building, or one over ENVELOPE_REPORT_CARD_MAX, leaves the text.
     """
     try:
-        import slack_audit_report  # noqa: PLC0415 -- on sys.path only with the platform scripts
+        import slack_audit_report  # on sys.path only with the platform scripts
 
         built = slack_audit_report.chat_from_summary(text)
     except Exception as exc:  # noqa: BLE001 -- the card is optional; the text stands
@@ -5064,18 +5080,25 @@ def _summary_chat_card(text: str) -> dict | None:
     return card
 
 
-def attach_chat_report(envelope: dict, render: Callable[[], str], silent: bool) -> None:
-    """Set the envelope's `report` from `render()`'s text. Best-effort.
+def attach_chat_report(envelope: dict, render: Callable[[], str], silent: bool) -> str | None:
+    """Set the envelope's `report` from `render()`'s text, and return that text. Best-effort.
 
     Called before `write_report`, so anything that keeps the report from
     building, a render included, leaves the envelope without one and the
     store write and the run go on: the gateway then posts the run's final
-    message, as before the report existed.
+    message, as before the report existed. The text is None when the render
+    itself failed, for a caller that needs it to render again after the write.
     """
     try:
-        envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(render(), silent)
+        text = render()
     except Exception as exc:  # noqa: BLE001 -- the report is optional; the store write is not
         log(f"WARNING: the stored envelope carries no chat report: {exc}")
+        return None
+    try:
+        envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(text, silent)
+    except Exception as exc:  # noqa: BLE001 -- as above
+        log(f"WARNING: the stored envelope carries no chat report: {exc}")
+    return text
 
 
 def envelope_chat_report(text: str, silent: bool) -> dict:
@@ -5085,9 +5108,10 @@ def envelope_chat_report(text: str, silent: bool) -> dict:
     repository; `silent` is `finish`'s quiet verdict for it (`silent_ok`).
     The body's redaction backstop is applied, as to the envelope's document.
     """
+    text = _encodable(text)
     report: dict = {
         "schema": ENVELOPE_REPORT_SCHEMA,
-        "text": _clip_utf8(redact_secrets(text), ENVELOPE_REPORT_TEXT_MAX),
+        "text": _clip_as_written(redact_secrets(text), ENVELOPE_REPORT_TEXT_MAX),
         "silent": bool(silent),
     }
     card = _summary_chat_card(text)
@@ -26822,15 +26846,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         whole_run_payload = whole_run_chat_payload(
             payload, baseline, scheduled, published_ids, gaps, reported_under_gap, retired_ids
         )
-        chat_text = render_chat_report(
-            audit_id,
-            whole_run_payload if whole_run else payload,
-            data,
-            baseline.known if whole_run else delta_known,
-            (0, run_resolved) if whole_run else None,
-        )
-        attach_chat_report(envelope, lambda: chat_text, bool(payload["silent_ok"]))
+        def render_text() -> str:
+            return render_chat_report(
+                audit_id,
+                whole_run_payload if whole_run else payload,
+                data,
+                baseline.known if whole_run else delta_known,
+                (0, run_resolved) if whole_run else None,
+            )
+
+        chat_text = attach_chat_report(envelope, render_text, bool(payload["silent_ok"]))
         stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
+        # A render that failed above fails here again, after the store write,
+        # as it did before the envelope carried the report.
+        chat_text = render_text() if chat_text is None else chat_text
         append_chat_report(
             audit_id,
             repo,
@@ -27387,17 +27416,22 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         if gaps or baseline.stale_scheme:
             run_resolved = []
         run_counts = (len(run_new), len(run_resolved))
-    chat_text = render_chat_report(
-        audit_id,
-        whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
-        if baseline.from_entry
-        else payload,
-        data,
-        baseline.known if baseline.from_entry else delta_known,
-        run_counts,
-    )
-    attach_chat_report(envelope, lambda: chat_text, bool(payload["silent_ok"]))
+    def render_text() -> str:
+        return render_chat_report(
+            audit_id,
+            whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
+            if baseline.from_entry
+            else payload,
+            data,
+            baseline.known if baseline.from_entry else delta_known,
+            run_counts,
+        )
+
+    chat_text = attach_chat_report(envelope, render_text, bool(payload["silent_ok"]))
     stored = write_report(audit_id, envelope, now)
+    # A render that failed above fails here again, after the store write, as
+    # it did before the envelope carried the report.
+    chat_text = render_text() if chat_text is None else chat_text
     append_chat_report(
         audit_id,
         repo,

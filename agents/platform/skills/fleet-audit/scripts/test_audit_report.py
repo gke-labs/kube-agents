@@ -33641,6 +33641,23 @@ class TestChatReport(HarnessTestCase):
         # A ledger card needs the fetched issue; the text stands alone.
         self.assertNotIn("card", report)
 
+    def test_a_chat_text_that_fails_to_render_still_lands_the_store_write(self):
+        """The render fails before the write too, but only after it does the run fail, as before the report."""
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("render failed")
+
+        self.patch_attr("render_chat_report", boom)
+        self.assertNotEqual(self.run_finish(make_doc()), 0)
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["issue_number"], 7)
+        self.assertNotIn(audit_report.ENVELOPE_REPORT_KEY, latest)
+
     def test_detail_lines_sit_between_the_audit_line_and_the_ledger_url(self):
         payload = {"status": "UPDATED", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 2, "resolved": 1, "prs_opened": ["https://github.com/acme/fleet/pull/9"],
@@ -38974,12 +38991,15 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
 class TestEnvelopeChatReport(unittest.TestCase):
     """#5618: the envelope's `report` object, bounded and redacted."""
 
-    def test_the_text_is_cut_on_a_character_boundary_under_its_cap(self):
-        text = "é" * audit_report.ENVELOPE_REPORT_TEXT_MAX
-        report = audit_report.envelope_chat_report(text, False)
-        cut = report["text"].encode("utf-8")
-        self.assertLessEqual(len(cut), audit_report.ENVELOPE_REPORT_TEXT_MAX)
-        self.assertTrue(text.startswith(report["text"]))
+    def test_the_text_is_cut_to_its_cap_as_written(self):
+        """Measured as `write_report` writes it: a non-ASCII or control character costs its escape."""
+        for char in ("é", "\x01", "a"):
+            with self.subTest(char=repr(char)):
+                text = char * audit_report.ENVELOPE_REPORT_TEXT_MAX
+                cut = audit_report.envelope_chat_report(text, False)["text"]
+                self.assertLessEqual(len(json.dumps(cut)) - 2, audit_report.ENVELOPE_REPORT_TEXT_MAX)
+                self.assertGreater(len(json.dumps(cut + char)) - 2, audit_report.ENVELOPE_REPORT_TEXT_MAX)
+                self.assertTrue(text.startswith(cut))
 
     def test_the_text_gets_the_bodys_redaction_backstop(self):
         secret = "ghp_" + "a" * 36
@@ -39015,11 +39035,10 @@ class TestEnvelopeChatReport(unittest.TestCase):
         def boom():
             raise RuntimeError("render failed")
 
-        audit_report.attach_chat_report(envelope, boom, False)
+        self.assertIsNone(audit_report.attach_chat_report(envelope, boom, False))
         self.assertEqual(envelope, {"audit_id": "x"})
 
 
 
 if __name__ == "__main__":
     unittest.main()
-
