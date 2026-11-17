@@ -5316,6 +5316,18 @@ def test_a_rate_limit_past_the_waits_does_not_read_as_a_missing_grant(monkeypatc
 
     reason = _Check().verify(1.0).reason
     assert verifiers._rate_limit_budget.get() is None, "the budget is the check's alone"
+
+    budgets = []
+
+    class _Budgeted:
+        @verifiers._marks_forge_unavailable
+        def verify(self, timeout_sec):
+            budgets.append(verifiers._rate_limit_budget.get()[0])
+            return VerificationResult(success=True, status="pass", reason="ok", elapsed_time=0.0)
+
+    for timeout_sec in (120.0, 600.0):
+        _Budgeted().verify(timeout_sec)
+    assert budgets == [60.0, verifiers._RATE_LIMIT_WAIT_BUDGET_SEC], "half the check's timeout, never past the cap"
     assert reason.startswith(f"{forges.FORGE_UNAVAILABLE_MARKER} (answered 403, rate limited): the grading token was rate limited")
     assert "does not apply" in reason
 

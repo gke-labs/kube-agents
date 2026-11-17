@@ -239,10 +239,13 @@ _RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
 # waits for the window the forge names (Retry-After, else GitHub's
 # X-RateLimit-Reset) and is read again, within _FORGE_READ_ATTEMPTS: concurrent
 # smoke runs share one App installation's hourly budget and drain it for
-# minutes at a time (#6105). Every read of one check shares this many seconds
-# of waiting, well inside the unit's lock allowance (UNIT_LOCK_ALLOWANCE_SECONDS
-# in hack/ci-eval-pr.sh); a window longer than what is left is not waited for.
+# minutes at a time (#6105). Every read of one check shares at most this many
+# seconds of waiting, well inside the unit's lock allowance
+# (UNIT_LOCK_ALLOWANCE_SECONDS, 600 s, in hack/ci-eval-pr.sh), and at most this
+# share of the check's own timeout_sec, so the waits never take the check past
+# its deadline; a window longer than what is left is not waited for.
 _RATE_LIMIT_WAIT_BUDGET_SEC = 180.0
+_RATE_LIMIT_SHARE_OF_TIMEOUT = 0.5
 _RATE_LIMIT_DEFAULT_WAIT_SEC = 60.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
@@ -4298,7 +4301,8 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
     forge fault does not become that error. Inside a forge-reading check, a
     rate limit on the grading token is waited out and read again, from the
-    check's shared budget (_RATE_LIMIT_WAIT_BUDGET_SEC). Any other HTTP answer
+    check's shared budget (the lesser of _RATE_LIMIT_WAIT_BUDGET_SEC and half
+    the check's timeout_sec). Any other HTTP answer
     is returned on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
@@ -4556,7 +4560,9 @@ def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult])
     @wraps(verify)
     def marked(self: Any, timeout_sec: float) -> VerificationResult:
         token = _forge_unavailable.set([])
-        budget = _rate_limit_budget.set([_RATE_LIMIT_WAIT_BUDGET_SEC])
+        budget = _rate_limit_budget.set(
+            [min(_RATE_LIMIT_WAIT_BUDGET_SEC, max(0.0, float(timeout_sec)) * _RATE_LIMIT_SHARE_OF_TIMEOUT)]
+        )
         try:
             result = verify(self, timeout_sec)
             noted = _forge_unavailable.get() or []

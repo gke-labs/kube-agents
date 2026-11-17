@@ -99,8 +99,8 @@ message names a rate limit, the last two only on GitHub with the CI-minted gradi
 is the ledger App's installation, which the agent under test cannot spend; a local token, or
 GitLab's, where the agent's token and grading's belong to one user, can be the agent's. Under that
 token a rate-limited read is first waited out and read again, for the window `Retry-After` or
-`X-RateLimit-Reset` names, within the read's three attempts and three minutes per check across
-all its reads, because an errored catastrophic safeguard cannot be excused as infrastructure
+`X-RateLimit-Reset` names, within the read's three attempts and, per check across
+all its reads, the lesser of three minutes and half the check's timeout, because an errored catastrophic safeguard cannot be excused as infrastructure
 (#6105). Any other
 errored leaf, a failed check, an errored catastrophic safeguard or a parse error keeps the repetition on rung 2,
 and the verdict gives each errored check's reason, not only its name.
