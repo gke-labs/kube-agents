@@ -2313,27 +2313,28 @@ class InstallerCommonTest(unittest.TestCase):
                         "OPENAI_COMPATIBLE_API_KEY", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
                         "SESSION_KV_API_KEY", "SESSION_KV_SALT")
 
-    def _secret_read_stub(self, read_arm, log=None):
+    def _secret_read_stub(self, read_arm, log=None, current_ctx=None):
         """kubectl on this install's context; the whole-Secret read runs read_arm."""
         rec = f'echo "$*" >> "{log}"; ' if log else ""
         return (
             "#!/usr/bin/env bash\n"
             f"{rec}"
             'case "$*" in\n'
-            f'  *"config current-context"*) printf "{self._CTX}" ;;\n'
+            f'  *"config current-context"*) printf "{current_ctx or self._CTX}" ;;\n'
             f'  *"get secret platform-agent-secrets"*"-o json"*) {read_arm} ;;\n'
             "  *) exit 1 ;;\n"
             "esac\n"
         )
 
-    def _recover(self, read_arm, env=None, log=None):
+    def _recover(self, read_arm, env=None, log=None, current_ctx=None, **run_kwargs):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 'print_warning() { echo "WARN: $*" >&2; }; print_error() { echo "ERROR: $*" >&2; }; '
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"KUBE_AGENTS_REQUIRE_SECRET_ANSWER": "true", "SLACK_BOT_TOKEN": "", **(env or {})},
-                kubectl_script=self._secret_read_stub(read_arm, log),
+                kubectl_script=self._secret_read_stub(read_arm, log, current_ctx),
+                **run_kwargs,
             )
             return proc, (dest.read_text() if dest.exists() else None)
 
@@ -2406,6 +2407,60 @@ class InstallerCommonTest(unittest.TestCase):
             env={"API_SERVER_KEY": "k", "ALLOW_EMPTY_SECRET_KEYS": ",".join(m for m in missing if m != "SESSION_KV_SALT")})
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("SESSION_KV_SALT", proc.stderr)
+
+    def test_an_existing_cluster_is_read_by_name_when_current_context_is_elsewhere(self):
+        # The adoption get-credentials is best-effort, and a shared kubeconfig
+        # can be switched underneath. Skipping recovery on a context mismatch
+        # would write the keys empty, so an existing cluster is read through
+        # its own context by name whatever current-context says.
+        exists = dict(
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 1 ;;\n",
+            current_ctx="gke_other-project_us-east1_other-cluster",
+        )
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1', **exists)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SLACK_BOT_TOKEN", proc.stderr)
+        self.assertIsNone(tfvars)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            api = base64.b64encode(b"live-api-key").decode()
+            proc, tfvars = self._recover(
+                f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{api}\"}}}}'", log=log, **exists)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('api_server_key    = "live-api-key"', tfvars)
+            self.assertIn(f"--context {self._CTX}", log.read_text())
+
+    def test_a_404_that_is_not_this_secrets_own_is_not_an_absence(self):
+        # kubectl prints (NotFound) for any 404, a proxy's included; only the
+        # Secret's own "not found" means there is nothing to recover.
+        proc, tfvars = self._recover(
+            "echo 'Error from server (NotFound): the server could not find the requested resource' >&2; exit 1",
+            env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIsNone(tfvars)
+
+    def test_the_guard_refuses_to_render_a_live_key_empty(self):
+        # Checked against the values as rendered, so a change between the
+        # recovery and the render can't blank a key the live Secret held.
+        for value, allow, want in (("", "", "rc=1"), ("", "SLACK_BOT_TOKEN", "rc=0"), ("xoxb-1", "", "rc=0")):
+            with self.subTest(value=value, allow=allow):
+                proc = self._run(
+                    'print_error() { echo "ERROR: $*" >&2; }; '
+                    'LIVE_SECRET_NONEMPTY_KEYS=" API_SERVER_KEY SLACK_BOT_TOKEN"; '
+                    'rc=0; refuse_blanking_live_secret_keys || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", "SLACK_BOT_TOKEN": value, "ALLOW_EMPTY_SECRET_KEYS": allow})
+                self.assertIn(want, proc.stdout, proc.stderr)
+                if want == "rc=1":
+                    self.assertIn("SLACK_BOT_TOKEN is set in the live", proc.stderr)
+
+    def test_allow_empty_secret_keys_unset_under_set_u(self):
+        # bash 4+ rejects ${unset//,/ } under set -u; the read must not abort.
+        proc, _ = self._recover('echo "Unable to connect" >&2; exit 1',
+                                env={"API_SERVER_KEY": "k"})
+        self.assertNotIn("unbound variable", proc.stderr)
 
     def test_a_value_that_is_not_base64_stops_an_applying_run(self):
         proc, tfvars = self._recover("printf '%s' '{\"data\": {\"SLACK_BOT_TOKEN\": \"not*base64\"}}'",

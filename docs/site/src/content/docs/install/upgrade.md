@@ -93,10 +93,14 @@ and do not save either one to a shared disk.
 4. Leave the secrets out. When the file holds no `API_SERVER_KEY`, model provider API key, Slack
    token or Session KV key, the upgrade reads it from the `platform-agent-secrets` Secret. Set
    `PERSIST_SECRETS_ON_DISK=false` to keep them out of the regenerated `terraform.tfvars` as well.
+
    If that Secret can't be read (a timeout, or credentials that can't read Secrets), the upgrade
    stops and names the keys it couldn't recover, rather than write them empty. Re-run once the
    cluster answers, or export those keys yourself. To leave a key empty on purpose, name it in
-   `ALLOW_EMPTY_SECRET_KEYS`.
+   `ALLOW_EMPTY_SECRET_KEYS` (comma- or space-separated) for that run only: while it stays set, it
+   applies to every later failed read. A value that ends in a newline, as
+   `kubectl create secret --from-file` stores one, also stops the upgrade: export the key without it.
+
 5. Check the file before you upgrade. Use the `upgrade.sh` of the release the install runs now, not
    the release you are moving to. Plan at the image tag in the state output `image_tag`. If the
    output is `null`, use `.platformAgent.deployment.image.tag` from `values.json`.
