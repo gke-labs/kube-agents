@@ -10,12 +10,13 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm` and
-# `world-open-ingress` are project-scoped, so they have no cluster slot).
-# fixtures.json carries `startup-fail-vm` and `world-open-ingress` as
-# project-scoped roles (`cluster_slot: null`), which the runner probes in the
-# project with gcloud; `orphan-disks` is in this file alone. A project-scoped
-# role in fixtures.json must appear here with `slot: null`.
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`
+# and `declared-mtu-peering` are project-scoped, so they have no cluster slot).
+# fixtures.json carries `startup-fail-vm`, `world-open-ingress` and
+# `declared-mtu-peering` as project-scoped roles (`cluster_slot: null`), which
+# the runner probes in the project with gcloud; `orphan-disks` is in this file
+# alone. A project-scoped role in fixtures.json must appear here with
+# `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -235,6 +236,20 @@ fixtures:
       A firewall rule opening tcp:2379 to the internet on the one VM that
       carries its tag, which holds an external IP. Nothing listens on 2379.
       A deny rule blocks tcp:22 and tcp:3389 on that VM.
+
+  - role: declared-mtu-peering
+    slot: null # Project-scoped, global; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - network/mtu-peer-declared
+    defect: >-
+      A custom-mode VPC at MTU 8896 with no subnet, peered both ways with
+      `default` (MTU 1460), so the networking SOP's 2.4 reads the ACTIVE
+      peering as an MTU mismatch. Not a defect: the one check of that stream
+      proposed as declarable on purpose. Inert for the audit until the
+      stream's declared-intent slice lands and the pool project's GitOps
+      knowledge/ note declares the peering; until then the finding publishes
+      and no case grades it.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

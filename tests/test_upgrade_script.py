@@ -25,6 +25,7 @@ from tests.testing.common import (
     VALID_IMMUTABLE_REFS,
     create_minimal_tools_bin,
     get_isolated_test_env,
+    installer_report_env,
 )
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
@@ -33,6 +34,38 @@ from tests.testing.release import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
+
+# upgrade.sh's variable for its report file, a seam for tests, and the path a real
+# run writes, which the upgrade skill and the site's upgrade page name.
+_REPORT_FILE_ENV = "KUBE_AGENTS_UPGRADE_REPORT_FILE"
+_REPORT_DEFAULT_FILE = "/tmp/kube-agents-upgrade-report.json"
+
+
+class ReportFileTest(unittest.TestCase):
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real run writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_report with the variable
+        unset would write that file."""
+        source = _UPGRADE_SH.read_text()
+        self.assertEqual(source.count(_REPORT_DEFAULT_FILE), 1, "the script names the report path in one place")
+        self.assertEqual(
+            source.count(f'  local report_file="${{{_REPORT_FILE_ENV}:-{_REPORT_DEFAULT_FILE}}}"\n'),
+            1,
+            "write_report takes the variable, then the documented path",
+        )
+
+    def test_write_report_writes_the_file_the_variable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "report.json"
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\nwrite_report "PROBE" >/dev/null'],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={_REPORT_FILE_ENV: str(report)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(report.read_text())["status"], "PROBE")
 
 
 class UpgradeScriptValidationTest(unittest.TestCase):
@@ -873,6 +906,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                         "HOME": os.environ.get("HOME", "/tmp"),
                         "TERM": "dumb",
                         "KUBE_AGENTS_LOCK_FILE": lock_file,
+                        **installer_report_env(),
                     },
                 )
             finally:
@@ -1756,7 +1790,7 @@ refresh_existing_clone "{clone_dir}" "{requested_ref}"
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={"HOME": str(home_dir), "PATH": os.environ["PATH"], **installer_report_env()},
             cwd=str(outside_dir),
         )
 
@@ -1894,7 +1928,7 @@ echo "INSTALL_CHECKOUT=$install_checkout"
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={"HOME": str(home_dir), "PATH": os.environ["PATH"], **installer_report_env()},
             cwd=str(cwd or outside_dir),
         )
 
@@ -2108,7 +2142,7 @@ exit {exit_code}
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={"HOME": str(home_dir), "PATH": os.environ["PATH"], **installer_report_env()},
             cwd=str(outside_dir),
         )
 
@@ -2488,7 +2522,7 @@ exit {exit_code}
                 'echo "INSTALL_CHECKOUT=$install_checkout"',
             ]
         )
-        run_env = {"HOME": str(home_dir), "PATH": os.environ["PATH"]}
+        run_env = {"HOME": str(home_dir), "PATH": os.environ["PATH"], **installer_report_env()}
         if extra_env:
             run_env.update(extra_env)
         return subprocess.run(
@@ -3012,7 +3046,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 source "{self._INSTALLER_COMMON}"
 resolve_install_env_file "{repo_dir}" "{install_checkout}"
 """
-        env = {"HOME": str(home if home is not None else cwd), "PATH": os.environ["PATH"]}
+        env = {"HOME": str(home if home is not None else cwd), "PATH": os.environ["PATH"], **installer_report_env()}
         if install_env_var is not None:
             env["KUBE_AGENTS_INSTALL_ENV"] = str(install_env_var)
         proc = subprocess.run(
@@ -3170,6 +3204,7 @@ class FrontDoorsAgreeOnTheInstallCheckoutTest(unittest.TestCase):
                         "HOME": "/h",
                         "PATH": os.environ["PATH"],
                         "KUBE_AGENTS_INSTALL_ENV": str(empty_install_env),
+                        **installer_report_env(),
                     },
                     cwd=str(_REPO_ROOT),
                 )
@@ -3187,7 +3222,7 @@ class FrontDoorsAgreeOnTheInstallCheckoutTest(unittest.TestCase):
             ["bash", "-c", f"set -u\n{definition.group(0)}\nkube_agents_clone_dir"],
             capture_output=True,
             text=True,
-            env={"HOME": "/h", "PATH": os.environ["PATH"]},
+            env={"HOME": "/h", "PATH": os.environ["PATH"], **installer_report_env()},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), paths["install.sh"])
