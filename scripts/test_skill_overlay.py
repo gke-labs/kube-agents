@@ -173,11 +173,18 @@ class Scenario(unittest.TestCase):
         patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: case-one, case-two"))
         self.assertIn("ok: 2", self.run_tool("check"))
 
-    def test_check_passes_a_patch_with_no_eval_case_line(self):
+    def test_check_fails_a_patch_with_no_eval_case_line(self):
         self.adopt_with_two_patches()
         patch = self.overlay() / "0001-use-location.patch"
-        patch.write_text(patch.read_text().replace("Eval-Case: none (fixture)\n", ""))
-        self.assertNotIn("Eval-Case", patch.read_text())
+        filled = patch.read_text()
+        # No line at all, and a key the tool does not read as the line.
+        for header in (filled.replace("Eval-Case: none (fixture)\n", ""),
+                       filled.replace("Eval-Case: none (fixture)", "Eval-case: none (fixture)")):
+            patch.write_text(header)
+            out = self.run_tool("check", expect=1)
+            self.assertIn("fill in the Eval-Case: header of 0001-use-location.patch", out)
+            self.assertNotIn("0002-fix-typo.patch", out)
+        patch.write_text(filled)
         self.assertIn("ok: 2", self.run_tool("check"))
 
     def test_eval_case_line_survives_a_sync_and_a_fold(self):

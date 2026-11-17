@@ -266,7 +266,7 @@ flowchart LR
 
 ### The presubmit check
 
-- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is empty or starts with `TODO`; a patch with no such line passes. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
+- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is missing, empty or starts with `TODO`. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
 - Reads only committed files: no network, so it cannot fail because GitHub is slow.
 - Patches are refreshed on every sync, so the check applies them without merging; a patch that needs a merge to apply is itself a failure.
 
@@ -341,7 +341,7 @@ What `make skills-check` reports when a step is skipped:
 | A patch or `append.md` was edited and the skill not rebuilt                                    | the rebuilt skill differs from the committed one  | `make skills-generate`                                                   |
 | The upstream copy was edited by hand                                                           | the copy no longer matches the sha256 in its lock | revert it; sync to change it                                             |
 | A patch no longer applies (an earlier patch it depends on was deleted, or a hand edit clashes) | the overlay cannot be applied in filename order   | delete it too, regenerate, then redo its edit with `make skills-refresh` |
-| A new patch's `Eval-Case:` line was not filled in                                              | the line is empty or starts with `TODO`           | name the pull request's case(s), or `none (<reason>)`                    |
+| A patch's `Eval-Case:` line is missing or was not filled in                                    | no such line, or one that is empty or `TODO`      | name the pull request's case(s), or `none (<reason>)`                    |
 
 ### Skills this repository writes
 

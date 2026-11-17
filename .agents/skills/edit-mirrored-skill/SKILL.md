@@ -80,8 +80,8 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
      patch, comma-separated (an id is a folder name in `bench/tasks/`), or `none (<reason>)` when
      that pull request states an exemption. The line names the case of the pull request that added
      the patch, and of a later one that changed what it does (a fold, step 2). It does not say the
-     case tested this patch alone. `make skills-check` fails while the line is empty or starts
-     with `TODO`; it does not fail a patch that has no `Eval-Case:` line.
+     case tested this patch alone. `make skills-check` fails while the line is missing, empty or
+     starts with `TODO`.
    - `Retire-When:`: the upstream change that makes the patch unnecessary, or `never; <reason>`.
    - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, `none filed yet` if the
      fix is general but not reported yet, or `none (specific to this repository)`.
@@ -150,4 +150,4 @@ a skill otherwise, patch it at its current pin ("Make a change").
 | a skill document is over 40,000 characters      | the generated skill grew past the size limit | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
 | the copy does not match its lock                | the upstream copy was edited by hand         | revert the copy; change it only through a sync                                            |
 | a patch no longer applies                       | a patch it builds on was deleted or edited   | "Remove a change", step 3                                                                 |
-| fill in the `Eval-Case:` header of a patch      | the line is empty or starts with `TODO`      | "Make a change", step 5                                                                   |
+| fill in the `Eval-Case:` header of a patch      | the line is missing, empty or `TODO`         | "Make a change", step 5                                                                   |

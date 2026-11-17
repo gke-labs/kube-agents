@@ -19,7 +19,7 @@ Subcommands:
   refresh <skill>            record edits to the generated skill as a patch
   generate <skill>           rebuild the generated skill from the upstream copy and overlay
   check [<skill>...]         verify copies against their locks and generated skills against
-                             copy + overlay, offline; fail on an unfilled Eval-Case: header
+                             copy + overlay, offline; fail on a missing or unfilled Eval-Case: header
   status                     list skills upstream has moved past, and upstream skills not mirrored
   verify-upstream            compare each copy with google/skills at its locked commit
 
@@ -338,13 +338,10 @@ def patch_why(path):
 
 
 def eval_case_unfilled(path):
-    """True when any Eval-Case: line of the patch header is empty or still the placeholder.
-
-    A patch with no such line passes: patches written before the line existed carry none.
-    """
+    """True when the patch header has no Eval-Case: line, or one that is empty or the placeholder."""
     values = [line[len(EVAL_CASE_PREFIX):].strip()
               for line in patch_header(read_exact(path)).splitlines() if line.startswith(EVAL_CASE_PREFIX)]
-    return any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
+    return not values or any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
 
 
 def separator_for(text):
@@ -626,8 +623,9 @@ def cmd_check(skills):
             unfilled = [p.name for p in patches(skill) if eval_case_unfilled(p)]
             if unfilled:
                 raise OverlayError(
-                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)}: the eval "
-                    f"case id(s) from the pull request's Live validation, or `none (<reason>)`."
+                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)} (add the line "
+                    f"after Local-Issue: when the patch has none): the eval case id(s) from the pull "
+                    f"request's Live validation, or `none (<reason>)`."
                 )
         except OverlayError as e:
             failures.append(str(e))
