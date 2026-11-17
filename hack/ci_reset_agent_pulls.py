@@ -159,7 +159,13 @@ def transient(exc: BaseException) -> bool:
 
 
 def _reset_at(exc: urllib.error.HTTPError) -> int | None:
+    """When the primary limit resets, if it is the one that ran out. GitHub
+    sends X-RateLimit-Reset on every answer, a secondary limit's included,
+    where X-RateLimit-Remaining is still above 0 and the hourly reset says
+    nothing about when the secondary limit lifts."""
     headers = getattr(exc, "headers", None) or {}
+    if str(headers.get(sweep.RATELIMIT_REMAINING_HEADER, "")).strip() != "0":
+        return None
     try:
         return int(str(headers.get(RATELIMIT_RESET_HEADER)).strip())
     except ValueError:

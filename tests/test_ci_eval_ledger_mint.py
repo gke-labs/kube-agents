@@ -506,6 +506,9 @@ if mode == "github-500":
     print("  GET /repos/x/pulls answered HTTP 500; trying again in 2s", file=sys.stderr)
     print("ERROR: GitHub answered HTTP 500 Internal Server Error reading gke-agentic/kube-agents-evals-2-infra", file=sys.stderr)
     sys.exit(1)
+if mode == "rate-limited":
+    print("ERROR: GitHub stayed rate limited past the waits (HTTP 403 Forbidden) on gke-agentic/kube-agents-evals-2-infra; infrastructure, not the token's reach", file=sys.stderr)
+    sys.exit(75)
 if mode == "unclean":
     print("closed 0 pull request(s) and deleted 0 branch(es); 0 agent pull request(s) and 1 branch(es) remain")
     sys.exit(1)
@@ -771,6 +774,17 @@ class UnitNotRunTest(unittest.TestCase):
         self._unit(1, "ok", phase="1", reset_helper="github-500")
         self.assertIsNone(self._dir(1))
         self.assertFalse((self.state / "not-run").exists())
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_reset_still_rate_limited_is_recorded_as_infrastructure(self):
+        # #6105: the helper exits 75 when GitHub's shared limit outlasted its
+        # waits, and the record says that, not that the mint failed.
+        self._unit(1, "ok", phase="1", reset_helper="rate-limited")
+        error = self._record(1)["errors"][0]
+        self.assertTrue(error.startswith("KUBE_AGENTS_INFRA_FAILURE: "), error)
+        self.assertIn("the repository reset stayed rate limited past its waits before launch", error)
+        self.assertIn("GitHub stayed rate limited past the waits", error)
+        self.assertNotIn("could not be minted", error)
         self.assertNotIn("devops-bench reached", self.finished.read_text())
 
     def test_a_reset_that_left_the_repository_unclean_stays_missing(self):

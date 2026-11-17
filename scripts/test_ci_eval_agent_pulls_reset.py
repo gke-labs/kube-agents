@@ -549,6 +549,12 @@ class RetryTest(unittest.TestCase):
             self.assertEqual(helper.limit_wait(limited({"X-RateLimit-Reset": "900"})), 1)
             self.assertEqual(helper.limit_wait(limited({"Retry-After": "7", "X-RateLimit-Reset": "1100"})), 7)
             self.assertEqual(helper.limit_wait(limited({})), helper.sweep.RETRY_AFTER_DEFAULT_SECONDS)
+            # A secondary limit: quota left, so the hourly reset is not its window.
+            secondary = urllib.error.HTTPError(
+                "u", 403, "F", {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "4000"},
+                io.BytesIO(b'{"message":"You have exceeded a secondary rate limit"}'),
+            )
+            self.assertEqual(helper.limit_wait(secondary), helper.sweep.RETRY_AFTER_DEFAULT_SECONDS)
 
     def test_a_limit_that_outlasts_its_waits_fails_the_later_calls_at_once(self):
         # Once one call met a limit that would not clear, the rest of the
