@@ -2622,6 +2622,10 @@ class VcsBroker:
             # earlier `practice` or `on` left.
             reason = "KUBEAGENTS_AUTOMERGE is off"
         want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch) if reason is None else None
+        if want == automerge_eligibility.AUTOMERGE_LABEL and not dial_allows_automerge():
+            # The dial below Auto-merge holds back the label a pipeline merges
+            # on, and takes a carried one off; `practice`'s label is unaffected.
+            reason, want = "the autonomy dial is below Auto-merge", None
         carried = _reserved_labels_on(proposal)
         after: dict[str, Any] | None = None
         added = False

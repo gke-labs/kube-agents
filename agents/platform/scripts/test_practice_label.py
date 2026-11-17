@@ -299,6 +299,15 @@ class PracticeLabelTest(unittest.TestCase):
                 self.assertIsNotNone(vcs_broker._gke_cluster(cluster))
         self.assertIsNone(vcs_broker._gke_cluster("acme-prod-1/--zone=x/fleet-1"))
 
+    def test_the_dial_below_auto_merge_holds_back_the_on_label(self):
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=False):
+            answer, calls = self.run_verb(switch="on", labels=[ae.AUTOMERGE_LABEL])
+            self.assertFalse(answer["labelled"])
+            self.assertIn("dial", answer["reason"])
+            self.assertEqual(self.writes(calls), [("proposal-update", {"number": 7, "labelsRemove": [ae.AUTOMERGE_LABEL]})])
+            answer, _ = self.run_verb(switch="practice")
+            self.assertTrue(answer["labelled"])
+
     def test_a_failed_read_says_nothing_of_what_it_read(self):
         answer, _ = self.run_verb(read_code=1)
         self.assertNotIn("denied", answer["reason"])

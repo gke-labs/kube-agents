@@ -105,7 +105,8 @@ With the switch `practice` or `on`, each time the fleet audit opens or refreshes
 
 A pull request that carries a label and no longer qualifies loses it on the audit's next
 run, which includes after the switch is turned back to `off`. A change of switch value swaps
-one label for the other. The broker reads all of this itself, and no request from the agent can add,
+one label for the other. While the autonomy dial is below Auto-merge, `kube-agents:auto-merge` is held
+back and a carried one comes off. The broker reads all of this itself, and no request from the agent can add,
 remove or create either label. The pull request's body shows the same safety checks under **Safety
 checks**.
 
