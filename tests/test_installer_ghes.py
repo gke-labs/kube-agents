@@ -923,8 +923,11 @@ class GhesSourcingTest(unittest.TestCase):
 class GhesInterviewAndHelpTest(unittest.TestCase):
 
     def test_help_describes_the_ghes_flags(self):
-        proc = subprocess.run(["bash", str(_INSTALL_SH), "--help"], capture_output=True, text=True,
-                              cwd=str(_REPO_ROOT), env=get_isolated_test_env(), timeout=60)
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+                timeout=60)
         out = proc.stdout
         self.assertIn("GitHub Enterprise Server", out)
         self.assertIn("github-forge-ca", out)
