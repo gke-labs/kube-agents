@@ -475,7 +475,8 @@ leave open:
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
-  and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
+  and `deadline-exceeded` while it holds, and on a `canceled` terminal `stopped` (the
+  conversation's stop) and `tier-ended` (an administrator ended its tier's drain, #5850). A terminal is retried until it lands, except for a
   profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as

@@ -493,6 +493,12 @@ type DrainingTier struct {
 	// the operator keeps rendering for it while it drains.
 	Mode  string    `json:"mode"`
 	Until time.Time `json:"until"`
+	// Ending, set, is an administrator ending this drain now (#5850): the
+	// dispatcher ends every task it holds at the tier instead of letting it
+	// run to its end, and the operator tears the tier down at Until, which it
+	// has shortened to a grace. An older dispatcher ignores it; the teardown
+	// still ends the work, as lease-expired.
+	Ending bool `json:"ending,omitempty"`
 }
 
 // DrainsTier reports whether tier is one p drains (DrainingTiers).
