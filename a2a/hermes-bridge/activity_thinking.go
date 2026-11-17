@@ -34,7 +34,7 @@ var (
 	// the pair and redacts the value whatever its shape
 	// (authHeaderKVLeadPattern).
 	authSchemeCredentialPattern = regexp.MustCompile(`(?i)\b(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+([^\s"'\x60,;)\]}>|]+)`)
-	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)authorization\\?["']?[ \t]*[:=][ \t]*\\?["']?[ \t]*$`)
+	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)(?:authorization\\?["']?[ \t]*[:=]|(?:^|[^a-z0-9-]|[a-z0-9]-)authorization\\?["']?[ \t]*[*_]+[ \t]*:)[ \t]*\\?["']?[ \t]*$`)
 	// "Authorization", "<scheme> <credential>": a header setter call or a
 	// header pair in code, the credential redacted whatever its shape.
 	authHeaderPairPattern = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\\?["'][ \t]*,[ \t]*(?:\r?\n[ \t]*)?\\?["'](?:(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+)?([^"'\\\r\n]+)`)
@@ -83,7 +83,7 @@ var (
 	// to), may be followed by a colon or by whitespace, none of which is the
 	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)[*_]*\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t*_]*([=:])[ \t]*)`) // a * or _ left as text may precede the separator (#6182)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -1675,12 +1675,22 @@ func scrubYAMLSecretBlocks(s string) string {
 // (proseSecretPattern), as proseValueRedacted says, matched with the
 // markdown around the noun and the value normalised away ("the
 // **password** is `x`").
+// proseMarkedAssignmentPattern is a prose label whose credential word has a
+// mark left against it and whose verb is "=": the key/value rule owns that
+// shape, and redacts the whole value.
+var proseMarkedAssignmentPattern = regexp.MustCompile(`(?i)(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)[*_]+\s*=`)
+
 func scrubProseSecrets(s string, sink secretSink) string {
 	return scrubNormalized(s, sink, func(n string, code [][2]int, rec func(lo, hi int, named bool)) {
 		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
 			lo, hi := m[4], m[5]
 			if end, ok := codeSpanEnd(code, lo); ok && n[lo:end] != redactedValue && proseValueRedacted(n[lo:end]) {
 				hi = end // a code-spanned value ends at its closing backtick
+			}
+			if proseMarkedAssignmentPattern.MatchString(n[m[2]:m[3]]) {
+				// "<word>* = value" is an assignment the key/value rule
+				// redacts whole; the prose value stops at punctuation (#6201).
+				continue
 			}
 			if n[lo:hi] != redactedValue && proseValueRedacted(n[lo:hi]) {
 				rec(lo, hi, clearSecretNounPattern.MatchString(n[m[2]:m[3]]))
@@ -1713,7 +1723,7 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		matchStart := pos + loc[0]
 		matchEnd := pos + loc[1]
 		openQuote := s[pos+loc[2] : pos+loc[3]]
-		key := s[pos+loc[4] : pos+loc[5]]
+		key := strings.TrimRight(s[pos+loc[4]:pos+loc[5]], "_")
 		closeQuote := s[pos+loc[6] : pos+loc[7]]
 		sep := s[pos+loc[10]]
 		// Only a blank counts here, not a mark the separator group allows.

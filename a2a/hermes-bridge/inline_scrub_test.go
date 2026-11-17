@@ -763,3 +763,55 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		}
 	}
 }
+
+// TestScrubInlineSecretsAMarkLeftAgainstALabel: a * or _ the markdown pass
+// leaves glued to a credential label still reads as a mark, not as part of
+// the label (#6201): a key's trailing _ before its separator, the same mark
+// after the credential word in prose, and a mark before an Authorization
+// key's separator. Synthetic values only.
+func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
+	for _, in := range []string{
+		// A key's trailing _ before its separator.
+		"password_: quietpasture",
+		"- password_: quietpasture",
+		"token_= quietpasture",
+		"DB_PASSWORD_: quietpasture",
+		"Note _ _password_: quietpasture",
+		// The same mark after the credential word in prose.
+		"Note * *the password* is quietpasture",
+		"a * b *the token* was quietpasture",
+		"Note _ _password_ is quietpasture",
+	} {
+		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+	}
+	for in, want := range map[string]string{
+		// A mark before an Authorization key's separator: the whole value
+		// goes, not the scheme's first token.
+		`Authorization*: Digest username="admin", response="Synth3tic-Pass-0001"`: `Authorization*: Digest [redacted]`,
+		`Authorization_: "Bearer Synth3tic-Pass-0001 extra"`:                      `Authorization_: "Bearer [redacted]"`,
+		// Unchanged from main: quoted keys ending in _, spaced marks around
+		// a value, and an emphasised label.
+		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
+		`"DB_PASSWORD_": "Synth3tic-Pass-0001"`: `"DB_PASSWORD_": "[redacted]"`,
+		"export DB_PASSWORD=* quietpasture *":   "export DB_PASSWORD=* [redacted] *",
+		"Note password: ** quietpasture ** ok":  "Note password: ** [redacted] ** ok",
+		"**Token:** quietpasture":               "**Token:** [redacted]",
+		"password: quietpasture*":               "password: [redacted]",
+		// A non-secret key ending in _ stays a non-secret key.
+		"host_: db.example": "host_: db.example",
+		// As at main: an assignment with a marked credential word is the
+		// key/value rule's, value whole; a key that only ends in
+		// "authorization", and a --flag, keep the auth-scheme rule.
+		"password* = quiet.pasture.0001":                   "password* = [redacted]",
+		"user = bob, password* = Synth3tic.Pass, host = h": "user = bob, password* = [redacted], host = h",
+		"preauthorization*: Bearer Synth3tic-Pass-0001":    "preauthorization*: Bearer [redacted]",
+		"--Authorization _=Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
+		"--Authorization *:Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
