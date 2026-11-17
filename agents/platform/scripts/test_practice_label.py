@@ -183,13 +183,25 @@ class PracticeLabelTest(unittest.TestCase):
         self.assertEqual(self.writes(calls), [("proposal-update", {"number": 7, "labelsRemove": [ae.PRACTICE_LABEL]})])
         self.assertEqual(self.reads, [])
 
-    def test_a_push_while_judging_takes_the_label_off_again(self):
+    def test_a_push_while_judging_labels_nothing(self):
         answer, calls = self.run_verb(moved=True)
         self.assertFalse(answer["labelled"])
-        self.assertEqual(
-            [c[1] for c in self.writes(calls) if c[0] == "proposal-update"],
-            [{"number": 7, "labelsAdd": [ae.PRACTICE_LABEL]}, {"number": 7, "labelsRemove": [ae.PRACTICE_LABEL]}],
-        )
+        self.assertEqual(self.writes(calls), [])
+
+    def test_a_push_while_judging_takes_a_carried_label_off(self):
+        answer, calls = self.run_verb(moved=True, labels=[ae.PRACTICE_LABEL])
+        self.assertFalse(answer["labelled"])
+        self.assertEqual(self.writes(calls), [("proposal-update", {"number": 7, "labelsRemove": [ae.PRACTICE_LABEL]})])
+
+    def test_a_merge_while_judging_labels_nothing(self):
+        answer, calls = self.run_verb(switch="on", later={"state": "merged"})
+        self.assertFalse(answer["labelled"])
+        self.assertEqual(self.writes(calls), [])
+
+    def test_no_rules_file_reads_no_cluster(self):
+        answer, _ = self.run_verb(rules=automation_rules.Rules(status=automation_rules.ABSENT))
+        self.assertFalse(answer["labelled"])
+        self.assertEqual(self.reads, [])
 
     def test_the_answer_names_checks_but_not_what_the_cluster_said(self):
         answer, _ = self.run_verb()

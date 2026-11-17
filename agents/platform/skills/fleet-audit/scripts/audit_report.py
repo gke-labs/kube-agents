@@ -17174,6 +17174,13 @@ def sync_open_remediation_labels(
             str(f.get("check") or "") == GENERATED_FIX_CHECK for f in group
         ):
             request_practice_label(repo, number)
+    # A labelled fix whose finding is not a manifest group this run (left
+    # `manual`, or not re-planned) is asked about too, so its label can come off.
+    for pr in pr_by_finding.values():
+        number = str((pr or {}).get("number", "") or "")
+        if number and number not in seen and str(pr.get("state", "")).upper() == "OPEN" and carries_practice_label(pr):
+            seen.add(number)
+            request_practice_label(repo, number)
 
 
 class _GroupPush(NamedTuple):

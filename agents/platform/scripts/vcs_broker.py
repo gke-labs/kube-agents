@@ -2622,6 +2622,12 @@ class VcsBroker:
         want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch) if reason is None else None
         carried = _reserved_labels_on(proposal)
         after: dict[str, Any] | None = None
+        added = False
+        if want is not None and want not in carried:
+            # The judgement took time: label only the head it judged, still open.
+            fresh = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if fresh.get("state") != OPEN_PROPOSAL_STATE or fresh.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason, want = "the proposal moved, merged or closed while it was judged", None
         if want is not None:
             if want not in carried:
                 bound.forge.label_ensure(
@@ -2635,6 +2641,7 @@ class VcsBroker:
                 )
                 bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsAdd": [want]})
                 carried.append(want)
+                added = True
             # The judgement was of the head read above. A push since then is
             # a diff nobody judged, so the label comes off again.
             after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
@@ -2645,7 +2652,9 @@ class VcsBroker:
             # The judgement took time; a pull request that merged meanwhile
             # keeps its label, which the post-merge step-down reads.
             after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
-        if stale and (after or {}).get("state") == OPEN_PROPOSAL_STATE:
+        # A label this call just added was never earned by a head that moved,
+        # so it comes off whatever the state; an older one stays on a merge.
+        if stale and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
             bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
         LOGGER.info(
             "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",
@@ -2701,6 +2710,8 @@ class VcsBroker:
         if not base or proposal.get("target") != base:
             return f"the proposal does not target the repository's base branch ({base or 'unknown'})"
         rules = self._practice_rules(payload, base)
+        if rules.status != automation_rules.LOADED:
+            return f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
         project, location, name = target
         code, out, err = self._cluster_read(
             ["gcloud", "container", "clusters", "describe", name, "--location", location,
