@@ -11199,6 +11199,54 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
                         dict(line.split("=", 1) for line in result.stdout.splitlines()),
                     )
 
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_the_bootstrap_command(self):
+        # `bootstrap` gives its command the command environment plus a second
+        # list of names from the proxy's own environment. A `serve` with no
+        # bootstrap command does not reach that list. This starts `serve` with
+        # one, for each role, with both names in the proxy's environment, and
+        # reads what the command was given. On GKE the operator's bootstrap
+        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # its own value; the pod's value must not replace it.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # The command writes these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log.
+        command = (
+            "{ "
+            + " ".join(f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\";" for name in pod_environment)
+            + ' } > "$HOME/bootstrap-names"'
+        )
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", unset),
+            ("combined", unset),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(
+                    None,
+                    extra_env={
+                        "CREDENTIAL_PROXY_ROLE": role,
+                        "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": command,
+                        **pod_environment,
+                    },
+                )
+                written = CredentialProxyHandler.executor.home_dir / "bootstrap-names"
+                given = written.read_text(encoding="utf-8")
+                # Removed before the assertion, so the next role starts with no
+                # file also when this role fails: a bootstrap that did not run
+                # cannot pass, or fail, on the file of the role before it.
+                written.unlink()
+                self.assertEqual(
+                    {
+                        "MALLOC_ARENA_MAX": unset,
+                        credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                    },
+                    dict(line.split("=", 1) for line in given.splitlines()),
+                )
+
     def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
         for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
             with self.subTest(role=role):
