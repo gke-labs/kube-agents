@@ -1,0 +1,81 @@
+"""The two file lists of .github/workflows/installer-tests-bash-floor.yml.
+
+The job runs the test files of `INSTALLER_TEST_FILES` under /bin/bash 3.2, and `paths` names
+the files whose change starts it. People keep both lists by hand. These tests hold them against
+the tree, so that a new installer test file is not left out of the job in silence.
+"""
+
+import fnmatch
+import pathlib
+import unittest
+
+import yaml
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "installer-tests-bash-floor.yml"
+# What counts as a new installer test file here. A test file with another name is not seen.
+_INSTALLER_TEST_GLOB = "tests/test_installer_*.py"
+# The files of the job that the glob does not match: the tests of the three front-door
+# scripts, of lifecycle.sh and of scripts/dev/repeat_under_load.sh.
+_ALSO_IN_THE_JOB = {
+    "tests/test_install_script.py",
+    "tests/test_upgrade_script.py",
+    "tests/test_uninstall_script.py",
+    "tests/test_lifecycle_script.py",
+    "tests/test_repeat_under_load.py",
+}
+# An installer test file that the job does not run: its path as the glob gives it
+# ("tests/test_installer_x.py"), and the reason.
+_NOT_IN_THE_JOB = {}
+
+
+def _workflow():
+    return yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def _triggers(workflow):
+    # YAML 1.1 reads the bare key `on` as the boolean True.
+    return workflow.get("on", workflow.get(True))
+
+
+def _job_files(workflow):
+    return workflow["env"]["INSTALLER_TEST_FILES"].split()
+
+
+class BashFloorFileListsTest(unittest.TestCase):
+    def test_each_installer_test_file_is_in_the_job_or_is_a_named_exception(self):
+        job_files = set(_job_files(_workflow()))
+        installer_tests = {str(p.relative_to(_REPO_ROOT)) for p in _REPO_ROOT.glob(_INSTALLER_TEST_GLOB)}
+        self.assertTrue(installer_tests, f"{_INSTALLER_TEST_GLOB} matched no file")
+        self.assertEqual(
+            set(),
+            (installer_tests | _ALSO_IN_THE_JOB) - job_files - set(_NOT_IN_THE_JOB),
+            f"add each file to INSTALLER_TEST_FILES and to paths in {_WORKFLOW.name}, "
+            "or to _NOT_IN_THE_JOB here with the reason",
+        )
+        self.assertEqual(set(), set(_NOT_IN_THE_JOB) & job_files, "an exception that the job runs")
+        self.assertEqual(
+            set(), set(_NOT_IN_THE_JOB) - installer_tests, f"an exception that {_INSTALLER_TEST_GLOB} does not match"
+        )
+
+    def test_each_file_of_the_job_exists_and_a_change_to_it_starts_the_job(self):
+        workflow = _workflow()
+        job_files = _job_files(workflow)
+        paths = _triggers(workflow)["pull_request"]["paths"]
+        self.assertEqual(len(job_files), len(set(job_files)), "a file is in INSTALLER_TEST_FILES two times")
+        for file in job_files:
+            with self.subTest(file=file):
+                self.assertTrue((_REPO_ROOT / file).is_file(), "INSTALLER_TEST_FILES names a file that does not exist")
+                # An entry of `paths` is a file or a pattern.
+                self.assertTrue(
+                    any(fnmatch.fnmatchcase(file, pattern) for pattern in paths),
+                    f"no entry of paths matches {file}: a change to it does not start the job",
+                )
+
+    def test_the_push_trigger_has_the_same_paths_as_the_pull_request_trigger(self):
+        triggers = _triggers(_workflow())
+        self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
+
+
+if __name__ == "__main__":
+    unittest.main()
