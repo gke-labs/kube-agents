@@ -91,8 +91,9 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 	}
 	size := len(cm.Data[a2aDispatchConfigKey])
 	const configMapLimit = 1 << 20
-	// Measured at 445,568 bytes (42%) with the test profile's three
-	// parameters. Held to half a ConfigMap, so the other half is headroom
+	// Measured at 483,068 bytes (46%) with the test profile's three
+	// parameters and a per-tier template reference, one hash however many
+	// tiers (#5646; 445,568 before it). Held to half a ConfigMap, so the other half is headroom
 	// for longer names and parameter lists.
 	const target = configMapLimit / 2
 	t.Logf("2,500 two-tier profiles: %d bytes, %.0f%% of a ConfigMap", size, 100*float64(size)/configMapLimit)
