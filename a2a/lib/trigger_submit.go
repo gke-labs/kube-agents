@@ -127,8 +127,8 @@ type TriggerSubmit struct {
 	Delivery ScheduleDelivery `json:"delivery"`
 }
 
-// TriggerClaim is the trigger as a submission names it: the same three
-// fields capability.Trigger binds (lib can't import capability).
+// TriggerClaim is the trigger as a submission names it: the fields
+// capability.Trigger binds (lib can't import capability).
 type TriggerClaim struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
