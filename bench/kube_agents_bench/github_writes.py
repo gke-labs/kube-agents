@@ -295,7 +295,9 @@ def _read_handled(status: int) -> None:
 def _is_rate_limit(status: int, payload: Any) -> bool:
     from kube_agents_bench import verifiers  # lazy: verifiers imports this module
 
-    return verifiers.is_rate_limit_answer(status, payload)
+    # The read's headers too (a Retry-After, no budget left), as the read
+    # path's wait judged it, so the two never disagree about one 403.
+    return verifiers.is_rate_limit_answer(status, payload, verifiers._last_forge_error_headers.get())
 
 
 class GitHubUnreadable(Exception):

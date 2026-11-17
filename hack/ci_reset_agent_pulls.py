@@ -68,6 +68,7 @@ import argparse
 import base64
 import http.client
 import json
+import math
 import os
 import pathlib
 import sys
@@ -172,13 +173,16 @@ def limit_wait(exc: urllib.error.HTTPError) -> float:
     when the budget is spent."""
     headers = getattr(exc, "headers", None) or {}
     wait: float = RATE_LIMIT_DEFAULT_WAIT_SECONDS
-    try:
-        wait = float(headers.get(sweep.RETRY_AFTER_HEADER))
-    except (TypeError, ValueError):
+    for header, offset in ((sweep.RETRY_AFTER_HEADER, None), (RATELIMIT_RESET_HEADER, now())):
         try:
-            wait = float(headers.get(RATELIMIT_RESET_HEADER)) - now() + 1
+            value = float(headers.get(header))
         except (TypeError, ValueError):
-            pass
+            continue
+        if math.isnan(value):
+            # nan compares false to everything, so min/max would keep it.
+            continue
+        wait = value if offset is None else value - offset + 1
+        break
     left = max(0.0, RATE_LIMIT_BUDGET_SECONDS - _rate_limit_waited)
     return min(max(wait, RATE_LIMIT_FLOOR_SECONDS), RATE_LIMIT_WAIT_SLICE_SECONDS, left)
 

@@ -4327,6 +4327,7 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         context = forges.forge_ssl_context()
     except forges.UnknownForge as exc:
         raise OSError(str(exc)) from exc
+    _last_forge_error_headers.set(None)
     handlers: list[Any] = [_NoRedirect]
     if context is not None:
         # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
@@ -4407,13 +4408,16 @@ def _forge_rate_limit_wait(headers: Any) -> float:
     budget is spent."""
     get = headers.get if headers is not None else (lambda _key: None)
     wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
-    try:
-        wait = float(get(_RETRY_AFTER_HEADER))
-    except (TypeError, ValueError):
+    for header, offset in ((_RETRY_AFTER_HEADER, None), (_RATELIMIT_RESET_HEADER, time.time())):
         try:
-            wait = float(get(_RATELIMIT_RESET_HEADER)) - time.time() + 1
+            value = float(get(header))
         except (TypeError, ValueError):
-            pass
+            continue
+        if math.isnan(value):
+            # nan compares false to everything, so min/max would keep it.
+            continue
+        wait = value if offset is None else value - offset + 1
+        break
     left = max(0.0, _forge_rate_limit_budget() - _forge_rate_limit_waited)
     return min(max(wait, _FORGE_RATE_LIMIT_FLOOR_SEC), _FORGE_RATE_LIMIT_SLICE_SEC, left)
 
@@ -4434,6 +4438,18 @@ def is_rate_limit_answer(status: int, payload: Any, headers: Any = None) -> bool
         if str(headers.get(_RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
             return True
     return False
+
+
+def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
+    """The check's reason when the read behind it answered a rate limit
+    (is_rate_limit_answer, with the read's headers), so the reader isn't sent
+    to the App's permissions; None for any other answer (#6105)."""
+    if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
+        return None
+    return (
+        f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
+        "installation's hourly budget, so this check could not be evaluated"
+    )
 
 
 def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
@@ -5045,6 +5061,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                         continue
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -5461,6 +5480,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
                         return done(False, why, status="error")
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -6263,6 +6285,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return {}, limit
             if status != 200 or not isinstance(files, list):
                 return {}, (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6318,6 +6343,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return [], limit
             if status != 200 or not isinstance(files, list):
                 return [], (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6419,6 +6447,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status_code, listed, f"the closed pull requests from {ref}")
+        if limit:
+            return None, limit
         if status_code != 200 or not isinstance(listed, list):
             return None, (
                 f"GitHub answered {status_code} listing the closed pull requests from "
@@ -6477,6 +6508,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         token,
                         budget,
                     )
+                limit = _rate_limit_reason(status_code, commits, f"the commits of {slug}")
+                if limit:
+                    return None, limit
                 if status_code != 200 or not isinstance(commits, list):
                     return None, (
                         f"GitHub answered {status_code} listing the commits of {slug}; "
@@ -6554,6 +6588,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         if status_code == 200 and isinstance(payload, dict):
             return payload, None
+        limit = _rate_limit_reason(status_code, payload, f"{owner}/{repo}#{number}")
+        if limit:
+            return None, limit
         if first == 403 and status_code == 403:
             return None, (
                 f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
@@ -6628,6 +6665,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     None,
                     {},
                     None,
+                    _rate_limit_reason(status, payload, f"{owner}/{repo}#{number} on the pulls endpoint") or
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
                     f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
@@ -6676,6 +6714,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 None,
                 {},
                 None,
+                _rate_limit_reason(status, commits, f"{owner}/{repo}#{number}'s commits page") or
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
                 f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "

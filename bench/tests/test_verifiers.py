@@ -5505,6 +5505,37 @@ def test_a_rename_away_from_a_kept_path_is_a_change_to_it(token, github):
     assert _pr_check(unchanged_paths=_KEPT).verify(5.0).status == "fail"
 
 
+def test_files_read_under_a_rate_limit_name_the_limit_not_a_permission(token, github):
+    """#6105: a pull request's files answered with the installation's limit
+    used to read as "needs `pull_requests: read`"; the reason names the limit."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (
+        403, {"message": "API rate limit exceeded for installation ID 157029058."}
+    )
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_rate_limit_reason_reads_the_reads_headers(monkeypatch):
+    """A 403 whose body names no limit but whose headers do (no budget left)
+    is a limit; with neither, there is no limit reason."""
+    verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+    assert "rate-limited" in verifiers._rate_limit_reason(403, {"message": "Forbidden"}, "x")
+    verifiers._last_forge_error_headers.set(None)
+    assert verifiers._rate_limit_reason(403, {"message": "Resource not accessible by integration"}, "x") is None
+
+
+def test_a_nan_header_waits_as_if_absent(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Reset": "1100"}) == 101.0
+
+
 def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())

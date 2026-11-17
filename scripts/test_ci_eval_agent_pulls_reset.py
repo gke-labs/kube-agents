@@ -603,6 +603,13 @@ class RetryTest(unittest.TestCase):
         with mock.patch.object(helper, "_rate_limit_waited", float(helper.RATE_LIMIT_BUDGET_SECONDS)):
             self.assertEqual(helper.limit_wait(zero), 0)
 
+    def test_a_nan_header_waits_as_if_absent(self):
+        # float("nan") parses, and min/max keep a nan: it must not reach
+        # pause(), which would raise, or the budget counter.
+        nan = urllib.error.HTTPError("u", 429, "L", {"Retry-After": "nan"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(nan), helper.RATE_LIMIT_DEFAULT_WAIT_SECONDS)
+
     def test_each_reset_starts_with_a_full_budget(self):
         # A budget an earlier reset spent doesn't carry into the next.
         github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])

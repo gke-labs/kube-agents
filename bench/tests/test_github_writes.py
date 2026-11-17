@@ -1259,3 +1259,22 @@ def test_a_rate_limited_branch_listing_raises_instead_of_reading_as_no_grant():
         limited.branch_tip_date("o/r", "fix-1")
     refused = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "Resource not accessible by integration"}), 1.0)
     assert refused.branches_under("o/r", "fix") is None
+
+
+def test_a_limit_marked_only_in_its_headers_is_a_limit_to_the_client():
+    """The client reads the read's headers as the read path's wait does: a
+    403 whose body names no limit but whose headers say no budget is left
+    raises on a branch listing, named as the limit, instead of reading as
+    "cannot list refs"."""
+    def transport(url, tok, timeout):
+        verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+        return 403, {"message": "Forbidden"}
+
+    client = github_writes.GitHubClient("t", transport, 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        client.branches_under("o/r", "fix")
+    assert "rate-limited" in str(exc.value)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        client.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "rate-limited" in str(exc.value)
+    verifiers._last_forge_error_headers.set(None)
