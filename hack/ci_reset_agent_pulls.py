@@ -104,8 +104,9 @@ RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
 # The evals repositories share one App installation, so one hourly REST budget
 # (#6105): when it runs out, every call answers a marked 403 until the reset
-# GitHub names in X-RateLimit-Reset, minutes away. A limited call waits for
-# that reset (or the Retry-After it asks), never more than
+# GitHub names in X-RateLimit-Reset, minutes away. A limited call waits the
+# Retry-After it asks, else for that reset when the budget is spent, else a
+# minute, never more than
 # RATE_LIMIT_WAIT_SLICE_SECONDS at a time and RATE_LIMIT_BUDGET_SECONDS in all
 # for this run, then gives up with RateLimitExhausted: the repository was
 # never reached, which is GitHub's weather, not the run's.
@@ -168,12 +169,18 @@ now = time.time
 
 def limit_wait(exc: urllib.error.HTTPError) -> float:
     """How long to wait before trying a rate-limited call again: the
-    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
-    default; at most one slice, and at most what is left of the budget. Zero
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice, and at
+    most what is left of the budget. Zero
     when the budget is spent."""
     headers = getattr(exc, "headers", None) or {}
     wait: float = RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    # The reset is the wait only when the hourly budget is spent; a
+    # secondary limit with budget left waits the default (#6177).
+    spent = str(headers.get(sweep.RATELIMIT_REMAINING_HEADER, "")).strip() == "0"
     for header, offset in ((sweep.RETRY_AFTER_HEADER, None), (RATELIMIT_RESET_HEADER, now())):
+        if header == RATELIMIT_RESET_HEADER and not spent:
+            continue
         try:
             value = float(headers.get(header))
         except (TypeError, ValueError):

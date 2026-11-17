@@ -1103,6 +1103,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: shell-sandbox
     spec:
       automountServiceAccountToken: false
       containers:

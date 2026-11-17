@@ -117,7 +117,7 @@ const (
 	// "create secrets (in namespace team-a)", "create deployments.apps (in
 	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
 	// the install namespace and the profile namespace by both install paths
-	// (the chart under mode next, make deploy in every mode); those two
+	// (the chart and make deploy alike, in every mode); those two
 	// namespaces, and an agent elsewhere, are what the operator-namespace
 	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
