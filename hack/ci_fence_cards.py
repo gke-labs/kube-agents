@@ -1,6 +1,6 @@
 """Archive every kanban card left live since the fan-out began. Runs in the agent container.
 
-Usage: python3 - <home> <since-epoch> <passes> <budget-seconds> < ci_fence_cards.py
+Usage: python3 - <home> <since-epoch> <passes> <budget-seconds> [live|arm] < ci_fence_cards.py
 
 hack/ci-eval-pr.sh pipes this into the gateway before each unit of the fan-out's second
 phase (fence_live_cards), where the units run one at a time and the GitHub-write safeguard
@@ -27,9 +27,21 @@ that kept going after it could archive the card of the unit launched next. An ar
 only while ARCHIVE_FLOOR_SECONDS are left, and each archive and board read is bounded by what
 is left. A budget that runs out ends the helper, naming the cards it did not reach.
 
-Prints one line. Exits 0 when nothing live is left (none found, or every one archived), and
-EXIT_LEFT_LIVE (3) when the board could not be read, the budget ran out, or a card is still
-live after the last pass. That code is the helper's own verdict, told apart from kubectl's exit
+With ``arm`` (the replay lane's live arm, run_replay_lane_live_arm), finished cards go too:
+every card not yet archived that was created at or after <since-epoch> and carries a chat or
+inject session, newest first so an archived parent promotes no child that is still to go. The
+replayed arm reads the board through ``kanban_list`` and the board summaries, which leave
+archived cards out, so it no longer finds the live arm's answers there (replay lane build
+2122208205344870400 read a finished live-arm card off the board). Cards with no session (filed by a script or the CLI, as the onboarding
+hand-off files its sweep) and cards from a Hermes cron run whose session is still the run's own
+(``cron_<job>_<time>``, the install's clock-started and first-run audits, which children
+inherit) are left alone. A cron run whose conversation was compressed has a new session id, and
+the install's event-triage cards carry a chat session, so a card either files during the live
+arm is archived too.
+
+Prints one line. Exits 0 when nothing in scope is left (none found, or every one archived), and
+EXIT_LEFT_LIVE (3) when the board could not be read, the budget ran out, or a card in scope is
+still unarchived after the last pass (a live one, or with ``arm`` any one). That code is the helper's own verdict, told apart from kubectl's exit
 1 for an exec that never reached the container, or for a helper that did not run to its verdict:
 the runner retries those and not this (EVAL_FENCE_DECIDED_EXIT in hack/ci-eval-pr.sh).
 """
@@ -42,9 +54,18 @@ import sys
 import time
 
 home, since, passes, budget = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+SCOPE_LIVE = "live"
+SCOPE_ARM = "arm"
+scope = sys.argv[5] if len(sys.argv) > 5 else SCOPE_LIVE
+if scope not in (SCOPE_LIVE, SCOPE_ARM):
+    sys.exit(f"scope must be {SCOPE_LIVE} or {SCOPE_ARM}, got {scope!r}")
 BOARD = os.path.join(home, "kanban.db")
 # harness.py's _TERMINAL_STATUSES: a card in one of these has no worker that writes.
 SETTLED = ("done", "archived", "blocked", "failed", "cancelled")
+# In the arm scope only an archived card is past clearing.
+ARCHIVED = ("archived",)
+# The session id Hermes' cron scheduler gives a job's run (cron/scheduler.py: cron_<job>_<time>).
+CRON_SESSION_PREFIX = "cron_"
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH (harness.py's
 # _HERMES_BIN_FALLBACK).
 HERMES_FALLBACK = "/opt/hermes/.venv/bin/hermes"
@@ -70,12 +91,22 @@ def left():
 
 
 def live_cards():
-    """``[(id, status)]`` of the live cards created since the fan-out began, oldest first."""
+    """``[(id, status)]`` of the cards to archive created since <since-epoch>: live ones oldest
+    first, or in the arm scope every unarchived one with a non-cron session, newest first (by
+    insertion within one second: ``created_at`` is whole seconds and ids are random)."""
     room = left()
     if room <= 0:
         raise BudgetSpent()
     conn = sqlite3.connect(f"file:{BOARD}?mode=ro", uri=True, timeout=min(SQLITE_BUSY_TIMEOUT_SECONDS, room))
     try:
+        if scope == SCOPE_ARM:
+            marks = ",".join("?" * len(ARCHIVED))
+            return conn.execute(
+                f"SELECT id, status FROM tasks WHERE status NOT IN ({marks}) AND COALESCE(created_at, 0) >= ? "
+                "AND COALESCE(session_id, '') != '' AND substr(session_id, 1, ?) != ? "
+                "ORDER BY created_at DESC, rowid DESC",
+                (*ARCHIVED, since, len(CRON_SESSION_PREFIX), CRON_SESSION_PREFIX),
+            ).fetchall()
         marks = ",".join("?" * len(SETTLED))
         return conn.execute(
             f"SELECT id, status FROM tasks WHERE status NOT IN ({marks}) AND COALESCE(created_at, 0) >= ? "
@@ -154,9 +185,10 @@ def fence(hermes, archived, refused):
         print(f"archived {len(archived)}: {', '.join(archived) or 'none'}; would not archive: {'; '.join(refused.values())}")
         return EXIT_LEFT_LIVE
     if not archived:
-        print("nothing live")
+        print("nothing live" if scope == SCOPE_LIVE else "nothing the live arm filed")
         return 0
-    print(f"archived {len(archived)} card(s) left live since the fan-out began: {', '.join(archived)}")
+    what = "left live since the fan-out began" if scope == SCOPE_LIVE else "the live arm filed"
+    print(f"archived {len(archived)} card(s) {what}: {', '.join(archived)}")
     return 0
 
 

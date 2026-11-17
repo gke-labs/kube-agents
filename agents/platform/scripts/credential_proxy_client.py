@@ -1765,7 +1765,9 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     with an HTML body. The body is read once and kept on the error, because
     the retry decision and the message printed after it both need it; a body
     that is not a JSON object counts as none. `exc.shim_dropped` says the
-    connection closed while the body was read.
+    connection closed while the body was read. The error is closed here, on
+    every way out: nothing reads the response again, and the status and the
+    headers stay on it.
     """
     exc.shim_dropped = False
     exc.shim_payload = None
@@ -1777,6 +1779,8 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         # The connection closed while the refusal's body was read.
         exc.shim_dropped = True
         return None
+    finally:
+        exc.close()
     exc.shim_payload = payload if isinstance(payload, dict) else None
     return exc.shim_payload
 
@@ -2106,7 +2110,6 @@ def execute(
                     report_throttled(exc.code, text, attempts_made)
                     return 1
                 report_retry(exc.code, text, attempts_made, delay)
-                exc.close()
                 sleep_fn(delay)
                 continue
             return _exec_refused(exc, payload)
@@ -2280,6 +2283,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
             # has no arm for and every consumer is built on it having one.
             raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
+        finally:
+            # The body is read, or lost: nothing reads the response again. The
+            # status stays on the error.
+            exc.close()
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by

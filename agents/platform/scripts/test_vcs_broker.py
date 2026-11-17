@@ -2584,6 +2584,73 @@ class CollaborationTest(unittest.TestCase):
         vcs_broker.set_dial_level("explain")
         self.assertTrue(vcs_broker.dial_reported())
 
+    def test_the_auto_merge_label_is_refused_below_auto_merge(self):
+        environ = self._dial()
+        adding = (
+            {"labels": ["kube-agents:auto-merge"]}, {"labelsAdd": [" KUBE-AGENTS:Auto-Merge "]},
+            {"labels": "kube-agents:auto-merge"},
+            # The GitLab adapter joins the list with commas, so one element can carry two labels.
+            {"labelsAdd": ["bug,kube-agents:auto-merge"]}, {"labels": "bug, Kube-Agents:auto-merge"},
+        )
+        for level in ("explain", "propose"):
+            vcs_broker.set_dial_level(level)
+            for payload in adding:
+                with self.subTest(level=level, payload=payload), self.assertRaises(vcs_broker.WorkspaceError) as caught:
+                    vcs_broker.refuse_dial_gated_labels(payload, environ)
+                self.assertEqual((caught.exception.status, caught.exception.fields["code"]), (403, "DIAL_AUTOMERGE_OFF"))
+            vcs_broker.refuse_dial_gated_labels({"labelsRemove": ["kube-agents:auto-merge"], "labels": ["bug"]}, environ)
+        vcs_broker.set_dial_level("automerge")
+        vcs_broker.refuse_dial_gated_labels({"labels": ["kube-agents:auto-merge"]}, environ)
+        vcs_broker.refuse_dial_gated_labels({"labels": ["kube-agents:auto-merge"]}, {vcs_broker.DIAL_ENV: "off"})
+
+    def test_the_gated_label_is_the_rules_files_label(self):
+        source = (Path(vcs_broker.__file__).parent / "automation_rules.py").read_text(encoding="utf-8")
+        self.assertIn('AUTOMERGE_LABEL = "kube-agents:auto-merge"', source)
+        self.assertEqual(frozenset({"kube-agents:auto-merge"}), vcs_broker.DIAL_GATED_LABELS)
+
+    def test_every_forge_write_verb_refuses_the_label_before_it_binds(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("propose")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda p, r: None)
+        with mock.patch.dict(os.environ, environ), mock.patch.object(broker, "_bind", side_effect=AssertionError("bound")):
+            for method in ("proposal_create", "proposal_update", "issue_create", "issue_update"):
+                with self.subTest(method=method), self.assertRaises(vcs_broker.WorkspaceError):
+                    getattr(broker, method)({"repository": "acme/infra", "number": 1, "labelsAdd": ["kube-agents:auto-merge"], "labels": ["kube-agents:auto-merge"]})
+
+    def test_a_list_filter_on_the_label_is_a_read_and_passes(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("propose")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda p, r: None)
+        with mock.patch.dict(os.environ, environ), mock.patch.object(broker, "_bind", side_effect=RuntimeError("bound")):
+            for method in ("proposal_list", "issue_list"):
+                with self.subTest(method=method), self.assertRaisesRegex(RuntimeError, "bound"):
+                    getattr(broker, method)({"repository": "acme/infra", "labels": ["kube-agents:auto-merge"]})
+
+    def test_the_practice_label_asks_the_dial_once_both_exist(self):
+        # The practice label's verb and this refusal land separately; whichever
+        # merges second must make that verb refuse while dial_allows_automerge()
+        # is False. Skipped until the verb exists, then a tripwire: a call (not a
+        # comment) in the verb or its refusal helper.
+        import ast
+        import inspect
+        import textwrap
+
+        methods = [getattr(vcs_broker.VcsBroker, name, None) for name in ("proposal_practice_label", "_practice_refusal")]
+        methods = [m for m in methods if m is not None]
+        if not methods:
+            self.skipTest("the practice label is not in vcs_broker yet")
+        calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            for m in methods
+            for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(m))))
+            if isinstance(node, ast.Call)
+        }
+        self.assertIn("dial_allows_automerge", calls)
+
     def test_set_dial_level_refuses_anything_but_a_level(self):
         self._dial()
         for level in ("", "EXPLAIN", "on", "none"):
@@ -4808,6 +4875,152 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
             "bundleBase64": bundle,
         })
         self.assertIn("LES-2026-001", ans.get("decisionMemoryMarkdown", ""))
+
+    def test_publish_blocks_decoy_replicaset_bypass_under_block_guard(self):
+        manifest_dir = self.seed / "clusters" / "prod"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      securityContext:\n        runAsNonRoot: true\n"
+            "      containers:\n      - name: checkout\n        image: checkout:1.0\n",
+            encoding="utf-8",
+        )
+        rec_dir = self.seed / "knowledge" / "decisions"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / "DEC-2026-002-run-as-non-root.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-002\n"
+            "title: Require runAsNonRoot in prod\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/*.yaml\n"
+            "guard:\n"
+            "  rule: runAsNonRoot must be true.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.securityContext.runAsNonRoot\n"
+            "    op: \"==\"\n"
+            "    value: true\n"
+            "---\n\nAlways set runAsNonRoot in prod.\n",
+            encoding="utf-8",
+        )
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "seed runAsNonRoot guard")
+        git(self.seed, "push", "--quiet", "origin", "main")
+
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/decoy-evade")
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n"
+            "---\n"
+            "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: checkout-decoy\nspec:\n"
+            "  replicas: 0\n"
+            "  template:\n    spec:\n      securityContext:\n        runAsNonRoot: true\n"
+            "      containers:\n      - name: checkout\n        image: checkout:1.0\n",
+            encoding="utf-8",
+        )
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "drop runAsNonRoot from Deployment with ReplicaSet decoy")
+        bundle = self.bundle_of(work, "platform-agent/decoy-evade", cloned["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/decoy-evade",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("DEC-2026-002", str(caught.exception))
+
+    def test_publish_ignores_oversize_yaml_lockfile_for_resource_scoped_guard(self):
+        manifest_dir = self.seed / "clusters" / "prod"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n",
+            encoding="utf-8",
+        )
+        rec_dir = self.seed / "knowledge" / "decisions"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / "DEC-2026-003-resource-scoped.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-003\n"
+            "title: Forbid hostNetwork on checkout\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n"
+            "  resources:\n"
+            "    - Deployment/*/checkout\n"
+            "guard:\n"
+            "  rule: hostNetwork must be absent.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: \"**/*.yaml\"\n"
+            "    path: spec.template.spec.hostNetwork\n"
+            "    op: absent\n"
+            "---\n\nNever enable hostNetwork on checkout.\n",
+            encoding="utf-8",
+        )
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "seed resource-scoped guard")
+        git(self.seed, "push", "--quiet", "origin", "main")
+
+        padding = "# " + ("A" * 1020) + "\n"
+        oversize_payload = "lockfileVersion: '9.0'\n" + (padding * 4200)
+        self.assertGreater(len(oversize_payload.encode("utf-8")), vcs_broker.DM_MAX_GUARD_FILE_BYTES)
+
+        work1, cloned1 = self.clone_locally("work1")
+        git(work1, "checkout", "--quiet", "-b", "platform-agent/large-lockfile")
+        (work1 / "web").mkdir(parents=True, exist_ok=True)
+        (work1 / "web" / "pnpm-lock.yaml").write_text(oversize_payload, encoding="utf-8")
+        git(work1, "add", "-A")
+        git(work1, "commit", "--quiet", "-m", "update large pnpm-lock.yaml")
+        bundle1 = self.bundle_of(work1, "platform-agent/large-lockfile", cloned1["revision"])
+
+        ans = self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/large-lockfile",
+            "target": "main",
+            "baseRevision": cloned1["revision"],
+            "bundleBase64": bundle1,
+        })
+        self.assertEqual(ans["branch"], "platform-agent/large-lockfile")
+
+        work2, cloned2 = self.clone_locally("work2")
+        git(work2, "checkout", "--quiet", "-b", "platform-agent/oversize-checkout")
+        (work2 / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      hostNetwork: true\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n"
+            + (padding * 4200),
+            encoding="utf-8",
+        )
+        git(work2, "add", "-A")
+        git(work2, "commit", "--quiet", "-m", "pad checkout.yaml past 4MiB")
+        bundle2 = self.bundle_of(work2, "platform-agent/oversize-checkout", cloned2["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/oversize-checkout",
+                "target": "main",
+                "baseRevision": cloned2["revision"],
+                "bundleBase64": bundle2,
+            })
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("DEC-2026-003", str(caught.exception))
 
 
 if __name__ == "__main__":

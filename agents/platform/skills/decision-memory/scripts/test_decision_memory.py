@@ -1244,6 +1244,42 @@ class LLMSynthesisTests(unittest.TestCase):
         self.assertEqual(len(findings2), 1)
         self.assertEqual(findings2[0]["verdict"], "consistent")
 
+    def test_decoy_replicaset_does_not_bypass_missing_podspec_guard(self):
+        decoy_manifest = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n        image: checkout:1.0\n"
+            "---\n"
+            "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: checkout-decoy\nspec:\n"
+            "  replicas: 0\n"
+            "  template:\n    spec:\n      securityContext:\n        runAsNonRoot: true\n"
+            "      containers:\n      - name: checkout\n        image: checkout:1.0\n"
+        )
+        rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-042.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-042",
+                "title": "Require runAsNonRoot in prod",
+                "status": "active",
+                "scope": {"paths": ["clusters/prod/*.yaml"]},
+                "guard": {
+                    "rule": "runAsNonRoot must be true",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/prod/*.yaml",
+                        "path": "spec.template.spec.securityContext.runAsNonRoot",
+                        "op": "==",
+                        "value": True,
+                    },
+                },
+            },
+            body="",
+        )
+        findings = dm.match_change([rec], {"clusters/prod/checkout.yaml": decoy_manifest})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["verdict"], "violates")
+        self.assertEqual(findings[0]["severity"], "block")
+
     def test_validate_non_mapping_fields_and_why_directory_and_decision_outcome(self):
         # 1. Non-mapping scope/guard/evidence and string supersedes report validation errors cleanly
         bad_rec = dm.parse_record(
