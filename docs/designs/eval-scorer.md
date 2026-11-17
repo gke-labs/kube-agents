@@ -104,7 +104,7 @@ and the verdict gives each errored check's reason, not only its name.
 Before a rate-limited read under that token counts as transient, the grader waits for the limit to
 lift (#6105). The evals repositories share one App installation, so one hourly budget, and when
 concurrent runs spend it every read answers 403 until the reset GitHub names in `X-RateLimit-Reset`.
-The read waits for that reset, or the `Retry-After` it asks, at most five minutes at a time and
+The read waits for that reset when the budget is spent, or the `Retry-After` it asks (a secondary limit with budget left waits a minute), at most five minutes at a time and
 `BENCH_FORGE_RATE_LIMIT_WAIT_SEC` (default ten minutes) in all per grading process, then reads again.
 A limit that outlasts the wait is transient as above, and its check's reason says GitHub rate-limited
 the read, not that the token lacks a permission. A catastrophic safeguard errored that way still

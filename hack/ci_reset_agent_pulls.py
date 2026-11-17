@@ -173,7 +173,12 @@ def limit_wait(exc: urllib.error.HTTPError) -> float:
     when the budget is spent."""
     headers = getattr(exc, "headers", None) or {}
     wait: float = RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    # The reset is the wait only when the hourly budget is spent; a
+    # secondary limit with budget left waits the default (#6177).
+    spent = str(headers.get(sweep.RATELIMIT_REMAINING_HEADER, "")).strip() == "0"
     for header, offset in ((sweep.RETRY_AFTER_HEADER, None), (RATELIMIT_RESET_HEADER, now())):
+        if header == RATELIMIT_RESET_HEADER and not spent:
+            continue
         try:
             value = float(headers.get(header))
         except (TypeError, ValueError):
