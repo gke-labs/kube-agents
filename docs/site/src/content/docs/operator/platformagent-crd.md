@@ -53,6 +53,10 @@ The operator also renders the task-signing key Secret `<agent>-a2a-task-signing-
 
 The bus runs [`harness.tuning.busReplicas`](/kube-agents/operator/platformagent-fields/#spec) NATS servers, three by default. They spread one per node with `DoNotSchedule`, so one drain takes one server. At three, the bus also has a routes Service and a PodDisruptionBudget of `maxUnavailable: 1`.
 
+One server isn't highly available. A node drain or an upgrade that moves its pod takes the bus down while the pod restarts, typically for about two minutes, and longer after a node scale-down (below). The operator says so once each time a new bus pod comes up, in a Normal `A2ABusSingleServer` Event on the PlatformAgent that links [Changing the bus's server count](#changing-the-buss-server-count). It writes the Event once more after an operator restart. Ready and Degraded don't change. A one-server bus has no PodDisruptionBudget and no `safe-to-evict` annotation, since on Autopilot either can hold node upgrades.
+
+After a node scale-down, GCE can keep a NATS disk attached to the node being deleted for tens of minutes. The bus pod's replacement then waits in `ContainerCreating`, with `FailedAttachVolume` (`RESOURCE_IN_USE_BY_ANOTHER_RESOURCE`) in the pod's Events only, until the old node is gone. On three servers the bus serves on two meanwhile.
+
 The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a single-node install still comes up. There the bus needs `busReplicas: 1`. On a cluster with no other schedulable node, such as a single-node install, a drain that evicts a callout waits until the node is uncordoned or the drain overrides the budget.
 
 ### Changing the bus's server count
@@ -999,7 +1003,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   Turning it on or off restarts the shell sandbox and the profile warm pools, and the A2A gateway under the cluster view; changing between two positive counts restarts nothing. With a positive count the agent's name must be at most 36 characters, or it is refused and `Degraded` reports `InvalidCredentialProxyExec`. The operator does not size the tier from the fleet; [`CredentialProxyExecReady`](#status) reports its Ready replicas, and `Unschedulable` with the scheduler's message for a replica that has no room.
 
-- `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged per key over the operator's defaults, or over the [`sizingProfile`](#specdeployment) row when one is set, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
+- `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector, and the audit-report store listener on 8700. Merged per key over the operator's defaults, or over the [`sizingProfile`](#specdeployment) row when one is set, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
 
   The event watcher reads the memory limit through the Downward API and sets its Go soft memory limit to half of it, so raise `limits.memory` when the watcher is OOM-killed under a large fleet of watched clusters. Overriding `limits.cpu` also changes the watcher's `GOMAXPROCS`, which the Go runtime derives from the container's CPU limit, so leave `limits.cpu` at the default unless you mean to. Only `cpu`, `memory` and `ephemeral-storage` are accepted.
 
@@ -1419,11 +1423,14 @@ Configures the operator-generated egress `NetworkPolicy`.
 
 - `enabled` (bool, optional) — toggle operator-managed NetworkPolicy generation. Default `true` (unset
   means on). Setting `false` stops generation and deletes the policies the operator manages for this
-  agent: `<name>-gateway-netpol`, the `<name>-fqdn-netpol` `FQDNNetworkPolicy`, and the shared
-  `litellm-policy` (if LiteLLM is present). Deletions check ownership / managed labels first, so a
+  agent: `<name>-gateway-netpol`, the `<name>-fqdn-netpol` `FQDNNetworkPolicy`, the shared
+  `litellm-policy` (if LiteLLM is present). The gateway policy also carries the audit-report store's rule, which goes with it. Deletions check ownership / managed labels first, so a
   policy that the operator did not create survives. To opt only LiteLLM out of operator NetworkPolicy
   management while keeping the agent pod's policies managed, set the annotation
   `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` on the `PlatformAgent`. When opted out, the operator deletes any managed copy of `litellm-policy`, leaving LiteLLM unselected (fail-open) unless a replacement policy is provided and managed out-of-band.
+
+  With it off, an install's own policies over the gateway pod should also admit TCP `8700` from the
+  credential broker's pods alone: the audit-report store listener's port.
 
   **Upgrade note:** when upgrading from a chart version that shipped the static `litellm-policy`, Helm
   prunes the static policy on the first upgrade (unless the live object already carries

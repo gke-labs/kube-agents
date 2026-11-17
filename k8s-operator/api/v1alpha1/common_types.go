@@ -1022,9 +1022,9 @@ type TuningSpec struct {
 	// map bounds WHO can spawn and this bounds HOW MANY.
 	//
 	// Unset means 10, the operator's default - a "busy day" sizing: at the
-	// session-pod shape (250m CPU / 512Mi requests) ten concurrent sessions
-	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
-	// preemption.
+	// session-pod shape's default requests (150m CPU / 320Mi, SessionResources)
+	// ten concurrent sessions hold 1.5 CPU / 3.2Gi, which a small dev cluster
+	// absorbs without preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
@@ -1088,6 +1088,24 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// SessionResources are the A2A session pods' CPU and memory requests and
+	// limits (#2371). Each of requests.cpu, requests.memory, limits.cpu and
+	// limits.memory is this field's if set to a positive quantity, else its
+	// default (150m, 320Mi, 2 and 2Gi), independently; a zero or negative key
+	// keeps its default. A request set alone above its default limit raises
+	// the limit to match; otherwise a request above its limit is lowered to
+	// it (ResolveSessionResources). Only cpu and memory are read. Ephemeral
+	// storage isn't set here. What it costs: the session cap multiplies the
+	// requests, and on Autopilot the requests are billed (on Autopilot
+	// without Pod bursting, its per-pod minimums of 250m and 512Mi apply
+	// instead). A change rolls the gateway; session pods already running keep
+	// their shape until they respawn.
+	// +kubebuilder:validation:XValidation:rule="!has(self.requests) || self.requests.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.requests may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.limits) || self.limits.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.limits may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.claims) || size(self.claims) == 0",message="sessionResources may not set claims"
+	// +optional
+	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
 
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
@@ -1532,7 +1550,8 @@ type DeploymentSpec struct {
 
 	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
 	// native container that authenticates the agent's API-server calls and also
-	// runs the event watcher and the drift detector.
+	// runs the event watcher and the drift detector, and the audit-report store
+	// listener on 8700, which renders with the A2A stack on every install.
 	// +optional
 	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
 
