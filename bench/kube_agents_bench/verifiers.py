@@ -4412,7 +4412,14 @@ def _rate_limit_wait(status: int, payload: Any, headers: Any) -> float | None:
     if not _rate_limited(status, payload, headers):
         return None
     headers = headers if headers is not None else {}
+    # The reset is the hourly primary window's; GitHub sends it on every
+    # answer, a secondary limit's included, where requests are still left and
+    # the reset says nothing about when that limit lifts.
+    remaining = headers.get("X-RateLimit-Remaining")
+    reset_applies = remaining is None or str(remaining).strip() == "0"
     for name, since_now in (("Retry-After", False), ("X-RateLimit-Reset", True)):
+        if since_now and not reset_applies:
+            continue
         try:
             value = float(str(headers.get(name)).strip())
         except ValueError:
@@ -4577,7 +4584,10 @@ def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult])
             return result
         what = ", ".join(what for _, what in noted)
         reason = result.reason
-        if all(what.endswith(_RATE_LIMITED_SUFFIX) for _, what in noted):
+        # Any, not all: every other transient read is a 5xx or a transport
+        # failure, which names no permission, so a permission named here is
+        # the rate limit's.
+        if any(what.endswith(_RATE_LIMITED_SUFFIX) for _, what in noted):
             # The check's own words read a 403 as a missing grant (#6105).
             reason = (
                 "the grading token was rate limited past the retries, so this check could not "

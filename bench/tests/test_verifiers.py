@@ -5271,6 +5271,8 @@ def test_a_rate_limit_is_waited_out_for_the_window_the_forge_names(monkeypatch):
         (429, b"{}", {"Retry-After": "30"}, [30.0]),
         (403, limited, {}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
         (429, b"{}", {"Retry-After": "nan", "X-RateLimit-Reset": "1020"}, [21.0]),
+        # A secondary limit: requests left, so the hourly reset is not its window.
+        (403, limited, {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "4000"}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
         (429, b"{}", {"Retry-After": "inf", "X-RateLimit-Reset": "1e400"}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
     ]
     def in_check(budget=verifiers._RATE_LIMIT_WAIT_BUDGET_SEC):
@@ -5332,6 +5334,15 @@ def test_a_rate_limit_past_the_waits_does_not_read_as_a_missing_grant(monkeypatc
     assert budgets == [60.0, verifiers._RATE_LIMIT_WAIT_BUDGET_SEC], "half the check's timeout, never past the cap"
     assert reason.startswith(f"{forges.FORGE_UNAVAILABLE_MARKER} (answered 403, rate limited): the grading token was rate limited")
     assert "does not apply" in reason
+
+    class _Mixed:
+        @verifiers._marks_forge_unavailable
+        def verify(self, timeout_sec):
+            verifiers._note_forge_read(True, "answered 502")
+            verifiers._note_forge_read(True, "answered 403, rate limited")
+            return VerificationResult(success=False, status="error", reason="502; add `pull_requests: read`", elapsed_time=0.0)
+
+    assert "does not apply" in _Mixed().verify(1.0).reason, "a 5xx beside the limit names no permission"
 
     class _Outage:
         @verifiers._marks_forge_unavailable
