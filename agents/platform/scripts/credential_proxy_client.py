@@ -2301,6 +2301,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # The body is read, or lost: nothing reads the response again. The
             # status stays on the error.
             exc.close()
+        if not isinstance(answer, dict):
+            # Valid JSON, but not an object, so no refusal document either.
+            # The status is the whole answer, as above.
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by

@@ -1062,6 +1062,22 @@ class VcsCallErrorTest(unittest.TestCase):
                     # The status is read off the error after the close.
                     self.assertEqual(caught.exception.status, status)
 
+    def test_a_refusal_whose_json_body_is_not_an_object_is_the_status_alone(self):
+        # Valid JSON, but no refusal document: something between the client and
+        # the broker answered. The caller gets the same error as for a body
+        # that is not JSON, and the refusal is closed.
+        for body in (b"[]", b'"busy"', b"503", b"true", b"null"):
+            for status in (404, 502):
+                with self.subTest(body=body, status=status):
+                    stream = io.BytesIO(body)
+                    error = self._held_refusal(status, stream)
+                    with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                            credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                    self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.
