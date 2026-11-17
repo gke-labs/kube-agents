@@ -248,9 +248,10 @@ caveat beside it:
   `platformAgent.deployment.incidentWorkloadDedupSeconds`, the key that turns it off.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
-its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to the
-shell sandbox, where the audits run, and passes every name it does not reserve to the credential
-proxy and `agent-api-auth` containers. The name in the example reaches the container that reads it.
+its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
+the shell sandbox, where the audits run, and passes every name it does not reserve to the
+credential proxy and `agent-api-auth` containers. The name in the example reaches the container
+that reads it.
 
 A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values
 file that sets it renders credential proxy and `agent-api-auth` containers that carry it, and an
