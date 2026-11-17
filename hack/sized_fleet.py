@@ -747,9 +747,14 @@ def cmd_install(args: argparse.Namespace) -> int:
         sets += ["-f", str(overrides)]
         # --reset-then-reuse-values: the chart's own defaults, then the release's values on top,
         # so a key the newer chart adds gets its default rather than nothing.
-        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(chart),
-                  "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
-                 timeout=HELM_TIMEOUT_SECONDS)
+        # Not kube.run: its transient pattern takes Helm's "context deadline exceeded", the message of
+        # a --wait that ran out because a Pod never became ready, and would retry a release that
+        # cannot fit for hours. A failed upgrade is the install's answer.
+        helm = subprocess.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE,
+                               str(chart), "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
+                              capture_output=True, text=True, timeout=HELM_TIMEOUT_SECONDS, check=False)
+        if helm.returncode != 0:
+            raise SystemExit(f"helm upgrade failed ({helm.returncode}): {helm.stderr.strip()[-STDERR_TAIL_CHARS:]}")
     LOG.info("installed %s", sha)
     return 0
 

@@ -262,3 +262,22 @@ class UsageWindowTest(unittest.TestCase):
         self.assertIn("overview", usage["burst"])
         self.assertIn("error", usage["soak"])
         self.assertIn("soak window (not read)", cli.attribution.markdown(usage))
+
+
+class InstallTimeoutTest(unittest.TestCase):
+    def test_a_helm_wait_that_runs_out_fails_once_and_is_not_retried(self):
+        calls = []
+
+        def helm(argv, **kwargs):
+            calls.append(argv[0])
+            return mock.Mock(returncode=1, stderr="Error: UPGRADE FAILED: context deadline exceeded", stdout=b"")
+
+        archive = mock.Mock(returncode=0, stdout=b"")
+        with tempfile.TemporaryDirectory(), \
+                mock.patch.object(cli.kube, "gcloud"), mock.patch.object(cli.kube, "run", return_value="{}"), \
+                mock.patch.object(cli, "check_host"), mock.patch.object(cli, "host_lease"), \
+                mock.patch.object(cli.subprocess, "run",
+                                  side_effect=lambda argv, **kw: helm(argv) if argv[0] == "helm" else archive):
+            with self.assertRaises(SystemExit):
+                cli.cmd_install(args(sha="abc", host_cluster="h", host_location="z", namespace="ns"))
+        self.assertEqual(calls, ["helm"])
