@@ -1463,6 +1463,9 @@ RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 # A profile caller at the version-control routes without a task credential,
 # or at a write verb without the permit its credential must carry (#3993).
 RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
+# The refusal code a profile caller gets for a version-control verb its task
+# credential doesn't cover (no credential, or a write without the permit).
+CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
@@ -16082,7 +16085,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     {
                         "status": "blocked",
                         "error": refusal,
-                        "code": "CALLER_PERMIT_REQUIRED",
+                        "code": CALLER_PERMIT_REQUIRED_CODE,
                         "rule": RULE_CALLER_VCS_PERMIT,
                     },
                 )
@@ -16107,7 +16110,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # admitted, the verb's git commands, and the response. See
             # CommandExecutor.request_slot for why the response is inside it;
             # the body is inside it for the same reason, from the other end.
-            with self._request_slot():
+            # A profile caller takes its own bounded share (profile_slots) and
+            # the background class, as on /v1/exec: a profile worker's clone or
+            # publish must not spend the interactive reserve the shell and the
+            # session pods keep. Every other role keeps the interactive slot
+            # it had.
+            vcs_session_slot = (
+                self._session_slot(role) if role == CALLER_ROLE_PROFILE else contextlib.nullcontext()
+            )
+            with vcs_session_slot, self._request_slot(admission_class(role)):
                 # Read under one deadline for the whole body: the slot is held
                 # from here on, and a caller that stalls or trickles mid-send
                 # would otherwise keep it with nothing running in it. A stalled

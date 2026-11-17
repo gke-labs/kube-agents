@@ -1503,9 +1503,9 @@ class _OwnershipForge:
         }
 
 
-def _ownership_broker(forge, viewer):
+def _ownership_broker(forge, viewer, repo=OWNED_REPO):
     """What VcsBroker.require_agent_proposal reads off self: _bind and _viewer."""
-    bound = type("Bound", (), {"forge": forge, "repo": OWNED_REPO, "api": staticmethod(lambda *a, **k: None)})()
+    bound = type("Bound", (), {"forge": forge, "repo": repo, "api": staticmethod(lambda *a, **k: None)})()
     return type(
         "OwnershipBroker", (), {"_bind": lambda self, payload: bound, "_viewer": lambda self, b: viewer}
     )()
@@ -1614,6 +1614,27 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.reset()
                 status, body = self.vcs_post(verb, VALID["token"])
                 self.assert_ran(verb, status, body)
+
+    def test_a_profile_vcs_request_takes_the_profile_share_and_the_background_class(self):
+        # As on /v1/exec: a profile worker's clone or publish is bounded by
+        # profile_slots and admitted as background work, so it can't spend the
+        # interactive reserve the shell and the session pods keep.
+        sessions, classes = [], []
+
+        def session_slot(handler, role):
+            sessions.append(role)
+            return contextlib.nullcontext()
+
+        def request_slot(handler, klass=credential_proxy.CLASS_INTERACTIVE):
+            classes.append(klass)
+            return contextlib.nullcontext()
+
+        with mock.patch.object(CredentialProxyHandler, "_session_slot", session_slot), \
+                mock.patch.object(CredentialProxyHandler, "_request_slot", request_slot):
+            status, body = self.vcs_post("proposal-list", VALID["token"])
+        self.assert_ran("proposal-list", status, body)
+        self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
+        self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
 
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):
@@ -1726,6 +1747,18 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.forge.proposals[8] = proposal
                 status, body = self.post_with("proposal-update", number=8)
                 self.assert_ownership_refused("proposal-update", status, body)
+
+    def test_a_dotted_top_level_group_is_still_the_installs_own_repository(self):
+        # The broker's bound repository is the forge's path, with no host. A
+        # GitLab group may carry a dot (my.org/sub/project); taking that for a
+        # host and stripping it would find none of the install's proposals.
+        dotted = "my.org/sub/project"
+        forge = _OwnershipForge({7: _proposal(7, "platform-agent/fix", source_repo=dotted)})
+        broker = _ownership_broker(forge, viewer=AGENT_LOGIN, repo=dotted)
+        vcs_broker.VcsBroker.require_agent_proposal(broker, "proposal-update", {"number": 7})
+        vcs_broker.VcsBroker.require_agent_proposal(
+            broker, "publish", {"branch": "platform-agent/fix"}
+        )
 
     def test_proposal_update_is_refused_when_the_credential_cannot_name_itself(self):
         self.ownership = _ownership_broker(self.forge, viewer="")

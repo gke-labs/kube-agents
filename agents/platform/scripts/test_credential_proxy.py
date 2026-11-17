@@ -3105,7 +3105,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         body = json.dumps({"repository": "acme/fleet", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
 
-        def wait_out_the_queue():
+        def wait_out_the_queue(*_args):
             time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
             raise credential_proxy.CommandSlotUnavailable("every slot is taken")
 
@@ -12133,7 +12133,7 @@ class VcsRouteTest(unittest.TestCase):
         why = "the caller disconnected while queued for the memory budget"
 
         @contextlib.contextmanager
-        def gone():
+        def gone(*_args):
             raise credential_proxy.CallerHungUp(why)
             yield  # pragma: no cover - a generator, never reached
 
