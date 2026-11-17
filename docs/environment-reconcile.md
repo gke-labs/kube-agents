@@ -1,7 +1,7 @@
 # Reconciling the long-lived environments
 
 A maintainer runbook for the environments **kube-agents itself** runs its CI
-against — `autopush`, `autopush-next`, `staging`, `rc` and `nightly`. Nothing
+against — `autopush`, `staging`, `rc` and `nightly`. Nothing
 here is something a user configures on their own install. It covers how the
 long-lived ones are kept in step with `terraform/examples/full-install`, what each one has to be
 configured with, and what to do when a drift report opens.
@@ -9,14 +9,14 @@ configured with, and what to do when a drift report opens.
 scripts these workflows run; [`ci-pool-projects.md`](ci-pool-projects.md) is the
 runbook for the presubmit's project pool.
 
-`autopush`, `autopush-next` and `staging` are long-lived: they are installed
+`autopush` and `staging` are long-lived: they are installed
 once and then kept running, and people live-test pull requests against them. `rc` and `nightly` are
 the opposite — every pipeline run destroys them and builds them again from
 `terraform/examples/full-install`, so they always run today's composition.
 
 Automated deployments to long-lived environments do not use isolated `helm upgrade`
-shortcuts. Instead, `Autopush: Deploy` (`autopush-deploy.yml`), `Autopush-Next: Deploy`
-(`autopush-next-deploy.yml`) and `Staging: Deploy` (`staging-deploy.yml`) drive unified, atomic reconciliations via `reconcile-environment.yml`
+shortcuts. Instead, `Autopush: Deploy` (`autopush-deploy.yml`)
+and `Staging: Deploy` (`staging-deploy.yml`) drive unified, atomic reconciliations via `reconcile-environment.yml`
 (`upgrade.sh --upgrade-mode=full`). Each deployment updates the Terraform composition,
 IAM bindings, Pub/Sub topics, and Helm release together from the candidate commit, and
 records the deployed image tag directly in Terraform state.
@@ -34,9 +34,7 @@ no lease.
 One issue per environment, edited in place while the drift lasts and closed
 automatically by the first clean plan. A plan that fails to run leaves whatever
 is open exactly as it is — a failure is not evidence either way, and the red job
-is the signal. `autopush-next` is the exception while it is being provisioned:
-until its GitHub environment exists with a `GCP_PROJECT_ID`, its plan posts a
-notice and is skipped rather than failing.
+is the signal.
 
 The plan pins no image tag. It holds the tag at whatever the last apply
 recorded, read out of Terraform state (`image_tag: ""`), so the daily report
@@ -60,7 +58,6 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 
 - **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag. It pushes that tag only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
-- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. `Autopush-Next: Google Chat E2E` (`autopush-next-e2e-gchat.yml`) reads `E2E_GCP_SERVICE_ACCOUNT`, `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER` and `E2E_CHAT_SPACE_ID` from the same environment and skips until all three are set ([`tests/e2e/README.md`](../tests/e2e/README.md#against-autopush-next)).
 
 A deploy takes the live-test lease before it applies anything (see
 [`designs/live-test-lease.md`](designs/live-test-lease.md)).
@@ -71,7 +68,7 @@ rather than deferring silently.
 Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). An apply to an older
 `image_tag` stops when the move leaves behind a commit marked as a breaking change, and names each
 one; set `allow_breaking_downgrade` on that dispatch, or on the `image_tag` dispatch of
-`Autopush: Deploy`, `Autopush-Next: Deploy` or `Staging: Deploy`, to roll the environment back
+`Autopush: Deploy` or `Staging: Deploy`, to roll the environment back
 anyway. Locally,
 `./upgrade.sh --plan` against any install shows what a reconcile would change;
 [`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
@@ -303,8 +300,8 @@ cluster and everything on it.
 
 ## Applying repeatedly against an environment that exists
 
-The in-place reconcile — the daily plan and the applies `Autopush: Deploy`,
-`Autopush-Next: Deploy` and `Staging: Deploy` drive through `reconcile-environment.yml` — is the only thing in
+The in-place reconcile — the daily plan and the applies `Autopush: Deploy`
+and `Staging: Deploy` drive through `reconcile-environment.yml` — is the only thing in
 this project that applies to the same environment over and over; `rc` and
 `nightly` destroy theirs first and so never exercise it. Two properties of the composition matter only on that path, and
 both are covered by comments in the source rather than restated here:

@@ -6,8 +6,8 @@ name: "Shared: Reconcile Environment"
 # This is the in-place half of #1117. deploy-environment.yml is the other half:
 # it destroys the environment and builds it again, which is right for `rc` and
 # `nightly` — they exist to prove an install works from nothing — and wrong for
-# `autopush`, `autopush-next` and `staging`, which people live-test against and
-# which hold state nobody wants rebuilt nightly.
+# `autopush` and `staging`, which people live-test against and which hold
+# state nobody wants rebuilt nightly.
 #
 # In-place is also the only path that exercises what a real user upgrading an
 # existing install goes through. Nothing else in CI covers it.
@@ -68,7 +68,6 @@ on:
         type: choice
         options:
           - "autopush"
-          - "autopush-next"
           - "staging"
           - "rc"
           - "nightly"
