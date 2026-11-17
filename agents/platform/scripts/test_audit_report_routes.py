@@ -984,8 +984,8 @@ class PublishKeyTest(unittest.TestCase):
             with self.subTest(name):
                 self.state([self.TERRAFORM, skipped])
                 registered = credential_proxy.report_install_store_keys()[1]
+                # Exact equality: the skipped GitLab entry contributes no key.
                 self.assertEqual(frozenset({"acme%2Fterraform"}), registered)
-                self.assertFalse(any("gitlab.example.com" in key for key in registered))
 
     def test_the_names_are_cached_as_managed_repositories_is(self):
         self.state([self.TERRAFORM], GITOPS)
