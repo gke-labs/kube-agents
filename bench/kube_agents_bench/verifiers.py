@@ -6646,8 +6646,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
-            # The same three readings `_resolve` gives this endpoint: 401 is
-            # the token, 403 is the permission, anything else is GitHub's.
+            # A limit first (a 429 or a marked 403), as `_resolve` reads it;
+            # then the same three readings: 401 is the token, 403 is the
+            # permission, anything else is GitHub's.
+            limit = _rate_limit_reason(status, payload, f"{owner}/{repo}#{number} on the pulls endpoint")
+            if limit:
+                return (None, None, {}, None, limit)
             if status == 401:
                 return (
                     None,
@@ -6665,7 +6669,6 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     None,
                     {},
                     None,
-                    _rate_limit_reason(status, payload, f"{owner}/{repo}#{number} on the pulls endpoint") or
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
                     f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
@@ -6694,6 +6697,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status, commits, f"{owner}/{repo}#{number}'s commits page")
+        if limit:
+            return (None, None, {}, None, limit)
         if status == 404:
             _forge_read_handled(status)
             return changed, None, payload, None, None
@@ -6714,7 +6720,6 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 None,
                 {},
                 None,
-                _rate_limit_reason(status, commits, f"{owner}/{repo}#{number}'s commits page") or
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
                 f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "

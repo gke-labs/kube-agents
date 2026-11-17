@@ -5536,6 +5536,20 @@ def test_a_nan_header_waits_as_if_absent(monkeypatch):
     assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Reset": "1100"}) == 101.0
 
 
+def test_a_429_on_the_commits_page_names_the_limit(token, github):
+    """A 429 that outlasts the wait on `_head_push`'s commits page used to
+    fall through to "unexpected GitHub response 429"; it names the limit,
+    as every other grading read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (429, {"message": "Too many requests"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason, res.reason
+    assert "unexpected GitHub response" not in res.reason
+
+
 def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
