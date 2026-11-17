@@ -218,6 +218,52 @@ func TestATriggerSubmissionsScriptIsMintedIntoTheGrantAndTheAuthority(t *testing
 	}
 }
 
+// A pending run published again carries the trigger its grant was minted
+// with, not the retry's: a retry naming another script (spec.script edited,
+// or an operator rolled back) would otherwise claim a trigger the grant
+// doesn't bind, and the verifier would refuse the task the gateway answered.
+func TestAPendingTriggerRunIsPublishedWithItsMintedTrigger(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "compliance-audit"
+	first := tr.submit(t, "schedule", s)
+	if first.Refused != nil {
+		t.Fatalf("refused: %+v", first.Refused)
+	}
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec, err := tr.g.reg.Get(ctx, key)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	rec.TriggerRuns[0].Published = false
+	if err := tr.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	retry := s
+	retry.Trigger.Script = ""
+	again := tr.submit(t, "schedule", retry)
+	if again.Refused != nil || again.TaskID != first.TaskID {
+		t.Fatalf("the pending run's repeat = %+v, want task %s", again, first.TaskID)
+	}
+	waitFor(t, "the run published again", func() bool { return len(tr.submissions()) == 2 })
+	var env lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[1].Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || claimed.Script != "compliance-audit" {
+		t.Fatalf("the republished authority trigger = %+v, %v; want the minted script", claimed, err)
+	}
+	ref, _, err := capability.RefFromAuthority(env.Authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := readCapEntry(t, tr.url, ref); entry.Trigger == nil || *entry.Trigger != *claimed {
+		t.Errorf("grant trigger %+v, authority %+v: they must be equal", entry.Trigger, *claimed)
+	}
+}
+
 // A script that is a path, not a name, is refused before anything is minted.
 func TestATriggerSubmissionWithAScriptPathIsRefused(t *testing.T) {
 	tr := startTriggerRig(t, nil)

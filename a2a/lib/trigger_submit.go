@@ -104,7 +104,8 @@ type ScheduleRef struct {
 // TriggerSubmit is a trigger's request for one task.
 type TriggerSubmit struct {
 	// Trigger is the trigger the task's grant binds: name schedule/<stream>,
-	// origin builtin, stream the schedule's report stream.
+	// origin builtin, stream the schedule's report stream, and script the
+	// profile script a script run executes, absent on a prompt run.
 	Trigger TriggerClaim `json:"trigger"`
 	// IdempotencyKey names the run: schedule/<ns>/<name>/<slot-unix> or
 	// run-now/<ns>/<name>/<token>. A repeat answers with the same task.
