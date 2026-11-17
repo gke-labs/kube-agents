@@ -1675,10 +1675,18 @@ func scrubYAMLSecretBlocks(s string) string {
 // (proseSecretPattern), as proseValueRedacted says, matched with the
 // markdown around the noun and the value normalised away ("the
 // **password** is `x`").
-// proseMarkedAssignmentPattern is a prose label whose credential word has a
-// mark left against it and whose verb is "=": the key/value rule owns that
-// shape, and redacts the whole value.
-var proseMarkedAssignmentPattern = regexp.MustCompile(`(?i)(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)[*_]+\s*=`)
+// proseMarkedAssignmentPattern is a prose label that ends in a key, a mark
+// left against it, and "=": an assignment. Its group is the key.
+var proseMarkedAssignmentPattern = regexp.MustCompile(`([A-Za-z0-9_.-]+)[*_]+\s*=\s*$`)
+
+// keyValueOwnsProseLabel says whether the key/value rule takes a prose
+// label's value instead: an assignment whose key it classifies as a secret
+// key redacts whole there, while the prose value stops at punctuation
+// (#6201). Any other label keeps the prose redaction.
+func keyValueOwnsProseLabel(label string) bool {
+	m := proseMarkedAssignmentPattern.FindStringSubmatch(label)
+	return m != nil && inlineSecretKey(strings.TrimRight(m[1], "_"))
+}
 
 func scrubProseSecrets(s string, sink secretSink) string {
 	return scrubNormalized(s, sink, func(n string, code [][2]int, rec func(lo, hi int, named bool)) {
@@ -1687,9 +1695,7 @@ func scrubProseSecrets(s string, sink secretSink) string {
 			if end, ok := codeSpanEnd(code, lo); ok && n[lo:end] != redactedValue && proseValueRedacted(n[lo:end]) {
 				hi = end // a code-spanned value ends at its closing backtick
 			}
-			if proseMarkedAssignmentPattern.MatchString(n[m[2]:m[3]]) {
-				// "<word>* = value" is an assignment the key/value rule
-				// redacts whole; the prose value stops at punctuation (#6201).
+			if keyValueOwnsProseLabel(n[m[2]:m[3]]) {
 				continue
 			}
 			if n[lo:hi] != redactedValue && proseValueRedacted(n[lo:hi]) {
