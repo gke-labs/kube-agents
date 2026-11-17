@@ -2500,7 +2500,7 @@ class VcsBroker:
             viewer = self._viewer(bound)
             strangers = [
                 item for item in proposals
-                if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer)
+                if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer, hostless=True)
             ]
             if strangers:
                 named = strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)
@@ -2545,7 +2545,7 @@ class VcsBroker:
             viewer = self._viewer(bound)
             view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number})
             proposal = view.get("proposal") or {}
-            if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, proposal), bound.repo, viewer):
+            if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, proposal), bound.repo, viewer, hostless=True):
                 raise ProposalNotOurs(
                     f"proposal #{number} is not this install's own (opened by its login, "
                     f"from a branch under {AGENT_BRANCH_PREFIX}, in this repository), so a "
