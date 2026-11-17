@@ -618,6 +618,15 @@ class RecordModeTest(CollectorTestCase):
     def kept(self, rel):
         return os.path.join(self.keep, "pods", POD_NAME, "cache", rel)
 
+    def test_alternates_are_kept_on_this_machine_and_emptied_in_the_pod(self):
+        first = self.cache(f"alts/{fp(1)}/{fp(7)}.json", b'{"answer": 7}')
+        self.cache(f"alts/{fp(1)}/{fp(8)}.json", b'{"answer": 8}')
+        self.collector.collect_pass()
+        for answer, data in ((fp(7), b'{"answer": 7}'), (fp(8), b'{"answer": 8}')):
+            with open(self.kept(f"alts/{fp(1)}/{answer}.json"), "rb") as handle:
+                self.assertEqual(handle.read(), data)
+        self.assertEqual(os.path.getsize(first), 0, "emptied, so its name still says that answer was written")
+
     def test_answers_are_kept_on_this_machine_and_emptied_in_the_pod(self):
         answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
         variant = self.cache(f"variants/{fp(2)}/{'a' * 16}.json", b"")

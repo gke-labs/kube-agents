@@ -11,13 +11,23 @@ passing runs got and no failing run did (examples/inference-replay/eval-design.m
 "Only save answers from runs that passed").
 
 What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
-- `answers/<fingerprint>.json`: an answer, only when the request that saved it
-  belongs to runs that passed, or, saved by a request no run owns, when a passing
-  run's request got that same answer and no failing run is tied to it
-  (run_attribution.Attribution.decide_answer). The key already holds the normalizer version,
-  the LiteLLM config checksum and image, so answers no other run could hit
-  cost space only; the version prefix lets a reader fetch only its own.
-- `slots/<slot key>.json`: a slot pointer, only to an answer that went up.
+- `alts/<fingerprint>-<answer>.json`: one answer to a request, flat
+  (replay_cache.py nests them one directory per fingerprint), named by the
+  answer's identity, so every distinct answer the night's runs gave to a key
+  has a name of its own. One goes up only when the request that saved it
+  belongs to runs that passed, or, saved by a request no run owns, when a
+  passing run's request got that same answer and no failing run is tied to it
+  (run_attribution.Attribution.decide_answer). An answer a failing run gave and
+  no passing run did stays here. The key already holds the normalizer
+  version, the LiteLLM config checksum and image, so answers no other run
+  could hit cost space only; the version prefix lets a reader fetch only its
+  own.
+- `answers/<fingerprint>.json`: the older layout's one answer per key, by the
+  same rule, for a pod cache an older proxy wrote; record mode writes
+  alternates now.
+- `slots/<slot key>.json`: a slot pointer to a fingerprint, only once an
+  answer to that fingerprint went up. The pointer names the key, not one of
+  its answers: replay chooses among the answers the lane loaded for it.
 - `variants/<context>-<answer>.json`: every answer a recording gave at a point,
   flat (replay_cache.py nests them one directory per context). A variant only
   vouches that a model really wrote an earlier answer in a history; what is
@@ -28,14 +38,18 @@ And gs://<bucket>/replay-cache/builds/<build>/publish-<ms>.json, one per call
 that changed anything: the graded runs and their outcomes, what was decided,
 and the objects this call confirmed are in the bucket (uploaded now, or there
 already from an earlier night), each with its size in this night's copy and,
-for a slot, the fingerprint of the answer it points at. The replay lane reads these to fetch exactly
-the answers recent nightlies selected (fetch_cache.py) and to compare verdicts
-(lane_report.py).
+for a slot, the fingerprint of the answer it points at; and, under `produced`,
+per fingerprint, the answers (alternates) this night's passing runs gave. The
+replay lane reads these to fetch exactly the answers recent nightlies
+produced (fetch_cache.py) and to compare verdicts (lane_report.py).
 
 Every object is written once (`gcloud storage cp --no-clobber`, and the
-recorder's grant cannot overwrite), so the first night to record a key keeps
-it. An answer whose runs are not all graded yet waits for a later call; the
-last call refuses what is still undecided.
+recorder's grant cannot overwrite). An alternate's name is its answer's
+identity, so one an earlier night wrote under the same name holds the same
+answer to the same request; tonight's passing runs producing it is what the
+record says. An older-layout answer's name is only its key, so there the
+first night to record a key keeps it. An answer whose runs are not all graded
+yet waits for a later call; the last call refuses what is still undecided.
 """
 
 from __future__ import annotations
@@ -61,18 +75,20 @@ PODS_DIR = "pods"
 POD_LOGS_DIR = "logs"
 POD_CACHE_DIR = "cache"
 ANSWERS = replay_cache.ANSWERS_DIR
+ALTS = replay_cache.ALTS_DIR
 SLOTS = replay_cache.SLOTS_DIR
 VARIANTS = replay_cache.VARIANTS_DIR
 MESSAGES = replay_cache.MESSAGES_DIR
 # Upload order: an answer before the slot pointing at it.
-UPLOAD_ORDER = (ANSWERS, VARIANTS, SLOTS, MESSAGES)
+UPLOAD_ORDER = (ANSWERS, ALTS, VARIANTS, SLOTS, MESSAGES)
 JSON_SUFFIX = replay_cache.JSON_SUFFIX
 VARIANT_SEPARATOR = "-"
 SEGMENT_SUFFIX = ".jsonl"
 HEX = replay_cache.CACHE_HEX
 SAFE_HEX = re.compile(rf"^{HEX}\Z")
 # A cache object's name under the version prefix: replay_cache.CACHE_REL_RE's
-# layout with each variant flattened to one name, `variants/<context>-<answer>.json`.
+# layout with each variant and alternate flattened to one name,
+# `variants/<context>-<answer>.json` and `alts/<fingerprint>-<answer>.json`.
 OBJECT_NAME_RE = re.compile(replay_cache.CACHE_LAYOUT_PATTERN.replace(replay_cache.VARIANT_JOINER, re.escape(VARIANT_SEPARATOR)))
 NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}\Z")
 POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
@@ -87,6 +103,11 @@ RECORD_RUNS = "runs"
 RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
 RECORD_OBJECTS = "objects"
+# Per normalizer version, per fingerprint, the identities of the answers this
+# night's passing runs gave (the alternates this record confirms): what the
+# lane may load (fetch_cache.py), so a served answer is never older than the
+# night that produced it.
+RECORD_PRODUCED = "produced"
 # The recording job: its Prow job name, the install mode it graded (next or
 # today), its forge (github when EVAL_FORGE is unset) and the commit its
 # checkout was at (empty when git could not say; records written before it
@@ -137,10 +158,38 @@ def object_name(sub: str, rel: str) -> Optional[str]:
     """The object name (under the version prefix) for a pod cache file `<sub>/<rel>`; None if it isn't one."""
     if not replay_cache.CACHE_REL_RE.match(f"{sub}/{rel}"):
         return None
-    if sub == VARIANTS:
+    if sub in (VARIANTS, ALTS):
         context, answer = rel.split("/")
-        return f"{VARIANTS}/{context}{VARIANT_SEPARATOR}{answer}"
+        return f"{sub}/{context}{VARIANT_SEPARATOR}{answer}"
     return f"{sub}/{rel}"
+
+
+def alternate_parts(name: str) -> Optional[Tuple[str, str]]:
+    """(fingerprint, answer identity) of an alternate's object name, or None for any other name."""
+    if not name.startswith(ALTS + "/") or not OBJECT_NAME_RE.match(name):
+        return None
+    fingerprint, _, answer = name[len(ALTS) + 1: -len(JSON_SUFFIX)].partition(VARIANT_SEPARATOR)
+    return fingerprint, answer
+
+
+def answered_key(name: str) -> Optional[str]:
+    """The fingerprint an answer object (either layout) answers, or None for any other name."""
+    parts = alternate_parts(name)
+    if parts is not None:
+        return parts[0]
+    if name.startswith(ANSWERS + "/") and OBJECT_NAME_RE.match(name):
+        return name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
+    return None
+
+
+def produced(names: Iterable[str]) -> Dict[str, List[str]]:
+    """RECORD_PRODUCED for one version: each fingerprint's answer identities among `names`, sorted."""
+    out: Dict[str, List[str]] = {}
+    for name in names:
+        parts = alternate_parts(name)
+        if parts is not None:
+            out.setdefault(parts[0], []).append(parts[1])
+    return {fingerprint: sorted(answers) for fingerprint, answers in sorted(out.items())}
 
 
 def read_json(path: str):
@@ -212,6 +261,7 @@ class Selection:
     """What one call decided: objects to upload by version, and the counts behind them."""
 
     objects: Dict[str, Dict[str, Dict[str, str]]] = field(default_factory=dict)  # version -> sub -> name -> path
+    answered: Set[Tuple[str, str]] = field(default_factory=set)  # (version, fingerprint) with an answer selected
     slot_targets: Dict[str, Dict[str, str]] = field(default_factory=dict)  # version -> slot object -> fingerprint
     decisions: Dict[str, int] = field(default_factory=dict)
     runs: List[RA.Run] = field(default_factory=list)
@@ -219,6 +269,9 @@ class Selection:
 
     def add(self, version: str, sub: str, name: str, path: str) -> None:
         self.objects.setdefault(version, {}).setdefault(sub, {}).setdefault(name, path)
+        key = answered_key(name)
+        if key is not None:
+            self.answered.add((version, key))
 
     def count(self, decision: str) -> None:
         self.decisions[decision] = self.decisions.get(decision, 0) + 1
@@ -234,6 +287,14 @@ class State:
     versions: Dict[str, str] = field(default_factory=dict)
     # (version, object name) already in the bucket: not read or decided again.
     done: Set[Tuple[str, str]] = field(default_factory=set)
+    # (version, fingerprint) with an answer, in either layout, in the bucket.
+    answered: Set[Tuple[str, str]] = field(default_factory=set)
+
+    def add_done(self, version: str, name: str) -> None:
+        self.done.add((version, name))
+        key = answered_key(name)
+        if key is not None:
+            self.answered.add((version, key))
 
 
 def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State] = None) -> Selection:
@@ -255,28 +316,34 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
         if not version:
             continue
         recorded: Dict[str, RA.Line] = {}
+        # Each alternate's recording line: the line that wrote that answer to that key.
+        recorded_alts: Dict[Tuple[str, str], RA.Line] = {}
         for line in state.reader.load(segments).lines:
             if line.recorded:
                 recorded.setdefault(line.fingerprint, line)
-        for name, path in pod_files(pod_dir, ANSWERS):
-            if (version, name) in state.done:
-                continue
-            fingerprint = name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
-            line = recorded.get(fingerprint)
-            if line is None:
-                selection.count(NO_RECORDING_LINE)
-                continue
-            entry = read_json(path)
-            if not isinstance(entry, dict) or entry.get(replay_cache.ENTRY_FINGERPRINT) != fingerprint:
-                selection.count(UNREADABLE)
-                continue
-            if entry.get(replay_cache.ENTRY_NORMALIZER_VERSION) != version:
-                selection.count(VERSION_MISMATCH)
-                continue
-            decision = attribution.decide_answer(line).decision
-            selection.count(decision)
-            if decision == RA.PASS:
-                selection.add(version, ANSWERS, name, path)
+                if line.answer_variant is not None:
+                    recorded_alts.setdefault((line.fingerprint, line.answer_variant[1]), line)
+        for sub in (ANSWERS, ALTS):
+            for name, path in pod_files(pod_dir, sub):
+                if (version, name) in state.done:
+                    continue
+                parts = alternate_parts(name)
+                fingerprint = parts[0] if parts is not None else name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
+                line = recorded_alts.get(parts) if parts is not None else recorded.get(fingerprint)
+                if line is None:
+                    selection.count(NO_RECORDING_LINE)
+                    continue
+                entry = read_json(path)
+                if not isinstance(entry, dict) or entry.get(replay_cache.ENTRY_FINGERPRINT) != fingerprint:
+                    selection.count(UNREADABLE)
+                    continue
+                if entry.get(replay_cache.ENTRY_NORMALIZER_VERSION) != version:
+                    selection.count(VERSION_MISMATCH)
+                    continue
+                decision = attribution.decide_answer(line).decision
+                selection.count(decision)
+                if decision == RA.PASS:
+                    selection.add(version, sub, name, path)
         for sub in (VARIANTS, MESSAGES):
             for name, path in pod_files(pod_dir, sub):
                 if (version, name) not in state.done:
@@ -287,17 +354,16 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
             target = read_json(path)
             if isinstance(target, str) and SAFE_HEX.match(target):
                 slots.append((version, name, path, target))
-    # A pointer is a candidate only once its answer is selected or already up,
-    # so one to an answer that will not go up never takes the name from one
-    # whose answer will. One whose answer is already up goes first: a failed
-    # answer upload in this call then cannot cost the slot.
+    # A pointer is a candidate only once an answer to its key is selected or
+    # already up, so one to a key no answer will go up for never takes the
+    # name from one whose answer will. One whose answer is already up goes
+    # first: a failed answer upload in this call then cannot cost the slot.
     def already_up(slot: Tuple[str, str, str, str]) -> bool:
         version, _, _, target = slot
-        return (version, f"{ANSWERS}/{target}{JSON_SUFFIX}") in state.done
+        return (version, target) in state.answered
 
     for version, name, path, target in sorted(slots, key=lambda slot: not already_up(slot)):
-        answer = f"{ANSWERS}/{target}{JSON_SUFFIX}"
-        if answer in selection.objects.get(version, {}).get(ANSWERS, {}) or (version, answer) in state.done:
+        if (version, target) in selection.answered or (version, target) in state.answered:
             selection.add(version, SLOTS, name, path)
             selection.slot_targets.setdefault(version, {}).setdefault(name, target)
     return selection
@@ -361,6 +427,7 @@ class Publisher:
                     RECORD_DECISIONS: selection.decisions, RECORD_LOST_LINES: selection.lost_lines,
                     RECORD_OBJECTS: {version: [objects[n] for n in sorted(objects)]
                                      for version, objects in confirmed.items()},
+                    RECORD_PRODUCED: {version: produced(objects) for version, objects in confirmed.items()},
                 }, handle, sort_keys=True)
             dest = f"gs://{self.bucket}/{CACHE_ROOT}/{BUILDS_DIR}/{self.build}/{name}"
             if self.run("publish_record", ["gcloud", "storage", "cp", "--no-clobber", path, dest],
@@ -382,16 +449,15 @@ class Publisher:
             for sub in UPLOAD_ORDER:
                 items = {n: p for n, p in subs.get(sub, {}).items() if (version, n) not in self.uploaded}
                 if sub == SLOTS:
-                    # A pointer goes up only once the answer it names has.
+                    # A pointer goes up only once an answer to the key it names has.
                     targets = selection.slot_targets.get(version, {})
-                    items = {n: p for n, p in items.items()
-                             if (version, f"{ANSWERS}/{targets.get(n, '')}{JSON_SUFFIX}") in self.uploaded}
+                    items = {n: p for n, p in items.items() if (version, targets.get(n, "")) in self.state.answered}
                 if not items:
                     continue
                 done = self._upload(version, sub, items)
                 targets = selection.slot_targets.get(version, {})
                 for name in done:
-                    self.uploaded.add((version, name))
+                    self.state.add_done(version, name)
                     described: Dict[str, object] = {OBJECT_NAME: name, OBJECT_BYTES: _size(items[name])}
                     if sub == SLOTS:
                         described[OBJECT_TARGET] = targets.get(name, "")

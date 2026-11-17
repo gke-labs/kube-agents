@@ -32,7 +32,8 @@ ANSWER = {
 
 class LayoutTest(unittest.TestCase):
     def test_a_name_with_a_trailing_newline_is_outside_the_layout(self):
-        for rel in (f"answers/{'a' * 64}.json", f"variants/{'a' * 16}/{'b' * 16}.json"):
+        for rel in (f"answers/{'a' * 64}.json", f"variants/{'a' * 16}/{'b' * 16}.json",
+                    f"alts/{'a' * 64}/{'b' * 64}.json"):
             with self.subTest(rel=rel):
                 self.assertTrue(replay_cache.CACHE_REL_RE.match(rel))
                 self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
@@ -89,6 +90,44 @@ class AnswerCacheTest(unittest.TestCase):
             handle.write("{not json")
         self.assertIsNone(self.cache.load("bad"))
         self.assertEqual(list(self.cache.entries()), [])
+
+    def test_an_alternate_is_written_once_and_never_changes(self):
+        fp, answer = "a" * 64, "b" * 64
+        self.assertTrue(self.cache.save_alternate(fp, answer, {"answer": {"content": "first"}}))
+        self.assertFalse(self.cache.save_alternate(fp, answer, {"answer": {"content": "second"}}))
+        (name, entry), = self.cache.answers(fp)
+        self.assertEqual((name, entry["answer"]["content"]), (answer, "first"))
+        self.assertEqual(os.listdir(os.path.join(self.root, replay_cache.ALTS_DIR, fp)), [answer + ".json"])
+
+    def test_concurrent_writers_of_one_alternate_leave_exactly_one_winner(self):
+        results = []
+        threads = [threading.Thread(target=lambda i=i: results.append(
+            self.cache.save_alternate("a" * 64, "b" * 64, {"n": i}))) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+
+    def test_a_keys_answers_come_in_one_order_and_only_hex_names_count(self):
+        fp = "a" * 64
+        for answer in ("c" * 64, "b" * 64):
+            self.cache.save_alternate(fp, answer, {"answer": {"content": answer[0]}})
+        Path(self.root, replay_cache.ALTS_DIR, fp, "stray.json").write_text("{}")
+        self.assertEqual([name for name, _ in self.cache.answers(fp)], ["b" * 64, "c" * 64])
+        for bad in ("../" + fp, fp + "\n", "x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.cache.answers(bad), [])
+                with self.assertRaises(ValueError):
+                    self.cache.save_alternate(bad, "b" * 64, {})
+
+    def test_an_alternate_counts_as_the_keys_answer_for_slots_and_the_index(self):
+        fp = "a" * 64
+        self.cache.save_alternate(fp, "b" * 64, {"answer": {"content": "x"}, "fingerprint": fp})
+        self.assertTrue(self.cache.has_answer(fp))
+        self.assertFalse(self.cache.save_slot("d" * 64, fp) and self.cache.save_slot("d" * 64, "e" * 64))
+        self.assertEqual(self.cache.load_slot("d" * 64), fp, "a pointer to a key with an alternate stays")
+        self.assertEqual([entry["fingerprint"] for entry in self.cache.entries()], [fp])
 
     def test_messages(self):
         self.assertTrue(self.cache.save_message("h1", "text \ud83d"))

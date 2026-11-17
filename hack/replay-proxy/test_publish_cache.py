@@ -220,6 +220,73 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.publisher.publish(final=True)["uploaded"], {"slots": 1},
                          "its answer is in the bucket from an earlier call")
 
+    def alternate(self, n, answer, version=VERSION, pod_dir=None):
+        self.cache_file(f"alts/{fp(n)}/{answer}.json", json.dumps(
+            {"fingerprint": fp(n), "answer": {"content": f"answer {answer[0]}"}, "normalizer_version": version}),
+            pod_dir)
+
+    def test_each_reps_answer_goes_up_only_when_its_run_passed(self):
+        # Two reps answered one request differently: rep 1 (failed) recorded
+        # first, which used to cost the key; rep 2 (passed) is kept beside it.
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=b)
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)))
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{b}.json", objects)
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", objects, "the failing run's answer")
+        self.assertIn(f"replay-cache/{VERSION}/slots/{fp(10)}.json", objects, "the key has an answer up")
+        self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
+        record = self._records()[-1]
+        self.assertEqual(record["produced"], {VERSION: {fp(1): [b]}})
+        slot = next(o for o in record["objects"][VERSION] if o["name"].startswith("slots/"))
+        self.assertEqual(slot["target"], fp(1))
+
+    def test_two_passing_reps_answers_both_go_up(self):
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=b)
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [a, b]}})
+
+    def test_an_alternate_is_decided_by_the_line_that_gave_that_answer(self):
+        # A line that recorded another answer to the key is no evidence for this one.
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.alternate(1, b)  # saved, but no line recorded this answer
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{b}.json", self.bucket.objects())
+        self.assertEqual(report["decisions"], {"no_recording_line": 1})
+
+    def test_an_alternate_already_in_the_bucket_is_never_overwritten(self):
+        b = "b" * 64
+        earlier = self.bucket.path(f"gs://{BUCKET}/replay-cache/{VERSION}/alts/{fp(1)}-{b}.json")
+        os.makedirs(os.path.dirname(earlier))
+        with open(earlier, "w") as handle:
+            handle.write("an earlier night's copy of the same answer")
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=b)
+        self.alternate(1, b)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        with open(earlier) as handle:
+            self.assertEqual(handle.read(), "an earlier night's copy of the same answer")
+        self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [b]}},
+                         "tonight's passing run produced that answer, whichever night wrote the object")
+
     def test_the_first_night_to_record_a_key_keeps_it(self):
         earlier = self.bucket.path(f"gs://{BUCKET}/replay-cache/{VERSION}/answers/{fp(1)}.json")
         os.makedirs(os.path.dirname(earlier))
@@ -341,6 +408,7 @@ class PublishTest(unittest.TestCase):
         import replay_cache
         shapes = [(sub, f"{fp(1)}.json") for sub in ("answers", "slots", "messages")]
         shapes.append(("variants", f"{fp(2)}/{'a' * 16}.json"))
+        shapes.append(("alts", f"{fp(2)}/{fp(3)}.json"))
         fetcher = fetch_cache.Fetcher(bucket=BUCKET, version=VERSION, run=self.bucket)
         for sub, rel in shapes:
             with self.subTest(sub=sub):

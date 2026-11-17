@@ -720,12 +720,24 @@ either. Each is matched through the requests that came after it: an answer is co
 of requests, each going on from exactly the answer before it, reaches a request naming a passing
 run's card.
 
-Each case runs three times. Ideally each of the three would replay its own recording, so we still
-get three different samples instead of one sample three times. That needs the proxy to know the run
-while it's happening, not afterwards. It could follow the same chain live: the harness tells the
-proxy which case and run each front-door task ID is, and every card after that was created by an
-answer the proxy already saw. That's more work, so it comes later. Until then all three runs of a
-case replay the same recording, which is also how our measurements were done.
+**Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
+often answer the same request differently. If the cache kept only the first answer to each request,
+a failing run that happened to answer first would cost the request its passing answers, and every
+replayed run of the case would follow that one recording, so three runs would be one sample
+counted three times. So the cache keeps every distinct answer to a request, each under a name made
+of the request's fingerprint and the answer itself, written once like every other object; only
+those from passing runs are published, decided answer by answer. The replay proxy hands a request's
+answers out in turn, so the first run to ask gets the first answer, the second run the second, and
+so on. Once a run is served one answer, its next request holds that answer, so it only matches what
+followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
+once can take turns in either order, so this spreads runs across recordings rather than giving each
+run its own. Giving each run exactly one recording needs the proxy to know the run while it's
+happening: the harness would tell the proxy which case and run each front-door task ID is, and every
+card after that was created by an answer the proxy already saw. That comes later.
+
+The lane loads only answers that a passing run of a night inside its 30-hour window produced. A
+night's record lists the answers its passing runs gave, so an older object that a later night only
+found already in the bucket never comes in on that night's record.
 
 ### Prompts change often
 
@@ -872,8 +884,9 @@ before stage 3 of the rollout (turning replay on):
    set of cases with replay on, served from the nightly's recordings, on the commit the newest
    recording night ran. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
-   answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
-   only reads them. For each conversation it records
+   answers, every distinct answer to each fingerprint, as the trusted writer in "Who can write to
+   the cache"; the lane only reads them, and hands a request's answers out in turn ("Only save
+   answers from runs that passed"). For each conversation it records
    how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
    short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation

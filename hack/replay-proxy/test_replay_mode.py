@@ -151,7 +151,7 @@ class SlotPointerTest(SlotCacheCase):
 
     def test_a_failed_entry_write_leaves_no_slot_and_still_logs(self):
         recorder = self.proxy("record", "x")
-        recorder.cache.save = lambda *args: (_ for _ in ()).throw(OSError("disk full"))
+        recorder.cache.save_alternate = lambda *args: (_ for _ in ()).throw(OSError("disk full"))
         line = recorder.analyze(self.BODY, time.time(), self.upstream(self.ANSWER))
         self.assertEqual((line["recorded"], line["record_error"], line["stored"]), (False, "OSError", True))
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.SLOTS_DIR)))
@@ -167,6 +167,122 @@ class SlotPointerTest(SlotCacheCase):
         hit, refused = self.proxy().lookup(changed, time.time())
         self.assertIsNone(refused)
         self.assertEqual((hit[0]["content"], hit[3]), ("done", "answer_slots"))
+
+
+class SeveralAnswersTest(SlotCacheCase):
+    """Every distinct answer to a key is kept, and replay hands a key's answers out in turn."""
+
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"}]}
+    LOOKING = {"role": "assistant", "content": "Looking at the card."}
+    ON_IT = {"role": "assistant", "content": "On it, reading the board."}
+
+    def saved(self, fingerprint):
+        return replay_cache.AnswerCache(self.cache_dir).answers(fingerprint)
+
+    def contents(self, fingerprint):
+        """The key's answers' texts in the order replay hands them out."""
+        return [entry["answer"]["content"] for _, entry in self.saved(fingerprint)]
+
+    def test_a_second_run_with_a_different_answer_is_kept_beside_the_first(self):
+        first = self.recorded(self.BODY, self.LOOKING)
+        second = self.recorded(self.BODY, self.ON_IT)
+        again = self.recorded(self.BODY, self.LOOKING)
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        self.assertEqual((first["recorded"], second["recorded"], again["recorded"]), (True, True, False),
+                         "a different answer is saved; the same answer again is not")
+        names = [name for name, _ in self.saved(first["fingerprint"])]
+        self.assertEqual(names, sorted([first["answer_variant"][1], second["answer_variant"][1]]))
+        self.assertEqual(sorted(self.contents(first["fingerprint"])), sorted([self.LOOKING["content"], self.ON_IT["content"]]))
+
+    def test_replay_hands_the_answers_out_in_turn_and_wraps(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        order = self.contents(fingerprint)
+        names = [name for name, _ in self.saved(fingerprint)]
+        replay = self.proxy()
+        hits = [replay.lookup(self.BODY, time.time()) for _ in range(5)]
+        self.assertEqual([refused for _, refused in hits], [None] * 5)
+        self.assertEqual([hit[0]["content"] for hit, _ in hits], [order[0], order[1], order[0], order[1], order[0]])
+        self.assertEqual([hit[4] for hit, _ in hits], [names[0], names[1], names[0], names[1], names[0]])
+        self.assertEqual({hit[5] for hit, _ in hits}, {2})
+
+    def test_a_key_with_one_answer_serves_it_every_time(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        replay = self.proxy()
+        hits = [replay.lookup(self.BODY, time.time()) for _ in range(3)]
+        self.assertEqual([(hit[0]["content"], hit[5], refused) for hit, refused in hits],
+                         [(self.LOOKING["content"], 1, None)] * 3)
+        self.assertEqual({hit[4] for hit, _ in hits}, {name for name, _ in self.saved(fingerprint)})
+
+    def break_answer(self, fingerprint, content):
+        """Make the saved answer with `content` name a placeholder no request binds."""
+        for path in Path(self.cache_dir, replay_cache.ALTS_DIR, fingerprint).iterdir():
+            entry = json.loads(path.read_text())
+            if entry["answer"]["content"] == content:
+                entry["answer"]["content"] = "look at ⟦TASK_9⟧"
+                path.write_text(json.dumps(entry))
+
+    def test_a_refused_answer_passes_to_the_next(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        self.break_answer(fingerprint, self.LOOKING["content"])
+        replay = self.proxy()
+        for _ in range(3):
+            hit, refused = replay.lookup(self.BODY, time.time())
+            self.assertIsNone(refused)
+            self.assertEqual(hit[0]["content"], self.ON_IT["content"], "whatever the turn, the servable one")
+
+    def test_a_key_whose_every_answer_is_refused_goes_live(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        self.break_answer(fingerprint, self.LOOKING["content"])
+        self.break_answer(fingerprint, self.ON_IT["content"])
+        self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
+                         (None, {"via": "exact", "guard": "unbound_placeholder", "alternates": 2}))
+
+    def test_an_alternate_filed_under_another_key_is_never_served(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        path, = Path(self.cache_dir, replay_cache.ALTS_DIR, fingerprint).iterdir()
+        entry = json.loads(path.read_text())
+        entry["fingerprint"] = "0" * 64
+        path.write_text(json.dumps(entry))
+        self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
+                         (None, {"via": "exact", "guard": "unreadable_entry"}))
+
+    def test_the_older_layout_still_serves_as_one_answer(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        (_, entry), = self.saved(fingerprint)
+        shutil.rmtree(Path(self.cache_dir, replay_cache.ALTS_DIR))
+        cache = replay_cache.AnswerCache(self.cache_dir)
+        self.assertTrue(cache.save(fingerprint, entry))
+        hit, refused = self.proxy().lookup(self.BODY, time.time())
+        self.assertIsNone(refused)
+        self.assertEqual((hit[0]["content"], hit[4], hit[5]), (self.LOOKING["content"], replay_cache.LEGACY_ANSWER, 1))
+
+    def test_alternates_win_over_the_older_layout(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        (_, entry), = self.saved(fingerprint)
+        old = dict(entry, answer={"role": "assistant", "content": "an old night's answer"})
+        replay_cache.AnswerCache(self.cache_dir).save(fingerprint, old)
+        replay = self.proxy()
+        for _ in range(2):
+            hit, _ = replay.lookup(self.BODY, time.time())
+            self.assertEqual(hit[0]["content"], self.LOOKING["content"])
+
+    def test_a_slot_hands_its_keys_answers_out_in_turn(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"},
+                                           {"role": "assistant", "content": "Yes."},
+                                           {"role": "user", "content": "ticket Latte"}]}
+        self.record(body, {"role": "assistant", "content": "done"})
+        fingerprint = self.recorded(body, {"role": "assistant", "content": "finished"})["fingerprint"]
+        order = self.contents(fingerprint)
+        changed = dict(body, messages=body["messages"][:1] + [{"role": "assistant", "content": "Sure."}]
+                       + body["messages"][2:])
+        self.record(dict(changed, messages=changed["messages"][:1]), {"role": "assistant", "content": "Sure."})
+        replay = self.proxy()
+        hits = [replay.lookup(changed, time.time()) for _ in range(3)]
+        self.assertEqual([(hit[0]["content"], hit[3]) for hit, _ in hits],
+                         [(order[0], "answer_slots"), (order[1], "answer_slots"), (order[0], "answer_slots")])
 
 
 class SlotCheckCostTest(SlotCacheCase):
@@ -201,23 +317,21 @@ class UnreadableEntryTest(SlotCacheCase):
 
     def test_a_broken_exact_entry(self):
         self.record(self.BODY, {"role": "assistant", "content": "done"})
-        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
+        for path in Path(self.cache_dir, replay_cache.ALTS_DIR).rglob("*.json"):
             path.write_text(json.dumps({"answer": "not an answer"}))
         self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
                          (None, {"via": "exact", "guard": "unreadable_entry"}))
 
     def test_a_slot_whose_entry_is_gone(self):
         self.record(self.BODY, {"role": "assistant", "content": "done"})
-        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
-            path.unlink()
+        shutil.rmtree(Path(self.cache_dir, replay_cache.ALTS_DIR))
         self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
                          (None, {"via": "answer_slots", "guard": "unreadable_entry"}))
 
     def test_a_slot_whose_entry_is_gone_is_refused_before_checking_its_answers(self):
         # Checking the answers is the costly step; a dangling slot skips it.
         self.recorded(self.BODY, {"role": "assistant", "content": "done"})  # its answers never recorded
-        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
-            path.unlink()
+        shutil.rmtree(Path(self.cache_dir, replay_cache.ALTS_DIR))
         replay = self.proxy()
         replay.answers_recorded = lambda *args: self.fail("checked a slot whose entry is gone")
         self.assertEqual(replay.lookup(self.BODY, time.time()),
@@ -805,7 +919,8 @@ class ReasoningTest(AnalyzeCase):
                   "thinking_blocks": [{"type": "thinking", "thinking": "checked it", "signature": "c2ln"}]}
         line = self.recorded(self.BODY, answer)
         self.assertTrue(line["recorded"])
-        saved = replay_cache.AnswerCache(self.cache_dir).load(line["fingerprint"])["answer"]
+        (_, entry), = replay_cache.AnswerCache(self.cache_dir).answers(line["fingerprint"])
+        saved = entry["answer"]
         self.assertNotIn("reasoning_content", saved)
         self.assertEqual(saved["thinking_blocks"][0]["signature"], "c2ln")
 
@@ -923,9 +1038,10 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(first["served"])
         self.assertTrue(first["recorded"])
         self.assertEqual(first["fingerprint"], second["fingerprint"])
-        self.assertFalse(second["recorded"], "the first write wins")
+        self.assertFalse(second["recorded"], "the same answer is saved once")
         self.assertEqual(len(FakeLiteLLM.calls), 2, "record mode never serves")
-        entry = replay_cache.AnswerCache(self.cache_dir).load(first["fingerprint"])
+        (name, entry), = replay_cache.AnswerCache(self.cache_dir).answers(first["fingerprint"])
+        self.assertEqual(name, first["answer_variant"][1], "an alternate is named by its answer's identity")
         arguments = json.loads(entry["answer"]["tool_calls"][0]["function"]["arguments"])
         self.assertEqual(arguments, {"task_id": "⟦TASK_1⟧"})
         self.assertEqual(entry["answer"]["tool_calls"][0]["id"], "call_1__thought__c2ln", "opaque ids are kept")
@@ -975,7 +1091,7 @@ class RecordTest(ProxyTestCase):
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
         line = self.lines(1)[0]
         self.assertFalse(line["recorded"])
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ALTS_DIR)))
 
 
 class RecordContinuationTest(ProxyTestCase):
@@ -1009,7 +1125,7 @@ class RecordBudgetTest(ProxyTestCase):
         self.assertEqual(status, 200)
         line = self.lines(1)[0]
         self.assertEqual((line["recorded"], line["record_error"]), (False, "budget_spent"))
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ALTS_DIR)))
         self.assertEqual(self.proxy.metrics.get("record_budget_spent"), 1)
 
     def test_the_cache_directory_is_one_of_the_budgets_roots(self):
@@ -1039,7 +1155,7 @@ class SecretReadTest(ProxyTestCase):
         line = self.lines(1, record_out)[0]
         self.assertIn("follows_secret_read", line["unstorable"])
         self.assertFalse(line["recorded"])
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ALTS_DIR)))
 
     def test_a_secret_read_result_is_withheld_in_the_cache_and_in_a_miss(self):
         # Record mode refuses such a request (follows_secret_read); the scrubbing
@@ -1115,6 +1231,27 @@ class ReplayTest(ProxyTestCase):
         self.assertTrue(line["served"])
         self.assertEqual(line["served_from"]["build"], "7")
         self.assertNotIn("miss", line)
+
+    def test_reps_are_served_the_keys_answers_in_turn_and_the_line_says_which(self):
+        self.record(chat("t_11111111", stream=False))
+        fingerprint = self.lines(1, self.record_out)[0]["fingerprint"]
+        recorded, = Path(self.cache_dir, replay_cache.ALTS_DIR, fingerprint).iterdir()
+        other = dict(json.loads(recorded.read_text()), answer={"role": "assistant", "content": "Nothing to do."})
+        self.assertTrue(replay_cache.AnswerCache(self.cache_dir).save_alternate(fingerprint, "f" * 64, other))
+        names = sorted([recorded.stem, "f" * 64])
+        _, port, out = self.replay()
+        calls = len(FakeLiteLLM.calls)
+        bodies = []
+        for _ in range(3):
+            status, headers, payload = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
+            self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
+            bodies.append(json.loads(payload)["choices"][0]["message"])
+        self.assertEqual(len(FakeLiteLLM.calls), calls, "every rep is served")
+        self.assertEqual(bodies[0], bodies[2])
+        self.assertNotEqual(bodies[0], bodies[1])
+        lines = self.lines(3, out)
+        self.assertEqual([line["served_alternate"] for line in lines], [names[0], names[1], names[0]])
+        self.assertEqual({line["alternates"] for line in lines}, {2})
 
     def test_a_replay_request_is_normalized_and_fingerprinted_once(self):
         self.record(chat("t_11111111", stream=False))
@@ -1302,7 +1439,7 @@ class ReplayTest(ProxyTestCase):
         self.assertIn("restarted", miss["current_snippet"])
         self.assertLessEqual(len(miss["current_snippet"]), replay_proxy.MISS_SNIPPET_CHARS)
         self.assertIn(" -> ", miss["signature"])
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, "answers", line["fingerprint"] + ".json")))
+        self.assertEqual(replay_cache.AnswerCache(self.cache_dir).answers(line["fingerprint"]), [])
 
     def test_a_miss_with_different_settings(self):
         self.record(chat("t_11111111", stream=False))
@@ -1334,7 +1471,7 @@ class ReplayTest(ProxyTestCase):
     def test_an_unbound_placeholder_is_a_miss(self):
         self.record(chat("t_11111111", stream=False))
         fingerprint = self.lines(1, self.record_out)[0]["fingerprint"]
-        path = Path(self.cache_dir, replay_cache.ANSWERS_DIR, fingerprint + ".json")
+        path, = Path(self.cache_dir, replay_cache.ALTS_DIR, fingerprint).iterdir()
         entry = json.loads(path.read_text())
         entry["answer"]["content"] = "look at ⟦TASK_9⟧"
         path.write_text(json.dumps(entry))

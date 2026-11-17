@@ -41,10 +41,12 @@ Decisions, per logged request:
 - `unattributed`: once every case is graded, no stored text or a card no run worked;
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
 
-A saved answer is decided by its recording line, or, when that line is left
-unattributed or ambiguous on the last call, by the other lines that sent the
-same request and got the same answer, provided no failing run is tied to any of
-them (Attribution.decide_answer).
+A saved answer (one alternate: one distinct answer to one request) is decided
+by its recording line, the first to give that answer, or, when that line is
+left unattributed or ambiguous on the last call, by the other lines that sent
+the same request and got the same answer, provided no failing run is tied to
+any of them (Attribution.decide_answer). A different answer to the same request
+is an alternate of its own, decided by its own lines.
 """
 
 from __future__ import annotations
@@ -438,8 +440,9 @@ class Attribution:
         # them, never for a run it was not proven for: every one of them sent
         # that request after that answer, since each holds both as a prefix.
         self.went_on: Dict[Tuple[str, Tuple[str, ...]], List[Tuple[List[str], str]]] = {}
-        # Every line by (build, fingerprint): the cache keeps the first answer
-        # to a fingerprint, and later lines sent the same request.
+        # Every line by (build, fingerprint): the cache keeps each distinct
+        # answer to a fingerprint once, so a later line that got the same
+        # answer recorded nothing, and its runs count through this.
         self.by_fingerprint: Dict[Tuple[str, str], List[Line]] = {}
         for line in logs.lines:
             self.by_fingerprint.setdefault((line.build, line.fingerprint), []).append(line)
@@ -512,10 +515,10 @@ class Attribution:
     def decide_answer(self, saved: Line) -> Decision:
         """The decision for the answer `saved` recorded: its own, or other lines' that got the same answer.
 
-        The cache keeps the first answer to a fingerprint, so when traffic no
-        graded run owns (an alert's triage, another Cluster Agent's turn) sent a
-        request first, a run that later sent the same request is never the
-        recording line. A line of the same build and fingerprint whose own
+        The cache keeps each distinct answer to a fingerprint once, so when
+        traffic no graded run owns (an alert's triage, another Cluster Agent's
+        turn) got an answer first, a run that later got the same answer to the
+        same request is never its recording line. A line of the same build and fingerprint whose own
         answer is the saved one (`answer_variant`, the identity a
         continuation's `prior_answer` is checked against) proves its runs got
         that answer to that request. Only a recording line left unattributed or

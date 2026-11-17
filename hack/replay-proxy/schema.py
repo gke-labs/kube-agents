@@ -145,8 +145,13 @@ SERVED_FROM = "served_from"
 SERVED_VIA = "served_via"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
-# In record mode: whether this request's answer was saved (false when the key
-# was already there, or the answer was unstorable).
+# On a served line: which of the key's saved answers was served (its identity,
+# the alternate's name; empty for the older layout's single answer), and how
+# many answers the key had. Replay hands a key's answers out in turn.
+SERVED_ALTERNATE = "served_alternate"
+ALTERNATES = "alternates"
+# In record mode: whether this request's answer was saved (false when the same
+# answer to the key was already saved, or the answer was unstorable).
 RECORDED = "recorded"
 # In record mode, when writing the cache failed: the exception's type name, or
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
@@ -176,6 +181,9 @@ MISS_SIGNATURE = "signature"
 MISS_REFUSED = "refused"
 REFUSED_VIA = "via"
 REFUSED_GUARD = "guard"
+# When the key had several saved answers and guards refused every one: how
+# many. REFUSED_GUARD is then the first one's guard.
+REFUSED_ALTERNATES = "alternates"
 # A slot held an answer no recording stored for its context.
 GUARD_ANSWER_NOT_RECORDED = "answer_not_recorded"
 # Through a slot, the saved answer names a value only an assistant message binds.

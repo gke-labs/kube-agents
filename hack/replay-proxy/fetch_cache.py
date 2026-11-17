@@ -13,17 +13,26 @@ from records back to the bucket's 30-day lifecycle: an answer is kept under
 the night that first wrote it, which can be that old, and its verdict is read
 from that night's newest record (one small object per older build).
 
+An answer is loaded only from a record that says its night's passing runs
+produced it: an alternate (`alts/`) must be in the record's `produced` list
+for its fingerprint as well as among its objects, so a record that merely
+found an older night's object in the bucket never brings it in, and no answer
+served is older than the window. An older-layout answer (`answers/`, one per
+key, from records written before alternates) is still taken as before, and
+can be as old as the bucket's lifecycle.
+
 What fits under `--max-bytes` is chosen before anything downloads, in this
-order, newest record first within each kind: answers; slots whose answer was
-chosen; variants; messages. An object is costed as the disk it takes, its size
-rounded up to whole 4 KiB blocks plus one block for its directory entry (and a
-block for each new variant directory), from the size the record gives. What
+order, newest record first within each kind: answers in the older layout;
+alternates; slots whose key has a chosen answer; variants; messages. An object
+is costed as the disk it takes, its size rounded up to whole 4 KiB blocks plus
+one block for its directory entry (and a block for each new variant or
+alternate directory), from the size the record gives. What
 does not fit is left out and counted, never refused: the lane replays less
 rather than nothing. After the download each file is costed again at its real
 size (an object the nightly found already in the bucket can differ from the
 copy it recorded), and one past the bound is removed and counted. A slot whose
-answer did not arrive (left out, expired, or never written) is removed too, so
-no pointer names an answer the pod lacks.
+key has no answer that arrived (left out, expired, or never written) is
+removed too, so no pointer names a key the pod has no answer for.
 
 Only the nightly runner can create objects in the bucket (docs/ci-pool-projects.md,
 "The replay cache bucket"). Object keys are still checked before anything
@@ -125,7 +134,11 @@ TEXT_ENCODING = "utf-8"
 STAGING_PREFIX = "replay-cache-fetch-"
 GCLOUD_ENV = {"CLOUDSDK_CORE_DISABLE_PROMPTS": "1"}
 # The order kinds are chosen in, and the kinds' names in the summary.
-PRIORITY = (P.ANSWERS, P.SLOTS, P.VARIANTS, P.MESSAGES)
+PRIORITY = (P.ANSWERS, P.ALTS, P.SLOTS, P.VARIANTS, P.MESSAGES)
+# Kinds stored one directory deeper on disk (object_path), each new directory a block.
+NESTED_KINDS = (P.VARIANTS, P.ALTS)
+# An alternate a recent record confirms but does not say its night produced.
+NOT_PRODUCED = "not_produced"
 
 Run = Callable[..., Optional[subprocess.CompletedProcess]]
 
@@ -167,6 +180,8 @@ class Fetched:
     by_kind: Dict[str, int] = field(default_factory=dict)
     left_out: Dict[str, int] = field(default_factory=dict)
     removed: Dict[str, int] = field(default_factory=dict)
+    # Objects a recent record named that the lane may not load (NOT_PRODUCED).
+    skipped: Dict[str, int] = field(default_factory=dict)
     runs: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
 
     def count(self, table: Dict[str, int], kind: str, n: int = 1) -> None:
@@ -194,10 +209,16 @@ def parse_listing(text: str, bucket: str) -> List[Tuple[int, float, str]]:
     return out
 
 
-def object_path(dest: str, name: str) -> str:
-    """Where replay_cache.py reads an object: variants nested one directory per context."""
+def nested_dir(name: str) -> str:
+    """The directory a variant or alternate is nested in on disk (its context or key), or empty for any other kind."""
     sub, _, base = name.partition("/")
-    if sub == P.VARIANTS:
+    return f"{sub}/{base.partition(P.VARIANT_SEPARATOR)[0]}" if sub in NESTED_KINDS else ""
+
+
+def object_path(dest: str, name: str) -> str:
+    """Where replay_cache.py reads an object: variants and alternates nested one directory per context or key."""
+    sub, _, base = name.partition("/")
+    if sub in NESTED_KINDS:
         context, _, answer = base.partition(P.VARIANT_SEPARATOR)
         return os.path.join(dest, sub, context, answer)
     return os.path.join(dest, sub, base)
@@ -270,6 +291,29 @@ class Fetcher:
             out.append((name, size, target))
         return out
 
+    def _produced(self, record: Dict[str, object]) -> Set[Tuple[str, str]]:
+        """(fingerprint, answer) of every alternate a record says its night's passing runs produced, at this version.
+
+        Refused when the field is there but not in its shape: the writer is
+        then not the code this reads.
+        """
+        produced = record.get(P.RECORD_PRODUCED)
+        if produced is None:
+            return set()
+        if not isinstance(produced, dict):
+            raise Refused("a record's produced answers are not a map")
+        out: Set[Tuple[str, str]] = set()
+        for version, keys in produced.items():
+            if not isinstance(keys, dict):
+                raise Refused("a record's produced answers are not a map")
+            for fingerprint, answers in keys.items():
+                if not SAFE_HEX.match(str(fingerprint)) or not isinstance(answers, list) or not all(
+                        isinstance(a, str) and SAFE_HEX.match(a) for a in answers):
+                    raise Refused("a record names a produced answer outside the cache layout")
+                if version == self.version:
+                    out.update((fingerprint, answer) for answer in answers)
+        return out
+
     def _same_job(self, record: Dict[str, object]) -> bool:
         """Whether a record's job graded the lane's own mode on its forge; a record naming no job doesn't."""
         job = record.get(P.RECORD_JOB)
@@ -315,6 +359,7 @@ class Fetcher:
         objects = record.get(P.RECORD_OBJECTS)
         for version in (objects if isinstance(objects, dict) else {}):
             self._confirmed(record, version)
+        self._produced(record)
         return self._commit(record)
 
     def night_commit(self) -> NightCommit:
@@ -372,7 +417,7 @@ class Fetcher:
                 objects = record.get(P.RECORD_OBJECTS)
                 for version in (objects if isinstance(objects, dict) else {}):
                     answers[commits[build]].update((version, name) for name, _, _ in self._confirmed(record, version)
-                                                   if name.startswith(P.ANSWERS + "/"))
+                                                   if P.answered_key(name) is not None)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         result.answers = {commit: len(names) for commit, names in answers.items()}
@@ -396,7 +441,7 @@ class Fetcher:
                     result.count(result.left_out, kind)
                     continue
                 cost = disk_cost(size)
-                context = name.partition("/")[2].partition(P.VARIANT_SEPARATOR)[0] if kind == P.VARIANTS else ""
+                context = nested_dir(name)
                 if context and context not in contexts:
                     cost += DISK_BLOCK_BYTES
                 if used + cost > self.max_bytes:
@@ -405,8 +450,9 @@ class Fetcher:
                 used += cost
                 if context:
                     contexts.add(context)
-                if kind == P.ANSWERS:
-                    answers.add(name.partition("/")[2][: -len(P.JSON_SUFFIX)])
+                key = P.answered_key(name)
+                if key is not None:
+                    answers.add(key)
                 chosen[kind].append((name, size, target))
         return chosen
 
@@ -455,10 +501,17 @@ class Fetcher:
                 # Every record's names are checked, matching or not: a name
                 # outside the layout means the writer is not this code.
                 items = self._confirmed(record)
+                produced = self._produced(record)
                 if not self._same_job(record):
                     result.other_job_records += 1
                     continue
                 for item in items:
+                    parts = P.alternate_parts(item[0])
+                    if parts is not None and parts not in produced:
+                        # Confirmed in the bucket, but not this night's answer: it
+                        # could be an older night's, so it never comes in on this record.
+                        result.count(result.skipped, NOT_PRODUCED)
+                        continue
                     confirmed.setdefault(item[0], item)
             result.objects = len(confirmed)
             chosen = self._plan(list(confirmed.values()), result)
@@ -480,7 +533,7 @@ class Fetcher:
                         continue
                     size = os.path.getsize(got)
                     cost = disk_cost(size)
-                    context = name.partition("/")[2].partition(P.VARIANT_SEPARATOR)[0] if kind == P.VARIANTS else ""
+                    context = nested_dir(name)
                     if context and context not in contexts:
                         cost += DISK_BLOCK_BYTES
                     if used + cost > self.max_bytes:
@@ -492,8 +545,9 @@ class Fetcher:
                     target_path = object_path(dest, name)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     shutil.move(got, target_path)
-                    if kind == P.ANSWERS:
-                        answers.add(os.path.basename(name)[: -len(P.JSON_SUFFIX)])
+                    key = P.answered_key(name)
+                    if key is not None:
+                        answers.add(key)
                     result.downloaded += 1
                     result.bytes += size
                     result.count(result.by_kind, kind)
@@ -503,6 +557,17 @@ class Fetcher:
             with open(runs_out, "w", encoding=TEXT_ENCODING) as handle:
                 json.dump(result.runs, handle, sort_keys=True)
         return result
+
+
+def answers_arrived(dest: str) -> bool:
+    """Whether any answer, in either layout, is in the filled cache directory."""
+    for sub in (P.ANSWERS, P.ALTS):
+        try:
+            if os.listdir(os.path.join(dest, sub)):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def default_run(kind: str, cmd: Sequence[str], timeout: float, input: Optional[bytes] = None,
@@ -593,10 +658,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    other_job_records=result.other_job_records, builds=len(result.builds),
                    objects=result.objects,
                    downloaded=result.downloaded, bytes=result.bytes, fetched=result.by_kind,
-                   left_out=result.left_out, removed=result.removed)
+                   left_out=result.left_out, removed=result.removed, skipped=result.skipped)
     print(json.dumps(summary, sort_keys=True))
-    answers = os.path.join(args.dest, P.ANSWERS)
-    return 0 if os.path.isdir(answers) and os.listdir(answers) else 1
+    return 0 if answers_arrived(args.dest) else 1
 
 
 if __name__ == "__main__":

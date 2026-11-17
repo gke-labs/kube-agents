@@ -84,6 +84,9 @@ ANALYSIS_QUEUE_SIZE = 1024
 # Slot answers whose (context, answer) the replay lookup keeps, so a turn
 # normalizes only its new answer's prefix.
 VARIANT_MEMO_CAPACITY = 100_000
+# Keys whose turn among their saved answers replay keeps (ShadowProxy.next_turn),
+# least recently looked up dropped first. A seeded cache holds fewer keys than this.
+TURN_MEMO_CAPACITY = 1_000_000
 # A rough prompt-token estimate for a line whose response carried no usage.
 BYTES_PER_TOKEN = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -557,13 +560,18 @@ def diff_snippets(saved: Optional[str], current: str) -> Dict[str, Any]:
     }
 
 
-def refusal(via: str, guard: str) -> Dict[str, str]:
+def refusal(via: str, guard: str) -> Dict[str, Any]:
     """The miss block's record of a matched saved answer a guard refused to serve."""
     return {F.REFUSED_VIA: via, F.REFUSED_GUARD: guard}
 
 
 # A request normalized as of when it arrived, and its exact fingerprint.
 Keyed = Tuple[normalizer.NormalizedRequest, str]
+# A servable replay hit: the restored answer, its saved entry, the fingerprint
+# it is saved under, how it matched (VIA_EXACT or VIA_ANSWER_SLOTS), which of
+# the key's answers it is (its identity; replay_cache.LEGACY_ANSWER for the
+# older layout's), and how many answers the key has.
+Hit = Tuple[Dict[str, Any], Dict[str, Any], str, str, str, int]
 
 # Tells the analysis worker to stop.
 _STOP = object()
@@ -623,6 +631,9 @@ class ShadowProxy:
         # digests of its raw prefix and answer; oldest dropped past the capacity.
         self._variants: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
         self._variant_lock = threading.Lock()
+        # Each key's next turn among its saved answers (next_turn).
+        self._turns: "OrderedDict[str, int]" = OrderedDict()
+        self._turn_lock = threading.Lock()
         self.out = out if out is not None else sys.stdout
         self._log_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=ANALYSIS_QUEUE_SIZE)
@@ -636,13 +647,17 @@ class ShadowProxy:
 
     def lookup(
         self, body: Dict[str, Any], received: float, keyed: Optional[Keyed] = None,
-    ) -> Tuple[Optional[Tuple[Dict[str, Any], Dict[str, Any], str, str]], Optional[Dict[str, str]]]:
-        """Replay mode: ((restored answer, saved entry, fingerprint, how it matched), None) on a servable hit.
+    ) -> Tuple[Optional[Hit], Optional[Dict[str, Any]]]:
+        """Replay mode: (hit, None) on a servable hit; see Hit for its parts.
 
-        On a miss, (None, None), or (None, refusal) when a key matched a saved
-        answer that a guard refused: the key and the guard, for the miss block.
-        `keyed` is the request's normalization and fingerprint (keyed()), when
-        the caller has them already.
+        On a miss, (None, None), or (None, refusal) when a key matched saved
+        answers that guards refused: the key and the guard, for the miss block.
+        A key with several saved answers hands them out in turn (next_turn):
+        each lookup starts at the next one, and a refused answer passes to the
+        one after it, so a request is served whichever of them its guards allow
+        and goes live only when they refuse every one. `keyed` is the
+        request's normalization and fingerprint (keyed()), when the caller has
+        them already.
         """
         messages = body.get(request_store.MESSAGES_KEY)
         messages = messages if isinstance(messages, list) else []
@@ -652,34 +667,78 @@ class ShadowProxy:
         prefix_seen = self.prefix_first_seen(body, digests, received)
         normalized, fingerprint = keyed or self.keyed(body, received)
         via = F.VIA_EXACT
-        entry = self.cache.load(fingerprint)
-        if entry is None:
+        saved = self.cache.answers(fingerprint)
+        if not saved:
             # The same conversation recorded after the same actions worded
             # differently: every answer here must be one a recording stored.
             slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
             recorded = self.cache.load_slot(slot_key) if slots else None
             if recorded is None:
                 return None, None
-            fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
-            if entry is not None and not self.answers_recorded(body, messages, digests, prefix_seen, received):
+            fingerprint, via, saved = recorded, F.VIA_ANSWER_SLOTS, self.cache.answers(recorded)
+            if any(entry is not None for _, entry in saved) and not self.answers_recorded(
+                    body, messages, digests, prefix_seen, received):
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
-        if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
+        if not saved:
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
+        start = self.next_turn(fingerprint)
+        first_guard = None
+        for offset in range(len(saved)):
+            name, entry = saved[(start + offset) % len(saved)]
+            answer, guard = self._servable(name, entry, fingerprint, via, normalized)
+            if answer is not None:
+                return (answer, entry, fingerprint, via, name, len(saved)), None
+            first_guard = first_guard or guard
+        refused = refusal(via, first_guard or F.GUARD_UNREADABLE_ENTRY)
+        if len(saved) > 1:
+            refused[F.REFUSED_ALTERNATES] = len(saved)
+        return None, refused
+
+    def next_turn(self, fingerprint: str) -> int:
+        """The turn this lookup of a key takes: 0 for its first, then 1, 2, ..., one counter per key.
+
+        A lookup takes the saved answer at its turn modulo how many there are,
+        so the repetitions of a case are served different recordings in turn
+        rather than all one. The counter is this process's: each proxy pod
+        turns its own.
+        """
+        with self._turn_lock:
+            turn = self._turns.get(fingerprint, 0)
+            self._turns[fingerprint] = turn + 1
+            self._turns.move_to_end(fingerprint)
+            while len(self._turns) > TURN_MEMO_CAPACITY:
+                self._turns.popitem(last=False)
+        return turn
+
+    def _servable(
+        self, name: str, entry: Optional[Dict[str, Any]], fingerprint: str, via: str,
+        normalized: normalizer.NormalizedRequest,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """One saved answer restored for this request, or None and the guard that refused it.
+
+        An alternate (`name` set) must say it answers the fingerprint it is
+        filed under, as record mode writes it; the older layout's entry is
+        read as before.
+        """
+        if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
+            return None, F.GUARD_UNREADABLE_ENTRY
+        if name != replay_cache.LEGACY_ANSWER and entry.get(replay_cache.ENTRY_FINGERPRINT) != fingerprint:
+            return None, F.GUARD_UNREADABLE_ENTRY
         if via == F.VIA_ANSWER_SLOTS:
             named = set(normalizer.PLACEHOLDER_RE.findall(json.dumps(entry[replay_cache.ENTRY_ANSWER], ensure_ascii=False)))
             # A timestamp's positions only ever count non-assistant messages.
             named = {t for t in named if normalizer.token_class(t) != normalizer.TIME_LITERAL_CLASS}
             if not named <= normalizer.placeholders_outside_answers(normalized):
                 # A value only an answer named could carry another number here.
-                return None, refusal(via, F.GUARD_VALUE_ONLY_IN_ANSWERS)
+                return None, F.GUARD_VALUE_ONLY_IN_ANSWERS
         answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
         if missing:
-            return None, refusal(via, F.GUARD_UNBOUND_PLACEHOLDER)
+            return None, F.GUARD_UNBOUND_PLACEHOLDER
         # The other direction of the record-time check: a file this run's
         # dropped list names, which the recording's run may not have had.
         if any(normalized.mapping.answer_names_dropped_file(t) for t in replay_cache.answer_texts(answer)):
-            return None, refusal(via, F.GUARD_NAMES_DROPPED_FILE)
-        return (answer, entry, fingerprint, via), None
+            return None, F.GUARD_NAMES_DROPPED_FILE
+        return answer, None
 
     @staticmethod
     def settings_chain(body: Dict[str, Any]) -> str:
@@ -875,6 +934,9 @@ class ShadowProxy:
     ) -> bool:
         """Record mode: save a storable answer under its fingerprint; True when this call saved it.
 
+        False too when the same answer to the same key was saved already: each
+        distinct answer is saved once.
+
         A cache that cannot be written costs the recording, never the log line
         or the stored request: the line says `recorded: false` and why
         (`record_error`), as RequestStore.write reports its own failures.
@@ -897,9 +959,18 @@ class ShadowProxy:
         self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
         stored: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any], received: float,
     ) -> bool:
+        # The model's own answer to this request, noted as one a later request's
+        # slot may hold (answer_variant says how replay finds it). Only answers
+        # this proxy recorded count: never a client's assistant message, a
+        # fallback's answer or any other unstorable one. Each recording notes its
+        # own, so two that answered differently both count.
+        variant = entry.get(F.ANSWER_VARIANT) or normalizer.answer_variant(normalized, upstream["message"], self.key_context)
         # The entry first and the slot pointer last, so a failure in between
-        # never leaves a pointer to an entry that was not written.
-        saved = self.cache.save(entry[F.FINGERPRINT], {
+        # never leaves a pointer to an entry that was not written. Every
+        # distinct answer to the key is kept, each in a file of its own named
+        # by its identity, so a second run's different answer is saved beside
+        # the first and the publisher can keep whichever came from passing runs.
+        saved = self.cache.save_alternate(entry[F.FINGERPRINT], variant[1], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
             replay_cache.ENTRY_ANSWER: stored,
             replay_cache.ENTRY_FINISH_REASON: upstream.get("finish_reason"),
@@ -911,13 +982,6 @@ class ShadowProxy:
             replay_cache.ENTRY_RECORDED_AT: received,
             replay_cache.ENTRY_NORMALIZER_VERSION: self.key_context.normalizer_version,
         })
-        # The model's own answer to this request, noted as one a later request's
-        # slot may hold (answer_variant says how replay finds it). Only answers
-        # this proxy recorded count: never a client's assistant message, a
-        # fallback's answer or any other unstorable one. Each recording notes its
-        # own, so two that answered differently both count, even where the first
-        # write of the saved answer won.
-        variant = entry.get(F.ANSWER_VARIANT) or normalizer.answer_variant(normalized, upstream["message"], self.key_context)
         self.cache.add_variant(*variant)
         slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
         if slots:
@@ -1084,6 +1148,8 @@ class ShadowProxy:
             entry[F.LITELLM_COST_USD] = None
         if served is not None:
             entry[F.SERVED_VIA] = upstream.get("served_via")
+            entry[F.SERVED_ALTERNATE] = upstream.get("served_alternate")
+            entry[F.ALTERNATES] = upstream.get("alternates")
         entry.update(usage_tokens(upstream["usage"]))
         if served is not None:
             # The recording's reasoning and cache writes, billed when it was recorded, not now.
@@ -1236,9 +1302,11 @@ class Handler(BaseHTTPRequestHandler):
             if hit is not None:
                 self.proxy.metrics.add("completions")
                 self.proxy.metrics.add("served")
-                answer, saved, fingerprint, via = hit
+                answer, saved, fingerprint, via, alternate, alternates = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
+                upstream["served_alternate"] = alternate
+                upstream["alternates"] = alternates
                 self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))

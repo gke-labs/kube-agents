@@ -84,7 +84,7 @@ class FetchTest(unittest.TestCase):
 
     NEXT_GITHUB = {"name": "ci-kube-agents-eval-nightly", "mode": "next", "forge": "github"}
 
-    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB):
+    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB, produced=None):
         """A publish record; `objects` maps a version to names, or to (name, bytes, target) entries."""
         described = {}
         for version, names in objects.items():
@@ -98,7 +98,8 @@ class FetchTest(unittest.TestCase):
                 described[version].append(entry)
         self.bucket.put(f"replay-cache/builds/{build}/publish-{ms}.json",
                         json.dumps({"build": build, "objects": described, "runs": list(runs),
-                                    **({"job": job} if job is not None else {})}), created)
+                                    **({"job": job} if job is not None else {}),
+                                    **({"produced": produced} if produced is not None else {})}), created)
 
     def objects(self, version, *names, content=None):
         for name in names:
@@ -126,6 +127,43 @@ class FetchTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dest, "answers", f"{fp(9)}.json")), "no record named it")
         with open(self.runs_out) as handle:
             self.assertEqual(len(json.load(handle)["101"]), 2, "the fullest record's runs")
+
+    def test_an_alternate_comes_in_only_from_a_recent_record_whose_night_produced_it(self):
+        import replay_cache
+        old, new, slot = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json", f"slots/{fp(2)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, old, new, slot)
+        self.record("100", 1, {VERSION: [old]}, created=NOW - 40 * HOUR, produced={VERSION: {fp(1): [fp(7)]}})
+        # Tonight's record names the old answer too (found in the bucket), but its runs produced only the new one.
+        self.record("101", 1, {VERSION: [old, new, slot]}, produced={VERSION: {fp(1): [fp(8)]}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "alts", fp(1))), [f"{fp(8)}.json"],
+                         "alternates nest again, one directory per key, as replay_cache.py reads them")
+        self.assertEqual(result.skipped, {"not_produced": 1})
+        self.assertEqual(result.by_kind, {"alts": 1, "slots": 1}, "the slot's key has an answer")
+        self.assertEqual([name for name, _ in replay_cache.AnswerCache(self.dest).answers(fp(1))], [fp(8)])
+        self.assertTrue(FC.answers_arrived(self.dest))
+
+    def test_a_slot_whose_keys_alternates_were_all_left_out_is_removed(self):
+        alt, slot = f"alts/{fp(1)}-{fp(7)}.json", f"slots/{fp(2)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, alt, slot)
+        self.record("101", 1, {VERSION: [alt, slot]}, produced={VERSION: {}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual((result.by_kind, result.left_out), ({}, {"slots": 1}))
+        self.assertFalse(FC.answers_arrived(self.dest))
+
+    def test_a_produced_list_outside_the_layout_refuses_the_whole_download(self):
+        message = f"messages/{'b' * 16}.json"  # a name in every version of the layout
+        for produced in ([fp(7)], {VERSION: [fp(7)]}, {VERSION: {"../x": [fp(7)]}}, {VERSION: {fp(1): ["../y"]}},
+                         {VERSION: {fp(1): fp(7)}}):
+            with self.subTest(produced=produced):
+                shutil.rmtree(self.bucket.root, ignore_errors=True)
+                self.bucket.created.clear()
+                self.objects(VERSION, message)
+                self.record("101", 1, {VERSION: [message]}, produced=produced)
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().fetch(self.dest)
 
     def test_records_older_than_the_window_are_left_out(self):
         self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
