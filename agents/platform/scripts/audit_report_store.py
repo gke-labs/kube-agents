@@ -96,6 +96,9 @@ REPORT_DIR_MODE = 0o755
 REPORT_FILE_MODE = 0o644
 REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 STORE_PATH_SEPARATOR = "%2F"
+# The longest directory name the store creates, in bytes: NAME_MAX on Linux
+# and macOS. A longer owner or name is a 400 before any directory is made.
+STORE_DIR_NAME_MAX_BYTES = 255
 # One envelope. audit_report.py keeps the ledger body near 1 MB across the
 # ring (MAX_BODY_CHARS is 64 KiB an envelope) and the findings document is
 # unbounded there; here a single envelope is capped at 1 MiB, and anything
@@ -207,7 +210,7 @@ def _http_get_json(url: str, token: str | None, ca_file: str | None) -> dict:
         raise JWKSUnavailable(f"GET {url}: answer over {JWKS_MAX_BYTES} bytes")
     try:
         document = json.loads(body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise JWKSUnavailable(f"GET {url}: not JSON") from exc
     if not isinstance(document, dict):
         raise JWKSUnavailable(f"GET {url}: not a JSON object")
@@ -273,11 +276,17 @@ class TokenVerifier:
             forced = not expired and kid not in self._keys and (
                 self._forced_at is None or now - self._forced_at >= JWKS_FORCED_REFRESH_SECONDS
             )
+            # A kid the cache lacks, inside the hold after a failed fetch, is
+            # one the cluster may well have: the JWKS is unavailable (503),
+            # not the key unknown (401), whichever branch reaches it.
+            held = self._failed_at is not None and now - self._failed_at < JWKS_FAILURE_HOLD_SECONDS
             if not expired and not forced:
                 assert self._issuer is not None
+                if held and kid not in self._keys:
+                    raise JWKSUnavailable("the last JWKS fetch failed moments ago and the key id is not cached")
                 return self._issuer, self._keys.get(kid)
-            if self._failed_at is not None and now - self._failed_at < JWKS_FAILURE_HOLD_SECONDS:
-                if expired:
+            if held:
+                if expired or kid not in self._keys:
                     raise JWKSUnavailable("the last JWKS fetch failed moments ago")
                 assert self._issuer is not None
                 return self._issuer, self._keys.get(kid)
@@ -317,7 +326,7 @@ class TokenVerifier:
             header = json.loads(_b64url_decode(parts[0]))
             claims = json.loads(_b64url_decode(parts[1]))
             signature = _b64url_decode(parts[2])
-        except (ValueError, binascii.Error, UnicodeDecodeError):
+        except (ValueError, RecursionError, binascii.Error, UnicodeDecodeError):
             raise AuthRefused(401, "malformed JWT") from None
         if not isinstance(header, dict) or not isinstance(claims, dict):
             raise AuthRefused(401, "malformed JWT")
@@ -477,12 +486,19 @@ def store_dirs_for_key(key: str) -> tuple[str, str]:
     if not _plain_segment(owner) or not below or not all(_plain_segment(part) for part in below):
         raise Refused(400, "the store key has a part that is not a plain path segment")
     if len(below) == 1:
-        return owner, below[0]
+        return _bounded(owner, below[0])
     if owner == "github.com" and len(below) == 2:
-        return below[0], below[1]
+        return _bounded(below[0], below[1])
     if "." not in owner:
         raise Refused(400, "a store key below a host names the host first")
-    return owner, STORE_PATH_SEPARATOR.join(below)
+    return _bounded(owner, STORE_PATH_SEPARATOR.join(below))
+
+
+def _bounded(owner: str, name: str) -> tuple[str, str]:
+    for part in (owner, name):
+        if len(part.encode("utf-8")) > STORE_DIR_NAME_MAX_BYTES:
+            raise Refused(400, f"a store key part is over {STORE_DIR_NAME_MAX_BYTES} bytes")
+    return owner, name
 
 
 def store_key_for_dirs(owner: str, name: str) -> str:
@@ -557,12 +573,19 @@ def _open_child_dir(parent_fd: int, name: str, create: bool) -> int:
     except OSError as exc:
         if exc.errno in _SYMLINK_ERRNOS:
             raise _symlink_refusal(name) from None
+        if exc.errno == errno.ENAMETOOLONG:
+            # A backstop: store_dirs_for_key bounds what a request can name.
+            raise Refused(400, "a store path component is too long") from None
         raise
     try:
         os.mkdir(name, REPORT_DIR_MODE, dir_fd=parent_fd)
         created = True
     except FileExistsError:
         created = False
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            raise Refused(400, "a store path component is too long") from None
+        raise
     try:
         fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except OSError as exc:
@@ -713,7 +736,7 @@ def _validated_body(body: bytes) -> bytes:
         raise Refused(413, f"the body is over {REPORT_MAX_BYTES} bytes")
     try:
         document = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise Refused(400, "the body is not JSON") from None
     if not isinstance(document, dict):
         raise Refused(400, "the body is not a JSON object")
@@ -766,7 +789,7 @@ def list_streams(root: str) -> list[dict]:
                         latest = json.loads(_read_at(chain.fd, REPORT_LATEST_NAME))
                     if isinstance(latest, dict) and isinstance(latest.get("finished_at"), str):
                         finished = latest["finished_at"]
-                except (_Missing, Refused, OSError, ValueError):
+                except (_Missing, Refused, OSError, ValueError, RecursionError):
                     pass
                 streams.append(
                     {

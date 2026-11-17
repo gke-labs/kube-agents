@@ -946,6 +946,92 @@ def tearDownModule():
     store._now = setUpModule.original
 
 
+class RoundThreeTests(StoreTestCase):
+    """A rotated kid during a failed fetch, overlong store keys, deeply nested JSON."""
+
+    def test_a_rotated_kid_during_a_failed_fetch_is_503_until_a_fetch_succeeds(self) -> None:
+        clock = [1000.0]
+        rotated = RSAKey("k2", slot=2)
+        state = {"keys": [self.key.jwk()], "fail": False, "fetches": 0}
+
+        def fetch():
+            state["fetches"] += 1
+            if state["fail"]:
+                raise store.JWKSUnavailable("down")
+            return ISSUER, list(state["keys"])
+
+        verifier = store.TokenVerifier(fetch=fetch, monotonic=lambda: clock[0])
+        self.assertEqual(BROKER, verifier.verify(f"Bearer {self.token}"))
+        state["fail"] = True
+        for step in range(4):
+            with self.subTest(step=step), self.assertRaises(store.AuthRefused) as caught:
+                verifier.verify(f"Bearer {mint(rotated)}")
+            self.assertEqual(503, caught.exception.status)
+            # A cached kid still verifies inside the hold.
+            self.assertEqual(BROKER, verifier.verify(f"Bearer {self.token}"))
+            clock[0] += 2
+        # The forced-refresh rate limit holds: one failed fetch in the window.
+        self.assertEqual(2, state["fetches"])
+        clock[0] += max(store.JWKS_FAILURE_HOLD_SECONDS, store.JWKS_FORCED_REFRESH_SECONDS)
+        state["fail"] = False
+        state["keys"] = [self.key.jwk(), rotated.jwk()]
+        self.assertEqual(BROKER, verifier.verify(f"Bearer {mint(rotated)}"))
+        self.assertEqual(3, state["fetches"])
+
+    def test_overlong_store_keys_are_400_and_create_nothing(self) -> None:
+        name_parts = "%252F".join(["abcdefghij"] * 30)
+        streams = {
+            "owner": f"/v1/audit-reports/compliance-audit/{'a' * 256}%2Fgitops",
+            "name": f"/v1/audit-reports/compliance-audit/gitlab.com%2F{name_parts}",
+            "github name": f"/v1/audit-reports/compliance-audit/acme%2F{'g' * 256}",
+        }
+        for case, stream in streams.items():
+            with self.subTest(case):
+                self.assertEqual(400, self.put_run(STAMP_1, stream=stream).status_code)
+                self.assertEqual(400, self.call("GET", f"{stream}/latest").status_code)
+        self.assertFalse(self.root.exists() and any(self.root.iterdir()))
+        # 255 bytes still passes.
+        ok = f"/v1/audit-reports/compliance-audit/{'a' * 255}%2Fgitops"
+        self.assertEqual(204, self.put_run(STAMP_1, stream=ok).status_code)
+
+    def test_enametoolong_on_the_path_is_400(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for create in (False, True):
+                with self.subTest(create=create), self.assertRaises(store.Refused) as caught:
+                    store._open_child_dir(fd, "x" * 300, create)
+                self.assertEqual(400, caught.exception.status)
+        finally:
+            os.close(fd)
+
+    def test_deeply_nested_json(self) -> None:
+        nested = b"[" * 100000 + b"]" * 100000
+        self.assertEqual(400, self.call("PUT", f"{STREAM}/runs/{STAMP_1}", nested).status_code)
+        self.assertEqual(400, self.call("PUT", f"{STREAM}/latest", nested).status_code)
+        # A nested latest.json is skipped by the listing (the stream is listed
+        # without a finished_at). GET latest hands stored bytes back unparsed.
+        directory = self.root / "compliance-audit" / "acme" / "gitops"
+        (directory / "runs").mkdir(parents=True)
+        (directory / "runs" / f"{STAMP_1}.json").write_text("{}")
+        (directory / "latest.json").write_bytes(nested)
+        listed = self.call("GET", "/v1/audit-reports")
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual(
+            [{"audit_id": "compliance-audit", "key": "acme%2Fgitops", "newest_run": STAMP_1,
+              "latest_finished_at": None}],
+            listed.json(),
+        )
+        # A nested JWT payload is a malformed token.
+        header = _b64(json.dumps({"alg": "RS256", "kid": self.key.kid}).encode())
+        payload = _b64(b"[" * 5000 + b"]" * 5000)
+        self.assertEqual(401, self.call("GET", f"{STREAM}/runs", token=f"{header}.{payload}.c2ln").status_code)
+        # And a nested JWKS answer is the JWKS unavailable.
+        with mock.patch.object(store.json, "loads", side_effect=RecursionError("deep")):
+            with self.assertRaises(store.JWKSUnavailable):
+                store.fetch_cluster_keys(self.api.url, str(self.sa_dir))
+
+
 class FutureStampTests(StoreTestCase):
     """A run stamped far ahead of the store's clock would never leave the ring."""
 
