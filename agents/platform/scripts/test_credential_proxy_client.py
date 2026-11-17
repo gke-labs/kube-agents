@@ -1519,6 +1519,10 @@ class ApiSessionTest(unittest.TestCase):
             self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
             return "upstream-response"
 
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.calls.append({"method": "POST", "url": url, "json": json, "headers": headers, "timeout": timeout})
+            return "upstream-response"
+
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
@@ -1547,6 +1551,24 @@ class ApiSessionTest(unittest.TestCase):
             self.http.calls,
         )
         self.assertEqual(credential_proxy_client.authorization_headers(), self.http.calls[0]["headers"])
+
+    def test_post_sends_the_json_body_to_the_relayed_url_with_the_caller_token(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        body = {"resourceNames": ["projects/kagents-dev"], "filter": "severity>=ERROR", "pageSize": 1000}
+        self.assertEqual(
+            "upstream-response",
+            session.post("https://logging.googleapis.com/v2/entries:list", json=body, timeout=120),
+        )
+        self.assertEqual(
+            [{
+                "method": "POST",
+                "url": f"{self.ENDPOINT}/v1/gcp/logging.googleapis.com/v2/entries:list",
+                "json": body,
+                "headers": {"Authorization": "Bearer caller-token"},
+                "timeout": 120,
+            }],
+            self.http.calls,
+        )
 
     def test_the_relay_prefix_is_the_shared_constant(self):
         session = credential_proxy_client.ApiSession(http=self.http)
@@ -2037,6 +2059,7 @@ class TestApiSessionExecTier(unittest.TestCase):
     class FlakyHttp:
         def __init__(self, unreachable_hosts=()):
             self.calls = []
+            self.posted = []
             self.unreachable_hosts = set(unreachable_hosts)
 
         def get(self, url, *, params=None, headers=None, timeout=None):
@@ -2044,6 +2067,10 @@ class TestApiSessionExecTier(unittest.TestCase):
             if urllib.parse.urlsplit(url).netloc in self.unreachable_hosts:
                 raise ConnectionError(f"cannot connect to {url}")
             return "upstream-response"
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.posted.append(json)
+            return self.get(url, headers=headers, timeout=timeout)
 
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
@@ -2105,6 +2132,27 @@ class TestApiSessionExecTier(unittest.TestCase):
             [urllib.parse.urlsplit(url).netloc for url in http_.calls],
         )
         self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+
+    def test_a_post_falls_back_with_its_body_when_the_exec_tier_is_down(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        body = {"resourceNames": ["projects/p"]}
+        with patch("sys.stderr", new=io.StringIO()):
+            answer = credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json=body
+            )
+        self.assertEqual("upstream-response", answer)
+        self.assertEqual(["exec-tier:8765", "stateful:8765"], [urllib.parse.urlsplit(url).netloc for url in http_.calls])
+        self.assertEqual([body, body], http_.posted, "both attempts are POSTs that carry the body")
+
+    def test_a_post_in_a_custom_universe_goes_to_that_universes_host_on_both_attempts(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": "apis-tpczero.example"}), \
+                patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json={"resourceNames": ["projects/p"]}
+            )
+        relayed = f"{credential_proxy_client.API_RELAY_PREFIX}logging.apis-tpczero.example/v2/entries:list"
+        self.assertEqual([self.EXEC + relayed, self.STATEFUL + relayed], http_.calls)
 
     def test_the_exec_attempt_gets_the_shims_connect_bound_and_the_callers_read_timeout(self):
         seen = []
