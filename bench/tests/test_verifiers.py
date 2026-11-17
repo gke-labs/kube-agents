@@ -5533,7 +5533,7 @@ def test_a_nan_header_waits_as_if_absent(monkeypatch):
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
     assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
     monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
-    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Reset": "1100"}) == 101.0
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}) == 101.0
 
 
 def test_a_429_on_the_commits_page_names_the_limit(token, github):
@@ -7274,10 +7274,51 @@ def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
     assert slept == []
 
 
+def test_a_secondary_limit_with_budget_left_waits_the_default_not_the_reset(monkeypatch):
+    """#6177: X-RateLimit-Reset is when the hourly budget returns, so it is
+    the wait only when that budget is spent; a secondary limit with budget
+    left waits the default, not up to a slice."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}) == 121.0
+
+
+def test_a_token_renewal_during_the_wait_does_not_stop_it(monkeypatch, tmp_path):
+    """#6177: the job renews the grading token file every 40 minutes. A
+    renewal while the read waits must not make the next pass read the sent
+    token as someone else's and stop waiting."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+
+    def renew_while_sleeping(_seconds):
+        (tmp_path / "t").write_text("ghs_renewed\n")
+
+    monkeypatch.setattr(verifiers.time, "sleep", renew_while_sleeping)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (200, [], None),
+    ]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+
+
+def test_a_gitlab_limit_is_named_as_gitlabs(monkeypatch):
+    """#6177: only GitHub's evals repositories share one installation, so a
+    GitLab 429 names GitLab and not the shared budget."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "gitlab")
+    verifiers._last_forge_error_headers.set(None)
+    reason = verifiers._rate_limit_reason(429, None, "the issue")
+    assert reason.startswith("GitLab rate-limited")
+    assert "installation" not in reason
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    assert "installation" in verifiers._rate_limit_reason(429, None, "the issue")
+
+
 def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
     monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
-    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
     assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
     assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC

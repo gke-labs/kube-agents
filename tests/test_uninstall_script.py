@@ -19,7 +19,6 @@ engine it does not carry.
 """
 
 import json
-import os
 import pathlib
 import re
 import shlex
@@ -40,24 +39,6 @@ _INSTALL_DEFAULTS = _REPO_ROOT / "install.defaults.env"
 # run writes, which the uninstall skill names.
 _REPORT_FILE_ENV = "KUBE_AGENTS_UNINSTALL_REPORT_FILE"
 _REPORT_DEFAULT_FILE = "/tmp/kube-agents-uninstall-report.json"
-
-
-def setUpModule():
-    # write_report runs for real in tests here. Its report goes to a file of
-    # this run of the module. The path a real run writes is one fixed file,
-    # which two runs of this module at the same time would share.
-    global _REPORT_DIR, _REPORT_ENV_BEFORE
-    _REPORT_DIR = tempfile.TemporaryDirectory()
-    _REPORT_ENV_BEFORE = os.environ.get(_REPORT_FILE_ENV)
-    os.environ[_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / pathlib.Path(_REPORT_DEFAULT_FILE).name)
-
-
-def tearDownModule():
-    if _REPORT_ENV_BEFORE is None:
-        os.environ.pop(_REPORT_FILE_ENV, None)
-    else:
-        os.environ[_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
-    _REPORT_DIR.cleanup()
 
 
 class ReportFileTest(unittest.TestCase):

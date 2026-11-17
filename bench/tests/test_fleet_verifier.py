@@ -1345,6 +1345,76 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 }
 
 
+# The ComputeClass fixtures on slot c (defects-c.tf): the workload that names
+# the class through nodeAffinity alone. `present` is what the remediation
+# would write; `absent` is the object as planted.
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "ccc-prefilter-nodeaffinity-bypass/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What `kubectl patch deployment app-worker-b -n seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'` writes.
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-b"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchExpressions": [
+                                            {
+                                                "key": "cloud.google.com/compute-class",
+                                                "operator": "In",
+                                                "values": ["general-ccc"],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-b"}},
+                "spec": {
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchExpressions": [
+                                            {
+                                                "key": "cloud.google.com/compute-class",
+                                                "operator": "In",
+                                                "values": ["general-ccc"],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+}
+
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
 

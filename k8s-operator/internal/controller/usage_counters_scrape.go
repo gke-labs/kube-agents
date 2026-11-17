@@ -1003,7 +1003,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						continue
 					}
 					if name == kanbanDispatcherStuckSecondsSeries {
-						// Bounded as the age is, for the condition's message.
+						// Bounded as the age is. The condition uses the value only to
+						// pick the board that it names.
 						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}

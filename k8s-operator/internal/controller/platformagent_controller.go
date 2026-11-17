@@ -778,8 +778,8 @@ type PlatformAgentReconciler struct {
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
 // into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
 // marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
-// beside it, which both install paths bind in the install namespace and, under mode next, in the
-// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// beside it, which both install paths bind in the install namespace and in the profile
+// namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
 // or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
@@ -850,8 +850,8 @@ type PlatformAgentReconciler struct {
 // exists, so a namespaced read would be a 403 wherever that RoleBinding is
 // absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
-// namespaced Role there in the same apply (the chart under mode next,
-// config/profiles under make deploy), which is what lets the namespaced
+// namespaced Role there in the same apply (the chart, or config/profiles
+// under make deploy), which is what lets the namespaced
 // writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
 // and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
