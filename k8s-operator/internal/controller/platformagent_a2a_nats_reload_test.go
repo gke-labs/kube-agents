@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -43,6 +44,14 @@ func a2aReloadFixture(t *testing.T, liveConf string, annotations map[string]stri
 	return &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: rec}, agent, sts, rec
 }
 
+// singleServerRecord is the per-server reload record for the fixture's one
+// pod (UID "pod-uid", on the fixed start the busConfigLoadTime stub answers)
+// with the load time loaded.
+func singleServerRecord(loaded string) string {
+	name := a2aNATSName(a2aSingleServerTestAgent()) + a2aNATSPodOrdinalSuffix
+	return `{"` + name + `":{"uid":"pod-uid","start":"s","loaded":"` + loaded + `"}}`
+}
+
 func a2aDesiredConfig(agent *agentv1alpha1.PlatformAgent, conf string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace},
@@ -74,7 +83,7 @@ func TestANewConfigUnderTheSameHashIsAReload(t *testing.T) {
 		t.Fatalf("plan = %+v, want a pending reload rechecked in %s", plan, a2aBusReloadRecheck)
 	}
 	state, _ := readA2ABusReloadState(config.Annotations, sts.Name)
-	if state.baselines[sts.Name+a2aNATSPodOrdinalSuffix] != "t0" || config.Annotations[a2aBusReloadRequestedAnnotation] != now.Format(time.RFC3339Nano) {
+	if state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t0" || config.Annotations[a2aBusReloadBaselineAnnotation] != "t0" || config.Annotations[a2aBusReloadRequestedAnnotation] != now.Format(time.RFC3339Nano) {
 		t.Fatalf("pending reload not stamped: %v", config.Annotations)
 	}
 }
@@ -88,7 +97,7 @@ func TestAChangedHashIsARollNotAReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan != (a2aBusReload{}) || len(config.Annotations) != 0 {
+	if !reflect.DeepEqual(plan, a2aBusReload{}) || len(config.Annotations) != 0 {
 		t.Fatalf("plan = %+v, annotations %v; want nothing tracked", plan, config.Annotations)
 	}
 }

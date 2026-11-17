@@ -198,7 +198,7 @@ func TestBindingAProfileReloadsTheBusInsteadOfRollingIt(t *testing.T) {
 				names = append(names, name)
 				loaded[name] = "2026-11-09T22:00:00Z"
 				if err := cl.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-					Name: name, Namespace: agent.Namespace,
+					Name: name, Namespace: agent.Namespace, UID: types.UID("uid-" + name),
 					OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID, Controller: ptr.To(true)}},
 				}}); err != nil {
 					t.Fatal(err)
@@ -223,12 +223,12 @@ func TestBindingAProfileReloadsTheBusInsteadOfRollingIt(t *testing.T) {
 				t.Fatal("the config Secret carries no deny for the bound profile")
 			}
 			state, pending := readA2ABusReloadState(secret.Annotations, sts.Name)
-			if !pending || len(state.baselines) != servers {
+			if !pending || len(state.servers) != servers {
 				t.Fatalf("no pending reload with a baseline per server recorded on the Secret: %v", secret.Annotations)
 			}
 			for _, name := range names {
-				if state.baselines[name] != "2026-11-09T22:00:00Z" {
-					t.Fatalf("baseline for %s = %q, want the load time read before the write", name, state.baselines[name])
+				if state.servers[name].Loaded != "2026-11-09T22:00:00Z" {
+					t.Fatalf("baseline for %s = %q, want the load time read before the write", name, state.servers[name].Loaded)
 				}
 			}
 			if st.busReloadRequeue <= 0 {
@@ -468,9 +468,14 @@ func TestAFailedRestartKeepsThePendingReload(t *testing.T) {
 	if secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
 		t.Fatal("the pending reload was dropped before the restarted server was read")
 	}
+	// The StatefulSet recreates it after the config write, by the API
+	// server's clock (the live Secret's managedFields): a fresh pod mounts
+	// the current Secret, so its first read confirms it.
+	written := time.Now().Add(-time.Minute).Truncate(time.Second)
+	r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return written, true }
 	restarted := pod.DeepCopy()
 	restarted.ResourceVersion, restarted.UID = "", "pod-2"
-	restarted.CreationTimestamp = metav1.NewTime(time.Now().Add(time.Minute))
+	restarted.CreationTimestamp = metav1.NewTime(written.Add(30 * time.Second))
 	if err := cl.Create(ctx, restarted); err != nil {
 		t.Fatal(err)
 	}

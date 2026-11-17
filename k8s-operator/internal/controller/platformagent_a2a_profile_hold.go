@@ -339,7 +339,6 @@ func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *age
 		replicas = *sts.Spec.Replicas
 	}
 	if sts.Status.ObservedGeneration < sts.Generation || sts.Status.UpdatedReplicas < replicas ||
-		sts.Status.Replicas > replicas ||
 		(sts.Status.CurrentRevision != "" && sts.Status.CurrentRevision != sts.Status.UpdateRevision) {
 		return false, nil
 	}

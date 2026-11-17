@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -55,7 +54,15 @@ const (
 	// config_load_time just before. A config_load_time that moves off the
 	// recorded one is the reload landing.
 	a2aBusReloadRequestedAnnotation = "kubeagents.x-k8s.io/a2a-reload-requested-at"
+	// a2aBusReloadBaselineAnnotation keeps the shape an earlier operator
+	// reads: pod -0's config_load_time read just before the write, as a bare
+	// string, empty when it couldn't be read. Rolled back mid-reload, that
+	// operator then confirms or restarts the one server as it always did,
+	// rather than mistaking another shape for a moved load time.
 	a2aBusReloadBaselineAnnotation  = "kubeagents.x-k8s.io/a2a-reload-baseline"
+	// a2aBusReloadServersAnnotation is the per-server record a reload is
+	// confirmed against (a2aBusServerRecord, by pod name, as JSON).
+	a2aBusReloadServersAnnotation = "kubeagents.x-k8s.io/a2a-reload-servers"
 	// a2aBusReloadFoldedAnnotation marks a pending reload that a later
 	// config was folded into before it was confirmed. One load-time move
 	// can't say which of the two writes it applied, so the move re-arms the
@@ -77,6 +84,22 @@ const (
 	// within its sync period plus its cache TTL, about a minute by default,
 	// and the reloader signals within seconds of the write.
 	a2aBusReloadBound = 3 * time.Minute
+	// a2aBusKubeletSyncWindow is how long a projected Secret file in a pod
+	// can lag the Secret object: the kubelet's sync period (syncFrequency, a
+	// minute by default) plus the delay of its configMapAndSecretChange-
+	// DetectionStrategy (Watch by default, whose cache can serve a value up
+	// to its TTL old). A server that started more than this after the config
+	// was written read the new file at start.
+	a2aBusKubeletSyncWindow = 90 * time.Second
+	// a2aBusReloadAfterStart is how far past a server's start a load time
+	// must be to be a reload rather than the load at start, which nats-server
+	// stamps in the same moment as start.
+	a2aBusReloadAfterStart = 2 * time.Second
+	// a2aBusReadyBeforeRestart is how long every other server must have been
+	// Ready before a straggler is restarted, so a server that has only just
+	// come back (and may still be catching up its streams) isn't counted on
+	// for quorum.
+	a2aBusReadyBeforeRestart = 30 * time.Second
 	// How often a pending reload is checked.
 	a2aBusReloadRecheck = 15 * time.Second
 	// The bus's monitoring endpoint answers on the pod network to the
@@ -89,6 +112,10 @@ const (
 	// a folded config change (a2aBusReloadRearmedAnnotation).
 	a2aBusConfigReloadFoldedReason = "BusConfigReloadFolded"
 	a2aBusReloadFailedReason       = "BusConfigReloadFailed"
+	// a2aBusForeignPodReason is the Warning for a pod under a bus server's
+	// name that the StatefulSet doesn't control: what it loaded is unknown,
+	// so the reload can't be confirmed while it serves.
+	a2aBusForeignPodReason = "BusPodNotControlled"
 )
 
 // a2aBusVarzClient reads the bus's monitoring endpoint directly: an
@@ -148,8 +175,8 @@ func a2aNATSPIDVolumeSource() corev1.VolumeSource {
 type a2aBusReload struct {
 	// restart names the one bus server to restart this pass: past
 	// a2aBusReloadBound its reload wasn't confirmed, and every other server
-	// is Ready, so the bus keeps quorum while it restarts. Empty restarts
-	// nothing.
+	// has been Ready for a2aBusReadyBeforeRestart, so the bus keeps quorum
+	// while it restarts. Empty restarts nothing.
 	restart string
 	// restartUID is the pod restart names, as read this pass; the delete is
 	// made on it, so a pod recreated since is left alone.
@@ -162,38 +189,49 @@ type a2aBusReload struct {
 	// reload's move, whose newest write can't be confirmed in place, not one
 	// whose reload failed (a2aBusReloadRearmedAnnotation).
 	folded bool
+	// foreign names pods under a bus server's name that the StatefulSet
+	// doesn't control, each of which holds the reload unconfirmed.
+	foreign []string
 	// busUID is the live StatefulSet's, which a restarted pod must belong to.
 	busUID types.UID
 }
 
+// a2aBusServerRecord is what was read from one server just before a config
+// write: its pod's UID, and from /varz its start and config_load_time. Empty
+// Start and Loaded mean it couldn't be read.
+type a2aBusServerRecord struct {
+	UID    types.UID `json:"uid"`
+	Start  string    `json:"start,omitempty"`
+	Loaded string    `json:"loaded,omitempty"`
+}
+
 // a2aBusReloadState is a pending reload as it rides the config Secret: when
-// the newest config was written (by the operator's clock), and per bus server
-// (by pod name) the config_load_time read just before it, empty where it
-// couldn't be read; plus which servers' waits fold an earlier write, and which
-// were re-armed off a folded move.
+// the newest config was written (by the operator's clock, for the bound
+// only), a record per bus server (by pod name), and which servers' waits fold
+// an earlier write, or were re-armed off a folded move.
 type a2aBusReloadState struct {
 	requestedAt string
-	baselines   map[string]string
+	servers     map[string]a2aBusServerRecord
 	folded      map[string]bool
 	rearmed     map[string]bool
 }
 
 // readA2ABusReloadState reads the pending reload off annotations, or reports
-// none. A record an earlier operator wrote for its one server (a bare load
-// time, and "true" for folded and re-armed) reads as that server's.
+// none. A record an earlier operator wrote (a bare load time, no per-server
+// record) reads as pod -0's with no UID, which confirms only a pod created
+// after the write.
 func readA2ABusReloadState(annotations map[string]string, stsName string) (a2aBusReloadState, bool) {
 	requestedAt, pending := annotations[a2aBusReloadRequestedAnnotation]
 	if !pending {
 		return a2aBusReloadState{}, false
 	}
-	state := a2aBusReloadState{requestedAt: requestedAt, baselines: map[string]string{}, folded: map[string]bool{}, rearmed: map[string]bool{}}
-	raw := annotations[a2aBusReloadBaselineAnnotation]
-	if strings.HasPrefix(raw, "{") {
-		if err := json.Unmarshal([]byte(raw), &state.baselines); err != nil {
-			state.baselines = map[string]string{}
+	state := a2aBusReloadState{requestedAt: requestedAt, servers: map[string]a2aBusServerRecord{}}
+	if raw, ok := annotations[a2aBusReloadServersAnnotation]; ok {
+		if err := json.Unmarshal([]byte(raw), &state.servers); err != nil {
+			state.servers = map[string]a2aBusServerRecord{}
 		}
-	} else if raw != "" {
-		state.baselines[stsName+a2aNATSPodOrdinalSuffix] = raw
+	} else if raw := annotations[a2aBusReloadBaselineAnnotation]; raw != "" {
+		state.servers[stsName+a2aNATSPodOrdinalSuffix] = a2aBusServerRecord{Loaded: raw}
 	}
 	state.folded = decodeA2ABusServerSet(annotations, a2aBusReloadFoldedAnnotation, stsName)
 	state.rearmed = decodeA2ABusServerSet(annotations, a2aBusReloadRearmedAnnotation, stsName)
@@ -213,14 +251,17 @@ func decodeA2ABusServerSet(annotations map[string]string, key, stsName string) m
 	return decodeA2AConfigProfiles(value)
 }
 
-// stamp writes the pending reload onto config's annotations.
-func (s a2aBusReloadState) stamp(config *corev1.Secret) {
+// stamp writes the pending reload onto config's annotations: the per-server
+// record under its own key, and pod -0's load time alone under the key an
+// earlier operator reads (a2aBusReloadBaselineAnnotation).
+func (s a2aBusReloadState) stamp(config *corev1.Secret, stsName string) {
 	if config.Annotations == nil {
 		config.Annotations = map[string]string{}
 	}
 	config.Annotations[a2aBusReloadRequestedAnnotation] = s.requestedAt
-	raw, _ := json.Marshal(s.baselines) // a map of strings always marshals
-	config.Annotations[a2aBusReloadBaselineAnnotation] = string(raw)
+	config.Annotations[a2aBusReloadBaselineAnnotation] = s.servers[stsName+a2aNATSPodOrdinalSuffix].Loaded
+	raw, _ := json.Marshal(s.servers) // a map of plain structs always marshals
+	config.Annotations[a2aBusReloadServersAnnotation] = string(raw)
 	if len(s.folded) > 0 {
 		config.Annotations[a2aBusReloadFoldedAnnotation] = encodeA2AConfigProfiles(setNames(s.folded))
 	}
@@ -232,11 +273,13 @@ func (s a2aBusReloadState) stamp(config *corev1.Secret) {
 // a2aBusServer is one bus server: its pod name, and the pod if one by that
 // name exists and the live StatefulSet controls it. extra marks a pod at an
 // ordinal past what the StatefulSet asks for (a scale-down unfinished, or a
-// pod left over), which still serves whatever config it started with.
+// pod left over), which still serves whatever config it started with;
+// foreign, a pod by that name the StatefulSet doesn't control.
 type a2aBusServer struct {
-	name  string
-	pod   *corev1.Pod
-	extra bool
+	name    string
+	pod     *corev1.Pod
+	extra   bool
+	foreign bool
 }
 
 // serving reports whether the server's pod exists, is the StatefulSet's and
@@ -258,6 +301,7 @@ func (r *PlatformAgentReconciler) a2aBusServers(ctx context.Context, sts *appsv1
 	for i := range ordinals {
 		name := sts.Name + "-" + strconv.Itoa(i)
 		pod := &corev1.Pod{}
+		foreign := false
 		err := r.podReader().Get(ctx, types.NamespacedName{Name: name, Namespace: sts.Namespace}, pod)
 		switch {
 		case errors.IsNotFound(err):
@@ -271,26 +315,98 @@ func (r *PlatformAgentReconciler) a2aBusServers(ctx context.Context, sts *appsv1
 			// A pod by that name the StatefulSet doesn't control runs a
 			// config nothing here records.
 			if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
-				pod = nil
+				pod, foreign = nil, true
 			}
 		}
-		out = append(out, a2aBusServer{name: name, pod: pod, extra: i >= replicas})
+		out = append(out, a2aBusServer{name: name, pod: pod, extra: i >= replicas, foreign: foreign})
 	}
 	return out, nil
 }
 
-// a2aBusStartedAfter is the margin by which a pod must postdate a reload's
-// request to count as started on its config: the config is applied in the
-// pass that stamps the request, after the stamp, and the two clocks (the
-// operator's and the API server's) are not the same.
-const a2aBusStartedAfter = 10 * time.Second
+// a2aBusConfigWrittenAt is when the live config Secret was last written, by
+// the API server's clock: the latest managedFields entry. Any write moves it,
+// so it is never earlier than the config write a pending reload waits on,
+// which is the safe side: a pod created after it read that config at start.
+// No entry, no time, and no pod is taken as started on the config.
+func a2aBusConfigWrittenAt(live *corev1.Secret) (time.Time, bool) {
+	var latest time.Time
+	for _, f := range live.ManagedFields {
+		if f.Time != nil && f.Time.After(latest) {
+			latest = f.Time.Time
+		}
+	}
+	return latest, !latest.IsZero()
+}
 
-// startedAfter reports whether the pod was created after requestedAt by
-// a2aBusStartedAfter, so it started on the config that request wrote. A
-// request time that doesn't parse dates no pod after it.
-func startedAfter(pod *corev1.Pod, requestedAt string) bool {
-	since, err := time.Parse(time.RFC3339Nano, requestedAt)
-	return err == nil && pod.CreationTimestamp.After(since.Add(a2aBusStartedAfter))
+// a2aBusCreatedAfter reports whether pod was created after writtenAt, both by
+// the API server's clock. Both carry whole seconds, so the same second is not
+// after.
+func a2aBusCreatedAfter(pod *corev1.Pod, writtenAt time.Time, known bool) bool {
+	return known && pod.CreationTimestamp.Truncate(time.Second).After(writtenAt.Truncate(time.Second))
+}
+
+// a2aBusConfirm is one server's verdict on a pending reload.
+type a2aBusConfirm int
+
+const (
+	a2aBusNotYet a2aBusConfirm = iota
+	a2aBusConfirmed
+	// a2aBusRearm: a folded server's move, which may be the earlier write
+	// landing; its record moves to what was just read.
+	a2aBusRearm
+)
+
+// a2aBusServerConfirms judges one readable server against its record. It
+// fails closed: anything it can't show loaded the newest write is NotYet,
+// and only a restart past the bound moves such a server on.
+//
+//   - The same pod, still on the start recorded: confirmed when its
+//     config_load_time has moved (a reload).
+//   - The same pod restarted in place (a new start): the start reloads the
+//     file the kubelet last synced, which can be the old one, so a moved load
+//     time proves nothing. Confirmed when the start came more than
+//     a2aBusKubeletSyncWindow after the write (the file it read was synced),
+//     or when a load time later than the start arrives (the reloader acting on
+//     a later sync).
+//   - A pod the record doesn't know (recreated, a new UID, or a record from
+//     an earlier operator): a fresh pod mounts the Secret as it is at start,
+//     so it is confirmed when created after the write by the API server's
+//     clock (writtenAt), the operator's own restarts included.
+//
+// The shipped single-server path took any moved load time as the reload,
+// restart included; this closes that on one server as on three.
+func a2aBusServerConfirms(rec a2aBusServerRecord, recorded bool, pod *corev1.Pod, varz a2aBusVarz, writtenAt time.Time, known, folded bool) a2aBusConfirm {
+	if !recorded || rec.UID == "" || rec.UID != pod.UID {
+		if a2aBusCreatedAfter(pod, writtenAt, known) {
+			return a2aBusConfirmed
+		}
+		return a2aBusNotYet
+	}
+	if rec.Start == "" {
+		// Not read before the write: nothing in place can say which
+		// write a load time is.
+		return a2aBusNotYet
+	}
+	verdict := a2aBusNotYet
+	if varz.Start == rec.Start {
+		if varz.Loaded != rec.Loaded {
+			verdict = a2aBusConfirmed
+		}
+	} else {
+		start, serr := time.Parse(time.RFC3339Nano, varz.Start)
+		loaded, lerr := time.Parse(time.RFC3339Nano, varz.Loaded)
+		switch {
+		case serr != nil:
+		case known && start.After(writtenAt.Add(a2aBusKubeletSyncWindow)):
+			return a2aBusConfirmed
+		case lerr == nil && loaded.After(start.Add(a2aBusReloadAfterStart)):
+			verdict = a2aBusConfirmed
+		}
+	}
+	if verdict == a2aBusConfirmed && folded {
+		return a2aBusRearm
+	}
+	return verdict
 }
 
 // planA2ABusReload decides whether the config about to be applied reaches the
@@ -300,17 +416,19 @@ func startedAfter(pod *corev1.Pod, requestedAt string) bool {
 // one only a reload would deliver. With a roll coming, or no bus yet, there
 // is nothing to track. One server and a cluster take this one path.
 //
-// A reload is confirmed server by server, by each server's config_load_time
-// moving off the value read from that server just before the new config was
-// written; a server whose pod started after the write (a2aBusStartedAfter)
-// runs it from the start. It fails closed: a server that can't be read, has
-// no pod, or recorded no baseline hasn't loaded the config, so the pending
-// reload stays, and the profile hold with it (a2aServerLoadedFrom), until
-// every server confirms. Past a2aBusReloadBound the servers that haven't are
-// restarted, one per pass and only while every other server is Ready, so a
-// cluster keeps quorum; a pod started after the write is never restarted for
-// it, since a restart would bring back the same config. The Secret and the
-// StatefulSet are read uncached (a2aReader).
+// A reload is confirmed server by server (a2aBusServerConfirms), against a
+// record read from each server just before the write: its pod UID, start
+// and config_load_time, by pod IP. It fails closed: a server that can't be
+// read, answers under another name, has no pod, or can't be shown to hold
+// the newest write hasn't loaded it, so the pending reload stays, and the
+// profile hold with it (a2aServerLoadedFrom), until every server confirms. A
+// pod at an ordinal past what the StatefulSet asks for, or one it doesn't
+// control, keeps it pending too. Past a2aBusReloadBound the servers that
+// haven't confirmed are restarted, one per pass and only once every other
+// server has been Ready for a2aBusReadyBeforeRestart, so a cluster keeps
+// quorum; the fresh pod mounts the current Secret, and is confirmed by its
+// creation time. The Secret and the StatefulSet are read uncached
+// (a2aReader).
 func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, config *corev1.Secret, sts *appsv1.StatefulSet, now time.Time) (a2aBusReload, error) {
 	live := &corev1.Secret{}
 	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: config.Name, Namespace: config.Namespace}, live); err != nil {
@@ -333,82 +451,85 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 		// A new config for the running bus. A reload still pending from an
 		// earlier change is folded in: the reloader applies whatever file
 		// it finds, so the newest write is the one to wait for.
-		state := a2aBusReloadState{requestedAt: now.UTC().Format(time.RFC3339Nano), baselines: map[string]string{}, folded: map[string]bool{}, rearmed: map[string]bool{}}
+		state := a2aBusReloadState{requestedAt: now.UTC().Format(time.RFC3339Nano), servers: map[string]a2aBusServerRecord{}, folded: map[string]bool{}, rearmed: map[string]bool{}}
 		for _, s := range servers {
-			baseline := ""
-			if s.serving() {
-				if loaded, err := r.a2aBusConfigLoadTime(ctx, agent, s.pod); err == nil {
-					baseline = loaded
-				} else {
-					logf.FromContext(ctx).Info("couldn't read an A2A bus server's config load time before a reload; it will be restarted if the reload can't be confirmed",
-						"pod", s.name, "error", err.Error())
-				}
+			if !s.serving() {
+				continue
 			}
-			state.baselines[s.name] = baseline
+			rec := a2aBusServerRecord{UID: s.pod.UID}
+			if varz, err := r.a2aBusVarz(ctx, agent, s.pod); err == nil {
+				rec.Start, rec.Loaded = varz.Start, varz.Loaded
+			} else {
+				logf.FromContext(ctx).Info("couldn't read an A2A bus server's config load time before a reload; it will be restarted if the reload can't be confirmed",
+					"pod", s.name, "error", err.Error())
+			}
+			state.servers[s.name] = rec
 			// Folded only while the earlier write is still unloaded on this
-			// server: a load time already off its pending baseline is that
-			// write landing before the recheck saw it, and the server then
-			// owes one reload, this one, which its next move confirms. A
-			// load time that couldn't be read, now or then, can't tell, and
-			// folds. A server that started after the earlier write had it
-			// from the start.
+			// server: a load time already off its pending record on the same
+			// start is that write landing before the recheck saw it, and the
+			// server then owes one reload, this one, which its next move
+			// confirms. Anything else can't tell, and folds.
 			if pending {
-				if s.pod != nil && startedAfter(s.pod, prior.requestedAt) {
-					continue
-				}
-				if p := prior.baselines[s.name]; baseline == "" || p == "" || baseline == p {
+				p, ok := prior.servers[s.name]
+				if !ok || p.UID != rec.UID || p.Start == "" || rec.Start != p.Start || rec.Loaded == p.Loaded {
 					state.folded[s.name] = true
 				}
 			}
 		}
-		state.stamp(config)
+		state.stamp(config, liveSts.Name)
 		return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 	}
 	if !pending {
 		return a2aBusReload{}, nil
 	}
+	writtenAt, known := a2aBusConfigWrittenAt(live)
+	if r.busConfigWrittenAt != nil {
+		writtenAt, known = r.busConfigWrittenAt(live)
+	}
 	state := prior
+	if state.folded == nil {
+		state.folded = map[string]bool{}
+	}
+	if state.rearmed == nil {
+		state.rearmed = map[string]bool{}
+	}
 	confirmed := map[string]bool{}
 	readable := map[string]bool{}
+	var foreign []string
 	for _, s := range servers {
+		if s.foreign {
+			foreign = append(foreign, s.name)
+		}
 		if !s.serving() || s.extra {
 			// An extra pod is on its way out with whatever it loaded: the
 			// reload isn't confirmed while it serves.
 			continue
 		}
-		loaded, err := r.a2aBusConfigLoadTime(ctx, agent, s.pod)
+		varz, err := r.a2aBusVarz(ctx, agent, s.pod)
 		if err != nil {
 			continue
 		}
 		readable[s.name] = true
-		if startedAfter(s.pod, state.requestedAt) {
+		rec, recorded := state.servers[s.name]
+		switch a2aBusServerConfirms(rec, recorded, s.pod, varz, writtenAt, known, state.folded[s.name]) {
+		case a2aBusConfirmed:
 			confirmed[s.name] = true
-			continue
-		}
-		baseline := state.baselines[s.name]
-		if baseline == "" || loaded == baseline {
-			continue
-		}
-		if state.folded[s.name] {
-			// The move may be the earlier write landing: wait for one off
-			// this load time, or restart past the bound, for the newest.
-			state.baselines[s.name] = loaded
+		case a2aBusRearm:
+			state.servers[s.name] = a2aBusServerRecord{UID: s.pod.UID, Start: varz.Start, Loaded: varz.Loaded}
 			delete(state.folded, s.name)
 			state.rearmed[s.name] = true
-			continue
 		}
-		confirmed[s.name] = true
 	}
 	if len(servers) > 0 && len(confirmed) == len(servers) {
 		return a2aBusReload{reloaded: true, busUID: busUID}, nil
 	}
-	state.stamp(config)
+	state.stamp(config, liveSts.Name)
 	since, perr := time.Parse(time.RFC3339Nano, state.requestedAt)
 	if perr == nil && now.Sub(since) < a2aBusReloadBound {
-		return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID}, nil
+		return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID, foreign: foreign}, nil
 	}
-	plan := a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}
-	if straggler, ok := a2aBusStragglerToRestart(servers, state, confirmed); ok {
+	plan := a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID, foreign: foreign}
+	if straggler, ok := a2aBusStragglerToRestart(servers, confirmed, now); ok {
 		plan.restart, plan.restartUID = straggler.name, straggler.pod.UID
 		// A re-armed fold the server still answers for is the expected
 		// shape, not a failed reload; it restarts all the same.
@@ -417,11 +538,23 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	return plan, nil
 }
 
+// a2aBusReadyFor reports whether pod has been Ready for at least d at now,
+// by its Ready condition's last transition.
+func a2aBusReadyFor(pod *corev1.Pod, d time.Duration, now time.Time) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() && now.Sub(c.LastTransitionTime.Time) >= d
+		}
+	}
+	return false
+}
+
 // a2aBusStragglerToRestart picks the one server to restart past the bound:
-// the first, by ordinal, that hasn't confirmed the reload and whose pod
-// predates the write, and only when every other server's pod is serving and
-// Ready. None qualifies while any other server is down or still starting.
-func a2aBusStragglerToRestart(servers []a2aBusServer, state a2aBusReloadState, confirmed map[string]bool) (a2aBusServer, bool) {
+// the first, by ordinal, that hasn't confirmed the reload, and only when every
+// other server's pod is serving and has been Ready for
+// a2aBusReadyBeforeRestart. None qualifies while any other server is down or
+// just back, or while a scale-down is under way.
+func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool, now time.Time) (a2aBusServer, bool) {
 	for _, s := range servers {
 		if s.extra {
 			// A scale-down is under way: the StatefulSet removes that pod
@@ -430,12 +563,12 @@ func a2aBusStragglerToRestart(servers []a2aBusServer, state a2aBusReloadState, c
 		}
 	}
 	for i, s := range servers {
-		if confirmed[s.name] || !s.serving() || startedAfter(s.pod, state.requestedAt) {
+		if confirmed[s.name] || !s.serving() {
 			continue
 		}
 		others := true
 		for j, o := range servers {
-			if j != i && (!o.serving() || !podIsReady(o.pod)) {
+			if j != i && (!o.serving() || !a2aBusReadyFor(o.pod, a2aBusReadyBeforeRestart, now)) {
 				others = false
 				break
 			}
@@ -449,13 +582,18 @@ func a2aBusStragglerToRestart(servers []a2aBusServer, state a2aBusReloadState, c
 }
 
 // actOnA2ABusReload acts on the plan before the config is applied: an Event
-// for a reload every server confirmed, or one straggling server deleted, with
-// a Warning, for a reload it didn't confirm in time. The live config is
-// already the desired one on that path, and the StatefulSet recreates the pod
-// on it; the pending record stays until that pod is read on it too. If the
-// delete fails, the pass returns before the apply. The delete names the pod's
-// UID, and only a pod the live StatefulSet controls is deleted.
+// for a reload every server confirmed, a Warning per pod the StatefulSet
+// doesn't control, or one straggling server deleted, with a Warning, for a
+// reload it didn't confirm in time. The live config is already the desired
+// one on that path, and the StatefulSet recreates the pod on it; the pending
+// record stays until that pod is read too. If the delete fails, the pass
+// returns before the apply. The delete names the pod's UID, and only a pod
+// the live StatefulSet controls is deleted.
 func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, stsName string, plan a2aBusReload) error {
+	for _, name := range plan.foreign {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aBusForeignPodReason,
+			fmt.Sprintf("Pod %s holds an A2A bus server's name, but the bus StatefulSet doesn't control it: what config it serves is unknown, so the bus config reload stays unconfirmed (and newly bound profiles held) while it exists.", name))
+	}
 	if plan.reloaded {
 		r.recordEvent(agent, corev1.EventTypeNormal, a2aBusConfigReloadedReason,
 			"Reloaded the A2A bus's config in place on every server.")
@@ -492,42 +630,75 @@ func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *
 	return nil
 }
 
-// a2aBusConfigLoadTime reads config_load_time from one bus server's
-// monitoring endpoint, by its pod IP, as the server reports it. A Service
-// answers from whichever server it picks, and the per-pod names under the
-// routes Service don't resolve (the StatefulSet's service is the client
-// Service), so the pod's own address is the only way to ask a given server.
-// It's compared as a string, so the operator's clock never meets the bus's.
-func (r *PlatformAgentReconciler) a2aBusConfigLoadTime(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error) {
-	if r.busConfigLoadTime != nil {
-		return r.busConfigLoadTime(ctx, agent, pod)
+// a2aBusVarz is what a reload reads from one server's /varz.
+type a2aBusVarz struct {
+	Name   string `json:"server_name"`
+	Start  string `json:"start"`
+	Loaded string `json:"config_load_time"`
+}
+
+// a2aBusVarz reads one bus server's /varz by its pod IP: a Service answers
+// from whichever server it picks, and the per-pod names under the routes
+// Service don't resolve (the StatefulSet's service is the client Service), so
+// the pod's own address is the only way to ask a given server. An answer whose
+// server_name (nats.conf sets it to $POD_NAME) isn't the pod's, an address
+// reused by another pod, say, is no answer. Times are compared as the server
+// reports them, or against the API server's clock where a2aBusServerConfirms
+// says so. nats-server 2.10 serves no config digest to compare instead.
+func (r *PlatformAgentReconciler) a2aBusVarz(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error) {
+	var varz a2aBusVarz
+	switch {
+	case r.busVarz != nil:
+		v, err := r.busVarz(ctx, agent, pod)
+		if err != nil {
+			return a2aBusVarz{}, err
+		}
+		varz = v
+	case r.busConfigLoadTime != nil:
+		loaded, err := r.busConfigLoadTime(ctx, agent, pod)
+		if err != nil {
+			return a2aBusVarz{}, err
+		}
+		varz = a2aBusVarz{Name: pod.Name, Start: "s", Loaded: loaded}
+	default:
+		v, err := a2aBusReadVarz(ctx, pod)
+		if err != nil {
+			return a2aBusVarz{}, err
+		}
+		varz = v
 	}
+	if varz.Name != pod.Name {
+		return a2aBusVarz{}, fmt.Errorf("A2A bus pod %s answered as server %q", pod.Name, varz.Name)
+	}
+	if varz.Loaded == "" || varz.Start == "" {
+		return a2aBusVarz{}, fmt.Errorf("A2A bus pod %s carries no start or config_load_time", pod.Name)
+	}
+	return varz, nil
+}
+
+// a2aBusReadVarz is the HTTP read behind a2aBusVarz.
+func a2aBusReadVarz(ctx context.Context, pod *corev1.Pod) (a2aBusVarz, error) {
 	if pod.Status.PodIP == "" {
-		return "", fmt.Errorf("A2A bus pod %s has no IP yet", pod.Name)
+		return a2aBusVarz{}, fmt.Errorf("A2A bus pod %s has no IP yet", pod.Name)
 	}
 	ctx, cancel := context.WithTimeout(ctx, a2aBusVarzTimeout)
 	defer cancel()
 	url := "http://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(a2aNATSMonitorPort)) + a2aBusVarzPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		return a2aBusVarz{}, err
 	}
 	resp, err := a2aBusVarzClient.Do(req)
 	if err != nil {
-		return "", err
+		return a2aBusVarz{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%s (%s) answered %s", url, pod.Name, resp.Status)
+		return a2aBusVarz{}, fmt.Errorf("%s (%s) answered %s", url, pod.Name, resp.Status)
 	}
-	var varz struct {
-		ConfigLoadTime string `json:"config_load_time"`
-	}
+	var varz a2aBusVarz
 	if err := json.NewDecoder(resp.Body).Decode(&varz); err != nil {
-		return "", fmt.Errorf("decoding %s (%s): %w", url, pod.Name, err)
+		return a2aBusVarz{}, fmt.Errorf("decoding %s (%s): %w", url, pod.Name, err)
 	}
-	if varz.ConfigLoadTime == "" {
-		return "", fmt.Errorf("%s (%s) carries no config_load_time", url, pod.Name)
-	}
-	return varz.ConfigLoadTime, nil
+	return varz, nil
 }

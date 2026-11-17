@@ -344,7 +344,7 @@ func TestTheConfigSecretRecordsThePreviousListUntilTheServerIsOnTheNewOne(t *tes
 
 	// Still pending: carried as it was.
 	config = a2aDesiredConfig(agent, "new")
-	a2aBusReloadState{requestedAt: "2026-11-11T00:00:00Z", baselines: map[string]string{b.sts.Name + a2aNATSPodOrdinalSuffix: "t0"}}.stamp(config)
+	a2aBusReloadState{requestedAt: "2026-11-11T00:00:00Z", servers: map[string]a2aBusServerRecord{b.sts.Name + a2aNATSPodOrdinalSuffix: {UID: "pod", Start: "s", Loaded: "t0"}}}.stamp(config, b.sts.Name)
 	live.Annotations[a2aBusReloadRequestedAnnotation] = "2026-11-11T00:00:00Z"
 	if err := c.Update(ctx, live); err != nil {
 		t.Fatal(err)
@@ -710,6 +710,7 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
 		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 		a2aBusReloadBaselineAnnotation:  "t0",
+		a2aBusReloadServersAnnotation:   singleServerRecord("t0"),
 	})
 	now := time.Date(2026, 11, 9, 22, 0, 30, 0, time.UTC)
 	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t0", nil }
@@ -739,7 +740,7 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	if plan.reloaded || plan.restart != "" {
 		t.Fatalf("plan = %+v: the first move confirmed a folded reload", plan)
 	}
-	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.baselines[sts.Name+a2aNATSPodOrdinalSuffix] != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
+	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
 	}
 	if config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
@@ -776,6 +777,7 @@ func TestAReArmedFoldedReloadRestartsAtTheBoundWithoutAWarning(t *testing.T) {
 			ann := map[string]string{
 				a2aBusReloadRequestedAnnotation: armed.Format(time.RFC3339Nano),
 				a2aBusReloadBaselineAnnotation:  "t1",
+				a2aBusReloadServersAnnotation:   singleServerRecord("t1"),
 			}
 			if tc.rearmed {
 				ann[a2aBusReloadRearmedAnnotation] = "true"
@@ -823,6 +825,7 @@ func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
 		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 		a2aBusReloadBaselineAnnotation:  "t0",
+		a2aBusReloadServersAnnotation:   singleServerRecord("t0"),
 	})
 	now := time.Date(2026, 11, 9, 22, 0, 10, 0, time.UTC)
 	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t1", nil } // v1 landed
@@ -833,7 +836,7 @@ func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
 	if config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Fatalf("a write after the earlier reload landed is marked folded: %v", config.Annotations)
 	}
-	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.baselines[sts.Name+a2aNATSPodOrdinalSuffix] != "t1" {
+	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t1" {
 		t.Fatalf("baseline %q, want the load time v1 left, t1", config.Annotations[a2aBusReloadBaselineAnnotation])
 	}
 

@@ -694,6 +694,13 @@ type PlatformAgentReconciler struct {
 	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
 	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
 	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
