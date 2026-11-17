@@ -92,7 +92,7 @@ func TestTheJobPolicyHoldsAReadTierJobToItsOwnTemplate(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	ctx, admin, dispatcher, agent := envtestJobPolicySetup(t)
 	templates := envtestTierParams(ctx, t, admin, agent, []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")})
-	read := templates["tse"][dispatchJobTierTemplatePrefix+"tse-read"]
+	read := templates["tse"][dispatchJobTierTemplatePrefix+"tse.read"]
 	unattended := templates["tse"][dispatchJobTemplatePrefix+"tse"]
 	if read == nil || unattended == nil {
 		t.Fatalf("rendered %v, want both tiers", paramsOf(templates["tse"]))
