@@ -175,10 +175,12 @@ def scope_clusters(profiles_dir: Path | None = None) -> fleet_scope_targets.Scop
     # spec.harness.projectId may be a project number, which no Cluster Agent
     # profile names. Then, as agent_roster does, take the project's ID from
     # the reconcile snapshot's management row; an ID is used as it is, and
-    # with no snapshot row list_scope_clusters falls back to GCP_PROJECT_ID.
-    management = None
-    if os.environ.get("GCP_PROJECT_ID", "").strip().isdigit():
-        management = fleet_scope_targets.management_project_id(home)
+    # with no snapshot row list_scope_clusters falls back to the same variable
+    # this reads (fleet_scope_targets.MANAGEMENT_PROJECT_ENVS).
+    fallback = next(
+        (os.environ[name] for name in fleet_scope_targets.MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), ""
+    )
+    management = fleet_scope_targets.management_project_id(home) if fallback.strip().isdigit() else None
     try:
         return fleet_scope_targets.list_scope_clusters(home, management_project=management)
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
