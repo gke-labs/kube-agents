@@ -104,6 +104,31 @@ class KeyTest(unittest.TestCase):
     def test_value_flags_before_the_verb_do_not_move_it(self):
         self.assertEqual(key("--vmodule", "x=2", "--kuberc", "f", "get", "pods", "-A"), "get pods cluster table")
 
+    def test_the_later_spelling_of_a_flag_wins_as_in_kubectl(self):
+        cases = [
+            (("get", "pods", "-A", "--all-namespaces=false"), "get pods namespace table"),
+            (("get", "pods", "--all-namespaces", "-A=false"), "get pods namespace table"),
+            (("get", "pods", "-A=false", "--all-namespaces"), "get pods cluster table"),
+            (("get", "pods", "-A", "-o", "wide", "--output=json"), "get pods cluster json"),
+            (("get", "pods", "-A", "--output", "json", "-o", "wide"), "get pods cluster table"),
+            (("get", "pods", "-A", "-w", "--watch=false"), "get pods cluster table"),
+        ]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(key(*argv), expected)
+        self.assertIsNone(key("get", "pods", "-A", "--watch=false", "-w"))
+        self.assertIsNone(key("get", "pods", "-A", "-w=false", "--watch-only"))  # its own flag, not --watch
+        self.assertFalse(parsed("get", "pods", "-A", "-l", "app=x", "--selector=")["selector"])
+        self.assertFalse(parsed("get", "pods", "-A", "-h", "--help=false")["help"])
+
+    def test_the_later_follow_flag_decides_whether_logs_stream(self):
+        for argv, unslotted in [(("logs", "x", "-f", "--follow=false"), False),
+                                (("logs", "x", "--follow=false", "-f"), True),
+                                (("logs", "x", "-f=false"), False),
+                                (("logs", "x", "--follow=true"), True)]:
+            with self.subTest(argv=argv):
+                self.assertEqual(admit.unslotted(parsed(*argv), list(argv)), unslotted)
+
 
 class CostTest(unittest.TestCase):
     def charge(self, tier, *argv):

@@ -108,6 +108,10 @@ FALSE_VALUES = ("false", "0", "f")
 # before the first of these is a boolean flag (`-Ao json` is `-A -o json`), and that one takes
 # the rest of the word, or the next word when nothing is left (`-Aojson`, `-nteam`).
 SHORT_VALUE_FLAGS = frozenset("olnLcfksv")
+# The long spellings of the shorthands the admission reads. kubectl takes both spellings as one
+# flag, and the later occurrence wins, so parse() files both under the shorthand.
+LONG_FLAG_SHORTHANDS = {"--all-namespaces": "-A", "--selector": "-l", "--output": "-o", "--watch": "-w",
+                        "--filename": "-f", "--kustomize": "-k", "--help": "-h"}
 PROC_ROOT = "/proc"
 # The guard's module once loaded; `rss` reads processes through it.
 GUARD = None
@@ -191,32 +195,30 @@ def parse(argv: list[str]) -> dict:
             if name in VALUE_FLAGS and not eq:
                 value = argv[i + 1] if i + 1 < len(argv) else ""
                 i += 1
-            flags.setdefault(name, []).append(value if (eq or name in VALUE_FLAGS) else "true")
+            flags.setdefault(LONG_FLAG_SHORTHANDS.get(name, name), []).append(
+                value if (eq or name in VALUE_FLAGS) else "true")
         else:
             words.append(w)
         i += 1
 
-    def last(*names: str) -> str | None:
-        for n in names:
-            if n in flags:
-                return flags[n][-1]
-        return None
+    def last(name: str) -> str | None:
+        return flags[name][-1] if name in flags else None
 
-    def on(*names: str) -> bool:
-        value = last(*names)
+    def on(name: str) -> bool:
+        value = last(name)
         return value is not None and value.lower() not in FALSE_VALUES
 
     return {
         "verb": words[0] if words else "",
         "args": words[1:],
-        "all_namespaces": on("-A", "--all-namespaces"),
-        "selector": bool(last("-l", "--selector") or last("--field-selector")),
-        "output": last("-o", "--output") or "",
+        "all_namespaces": on("-A"),
+        "selector": bool(last("-l") or last("--field-selector")),
+        "output": last("-o") or "",
         "raw": last("--raw") is not None,
-        "watch": on("-w", "--watch", "--watch-only"),
-        "files": last("-f", "--filename", "-k", "--kustomize") is not None,
+        "watch": on("-w") or on("--watch-only"),
+        "files": last("-f") is not None or last("-k") is not None,
         "sort_by": last("--sort-by") or "",
-        "help": on("-h", "--help"),
+        "help": on("-h"),
     }
 
 
@@ -484,8 +486,12 @@ def refuse_flood(running: int, waiting: int, tier: str, key) -> int:
 
 def unslotted(cmd: dict, argv: list[str]) -> bool:
     """A command that takes no slot and no charge: a local verb, a watch, a stream, a help request."""
-    follows = cmd["verb"] == "logs" and any(a in FOLLOW_FLAGS or a.startswith("--follow=t") for a in argv)
-    return cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or cmd["help"] or follows
+    follows = False
+    for a in argv:  # the last of `-f`, `--follow` and `--follow=<bool>` wins, as in kubectl
+        name, eq, value = a.partition("=")
+        if name in FOLLOW_FLAGS:
+            follows = not eq or value.lower() not in FALSE_VALUES
+    return cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or cmd["help"] or (cmd["verb"] == "logs" and follows)
 
 
 def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> int:
