@@ -78,7 +78,7 @@ class SessionResourcesRenderTest(unittest.TestCase):
         # own check refuses it when schema validation is skipped.
         for value in ['"1e.5"', '"2GB"', '"lots"', '"1.5.0"', '"1e99999999999999999999"',
                       '"-1e99999999999999999999"', '"1234567890123456"', '"8Ei"', '"1e-99999999999999999999"',
-                      '"1e-2147483649"', '"+-1"']:
+                      '"1e-2147483649"', '"+-1"', '"1e400"', '"1e-2147483647"', '"1e-19"']:
             for extra in ((), ("--skip-schema-validation",)):
                 with self.subTest(value=value, extra=extra):
                     proc = self._helm(self._one("limits", "memory", value), *extra)

@@ -2485,6 +2485,25 @@ these have passed.
 ^(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$
 {{- end }}
 
+{{- /* kube-agents.quantityExponentCheck refuses a quantity whose exponent is below -18
+       (#6196). The CRD's quantity pattern admits any integer exponent, and
+       resource.ParseQuantity reads it into an int32 and then rounds through a big.Int of
+       that many digits: past int32 it refuses the PlatformAgent outright, and a large
+       negative one (1e-30000000 took 3.9s, growing faster than the exponent) stalls every
+       decode of it. Below -18 a quantity is smaller than the n suffix and rounds to 1n, so
+       nothing a pod requests needs one. A positive exponent past 18 is past int64 in bytes
+       or millicores, which the callers' overflow checks already refuse, by name.
+       Args: raw (the value without a leading sign), key (the values path, for the message). */ -}}
+{{- define "kube-agents.quantityExponentCheck" -}}
+{{- $exp := regexFind "[eE][-+]?[0-9]+$" .raw -}}
+{{- if $exp -}}
+{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
+{{- if and (contains "-" $exp) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
+{{- fail (printf "%s is %s, whose exponent is below -18: the operator decodes a quantity like this slowly or not at all, and no pod resource needs one. Write it with a unit suffix (m, n) instead" .key .raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- /* kube-agents.sessionResourcesCheck refuses a session-pod resources value the operator
        cannot read (#2371). The CRD's quantity pattern also admits a decimal exponent (1e.5),
        which the API server stores and resource.ParseQuantity then refuses on every decode of
@@ -2507,16 +2526,7 @@ these have passed.
        without its sign (the resolver reads a negative as unset, but the operator must
        still decode it): 15 significant digits, and nothing past int64 in bytes or in
        millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
-{{- /* resource.ParseQuantity reads an exponent into an int32 (strconv.ParseInt, then
-       int32()): past int64 it refuses the quantity, and between int32 and int64 it
-       truncates it to another value. So no exponent past int32, either sign. */ -}}
-{{- $exp := regexFind "[eE][-+]?[0-9]+$" $abs -}}
-{{- if $exp -}}
-{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
-{{- if or (gt (len $digits) 10) (and (eq (len $digits) 10) (gt (int64 $digits) 2147483647)) -}}
-{{- fail (printf "%s.%s.%s is %s, whose exponent is past the int32 the operator reads it into: past int64 the operator cannot decode the PlatformAgent, and below that it truncates the exponent to another value" $prefix $side $name $raw) -}}
-{{- end -}}
-{{- end -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" $abs "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
@@ -2570,6 +2580,7 @@ these have passed.
 {{- if hasPrefix "-" $raw -}}
 {{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" (trimPrefix "+" $raw) "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
