@@ -701,6 +701,10 @@ type PlatformAgentReconciler struct {
 	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
 	// keeps no managedFields.
 	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)

@@ -780,3 +780,142 @@ func TestTheLoneDownStragglerIsRestartedFirst(t *testing.T) {
 		})
 	}
 }
+
+// A renewed TLS certificate synced into the pods while a reload is pending
+// reloads the servers on whatever nats.conf they hold: the move that follows
+// re-arms the wait, and only a further move confirms.
+func TestATLSChangeDuringAReloadFoldsEveryServer(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	r, agent, sts, _ := a2aRecordedCluster(t, asked, asked.Add(time.Second))
+	tls := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}
+	if err := r.Create(context.Background(), tls); err != nil {
+		t.Fatal(err)
+	}
+	// The record saw the TLS Secret as it was.
+	live := &corev1.Secret{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Annotations[a2aBusReloadWatchedAnnotation] = tls.ResourceVersion
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	// The certificate is renewed.
+	tls.Data = map[string][]byte{"tls.crt": []byte("renewed")}
+	if err := r.Update(context.Background(), tls); err != nil {
+		t.Fatal(err)
+	}
+	v := map[string]a2aBusVarz{}
+	for i := range 3 {
+		v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: t1}
+	}
+	r.busVarz = varzOf(v)
+	config := a2aDesiredConfig(agent, "new")
+	plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), asked.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.reloaded {
+		t.Fatal("a move after a TLS change confirmed the reload")
+	}
+	state, _ := readA2ABusReloadState(config.Annotations, sts.Name)
+	if len(state.rearmed) != 3 || state.watched != tls.ResourceVersion {
+		t.Fatalf("rearmed %v, watched %q: want every server re-armed and the new version recorded", state.rearmed, state.watched)
+	}
+}
+
+// A server already re-armed folds again on a TLS change: the TLS reload's
+// move must re-arm it, not confirm it.
+func TestATLSChangeFoldsAReArmedServerToo(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	base := buildA2ANATSStatefulSet(a2aTestAgentWithBusReplicas(3), "h1")
+	state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), watched: "a-stale-version", servers: map[string]a2aBusServerRecord{}, rearmed: map[string]bool{}}
+	for i := range 3 {
+		state.servers[base.Name+"-"+strconv.Itoa(i)] = a2aBusServerRecord{UID: types.UID("pod-uid-" + strconv.Itoa(i)), Start: t0, Loaded: t0}
+		state.rearmed[base.Name+"-"+strconv.Itoa(i)] = true
+	}
+	pending := &corev1.Secret{}
+	state.stamp(pending, base.Name)
+	r, agent, sts, _ := a2aClusterReloadFixture(t, "new", pending.Annotations)
+	r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return asked, true }
+	if err := r.Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	v := map[string]a2aBusVarz{}
+	for i := range 3 {
+		v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: t1}
+	}
+	r.busVarz = varzOf(v)
+	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.reloaded {
+		t.Fatal("re-armed servers confirmed on the move a TLS change can cause")
+	}
+}
+
+// A TLS write just before the config write may land in the pods after it:
+// every server is folded from the start and stays folded through the
+// kubelet's sync window; after it, a further move confirms.
+func TestATLSWriteJustBeforeTheConfigFoldsThroughTheSyncWindow(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	r, agent, sts, _ := a2aClusterReloadFixture(t, "old", nil)
+	if err := r.Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	r.busTLSWrittenAt = func(*corev1.Secret) (time.Time, bool) { return asked.Add(-30 * time.Second), true }
+	r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return asked, true }
+	v := map[string]a2aBusVarz{}
+	for i := range 3 {
+		v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: t0}
+	}
+	r.busVarz = varzOf(v)
+	config := a2aDesiredConfig(agent, "new")
+	if _, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), asked); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := readA2ABusReloadState(config.Annotations, sts.Name)
+	if len(state.folded) != 3 || state.tlsSeen == "" {
+		t.Fatalf("folded %v, tls seen %q: want every server folded from the start", state.folded, state.tlsSeen)
+	}
+	live := &corev1.Secret{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(config), live); err != nil {
+		t.Fatal(err)
+	}
+	live.Data[a2aNATSConfKey], live.Annotations = []byte("new"), config.Annotations
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	pass := func(at time.Duration, loaded string) a2aBusReload {
+		t.Helper()
+		for i := range 3 {
+			v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: loaded}
+		}
+		cfg := a2aDesiredConfig(agent, "new")
+		plan, err := r.planA2ABusReload(context.Background(), agent, cfg, sts.DeepCopy(), asked.Add(at))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.reloaded {
+			live := &corev1.Secret{}
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(cfg), live); err != nil {
+				t.Fatal(err)
+			}
+			live.Annotations = cfg.Annotations
+			if err := r.Update(context.Background(), live); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return plan
+	}
+	if pass(30*time.Second, "2026-11-17T08:00:40Z").reloaded {
+		t.Fatal("a move inside the sync window confirmed the reload")
+	}
+	if pass(60*time.Second, "2026-11-17T08:01:10Z").reloaded {
+		t.Fatal("a second move still inside the window confirmed the reload")
+	}
+	if !pass(2*time.Minute, "2026-11-17T08:02:00Z").reloaded {
+		t.Fatal("a move after the window didn't confirm the reload")
+	}
+}

@@ -63,6 +63,23 @@ const (
 	// a2aBusReloadServersAnnotation is the per-server record a reload is
 	// confirmed against (a2aBusServerRecord, by pod name, as JSON).
 	a2aBusReloadServersAnnotation = "kubeagents.x-k8s.io/a2a-reload-servers"
+	// a2aBusReloadWatchedAnnotation records the bus's TLS serving Secret's
+	// resourceVersion as the pending reload last saw it. The reloader acts
+	// on any file the server's config names, so a renewed certificate synced
+	// into the pod reloads the server, moving its config_load_time, possibly
+	// before the kubelet syncs the new nats.conf. A change to it while a
+	// reload is pending folds every server: its next move re-arms the wait
+	// rather than confirms it. A reload an admin sends by hand can't be told
+	// from this one at all; that is left to whoever sends it.
+	a2aBusReloadWatchedAnnotation = "kubeagents.x-k8s.io/a2a-reload-watched"
+	// a2aBusReloadTLSSeenAnnotation is when (by the operator's clock) the
+	// pending reload first saw a TLS Secret change that the kubelet may still
+	// be syncing into the pods: a change seen mid-reload, or a write within
+	// a2aBusKubeletSyncWindow before the config write, whose resourceVersion
+	// the record already holds but whose file can land after the new
+	// nats.conf is written. Every server stays folded until the window has
+	// passed since then.
+	a2aBusReloadTLSSeenAnnotation = "kubeagents.x-k8s.io/a2a-reload-tls-seen"
 	// a2aBusReloadFoldedAnnotation marks a pending reload that a later
 	// config was folded into before it was confirmed. One load-time move
 	// can't say which of the two writes it applied, so the move re-arms the
@@ -211,6 +228,8 @@ type a2aBusServerRecord struct {
 // an earlier write, or were re-armed off a folded move.
 type a2aBusReloadState struct {
 	requestedAt string
+	watched     string
+	tlsSeen     string
 	servers     map[string]a2aBusServerRecord
 	folded      map[string]bool
 	rearmed     map[string]bool
@@ -225,7 +244,7 @@ func readA2ABusReloadState(annotations map[string]string, stsName string) (a2aBu
 	if !pending {
 		return a2aBusReloadState{}, false
 	}
-	state := a2aBusReloadState{requestedAt: requestedAt, servers: map[string]a2aBusServerRecord{}}
+	state := a2aBusReloadState{requestedAt: requestedAt, watched: annotations[a2aBusReloadWatchedAnnotation], tlsSeen: annotations[a2aBusReloadTLSSeenAnnotation], servers: map[string]a2aBusServerRecord{}}
 	if raw, ok := annotations[a2aBusReloadServersAnnotation]; ok {
 		if err := json.Unmarshal([]byte(raw), &state.servers); err != nil {
 			state.servers = map[string]a2aBusServerRecord{}
@@ -262,6 +281,12 @@ func (s a2aBusReloadState) stamp(config *corev1.Secret, stsName string) {
 	config.Annotations[a2aBusReloadBaselineAnnotation] = s.servers[stsName+a2aNATSPodOrdinalSuffix].Loaded
 	raw, _ := json.Marshal(s.servers) // a map of plain structs always marshals
 	config.Annotations[a2aBusReloadServersAnnotation] = string(raw)
+	if s.watched != "" {
+		config.Annotations[a2aBusReloadWatchedAnnotation] = s.watched
+	}
+	if s.tlsSeen != "" {
+		config.Annotations[a2aBusReloadTLSSeenAnnotation] = s.tlsSeen
+	}
 	if len(s.folded) > 0 {
 		config.Annotations[a2aBusReloadFoldedAnnotation] = encodeA2AConfigProfiles(setNames(s.folded))
 	}
@@ -454,7 +479,16 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 		// A new config for the running bus. A reload still pending from an
 		// earlier change is folded in: the reloader applies whatever file
 		// it finds, so the newest write is the one to wait for.
-		state := a2aBusReloadState{requestedAt: now.UTC().Format(time.RFC3339Nano), servers: map[string]a2aBusServerRecord{}, folded: map[string]bool{}, rearmed: map[string]bool{}}
+		watched, tlsAt, tlsKnown, err := r.a2aBusWatched(ctx, agent)
+		if err != nil {
+			return a2aBusReload{}, err
+		}
+		state := a2aBusReloadState{requestedAt: now.UTC().Format(time.RFC3339Nano), watched: watched, servers: map[string]a2aBusServerRecord{}, folded: map[string]bool{}, rearmed: map[string]bool{}}
+		// A TLS write just before this config write may still be syncing
+		// into the pods, so a reload it causes can follow this write.
+		if tlsKnown && now.Sub(tlsAt) < a2aBusKubeletSyncWindow {
+			state.tlsSeen = state.requestedAt
+		}
 		for _, s := range servers {
 			if !s.serving() {
 				continue
@@ -467,6 +501,9 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 					"pod", s.name, "error", err.Error())
 			}
 			state.servers[s.name] = rec
+			if state.tlsSeen != "" {
+				state.folded[s.name] = true
+			}
 			// Folded only while the earlier write is still unloaded on this
 			// server: a load time already off its pending record on the same
 			// start is that write landing before the recheck saw it, and the
@@ -495,6 +532,24 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	}
 	if state.rearmed == nil {
 		state.rearmed = map[string]bool{}
+	}
+	// The TLS Secret changed since the record: a reload it causes can't be
+	// told from this one, so every recorded server folds, a re-armed one
+	// included, until the kubelet's sync window has passed since the change
+	// was first seen.
+	watched, _, _, err := r.a2aBusWatched(ctx, agent)
+	if err != nil {
+		return a2aBusReload{}, err
+	}
+	if watched != state.watched {
+		state.watched = watched
+		state.tlsSeen = now.UTC().Format(time.RFC3339Nano)
+	}
+	if seen, err := time.Parse(time.RFC3339Nano, state.tlsSeen); err == nil && now.Sub(seen) < a2aBusKubeletSyncWindow {
+		for name := range state.servers {
+			delete(state.rearmed, name)
+			state.folded[name] = true
+		}
 	}
 	confirmed := map[string]bool{}
 	readable := map[string]bool{}
@@ -546,6 +601,32 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 // owed the time to start and answer before anything restarts it.
 func a2aBusYoungReplacement(pod *corev1.Pod, writtenAt time.Time, known bool, now time.Time) bool {
 	return a2aBusCreatedAfter(pod, writtenAt, known) && now.Sub(pod.CreationTimestamp.Time) < a2aBusReloadBound
+}
+
+// a2aBusWatched reads the bus's TLS serving Secret: its resourceVersion
+// (a2aBusReloadWatchedAnnotation) and when it was last written by the API
+// server's clock, the latest managedFields entry of any manager (any write
+// may change the files the reloader acts on, and a later time only folds
+// more). Empty and unknown with none.
+func (r *PlatformAgentReconciler) a2aBusWatched(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, time.Time, bool, error) {
+	tls := &corev1.Secret{}
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}, tls); err != nil {
+		return "", time.Time{}, false, client.IgnoreNotFound(err)
+	}
+	var at time.Time
+	if r.busTLSWrittenAt != nil {
+		var ok bool
+		if at, ok = r.busTLSWrittenAt(tls); !ok {
+			at = time.Time{}
+		}
+	} else {
+		for _, f := range tls.ManagedFields {
+			if f.Time != nil && f.Time.After(at) {
+				at = f.Time.Time
+			}
+		}
+	}
+	return tls.ResourceVersion, at, !at.IsZero(), nil
 }
 
 // a2aBusReadyFor reports whether pod has been Ready for at least d at now,
