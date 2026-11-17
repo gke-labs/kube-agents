@@ -660,3 +660,44 @@ func TestOnlyTheStatefulSetsOrdinalPodsAreRead(t *testing.T) {
 		t.Errorf("read %v", names)
 	}
 }
+
+// During a bus migration the meta group check doesn't run: the migration
+// holds the provision Job itself, and mid-way the bus is unprovisioned with
+// no streams, which the restart's guards would read as a fresh bus.
+func TestTheMetaCheckWaitsOutABusMigration(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	reads := 0
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8),
+		busServerViews: func(context.Context, *agentv1alpha1.PlatformAgent, *appsv1.StatefulSet) ([]a2aBusServerView, error) {
+			reads++
+			return lateJoinerViews(), nil
+		}}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 2, 2, 2)
+	reportBusRolledOut(t, ctx, cl, agent)
+	reads = 0
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), Phase: string(busMigrationConverting), RunID: "3-1"}
+	if !busMigrationHoldsProvision(agent) {
+		t.Fatal("the fixture's run doesn't hold provisioning")
+	}
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job wasn't held during a migration")
+	}
+	if reads != 0 || state.busMeta.message != "" {
+		t.Errorf("the meta check ran during a migration: %d reads, meta %+v", reads, state.busMeta)
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // The bus principals, in one place, as data.
@@ -97,6 +98,12 @@ type a2aIdentity struct {
 	// empty, and the callout refuses the whole map if it does not — see
 	// sessionIdentity for why that is fail-closed rather than fussy.
 	narrowing string
+
+	// notAfter, when set, is the instant the callout stops authenticating
+	// this principal and the latest any JWT minted for it expires. Set on
+	// the bus migration's per-run principals at the run's deadline. Only
+	// for a2aAuthCallout, and never with narrowing.
+	notAfter *time.Time
 
 	publish   []string
 	subscribe []string
@@ -282,6 +289,20 @@ const (
 	// logs in as, separated from console so its inbox prefix and
 	// confirmation surface are distinct from the browser's.
 	a2aConsoleMCPUser = "console-mcp"
+
+	// a2aCuratorUser is the NATS user name for the OKF memory curator pod
+	// (a2a/cmd/curator), rendered under A2A_CURATOR=true.
+	a2aCuratorUser = "curator"
+
+	// The memory query and outcome subjects served by the curator pod under
+	// A2A_CURATOR=true. Replies ride their own namespace (a2a.memory.reply.>)
+	// for the same reason verifierIdentity answers on a2a.cap.reply.> and
+	// bridgeIdentity answers on chat.board.reply.gateway.>: the curator never
+	// holds a publish grant on _INBOX.agent.>.
+	a2aMemoryQuerySubject       = "a2a.memory.query"
+	a2aMemoryReplySubjects      = "a2a.memory.reply.>"
+	a2aMemoryReplyAgentSubjects = "a2a.memory.reply.agent.>"
+	a2aCuratorOutcomesSubject   = "a2a.topics.agent.platform.curator-outcomes"
 
 	// a2aConsoleConfirmSubject is the console confirmation subject: console
 	// alone may publish it and gateway alone may subscribe to it. Its
@@ -494,6 +515,8 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	if op, ok := operatorIdentity(); ok {
 		ids = append(ids, op)
 	}
+	// The bus migration's principal for the step it is in, while it runs.
+	ids = append(ids, busMigrationIdentities(agent)...)
 	return append(ids,
 		seedIdentity(),
 		webIdentity(),
@@ -950,6 +973,36 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 			// The gateway's answers to its notifies.
 			a2aNotifyReplySubjects,
 			"_INBOX." + a2aAgentBusUser + ".>",
+		},
+	}
+}
+
+// curatorIdentity returns the NATS auth-callout entry for the curator pod,
+// rendered when A2A_CURATOR=true. It holds no task-plane grants, no JetStream
+// consumer-create verbs, and no publish grant on _INBOX.agent.>; replies to
+// a2a.memory.query ride a2a.memory.reply.>.
+func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.topics.shared.annotations",
+		"a2a.topics.shared.blueprint",
+	}
+	publish = append(publish, a2aAgentJetStreamGrants()...)
+	publish = append(publish, a2aMemoryReplySubjects)
+	publish = append(publish, "_INBOX."+a2aCuratorUser+".>")
+
+	return a2aIdentity{
+		user:           a2aCuratorUser,
+		account:        a2aAccountApp,
+		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries on a2a.memory.reply.> with no cluster or forge credentials",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.topics.shared.annotations",
+			"a2a.topics.shared.blueprint",
+			a2aCuratorOutcomesSubject,
+			a2aMemoryQuerySubject,
+			"_INBOX." + a2aCuratorUser + ".>",
 		},
 	}
 }

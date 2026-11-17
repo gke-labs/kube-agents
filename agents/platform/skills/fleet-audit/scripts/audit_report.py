@@ -17119,6 +17119,7 @@ def sync_open_remediation_labels(
     audit_id: str,
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
+    listed: list[dict] | None = None,
 ) -> None:
     """Re-assert the labels on every open remediation pull request this run saw.
 
@@ -17167,6 +17168,22 @@ def sync_open_remediation_labels(
         counts = severity_counts(group)
         highest = next((s for s in SEVERITIES if counts[s]), SEVERITIES[-1])
         sync_remediation_labels(repo, number, audit_id, highest)
+        # The broker re-judges an open disruption-budget fix every run, so a
+        # label it applied comes off once the switch, the rules or the cluster
+        # no longer allow it.
+        if carries_practice_label(pr) or any(
+            str(f.get("check") or "") == GENERATED_FIX_CHECK for f in group
+        ):
+            request_practice_label(repo, number)
+    # A labelled fix whose finding is not a manifest group this run (left
+    # `manual`, or not re-planned) has no entry in `pr_by_finding`, so the
+    # run's listing (`listed`) is walked for it: the broker re-judges it and
+    # takes the label off itself.
+    for pr in listed or []:
+        number = str((pr or {}).get("number", "") or "")
+        if number and number not in seen and str(pr.get("state", "")).upper() == "OPEN" and carries_practice_label(pr):
+            seen.add(number)
+            request_practice_label(repo, number)
 
 
 class _GroupPush(NamedTuple):
@@ -17733,6 +17750,8 @@ def open_remediation_pr(
             {"number": int(number), "title": title, "body": body},
         )
         sync_remediation_labels(repo, number, audit_id, highest)
+        if safety or carries_practice_label(existing):
+            request_practice_label(repo, number)
         return str(existing.get("url") or "")
     # Labelled in a second call because creating a proposal takes none; `gh pr
     # create --label` made the same two requests. Not best-effort: an unlabelled
@@ -17768,7 +17787,42 @@ def open_remediation_pr(
                     ),
                 },
             )
+    if safety and number is not None:
+        request_practice_label(repo, number)
     return str(created.get("url") or "") or None
+
+
+# The broker verb that judges a disruption-budget fix and applies the reserved
+# auto-merge label itself (vcs_broker.VcsBroker.proposal_practice_label), and
+# its labels (automerge_eligibility.RESERVED_LABELS).
+PRACTICE_LABEL_VERB = "proposal-practice-label"
+PRACTICE_LABELS = ("kube-agents:would-auto-merge", "kube-agents:auto-merge")
+
+
+def carries_practice_label(pr: dict | None) -> bool:
+    """Whether a pull request record carries one of the broker's auto-merge labels: a
+    refresh then asks the broker again even with no section to write, so a
+    label from an earlier `practice` or `on`, or from a group that has since
+    changed, comes off."""
+    return any(name.casefold() in PRACTICE_LABELS for name in pr_labels(pr))
+
+
+def request_practice_label(repo: str, number: int | str) -> None:
+    """Ask the broker to judge pull request `number` for the auto-merge label.
+
+    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    holding a disruption-budget fix), and on a refresh of a pull request that
+    already carries the label. The broker reads everything itself and decides;
+    this sends the number and logs the answer. A refusal is logged and nothing
+    more: the pull request is open either way. A broker that does not answer
+    raises `BrokerUnavailable`, as every forge call here does.
+    """
+    try:
+        answer = forge(PRACTICE_LABEL_VERB, repo, {"number": int(number)})
+    except (ForgeError, ValueError) as exc:
+        log(f"WARNING: #{number}: the auto-merge label was not judged: {exc}")
+        return
+    log(f"PRACTICE LABEL: #{number}: labelled={answer.get('labelled')} ({answer.get('reason')})")
 
 
 def open_proposal_on(repo: str, branch: str) -> dict | None:
@@ -23412,11 +23466,8 @@ def handle_remediate(args: argparse.Namespace) -> None:
     if issue_number is None and on_forge:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
-    pr_by_finding, _ = reconcile_remediation_prs(
-        audit_id,
-        findings,
-        remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id),
-    )
+    listed = remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id)
+    pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, listed)
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.
     #
@@ -23456,7 +23507,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"{fid} already has an open remediation pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
         )
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, listed)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         revival = (
@@ -24661,7 +24712,7 @@ def _finish_store_ledger(
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation {noun}; not replacing it.")
     if findings and listing_refusal is None:
-        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
         comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
 
     # Retiring a fix asserts that its finding no longer reproduces: not over a
@@ -26835,7 +26886,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         log(

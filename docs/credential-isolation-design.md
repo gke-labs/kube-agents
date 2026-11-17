@@ -335,6 +335,13 @@ which also run in the sandbox, before any identity is written to disk; hashing
 it anywhere else would mean shipping the plaintext address out of the sandbox
 first, which is exactly what it exists to prevent.
 
+The sandbox holds one more Secret-backed value, `A2A_ACTIVITY_SECRET`: the key
+hermes signs its tool-call deliveries to the bridge sidecar's loopback door with.
+It is pod-scoped like the two above, and hermes needs it in its own process. The
+activity signing key is withheld from child processes: `_run_env` in
+`agent_common_server.py` drops it from every child it spawns, so the gcloud,
+kubectl and hermes CLI children see only the two Session KV values.
+
 Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields
@@ -1226,7 +1233,8 @@ gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespa
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
 
 The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
-the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+the envelope keys and, on the records of the exec route, the Cloud API relay and the feedback
+route, the `tool_execution_audit` fields the site's
 [observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the

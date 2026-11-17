@@ -101,15 +101,18 @@ const (
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
 	workerRunAsUser = 1000
 	// Worker requests: the harness spike's per-session footprint, and what
-	// the session cap's sizing math multiplies. The limits exist because a
+	// the session cap's sizing math multiplies. These are the defaults: the
+	// operator renders A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT} from
+	// spec.harness.tuning.sessionResources (#2371), and they must equal its
+	// DefaultSession* constants (TestSessionResourceDefaultsMatchTheOperators). The limits exist because a
 	// namespace ResourceQuota that requires them refuses a pod without
 	// them at admission, and a session pod refused there is a delegation
 	// that never starts; they are the sandbox's (2 CPU, 2Gi), which is
 	// what a headless harness turn has been observed to fit in. On an
 	// Autopilot cluster without Pod bursting the limit is rewritten to the
 	// request, so the request stays a ceiling a turn can live under.
-	workerCPURequest    = "250m"
-	workerMemoryRequest = "512Mi"
+	workerCPURequest    = "150m"
+	workerMemoryRequest = "320Mi"
 	workerCPULimit      = "2"
 	workerMemoryLimit   = "2Gi"
 	// The scratch emptyDir is the harness's working directory (the worker
@@ -351,7 +354,7 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 }
 
 // Spawn creates the session pod: the demo's reference worker shape — no
-// ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests —
+// ambient k8s credentials, scratch on emptyDir, the configured requests —
 // running the headless harness behind the worker adapter (W4's image).
 // Model auth, as shipped (spec-chatops-gateway.md, amended 8/31): the
 // worker talks to the install's own LiteLLM, in-namespace, with no per-pod
@@ -402,7 +405,8 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			ImagePullSecrets: sessionImagePullRefs(s.cfg.ImagePullRefs),
+			RestartPolicy:    corev1.RestartPolicyNever,
 			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
 			// asked as written first: 2 DNS queries, not up to 14 (#5590).
 			DNSConfig: &corev1.PodDNSConfig{
@@ -496,18 +500,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "A2A_AUTHORITY_SCOPE", Value: string(s.cfg.AuthorityScope)},
 					{Name: "A2A_CAPABILITY_REQUIRED", Value: strconv.FormatBool(!s.cfg.CapabilityOptional)},
 				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPURequest),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryRequest),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPULimit),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryLimit),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-				},
+				Resources: s.workerResources(),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "scratch", MountPath: "/scratch"},
 					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
@@ -600,6 +593,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		if s.cfg.CredentialProxyExecURL != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
 		}
+		if s.cfg.UniverseDomain != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: envGoogleCloudUniverseDomain, Value: s.cfg.UniverseDomain})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,
@@ -638,6 +634,17 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		return "", err
 	}
 	return created.Name, nil
+}
+
+func sessionImagePullRefs(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return refs
 }
 
 func (s *podSpawner) Delete(ctx context.Context, podName string) error {
@@ -889,6 +896,16 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
 		workers, g.cfg.MaxSessions))
 	return true
+}
+
+// workerResources is the session pod's requests and limits: CPU and memory
+// as the gateway was configured (Config.SessionResources, #2371), ephemeral
+// storage fixed.
+func (s *podSpawner) workerResources() corev1.ResourceRequirements {
+	r := s.cfg.sessionResources()
+	r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	r.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	return r
 }
 
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a
