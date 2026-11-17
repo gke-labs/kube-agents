@@ -42,6 +42,10 @@ so `make mirror-images` copies them. The chart sets their env vars (`A2A_NATS_IM
 the four with nothing more to do. The two pinned by digest render under the prefix by tag alone,
 which is the copy `make mirror-images` pushes.
 
+An upgrade with `helm upgrade --reuse-values` from a release before `a2aBus.images` existed
+renders without that key. The chart then takes the same pins from its own templates, so under
+`global.thirdPartyImageRegistry` the bus still pulls from the mirror.
+
 A kustomize install (`make deploy`) renders the operator without the chart, so there the operator
 runs on its compiled defaults, the same pins on Docker Hub, until the four env vars are set by
 hand on the controller manager.
@@ -61,9 +65,9 @@ The bases those images are built from are inventory entries too. `golang`, `node
 `a2a/Dockerfile.worker`, `a2a/Dockerfile.hermes-bridge` and `a2a/Dockerfile.web-console` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
-Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
-`ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
-this file. How to bump a pin is in
+Several images keep a second copy of their pin elsewhere in the tree: a chart value, a Dockerfile
+`ARG` default, a compiled constant in the operator, or the chart's template default for the A2A bus.
+`make images-check` holds them in step with this file. How to bump a pin is in
 [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md#local-validation-before-committing).
 
 <!-- BEGIN GENERATED: container-images -->
