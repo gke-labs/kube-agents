@@ -50,6 +50,7 @@ const (
 	memoryLimitCallEnvArg    = "operatorMemoryLimitEnv"
 	memoryLimitCallShareArg  = "operatorMemoryLimitFraction"
 	managerConstructorCall   = "ctrl.NewManager"
+	managerStartCall         = "mgr.Start"
 	// The webhook's namespace rule reaches the validator through this one
 	// call's second argument. Every webhook test builds the validator by
 	// hand, so a call that passed "" or another name would switch the rule
@@ -193,4 +194,53 @@ func literalTypeName(expr ast.Expr) string {
 		return ""
 	}
 	return pkg.Name + "." + sel.Sel.Name
+}
+
+// LeaderElectionReleaseOnCancel hands the lease over on shutdown instead of
+// letting it expire. controller-runtime documents it as unsafe unless the
+// binary ends as soon as the manager stops: the next leader can start the
+// moment the lease is released, so anything this process did after mgr.Start
+// returned would run alongside it. That holds today only by the shape of
+// main(), which nothing else checks: mgr.Start is its last statement, and it
+// has no defer (which runs after Start returns) and no go statement (which
+// could outlive it). Each of the four assertions below is one way to break it.
+func TestMainReleasesTheLeaseOnlyWhereItExitsWithTheManager(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, mainSourceFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", mainSourceFile, err)
+	}
+	if got, set := literalField(file, managerOptionsType, "LeaderElectionReleaseOnCancel"); !set || got != "true" {
+		t.Errorf("%s in %s sets LeaderElectionReleaseOnCancel to %q (set: %v), want true: a new operator pod waits out the whole lease before its first reconcile", managerOptionsType, mainSourceFile, got, set)
+	}
+	var mainFn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "main" {
+			mainFn = fn
+		}
+	}
+	if mainFn == nil || len(mainFn.Body.List) == 0 {
+		t.Fatalf("%s has no main function with a body", mainSourceFile)
+	}
+	startsManager := false
+	ast.Inspect(mainFn.Body.List[len(mainFn.Body.List)-1], func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && literalTypeName(call.Fun) == managerStartCall {
+			startsManager = true
+		}
+		return !startsManager
+	})
+	if !startsManager {
+		t.Errorf("main's last statement doesn't call %s: something runs after the manager stops, and with the lease released another operator may already be leading", managerStartCall)
+	}
+	ast.Inspect(mainFn.Body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.DeferStmt:
+			t.Errorf("main has a defer at %s: it runs after mgr.Start returns, when the lease is already released", fset.Position(n.Pos()))
+		case *ast.GoStmt:
+			t.Errorf("main starts a goroutine at %s: it can still be running after mgr.Start returns and the lease is released", fset.Position(n.Pos()))
+		case *ast.FuncLit:
+			return false // a closure handed to something else isn't main's own statement
+		}
+		return true
+	})
 }
