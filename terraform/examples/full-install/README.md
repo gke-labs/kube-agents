@@ -75,6 +75,10 @@ install without the interview.
   those through `platformAgent.deployment.env` in `extra_helm_values`. The
   [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
   gives the buckets, the defaults and a sizing method.
+- With `install_helm_releases = false`, neither chart is installed: the apply
+  builds only the Google Cloud side, and
+  [a separate pipeline installs the charts](#installing-the-charts-from-a-separate-pipeline-install_helm_releases)
+  from the outputs.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -161,7 +165,8 @@ install without the interview.
 - With `create_cluster = false`, a cluster that meets the
   [cluster requirements](../../../docs/site/src/content/docs/install/prerequisites.md#cluster-requirements):
   GKE 1.29+, Workload Identity with `GKE_METADATA` on every node pool,
-  NetworkPolicy enforcement, a control plane reachable from here, and cert-manager
+  NetworkPolicy enforcement, a control plane reachable from here (not with
+  `install_helm_releases = false`), and cert-manager
   either present (`enable_cert_manager = false`) or absent. The module refuses the
   plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
   and checks none of the others; `install.sh` changes an adopted cluster to meet
@@ -173,7 +178,7 @@ install without the interview.
   install ships is then inert, including the ones that confine the agent's shell
   sandbox.
 - Application Default Credentials for the Google, Kubernetes, and Helm
-  providers:
+  providers (the Google provider alone with `install_helm_releases = false`):
 
   ```bash
   gcloud auth application-default login
@@ -552,6 +557,67 @@ It exists because the chart is installed from this checkout, and a checkout's `C
 carries an `appVersion` placeholder that never matches a published image tag — so the
 chart's usual tag defaulting cannot work here (see the [chart README](../../../charts/kube-agents/README.md)).
 For production, always pin a validated numeric SemVer release tag or full commit SHA.
+
+### Installing the charts from a separate pipeline (`install_helm_releases`)
+
+Set `install_helm_releases = false` when the pipeline that may create Google
+Cloud resources is not the one that deploys to Kubernetes, or cannot reach the
+cluster's control plane. The apply then builds everything on the Google Cloud
+side (APIs, the cluster, IAM, Pub/Sub, the minter) and skips the cert-manager
+and kube-agents Helm releases. The Helm provider is still configured, which
+makes no network call, but nothing uses it.
+
+Your Kubernetes pipeline installs the charts from the outputs:
+
+| Output                      | What it carries                                                                                                                                                   |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cert_manager_helm_release` | Repository, chart, version, namespace and values for cert-manager, or `null` when `enable_cert_manager = false`.                                                  |
+| `kube_agents_helm_release`  | Release name, namespace, chart directory (relative to the repository or release bundle root) and chart version.                                                   |
+| `kube_agents_helm_values`   | The values documents the release would be given, in order. **Sensitive**: they hold every credential the install was given (the output's description lists them). |
+
+The values already name every service account the chart needs, such as the
+agent's Google service account for Workload Identity, so there is nothing to
+copy across by hand. `agent_service_account_email` and the other
+service-account outputs remain for anything else that needs them.
+
+```bash
+terraform output -json kube_agents_helm_values | jq -r '.[0]' > values-0.yaml
+terraform output -json kube_agents_helm_values | jq -r '.[1]' > values-1.yaml
+terraform output -json cert_manager_helm_release > cert-manager.json
+terraform output -json kube_agents_helm_release > kube-agents.json
+
+# In the Kubernetes pipeline, from the root of the same release of this repository
+# (the chart path in kube-agents.json is relative to it):
+helm upgrade --install cert-manager cert-manager --repo https://charts.jetstack.io \
+  --version "$(jq -r .version cert-manager.json)" --namespace cert-manager --create-namespace \
+  -f <(jq -r '.values[0]' cert-manager.json) --wait --timeout 10m
+helm upgrade --install "$(jq -r .name kube-agents.json)" "$(jq -r .chart kube-agents.json)" \
+  --namespace "$(jq -r .namespace kube-agents.json)" --create-namespace \
+  -f values-0.yaml -f values-1.yaml --wait --timeout 10m
+```
+
+Install cert-manager first and wait for it: the kube-agents chart creates a
+Certificate and an Issuer, which the API server refuses until cert-manager's
+webhook is serving. A mirrored install's cert-manager values have a second
+document, which goes after the first. Keep the namespace `kube_agents_helm_release`
+names: the agent's gateway endpoint is fixed to it.
+
+The checks the chart's values must pass, such as `openai_compatible` needing a
+model name or the GitOps forge settings, run on every plan in either mode.
+
+`lifecycle.sh apply` (and `make tf-apply`) works in this mode and never reaches
+the cluster. `lifecycle.sh destroy` does reach it, to delete the PlatformAgent
+before the cluster goes, so either run it where the cluster is reachable or
+uninstall the charts from your pipeline first. `install.sh` and `upgrade.sh`
+always install the charts.
+
+Turning `install_helm_releases` off on an install whose releases Terraform
+already manages uninstalls them on the next apply. To hand existing releases to
+another pipeline instead, remove them from state first:
+`terraform state rm 'helm_release.kube_agents[0]' 'helm_release.cert_manager[0]'`.
+An install from before this setting holds the release at
+`helm_release.kube_agents`. The first apply moves it to
+`helm_release.kube_agents[0]` without touching the release.
 
 ### Installing from a mirrored registry
 
@@ -1005,8 +1071,8 @@ detector, the sinks publish every mutating call on every GKE cluster in the
 project and in each project the scope lists (about 60k messages a day after the module's lease filter, per its
 README) into a subscription that retains them for 31 days and never expires:
 Pub/Sub storage cost and a backlog until the detector is enabled. The reverse
-is refused — a `helm_release` precondition fails the apply when
-`enable_drift_detector` is set without `enable_drift_pubsub`. The block
+is refused — a precondition on the `kube_agents_helm_values` output fails the
+plan when `enable_drift_detector` is set without `enable_drift_pubsub`. The block
 carrying `enabled` is written only when the ingress is on, so the failure that
 precondition catches is quieter than the Ready-forever detector the CRD
 field's description warns about: an apply that succeeds, renders no
