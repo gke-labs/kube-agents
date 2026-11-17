@@ -34,7 +34,9 @@ func scriptAdmission(t *testing.T) (*Dispatcher, *fakeVerifier, lib.DispatchConf
 	v := &fakeVerifier{}
 	d := &Dispatcher{cfg: testConfig(), verifier: v, verified: map[holdKey]permit{}, jobs: newFakeJobs(0), pool: NewStaticPool()}
 	prof := testProfile("tse", 1, "unattended")
-	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	// By reference, as the operator renders it; the inline form is
+	// TestAdmissionHandsAnInlineTemplatesScriptOn's.
+	prof.JobTemplateRef = &lib.DispatchJobTemplateRef{Name: "dispatch-job-tse", Hash: "h1"}
 	snap := lib.DispatchConfig{Namespace: "kubeagents-system", Profiles: []lib.DispatchProfile{prof}}
 	return d, v, snap, prof, holdKey{"tse", "unattended", lib.SubmitKindTop, "task-1"}
 }
@@ -267,7 +269,9 @@ func TestAdmissionRefusesAScriptOutsideJobMode(t *testing.T) {
 			hk.tier = "read"
 		},
 		"no Job runner":   func(d *Dispatcher, _ *lib.DispatchProfile, _ *holdKey) { d.jobs = nil },
-		"no Job template": func(_ *Dispatcher, prof *lib.DispatchProfile, _ *holdKey) { prof.JobTemplate = nil },
+		"no Job template": func(_ *Dispatcher, prof *lib.DispatchProfile, _ *holdKey) {
+			prof.JobTemplate, prof.JobTemplateRef = nil, nil
+		},
 	} {
 		d, v, snap, prof, hk := scriptAdmission(t)
 		prof.Scripts = listed
@@ -284,5 +288,21 @@ func TestAdmissionRefusesAScriptOutsideJobMode(t *testing.T) {
 		if adm.script != nil || len(v.triggerList()) != 0 {
 			t.Errorf("%s: admitted script %+v, verifier asked %d time(s)", name, adm.script, len(v.triggerList()))
 		}
+	}
+}
+
+// A profile whose config carries its Job template inline still runs scripts:
+// HasJobTemplate takes either form.
+func TestAdmissionHandsAnInlineTemplatesScriptOn(t *testing.T) {
+	d, _, snap, prof, hk := scriptAdmission(t)
+	prof.JobTemplateRef = nil
+	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
+	snap.Profiles = []lib.DispatchProfile{prof}
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+	adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+	if err != nil || ref != nil || adm.script == nil || *adm.script != prof.Scripts[0] {
+		t.Fatalf("an inline template's script: admitted %+v, refusal %+v, err %v", adm.script, ref, err)
 	}
 }

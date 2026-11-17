@@ -158,7 +158,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		if !ok {
 			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("profile %s allowlists no script %q", prof.Name, trigger.Script)}, nil
 		}
-		if !d.cfg.unattendedFor(prof, tier) || d.jobs == nil || len(prof.JobTemplate) == 0 {
+		if !d.cfg.unattendedFor(prof, tier) || d.jobs == nil || !prof.HasJobTemplate() {
 			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("script %q runs only in Job mode, which profile %s at tier %s doesn't have here", sc.Name, prof.Name, tier)}, nil
 		}
 		script = &sc
