@@ -1520,6 +1520,8 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
             - name: AUDIT_REPORT_STORE_URL
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE
@@ -1583,6 +1585,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
       dnsConfig:
         options:
@@ -1660,6 +1665,10 @@ spec:
                   audience: kubeagents-audit-report-store
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -5453,6 +5462,8 @@ spec:
               value: 6h0m0s
             - name: A2A_DISPATCHER_BUCKETED_GRANTS
               value: "true"
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
           livenessProbe:
             failureThreshold: 6
@@ -5495,6 +5506,9 @@ spec:
             - mountPath: /var/run/kube-agents/task-signing
               name: task-signing-seed
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         fsGroup: 1000
@@ -5521,6 +5535,10 @@ spec:
               - key: task-signing-seed
                 path: seed
             secretName: platformagent-a2a-task-signing-key
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: v1
