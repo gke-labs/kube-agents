@@ -877,10 +877,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		// changeRequested from each delivery), so an earlier pass may have
 		// launched a Job for this task while it carried a permit. That Job
 		// goes before the task is offered to a pool pod, or its pod would wait
-		// for an offer until its deadline, outside every cap. Only a profile
-		// with templates per tier runs such a task on a Job off the
-		// unattended side.
-		if prof.JobTemplatesPerTier() {
+		// for an offer until its deadline, outside every cap. Attempted under
+		// Job mode (the config carries jobLabels) whatever the profile's
+		// template says now; without it the dispatcher has no Jobs Role.
+		if len(snap.JobLabels) > 0 {
 			d.dropUnstartedJob(ctx, log, hk)
 		}
 		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)

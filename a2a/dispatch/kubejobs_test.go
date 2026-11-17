@@ -125,8 +125,12 @@ func TestAKubeJobNeedsATemplate(t *testing.T) {
 func TestAKubeJobIsFoundAgainWithItsCreation(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	created := metav1.NewTime(time.Now().Add(-time.Hour).Truncate(time.Second))
-	kube := fake.NewClientset(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "ns-profiles",
-		Name: JobName("inv", "unattended", lib.SubmitKindTop, "task-1"), CreationTimestamp: created}})
+	existing, err := buildJob(cfg, &cfg.Profiles[0], cfg.Profiles[0].JobTemplate, "unattended", lib.SubmitKindTop, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.CreationTimestamp = created
+	kube := fake.NewClientset(existing)
 	got, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1")
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +159,7 @@ func TestKubeJobsFindsTheJobsPod(t *testing.T) {
 	}
 	pod := func(n string, owner *batchv1.Job, ready bool, phase corev1.PodPhase) *corev1.Pod {
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "ns-profiles", Labels: map[string]string{jobNameLabel: name}},
-			Status: corev1.PodStatus{Phase: phase}}
+			Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-inv-unattended"}, Status: corev1.PodStatus{Phase: phase}}
 		if owner != nil {
 			p.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(owner, batchv1.SchemeGroupVersion.WithKind("Job"))}
 		}

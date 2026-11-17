@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -51,11 +52,16 @@ type KubeJobs struct {
 	// getTemplate reads a DispatchJobTemplate's JSON; getJobTemplate by
 	// default, a stand-in in tests.
 	getTemplate func(ctx context.Context, namespace, name string) ([]byte, error)
+	// launched is each Job this process made or found and checked at Launch,
+	// by name: the ServiceAccount its template runs as, which Pod holds the
+	// Job's pod to. Pod refuses a Job Launch didn't check.
+	mu       sync.Mutex
+	launched map[string]string
 }
 
 // NewKubeJobs returns a JobRunner reading the current config from config.
 func NewKubeJobs(kube kubernetes.Interface, config func() lib.DispatchConfig) *KubeJobs {
-	k := &KubeJobs{kube: kube, config: config}
+	k := &KubeJobs{kube: kube, config: config, launched: map[string]string{}}
 	k.getTemplate = k.getJobTemplate
 	return k
 }
@@ -170,6 +176,49 @@ func validJobKey(profile, tier, kind, taskID string) error {
 	return nil
 }
 
+// ErrJobNotOurs marks a Job under a task's name that isn't the one this
+// dispatcher would have made for it: no dispatcher marker, annotations naming
+// another task, or a pod template running as another ServiceAccount. It is
+// never offered the task; the task stays queued.
+var ErrJobNotOurs = errors.New("the Job under the task's name is not the dispatcher's Job for that task")
+
+// ourJob says whether job is the dispatcher's Job for the task, with a pod
+// template running as sa.
+func ourJob(job *batchv1.Job, profile, tier, kind, taskID, sa string) error {
+	a := job.Annotations
+	switch {
+	case job.Labels[lib.DispatchJobLabel] != "true":
+		return fmt.Errorf("%w: %s has no %s label", ErrJobNotOurs, job.Name, lib.DispatchJobLabel)
+	case a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobKindAnnotation] != kind || a[jobTaskAnnotation] != taskID:
+		return fmt.Errorf("%w: %s is annotated for %q/%q/%q/%q", ErrJobNotOurs, job.Name,
+			a[jobProfileAnnotation], a[jobTierAnnotation], a[jobKindAnnotation], a[jobTaskAnnotation])
+	case sa == "":
+		return fmt.Errorf("%w: %s wasn't launched or checked by this dispatcher", ErrJobNotOurs, job.Name)
+	case job.Spec.Template.Spec.ServiceAccountName != sa:
+		return fmt.Errorf("%w: %s runs as %q, its template as %q", ErrJobNotOurs, job.Name, job.Spec.Template.Spec.ServiceAccountName, sa)
+	}
+	return nil
+}
+
+func (k *KubeJobs) remember(name, sa string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.launched[name] = sa
+}
+
+func (k *KubeJobs) launchedAs(name string) (string, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	sa, ok := k.launched[name]
+	return sa, ok
+}
+
+func (k *KubeJobs) forget(name string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	delete(k.launched, name)
+}
+
 // legacyJobName is the name a dispatcher from before the kind was in it gave
 // the task's Job, its key joined with slashes. Delete removes a Job under it
 // only when the Job's own annotations say it is this task's; to go a release
@@ -213,12 +262,19 @@ func (k *KubeJobs) Launch(ctx context.Context, profile, tier, kind, taskID strin
 	made, err := k.kube.BatchV1().Jobs(cfg.ProfileNamespace).Create(ctx, job, metav1.CreateOptions{})
 	switch {
 	case err == nil:
+		k.remember(job.Name, job.Spec.Template.Spec.ServiceAccountName)
 		return made.CreationTimestamp.Time, nil
 	case apierrors.IsAlreadyExists(err):
 		found, err := k.kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(ctx, job.Name, metav1.GetOptions{})
 		if err != nil {
 			return time.Time{}, fmt.Errorf("read the task's existing Job: %w", err)
 		}
+		// Found by name only: adopted only if it is the Job this task's
+		// would be, so no permit is minted for a pod someone else shaped.
+		if err := ourJob(found, profile, tier, kind, taskID, job.Spec.Template.Spec.ServiceAccountName); err != nil {
+			return time.Time{}, err
+		}
+		k.remember(job.Name, job.Spec.Template.Spec.ServiceAccountName)
 		return found.CreationTimestamp.Time, nil
 	case apierrors.IsForbidden(err) && strings.Contains(err.Error(), jobPolicyName):
 		return time.Time{}, fmt.Errorf("%w: %v", ErrJobRefusedByPolicy, err)
@@ -283,6 +339,13 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, kind, taskID string) 
 	case job.DeletionTimestamp != nil:
 		return "", true, nil
 	}
+	// Read again by name: the Job may have been replaced since Launch
+	// checked it. A Job Launch never checked has no expected ServiceAccount
+	// (""), which ourJob refuses.
+	sa, _ := k.launchedAs(name)
+	if err := ourJob(job, profile, tier, kind, taskID, sa); err != nil {
+		return "", false, err
+	}
 	for _, c := range job.Status.Conditions {
 		// Failed, or already finished: a Job's one pod ran without this
 		// dispatcher's confirm (an abandoned offer it exited on), so it will
@@ -306,6 +369,9 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, kind, taskID string) 
 		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
 			return "", true, nil
 		}
+		if p.Spec.ServiceAccountName != sa {
+			return "", false, fmt.Errorf("%w: pod %s runs as %q, its template as %q", ErrJobNotOurs, p.Name, p.Spec.ServiceAccountName, sa)
+		}
 		if p.DeletionTimestamp == nil && podReady(p) && lib.ValidSubjectToken(p.Name) {
 			return p.Name, false, nil
 		}
@@ -318,6 +384,7 @@ func (k *KubeJobs) Delete(ctx context.Context, profile, tier, kind, taskID strin
 		return err
 	}
 	jobs := k.kube.BatchV1().Jobs(k.config().ProfileNamespace)
+	k.forget(JobName(profile, tier, kind, taskID))
 	err := jobs.Delete(ctx, JobName(profile, tier, kind, taskID),
 		metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationBackground)})
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -341,9 +408,15 @@ func (k *KubeJobs) deleteLegacy(ctx context.Context, profile, tier, kind, taskID
 	if err != nil {
 		return err
 	}
+	// TODO(#TBD-legacy-delete): remove deleteLegacy a release after #5646.
 	a := old.Annotations
-	if a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobTaskAnnotation] != taskID ||
-		(a[jobKindAnnotation] != "" && a[jobKindAnnotation] != kind) {
+	if a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobTaskAnnotation] != taskID {
+		return nil
+	}
+	// An older Job names no kind; a dispatcher from before #5646 ran
+	// top-level tasks on Jobs under that name, and a child's cleanup mustn't
+	// take one.
+	if got := a[jobKindAnnotation]; (got == "" && kind != lib.SubmitKindTop) || (got != "" && got != kind) {
 		return nil
 	}
 	err = jobs.Delete(ctx, old.Name, metav1.DeleteOptions{

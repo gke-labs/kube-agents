@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -26,6 +28,7 @@ func readPermitInstall(concurrency int, pods ...string) *testInstall {
 	ti := oneProfile("tse", concurrency, pods...)
 	ti.update(func(c *lib.DispatchConfig) {
 		c.Profiles[0].JobTemplateRef = &lib.DispatchJobTemplateRef{Hash: "0123456789abcdef", PerTier: true}
+		c.JobLabels = map[string]string{lib.DispatchJobLabel: "true"}
 	})
 	return ti
 }
@@ -250,9 +253,9 @@ func TestEachTierReadsItsOwnParam(t *testing.T) {
 		tier, want string
 	}{
 		{perTier, "unattended", "kube-agents-dispatch-job-profile-tse"},
-		{perTier, "read", "kube-agents-dispatch-job-tier-tse-read"},
+		{perTier, "read", "kube-agents-dispatch-job-tier-tse.read"},
 		{custom, "batch", "kube-agents-dispatch-job-profile-tse"},
-		{custom, "read", "kube-agents-dispatch-job-tier-tse-read"},
+		{custom, "read", "kube-agents-dispatch-job-tier-tse.read"},
 		{legacy, "unattended", "kube-agents-dispatch-job-profile-tse"},
 	} {
 		if got := jobTemplateName(c.prof, c.tier); got != c.want {
@@ -333,25 +336,38 @@ func TestDeleteRemovesOnlyThisTasksLegacyJob(t *testing.T) {
 			Namespace: cfg.ProfileNamespace, UID: "uid-old", Annotations: annotations}}
 	}
 	mine := map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1"}
-	for name, c := range map[string]struct {
+	with := func(kind string) map[string]string {
+		a := map[string]string{jobKindAnnotation: kind}
+		for k, v := range mine {
+			a[k] = v
+		}
+		return a
+	}
+	for _, c := range []struct {
+		name        string
 		annotations map[string]string
+		kind        string
 		deleted     bool
 	}{
-		"this task's, from before the kind":     {mine, true},
-		"this task's, this kind":                {map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1", jobKindAnnotation: lib.SubmitKindTop}, true},
-		"this task id's, another kind":          {map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1", jobKindAnnotation: lib.SubmitKindChild}, false},
-		"another task's under the same name":    {map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-9"}, false},
-		"another profile's under the same name": {map[string]string{jobProfileAnnotation: "x", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1"}, false},
-		"no annotations":                        {nil, false},
+		{"this task's, from before the kind", mine, lib.SubmitKindTop, true},
+		{"this task's, this kind", with(lib.SubmitKindTop), lib.SubmitKindTop, true},
+		{"this task id's, another kind", with(lib.SubmitKindChild), lib.SubmitKindTop, false},
+		// An older Job names no kind and ran a top-level task: a child's
+		// cleanup leaves it.
+		{"a top-level task's from before the kind, for a child's cleanup", mine, lib.SubmitKindChild, false},
+		{"this child's, this kind", with(lib.SubmitKindChild), lib.SubmitKindChild, true},
+		{"another task's under the same name", map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-9"}, lib.SubmitKindTop, false},
+		{"another profile's under the same name", map[string]string{jobProfileAnnotation: "x", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1"}, lib.SubmitKindTop, false},
+		{"no annotations", nil, lib.SubmitKindTop, false},
 	} {
 		kube := fake.NewClientset(legacy(c.annotations))
 		k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
-		if err := k.Delete(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
-			t.Fatalf("%s: %v", name, err)
+		if err := k.Delete(context.Background(), "inv", "unattended", c.kind, "task-1"); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
 		}
 		_, err := kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(context.Background(), legacyJobName("inv", "unattended", "task-1"), metav1.GetOptions{})
 		if gone := apierrors.IsNotFound(err); gone != c.deleted {
-			t.Errorf("%s: deleted %v, want %v (%v)", name, gone, c.deleted, err)
+			t.Errorf("%s: deleted %v, want %v (%v)", c.name, gone, c.deleted, err)
 		}
 	}
 	// None there is no error.
@@ -381,4 +397,135 @@ func TestARefusedReadTierTasksEarlierJobIsDeleted(t *testing.T) {
 		t.Fatalf("terminal %+v, want rejected", ts)
 	}
 	waitFor(t, 5*time.Second, "the earlier pass's Job deleted", func() bool { return jobs.deleted("task-1") })
+}
+
+// A permit-carrying task's Job failing to start at the read tier fails that
+// task, but doesn't count on the read tier's breaker: the breaker guards the
+// warm pool there, so read tasks on the pool keep being served.
+func TestReadTierJobFailuresDontHoldBackThePool(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
+	ti := readPermitInstall(2, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	jobs := newFakeJobs(0)
+	kp, _ := signingKey(t)
+	b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) { d.UseJobs(jobs) })
+	for i := range defaultBreakerThreshold + 1 {
+		id := fmt.Sprintf("change-%d", i)
+		jobs.mu.Lock()
+		jobs.failed[id] = true
+		jobs.mu.Unlock()
+		b.submitChange("tse", "read", lib.SubmitKindTop, id, clusterParams)
+		if ts := b.waitTerminal(id, 10*time.Second); ts.state != lib.StateFailed || !hasReason(ts, ReasonNoWorker) {
+			t.Fatalf("%s terminal %+v, want failed %s", id, ts, ReasonNoWorker)
+		}
+	}
+	b.submitWith("tse", "read", lib.SubmitKindTop, "plain", "cap-ok", clusterParams)
+	if ts := b.waitTerminal("plain", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("a pool read task after failing read-tier Jobs: terminal %+v, want completed", ts)
+	}
+	if !w.startedTask("plain") {
+		t.Error("the pool pod never ran the read task")
+	}
+}
+
+// A Job an earlier pass launched at the read tier is deleted when its task
+// ends at admission even after the profile's template reference is gone:
+// under Job mode cleanup is attempted whatever the reference says now.
+func TestAnUnstartedReadTierJobIsDeletedAfterItsReferenceIsLost(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.JobLabels = map[string]string{lib.DispatchJobLabel: "true"} })
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	jobs := newFakeJobs(0)
+	if _, err := jobs.Launch(context.Background(), "tse", "read", lib.SubmitKindTop, "task-1"); err != nil { // while the profile had a read template
+		t.Fatal(err)
+	}
+	kp, _ := signingKey(t)
+	b.runKeyedWith(ti, kp, 0, &fakeVerifier{refuse: map[string]bool{"cap-ok": true}}, func(d *Dispatcher) { d.UseJobs(jobs) })
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateRejected {
+		t.Fatalf("terminal %+v, want rejected", ts)
+	}
+	waitFor(t, 5*time.Second, "the earlier pass's Job deleted", func() bool { return jobs.deleted("task-1") })
+}
+
+// A Job found under the task's name is used only if it is the dispatcher's
+// Job for that task, with a pod template running as the task's template
+// does: an impostor someone else made under the name is refused at Launch,
+// and a Job swapped in after Launch, or its pod, is refused at Pod, so no
+// permit is minted for a pod the dispatcher didn't shape.
+func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
+	cfg := kubeJobsConfig(t)
+	ctx := context.Background()
+	own := func(t *testing.T) *batchv1.Job {
+		j, err := buildJob(cfg, &cfg.Profiles[0], cfg.Profiles[0].JobTemplate, "unattended", lib.SubmitKindTop, "task-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+	for name, mutate := range map[string]func(*batchv1.Job){
+		"no dispatcher marker":      func(j *batchv1.Job) { delete(j.Labels, lib.DispatchJobLabel) },
+		"another task's annotation": func(j *batchv1.Job) { j.Annotations[jobTaskAnnotation] = "task-9" },
+		"another kind's annotation": func(j *batchv1.Job) { j.Annotations[jobKindAnnotation] = lib.SubmitKindChild },
+		"another ServiceAccount":    func(j *batchv1.Job) { j.Spec.Template.Spec.ServiceAccountName = "agentprofile-inv-admin" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			impostor := own(t)
+			mutate(impostor)
+			k := NewKubeJobs(fake.NewClientset(impostor), func() lib.DispatchConfig { return cfg })
+			if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
+				t.Errorf("Launch over an impostor: %v, want ErrJobNotOurs", err)
+			}
+			if _, _, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
+				t.Errorf("Pod of an impostor never checked: %v, want ErrJobNotOurs", err)
+			}
+		})
+	}
+
+	// A Job this dispatcher never launched or checked is refused at Pod even
+	// if its template names no ServiceAccount to compare.
+	bare := own(t)
+	bare.Spec.Template.Spec.ServiceAccountName = ""
+	kb := NewKubeJobs(fake.NewClientset(bare), func() lib.DispatchConfig { return cfg })
+	if _, _, err := kb.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
+		t.Errorf("Pod of a never-checked Job with no ServiceAccount: %v, want ErrJobNotOurs", err)
+	}
+
+	// Launched and checked, then swapped for an impostor, or holding a pod
+	// that runs as another ServiceAccount: Pod refuses both.
+	kube := fake.NewClientset()
+	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
+		t.Fatal(err)
+	}
+	name := JobName("inv", "unattended", lib.SubmitKindTop, "task-1")
+	job, err := kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "job-pod", Namespace: cfg.ProfileNamespace, Labels: map[string]string{jobNameLabel: name},
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job"))}},
+		Spec:   corev1.PodSpec{ServiceAccountName: "agentprofile-inv-admin"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	if _, err := kube.CoreV1().Pods(cfg.ProfileNamespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); p != "" || !errors.Is(err, ErrJobNotOurs) {
+		t.Errorf("a pod running as another ServiceAccount: %q, %v, want refused", p, err)
+	}
+	// The pod is gone, so only the Job's own check can refuse what follows.
+	if err := kube.CoreV1().Pods(cfg.ProfileNamespace).Delete(ctx, "job-pod", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	job.Annotations[jobTaskAnnotation] = "task-9"
+	if _, err := kube.BatchV1().Jobs(cfg.ProfileNamespace).Update(ctx, job, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
+		t.Errorf("a Job swapped after Launch: %v, want ErrJobNotOurs", err)
+	}
 }
