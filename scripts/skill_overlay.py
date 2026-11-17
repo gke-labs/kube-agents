@@ -19,7 +19,7 @@ Subcommands:
   refresh <skill>            record edits to the generated skill as a patch
   generate <skill>           rebuild the generated skill from the upstream copy and overlay
   check [<skill>...]         verify copies against their locks and generated skills against
-                             copy + overlay, offline
+                             copy + overlay, offline; fail on an unfilled Eval-Case: header
   status                     list skills upstream has moved past, and upstream skills not mirrored
   verify-upstream            compare each copy with google/skills at its locked commit
 
@@ -93,6 +93,11 @@ BINARY_PATCH_MARKER = "GIT binary patch"
 # left out: it is also a Markdown heading underline.
 CONFLICT_MARKER_PREFIXES = ("<<<<<<< ", ">>>>>>> ")
 WHY_PREFIX = "Why:"
+# The header line that names the eval case(s) of the pull request that added the patch, and of a
+# later one that changed what it does. A new patch carries the placeholder until its author
+# fills the line in.
+EVAL_CASE_PREFIX = "Eval-Case:"
+HEADER_PLACEHOLDER = "TODO"
 STATE_FILE = "sync-state.json"
 SERIES_BRANCH = "patches"
 BASE_TAG = "base"
@@ -112,6 +117,7 @@ PATCH_HEADER_TEMPLATE = (
     "\n"
     "Why: TODO, say why this repository needs the change\n"
     "Local-Issue: TODO\n"
+    f"{EVAL_CASE_PREFIX} {HEADER_PLACEHOLDER}\n"
     "Upstream-Issue: none\n"
     "Retire-When: TODO\n"
     "\n"
@@ -329,6 +335,18 @@ def patch_why(path):
         if line.startswith(WHY_PREFIX):
             return line[len(WHY_PREFIX):].strip()
     return ""
+
+
+def eval_case_unfilled(path):
+    """True when the patch has an Eval-Case: line that is empty or still the placeholder.
+
+    A patch with no such line passes: patches written before the line existed carry none.
+    """
+    for line in patch_header(read_exact(path)).splitlines():
+        if line.startswith(EVAL_CASE_PREFIX):
+            value = line[len(EVAL_CASE_PREFIX):].strip()
+            return not value or value.startswith(HEADER_PLACEHOLDER)
+    return False
 
 
 def separator_for(text):
@@ -607,6 +625,12 @@ def cmd_check(skills):
                     + f"\nIf you edited the skill, run `make skills-refresh SKILL={skill}`. If you "
                     f"edited a patch or {APPEND_NAME}, run `make skills-generate SKILL={skill}`."
                 )
+            unfilled = [p.name for p in patches(skill) if eval_case_unfilled(p)]
+            if unfilled:
+                raise OverlayError(
+                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)}: the eval "
+                    f"case id(s) from the pull request's Live validation, or `none (<reason>)`."
+                )
         except OverlayError as e:
             failures.append(str(e))
     for msg in failures:
@@ -740,7 +764,7 @@ def refresh_into_overlay(skill, repo, tmp, target, message):
     header = PATCH_HEADER_TEMPLATE.format(subject=message or DEFAULT_SUBJECT)
     diff = git_diff_text(["show", "--format=", "--no-color", "--binary", "HEAD"], cwd=repo)
     write_exact(overlay_dir(skill) / name, header + strip_index_lines(diff))
-    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why: header")
+    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why: and {EVAL_CASE_PREFIX} headers")
     return edited
 
 
