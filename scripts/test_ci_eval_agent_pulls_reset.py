@@ -548,6 +548,50 @@ class RetryTest(unittest.TestCase):
         self.assertIn(helper.sweep.RETRY_AFTER_DEFAULT_SECONDS, pauses)
         self.assertNotIn(helper.RETRY_DELAYS_SECONDS[0], pauses)
 
+    def test_an_installation_limit_waits_until_its_reset(self):
+        # The shared installation's budget (#6105): a 403 with no Retry-After,
+        # X-RateLimit-Remaining 0 and X-RateLimit-Reset two minutes away waits
+        # until the reset, not the 60 s default twice.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        limited = urllib.error.HTTPError(
+            "https://api.github.com/x", 403, "Forbidden",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"},
+            io.BytesIO(b'{"message":"API rate limit exceeded for installation ID 157029058."}'),
+        )
+        with mock.patch.object(helper, "now", lambda: 1000.0):
+            record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), limited)], github))
+        self.assertEqual(record["closed"], [1])
+        self.assertIn(121.0, pauses)
+
+    def test_a_far_reset_waits_one_slice_at_a_time(self):
+        far = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "9000"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "now", lambda: 1000.0), mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(far), helper.RATE_LIMIT_WAIT_SLICE_SECONDS)
+
+    def test_a_limit_that_outlasts_the_budget_is_named_as_the_limit(self):
+        # Limited on every listing: it waits RATE_LIMIT_BUDGET_SECONDS in all,
+        # then main exits 1 with the limit named, not the token's reach.
+        def limited():
+            return urllib.error.HTTPError(
+                "https://api.github.com/x", 403, "Forbidden", {"X-RateLimit-Remaining": "0"},
+                io.BytesIO(b'{"message":"API rate limit exceeded for installation ID 157029058."}'),
+            )
+        listing = ("GET", f"/repos/{REPO}/pulls")
+        api = self.flaky([(listing, limited()) for _ in range(100)], FakeGitHub())
+        pauses = []
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "record.json"
+            with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", pauses.append), \
+                    mock.patch.dict(os.environ, {helper.TOKEN_ENV: "tok"}), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = helper.main(["--repo", REPO, "--project", PROJECT, "--build", BUILD, "--scope", "lease", "--record", str(out)])
+            record = json.loads(out.read_text())
+        self.assertEqual(rc, 1)
+        self.assertTrue(record["rate_limited"])
+        self.assertIn("rate limit", record["error"])
+        self.assertNotIn("token's reach", err.getvalue())
+        self.assertEqual(sum(pauses), helper.RATE_LIMIT_BUDGET_SECONDS)
+
     def test_a_refusal_is_not_tried_again(self):
         github = FakeGitHub(pulls=[pull(1)])
         record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), _http_error(403))], github))

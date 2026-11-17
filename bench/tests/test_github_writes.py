@@ -1230,3 +1230,18 @@ def test_the_report_reads_the_token_file(env, github, capsys, monkeypatch, tmp_p
     token_file.write_text("", encoding="utf-8")
     assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == github_writes.EXIT_UNREADABLE
     assert f"BENCH_GITHUB_TOKEN_FILE names {token_file}, which was refused" in capsys.readouterr().err
+
+
+def test_a_rate_limited_listing_is_named_as_the_limit_not_a_permission():
+    """#6105: the grader used to report the shared installation's limit as
+    "needs `pull_requests: read`". A rate-limit 403 now says it is a limit; a
+    permission 403 still names the permission."""
+    limited = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "API rate limit exceeded for installation ID 1."}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        limited.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "rate-limited" in str(exc.value)
+    assert "pull_requests: read" not in str(exc.value)
+    refused = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "Resource not accessible by integration"}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        refused.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "pull_requests: read" in str(exc.value)

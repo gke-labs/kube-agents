@@ -101,6 +101,17 @@ describe = sweep.boskos_pool.describe
 # request's fault and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
+# The evals repositories share one App installation, so one hourly REST budget
+# (#6105): when it runs out, every call answers a marked 403 until the reset
+# GitHub names in X-RateLimit-Reset, minutes away. A limited call waits for
+# that reset (or the Retry-After it asks), never more than
+# RATE_LIMIT_WAIT_SLICE_SECONDS at a time and RATE_LIMIT_BUDGET_SECONDS in all
+# for this run, then gives up with RateLimitExhausted: the repository was
+# never reached, which is GitHub's weather, not the run's.
+RATE_LIMIT_BUDGET_SECONDS = 900
+RATE_LIMIT_WAIT_SLICE_SECONDS = 300
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60
+RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
@@ -141,6 +152,33 @@ pause = time.sleep
 ResetError = ledgers.ResetError
 
 
+class RateLimitExhausted(Exception):
+    """GitHub's rate limit outlasted RATE_LIMIT_BUDGET_SECONDS of waiting."""
+
+
+# Seconds of rate-limit waiting this process has spent (limit_wait).
+_rate_limit_waited = 0.0
+now = time.time
+
+
+def limit_wait(exc: urllib.error.HTTPError) -> float:
+    """How long to wait before trying a rate-limited call again: the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
+    default; at most one slice, and at most what is left of the budget. Zero
+    when the budget is spent."""
+    headers = getattr(exc, "headers", None) or {}
+    wait: float = RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    try:
+        wait = float(headers.get(sweep.RETRY_AFTER_HEADER))
+    except (TypeError, ValueError):
+        try:
+            wait = float(headers.get(RATELIMIT_RESET_HEADER)) - now() + 1
+        except (TypeError, ValueError):
+            pass
+    left = RATE_LIMIT_BUDGET_SECONDS - _rate_limit_waited
+    return max(0.0, min(wait, RATE_LIMIT_WAIT_SLICE_SECONDS, left))
+
+
 def transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= RETRYABLE_STATUS_FLOOR
@@ -148,8 +186,12 @@ def transient(exc: BaseException) -> bool:
 
 
 def call(method: str, path: str, token: str, body: dict | None = None):
-    """One GitHub call, tried again after a transient answer or a marked limit."""
-    for delay in (*RETRY_DELAYS_SECONDS, None):
+    """One GitHub call, tried again after a transient answer, and after a
+    marked limit until the limit resets or the rate-limit budget is spent
+    (limit_wait), when it raises RateLimitExhausted."""
+    global _rate_limit_waited
+    delays = list(RETRY_DELAYS_SECONDS)
+    while True:
         try:
             return ledgers.api(method, path, token, body)
         except CALL_FAULTS as exc:
@@ -157,13 +199,21 @@ def call(method: str, path: str, token: str, body: dict | None = None):
             # exception (boskos_pool.error_body), so the answer is the same
             # for the log line and the record afterwards.
             limited = isinstance(exc, urllib.error.HTTPError) and is_rate_limited(exc)
-            if delay is None or not (limited or transient(exc)):
-                raise
             if limited:
-                delay = retry_after(exc)
-            print(f"  {method} {path} answered {describe(exc)}; trying again in {delay}s", file=sys.stderr)
+                delay = limit_wait(exc)
+                if delay <= 0:
+                    raise RateLimitExhausted(
+                        f"GitHub's rate limit on {method} {path} outlasted {RATE_LIMIT_BUDGET_SECONDS}s of "
+                        f"waiting ({describe(exc)}); the evals repositories share one App installation's "
+                        "hourly budget (#6105)"
+                    ) from exc
+                _rate_limit_waited += delay
+            elif transient(exc) and delays:
+                delay = delays.pop(0)
+            else:
+                raise
+            print(f"  {method} {path} answered {describe(exc)}; trying again in {delay:.0f}s", file=sys.stderr)
             pause(delay)
-    raise AssertionError("unreachable")
 
 
 def is_agent_pull_request(pull: dict, repo: str) -> bool:
@@ -317,6 +367,8 @@ def reset(
 ) -> dict:
     """Close, delete, read back. Fills and returns the record; `clean` says
     whether the repository is now what a unit may start on."""
+    global _rate_limit_waited
+    _rate_limit_waited = 0.0  # one rate-limit budget per reset
     stack_paths = planted_stack_files(kcc_cluster)
     if record is None:
         record = new_record(repo, project, build, scope, dry_run)
@@ -479,6 +531,13 @@ def main(argv: list[str] | None = None) -> int:
         record["error"] = str(exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except RateLimitExhausted as exc:
+        # GitHub's shared limit outlasted the wait: named as the limit, not
+        # as the token's reach, and the repository is not clean (#6105).
+        record["error"] = str(exc)
+        record["rate_limited"] = True
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     except limited as exc:
         # GitLab's limit, reported as the GitHub path reports its HTTPError:
         # in the record and on stderr, and the repository is not clean.
