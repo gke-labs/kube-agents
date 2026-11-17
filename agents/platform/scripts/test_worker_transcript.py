@@ -1783,6 +1783,8 @@ class TestSecretReadDetector(unittest.TestCase):
         "echo 'unclosed; oc create token builder",
         "echo 'unclosed; python3 -c print(os.environ)",
         "echo 'unclosed; node -p process.env",
+        "echo 'unclosed; python3 -c print(__import__(\"os\").environ)",
+        "echo 'unclosed; python3 -c from os import environ; print(environ)",
     ]
     # The same words where nothing of the environment is printed.
     NO_TOKEN_OR_ENVIRONMENT_PRINTS = [
@@ -1986,6 +1988,9 @@ class TestSecretReadDetector(unittest.TestCase):
         "echo 'unclosed; aws s3 ls",
         # ... and with a printer path's words and no tool's name
         "echo 'unclosed; the auth token is stale",
+        # ... and with a read of one variable, which the walk's patterns serve
+        "echo 'unclosed; python3 -c print(os.environ[\"HOME\"])",
+        "echo 'unclosed; node -p process.env.HOME",
     ]
 
     def test_a_token_print_or_an_environment_dump_is_withheld(self):
@@ -2036,6 +2041,8 @@ class TestSecretReadDetector(unittest.TestCase):
         self.assertFalse(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "git config token"))
         self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth token)"'))
         self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth status)"'))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + "\"$(python3 -c 'from os import environ; print(environ)')\""))
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(node -p process.env.HOME)"'))
         # A script word nested past the depth limit is not read, and withholds.
         nested = "sh<<<x"
         self.assertFalse(worker_transcript.command_reads_a_secret("env=1 " + nested))

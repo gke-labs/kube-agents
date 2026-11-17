@@ -608,8 +608,9 @@ SECRET_READ_COMMAND_RE = re.compile(
 # is read line by line; one such line, such text of many lines, a long
 # substitution and a line of many substitutions withhold when a dump starts a
 # line or a command, or when a `gcloud` token printer, another tool's name
-# with its printer path, or a language's environment name stands anywhere
-# (`UNSPLIT_LINE_RE`, `UNSPLIT_PRINTER_RES`). A command that costs more than
+# with its printer path, or a language's use of its whole environment (by
+# the word walk's own patterns) stands anywhere (`_unsplit_text_prints`). A
+# command that costs more than
 # `MAX_READ_STEPS` to walk withholds when any of its words names a dump word,
 # `gcloud`, another tool with a token printer or an interpreter
 # (`WALK_LIMIT_COMMAND_WORDS`), and a call past its read budget
@@ -866,7 +867,6 @@ UNSPLIT_LINE_RE = re.compile(
     r"(?:^|[\n;&|])[ \t]*" + _UNSPLIT_DUMP + r"(?=[\n;|&<>#]|$)"
     r"|\$\([ \t]*" + _UNSPLIT_DUMP + r"(?=[;|&<>)])"
     r"|(?<![\w-])(?:" + "|".join(sorted(GCLOUD_TOKEN_PRINTERS)) + r")(?![\w-])"
-    r"|(?<!\w)os\.environ|(?<!\w)process\.env\b"
 )
 
 
@@ -2296,7 +2296,10 @@ def _unsplit_text_prints(text: str) -> bool:
     """Whether text the rule cannot read as words holds a dump, a token printer or an environment name (see `UNSPLIT_LINE_RE`)."""
     if UNSPLIT_LINE_RE.search(text):
         return True
-    return any(tool_re.search(text) and path_re.search(text) for tool_re, path_re in UNSPLIT_PRINTER_RES)
+    if any(tool_re.search(text) and path_re.search(text) for tool_re, path_re in UNSPLIT_PRINTER_RES):
+        return True
+    # The same patterns as the word walk's, so that the two cannot know different spellings.
+    return _python_code_prints_environment(text) or _code_prints_environment(text, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
 
 
 def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) -> bool:
