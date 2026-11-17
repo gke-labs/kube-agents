@@ -113,9 +113,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -300,9 +300,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -480,9 +480,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -705,9 +705,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [

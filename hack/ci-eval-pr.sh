@@ -434,8 +434,13 @@ readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
 readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
 # What a unit's lock deadline allows past its delegation timeout, for the
-# stack, the verifier and the state writes around the run.
-readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
+# stack, the verifier and the state writes around the run: 600 s, plus the
+# GitHub rate-limit waits the unit may spend while it holds the lock (#6105),
+# the pull-request reset's (hack/ci_reset_agent_pulls.py
+# RATE_LIMIT_BUDGET_SECONDS, 900) and the grader's
+# (bench/kube_agents_bench/verifiers.py _FORGE_RATE_LIMIT_BUDGET_SEC, 600).
+# scripts/test_ci_eval_agent_pulls_reset.py keeps it at least that sum.
+readonly UNIT_LOCK_ALLOWANCE_SECONDS=2100
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
 # applied: oobe-first-run-audits' own_wait plus its chain_wait
 # (bench/tf/prebuilt/oobe-first-run-audits/main.tf). The stack runs one wait
