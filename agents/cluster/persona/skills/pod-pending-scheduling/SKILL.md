@@ -60,7 +60,7 @@ On Autopilot, a ComputeClass the pod selects that cannot be provisioned shows in
 A repeated `NotTriggerScaleUp` event with the message `Pod didn't trigger scale-up:` and no reason after the colon can be a ComputeClass pre-filter skip: the Cluster Autoscaler does not scale up a pool that has a `cloud.google.com/compute-class` label for a pod that does not name that class. Rule it out before you stop at `Insufficient cpu` or propose a larger pool. It is the likely cause when all of these are true:
 
 - The pod names no ComputeClass: `cloud.google.com/compute-class` is not in its `nodeSelector` and not in a required `nodeAffinity` term. Both count as naming the class.
-- The namespace has no `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset` label.
+- A default class on the namespace (the label `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset`) counts only when the pod's `nodeSelector` shows the class: GKE adds it to pods that are created after the label. A label that was set after the pod was created does not rule the skip out.
 - Each node pool with autoscaling on has the class label in `config.labels`, and has room to grow. `autoscaling.maxNodeCount` is for each zone: compare the pool's node count with `autoscaling.totalMaxNodeCount` when it is set, else with `maxNodeCount` times the number of the pool's zones (`locations`).
 - The event is repeated. One event with no reason is not enough: the autoscaler can write one before it gives a reason, such as `1 max node group size reached`.
 
@@ -68,7 +68,7 @@ Then:
 
 - State the version (`currentMasterVersion`). The skip was seen on GKE 1.35.8 and was not seen on GKE 1.36.4. On another version, say that it is not confirmed there.
 - Report the cause as likely. These steps do not read the autoscaler's visibility log or a cluster default class (a ComputeClass with the name `default`): name both as the reads that confirm it.
-- Give `cloud.google.com/compute-class: <name>` in the pod template's `nodeSelector` as the patch. A namespace default-class label is the other way; it applies to new pods only, and it was not tested with this cause.
+- Give `cloud.google.com/compute-class: <name>` in the pod template's `nodeSelector` as the patch. A namespace default-class label is the other way; it applies to new pods only, so pods that were Pending before the label must be created again.
 - Do not call it a capacity shortage, and do not propose a larger pool or lower requests.
 
 # Rules
