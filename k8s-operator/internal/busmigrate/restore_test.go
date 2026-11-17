@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -106,6 +107,14 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
+			// As the migration Job does (cli.go): a restore that stalled
+			// mid-stream (a chunk with no responder) leaves its name held,
+			// and every later attempt is refused 10130 until it is freed.
+			if isRestoreNameInUse(err) {
+				if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, n), nil, nil); derr != nil && !isStreamNotFound(derr) {
+					t.Logf("restore %s: freeing the name: %v", n, derr)
+				}
+			}
 			time.Sleep(time.Second)
 		}
 		if err != nil {

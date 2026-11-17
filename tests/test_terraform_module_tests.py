@@ -49,6 +49,7 @@ import os
 import pathlib
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -220,6 +221,18 @@ _TEST_FILE_JSON_SUFFIX = ".tftest.json"
 #: The job that initialises every root on the floor, and where the floor is.
 _FLOOR_WORKFLOW, _FLOOR_JOB, _FLOOR_MATRIX_KEY = "validate.yml", "terraform-floor", "terraform"
 _MIN_VERSIONS_SCRIPT = _REPO_ROOT / "scripts" / "installer" / "min_versions.sh"
+_FLOOR_PLAN_COMMAND, _FLOOR_PLAN_DIRECTORY = "terraform plan", "terraform/examples/full-install"
+#: The flag that keeps the plan off the network: the cert-manager release is
+#: the one resource whose plan fetches a chart.
+_FLOOR_PLAN_OFFLINE_FLAG = "-var=enable_cert_manager=false"
+#: Stands in for terraform under the plan step: refuses anything but a plan
+#: that keeps off the network, and exits with the status the test asked for.
+_FLOOR_PLAN_STUB = """#!/bin/sh
+[ "$1" = plan ] || { echo "unexpected: terraform $*" >&2; exit 2; }
+case " $* " in *" %(offline)s "*) ;; *) echo "plan would fetch a chart: $*" >&2; exit 3 ;; esac
+echo plan >> "%(calls)s"
+exit %(status)d
+"""
 _MIN_TERRAFORM_ASSIGNMENT = r'^MIN_TERRAFORM_VERSION="([0-9.]+)"$'
 #: Where the suites live, the Makefile's TERRAFORM_TEST_DIR; not Terraform's
 #: default, which `terraform init` parses from 1.6 on.
@@ -756,12 +769,14 @@ def _unmocked(text: str, providers, name: str = _TEST_FILE_SUFFIXES[0]) -> list:
 
 
 class TerraformFloorJobTest(unittest.TestCase):
-    """validate.yml's terraform-floor job starts at the installer's floor.
+    """validate.yml's terraform-floor job starts at the installer's floor and plans.
 
     Three places carry the floor: the roots' `~> 1.5`, MIN_TERRAFORM_VERSION
     in the installer, and the job's first matrix entry. The job is what tests
     the other two, so a floor raised in the installer and not in the job
-    would leave the new floor untested."""
+    would leave the new floor untested. Its plan step is the only place a
+    validation that fails below Terraform 1.12 shows up, so it must run, and
+    its failure must fail the job."""
 
     def test_the_first_matrix_entry_is_the_installer_floor(self):
         text = _MIN_VERSIONS_SCRIPT.read_text()
@@ -770,6 +785,52 @@ class TerraformFloorJobTest(unittest.TestCase):
         workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / _FLOOR_WORKFLOW).read_text())
         matrix = workflow["jobs"][_FLOOR_JOB]["strategy"]["matrix"][_FLOOR_MATRIX_KEY]
         self.assertEqual(matrix[0], match.group(1), f"{_FLOOR_JOB}'s first leg must be the floor the installer checks")
+
+    def _plan_step(self):
+        workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / _FLOOR_WORKFLOW).read_text())
+        job = workflow["jobs"][_FLOOR_JOB]
+        plans = [
+            step for step in job["steps"]
+            if _FLOOR_PLAN_COMMAND in str(step.get("run", "")) and step.get("working-directory") == _FLOOR_PLAN_DIRECTORY
+        ]
+        self.assertEqual(len(plans), 1, f"{_FLOOR_JOB} must run `{_FLOOR_PLAN_COMMAND}` in {_FLOOR_PLAN_DIRECTORY} exactly once")
+        return job, plans[0]
+
+    def _run_plan_step(self, status):
+        """The step's script under `bash -e` with a stub terraform whose plan
+        exits with `status`; returns (exit code, plan calls)."""
+        _job, step = self._plan_step()
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = pathlib.Path(scratch)
+            calls = scratch / "calls"
+            calls.write_text("")
+            stub = scratch / "terraform"
+            stub.write_text(_FLOOR_PLAN_STUB % {"calls": calls, "status": status, "offline": _FLOOR_PLAN_OFFLINE_FLAG})
+            stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+            script = scratch / "step.sh"
+            script.write_text(step["run"])
+            env = dict(os.environ, PATH=f"{scratch}{os.pathsep}{os.environ.get('PATH', '')}")
+            result = subprocess.run(["bash", "-e", str(script)], cwd=scratch, env=env, capture_output=True, text=True, timeout=_MAKE_TIMEOUT_SECONDS)
+            return result.returncode, len(calls.read_text().split())
+
+    def test_the_job_plans_the_composition_unconditionally(self):
+        # validate evaluates no variable validation and no precondition, and
+        # Terraform below 1.12 evaluates both operands of || and &&, so only a
+        # plan on the floor sees a check whose right operand fails there.
+        job, step = self._plan_step()
+        for scope, where in ((step, "step"), (job, "job")):
+            self.assertNotIn("if", scope, f"the plan's {where} carries an `if:`")
+            self.assertFalse(scope.get("continue-on-error"), f"the plan's {where} carries `continue-on-error`")
+
+    def test_a_failing_plan_fails_the_step_once_and_a_passing_one_passes(self):
+        # Run, not read: an `|| true` or a swallowed status anywhere in the
+        # step would leave the first assertion green. The plan touches no
+        # network, so a failure is a verdict and is not retried; the stub
+        # refuses a plan that would fetch the cert-manager chart.
+        code, plans = self._run_plan_step(status=1)
+        self.assertNotEqual(code, 0, "a failing plan must fail the step")
+        self.assertEqual(plans, 1, "a failing plan is a verdict: run once, not retried")
+        self.assertEqual(self._run_plan_step(status=0), (0, 1), "a passing plan passes the step, run once")
 
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):

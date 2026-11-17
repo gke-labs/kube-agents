@@ -17,7 +17,9 @@ The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gatew
 - **Control-plane egress** — the Kubernetes API server, at the endpoints the operator discovers.
 - **External egress** — HTTPS (`443`) to `0.0.0.0/0` minus the private ranges, unless FQDN filtering is on.
 
-[Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for the full rule set and why each peer is there. `spec.networkPolicy.enabled: false` stops policy generation and deletes the policies the operator manages; [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for that field.
+The policy carries one more ingress rule, which renders with the A2A stack on every install: the credential broker's Pods, and nobody else, to the audit-report store listener on `8700`.
+
+[Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for the full rule set and why each peer is there. `spec.networkPolicy.enabled: false` stops policy generation and deletes the policies the operator manages, the store's rule with the gateway policy. An install's own policies should then also admit TCP `8700` to the agent Pod from the credential broker's Pods alone. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for that field.
 
 ### GKE Dataplane V2 & FQDN Network Policies
 

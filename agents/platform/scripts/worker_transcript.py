@@ -216,7 +216,15 @@ JSON_OBJECT_CLOSE = "}"
 YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
 YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
 JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+# A `"key": "value"` pair (groups 1 to 3; a value the block body cuts short
+# ends at the body's end), or a string that opens no pair, up to its closing
+# quote or to where it stops when it does not close (no group). Without the
+# second branch such a string was read again from each escaped quote in it,
+# which costs quadratic time; each of those reads ends where the first one
+# ended and meets the same text after it, so none of them finds a pair. A
+# match with no group 1 is left as it is, and the next read starts at the
+# closing quote, as before.
+JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)|"(?:[^"\\]|\\.)*')
 URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
@@ -826,18 +834,51 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
     # `apiVersion`. A `stringData` object is a Secret's wherever it sits. A
     # log line's or an API envelope's `data` is kept, whatever an earlier
     # line said.
+    # The nearest opener line before a block and the first marker at or after
+    # that line are followed with two iterators over the text, each read once.
+    # Before, the opener line was looked for again from the text's start for
+    # each block (quadratic on JSON lines), and the marker from the opener
+    # line (quadratic on many blocks with no opener line before them). Two
+    # facts make one read enough: `re.sub` calls `_mask_json_block` for the
+    # blocks in the text's order, so both places only move forward; and two
+    # marker matches never overlap (a marker is a quoted key, blanks and a
+    # colon), so the first marker at or after the opener line is the one a
+    # search from there finds, and when it ends after the block's start, no
+    # marker stands between the two.
+    openers = JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined)
+    markers = JSON_MANIFEST_MARKER_RE.finditer(joined)
+    next_opener = next(openers, None)
+    document_start = 0
+    next_marker = next(markers, None)
+
+    def _mask_json_pair(pair: "re.Match[str]") -> str:
+        return pair.group(1) + REDACTED_SECRET_MARKER + pair.group(3)
+
     def _mask_json_block(m: "re.Match[str]") -> str:
+        nonlocal next_opener, document_start, next_marker
         if JSON_STRING_DATA_KEY_QUOTED not in m.group(1):
-            document_start = 0
-            for opener in JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined, 0, m.start() + 1):
-                document_start = opener.start()
-            if not JSON_MANIFEST_MARKER_RE.search(joined, document_start, m.start()):
+            # An opener line counts when its `{` stands before the block.
+            while next_opener is not None and next_opener.end() <= m.start() + 1:
+                document_start = next_opener.start()
+                next_opener = next(openers, None)
+            while next_marker is not None and next_marker.start() < document_start:
+                next_marker = next(markers, None)
+            if next_marker is None or next_marker.end() > m.start():
                 return m.group(0)
-        return (
-            m.group(1)
-            + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED_SECRET_MARKER + p.group(3), m.group(2))
-            + m.group(3)
-        )
+        # `_mask_json_pair` is called for a pair only, as the pattern's `sub`
+        # called its function before: a call for each string that opens no
+        # pair would be one Python frame more than before at that place, and
+        # a deeply nested step would reach the recursion limit sooner.
+        body = m.group(2)
+        pieces: list[str] = []
+        done = 0
+        for pair in JSON_PAIR_RE.finditer(body):
+            if pair.group(1) is not None:
+                pieces.append(body[done : pair.start()])
+                pieces.append(_mask_json_pair(pair))
+                done = pair.end()
+        pieces.append(body[done:])
+        return m.group(1) + "".join(pieces) + m.group(3)
 
     return JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
 
