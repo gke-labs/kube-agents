@@ -274,6 +274,12 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # as the task is active -- what the real gateway answers for a task an
     # executor took. "" is a stream with no event.
     executor_states: list[str]
+    # Entries the stub appends at the start of the first probed read after
+    # finish_after_active_reads reads of the active task, so a test can
+    # finish the task after the harness has seen given states, whatever the
+    # runner's speed. 0 leaves the entries alone.
+    on_finish: list[dict[str, Any]]
+    finish_after_active_reads: int = 0
     probed_reads: int = 0
     active_reads: int = 0
     # Overrides on the probe. probe_active None derives it: active until the
@@ -364,6 +370,13 @@ class _StubGatewayServer(ThreadingHTTPServer):
 
     def probe_report(self, task: str = "", chain: bool = False) -> dict[str, Any]:
         self.probed_reads += 1
+        if (
+            self.finish_after_active_reads
+            and self.active_reads >= self.finish_after_active_reads
+            and self.on_finish
+        ):
+            self.entries = self.entries + self.on_finish
+            self.on_finish = []
         finished = any(
             e["kind"] == inject.ENTRY_TERMINAL and e.get("taskId") == self.task_id
             for e in self.entries
@@ -445,6 +458,7 @@ def stub_gateway(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubGatewayServe
     server.calls = []
     server.on_cancel = []
     server.executor_states = []
+    server.on_finish = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
@@ -717,18 +731,15 @@ def test_the_record_carries_the_lifecycle_as_status_events(
     transport uses, and the final one is what rung 3 accepts in place of a
     token count. Tokens stay null (the stub reports no usage); latency is the harness's."""
     stub_gateway.executor_states = ["submitted", "working"]
-    # Let two reads see the task running before the terminal appears.
     stub_gateway.entries = running_transcript(stub_gateway.task_id)
-
-    def finish() -> None:
-        time.sleep(0.3)
-        stub_gateway.entries = stub_gateway.entries + [
-            entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
-            entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
-                  source=inject.TERMINAL_SOURCE_EXECUTOR),
-        ]
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Two reads see the task running before the terminal appears. Counted in
+    # reads, not seconds: a timer lost the race on a slow runner (#6212).
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = [
+        entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
+        entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
+              source=inject.TERMINAL_SOURCE_EXECUTOR),
+    ]
     result = KubeAgentsHarness().run("watch it")
 
     assert result.output == "all quiet"
