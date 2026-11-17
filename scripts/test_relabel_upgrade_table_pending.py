@@ -91,6 +91,42 @@ class RelabelUpgradeTablePendingTest(unittest.TestCase):
         self.assertIn("left pending:", err)
         self.assertIn("| pending | a cherry-picked change | x |", page(self.repo))
 
+    def test_relabelled_rows_go_newest_first_with_pending_on_top(self):
+        # Added in an order that, relabelled in place, would put 0.11.0 between two 0.10.0 rows and
+        # below the first, with a row still pending below them (#5991). 0.10.0 and 0.11.0 sort above
+        # 0.9.0 by number, not by string, and the two 0.10.0 rows keep their order.
+        self.repo.commit("feat: first", row=row("pending", "a first change"))
+        self.repo.commit("feat: second", row=row("pending", "a second change"))
+        self.repo.tag("0.10.0")
+        self.repo.commit("feat: newer", row=row("pending", "a newer change"))
+        self.repo.tag("0.11.0")
+        self.repo.commit("feat: not yet", row=row("pending", "an unshipped change"))
+        self.repo.rows = [row("pending", "a first change"), row("pending", "a newer change"),
+                          row("pending", "a second change"), row("pending", "an unshipped change"),
+                          row("0.9.0", "an old change")]
+        self.repo.write_page()
+        self.repo.commit("docs: reorder", code=False)
+        code, out, err = relabel(self.repo)
+        self.assertEqual((code, err), (0, ""))
+        table = [line for line in page(self.repo).splitlines() if line.startswith("| ") and "| x |" in line]
+        self.assertEqual([line.split("|")[2].strip() for line in table],
+                         ["an unshipped change", "a newer change", "a first change", "a second change", "an old change"])
+        self.assertEqual([line.split("|")[1].strip() for line in table], ["pending", "0.11.0", "0.10.0", "0.10.0", "0.9.0"])
+        self.repo.commit("docs: relabel", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_the_sort_moves_only_the_tables_rows(self):
+        # Another table above it on the page, with a newer version row the whole-page rows would sort into
+        # the breaking-changes table.
+        self.repo.prose = "## Versions\n\n| Version | Supported |\n| --- | --- |\n| 0.40.0 | yes |\n\n"
+        self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
+        self.repo.tag("1.0.0")
+        code, out, err = relabel(self.repo)
+        self.assertEqual((code, out, err), (0, "1.0.0\ta shipped change\n", ""))
+        text = page(self.repo)
+        self.assertIn("| --- | --- |\n| 0.40.0 | yes |\n", text)
+        self.assertLess(text.index("| 0.40.0 | yes |"), text.index("### Breaking changes"))
+
     def test_a_shallow_clone_is_refused(self):
         self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
         shallow = Path(self.tmp.name) / "shallow"

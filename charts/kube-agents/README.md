@@ -996,12 +996,18 @@ is canonical for the behaviour.
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
-`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+`platformAgent.harness.driftDetector`, `platformAgent.harness.universeDomain`, and
+`platformAgent.deployment.availability`
 expose the remaining PlatformAgent CR fields, so a chart install can reach every
 field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
-means zero rather than unset.
+means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
+`helm upgrade` on an install whose served `PlatformAgent` CRD predates
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+to a domain other than `googleapis.com`, the chart also sets
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
+renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
@@ -1431,7 +1437,8 @@ pods with the surge pods each one's rollout can add, from its `maxSurge` (which 
 and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`, and instead renders
 the same count in a ConfigMap, `a2a-quota-chart-pods`, in the release namespace, which the
 operator reads for one written by hand there. The operator reads it from its own namespace only. For a
-hand-written CR in any other namespace, such as beside a release with `operator.enabled=false`, it counts the chart's
+hand-written CR in any other namespace, such as beside a release with `operator.enabled=false` (a CR the
+operator's validating webhook, where it is enabled, refuses on create), it counts the chart's
 Deployments and StatefulSets there (those labelled `app.kubernetes.io/managed-by: Helm` and
 `app.kubernetes.io/part-of: kube-agents`) at their replicas and rollout surge pods, as the chart does. An annotation on
 the CR still wins. A count past the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
@@ -1572,14 +1579,14 @@ limit. A cluster with bursting admits the manifest as rendered.
 (GKE Support Agent — Customer-Side Technical Solutions Engineer)
 (`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
 `profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
-controlling its `AgentProfile` spec. When bound, the operator passes
+controlling its `AgentProfile` spec. Its persona is the `persona-tse` image,
+built from `agents/tse/persona`, which a profile worker pod mounts at
+`/persona`; like the cluster profile below, it takes its target per task through
+the `project`, `cluster` and `location` parameters, fixed in the persona's
+order. When bound, the operator also passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
-scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
-Its default persona image is still a placeholder with no persona payload, and the
-profile dispatcher, on by default, gives every bound profile a warm worker. So until
-tse ships a real persona image, enabling `profiles.tse` leaves a tse warm pod
-crash-looping at its persona step. Handing work to tse through Kanban still works,
-since that runs in the scaffolded profile, not in the worker.
+scaffolds the Hermes profile `/opt/data/profiles/tse` from `/opt/tse-template`
+on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the

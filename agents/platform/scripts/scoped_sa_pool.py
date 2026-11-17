@@ -344,16 +344,27 @@ def mint_impersonated_token(service_account: str, lifetime_seconds: int) -> tupl
             " which this deployment deliberately does not enable"
         )
 
+    import credential_proxy_client
     import google.auth
+    import wif_credentials
     from google.auth import impersonated_credentials
     from google.auth.transport.requests import Request
 
     source, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+    domain = credential_proxy_client.google_universe_domain()
+    extra_kwargs: dict[str, str] = {}
+    if domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
+        extra_kwargs["iam_endpoint_override"] = (
+            wif_credentials.IMPERSONATION_URL_TEMPLATE.format(
+                universe_domain=domain, email=service_account
+            )
+        )
     credentials = impersonated_credentials.Credentials(
         source_credentials=source,
         target_principal=service_account,
         target_scopes=[CLOUD_PLATFORM_SCOPE],
         lifetime=lifetime_seconds,
+        **extra_kwargs,
     )
     credentials.refresh(Request())
     if not credentials.token:
