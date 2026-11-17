@@ -1107,6 +1107,23 @@ class BrowserTest(unittest.TestCase):
         run_page = dom_text(out / "run.html", query="build=2097282860221206528")
         self.assertIn("Grading cannot read GitHub", run_page)
 
+    def test_a_red_only_the_forge_safeguard_explains_is_not_the_prs(self):
+        safeguard = "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied"
+        data = json.loads(json.dumps(self.data))
+        hit = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        hit["result"] = "FAILURE"
+        for t in hit["tasks"]:
+            t["reps"] = [rep if rep.get("result") == "pass" else dict(rep, result="fail", reason=safeguard) for rep in t.get("reps") or []]
+            if any(rep["result"] == "fail" for rep in t["reps"]):
+                t["result"] = "fail"
+        base = dom_text(render_to(pathlib.Path(self.tmp.name) / "forge-red-base", self.data, health=health_doc("GREEN")) / "index.html")
+        out = render_to(pathlib.Path(self.tmp.name) / "forge-red", data, health=health_doc("GREEN"))
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("a catastrophic safeguard could not read GitHub", run_page)
+        self.assertNotIn("Fix the PR", run_page)
+        own = re.compile(r"(\d+) look like the PR")
+        self.assertEqual(own.search(dom_text(out / "index.html")).group(1), own.search(base).group(1), "not counted as PR-caused")
+
     def test_a_deadline_kill_outage_has_its_own_brief_and_banner(self):
         # #1894: runs Prow killed at the job deadline with no verdict.
         health = health_doc(

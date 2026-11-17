@@ -956,6 +956,7 @@ function runsListHtml(inWindow, inc, title) {
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
+    else if (run.cls === "forge-unavailable") note = '<span class="chip inf">safeguard could not read GitHub</span>';
     else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';
     const stormChip = (run.storm_reps || 0) >= 5 ? `<span class="chip inf">${run.storm_reps} reps lost</span>` : "";
     const ceilingChip = (run.ceiling_reps || 0) >= 5 ? `<span class="chip inf">${run.ceiling_reps} reps at the delegation ceiling</span>` : "";
@@ -975,7 +976,8 @@ function numbers(sinceMs, untilMs) {
   const done = full.filter(concluded);
   const green = done.filter(isGreen);
   const reds = done.length - green.length;
-  const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
+  // A red only the forge safeguard explains (classify.py's run-level forge class) is the gate's, not the PR's.
+  const own = done.filter((r) => !isGreen(r) && r.verdict === "red" && r.cls !== "forge-unavailable").length;
   // Named inside the gate's reds, where health.py's infra_reds (the daily
   // digest's "N infra") also counts them: its pr_caused_reds never takes a
   // not-evaluated run, collapsed gate case or not, so the two surfaces agree
@@ -1338,6 +1340,9 @@ function whatToDoHtml(run) {
     items.push("<li><b>Nothing right now.</b> Retesting before the gate is healthy will fail the same way.</li>");
     items.push("<li>Run <code>/retest</code> once the brief says healthy again (the Chat space announces it).</li>");
     items.push('<li>If a case here were marked <span class="tag yours">only your PR</span>, the fix would be on you: the transcript usually names the problem.</li>');
+  } else if (run.cls === "forge-unavailable") {
+    items.push(runDoHtml(run.do));
+    items.push("<li>The run is red because a catastrophic safeguard could not read GitHub, not because a check failed; nothing here is about your change.</li>");
   } else {
     const yours = (run.cases || []).filter((c) => c.cls === "only-this-pr").length;
     items.push(`<li><b>Fix the PR.</b> ${yours ? "Retesting won't change this: the case passes for everyone else." : "Nothing on other PRs matches the unexplained failure, so treat it as yours until the transcript says otherwise."}</li>`);
