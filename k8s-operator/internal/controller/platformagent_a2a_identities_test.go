@@ -625,14 +625,16 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 //     directions. That path is the $SYS exemption working as intended and is
 //     why the check below is on the identity table rather than on the block.
 //
-//  2. CALLOUT principals. renderA2AAuthMap copies id.publish and id.subscribe
-//     into a2aAuthMapGrants, which has no deny field of any spelling. A deny on
-//     a callout identity is dropped before the JWT is minted, unconditionally,
-//     whether or not an allow sits beside it.
+//  2. CALLOUT principals. Since #5301 renderA2AAuthMap carries a callout
+//     identity's denies into its map grants, and the callout writes them into
+//     the minted JWT. But it refuses an entry whose allow side is empty
+//     whatever it denies (the server reads an empty allow as unrestricted), so
+//     a deny without an allow beside it fails the whole map, which is louder
+//     but still not what the author meant.
 //
 // Neither is live today: the deny lists in the table (gateway, bridge, web,
-// console) sit on static principals with allows in the same direction, which
-// is the case that renders correctly. The point is that nothing stops the next
+// console) sit on principals with allows in the same direction, which is the
+// case that renders correctly. The point is that nothing stops the next
 // one. Every deny in this table is an operator-authored constant --
 // capDenyPublish, capDenySubscribe, and web's and console's literals -- so this
 // test sees all of them, which is what makes a test the right place for the
@@ -678,10 +680,9 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 			if len(d.deny) == 0 {
 				continue
 			}
-			if id.auth == a2aAuthCallout {
-				t.Errorf("callout principal %q carries a %s deny %v: renderA2AAuthMap copies only the "+
-					"allow lists into a2aAuthMapGrants, so this never reaches the minted JWT and the "+
-					"principal is granted the allow list unsubtracted", id.user, d.kind, d.deny)
+			if id.auth == a2aAuthCallout && len(d.allow) == 0 {
+				t.Errorf("callout principal %q carries a %s deny %v with no %s allow: the callout refuses "+
+					"an entry with an empty allow side, so this fails the whole map", id.user, d.kind, d.deny, d.kind)
 				continue
 			}
 			if len(d.allow) == 0 {
