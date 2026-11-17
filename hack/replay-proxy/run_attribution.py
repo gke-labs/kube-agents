@@ -42,7 +42,8 @@ Decisions, per logged request:
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
 
 A saved alternate (one distinct answer to one request) is decided by every
-storable line that gave that answer to that request, recorded or not: it
+storable line whose logged `answer_hash`, the hash of the answer as stored, is
+the alternate's name, recorded or not: it
 passes when any of them is attributed to runs that all passed, since a passing
 run produced that very answer, even when a failing run gave it first and saved
 it (Attribution.decide_alternate). An answer only failing runs gave never
@@ -290,6 +291,9 @@ class Line:
     prior_answer: Optional[Tuple[str, ...]] = None
     # Whether record mode would have saved this line's answer (no unstorable reason).
     storable: bool = False
+    # The hash of the answer as record mode stores it (the proxy's answer_hash):
+    # the name of the alternate it saved or would have saved.
+    answer_hash: str = ""
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -308,6 +312,7 @@ class Line:
             answer_variant=_pair(entry.get(F.ANSWER_VARIANT)),
             prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
             storable=entry.get(F.UNSTORABLE) == [],
+            answer_hash=str(entry.get(F.ANSWER_HASH) or ""),
         )
 
 
@@ -553,7 +558,7 @@ class Attribution:
         return decision
 
     def decide_alternate(self, producers: List[Line]) -> Decision:
-        """The decision for one alternate, from every line that produced it (same request, same answer).
+        """The decision for one alternate, from every line that produced it (same request, same answer_hash).
 
         Record mode saves an answer once, so of several runs that gave the same
         answer only the first line says `recorded`; the later ones still

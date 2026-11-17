@@ -190,11 +190,31 @@ class SeveralAnswersTest(SlotCacheCase):
         self.assertEqual(first["fingerprint"], second["fingerprint"])
         self.assertEqual((first["recorded"], second["recorded"], again["recorded"]), (True, True, False),
                          "a different answer is saved; the same answer again is not")
-        self.assertEqual(again["answer_variant"], first["answer_variant"],
+        self.assertEqual((again["answer_variant"], again["answer_hash"]), (first["answer_variant"], first["answer_hash"]),
                          "an unsaved line still logs which answer it got, so the publisher can count its run")
         names = [name for name, _ in self.saved(first["fingerprint"])]
-        self.assertEqual(names, sorted([first["answer_variant"][1], second["answer_variant"][1]]))
+        self.assertEqual(names, sorted([first["answer_hash"], second["answer_hash"]]))
         self.assertEqual(sorted(self.contents(first["fingerprint"])), sorted([self.LOOKING["content"], self.ON_IT["content"]]))
+
+    def test_answers_whose_identity_collides_but_whose_stored_text_differs_get_files_of_their_own(self):
+        # answer_variant's identity renames values the request never held (a
+        # keyed number, a pid), so these pairs share it; what is stored and
+        # served differs, so each must be its own alternate.
+        card = {"model": "m", "messages": [{"role": "user", "content": "Show the latest card."}]}
+        pod = {"model": "m", "messages": [{"role": "user", "content": "Why is pod web-1 crashing?"}]}
+        shows = [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "kanban_show", "arguments": json.dumps({"id": n})}}]} for n in (12, 13)]
+        pids = [{"role": "assistant", "content": f"Process pid {n} was killed."} for n in (4821, 9999)]
+        for body, (one, other) in ((card, shows), (pod, pids)):
+            with self.subTest(body=body["messages"][0]["content"]):
+                first, second = self.recorded(body, one), self.recorded(body, other)
+                self.assertEqual(first["answer_variant"], second["answer_variant"], "the coarse identity collides")
+                self.assertNotEqual(first["answer_hash"], second["answer_hash"])
+                self.assertEqual((first["recorded"], second["recorded"]), (True, True))
+                stored = [entry["answer"] for _, entry in self.saved(first["fingerprint"])]
+                self.assertEqual(len(stored), 2, "the second answer is not dropped onto the first's file")
+                self.assertEqual(sorted(json.dumps(a, sort_keys=True) for a in stored),
+                                 sorted(json.dumps(a, sort_keys=True) for a in (one, other)))
 
     def test_replay_hands_the_answers_out_in_turn_and_wraps(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -1043,7 +1063,7 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(second["recorded"], "the same answer is saved once")
         self.assertEqual(len(FakeLiteLLM.calls), 2, "record mode never serves")
         (name, entry), = replay_cache.AnswerCache(self.cache_dir).answers(first["fingerprint"])
-        self.assertEqual(name, first["answer_variant"][1], "an alternate is named by its answer's identity")
+        self.assertEqual(name, first["answer_hash"], "an alternate is named by the hash of the answer as stored")
         arguments = json.loads(entry["answer"]["tool_calls"][0]["function"]["arguments"])
         self.assertEqual(arguments, {"task_id": "⟦TASK_1⟧"})
         self.assertEqual(entry["answer"]["tool_calls"][0]["id"], "call_1__thought__c2ln", "opaque ids are kept")

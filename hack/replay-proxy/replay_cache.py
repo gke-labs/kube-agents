@@ -1,8 +1,10 @@
 """Saved answers for the proxy's record and replay modes.
 
 Record mode writes one file per distinct answer to a fingerprint under the
-cache directory, `alts/<fingerprint>/<answer>.json`, the answer being its
-identity (normalizer.answer_variant): the answer with the values its request
+cache directory, `alts/<fingerprint>/<answer>.json`, named by the hash of the
+answer as stored (its text and tool calls after the swap below; the proxy's
+answer_hash), so two answers that differ in what is served never share a
+name: the answer with the values its request
 bound swapped for placeholders, its finish reason and usage, and the request's
 hashes for diagnosis. Each file is written once; a second delivery of the same
 answer finds it there and writes nothing, and a different answer to the same
@@ -34,7 +36,7 @@ import normalizer
 # (a key with no alternates), never written by record mode.
 ANSWERS_DIR = "answers"
 # Every distinct answer recorded for a fingerprint, one file each:
-# alts/<fingerprint>/<answer identity>.json.
+# alts/<fingerprint>/<answer hash>.json (replay_proxy.answer_hash).
 ALTS_DIR = "alts"
 MESSAGES_DIR = "messages"
 # Saved answers by answer-slot key, and the answers recorded for each slot context.

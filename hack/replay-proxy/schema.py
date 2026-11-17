@@ -145,8 +145,9 @@ SERVED_FROM = "served_from"
 SERVED_VIA = "served_via"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
-# On a served line: which of the key's saved answers was served (its identity,
-# the alternate's name; empty for the older layout's single answer), and how
+# On a served line: which of the key's saved answers was served (the
+# alternate's name, the ANSWER_HASH of the line that saved it; empty for the
+# older layout's single answer), and how
 # many answers the key had. Replay hands a key's answers out in turn.
 SERVED_ALTERNATE = "served_alternate"
 ALTERNATES = "alternates"

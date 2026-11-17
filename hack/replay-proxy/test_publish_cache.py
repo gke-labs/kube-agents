@@ -263,6 +263,24 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(report["decisions"], {"pass": 1})
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [a]}})
 
+    def test_a_failing_reps_answer_is_not_published_by_a_passing_rep_whose_stored_answer_differs(self):
+        # kanban_show(12) and kanban_show(13): one answer_variant identity,
+        # two stored answers. The passing rep vouches for its own file only.
+        identity, x, y = "a" * 64, "c" * 64, "d" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=identity, answer_hash=x)
+        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=identity, answer_hash=y)
+        self.alternate(1, x)
+        self.alternate(1, y)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", objects, "the failing rep's stored answer")
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{y}.json", objects)
+        self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
+        self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [y]}})
+
     def test_the_same_answer_from_failing_reps_only_stays(self):
         a = "a" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])

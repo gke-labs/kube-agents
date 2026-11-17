@@ -725,8 +725,10 @@ often answer the same request differently. If the cache kept only the first answ
 a failing run that happened to answer first would cost the request its passing answers, and every
 replayed run of the case would follow that one recording, so three runs would be one sample
 counted three times. So the cache keeps every distinct answer to a request, each under a name made
-of the request's fingerprint and the answer itself, written once like every other object; only
-those from passing runs are published, decided answer by answer. The replay proxy hands a request's
+of the request's fingerprint and a hash of the answer exactly as it is stored and served, written
+once like every other object; only those a passing run gave are published, decided answer by
+answer, so two runs that gave the same answer share one file and two that differed in any served
+word or action never do. The replay proxy hands a request's
 answers out in turn, so the first run to ask gets the first answer, the second run the second, and
 so on. Once a run is served one answer, its next request holds that answer, so it only matches what
 followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
