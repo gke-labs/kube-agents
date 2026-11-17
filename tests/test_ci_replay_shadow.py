@@ -1006,14 +1006,42 @@ class EvalWiringTest(unittest.TestCase):
         arms = body.index('  write_replay_lane_arms "$(date -u +%s)"')
         collector = body.index("  start_replay_shadow_collector")
         self.assertEqual(body[live + 1], "    wait", "the live arm finishes before the seed")
-        self.assertLess(live, seed)
+        # Then every card it filed is archived, so the replayed arm cannot read the
+        # live arm's answers off the board (2122208205344870400).
+        clear = body.index('    fence_live_cards "replay lane live arm" "" "" arm')
+        self.assertLess(live + 1, clear)
+        self.assertLess(clear, seed)
         self.assertLess(seed, arms)
         self.assertLess(arms, collector)
-        # The fan-out calls it right before the main queue, which is then replayed.
+        # The fan-out calls it right before the main queue, which is then replayed,
+        # and right after taking the time the clear archives from.
         replayed = at('launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
         self.assertEqual(self.lines[replayed - 1], "run_replay_lane_live_arm")
+        self.assertEqual(self.lines[replayed - 2], 'EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"')
         self.assertGreater(replayed, end, "defined before the fan-out calls it")
         self.assertEqual(sum(1 for l in self.lines if l.strip() == "seed_replay_lane_cache || exit 1"), 1)
+
+    def _live_arm(self, lane: str) -> list[str]:
+        stubs = textwrap.dedent("""\
+            LIVE_TOTAL=2 UNIT_QUEUE_LIVE="1 0 0" EVAL_TASK_PARALLELISM=4 EVAL_UNIT_LAUNCH_STAGGER_SECONDS=0
+            REPLAY_LANE_SAFETY_NAMES=a
+            launch_units() { (sleep 1; echo "UNIT END") & }
+            fence_live_cards() { echo "CLEAR $*"; }
+            seed_replay_lane_cache() { echo SEED; }
+            write_replay_lane_arms() { echo ARMS; }
+            start_replay_shadow_collector() { echo COLLECTOR; }
+            """)
+        script = ("set -euo pipefail\n" + stubs + f"EVAL_REPLAY_LANE={lane}\n"
+                  + lift_function("run_replay_lane_live_arm", _CI_EVAL.read_text(), _CI_EVAL) + "run_replay_lane_live_arm\n")
+        proc = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line for line in proc.stdout.splitlines() if not line.startswith(">>>")]
+
+    def test_the_live_arm_cards_are_archived_after_its_units_end_and_before_the_seed(self):
+        self.assertEqual(self._live_arm("true"),
+                         ["UNIT END", 'CLEAR replay lane live arm   arm', "SEED", "ARMS", "COLLECTOR"])
+        self.assertEqual(self._live_arm("false"), [], "nothing changes off the lane")
 
     # The script's decision on whether the run records, run as written: from
     # the JOB_TYPE case to the commit stamp that follows it.

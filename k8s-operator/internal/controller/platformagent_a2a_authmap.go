@@ -291,6 +291,22 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining))
 		}
 	}
+	if a2aCuratorEnabled() {
+		for i := range identities {
+			if identities[i].User == a2aAgentBusUser {
+				identities[i].Grants.Publish = append(identities[i].Grants.Publish, a2aCuratorOutcomesSubject, a2aMemoryQuerySubject)
+				identities[i].Grants.Subscribe = append(identities[i].Grants.Subscribe, a2aMemoryReplyAgentSubjects)
+				break
+			}
+		}
+		id := curatorIdentity(agent, agent.Namespace)
+		identities = append(identities, a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		})
+	}
 
 	// Refuse here what the callout would refuse there.
 	//

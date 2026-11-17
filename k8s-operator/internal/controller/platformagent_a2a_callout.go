@@ -719,6 +719,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 					},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// Two replicas on two nodes, so that the drain the budget
 					// rate-limits is a drain of one of them. Advisory
