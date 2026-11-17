@@ -4177,7 +4177,6 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent

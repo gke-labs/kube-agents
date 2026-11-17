@@ -285,6 +285,7 @@ func TestAnUnrecordedSingleServerIsReadByItsRenderedShape(t *testing.T) {
 	b.sts.Status.ObservedGeneration = 1
 	b.sts.Status.UpdatedReplicas = 1
 	b.sts.Status.CurrentRevision, b.sts.Status.UpdateRevision = "bus-a", "bus-a"
+	b.plainRevision(t, "bus-a")
 	b.pod(0, "bus-a")
 	stored := a2aTestAgent() // no record, no tuning
 	stored.Status.BusReplicas = 0
@@ -399,6 +400,7 @@ func TestASingleServerOnAnEarlierTemplateHasNotLoadedTheNewList(t *testing.T) {
 	agent := a2aSingleServerTestAgent()
 	b := newHoldBus(agent)
 	b.sts.Generation, b.sts.Status.ObservedGeneration, b.sts.Status.UpdatedReplicas = 1, 1, 1
+	b.plainRevision(t, "bus-a")
 	b.pod(0, "bus-a")
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace, Annotations: map[string]string{
@@ -412,6 +414,7 @@ func TestASingleServerOnAnEarlierTemplateHasNotLoadedTheNewList(t *testing.T) {
 	b2 := newHoldBus(agent.DeepCopy())
 	b2.sts.Spec.Template.Annotations[a2aConfigHashAnnotation] = "h2"
 	b2.sts.Generation, b2.sts.Status.ObservedGeneration, b2.sts.Status.UpdatedReplicas = 1, 1, 1
+	b2.plainRevision(t, "bus-a")
 	b2.pod(0, "bus-a")
 	if got := loadedList(loadedOrFatal(t, b2.client(secret.DeepCopy()), b2.agent)); got != "x,y" {
 		t.Errorf("loaded = %q settled on h2, want \"x,y\"", got)
