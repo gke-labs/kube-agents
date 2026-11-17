@@ -873,7 +873,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (INFRA_CLS[inc.condition] ? c.outcome === "infra" && c.cls === INFRA_CLS[inc.condition] && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (INFRA_CLS[inc.condition] ? (c.outcome === "infra" || c.cls === "forge-unavailable") && c.cls === INFRA_CLS[inc.condition] && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -1370,16 +1370,22 @@ function runHtml(link) {
   // the held-out tag). A named case this run has no record of (the log
   // parsed no task for it) is listed by name under the same heading.
   const suiteLost = new Set(run.verdict === "not_evaluated" && Array.isArray(run.not_evaluated) ? run.not_evaluated.map(String) : []);
-  const lost = cases.filter((c) => c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
+  // Cases whose checks could not read GitHub (classify.py's forge class): a
+  // safeguard-blocked one can red the run whether it is admitted, held out,
+  // partial or ungraded, so they are listed together, never as passed.
+  const forge = cases.filter((c) => c.cls === "forge-unavailable");
+  const notForge = (c) => c.cls !== "forge-unavailable";
+  const lost = cases.filter((c) => notForge(c) && c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
   const lostUnrecorded = [...suiteLost].filter((name) => !cases.some((c) => c.case === name));
-  const partial = cases.filter((c) => c.admitted && c.outcome === "partial");
+  const partial = cases.filter((c) => notForge(c) && c.admitted && c.outcome === "partial");
   const passed = cases.filter((c) => c.admitted && c.outcome === "passed");
-  const heldPassed = cases.filter((c) => !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
+  const heldPassed = cases.filter((c) => notForge(c) && !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
   const heldFailed = cases.filter((c) => !c.admitted && c.outcome === "failed");
   let body = "";
   if (failed.length) body += `<div class="sec"><h2>Failed gate cases · ${failed.length}</h2>${failed.map((c) => caseCard(run, c)).join("")}</div>`;
   if (lost.length || lostUnrecorded.length) body += `<div class="sec"><h2>Not graded · ${lost.length + lostUnrecorded.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}` +
     (lostUnrecorded.length ? `<div class="passed">${lostUnrecorded.map((name) => `<span>${esc(name)}</span>`).join("")}</div><p class="mut small">Named by the suite's verdict; this run's log recorded no grading for ${lostUnrecorded.length === 1 ? "it" : "them"}.</p>` : "") + "</div>";
+  if (forge.length) body += `<div class="sec"><h2>Could not read GitHub · ${forge.length}</h2>${forge.map((c) => caseCard(run, c)).join("")}<p class="mut small">These checks errored on a GitHub read during grading (usually the GitHub App's hourly rate limit); a catastrophic safeguard among them keeps the run red, held-out case or not, with nothing about your change graded.</p></div>`;
   if (partial.length) body += `<div class="sec"><h2>Passed on retry · ${partial.length}</h2><div class="passed">${partial.map((c) => `<span>${esc(c.case)}</span>`).join("")}</div><p class="mut small">Some repetitions failed; the gate counts a case as failed only when every graded repetition fails.</p></div>`;
   if (passed.length || heldPassed.length) body += `<div class="sec"><h2>Passed · ${passed.length + heldPassed.length}</h2><div class="passed">${passed.map((c) => `<span>${esc(c.case)}</span>`).join("")}${heldPassed.length ? `<span class="held">+${heldPassed.length} held out</span>` : ""}</div></div>`;
   if (heldFailed.length) body += `<div class="sec"><h2>Held out · failed · ${heldFailed.length}</h2><div class="passed">${heldFailed.map((c) => `<span class="held">${esc(c.case)}</span>`).join("")}</div><p class="mut small">Held-out cases are measured but never block a PR.</p></div>`;
@@ -1741,7 +1747,7 @@ function detailHtml() {
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";
-  const tag = c.outcome === "failed" || c.outcome === "infra" ? ` · ${tagFor(c)}` : "";
+  const tag = c.outcome === "failed" || c.outcome === "infra" || c.cls === "forge-unavailable" ? ` · ${tagFor(c)}` : "";
   const n = repOf(c), url = transcriptUrl(run, c.case, n), log = buildUrl(run);
   return `<div class="detail" id="detail"><h3><code>${esc(c.case)}</code> · ${prLink(run.pr)} · ${esc(et(runFinish(run)))} · project ${esc(projectShort(run.project))}<button type="button" class="close" data-toggle="close">close ×</button></h3>` +
     `<div class="sub">${esc(how)}${esc(length)} · ${plural(others, "other case")} passed in this run${tag}</div>` +

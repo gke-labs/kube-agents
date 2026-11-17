@@ -1114,6 +1114,9 @@ class BrowserTest(unittest.TestCase):
         hit["result"] = "FAILURE"
         for t in hit["tasks"]:
             t["reps"] = [rep if rep.get("result") == "pass" else dict(rep, result="fail", reason=safeguard) for rep in t.get("reps") or []]
+            if t["name"] == "reliability-pdb-probe":
+                # Admitted, passes beside a block: partial, and the case that reds the run.
+                t["reps"][-1] = dict(t["reps"][-1], result="fail", reason=safeguard)
             if any(rep["result"] == "fail" for rep in t["reps"]):
                 t["result"] = "fail"
         base = dom_text(render_to(pathlib.Path(self.tmp.name) / "forge-red-base", self.data, health=health_doc("GREEN")) / "index.html")
@@ -1121,6 +1124,11 @@ class BrowserTest(unittest.TestCase):
         run_page = dom_text(out / "run.html", query="build=2097282860221206528")
         self.assertIn("a catastrophic safeguard could not read GitHub", run_page)
         self.assertNotIn("Fix the PR", run_page)
+        # Admitted partial, held-out partial and held-out ungraded forge cases are listed together, none as passed.
+        group = run_page[run_page.index("Could not read GitHub · "):]
+        for name in ("reliability-pdb-probe", "capacity-pinned-pool-probe", "obtainability-healthy-namespace-silence"):
+            self.assertIn(name, group.split("These checks errored on a GitHub read")[0], name)
+        self.assertNotIn("Passed on retry", run_page)
         own = re.compile(r"(\d+) look like the PR")
         self.assertEqual(own.search(dom_text(out / "index.html")).group(1), own.search(base).group(1), "not counted as PR-caused")
 
