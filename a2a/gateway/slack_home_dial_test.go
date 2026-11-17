@@ -463,3 +463,23 @@ func TestDecodeBoardKeepsTheBoardWhenTheDialIsUnreadable(t *testing.T) {
 		t.Errorf("a good dial section did not decode: err=%v", err)
 	}
 }
+
+func TestSlackHomeDialTapAnswerGoesOnceItsRowMovesOn(t *testing.T) {
+	b := dialBoard("U1")
+	a, api, _ := homeAdapter(t, b, nil)
+	opening := "Opening the rules pull request for org/infra; the row shows it once it is open."
+	a.SetBoardActor((&dialActor{res: &lib.BoardActionResult{OK: true, Message: opening}}).act)
+	a.dialClick(dialClickPayload("U1", "10.1"), slackDialActionReq, "no-pdb|dev|github.com/org/infra", "")
+	if got := dialText(t, dialBlocks(t, api)); !strings.Contains(got, opening) {
+		t.Fatalf("the answer is not drawn while the row is still off:\n%s", got)
+	}
+	// session-kv opens the rules pull request: the row turns pending.
+	b.Dial.Kinds[0].Repos[0].State = lib.DialStatePending
+	a.home.mu.Lock()
+	a.home.cached = nil
+	a.home.mu.Unlock()
+	openHome(a, "U1")
+	if got := dialText(t, dialBlocks(t, api)); strings.Contains(got, opening) {
+		t.Errorf("the answer stayed under the row after it turned pending:\n%s", got)
+	}
+}

@@ -201,7 +201,7 @@ func (s *SlackAdapter) homeDialBlocks(member string, d *lib.BoardDial) []slack.B
 		}
 		blocks = append(blocks, s.homeDialKind(member, admin, k)...)
 	}
-	if status := s.dialStatus(member); status != "" {
+	if status := s.dialStatus(member, d); status != "" {
 		blocks = append(blocks, slack.NewContextBlock("", mrk(status)))
 	}
 	return blocks
@@ -313,8 +313,38 @@ func (s *SlackAdapter) setDialPick(member, kind, environment, repoKey string) {
 	s.home.dialPicks[member][slackDialRepoKey(kind, environment)] = repoKey
 }
 
-// dialStatus is the answer to member's last dial tap, while it is recent.
-func (s *SlackAdapter) dialStatus(member string) string {
+// slackDialStatus is the answer to a member's last dial tap. For a Request
+// or Stop it remembers the row and the row's state when tapped, so the line
+// ("Opening the rules pull request…") goes once the row has moved on.
+type slackDialStatus struct {
+	text  string
+	at    time.Time
+	row   string
+	state string
+}
+
+// slackDialRowState is the state of the row kind/environment/repoKey in d,
+// and whether d has that row.
+func slackDialRowState(d *lib.BoardDial, kind, environment, repoKey string) (string, bool) {
+	if d == nil {
+		return "", false
+	}
+	for _, k := range d.Kinds {
+		if k.Kind != kind || k.Environment != environment {
+			continue
+		}
+		for _, r := range k.Repos {
+			if r.RepoKey == repoKey {
+				return r.State, true
+			}
+		}
+	}
+	return "", false
+}
+
+// dialStatus is the answer to member's last dial tap, while it is recent and,
+// for a Request or Stop, while its row is still in the state it was tapped in.
+func (s *SlackAdapter) dialStatus(member string, d *lib.BoardDial) string {
 	s.home.mu.Lock()
 	defer s.home.mu.Unlock()
 	st, ok := s.home.dialStatuses[member]
@@ -322,16 +352,24 @@ func (s *SlackAdapter) dialStatus(member string) string {
 		delete(s.home.dialStatuses, member)
 		return ""
 	}
+	if st.row != "" {
+		kind, environment, repoKey, _ := slackDialRow(st.row)
+		if state, found := slackDialRowState(d, kind, environment, repoKey); found && state != st.state {
+			delete(s.home.dialStatuses, member)
+			return ""
+		}
+	}
 	return st.text
 }
 
-func (s *SlackAdapter) setDialStatus(member, text string) {
+func (s *SlackAdapter) setDialStatus(member string, st slackDialStatus) {
 	s.home.mu.Lock()
 	defer s.home.mu.Unlock()
 	if s.home.dialStatuses == nil {
-		s.home.dialStatuses = map[string]slackHomePickStatus{}
+		s.home.dialStatuses = map[string]slackDialStatus{}
 	}
-	s.home.dialStatuses[member] = slackHomePickStatus{text: text, at: time.Now()}
+	st.at = time.Now()
+	s.home.dialStatuses[member] = st
 }
 
 // dialClick takes one dial tap off the event pump. A tap that is not a Home
@@ -410,11 +448,15 @@ func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor B
 		}
 		return
 	}
-	if board, err := s.homeBoard(); err == nil && board != nil && board.Dial != nil && !slices.Contains(board.Dial.Admins, member) {
+	var dial *lib.BoardDial
+	if board, err := s.homeBoard(); err == nil && board != nil {
+		dial = board.Dial
+	}
+	if dial != nil && !slices.Contains(dial.Admins, member) {
 		// The controls were drawn for an admin who no longer is one, or the
 		// payload was not ours. session-kv would refuse it too; this only
 		// saves the round trip.
-		s.setDialStatus(member, slackDialNotAdmin)
+		s.setDialStatus(member, slackDialStatus{text: slackDialNotAdmin})
 		s.publishHome(member, false)
 		return
 	}
@@ -425,7 +467,11 @@ func (s *SlackAdapter) runDialTap(member string, action lib.BoardAction, actor B
 	line := slackDialAnswer(res, err)
 	s.log.Info("slack: dial tap", "action", action.Action, "member", member, "level", action.Level,
 		"kind", action.Kind, "environment", action.Environment, "repo", action.RepoKey, "ok", res != nil && res.OK, "err", err)
-	s.setDialStatus(member, line)
+	status := slackDialStatus{text: line}
+	if state, found := slackDialRowState(dial, action.Kind, action.Environment, action.RepoKey); found {
+		status.row, status.state = slackDialRowValue(action.Kind, action.Environment, action.RepoKey), state
+	}
+	s.setDialStatus(member, status)
 	s.home.mu.Lock()
 	s.home.cached, s.home.readErr = nil, nil
 	s.home.mu.Unlock()

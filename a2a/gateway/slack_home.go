@@ -172,7 +172,7 @@ type slackHome struct {
 	// dialPicks is each member's picked repository per dial row, and
 	// dialStatuses the answer to their last dial tap (slack_home_dial.go).
 	dialPicks    map[string]map[string]string
-	dialStatuses map[string]slackHomePickStatus
+	dialStatuses map[string]slackDialStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
