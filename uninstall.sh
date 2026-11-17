@@ -259,7 +259,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-uninstall-report.json"
+  # KUBE_AGENTS_UNINSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UNINSTALL_REPORT_FILE:-/tmp/kube-agents-uninstall-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",
@@ -946,9 +947,6 @@ main() {
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""
-  # The mode, likewise: the generator refuses a value outside the CRD's enum,
-  # and the destroy removes the release whichever mode it renders.
-  export PLATFORM_AGENT_MODE=""
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""

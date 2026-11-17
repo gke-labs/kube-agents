@@ -187,7 +187,7 @@ init_var_registry_prefix() {
 
 # ─── Third-party images ───────────────────────────────────────────────────────
 # Images an install pulls that this project does not build: the LiteLLM
-# gateway, the fluent-bit logging sidecar, the GitHub token minter, and
+# gateway, the fluent-bit logging sidecar, the NATS bus, the GitHub token minter, and
 # cert-manager. A mirror commonly keeps those under a different path from the
 # kube-agents images, and an install may mirror one set without the other, so
 # they get their own prefix rather than sharing REGISTRY_PREFIX.
@@ -219,7 +219,7 @@ warn_unmirrored_third_party() {
   prefix="$(registry_prefix)"
   [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && return 0
   [ -n "$(third_party_registry_prefix)" ] && return 0
-  print_warning "REGISTRY_PREFIX is '${prefix}', but the third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter and Hindsight) will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
+  print_warning "REGISTRY_PREFIX is '${prefix}', but the third-party images (cert-manager, LiteLLM, fluent-bit, the NATS bus, the GitHub token minter and Hindsight) will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
 }
 
 is_non_interactive() {

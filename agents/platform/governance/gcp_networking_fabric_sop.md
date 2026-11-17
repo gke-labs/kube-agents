@@ -130,7 +130,7 @@ For promoted findings requiring `kind: manifest` remediation, write the updated 
 
 ### 4. Emit findings.json
 
-Write the whole document to `findings_path` in one shot, with `audit: "gcp-networking-fabric-audit"`, `scope.clusters` listing every target you queried — each carrying the `checks_run` list §2 required and, where §2 recorded them, that target's `checks_not_applicable` entries and `limitations` string — and `scope.skipped` listing only the targets you could not read.
+Fill the drafted document at `findings_path` in place, as step 3 of the skill says and never as one tool call that carries the whole document, with `audit: "gcp-networking-fabric-audit"`, `scope.clusters` listing every target you queried — each carrying the `checks_run` list §2 required and, where §2 recorded them, that target's `checks_not_applicable` entries and `limitations` string — and `scope.skipped` listing only the targets you could not read.
 
 `command` in `checks_run` is the literal inspection command executed, and anything under eight characters is rejected.
 

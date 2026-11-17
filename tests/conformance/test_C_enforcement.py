@@ -1040,6 +1040,184 @@ class C1IsolationIsStructural(unittest.TestCase):
                         "a peer is admitted to a port other than the metrics listener's",
                     )
 
+    # The audit-report store listener (#5619): its port and the name of it,
+    # which the Service targets.
+    _REPORT_STORE_PORT = 8700
+    _REPORT_STORE_PORT_NAME = "report-store"
+
+    @staticmethod
+    def _rule_reaches(rule: dict, port: int, port_name: str) -> bool:
+        """Whether an ingress rule admits TCP to `port` (or its name) at all.
+
+        No `ports` is every port, a port entry with no `port` is every port of
+        its protocol, an absent protocol is TCP, and `endPort` makes a range.
+        """
+        ports = rule.get("ports")
+        if not ports:
+            return True
+        for entry in ports:
+            if (entry.get("protocol") or "TCP") != "TCP":
+                continue
+            value = entry.get("port")
+            if value is None or value == port_name:
+                return True
+            if isinstance(value, int) and value <= port <= entry.get("endPort", value):
+                return True
+        return False
+
+    def test_C1_only_the_broker_reaches_the_audit_report_store_listener(self) -> None:
+        """The store's port on the gateway pod admits the broker's pods alone.
+
+        The listener reads and writes the fleet-audit report store, which is a
+        profile worker's memory of what the last run found. It checks the
+        broker's token as well, but on the pod network nothing but the broker
+        should reach it: a rule from any other peer that covers the port --
+        a port range that takes 8700 in, or a rule with no ports -- is the
+        store reachable from every pod beside it.
+
+        NetworkPolicies selecting one pod are additive, so this reads every
+        policy that selects the gateway pod and isolates it for ingress, and
+        every rule in them that reaches the port: each must admit exactly the
+        broker's pod selector. And at least one must, or the store is reached
+        by nobody, which is no listener. The rule lives in the gateway policy,
+        and no policy of the store's own is rendered: an operator rollback
+        rewrites the gateway policy without the rule, where a separate policy
+        would be left behind isolating the pod to the broker alone.
+
+        The store renders with the A2A stack, on every install, so this holds
+        on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self._assert_only_the_broker_reaches_the_store(documents)
+
+    def _assert_only_the_broker_reaches_the_store(self, documents: tuple[dict, ...]) -> None:
+        port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
+        services = [s for s in h.objects_of_kind(documents, "Service") if s["metadata"]["name"].endswith("-report-store")]
+        self.assertEqual(len(services), 1, "the golden renders no report-store Service")
+        selector = services[0]["spec"]["selector"]
+        self.assertTrue(selector, "the report-store Service selects every pod")
+        # The pod behind the Service: the Hermes gateway, not the A2A gateway.
+        gateways = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if selector == {k: d["spec"]["template"]["metadata"]["labels"].get(k) for k in selector}
+        ]
+        self.assertEqual(
+            [d["metadata"]["name"] for d in gateways], [services[0]["metadata"]["name"].removesuffix("-report-store") + "-gateway"],
+            "the report-store Service does not select the gateway pod alone",
+        )
+        gateway = gateways[0]
+        pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        # Every port entry on the store's port or carrying its name: a second name
+        # on 8700 would let a rule admitting that name reach the store unseen.
+        declared = [
+            (c["name"], p.get("name"), p.get("containerPort"))
+            for c in h.containers_of(gateway)
+            for p in c.get("ports") or []
+            if p.get("name") == port_name or p.get("containerPort") == port
+        ]
+        self.assertEqual(
+            declared, [("agent-api-auth", port_name, port)], "the store's port is not agent-api-auth's alone"
+        )
+
+        brokers = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if d["metadata"]["name"].endswith("-credential-proxy")
+        ]
+        self.assertEqual(len(brokers), 1, "the golden no longer renders one broker Deployment")
+        broker_labels = brokers[0]["spec"]["template"]["metadata"]["labels"]
+        broker_selector = {
+            "app": brokers[0]["metadata"]["name"],
+            "kubeagents.x-k8s.io/component": "credential-proxy",
+        }
+        self.assertEqual(broker_selector, {k: broker_labels.get(k) for k in broker_selector})
+
+        def selects_gateway(policy: dict) -> bool:
+            chosen = policy["spec"].get("podSelector") or {}
+            # Not evaluated, so refused outright: a policy selecting the gateway
+            # by matchExpressions could admit any peer to the store unseen.
+            self.assertFalse(
+                chosen.get("matchExpressions"),
+                f"{policy['metadata']['name']} uses matchExpressions, which this check does not evaluate",
+            )
+            labels = chosen.get("matchLabels") or {}
+            return labels == {k: pod_labels.get(k) for k in labels}
+
+        isolating = [
+            p for p in h.objects_of_kind(documents, "NetworkPolicy")
+            if selects_gateway(p) and "Ingress" in (p["spec"].get("policyTypes") or [])
+        ]
+        self.assertTrue(isolating, "nothing isolates the gateway pod for ingress, so every pod reaches the store")
+        reaching = []
+        for policy in isolating:
+            for rule in policy["spec"].get("ingress") or []:
+                if self._rule_reaches(rule, port, port_name):
+                    reaching.append((policy["metadata"]["name"], rule.get("from")))
+        self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
+        self.assertEqual(
+            {name for name, _ in reaching}, {gateway["metadata"]["name"] + "-netpol"},
+            "the store's rule is not in the gateway policy",
+        )
+        self.assertEqual(
+            [p["metadata"]["name"] for p in h.objects_of_kind(documents, "NetworkPolicy")
+             if p["metadata"]["name"].endswith("-report-store")],
+            [], "a NetworkPolicy of the store's own is rendered, which an operator rollback leaves behind",
+        )
+        for name, peers in reaching:
+            with self.subTest(policy=name):
+                self.assertEqual(
+                    peers, [{"podSelector": {"matchLabels": broker_selector}}],
+                    "a rule reaching the store's port admits a peer other than the broker's pods",
+                )
+
+    def test_C1_the_report_store_listener_reads_only_reserved_env(self) -> None:
+        """Every environment variable the store listener reads is one a CR cannot set.
+
+        agent-api-auth takes spec.deployment.env through
+        mergeCredentialProxyEnv, which drops only reserved names. A name the
+        listener reads that is not reserved is a CR choosing it: its subject
+        check, its root, or the API server it fetches the JWKS from with the
+        pod's own token, which would then vouch for any token the CR signs.
+        So the names the listener reads, each spelled through a module
+        constant, must all be in the operator's auditReportStoreEnvNames, and
+        the API server, the ServiceAccount directory and the root must come
+        from no environment variable at all.
+        """
+        listener = h.text("audit_report_store_listener")
+        tree = ast.parse(listener)
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        }
+        read = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "getenv")
+                and ast.unparse(node.func.value) in ("os.environ", "os") and node.args
+            ):
+                arg = node.args[0]
+                read.add(constants.get(arg.id) if isinstance(arg, ast.Name) else ast.unparse(arg))
+            if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                read.add(ast.unparse(node.slice))
+        self.assertTrue(read, "the listener reads no environment at all, so its subject check has no subject")
+        self.assertNotIn(None, read, "the listener reads an environment name not spelled through a module constant")
+
+        operator = h.text("audit_report_store_operator")
+        block = self._one_match(r"(?s)var auditReportStoreEnvNames = \[\]string\{(.*?)\n\}", operator, "auditReportStoreEnvNames")
+        go_constants = dict(re.findall(r"^\s*(auditReportStore\w+Env)\s*=\s*\"([^\"]+)\"", operator, re.MULTILINE))
+        reserved = set()
+        for line in re.sub(r"//[^\n]*", "", block).split(","):
+            item = line.strip()
+            if not item:
+                continue
+            reserved.add(item.strip('"') if item.startswith('"') else go_constants.get(item, item))
+        self.assertLessEqual(read, reserved, "the listener reads a name a CR can set through spec.deployment.env")
+        for name in ("FLEET_AUDIT_REPORTS_DIR", "AUDIT_REPORT_STORE_API_SERVER", "AUDIT_REPORT_STORE_SA_DIR"):
+            self.assertNotIn(name, read, f"the listener takes {name} from the environment")
+            self.assertIn(name, reserved, f"{name} is not reserved, so an image that read it would let a CR set it")
+
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
@@ -1828,7 +2006,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
         # request lib.ValidateDelegateRequest refuses, and the validator caps
-        # the single task's text and every batch entry's.
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
         # Followed only by `||` or the block: an `&&` after the call (a
         # condition on it) would validate only some requests and mint the rest.
@@ -2521,6 +2704,63 @@ class C2FailClosed(unittest.TestCase):
                 "present, so a missing key degrades to an unauthenticated request",
             )
 
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
+            )
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
@@ -2960,7 +3200,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("rbac.authorization.k8s.io", "roles"),
     })
     OPERATOR_NAMESPACED_READ_KINDS = frozenset()
-    # The two namespaces the chart binds the Role in under mode next: the
+    # The two namespaces the chart binds the Role in, in every mode: the
     # release namespace and its profile namespace.
     OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
     HELM_MODE_NEXT = "platformAgent.mode=next"

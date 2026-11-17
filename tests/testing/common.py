@@ -1,5 +1,6 @@
 """Common test constants and fixtures shared across test suites."""
 
+import atexit
 import os
 import pathlib
 import shutil
@@ -127,6 +128,43 @@ SEEDED_INSTALLER_ENV_KEYS = (
 )
 
 
+#: Git in the child reads neither the global nor the system configuration file, only the
+#: repository's own. A developer's global rule such as
+#: `url.git@github.com:.pushInsteadOf https://github.com/` is applied to a push before a
+#: repository's `insteadOf`, so without this a script's push to the test's local stand-in for the
+#: release repository goes to GitHub, with the developer's key. Configuration that arrives in the
+#: environment (GIT_CONFIG_COUNT) still applies, and git before 2.32 does not know
+#: GIT_CONFIG_GLOBAL.
+HERMETIC_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+#: The variable that names the report file of each front-door script, and the name of the file a
+#: real run writes under /tmp. A script writes its report also when it is only sourced and a
+#: command fails, through its ERR trap, so a test's child must not get the real path.
+INSTALLER_REPORT_FILE_ENV_VARS = {
+    "KUBE_AGENTS_INSTALL_REPORT_FILE": "kube-agents-install-report.json",
+    "KUBE_AGENTS_UPGRADE_REPORT_FILE": "kube-agents-upgrade-report.json",
+    "KUBE_AGENTS_UNINSTALL_REPORT_FILE": "kube-agents-uninstall-report.json",
+}
+_INSTALLER_REPORT_DIR_PREFIX = "kube-agents-test-reports-"
+# Made at import, so the folder exists and its removal is registered before a test forks a child.
+_INSTALLER_REPORT_DIR = tempfile.mkdtemp(prefix=_INSTALLER_REPORT_DIR_PREFIX)
+atexit.register(shutil.rmtree, _INSTALLER_REPORT_DIR, ignore_errors=True)
+
+
+def installer_report_env():
+    """The report file of each front-door script, in one folder of this test process.
+
+    `get_isolated_test_env` sets these. An environment that a test builds from nothing takes
+    them from here: `env={"PATH": ..., **installer_report_env()}`.
+    """
+    return {name: os.path.join(_INSTALLER_REPORT_DIR, file) for name, file in INSTALLER_REPORT_FILE_ENV_VARS.items()}
+
+
+# The test process has them too, for a child that inherits its environment (no `env=`).
+os.environ.update(installer_report_env())
+
+
 def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     """Returns a sanitized environment for hermetic script execution, free of CI runner pollution.
 
@@ -134,6 +172,8 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     see even when the developer's shell exports them: a test that relies on a
     variable being unset has to be insulated from os.environ. Popped before the
     overrides, so a caller can name a key in `overrides` and the override wins.
+    `HERMETIC_GIT_ENV` and `installer_report_env()` are set before the overrides
+    for the same reason.
     """
     env = {
         k: v
@@ -144,6 +184,8 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
         env.pop(key, None)
     for key in absent:
         env.pop(key, None)
+    env.update(HERMETIC_GIT_ENV)
+    env.update(installer_report_env())
     if bin_dir:
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if overrides:

@@ -548,6 +548,92 @@ class RetryTest(unittest.TestCase):
         self.assertIn(helper.sweep.RETRY_AFTER_DEFAULT_SECONDS, pauses)
         self.assertNotIn(helper.RETRY_DELAYS_SECONDS[0], pauses)
 
+    def test_an_installation_limit_waits_until_its_reset(self):
+        # The shared installation's budget (#6105): a 403 with no Retry-After,
+        # X-RateLimit-Remaining 0 and X-RateLimit-Reset two minutes away waits
+        # until the reset, not the 60 s default twice.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        limited = urllib.error.HTTPError(
+            "https://api.github.com/x", 403, "Forbidden",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"},
+            io.BytesIO(b'{"message":"API rate limit exceeded for installation ID 157029058."}'),
+        )
+        with mock.patch.object(helper, "now", lambda: 1000.0):
+            record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), limited)], github))
+        self.assertEqual(record["closed"], [1])
+        self.assertIn(121.0, pauses)
+
+    def test_a_far_reset_waits_one_slice_at_a_time(self):
+        far = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "9000"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "now", lambda: 1000.0), mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(far), helper.RATE_LIMIT_WAIT_SLICE_SECONDS)
+
+    def test_a_limit_that_outlasts_the_budget_is_named_as_the_limit(self):
+        # Limited on every listing: it waits RATE_LIMIT_BUDGET_SECONDS in all,
+        # then main exits 1 with the limit named, not the token's reach.
+        def limited():
+            return urllib.error.HTTPError(
+                "https://api.github.com/x", 403, "Forbidden", {"X-RateLimit-Remaining": "0"},
+                io.BytesIO(b'{"message":"API rate limit exceeded for installation ID 157029058."}'),
+            )
+        listing = ("GET", f"/repos/{REPO}/pulls")
+        api = self.flaky([(listing, limited()) for _ in range(100)], FakeGitHub())
+        pauses = []
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "record.json"
+            with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", pauses.append), \
+                    mock.patch.dict(os.environ, {helper.TOKEN_ENV: "tok"}), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = helper.main(["--repo", REPO, "--project", PROJECT, "--build", BUILD, "--scope", "lease", "--record", str(out)])
+            record = json.loads(out.read_text())
+        self.assertEqual(rc, 1)
+        self.assertTrue(record["rate_limited"])
+        self.assertIn("rate limit", record["error"])
+        self.assertNotIn("token's reach", err.getvalue())
+        self.assertEqual(sum(pauses), helper.RATE_LIMIT_BUDGET_SECONDS)
+
+    def test_a_past_reset_or_a_zero_retry_after_waits_the_floor(self):
+        # A clock ahead, or the old epoch just after the reset: not a spent
+        # budget, so the call waits the floor and tries again.
+        past = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "900"}, io.BytesIO(b""))
+        zero = urllib.error.HTTPError("u", 429, "L", {"Retry-After": "0"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "now", lambda: 1000.0), mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(past), helper.RATE_LIMIT_FLOOR_SECONDS)
+            self.assertEqual(helper.limit_wait(zero), helper.RATE_LIMIT_FLOOR_SECONDS)
+        with mock.patch.object(helper, "_rate_limit_waited", float(helper.RATE_LIMIT_BUDGET_SECONDS)):
+            self.assertEqual(helper.limit_wait(zero), 0)
+
+    def test_a_nan_header_waits_as_if_absent(self):
+        # float("nan") parses, and min/max keep a nan: it must not reach
+        # pause(), which would raise, or the budget counter.
+        nan = urllib.error.HTTPError("u", 429, "L", {"Retry-After": "nan"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(nan), helper.RATE_LIMIT_DEFAULT_WAIT_SECONDS)
+
+    def test_a_secondary_limit_with_budget_left_waits_the_default(self):
+        # The reset is the wait only when the hourly budget is spent (#6177).
+        secondary = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}, io.BytesIO(b'{"message":"secondary rate limit"}'))
+        with mock.patch.object(helper, "now", lambda: 1000.0), mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(secondary), helper.RATE_LIMIT_DEFAULT_WAIT_SECONDS)
+
+    def test_each_reset_starts_with_a_full_budget(self):
+        # A budget an earlier reset spent doesn't carry into the next.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        limited = urllib.error.HTTPError("https://api.github.com/x", 403, "F", {"Retry-After": "7"}, io.BytesIO(b""))
+        with mock.patch.object(helper, "_rate_limit_waited", float(helper.RATE_LIMIT_BUDGET_SECONDS)):
+            record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), limited)], github))
+        self.assertEqual(record["closed"], [1])
+        self.assertIn(7, pauses)
+
+    def test_the_unit_lock_allowance_covers_the_rate_limit_waits(self):
+        # A unit holds its lock through the reset and the grading, so a
+        # successor's deadline must cover both waits (hack/ci-eval-pr.sh).
+        script = (REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
+        allowance = int(re.search(r"^readonly UNIT_LOCK_ALLOWANCE_SECONDS=(\d+)$", script, re.M).group(1))
+        verifiers = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(encoding="utf-8")
+        grader = float(re.search(r"^_FORGE_RATE_LIMIT_BUDGET_SEC = ([\d.]+)$", verifiers, re.M).group(1))
+        self.assertGreaterEqual(allowance, 600 + helper.RATE_LIMIT_BUDGET_SECONDS + grader)
+
     def test_a_refusal_is_not_tried_again(self):
         github = FakeGitHub(pulls=[pull(1)])
         record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), _http_error(403))], github))

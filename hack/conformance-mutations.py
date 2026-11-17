@@ -94,6 +94,16 @@ MUTATIONS: list[Mutation] = [
         "forge read no task target confines",
     ),
     Mutation(
+        "A3-report-credential-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
+         "        if False:\n"),
+        "test_A3_a_report_credential_reaches_the_audit_report_routes_alone",
+        "let a report credential reach every route, since a fleet audit only "
+        "ever calls the store -- until its model output calls /v1/exec with "
+        "no target to confine it",
+    ),
+    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
@@ -107,7 +117,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-mcp-without-task",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if principal.task is None:\n        return (\n",
+        ("    if principal.task is None or getattr(principal.task, \"report_only\", False):\n        return (\n",
          "    if False:\n        return (\n"),
         "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
         "let a warm profile pod between tasks read through the MCP relay "
@@ -843,8 +853,8 @@ Mutation(
     Mutation(
         "C3-management-project-unpinned",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
-         "    RECONCILE_PROJECT=\n"),
+        ("    KUBEAGENTS_DIAL_ADMINS=\n    GKE_PROJECT_ID=example-project\n",
+         "    KUBEAGENTS_DIAL_ADMINS=\n"),
         "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
         "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
         "line in the agent-writable PVC .env then re-points the management "
@@ -1441,6 +1451,18 @@ Mutation(
         "test_C2_the_agent_api_proxy_refuses_to_start_without_its_key",
         "give the external key a development default, which is how the "
         "loopback sentinel got there in the first place",
+    ),
+    Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
     ),
     Mutation(
         "C3-policy-reads-a-file",
@@ -2318,6 +2340,64 @@ Mutation(
         "server reports that as success",
     ),
     Mutation(
+        "C1-report-store-admits-every-pod",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    - from:\n        - podSelector:\n            matchLabels:\n"
+         "              app: platformagent-credential-proxy\n"
+         "              kubeagents.x-k8s.io/component: credential-proxy\n"
+         "      ports:\n        - port: 8700\n",
+         "    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8700\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "admit every pod in the namespace to the report store, since the "
+        "listener checks the broker's token anyway -- the sandbox and every "
+        "session pod then reach the fleet-audit memory on the pod network",
+    ),
+    Mutation(
+        "C1-report-store-range-takes-in-8700",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      ports:\n        - port: 8700\n          protocol: TCP\n",
+         "      ports:\n        - port: 8700\n          protocol: TCP\n"
+         "    - ports:\n        - endPort: 65535\n          port: 1\n          protocol: TCP\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "add the keep-everything-else-open rule with one range, 1-65535, "
+        "instead of two that step over 8700 -- added to the gateway policy's "
+        "allowlist, it opens the store and every other port to every source",
+    ),
+    Mutation(
+        "C1-report-store-separate-policy",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n",
+         "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n"
+         "  name: platformagent-report-store\n  namespace: kubeagents-system\nspec:\n"
+         "  podSelector:\n    matchLabels:\n      app: platformagent-gateway\n"
+         "  policyTypes:\n    - Ingress\n"
+         "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "render the store's rule as a policy of its own, easier to read -- until "
+        "an operator rollback leaves it behind and it alone isolates the gateway "
+        "pod to the broker",
+    ),
+    Mutation(
+        "C1-report-store-pod-prefix-unreserved",
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("\tauditReportStoreAllowedSubjectEnv,\n\tauditReportStoreAllowedPodPrefixEnv,\n",
+         "\tauditReportStoreAllowedSubjectEnv,\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "leave the pod-prefix name off the reserved list since only the "
+        "operator renders it -- a CR then sets it to the exec tier's prefix and "
+        "every exec pod's token passes as the broker",
+    ),
+    Mutation(
+        "C1-report-store-api-server-from-env",
+        "agents/platform/scripts/audit_report_store.py",
+        ("    base = api_server.rstrip(\"/\")\n",
+         "    base = (os.environ.get(\"AUDIT_REPORT_STORE_API_SERVER\") or api_server).rstrip(\"/\")\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "let an install point the JWKS fetch at a proxy -- a CR then points it at "
+        "a server of its own, hands it the pod's token, and signs broker tokens",
+    ),
+    Mutation(
         "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",
@@ -2465,7 +2545,10 @@ Mutation(
     Mutation(
         "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "drop the gateway's call to lib.ValidateDelegateRequest: an "
         "over-length text, or a malformed batch, that reached the bus without "
@@ -2473,10 +2556,26 @@ Mutation(
         "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
+    ),
+    Mutation(
         "C1-delegate-gateway-validates-only-some-requests",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
-         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "condition the gateway's validator call so it guards only batches: "
         "the call still appears, but a single over-length task that reached "

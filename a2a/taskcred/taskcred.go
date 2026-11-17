@@ -165,6 +165,9 @@ type Trigger struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
+	// Script is the profile script a built-in schedule's run executes
+	// (capability.Trigger.Script, #5622); empty on every other trigger.
+	Script string `json:"script,omitempty"`
 }
 
 // TriggerOriginBuiltin is the one trigger origin a credential may name, lib's.
@@ -432,7 +435,7 @@ func (c Claims) validate() error {
 
 // validate is a trigger's shape check, lib.ValidateTrigger's.
 func (t Trigger) validate() error {
-	if err := lib.ValidateTrigger(t.Name, t.Origin, t.Stream); err != nil {
+	if err := lib.ValidateTrigger(t.Name, t.Origin, t.Stream, t.Script); err != nil {
 		return fmt.Errorf("task credential %w", err)
 	}
 	return nil
@@ -468,7 +471,7 @@ var (
 	topLevelClaims = map[string]bool{"jti": true, "iat": true, "iss": true, "name": true, "sub": true, "aud": true, "exp": true, "nbf": true, "nats": true}
 	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true, "trigger": true}
 	targetClaims   = map[string]bool{"project": true, "location": true, "cluster": true}
-	triggerClaims  = map[string]bool{"name": true, "origin": true, "stream": true}
+	triggerClaims  = map[string]bool{"name": true, "origin": true, "stream": true, "script": true}
 )
 
 // checkStrictClaims re-reads the raw payload segment before anything trusts

@@ -422,6 +422,23 @@ func scopePublisherPodLabels(agent *agentv1alpha1.PlatformAgent) map[string]stri
 	return a2aLabels(agent, scopePublisherComponent)
 }
 
+func scopePublisherContainerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: scopeFileEnvKey, Value: path.Join(scopeDir, scopeFileName)},
+		{Name: scopePublisherConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)},
+		{Name: scopePublisherNamespaceEnvVar, ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		}},
+		{Name: scopePublisherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+		{Name: scopePublisherBrokerTokenFileEnvVar, Value: path.Join(scopePublisherBrokerTokenMountDir, scopePublisherBrokerTokenKey)},
+		{Name: scopePublisherManagementProjectEnvVar, Value: scopeManagementProject(agent)},
+	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+	}
+	return env
+}
+
 // buildScopePublisherNetworkPolicy fences the publisher's egress to the three
 // things it talks to: cluster DNS, the credential broker's port, and the API
 // server (for the merge patch), on the ports the agent's own policy allows
@@ -566,16 +583,7 @@ func buildScopePublisherJob(agent *agentv1alpha1.PlatformAgent, start time.Time,
 						Image:           resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage()),
 						ImagePullPolicy: scopePublisherPullPolicy(agent),
 						Command:         []string{scopePublisherPython, scopePublisherScript},
-						Env: []corev1.EnvVar{
-							{Name: scopeFileEnvKey, Value: path.Join(scopeDir, scopeFileName)},
-							{Name: scopePublisherConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)},
-							{Name: scopePublisherNamespaceEnvVar, ValueFrom: &corev1.EnvVarSource{
-								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-							}},
-							{Name: scopePublisherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
-							{Name: scopePublisherBrokerTokenFileEnvVar, Value: path.Join(scopePublisherBrokerTokenMountDir, scopePublisherBrokerTokenKey)},
-							{Name: scopePublisherManagementProjectEnvVar, Value: scopeManagementProject(agent)},
-						},
+						Env: scopePublisherContainerEnv(agent),
 						VolumeMounts: []corev1.VolumeMount{
 							scopeConfigMount(scopeDir),
 							{Name: buildEventWatcherTokenVolume().Name, MountPath: kubeAPIAccessMountPath, ReadOnly: true},

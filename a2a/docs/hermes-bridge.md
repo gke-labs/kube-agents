@@ -95,17 +95,17 @@ the refusal parks the CR), running over the undersized stream, so consumer creat
 under load. That's the shape [#2043](https://github.com/gke-labs/kube-agents/issues/2043) describes. A fresh install creates TASKS at 110 from the first
 render.
 
-**It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
-agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to
-connect to and no runtime-state bucket, exits, and would hold the agent pod in
-`CrashLoopBackOff` through the bring-up. The TASKS consumer reserve does not wait; it counts
-the bridge from the first `next` render, so the one provisioning Job is already sized for it
-and the bridge's arrival does not re-render the Job. The cost is a second roll. On a fresh
-`next` install, and on a flip from `today` back to `next`, the agent pod rolls once for the
-mode and again when the bridge arrives after the Job. The agent Deployment's strategy is
-`Recreate` at one replica (`resolveDeploymentReplicasAndStrategy`), so each roll is a brief
-agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
-`True` the bridge stays in the pod on later renders.
+**It is in the pod from the first render.** The rendered bridge is in the agent pod before the
+bus is provisioned. Until the bus serves and the provisioning Job has created the runtime-state
+bucket, the bridge waits for them, logging each attempt with its cause and backing off up to 30
+seconds, instead of exiting. The agent pod is Ready meanwhile: the agent's own API serves
+without the bus, tasks for the bridge wait on its durable, and the CR's `BusProvisioned`
+condition says the bus isn't there yet. The operator ensures the bus creds Secret, which the
+bridge reads its password from, before it applies the agent Deployment. So the pod template is
+the same before and after provisioning, and a fresh install rolls the agent pod once. The TASKS
+consumer reserve counts the bridge from the first render too, so the one provisioning Job is
+already sized for it. A bridge image from before this wait, pinned under a newer operator, exits instead of waiting,
+so on a fresh install it restarts until the bus is provisioned.
 
 **It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
 CPU and 512Mi, with limits of 1 CPU and 1Gi. This paragraph is the one statement of that
