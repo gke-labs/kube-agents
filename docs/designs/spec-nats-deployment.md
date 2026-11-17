@@ -1244,7 +1244,10 @@ within three minutes, or can't be read, the operator deletes that server's pod s
 onto the new config: one server per pass, only once every other server has been Ready for
 30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. When exactly
 one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
-quorum. The fresh pod mounts the current Secret, so its creation after the write confirms
+quorum. A server that can never start (unschedulable, or crash-looping) is deleted once per bound
+while it stays unconfirmed, with a Warning each time, and the profile stays held throughout.
+An upgrade that lands in the middle of a reload folds every server once: the earlier
+operator's record carries no TLS version, which reads as a change. The fresh pod mounts the current Secret, so its creation after the write confirms
 it, and the pending record stays until it is read. A pod created after the write is given a
 full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
