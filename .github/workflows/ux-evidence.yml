@@ -5,11 +5,15 @@ name: UX Evidence
 # "UX change"). `scripts/ux_evidence.py` holds the list of user-facing paths
 # and the body check; this file only feeds it the diff and the body.
 #
-# The body comes from the event payload through `env:`, never interpolated into
-# a script, and the job needs no token: it reads nothing from the API. `edited`
-# is in the list so that adding a screenshot to the body re-runs the check
-# without a push, which is also why the concurrency key carries the head SHA
-# (.agents/rules/github_actions.md, "Collapse superseded pull-request runs").
+# The body is read from the API when the job runs, not from the event payload:
+# a re-run replays its original payload, so a run re-run after the author added
+# a screenshot or ticked the box would otherwise judge the body as it was
+# before. The token is read-only. `edited` is in the list so that adding a
+# screenshot re-runs the check without a push, which is also why the
+# concurrency key carries the head SHA (.agents/rules/github_actions.md,
+# "Collapse superseded pull-request runs"). GitHub starts no pull_request run
+# while the branch conflicts with its base, so an edit made then is judged at
+# the push that clears the conflict, or by a re-run.
 #
 # A merge-queue run reports success without checking: the body was checked on
 # the head, and the queue commit has none. It is listed so the check can be
@@ -38,6 +42,10 @@ jobs:
     if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Reads the current body; the chat job, which runs the PR's code, gets none.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       chat: ${{ steps.check.outputs.chat }}
     steps:
@@ -56,9 +64,15 @@ jobs:
         # lists (pins and lockfiles are excluded), and this keeps it that way.
         if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
         env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The payload's copy, used only if the API read fails.
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.md"
+          if ! gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.body // ""' > "$RUNNER_TEMP/body.md"; then
+            echo "::warning::could not read the current body; judging the event's copy"
+            printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.md"
+          fi
           git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"
           python3 scripts/ux_evidence.py --body-file "$RUNNER_TEMP/body.md" --files "$RUNNER_TEMP/files.txt"
 

@@ -273,7 +273,8 @@ ingress gap above.
   `next` installs, one allowed. More replicas add
   standbys and nothing else in phase one.
 - **A readiness probe** that holds the pod not Ready until it has a NATS connection and has read
-  the Lease. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
+  the Lease, and again whenever the connection is down, the leader's included once its relay has
+  bound. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
   standby.
 - **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
   pod comes up as a standby before an old one stops. The operator renders it, and a second

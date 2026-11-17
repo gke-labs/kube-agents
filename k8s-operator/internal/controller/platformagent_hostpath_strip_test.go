@@ -473,8 +473,8 @@ func TestReconcileWritesNoVolumesDroppedConditionWithoutAHostPath(t *testing.T) 
 }
 
 // TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded is the gap the
-// Ready-only condition write left. Three refusals render the workload in full
-// and then park the CR on Degraded (ModeNotRecognized, A2AProvisionFailed,
+// Ready-only condition write left. Two refusals render the workload in full
+// and then park the CR on Degraded (A2AProvisionFailed,
 // ShellSandboxKeysMissing), and on those passes updateStatusReady never runs.
 // The one used here is the one a chart-default install sits on indefinitely:
 // the chart renders the sandbox's authorized-keys Secret only when a public
@@ -658,7 +658,7 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 			ctx := context.Background()
 
-			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+			if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 				t.Fatalf("updateStatusReady failed: %v", err)
 			}
 			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
@@ -681,7 +681,7 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 				t.Fatalf("reading the PlatformAgent back: %v", err)
 			}
 			settledVersion := stored.ResourceVersion
-			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+			if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 				t.Fatalf("updateStatusReady (settled) failed: %v", err)
 			}
 			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {

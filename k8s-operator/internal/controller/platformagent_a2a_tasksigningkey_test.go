@@ -167,7 +167,7 @@ func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
 	}
 }
 
-// After a full reconcile under next: the callout carries the public half as a
+// After a full reconcile: the callout carries the public half as a
 // plain value, and nothing else the operator rendered references the
 // task-signing Secret or carries the seed, except the dispatcher, which runs
 // by default and is the one workload that mounts it.
@@ -202,7 +202,7 @@ func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
 	secret := &corev1.Secret{}
 	secretName := "test-agent-a2a-task-signing-key"
 	if err := cl.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "test-ns"}, secret); err != nil {
-		t.Fatalf("the task-signing Secret was not rendered under next: %v", err)
+		t.Fatalf("the task-signing Secret was not rendered: %v", err)
 	}
 	key, ok := readA2ATaskSigningKey(secret)
 	if !ok {

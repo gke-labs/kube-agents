@@ -31,14 +31,26 @@ This is the module the full-install composition (and therefore `install.sh`, whe
 GitHub integration is configured) uses for the minter's GCP half; the chart's
 `githubMinter.*` values render the Kubernetes half, and the AOT KMS key import completes
 the pair. The canonical identifiers also live with the installer, and the module's
-defaults mirror them: the GSA `kubeagents-github-minter-gsa` and the namespace
-`kubeagents-system` as defaults in `install.defaults.env` (an install overrides them
-through `install.env`), the KSA `kubeagents-github-minter` as a constant in
-`scripts/installer/common.sh` for the dev tooling. `install.sh` gives a new install its
-own GSA, key ring and key names, derived from the cluster, and keeps the names an
-existing install's state holds; these defaults are what an existing install was
-created with. `owner_labels` and `owner_description` record the owning install on the
+defaults mirror them: the GSA `kubeagents-github-minter-gsa`, the KSA
+`kubeagents-github-minter` and the namespace `kubeagents-system` as defaults in
+`install.defaults.env` (an install overrides them through `install.env`). `install.sh`
+gives a new install its own GSA, KSA, key ring and key names, derived from the cluster,
+and keeps the names an existing install's state holds; these defaults are what an
+existing install was created with. `owner_labels` and `owner_description` record the owning install on the
 crypto key and the GSA, for the full-install composition's adoption check.
+
+## Trust between installs in one project
+
+The minter GSA trusts one Workload Identity member,
+`serviceAccount:<project>.svc.id.goog[<namespace>/<ksa_name>]`. The pool is the whole
+project, so the member names no cluster. Two installs in one project that share the
+namespace and `ksa_name` can each act as the other's minter GSA, however differently
+the GSAs are named; that is why `install.sh` gives each new install its own KSA name.
+
+Distinct names stop accidental cross-use, not a deliberate one. Anyone who can create a
+ServiceAccount in that namespace on any cluster in the project can create one with this
+install's KSA name and act as its minter GSA. Installs that must not be able to act as
+each other belong in separate projects: the project is the trust boundary.
 
 ## Usage
 

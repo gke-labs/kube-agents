@@ -41,16 +41,11 @@ import (
 // file, it existed only as a sidecar the CR declared on spec.deployment.sidecars,
 // and only CI declared one (hack/ci-deploy.sh), so a stock `next` install had no
 // executor and answered nothing. The bridge is release surface now, so the
-// operator renders it beside the agent container under `next`, the way the
-// agent's other next-only wiring is rendered (a2aAgentSurface: next, and version
-// skew, where a frozen bus that is still running keeps its executor). Under
-// `today` nothing is rendered.
+// operator renders it beside the agent container on every install.
 //
 // A CR that declares its own bridge sidecar keeps it: the declared one wins and
 // the operator renders none (a2aBridgeDeclared says what counts as declared), so
-// an install that already carries one does not get two bridges. Such a declared sidecar is still
-// copied into the pod without regard to the mode, so it still crash-loops on a
-// flip to `today` (a2a/docs/hermes-bridge.md); the rendered one does not.
+// an install that already carries one does not get two bridges.
 //
 // The rendered container is the agent container with the bridge's own settings
 // on top, exactly as ci-deploy.sh built the declared one: the agent's env and
@@ -185,7 +180,7 @@ func a2aIsBridgeSidecar(c corev1.Container) bool {
 // agent: the agent carries its next-only wiring, and the CR declares no bridge
 // of its own.
 func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aAgentSurface(agent) && !a2aBridgeDeclared(agent)
+	return !a2aBridgeDeclared(agent)
 }
 
 // a2aBridgeInPod reports whether the rendered bridge is in the pod yet: it is
@@ -197,8 +192,18 @@ func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
 // not wait: it counts the bridge from the first render (a2aBridgeSidecars), so
 // the first provisioning Job is already sized for it and the bridge's arrival
 // does not re-render the Job.
+//
+// A bus migration drops BusProvisioned when it changes the server count, so
+// Ready waits for the provision Job after it (reconcileA2AStack). The bridge
+// does not wait with it: the streams come through a run, and withholding the
+// bridge for the run's length would roll the agent pod out and back in for
+// nothing. A run given up is the exception: the provision Job recreates,
+// empty, the streams it did not put back, so the bridge waits for that. The
+// record goes when the stack is torn down (a switch to today), so a later
+// bring-up waits for its own provisioning.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent) && busProvisioned(agent)
+	run := agent.Status.BusMigration
+	return a2aBridgeRendered(agent) && (busProvisioned(agent) || (run != nil && !run.GivenUp))
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment

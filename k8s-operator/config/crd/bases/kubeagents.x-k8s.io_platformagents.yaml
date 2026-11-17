@@ -145,9 +145,7 @@ spec:
                         settings for the agent pod.
                       properties:
                         a2aGateway:
-                          description:
-                            A2AGateway is the A2A gateway's availability,
-                            under mode next.
+                          description: A2AGateway is the A2A gateway's availability.
                           properties:
                             replicas:
                               description: |-
@@ -10075,7 +10073,7 @@ spec:
                           type: object
                         busReplicas:
                           description: |-
-                            BusReplicas is how many NATS servers run the A2A bus under mode: next,
+                            BusReplicas is how many NATS servers run the A2A bus,
                             and so how many copies JetStream keeps of every stream and bucket: 3
                             runs a cluster with R3 streams, which keeps the bus up through a node
                             drain, upgrade or eviction that moves one server; 1 runs a single
@@ -10084,16 +10082,16 @@ spec:
                             that outage; it saves two NATS pods and two 40Gi volumes.
 
                             Unset, an install keeps the count its bus already runs, so an install
-                            whose next-mode bus predates the three-server default stays on one
-                            server, and a new bus gets three, including the one a today install's
-                            first switch to next creates (status.busReplicas shows which applies).
+                            whose bus predates the three-server default stays on one
+                            server, and a new bus gets three (status.busReplicas shows which applies).
 
-                            Set, it decides the count of a bus that does not exist yet. An existing
-                            bus keeps the count it runs: NATS cannot carry a single server's streams
-                            into a cluster or a cluster's into a single server, and the migration
-                            that would keep them is not here yet, so a count that differs is refused
-                            (the A2ABusConversionRefused condition; the admission webhook refuses the
-                            edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+                            Set, it decides the count of a bus that does not exist yet. On an
+                            existing bus, a change between 1 and 3 starts a migration that keeps
+                            the bus's data (status.busMigration, the A2ABusMigrating condition):
+                            the bus keeps the count it runs until the migration converts it, and
+                            the admission webhook refuses another change while one runs. One server
+                            to three freezes writes for the window, since it copies the streams
+                            (docs/designs/spec-nats-deployment.md).
                           enum:
                             - 1
                             - 3
@@ -10214,8 +10212,7 @@ spec:
                         maxSessions:
                           description: |-
                             MaxSessions caps how many A2A session pods run concurrently, install-wide.
-                            It only means something under mode: next - a today install renders neither
-                            the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+                            "Delegate:" makes pod
                             creation user-triggerable from chat and threads are free, so the principal
                             map bounds WHO can spawn and this bounds HOW MANY.
 
@@ -10246,7 +10243,7 @@ spec:
                             cannot hold the configured concurrency refuses a legitimate session's
                             consumer create at load. That one is capacity, not a control - it is
                             sized to fit this cap rather than to enforce it - and because
-                            provisioning never edits an existing stream, an install whose TASKS
+                            provisioning never changes an existing stream's max_consumers, an install whose TASKS
                             stream is too small for the configured cap makes the provision Job
                             fail rather than letting the shortfall surface later as a legitimate
                             session's consumer create being refused and reported as a task
@@ -10425,6 +10422,21 @@ spec:
                             || self.profiles.childReserve < (has(self.profiles.ceiling)
                             ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress
                             : 6))"
+                    universeDomain:
+                      description: |-
+                        UniverseDomain is the Google Cloud API universe domain for this install
+                        (for example, "googleapis.com" on standard Google Cloud, or a custom API
+                        domain on Google Cloud Dedicated / Sovereign Cloud). When omitted, the
+                        operator probes the GKE metadata server
+                        (/computeMetadata/v1/universe/universe-domain) and falls back to
+                        "googleapis.com" outside GCE/GKE. One PlatformAgent spans a single
+                        universe domain: when set and the host metadata server reports a
+                        different universe domain, the operator refuses the mismatch and marks
+                        the CR Degraded with reason UniverseDomainMismatch rather than sending
+                        tokens across universe boundaries.
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$
+                      type: string
                   required:
                     - clusterName
                     - location
@@ -10789,7 +10801,7 @@ spec:
                           default: true
                           description: |-
                             AnswerFeedback draws thumbs-up and thumbs-down buttons under each
-                            final answer on Google Chat under spec.mode next, and keeps each rating
+                            final answer on Google Chat, and keeps each rating
                             with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
                             False hides the buttons and keeps nothing.
                           type: boolean
@@ -10966,7 +10978,7 @@ spec:
                           default: true
                           description: |-
                             AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
-                            each final answer under spec.mode next, and keeps each rating with
+                            each final answer, and keeps each rating with
                             its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
                             False hides the buttons and keeps nothing.
                           type: boolean
@@ -11043,10 +11055,9 @@ spec:
                         homeChannelPolicy:
                           description: |-
                             HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-                            A2A gateway may learn the Slack home channel under spec.mode next with
-                            Slack on the gateway (Google Chat not enabled) when HomeChannel is
-                            empty. Under "auto" the channel of the first top-level
-                            mention of the agent in a channel becomes the home channel: the gateway
+                            A2A gateway may learn the Slack home channel when HomeChannel is
+                            empty. Under "auto" the channel of the first top-level mention of the
+                            agent in a channel becomes the home channel: the gateway
                             records it in the <agent>-home-channel ConfigMap, the operator projects
                             it into the <agent>-chat-home ConfigMap it mounts as a directory in the
                             agent pod and the gateway pod, both read the file within about a minute
@@ -11190,10 +11201,14 @@ spec:
                         "!has(self.repositories) || self.repositories.all(r, has(self.forges)
                         && self.forges.exists(f, f.name == r.forge))"
                 mode:
+                  default: next
                   description: |-
-                    Mode selects which component stack the operator renders.  "today" is the
-                    current architecture.  "next" additionally renders the NATS and A2A
-                    gateway components, which are otherwise dark.  Absent means "today".
+                    Mode is deprecated and ignored: every install runs the A2A stack (the
+                    NATS bus and the A2A gateway), which "next" once selected.
+                    The field stays so a stored object that still carries "today" remains
+                    valid; the admission webhook rewrites "today" to "next", the schema
+                    defaults an absent field to "next", and the operator patches a stored
+                    "today" to "next" on its first pass. A later release removes the field.
                   enum:
                     - today
                     - next
@@ -12142,7 +12157,7 @@ spec:
                         PeopleSeen keeps one hashed key and a last-active time per verified
                         chat person in the gateway's people bucket, for 30 days after their
                         last turn, and serves the people seen in the last 7 and 30 days as
-                        kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+                        kubeagents_a2a_gateway_people_seen. False writes no
                         key, deletes every key the bucket holds at the gateway's next start,
                         and serves no sample.
                       type: boolean
@@ -12158,16 +12173,165 @@ spec:
                     Address is the fully qualified domain name (FQDN) of
                     the agent service.
                   type: string
+                busMigration:
+                  description: |-
+                    BusMigration is the A2A bus's server-count migration under spec.mode:
+                    next, while one runs or since the last one ended: setting
+                    spec.harness.tuning.busReplicas to another count on an existing bus
+                    starts one, and it converts the bus without emptying it. Unset when no
+                    migration has run.
+                  properties:
+                    abandoning:
+                      description: |-
+                        Abandoning is set once the migration is on its way back to the old
+                        count.
+                      type: boolean
+                    cause:
+                      description: |-
+                        Cause is why the run turned back: the phase that failed, and whether
+                        it was still running at Deadline. Set at the first failure and kept
+                        until a retry, which moves it into Retries.
+                      type: string
+                    cleared:
+                      description: |-
+                        Cleared lists the provisioned streams the latest Clearing phase has
+                        deleted, ahead of the conversion or of the rollback after a failed
+                        restore (a failed conversion rolls back on the forward clear's
+                        record). A restore starts only once it names every one.
+                      items:
+                        type: string
+                      type: array
+                    deadline:
+                      description: |-
+                        Deadline is the deadline of the stretch the run is on: when an
+                        unfinished phase counts as failed, and when the migration's bus
+                        credentials stop working. Its Jobs stop a few minutes before it. A
+                        run that turns back gets one fresh deadline for its way back
+                        (ForwardDeadline keeps the first), and a retry another.
+                      format: date-time
+                      type: string
+                    failedIn:
+                      description: |-
+                        FailedIn is the phase a Failed run failed in. A run that failed inside
+                        the one to three leg's write freeze keeps the freeze, with its
+                        snapshot, until a person retries it or gives it up, each with an
+                        annotation on the PlatformAgent naming this run (the A2ABusMigrating
+                        condition says which). A Failed run blocks any new migration until
+                        then.
+                      type: string
+                    forwardDeadline:
+                      description: |-
+                        ForwardDeadline is the deadline the run went forward under, kept once
+                        it turned back and Deadline became its way back's.
+                      format: date-time
+                      type: string
+                    freezeConfirmed:
+                      description: |-
+                        FreezeConfirmed is set once every callout replica serves the write
+                        freeze's identity map, and only then does the bus render without its
+                        static application users and restart into the freeze.
+                      type: boolean
+                    givenUp:
+                      description: |-
+                        GivenUp is set when a person gave a Failed run up: its freeze is
+                        lifted, and streams it did not put back are recreated empty.
+                      type: boolean
+                    leg:
+                      description: |-
+                        Leg is the direction: OneToThree (snapshot and restore, behind a write
+                        freeze) or ThreeToOne (in place).
+                      enum:
+                        - OneToThree
+                        - ThreeToOne
+                      type: string
+                    message:
+                      description: Message is the manual step a Failed migration names.
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        ObservedGeneration is the PlatformAgent generation that started this
+                        migration. A migration that ended without converting is not started
+                        again until busReplicas asks for another count, or the
+                        bus-migration-start annotation names the run.
+                      format: int64
+                      type: integer
+                    phase:
+                      description: |-
+                        Phase is where the migration is. Done converted the bus with its data;
+                        Abandoned left it at its old count with its data; Failed stopped where
+                        a person has to act, and Message says what.
+                      type: string
+                    phaseDeadline:
+                      description: |-
+                        PhaseDeadline is a deadline the current phase has of its own, shorter
+                        than Deadline, which applies as well: the one to three leg's
+                        Converting phase has 15 minutes to get three servers Ready, since the
+                        bus is write-frozen and its only copy is on the staging claim while it
+                        waits. Unset in every other phase.
+                      format: date-time
+                      type: string
+                    retries:
+                      description: |-
+                        Retries records each retry of a Failed run, oldest first, at most
+                        three.
+                      items:
+                        description: |-
+                          BusMigrationRetry is one retry of a Failed bus migration run: when it was
+                          asked for, and the failure it retried.
+                        properties:
+                          at:
+                            description: At is when the retry was asked for.
+                            format: date-time
+                            type: string
+                          cause:
+                            description: Cause is why the retried attempt failed.
+                            type: string
+                          failedIn:
+                            description:
+                              FailedIn is the phase the retried attempt failed
+                              in.
+                            type: string
+                        required:
+                          - at
+                          - failedIn
+                        type: object
+                      maxItems: 3
+                      type: array
+                    runID:
+                      description: |-
+                        RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+                        principals.
+                      type: string
+                    startedAt:
+                      description: StartedAt is when the migration began.
+                      format: date-time
+                      type: string
+                    warnings:
+                      description: |-
+                        Warnings are what the restore found and restored anyway: a stream
+                        lacking a subject a fresh install has, or a field outside the
+                        restore's policy that differs from a fresh install. Together they are
+                        reported once, in one Warning Event. At most 4 KiB of them; the last says
+                        how many more there were.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                    - deadline
+                    - leg
+                    - observedGeneration
+                    - phase
+                    - runID
+                    - startedAt
+                  type: object
                 busReplicas:
                   description: |-
-                    BusReplicas is the A2A bus's NATS server count under spec.mode: next:
-                    the count the bus already runs, which spec.harness.tuning.busReplicas
-                    does not change; for a new bus, that field, or 3. Re-derived on every
-                    reconcile under next, so it is a reading of the bus rather than a
-                    setting. Under spec.mode: today it is left at the count the bus last
-                    ran, so that a flip back returns the bus at that count rather than the
-                    count its kept data claims imply; it is not a claim that a bus is
-                    running, and with the claims deleted it no longer decides anything.
+                    BusReplicas is the A2A bus's NATS server count:
+                    the count the bus runs, which only a migration changes (BusMigration);
+                    for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived on
+                    every reconcile, so it is a reading of the bus rather than a setting;
+                    it is not a claim that a bus is running, and with the claims deleted it
+                    no longer decides anything.
                   format: int32
                   type: integer
                 conditions:
@@ -12335,6 +12499,12 @@ spec:
                     was last computed from.
                   format: int64
                   type: integer
+                observedVersion:
+                  description: |-
+                    ObservedVersion is the image tag or digest from the reconciled gateway
+                    workload's platform-agent container (for example, "v0.12.3", "sha-abc1234",
+                    or "sha256:..."), stripped of any registry host and repository path.
+                  type: string
                 phase:
                   description: |-
                     Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
@@ -12347,7 +12517,7 @@ spec:
                     in seconds, when the A2A provision Job last found it longer than this
                     operator creates the stream with (0 when the stream has no age limit).
                     It is absent when the stream is no longer than that, or before a report.
-                    Provisioning never edits an existing stream, so one an older operator
+                    Provisioning never changes an existing stream's max age, so one an older operator
                     created longer, or one edited by hand, can keep submissions longer than
                     this operator would, and the dispatcher is told the longer of the two
                     (up to a year): a finished task's tombstone has to outlive its
@@ -12355,6 +12525,15 @@ spec:
                     picked up within a day.
                   format: int64
                   type: integer
+                resolvedUniverseDomain:
+                  description: |-
+                    ResolvedUniverseDomain is the Google Cloud API universe domain the
+                    operator resolved for this install from spec.harness.universeDomain or
+                    from the GKE metadata server (/computeMetadata/v1/universe/universe-domain).
+                    Written by the Ready status update; absent before a pass reaches it, when
+                    spec.harness.universeDomain is unset and the metadata server did not
+                    answer (for example on kind), and while the served CRD predates the field.
+                  type: string
                 serviceStatus:
                   description: ServiceStatus holds internal/external endpoints.
                   properties:
@@ -12406,6 +12585,12 @@ spec:
                         install gets when discovery is switched off or could not complete.
                       type: string
                   type: object
+                universeDomainSource:
+                  description: |-
+                    UniverseDomainSource reports how ResolvedUniverseDomain was determined
+                    ("Spec" when spec.harness.universeDomain is set, "Discovered" when read
+                    from the GKE metadata server). Absent alongside ResolvedUniverseDomain.
+                  type: string
                 usage:
                   description: |-
                     Usage summarises the agent's activity: the interfaces its spec enables and
@@ -12477,8 +12662,8 @@ spec:
                         does. Read every five minutes from the chat_metrics plugin's
                         kubeagents_chat_messages_inbound_total on the platform-agent container
                         of the gateway pod that runs Hermes (above one replica, the leader
-                        alone), summed across the pods that have led, and, on a next-mode
-                        install, from the A2A gateway's
+                        alone), summed across the pods that have led, and from the A2A
+                        gateway's
                         kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
                         ingress is that gateway's there; kept monotonic the same way as
                         ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
@@ -12490,9 +12675,9 @@ spec:
                       description: |-
                         ChatSessionsTotal is the chat half of SessionsTotal: the chat
                         conversations the gateway opened a session for (the session_store
-                        plugin's kubeagents_chat_sessions_total on a today install, that plus
-                        the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
-                        install), without the event watcher's triage sessions. A re-seed from
+                        plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+                        kubeagents_a2a_gateway_sessions_total), without the event watcher's
+                        triage sessions. A re-seed from
                         a status that carries no chatSessionsTotal (an install with triage
                         sessions and no chat yet, or a served CRD that holds the field back)
                         seeds those triage sessions into the chat half, and the counter keeps
@@ -12509,10 +12694,10 @@ spec:
                         connection error, the gateway timeout) or a provider authentication
                         failure, counted by the chat_metrics plugin's
                         kubeagents_chat_turns_errored_total on the gateway pod that runs
-                        Hermes; and on a next-mode install, an A2A task that ended failed or
+                        Hermes; and an A2A task that ended failed or
                         rejected, read from the A2A gateway's
                         kubeagents_a2a_gateway_task_terminals_total under those two states.
-                        That family carries no platform, so on next it counts every A2A task's
+                        That family carries no platform, so it counts every A2A task's
                         terminal, a door's program-to-program task included, not chat alone;
                         rejected is a task the executor refused, counted as the design asks.
                         Read every five minutes and kept monotonic the same way as
@@ -12624,7 +12809,7 @@ spec:
                         counts again, and a reaction before the first inbound message after a
                         start is not counted), into the chat_metrics plugin's
                         kubeagents_chat_feedback_negative_total; Google Chat delivers no
-                        reaction events. On a next-mode install the A2A gateway's
+                        reaction events. The A2A gateway's
                         kubeagents_a2a_gateway_answer_feedback_total under rating down joins
                         it: one count each time a verified sender's rating of one of its
                         answers becomes Bad answer, so a repeated tap adds nothing. Read every
@@ -12645,13 +12830,13 @@ spec:
                     peopleSeen7d:
                       description: |-
                         PeopleSeen7d is the A2A gateway's count now of the distinct people who
-                        wrote on the chat platform it serves within the last 7 days:
+                        wrote on the chat platforms it serves within the last 7 days:
                         kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
                         across gateway pods. A reading, not an accumulation: it falls as a
                         person's last message ages out of the window. A 0 is a reading. Absent
                         until the first reading, after two polls in a row without one, while a
-                        chat platform the install enables is served through Hermes (Google Chat
-                        or Slack on their legacy consumers, or Teams), and while the served CRD
+                        chat platform the install enables is served through Hermes (Microsoft
+                        Teams), and while the served CRD
                         predates the field. Moves neither LastActiveTime nor
                         LastHumanActiveTime.
                       format: int64
@@ -12671,8 +12856,8 @@ spec:
                         so a repeated tap adds nothing:
                         kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
                         over its other labels; read every five minutes and kept monotonic the
-                        same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
-                        install this stays at 0. Does not move LastActiveTime: the message the
+                        same way as ToolExecutionsTotal. The Hermes gateway counts no thumbs-up,
+                        so only ratings through the A2A gateway move it. Does not move LastActiveTime: the message the
                         person rated already did.
                       format: int64
                       type: integer
@@ -12858,8 +13043,8 @@ spec:
                         delivered (its k8s_event_watcher_triage_sessions_total; a session
                         whose inject was filtered, suppressed or failed is not counted) plus
                         the chat conversations the gateway opened a session for (the session_store
-                        plugin's kubeagents_chat_sessions_total on a today install, that plus the
-                        A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+                        kubeagents_a2a_gateway_sessions_total). A
                         chat conversation that resumes after the session store's retention
                         window (seven days by default) counts again. Read every five minutes
                         and kept monotonic across restarts, like toolExecutionsTotal.

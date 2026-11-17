@@ -58,7 +58,7 @@ Through the full-install composition's front doors there is no plan to read: the
 
 ## Tests
 
-`tests/sizing_profile.tftest.hcl` plans the module against mocked `google` and `google-beta` providers and asserts what each sizing input renders: the default and `medium` give both pools the `small` shape with the gVisor pool autoscaling from 1 to 2 per zone, `fleet` gives the two fleet shapes, an explicit machine type, disk or bound wins over `fleet`, a string input set to `""` takes the profile's value and a blank profile the default, and the validations refuse an unknown profile, a boot disk under 10 GB, an unknown disk type, a bound below 1 and a floor above the ceiling. `make terraform-test` runs it; the suite needs Terraform 1.11 or newer, above the floor the module declares for an install.
+`tftests/sizing_profile.tftest.hcl` plans the module against mocked `google` and `google-beta` providers and asserts what each sizing input renders: the default and `medium` give both pools the `small` shape with the gVisor pool autoscaling from 1 to 2 per zone, `fleet` gives the two fleet shapes, an explicit machine type, disk or bound wins over `fleet`, a string input set to `""` takes the profile's value and a blank profile the default, and the validations refuse an unknown profile, a boot disk under 10 GB, an unknown disk type, a bound below 1 and a floor above the ceiling. `make terraform-test` runs it; the suites need the Terraform the Makefile's `TERRAFORM_TEST_MIN_VERSION` names, above the floor the module declares for an install.
 
 ## Usage
 

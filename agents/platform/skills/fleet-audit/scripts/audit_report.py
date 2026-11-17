@@ -180,6 +180,7 @@ AUDITS: dict[str, AuditSpec] = {
             "lb-world-open",
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
+            "webhook-backend-unreachable",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -1189,6 +1190,7 @@ CHECK_PHRASES = {
     "lb-world-open": "{object} is a load balancer open to the internet",
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
+    "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -2794,6 +2796,96 @@ def _manifest_delta():
     import manifest_delta
 
     return manifest_delta
+
+
+# The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
+# kubeagents_switches.py in the shared scripts directory). Anything but "off"
+# has every disruption-budget fix checked against its cluster before its pull
+# request opens, and the answer written into the body (pdb_safety.py).
+AUTOMERGE_SWITCH = "AUTOMERGE"
+SWITCH_OFF = "off"
+AUTOMERGE_PRACTICE = "practice"
+# The collector outcome that says it read a cluster under the install's scope.
+COLLECTED_OUTCOME = "collected"
+
+
+def automerge_switch() -> str:
+    """The install's auto-merge switch; "off" where the switch module is absent
+    or fails, so a broken switch neither turns the checks on nor stops a fix."""
+    try:
+        from kubeagents_switches import switch  # lazy, as gitops_workspace is
+
+        return switch(AUTOMERGE_SWITCH)
+    except Exception as exc:  # noqa: BLE001 -- any failure reads as the default
+        if not isinstance(exc, ImportError):
+            log(f"WARNING: the {AUTOMERGE_SWITCH} switch could not be read ({type(exc).__name__}: {exc}); reading it as off")
+        return SWITCH_OFF
+
+
+def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+    """The safety-check section for a group's disruption-budget fixes, or "".
+
+    "" while the auto-merge switch is off, and for a group with no `no-pdb`
+    manifest fix. The group is eligible for auto-merge only when every finding
+    in it is such a fix and every check on every one passed; anything else
+    still opens, for a person to review. A check that crashes is a failed
+    check, never a refused pull request.
+    """
+    if automerge_switch() == SWITCH_OFF:
+        return ""
+    budgets = [
+        f
+        for f in group
+        if str(f.get("check") or "") == GENERATED_FIX_CHECK
+        and (f.get("remediation") or {}).get("kind") == MANIFEST_REMEDIATION_KIND
+    ]
+    if not budgets:
+        return ""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import pdb_safety  # lazy, as manifest_delta is
+
+    read = {
+        str(entry.get("name") or "")
+        for entry in _manifest_clusters(manifest)
+        if entry.get("outcome") == COLLECTED_OUTCOME
+    }
+    answers = []
+    for finding in budgets:
+        path = str((finding.get("remediation") or {}).get("path") or "")
+        raw = snapshot.get(path)
+        if GENERATED_THIS_RUN.get(str(finding.get("id", ""))) != path:
+            # Byte-exact text at a path the worker chose (over a committed
+            # file, or in another cluster's tree) is a fix for a person to read.
+            answers.append({
+                "finding_id": str(finding.get("id", "")),
+                "command": "",
+                "eligible": False,
+                "checks": pdb_safety._unanswered(
+                    "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
+                ),
+            })
+            continue
+        try:
+            answer = pdb_safety.check_fix(
+                finding,
+                raw.decode("utf-8", errors="replace") if raw is not None else None,
+                in_manifest=str(finding.get("cluster") or "") in read,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a crash is a failed check, and the fix still opens
+            answer = {
+                "finding_id": str(finding.get("id", "")),
+                "command": "",
+                "eligible": False,
+                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+            }
+        answers.append(answer)
+    eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
+    log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
+    return pdb_safety.render_section(
+        answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
+    )
 
 
 def set_sweep_waived(waived: bool) -> None:
@@ -14763,6 +14855,7 @@ def render_remediation_pr_body(
     generated_at: datetime,
     noun: str = DEFAULT_PROPOSAL_NOUN,
     unlabelled: bool = False,
+    safety: str = "",
 ) -> str:
     """The body of one remediation pull request.
 
@@ -14773,6 +14866,8 @@ def render_remediation_pr_body(
 
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
+
+    `safety` is `pdb_safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -14797,6 +14892,8 @@ def render_remediation_pr_body(
     out += ["## Files", ""]
     for path in paths:
         out.append(f"- [`{path}`]({path})")
+    if safety:
+        out += ["", safety]
 
     out += [
         "",
@@ -17022,6 +17119,7 @@ def sync_open_remediation_labels(
     audit_id: str,
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
+    listed: list[dict] | None = None,
 ) -> None:
     """Re-assert the labels on every open remediation pull request this run saw.
 
@@ -17070,6 +17168,22 @@ def sync_open_remediation_labels(
         counts = severity_counts(group)
         highest = next((s for s in SEVERITIES if counts[s]), SEVERITIES[-1])
         sync_remediation_labels(repo, number, audit_id, highest)
+        # The broker re-judges an open disruption-budget fix every run, so a
+        # label it applied comes off once the switch, the rules or the cluster
+        # no longer allow it.
+        if carries_practice_label(pr) or any(
+            str(f.get("check") or "") == GENERATED_FIX_CHECK for f in group
+        ):
+            request_practice_label(repo, number)
+    # A labelled fix whose finding is not a manifest group this run (left
+    # `manual`, or not re-planned) has no entry in `pr_by_finding`, so the
+    # run's listing (`listed`) is walked for it: the broker re-judges it and
+    # takes the label off itself.
+    for pr in listed or []:
+        number = str((pr or {}).get("number", "") or "")
+        if number and number not in seen and str(pr.get("state", "")).upper() == "OPEN" and carries_practice_label(pr):
+            seen.add(number)
+            request_practice_label(repo, number)
 
 
 class _GroupPush(NamedTuple):
@@ -17527,6 +17641,7 @@ def open_remediation_pr(
     existing: dict | None,
     generated_at: datetime,
     noun: str | None = None,
+    manifest: dict | None = None,
 ) -> str | None:
     """Land the group's files on their own branch, then open or refresh its PR.
 
@@ -17594,6 +17709,8 @@ def open_remediation_pr(
     # Known from `ensure_labels`, which every run calls first; a forge not yet
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
+    # Read once: the label fallback below re-renders the same body.
+    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -17601,6 +17718,7 @@ def open_remediation_pr(
         generated_at=generated_at,
         noun=noun or _proposal_noun(repo),
         unlabelled=not labelled,
+        safety=safety,
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
@@ -17632,6 +17750,8 @@ def open_remediation_pr(
             {"number": int(number), "title": title, "body": body},
         )
         sync_remediation_labels(repo, number, audit_id, highest)
+        if safety or carries_practice_label(existing):
+            request_practice_label(repo, number)
         return str(existing.get("url") or "")
     # Labelled in a second call because creating a proposal takes none; `gh pr
     # create --label` made the same two requests. Not best-effort: an unlabelled
@@ -17663,10 +17783,46 @@ def open_remediation_pr(
                         generated_at=generated_at,
                         noun=noun or _proposal_noun(repo),
                         unlabelled=True,
+                        safety=safety,
                     ),
                 },
             )
+    if safety and number is not None:
+        request_practice_label(repo, number)
     return str(created.get("url") or "") or None
+
+
+# The broker verb that judges a disruption-budget fix and applies the reserved
+# auto-merge label itself (vcs_broker.VcsBroker.proposal_practice_label), and
+# its labels (automerge_eligibility.RESERVED_LABELS).
+PRACTICE_LABEL_VERB = "proposal-practice-label"
+PRACTICE_LABELS = ("kube-agents:would-auto-merge", "kube-agents:auto-merge")
+
+
+def carries_practice_label(pr: dict | None) -> bool:
+    """Whether a pull request record carries one of the broker's auto-merge labels: a
+    refresh then asks the broker again even with no section to write, so a
+    label from an earlier `practice` or `on`, or from a group that has since
+    changed, comes off."""
+    return any(name.casefold() in PRACTICE_LABELS for name in pr_labels(pr))
+
+
+def request_practice_label(repo: str, number: int | str) -> None:
+    """Ask the broker to judge pull request `number` for the auto-merge label.
+
+    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    holding a disruption-budget fix), and on a refresh of a pull request that
+    already carries the label. The broker reads everything itself and decides;
+    this sends the number and logs the answer. A refusal is logged and nothing
+    more: the pull request is open either way. A broker that does not answer
+    raises `BrokerUnavailable`, as every forge call here does.
+    """
+    try:
+        answer = forge(PRACTICE_LABEL_VERB, repo, {"number": int(number)})
+    except (ForgeError, ValueError) as exc:
+        log(f"WARNING: #{number}: the auto-merge label was not judged: {exc}")
+        return
+    log(f"PRACTICE LABEL: #{number}: labelled={answer.get('labelled')} ({answer.get('reason')})")
 
 
 def open_proposal_on(repo: str, branch: str) -> dict | None:
@@ -18308,7 +18464,10 @@ def unwritten_refusal_message(
     notes = notes or {}
     parts = [
         f"{len(unwritten)} finding(s) need their fix written before a `/remediate` "
-        "can open a pull request for them."
+        # The second sentence is #2953: a worker wrote the fixes and then opened them.
+        "can open a pull request for them. Writing a fix opens nothing unless a person's "
+        "`/remediate` already asks for it: it waits in the ledger as awaiting `/remediate`, "
+        "and you run `remediate` only when the request itself asks for fixes to be opened."
         if sweep_off
         else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
@@ -18965,6 +19124,13 @@ def plan_generated_fixes(
     return planned, answered
 
 
+#: Finding id to the path `write_generated_fixes` wrote its budget at, in this
+#: process. The safety checks read only these: `plan_generated_fixes` put the
+#: file beside the declaration under the generated name and refused a path that
+#: already held a file, which a worker-supplied path never went through.
+GENERATED_THIS_RUN: dict[str, str] = {}
+
+
 def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
     """Write each planned fix and make it the finding's `manifest` remediation."""
     for finding in findings:
@@ -18980,6 +19146,7 @@ def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, st
         remediation.update(
             {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
         )
+        GENERATED_THIS_RUN[fid] = path
         log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
 
 
@@ -22749,10 +22916,12 @@ def _open_promoted_prs(
     generated_at: datetime,
     noun: str | None = None,
     on_open: Callable[[], None] = lambda: None,
+    manifest: dict | None = None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
 
-    `on_open` runs after each one, before the next is tried.
+    `on_open` runs after each one, before the next is tried. `manifest` is the
+    run's collector manifest, which `pdb_safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -22806,6 +22975,7 @@ def _open_promoted_prs(
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
                     noun=noun,
+                    manifest=manifest,
                 )
             except BrokerUnavailable:
                 # The broker is gone, not this group: the next group would fail
@@ -23296,11 +23466,8 @@ def handle_remediate(args: argparse.Namespace) -> None:
     if issue_number is None and on_forge:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
-    pr_by_finding, _ = reconcile_remediation_prs(
-        audit_id,
-        findings,
-        remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id),
-    )
+    listed = remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id)
+    pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, listed)
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.
     #
@@ -23340,7 +23507,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"{fid} already has an open remediation pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
         )
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, listed)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         revival = (
@@ -23366,6 +23533,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number=issue_number,
         generated_at=now,
         noun=noun,
+        manifest=manifest,
     )
     print(
         json.dumps(
@@ -24544,7 +24712,7 @@ def _finish_store_ledger(
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation {noun}; not replacing it.")
     if findings and listing_refusal is None:
-        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
         comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
 
     # Retiring a fix asserts that its finding no longer reproduces: not over a
@@ -24604,6 +24772,7 @@ def _finish_store_ledger(
         # As each opens: a `finish` that dies after one is re-run, and the
         # re-run must not sweep again.
         on_open=lambda: save_chat_verdict(audit_id, repo, False, [], now, news=True),
+        manifest=manifest,
     )
     if prs_opened:
         pr_by_finding, _ = reconcile_remediation_prs(
@@ -26704,24 +26873,26 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         log(
             f"{fid}: the collector ran this check on this cluster and emitted no "
             "candidate for this object, so the sweep will not open a pull request "
-            f"on it. Comment `/remediate {fid}` if you have read it and want one."
+            f"on it. A person who has read it and wants one comments `/remediate {fid}`; never you. "
+            "A request that itself asks for fixes to be opened runs `remediate` instead."
         )
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
             f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
-            f"not open a pull request on it. Comment `/remediate {fid}` once you "
-            "have decided."
+            f"not open a pull request on it. A person comments `/remediate {fid}` once they "
+            "have decided; never you. A request that itself asks for fixes to be opened runs "
+            "`remediate` instead."
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         log(
             f"{fid} was requested by a `/remediate` older than the close of "
-            f"#{pr.get('number', '?')}; the close answers the request. Comment "
-            "`/remediate " + fid + "` again to re-open it."
+            f"#{pr.get('number', '?')}; the close answers the request. A person comments "
+            "`/remediate " + fid + "` again to re-open it; never you."
         )
 
     title = issue_title(audit_id, findings)
@@ -26925,6 +27096,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # As each opens, and not only before the store write: a `finish` that
         # dies after one is re-run, and the re-run must not sweep again.
         on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now, news=True),
+        manifest=manifest,
     )
 
     # What the live ledger renders once this branch is done, for the store.

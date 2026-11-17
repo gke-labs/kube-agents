@@ -706,13 +706,18 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
-# What this script's probe mint asks for: the same three reads the eval's
+# What this script's probe mint asks for: the same four reads the eval's
 # grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
 # holds the two equal). An omitted body would mint the installation's whole
 # grant, which includes issues: write (2026-09-22, the ledger reset) and
 # pull_requests and contents write (2026-10-01, the repository reset) on every
 # pool repository; a read probe has no business holding that.
-LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
+LEDGER_READ_PERMISSIONS = {
+    "issues": "read",
+    "pull_requests": "read",
+    "contents": "read",
+    "metadata": "read",
+}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -841,9 +846,10 @@ GEMINI_KEY_FINDINGS = frozenset(
 PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 
 # The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
-# ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
-# subnets, addresses and alert policies that a killed run left in a free
-# project. It holds one project-level custom role with exactly
+# ci-kube-agents-compute-sweep on main) lists and deletes the plant clusters,
+# forwarding rules, service attachments, backend services, health checks,
+# networks, subnets, addresses and alert policies that a killed run left in a
+# free project. It holds one project-level custom role with exactly
 # COMPUTE_SWEEP_PERMISSIONS, and nothing else on the project.
 # roles/compute.networkAdmin also covers the sweep, but it holds almost a
 # thousand permissions. A project without the grant fails every
@@ -890,6 +896,38 @@ COMPUTE_SWEEP_PERMISSIONS = frozenset({
     # list repairs it (docs/ci-pool-projects.md section 5.7).
     "monitoring.alertPolicies.list",
     "monitoring.alertPolicies.delete",
+    # `gcloud container clusters list`, and `clusters delete --async` for a
+    # cluster labelled managed-by=kube-agents-bench. No container.operations.get:
+    # with --async gcloud returns before any operation read.
+    "container.clusters.list",
+    "container.clusters.delete",
+    # `gcloud compute forwarding-rules list` (an aggregated list; both scopes
+    # held so a global plant rule cannot hide in a partial list), and
+    # `forwarding-rules delete --region` or `--global`. A PSC consumer
+    # endpoint (a rule whose target is a service attachment) is deleted under
+    # pscDelete, a producer rule under delete.
+    "compute.forwardingRules.list",
+    "compute.forwardingRules.delete",
+    "compute.forwardingRules.pscDelete",
+    "compute.globalForwardingRules.list",
+    "compute.globalForwardingRules.delete",
+    "compute.globalForwardingRules.pscDelete",
+    # `gcloud compute service-attachments list`, and `service-attachments
+    # delete --region` (regional only).
+    "compute.serviceAttachments.list",
+    "compute.serviceAttachments.delete",
+    # `gcloud compute backend-services list` (aggregated), and
+    # `backend-services delete --region` or `--global`.
+    "compute.backendServices.list",
+    "compute.backendServices.delete",
+    "compute.regionBackendServices.list",
+    "compute.regionBackendServices.delete",
+    # `gcloud compute health-checks list` (aggregated), and `health-checks
+    # delete --region` or `--global`.
+    "compute.healthChecks.list",
+    "compute.healthChecks.delete",
+    "compute.regionHealthChecks.list",
+    "compute.regionHealthChecks.delete",
 })
 
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
@@ -1251,7 +1289,7 @@ _UNREAD_PATTERNS = (
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs eight projects at once, and one wave of 429s would read
+    # the scan runs ten projects at once, and one wave of 429s would read
     # as several drifted. gRPC's retryable statuses, as gcloud prints them
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.
@@ -4033,7 +4071,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
     pins, whatever the App is granted.
     """
 

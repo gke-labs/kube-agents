@@ -121,6 +121,7 @@ func steerAndWait(t *testing.T, r *rig, conv, who, id string, origin *lib.Envelo
 // point, and the requester's press on the same record then cancels, and is
 // told nothing, so it was the presser that was refused and not the press.
 func TestAChatStopPressFromAnotherMemberCancelsNothing(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:spaces/S1/threads/T-gate-other"
 	r, origin, line := gateChatRig(t, conv)
 
@@ -175,6 +176,7 @@ func TestAChatStopPressFromAnotherMemberCancelsNothing(t *testing.T) {
 // nothing: a post with no viewer would be public. The press cancels nothing
 // all the same.
 func TestAChatStopPressNamingNoUserIsRefusedSilently(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:spaces/S1/threads/T-gate-nameless"
 	r, origin, line := gateChatRig(t, conv)
 
@@ -194,6 +196,7 @@ func TestAChatStopPressNamingNoUserIsRefusedSilently(t *testing.T) {
 // other member to refuse, and the DM's one reader would see the post as any
 // other. The press cancels nothing all the same.
 func TestAChatStopPressInADMIsRefusedSilently(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:dm/spaces/S1/threads/T-gate-dm"
 	r, origin, line := gateChatRig(t, conv)
 
@@ -280,6 +283,7 @@ func TestTheMuxAndTheSideDoorForwardAPrivatePost(t *testing.T) {
 
 // A steer author's press cancels: they asked for work in the thread too.
 func TestAChatStopPressFromASteerAuthorCancels(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:spaces/S1/threads/T-gate-steer"
 	r, origin, line := gateChatRig(t, conv)
 	steerAndWait(t, r, conv, gateOther, "spaces/S1/messages/M2", origin)
@@ -296,6 +300,7 @@ func TestAChatStopPressFromASteerAuthorCancels(t *testing.T) {
 // button, so the gate does not read it, and the line answers as it does for
 // any typed stop on Chat.
 func TestATypedStopFromAnotherMemberOnChatKeepsItsRule(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:spaces/S1/threads/T-gate-typed"
 	r, _, _ := gateChatRig(t, conv)
 
@@ -330,6 +335,7 @@ func cardStopControlsOn(t *testing.T, r *rig, addressee string) int {
 // member's press stops no cards and posts nothing; the requester's press
 // cancels the turn and sends the card-stop control.
 func TestAChatStopPressFromAnotherMemberStopsNoCards(t *testing.T) {
+	t.Parallel()
 	conv := "gchat:spaces/S1/threads/T-gate-cards"
 	r, origin, line := gateChatRig(t, conv, func(c *Config) { c.CardStop = true })
 
