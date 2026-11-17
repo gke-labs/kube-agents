@@ -29,9 +29,11 @@ The AgentProfile dispatcher runs by default, from the release set's image, which
 
 The Hermes bridge sidecar the operator renders into the agent pod is built from the
 `platform-agent` image of the same commit. The operator therefore takes its registry and tag from
-the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent`
-that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
-resource names.
+the agent image instead when that is the release `platform-agent` image by tag, else from the
+operator's release set, and `A2A_BRIDGE_IMAGE` on the operator overrides it. The chart value
+`hermesBridge.image` (`repository`, `tag`) renders that override; empty, the default, renders
+nothing. A `PlatformAgent` that declares its own `hermes-bridge` sidecar keeps it, and that
+sidecar's image is whatever the resource names.
 
 NATS, nats-box, the NATS config reloader and its metrics exporter are ordinary third-party pins,
 in the table as `nats`, `nats-box`, `nats-server-config-reloader` and `prometheus-nats-exporter`,
@@ -92,7 +94,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set). |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders. It resolves the same way the gateway, the worker and the callout do. |
 | `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders unless `operator.profileDispatcher.enabled` is `false`. |
-| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) when that image is the release platform-agent image by tag, else from the operator's release set, unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
 | `web-console` | `ghcr.io/gke-labs/kube-agents/web-console` | release tag | — | The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion. |
 
 ### Pulled by an install, built elsewhere
@@ -333,8 +335,23 @@ explicitly still wins, which is why `install.sh` leaves them unset: one explicit
 `CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
 derivation keeps each broker in step with its own agent's image.
 
+The chart passes those three always, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` only
+when `credentialProxy.image` or `hermesBridge.image` (`repository`, `tag`) is set. Unset, the
+operator derives the broker from each agent's image, and the bridge from the agent image only when
+that is the release `platform-agent` image by tag, else from the operator's release set
+([hermes-bridge.md](https://github.com/gke-labs/kube-agents/blob/main/a2a/docs/hermes-bridge.md)).
+Set one for a tag the two images were never built for, or for a mirror or registry that holds them
+at a different tag than the agent image (set `tag`). For the broker alone, set it for a
+digest-pinned or custom-named agent image too.
+
+Under `global.imageRegistry` the rendered reference is `<prefix>/<trailing name>:<tag>`, so a
+different repository path needs the prefix empty. The pin applies to every `PlatformAgent` the
+operator manages; the chart's `values.yaml` has the rest of the contract. On an `install.sh` or
+Terraform install, pass the keys through `TF_VAR_extra_helm_values`.
+
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
-the above for that agent's containers — see the
+the above for that agent's containers, except these two pins, which the operator reads before the
+CR — see the
 [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The sandbox has
 `spec.harness.experimental.shellSandbox.image`, which overrides `AGENT_SANDBOX_IMAGE` for that
 agent. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.

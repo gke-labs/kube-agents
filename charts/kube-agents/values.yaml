@@ -1032,6 +1032,41 @@ agentSandbox:
     repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
     tag: "" # defaults to Chart.appVersion
 
+# The credential broker Deployment and the hermes-bridge sidecar the operator
+# renders beside every agent: the two images it does not take from
+# OPERATOR_IMAGE by default. It derives the broker from each agent's image, taking its
+# registry path and tag and swapping the trailing name (platform-agent to
+# credential-proxy); a digest-pinned agent image falls to the CR's
+# spec.deployment.tag, else :latest. It derives the bridge the same way only
+# when the agent image is the release platform-agent image by tag; a custom
+# repository name or a digest alone takes the bridge from the operator's
+# release set, like the other A2A images (a2a/docs/hermes-bridge.md). Both
+# keys empty, the default, renders nothing and keeps that derivation, which
+# follows a mirror and the agent's tag on its own. Set either key when the
+# derivation names an image that does not exist: an agent image at a tag the
+# two were not built for (a dev tag), a mirror or registry that holds the two
+# at a different tag than the agent image (set tag), or, for the broker alone,
+# a digest-pinned or custom-named agent image. The chart then passes
+# CREDENTIAL_PROXY_IMAGE or A2A_BRIDGE_IMAGE to the operator as
+# <repository, or ghcr.io/gke-labs/kube-agents/<name> when empty>:<tag, or
+# Chart.appVersion when empty>. Under global.imageRegistry the rendered
+# reference is <prefix>/<trailing name>:<tag>, like the other first-party
+# images, so a different repository path needs the prefix empty. The operator
+# reads the env var before anything on the CR, so the pin applies to every
+# PlatformAgent in the cluster. An `upgrade.sh --upgrade-mode=harness` or a
+# Terraform `full` upgrade moves the agent's tag but not these pins, so a
+# pinned tag is moved by hand. An operator.extraEnv entry with the same name
+# still wins. The broker's per-CR sizing is
+# platformAgent.deployment.credentialProxy below.
+credentialProxy:
+  image:
+    repository: ""
+    tag: ""
+hermesBridge:
+  image:
+    repository: ""
+    tag: ""
+
 platformAgent:
   enabled: true
   name: platform-agent
