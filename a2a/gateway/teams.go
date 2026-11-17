@@ -67,6 +67,13 @@ const (
 	// it in every script (the Hermes adapter's budget, agents/platform/
 	// scripts/teams_relay_patch.py).
 	teamsMaxActivityBytes = 28 * 1024
+	// teamsPieceRunes is the most runes one post or edit carries
+	// (PieceSizer): the relay and the notifier split above it. Well under
+	// teamsMaxActivityBytes once the card's per-line overhead is added, and
+	// far above discordChunk, so a report's table lands in one card rather
+	// than cut into two with its header repeated (the 11-17 live test: a
+	// seven-row table with console links came as six rows and one).
+	teamsPieceRunes = 10000
 	// The Adaptive Card vocabulary the builder emits (teamsMarkdownToCard):
 	// element types, the header weight, heading sizes, the code font, and
 	// the Markdown marks it reads.
@@ -762,6 +769,15 @@ func (a *TeamsAdapter) OpenDirect(string) (string, error) { return "", errTeamsN
 // the ask's one receipt, and it ends as the hand-off acknowledgement or a
 // bare mark rather than "✅ completed" under the question, as on Chat.
 func (a *TeamsAdapter) AnswersOnLine(string) bool { return true }
+
+// AnswersWholeOnLine is true for every Teams conversation
+// (WholeLineAnswerer): a direct answer that fits one piece is edited onto
+// the task's line, so the ask gets one card rather than a ✅ card above a
+// second one. The live test of 11-17 showed the pair on every direct answer.
+func (a *TeamsAdapter) AnswersWholeOnLine(string) bool { return true }
+
+// PieceSize is teamsPieceRunes for every conversation (PieceSizer).
+func (a *TeamsAdapter) PieceSize(string) int { return teamsPieceRunes }
 
 // React and RemoveReaction draw no mark on Teams: a nil no-op, as the
 // Adapter contract allows a backend that does not react.

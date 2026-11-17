@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -151,6 +152,18 @@ func (g *Gateway) answerLineFor(rec *SessionRecord, taskID string) string {
 		return ref.StatusMsgID
 	}
 	return ""
+}
+
+// answersWholeOnLine reports a direct answer the backend takes whole on the
+// task's live message (WholeLineAnswerer): one within the backend's piece
+// size (PieceSizer), so the edit carries all of it. A longer one posts, in
+// pieces, and the line ends as lineDoneMark.
+func (g *Gateway) answersWholeOnLine(conversation string, m OutMessage) bool {
+	answerer, ok := g.adapter.(WholeLineAnswerer)
+	if !ok || !answerer.AnswersWholeOnLine(conversation) {
+		return false
+	}
+	return utf8.RuneCountInString(m.Text) <= pieceSizeOf(g.adapter, conversation)
 }
 
 // answerOnLine edits messageID, the task's live message, into m, the

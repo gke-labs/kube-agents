@@ -663,3 +663,17 @@ func TestTeamsNotifyRoutePostsIntoTheConversation(t *testing.T) {
 		t.Fatalf("api calls %v", relay.apiCall)
 	}
 }
+
+// The Teams adapter takes a fitting direct answer whole on the task's line
+// and names a piece size far above Discord's, under its activity cap.
+func TestTeamsAnswersWholeOnTheLineWithItsOwnPieceSize(t *testing.T) {
+	a := &TeamsAdapter{}
+	if !a.AnswersWholeOnLine("teams:19:abc@thread.tacv2") || !a.AnswersOnLine("teams:a:1") {
+		t.Fatal("want the whole answer on the line for every Teams conversation")
+	}
+	if got := a.PieceSize("teams:19:abc@thread.tacv2"); got != teamsPieceRunes || got <= discordChunk || got >= teamsMaxActivityBytes {
+		t.Fatalf("PieceSize = %d, want %d: above discordChunk (%d), under the activity cap (%d)", got, teamsPieceRunes, discordChunk, teamsMaxActivityBytes)
+	}
+	var _ WholeLineAnswerer = a
+	var _ PieceSizer = a
+}

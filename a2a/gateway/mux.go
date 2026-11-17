@@ -348,6 +348,26 @@ func (m *MultiAdapter) AnswersOnLine(conversation string) bool {
 	return ok && answerer.AnswersOnLine(conversation)
 }
 
+// AnswersWholeOnLine answers for the backend that owns the conversation
+// (WholeLineAnswerer).
+func (m *MultiAdapter) AnswersWholeOnLine(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	answerer, ok := a.(WholeLineAnswerer)
+	return ok && answerer.AnswersWholeOnLine(conversation)
+}
+
+// PieceSize is the owning backend's (PieceSizer), discordChunk otherwise.
+func (m *MultiAdapter) PieceSize(conversation string) int {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return discordChunk
+	}
+	return pieceSizeOf(a, conversation)
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {

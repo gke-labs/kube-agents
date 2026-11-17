@@ -311,6 +311,25 @@ func (s *sideDoorAdapter) AnswersOnLine(conversation string) bool {
 	return ok && answerer.AnswersOnLine(conversation)
 }
 
+// AnswersWholeOnLine answers for the primary's own conversations; a door
+// keeps the post and the terminal edit.
+func (s *sideDoorAdapter) AnswersWholeOnLine(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	answerer, ok := s.primary.(WholeLineAnswerer)
+	return ok && answerer.AnswersWholeOnLine(conversation)
+}
+
+// PieceSize is the primary's for its own conversations (PieceSizer); a
+// door's caller reads chat-sized pieces, discordChunk.
+func (s *sideDoorAdapter) PieceSize(conversation string) int {
+	if s.doorFor(conversation) != nil {
+		return discordChunk
+	}
+	return pieceSizeOf(s.primary, conversation)
+}
+
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return

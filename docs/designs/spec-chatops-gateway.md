@@ -3067,9 +3067,11 @@ Replies render as Adaptive Cards 1.5 (`adaptiveCards`, on by default), asked for
 pane width: headings, bullets, fenced code as a monospace block, a pipe table as a `Table`, a
 plain `summary` for the chat list; a card over the 28 KB activity budget posts as text, text
 over it is cut with a marker. A long reply reaches the adapter already split: the gateway cuts
-every backend's text at 1,900 bytes before it posts (`chatChunks`, which carries an open fence
-and a table's header into the next piece), so one activity is one piece and the adapter only
-fits it under the budget. The chat.notify route (`chat.notify.teams`, `NewTeamsNotifier`)
+a backend's text at its piece size before it posts (`chatChunks`, which carries an open fence
+and a table's header into the next piece); the size is the backend's own where it names one
+(`PieceSizer`: Teams says 10,000 runes, so a report's table is one card rather than two with
+the header repeated) and Discord's 1,900 elsewhere, so one activity is one piece and the
+adapter only fits it under the budget. The chat.notify route (`chat.notify.teams`, `NewTeamsNotifier`)
 posts a kanban card's report back into the Teams conversation it came from (the bridge records
 `teams:` routes beside `gchat:` and `slack:`; the bus grants, exports and imports carry the
 subject beside the other three) and a proactive post into `homeChannel`, a Teams conversation
@@ -3085,7 +3087,14 @@ is a whole conversation to the bridge's incident lookup (never spliced), as a Sl
 thread is looked up by the `(thread, thread)` row the relay stores for it, so a reply under a Teams home
 alert or report finds the stored report, as on Slack and Chat. The rolling
 status line edits its own activity through the one PUT the passthrough admits, an update of an
-activity at its id (Bot Framework's updateActivity), never the activities collection. What the
+activity at its id (Bot Framework's updateActivity), never the activities collection. The
+adapter answers `LineAnswerer` and `WholeLineAnswerer` for every Teams conversation: a
+completed task's direct answer that fits one piece is edited onto that line, so the ask gets
+one card rather than a card holding ✅ alone above a second (the 11-17 live test showed the
+pair on every direct answer); a longer answer posts in pieces and the line ends as the bare
+mark, and a task handed to cards ends it as the acknowledgement, as on Chat. An edit raises no
+Teams notification where a post does; the trade is taken for a reply that lands within the
+ask's own minute. What the
 passthrough does not serve the adapter says so about rather than guess: `OpenDirect` is refused
 (creating a conversation is outside the allowed paths), `Roster` is incomplete and empty,
 reactions are a nil no-op.

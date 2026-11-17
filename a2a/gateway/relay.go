@@ -1131,8 +1131,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		} else if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
-			} else if doneLine != "" && toCards && result != completedNonTextResult {
-				// The task's live message becomes the acknowledgement,
+			} else if doneLine != "" && (toCards || g.answersWholeOnLine(rec.Key, answer)) && result != completedNonTextResult {
+				// The task's live message becomes the acknowledgement, or
+				// the whole answer where the backend takes one that fits
+				// (WholeLineAnswerer, answersWholeOnLine),
 				// and takes no terminal edit below (LineAnswerer); an
 				// edit that does not land posts it instead. An answer
 				// posts, so it notifies: a Chat edit raises none, and
@@ -1546,7 +1548,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 // the Stop control a backend draws on it (OutMessage.Stop); the terminal
 // edit passes none and takes it off.
 func (g *Gateway) editLine(conversation, messageID, line, stop string) bool {
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: stop}); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, pieceSizeOf(g.adapter, conversation)), Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}
@@ -1622,7 +1624,7 @@ func (g *Gateway) post(conversation, text string) {
 	if strings.TrimSpace(text) == "" || g.unpostableTrigger(conversation) {
 		return
 	}
-	for _, chunk := range chatChunks(text, discordChunk) {
+	for _, chunk := range chatChunks(text, pieceSizeOf(g.adapter, conversation)) {
 		if _, err := g.adapter.Post(conversation, chunk); err != nil {
 			g.log.Error("post failed", "conversation", conversation, "err", err)
 			return

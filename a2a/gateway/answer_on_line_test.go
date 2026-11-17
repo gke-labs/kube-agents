@@ -262,3 +262,106 @@ func TestGchatAnswersOnTheLine(t *testing.T) {
 		t.Error("want the answer on the line in a thread and in a thread-less DM")
 	}
 }
+
+// wholeLineAnsweringAdapter is the fake as a backend that takes a direct
+// answer whole on the task's live message when it fits one piece
+// (WholeLineAnswerer, PieceSizer), as Teams does.
+type wholeLineAnsweringAdapter struct{ *fakeAdapter }
+
+func (wholeLineAnsweringAdapter) AnswersOnLine(string) bool      { return true }
+func (wholeLineAnsweringAdapter) AnswersWholeOnLine(string) bool { return true }
+func (wholeLineAnsweringAdapter) PieceSize(string) int           { return 60 }
+
+func startWholeLineAnsweringRig(t *testing.T) *rig {
+	t.Helper()
+	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, func(*Config) {}, func(a *fakeAdapter) Adapter {
+		return wholeLineAnsweringAdapter{a}
+	})
+	return r
+}
+
+// On a backend that takes the whole answer on the line, a direct answer
+// within one piece is edited onto the task's live message: no post carries
+// it, and the line does not end as the bare mark.
+func TestAWholeLineAnswerBackendEditsAFittingAnswerOntoTheLine(t *testing.T) {
+	t.Parallel()
+	r := startWholeLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/whole-answer-on-line", false)
+	line := lineID(t, r)
+	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
+	waitFor(t, "the answer edited onto the line", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && edits[len(edits)-1] == "the fleet is fine"
+	})
+	if postedContaining(r, "the fleet is fine")() {
+		t.Fatalf("posts = %+v, want the answer on the line only", r.adapter.posts)
+	}
+	for _, e := range editsOf(r, line) {
+		if e == lineDoneMark {
+			t.Fatalf("edits = %q, want no bare mark on a line that carries the answer", editsOf(r, line))
+		}
+	}
+}
+
+// An answer past the backend's piece size posts, in pieces, and the line
+// ends as the bare mark, as on a backend that answers on the line.
+func TestAWholeLineAnswerBackendPostsAnAnswerPastOnePiece(t *testing.T) {
+	t.Parallel()
+	r := startWholeLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/whole-answer-too-long", false)
+	line := lineID(t, r)
+	long := strings.Repeat("a line of the fleet report\n", 6) // 162 runes, past the fake's 60
+	completeTask(t, r.execFor(t, origin, "platform"), long)
+	waitFor(t, "the answer posted in pieces", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		n := 0
+		for _, p := range r.adapter.posts {
+			if strings.Contains(p.Text, "a line of the fleet report") {
+				n++
+			}
+		}
+		return n >= 2
+	})
+	waitFor(t, "the bare mark on the line", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && edits[len(edits)-1] == lineDoneMark
+	})
+	r.adapter.mu.Lock()
+	defer r.adapter.mu.Unlock()
+	for _, p := range r.adapter.posts {
+		if n := len([]rune(p.Text)); n > 60 {
+			t.Fatalf("a post of %d runes; want every piece within the backend's 60", n)
+		}
+	}
+}
+
+// Behind the mux, the whole-line answer and the piece size are the owning
+// backend's; a backend without them keeps the post and Discord's piece.
+func TestTheMuxTakesTheWholeLineAnswerAndPieceSizeFromTheOwningBackend(t *testing.T) {
+	mux, err := NewMultiAdapter("teams", "console", map[string]Adapter{
+		"teams":   wholeLineAnsweringAdapter{newFakeAdapter()},
+		"console": newFakeAdapter(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mux.AnswersWholeOnLine("teams:19:abc@thread.tacv2") || mux.PieceSize("teams:19:abc@thread.tacv2") != 60 {
+		t.Error("a Teams conversation: want the whole answer on the line and the backend's piece size")
+	}
+	if mux.AnswersWholeOnLine("console:abc") || mux.PieceSize("console:abc") != discordChunk || mux.PieceSize("discord:g/1") != discordChunk {
+		t.Error("a console or unknown conversation: want the post and Discord's piece")
+	}
+	s := &sideDoorAdapter{
+		primary: wholeLineAnsweringAdapter{newFakeAdapter()},
+		doors:   []DoorSpec{{Name: "inject", Prefix: "inject:", Door: stubDoor{}}},
+	}
+	if !s.AnswersWholeOnLine("teams:19:abc@thread.tacv2") || s.PieceSize("teams:19:abc@thread.tacv2") != 60 {
+		t.Error("the primary's conversation: want the primary's whole-line answer and piece size")
+	}
+	if s.AnswersWholeOnLine("inject:case-1") || s.PieceSize("inject:case-1") != discordChunk {
+		t.Error("a door's conversation: want the terminal edit kept and Discord's piece")
+	}
+	var _ WholeLineAnswerer = mux
+	var _ PieceSizer = mux
+}

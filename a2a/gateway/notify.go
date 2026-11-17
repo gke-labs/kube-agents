@@ -321,6 +321,11 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 // (a channel's "19:…@thread.tacv2" or a chat's) or "", for conversation
 // requests only; a thread under the home is the home with its
 // ";messageid=" suffix, which is how Teams names a channel thread.
+// pieceSize is the most runes one post or edit carries on this backend
+// (PieceSizer, discordChunk otherwise): the split and the truncations below
+// follow it, so a Teams report's table is not cut at Discord's cap.
+func (n *Notifier) pieceSize(conversation string) int { return pieceSizeOf(n.poster, conversation) }
+
 func NewTeamsNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
 	if home != "" && !teamsIsHomeConversationID(home) {
 		return nil, fmt.Errorf("notify: home channel %q is not a Teams channel, group or personal chat id", home)
@@ -888,7 +893,7 @@ func (n *Notifier) post(job notifyJob) {
 	if job.req.Conversation == "" && job.req.Thread == "" {
 		feedback = n.homeFeedback(job.req.Update, "")
 	}
-	chunks := chatChunks(job.req.Text, discordChunk)
+	chunks := chatChunks(job.req.Text, n.pieceSize(job.req.Thread))
 	for i, chunk := range chunks {
 		var message, landed string
 		var err error
@@ -1016,7 +1021,7 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 		n.log.Info("notify posted", "conversation", conversation, "message", message, "chat", true)
 		return true
 	}
-	text := OutMessage{Text: truncateRunes(m.Text, discordChunk)}
+	text := OutMessage{Text: truncateRunes(m.Text, n.pieceSize(conversation))}
 	if message, ok := n.updates.get(conversation, key); ok {
 		edited, err := n.editKeyed(conversation, message, m, text)
 		if err != nil {
@@ -1058,7 +1063,7 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 // chunk the backend will not draw the controls on posts as plain text.
 func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 	conversation := job.req.Conversation
-	chunks := chatChunks(m.Text, discordChunk)
+	chunks := chatChunks(m.Text, n.pieceSize(conversation))
 	if len(chunks) == 0 {
 		return false
 	}
@@ -1149,7 +1154,7 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		return true
 	}
 	text := OutMessage{Text: m.Text, Feedback: m.Feedback}
-	fits := utf8.RuneCountInString(m.Text) <= discordChunk
+	fits := utf8.RuneCountInString(m.Text) <= n.pieceSize(thread)
 	if m.Chat == nil && !fits {
 		return false
 	}
@@ -1506,7 +1511,7 @@ func slackThreadTS(thread string) string {
 // chunk. validate has already refused blocks to a backend without them.
 func (n *Notifier) postBlocks(job notifyJob) {
 	poster := n.poster.(notifyBlocksPoster)
-	message, landed, err := poster.PostNotifyBlocks(job.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks,
+	message, landed, err := poster.PostNotifyBlocks(job.home, job.req.Thread, truncateRunes(job.req.Text, n.pieceSize(job.req.Thread)), job.req.Blocks,
 		n.homeFeedback("", job.req.Thread))
 	if err != nil {
 		n.log.Error("notify blocks post failed", "home", job.home, "thread", job.req.Thread, "err", err, "hint", n.homePostHint(err))

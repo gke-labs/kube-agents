@@ -229,7 +229,10 @@ CLIPPED_TAIL = (
 # read needs no import of that module, which the unit tests load flat.
 SLACK_PLATFORM = "slack"
 GOOGLE_CHAT_PLATFORM = "google_chat"
-CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM)
+# Microsoft Teams is a card platform only where the gateway serves it (the
+# operator's A2A_TEAMS_BACKEND switch; the Hermes Teams adapter takes text).
+TEAMS_PLATFORM = "teams"
+CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM, TEAMS_PLATFORM)
 GATEWAY_PLATFORM_ENVS = ("A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")
 # What separates the platform names in either variable
 # (kanban_chat_notify.PLATFORM_LIST_SEPARATOR).
@@ -1609,7 +1612,9 @@ def slack_ux_on(platform: object) -> bool:
 
 def chat_ux_on(platform: object) -> bool:
     """Whether ``platform``'s cards get laid-out chat messages: :func:`slack_ux_on`, or
-    Google Chat with the flag on when the gateway serves it.
+    Google Chat or Microsoft Teams with the flag on when the gateway serves it (for
+    Teams the operator's ``A2A_TEAMS_BACKEND`` switch, which names ``teams`` in the
+    same two variables).
 
     The A2A gateway lays a ``kube-agents.chat/v1`` message out on
     Google Chat as text with buttons, so the plan, the moments, the answer and
@@ -1622,7 +1627,7 @@ def chat_ux_on(platform: object) -> bool:
     name = str(platform or "").strip().lower()
     if name == SLACK_PLATFORM:
         return slack_ux_on(platform)
-    if name != GOOGLE_CHAT_PLATFORM or not gateway_serves(name):
+    if name not in (GOOGLE_CHAT_PLATFORM, TEAMS_PLATFORM) or not gateway_serves(name):
         return False
     return _ux_flag_on()
 
