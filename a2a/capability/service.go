@@ -154,6 +154,10 @@ type Request struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 
+// malformedRequestReason is the refusal for a request that doesn't decode or
+// carries a malformed request id.
+const malformedRequestReason = "the request is not well-formed"
+
 // requestIDBytes is the entropy in one request id: 128 bits.
 const requestIDBytes = 16
 
@@ -240,7 +244,7 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 	}
 	var req Request
 	if err := json.Unmarshal(data, &req); err != nil || (req.RequestID != "" && !validRequestID(req.RequestID)) {
-		return Response{Reason: "the request is not well-formed", RequestID: id}
+		return Response{Reason: malformedRequestReason, RequestID: id}
 	}
 	resp := s.decide(ctx, caller, req)
 	resp.RequestID = req.RequestID
