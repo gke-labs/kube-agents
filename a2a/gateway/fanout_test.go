@@ -596,10 +596,14 @@ func TestTheCardsPendingMarkSurvivesARestart(t *testing.T) {
 	if len(got) != 1 || got[0].TaskID != origin.TaskID || !got[0].CardsPending {
 		t.Fatalf("terminal frames = %+v, want one for %s with cardsPending", got, origin.TaskID)
 	}
-	rec, _ := r2.g.reg.Get(context.Background(), conv)
-	if ref, _ := rec.TaskRefFor(origin.TaskID); ref.CardsPending {
-		t.Fatal("the chain's end left the mark on the record")
-	}
+	// The frame is posted before the caller writes the record that clears
+	// the mark (consoleFrame takes it; the caller writes), so wait for the
+	// write rather than read once.
+	waitFor(t, "the chain's end to clear the mark on the record", func() bool {
+		rec, _ := r2.g.reg.Get(context.Background(), conv)
+		ref, _ := rec.TaskRefFor(origin.TaskID)
+		return !ref.CardsPending
+	})
 }
 
 // TestABatchCutShortByARestartFinishesOnRedelivery: a gateway that stops
