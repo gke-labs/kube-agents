@@ -45,6 +45,8 @@ case "$*" in
     if [ -f "$STATE/callout_flaky" ]; then echo "Unable to connect to the server: dial tcp: i/o timeout" >&2; exit 1; fi
     echo 'Error from server (NotFound): deployments.apps "platform-agent-a2a-callout" not found' >&2; exit 1 ;;
   "get deployment/platform-agent-gateway"*jsonpath*)
+    n=$(cat "$STATE/fails" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$STATE/fails"; echo "Unable to connect" >&2; exit 1; fi
     if [ -f "$STATE/bridge" ]; then echo "platform-agent fluent-bit hermes-bridge"; else echo "platform-agent fluent-bit"; fi ;;
   *) exit 0 ;;
 esac
@@ -52,7 +54,7 @@ esac
 
 
 class BridgeFromTheFirstRolloutTest(unittest.TestCase):
-    def _run(self, *, callout: bool, bridge: bool, callout_flaky: bool = False):
+    def _run(self, *, callout: bool, bridge: bool, callout_flaky: bool = False, fails: int = 0):
         with tempfile.TemporaryDirectory() as d:
             state = pathlib.Path(d)
             stub_dir = state / "bin"
@@ -64,10 +66,13 @@ class BridgeFromTheFirstRolloutTest(unittest.TestCase):
                 if on:
                     (state / name).write_text("")
             (state / "calls").write_text("")
+            (state / "fails").write_text(str(fails))
             script = "\n".join(
                 [
                     "set -euo pipefail",
                     'NAMESPACE="kubeagents-system"',
+                    "MODE_NEXT_POLL_SECONDS=0",
+                    "BRIDGE_TEMPLATE_READ_ATTEMPTS=3",
                     'PLATFORM_AGENT_CR_NAME="platform-agent"',
                     'AGENT_DEPLOYMENT_NAME="platform-agent-gateway"',
                     'BRIDGE_SIDECAR_NAME="hermes-bridge"',
@@ -99,6 +104,18 @@ class BridgeFromTheFirstRolloutTest(unittest.TestCase):
         self.assertIn("DONE", proc.stdout)
         self.assertIn("WARNING: the A2A stack is rendered", proc.stdout)
         self.assertEqual(len([c for c in calls if "jsonpath" in c]), 1, calls)
+
+    def test_a_failed_read_is_retried_not_read_as_a_missing_bridge(self):
+        proc, calls = self._run(callout=True, bridge=True, fails=2)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("from its first rollout", proc.stdout)
+        self.assertEqual(len([c for c in calls if "jsonpath" in c]), 3, calls)
+
+    def test_a_template_never_read_warns_as_unreadable(self):
+        proc, _ = self._run(callout=True, bridge=True, fails=9)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("could not read", proc.stdout)
+        self.assertNotIn("has no hermes-bridge", proc.stdout)
 
     def test_no_a2a_stack_skips_the_read(self):
         proc, calls = self._run(callout=False, bridge=False)
@@ -154,7 +171,8 @@ class Step6bBridgeReadTest(unittest.TestCase):
 
     def _run(self, *, bridge: bool, fails: int = 0):
         text = _CI_DEPLOY.read_text()
-        start = text.index(_6B_START)
+        gate = text.index('gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"')
+        start = text.index(_6B_START, gate)
         block = text[start : text.index(_6B_END, start) + len(_6B_END)]
         with tempfile.TemporaryDirectory() as d:
             state = pathlib.Path(d)
@@ -173,6 +191,7 @@ class Step6bBridgeReadTest(unittest.TestCase):
                     'AGENT_DEPLOYMENT_NAME="platform-agent-gateway"',
                     'BRIDGE_SIDECAR_NAME="hermes-bridge"',
                     "MODE_NEXT_POLL_SECONDS=0",
+                    "BRIDGE_TEMPLATE_READ_ATTEMPTS=3",
                     "MODE_NEXT_START=$SECONDS",
                     'dump_mode_next_state() { echo DUMPED; }',
                     block,

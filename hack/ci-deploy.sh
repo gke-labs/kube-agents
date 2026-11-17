@@ -623,6 +623,9 @@ readonly A2A_AGENT_DOOR_ON="true"
 # it must not mount are the operator's, not this script's. The script names
 # the container only to read its log (a2aBridgeContainerName).
 readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
+# How many times steps 6 and 6b read the agent pod template for the bridge
+# before a read that never answers is reported as unreadable (#5973).
+readonly BRIDGE_TEMPLATE_READ_ATTEMPTS=3
 # The lane runs the bridge's shipped default executor, api, the one a customer
 # install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
 # unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
@@ -2526,14 +2529,29 @@ callout_read="$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -
 if [ "${bridge_check}" = false ]; then
   echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar to check"
 else
-  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
-    *" ${BRIDGE_SIDECAR_NAME} "*)
-      echo "✓ ${AGENT_DEPLOYMENT_NAME} carries the ${BRIDGE_SIDECAR_NAME} sidecar from its first rollout"
-      ;;
-    *)
-      echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME}'s template has no ${BRIDGE_SIDECAR_NAME} sidecar after its rollout; an operator that adds it later rolls the gateway again under the checks below (#5962)"
-      ;;
-  esac
+  # A read that fails is retried, and one that never answers is named as
+  # such rather than as a missing bridge.
+  agent_containers=""
+  agent_read=false
+  for ((attempt = 0; attempt < BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if agent_containers="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)"; then
+      agent_read=true
+      break
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [ "${agent_read}" = false ]; then
+    echo "WARNING: could not read ${AGENT_DEPLOYMENT_NAME}'s template to check for the ${BRIDGE_SIDECAR_NAME} sidecar; carrying on"
+  else
+    case " ${agent_containers} " in
+      *" ${BRIDGE_SIDECAR_NAME} "*)
+        echo "✓ ${AGENT_DEPLOYMENT_NAME} carries the ${BRIDGE_SIDECAR_NAME} sidecar from its first rollout"
+        ;;
+      *)
+        echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME}'s template has no ${BRIDGE_SIDECAR_NAME} sidecar after its rollout; an operator that adds it later rolls the gateway again under the checks below (#5962)"
+        ;;
+    esac
+  fi
 fi
 
 # The shell sandbox is the other half of the agent: everything the model runs
@@ -3249,7 +3267,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # container fails the step.
   agent_containers=""
   agent_read=false
-  for _ in 1 2 3; do
+  for ((attempt = 0; attempt < BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
     if agent_containers="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}')"; then
       agent_read=true
       break
