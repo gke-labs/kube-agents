@@ -4583,12 +4583,16 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         dep = self.backend(ports=[{"name": "https", "containerPort": 8443}])
 
         # 1. Autopilot cluster still evaluates HTTPRoute mismatches before returning early on ComputeClass.
-        def run_autopilot(argv, **kwargs):
+        def run_autopilot(argv: list[str], **kwargs):
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.01)
-            if "httproutes.gateway.networking.k8s.io" in argv:
+            if argv[:3] == ["kubectl", "get", collect.HTTPROUTE_CRD_RESOURCE]:
                 return Run(argv, 0, json.dumps(dump_of(route)), "", 0.01)
-            if "backendconfigs.cloud.google.com" in argv or "healthcheckpolicies.networking.gke.io" in argv:
+            if (
+                argv[:2] == ["kubectl", "get"]
+                and len(argv) >= 3
+                and argv[2] in (collect.BACKEND_CONFIG_CRD_RESOURCE, collect.HEALTH_CHECK_POLICY_CRD_RESOURCE)
+            ):
                 return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "backendconfigs"', 0.01)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
@@ -4597,19 +4601,23 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         ap_cluster = {"name": "ap", "project": "acme", "location": "us-central1", "autopilot": True}
         with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
             res_ap = collect.collect_cluster(ap_cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run_autopilot)
+            ap_kc = collect.kubeconfig_path(ap_cluster["project"], ap_cluster["name"], ap_cluster["location"])
         self.assertEqual(res_ap["outcome"], "collected")
         mismatch = [c for c in res_ap["candidates"] if c["check"] == "ingress-gateway-healthcheck-mismatch"]
         self.assertEqual(len(mismatch), 1)
         self.assertEqual(mismatch[0]["object"], "Service/backend-api-svc")
         mm_cmd = next(c["command"] for c in res_ap["commands"] if c["check"] == "ingress-gateway-healthcheck-mismatch")
-        self.assertIn("kubectl get httproutes.gateway.networking.k8s.io -A --chunk-size=500 -o json", mm_cmd)
-        self.assertNotIn("backendconfigs.cloud.google.com", mm_cmd)
+        expected_ap_dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=ap_kc)
+        self.assertEqual(
+            mm_cmd,
+            f"{expected_ap_dump}; KUBECONFIG={collect.shlex.quote(str(ap_kc))} kubectl get {collect.HTTPROUTE_CRD_RESOURCE} -A --chunk-size=500 -o json",
+        )
 
         # 2. Forbidden / failed CRD read marks ingress-gateway-healthcheck-mismatch unevaluated.
-        def run_forbidden(argv, **kwargs):
+        def run_forbidden(argv: list[str], **kwargs):
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.01)
-            if "httproutes.gateway.networking.k8s.io" in argv:
+            if argv[:3] == ["kubectl", "get", collect.HTTPROUTE_CRD_RESOURCE]:
                 return Run(argv, 1, "", "Error from server (Forbidden): httproutes is forbidden", 0.01)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
@@ -4770,6 +4778,45 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         )
         self.assertEqual(len(mirror_hits), 1)
         self.assertIn("HTTPRoute/edge/edge-route", mirror_hits[0]["excerpt"])
+
+        # Per-backend RequestMirror filter under spec.rules[].backendRefs[].filters[].
+        backend_filter_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "backend-mirror", "namespace": "edge", "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "backendRefs": [
+                            {
+                                "name": "edge-svc",
+                                "port": 80,
+                                "filters": [
+                                    {
+                                        "type": "RequestMirror",
+                                        "requestMirror": {
+                                            "backendRef": {
+                                                "name": "backend-api-svc",
+                                                "namespace": "seeded-networking",
+                                                "port": 80,
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        backend_mirror_hits = self.hits(
+            backend_filter_route,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(backend_mirror_hits), 1)
+        self.assertIn("HTTPRoute/edge/backend-mirror", backend_mirror_hits[0]["excerpt"])
 
         default_ing = {
             "apiVersion": "networking.k8s.io/v1",
@@ -5296,7 +5343,8 @@ class TestCollectCluster(unittest.TestCase):
             for c in result["commands"]
             if c["check"] == "ingress-gateway-healthcheck-mismatch"
         )
-        self.assertIn("kubectl get httproutes.gateway.networking.k8s.io", mm_cmd)
+        base_dump = next(iter(dump_commands))
+        self.assertTrue(mm_cmd.startswith(f"{base_dump}; KUBECONFIG="), mm_cmd)
 
     def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
         """The record, not only the reads: each obtainability check's `command` is

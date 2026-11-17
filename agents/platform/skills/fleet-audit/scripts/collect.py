@@ -4385,7 +4385,11 @@ def check_ingress_gateway_healthcheck_mismatch(context: dict) -> list[dict]:
             if not isinstance(rule, dict):
                 continue
             refs = list(rule.get("backendRefs") or [])
-            for flt in rule.get("filters") or []:
+            rule_filters = list(rule.get("filters") or [])
+            for bref in rule.get("backendRefs") or []:
+                if isinstance(bref, dict):
+                    rule_filters.extend(bref.get("filters") or [])
+            for flt in rule_filters:
                 if isinstance(flt, dict) and flt.get("type") == REQUEST_MIRROR_FILTER_TYPE:
                     mirror_ref = (flt.get("requestMirror") or {}).get("backendRef")
                     if isinstance(mirror_ref, dict):
