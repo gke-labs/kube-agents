@@ -123,8 +123,8 @@ the card, the chat gateway as `chat`, and the Session KV server from the inject'
 The install's LiteLLM has no database, so its spend tracking by tag is not available. Two outputs
 can carry the tag instead. LiteLLM's `custom_prometheus_metadata_labels` setting adds a label from
 request metadata to its token metrics, which the existing scrape
-(`bench/kube_agents_bench/scale/collect.py`) reads. The setting was read in LiteLLM 1.103; the
-pinned image is 1.106 (`images.json`), so the first step confirms it there. The other output is
+(`bench/kube_agents_bench/scale/collect.py`) reads. The setting was read in LiteLLM 1.103;
+`images.json` pins a later release, so the first step confirms it there. The other output is
 `charts/kube-agents/files/llm_trace_logger.py`, which already writes one JSON line per model call with its token usage; it
 writes to `/tmp`, and would write to the container log instead.
 
