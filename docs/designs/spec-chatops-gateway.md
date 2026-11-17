@@ -751,8 +751,9 @@ leaves the record as it was:
    steer authors), each mapped by the PlatformAgent's `spec.tiers.membership` or else `read`;
    authors at different tiers are refused, and so is a tier that isn't loaded and interactive,
    or one wider than the gateway's own authority tier besides `profile.run` (#3659). The
-   console is `read`, and a requester with no identity is refused; no trigger submits through the
-   gateway yet, so nothing is minted `unattended`. A delegated profile child runs at its
+   console is `read`, and a requester with no identity is refused. The one path that mints
+   `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
+   ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
    parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
@@ -3082,8 +3083,10 @@ Validating a token at the door is not the per-user token brokerage the permissio
 declined: the door holds a client id and an allowlist (which the gateway checks again), never a refresh token or a
 client secret. The principal this class asserts is attribution: the task's capability is the
 install's, as it is for every ingress. Still to come as verifiers of their own, each with its
-own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta), and the
-unattended class (an organisation's service identity, read-only against protected targets).
+own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta). The
+unattended class (`verifiedBy: unattended-ksa`, a trigger's ServiceAccount bound by the callout)
+is built as the trigger ingress (scheduling-on-profiles.md §3), dark until the callout grants a
+source its submit subject.
 
 **The card is the catalog.** One skill per destination this door routes to, which today is the
 gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the

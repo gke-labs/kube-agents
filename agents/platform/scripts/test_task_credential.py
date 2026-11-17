@@ -54,8 +54,10 @@ class GoldenFixtureTest(unittest.TestCase):
                     self.assertEqual(want["pod_uid"], claims.pod_uid)
                     self.assertEqual(want["exp"], claims.expires)
                     self.assertEqual(
-                        task_credential.TaskTarget(**want["target"]), claims.target
+                        task_credential.TaskTarget(**want["target"]) if want["target"] else None,
+                        claims.target,
                     )
+                    self.assertEqual(want["target"] is None, claims.report_only)
                     want_trigger = want.get("trigger")
                     self.assertEqual(
                         task_credential.TaskTrigger(**want_trigger) if want_trigger else None,
@@ -86,6 +88,11 @@ class GoldenFixtureTest(unittest.TestCase):
             "a case-variant AUD beside aud",
             "an unknown top-level claim",
             "no target",
+            "a report credential: unattended, a builtin schedule trigger, no target",
+            "a report credential: unattended, a collector trigger, no target",
+            "no target, a trigger, at the read tier",
+            "no target, unattended, no trigger",
+            "a null target, unattended, a trigger",
             "a non-canonical base64url signature",
             "expired a minute ago",
             "a span past the ceiling, with exp-now inside it",
