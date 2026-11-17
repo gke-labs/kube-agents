@@ -33,15 +33,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# The Google endpoints the exchange goes through. None varies per install: STS is
-# global, and the IAM Credentials URLs take `-` for the project because the
-# service account's email already identifies it.
-STS_TOKEN_URL = "https://sts.googleapis.com/v1/token"
-IMPERSONATION_URL = (
-    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{email}:generateAccessToken"
+import credential_proxy_client
+
+# The Google endpoints the exchange goes through. STS is global per universe,
+# and the IAM Credentials URLs take `-` for the project because the service
+# account's email already identifies it.
+DEFAULT_UNIVERSE_DOMAIN = credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
+STS_TOKEN_URL_TEMPLATE = "https://sts.{universe_domain}/v1/token"
+IMPERSONATION_URL_TEMPLATE = (
+    "https://iamcredentials.{universe_domain}/v1/projects/-/serviceAccounts/{email}:generateAccessToken"
 )
-ID_TOKEN_URL = (
-    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{email}:generateIdToken"
+ID_TOKEN_URL_TEMPLATE = (
+    "https://iamcredentials.{universe_domain}/v1/projects/-/serviceAccounts/{email}:generateIdToken"
+)
+STS_TOKEN_URL = STS_TOKEN_URL_TEMPLATE.format(universe_domain=DEFAULT_UNIVERSE_DOMAIN)
+IMPERSONATION_URL = IMPERSONATION_URL_TEMPLATE.format(
+    universe_domain=DEFAULT_UNIVERSE_DOMAIN, email="{email}"
+)
+ID_TOKEN_URL = ID_TOKEN_URL_TEMPLATE.format(
+    universe_domain=DEFAULT_UNIVERSE_DOMAIN, email="{email}"
 )
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 # The segment of an impersonation URL that the service account's email follows.
@@ -55,7 +65,13 @@ IMPERSONATION_PATH = "/serviceAccounts/"
 TOKEN_REQUEST_TIMEOUT_SECONDS = 10
 
 
-def build_document(audience: str, service_account: str, token_file: str) -> dict:
+def build_document(
+    audience: str,
+    service_account: str,
+    token_file: str,
+    *,
+    universe_domain: str = DEFAULT_UNIVERSE_DOMAIN,
+) -> dict:
     """Return the external_account document.
 
     Impersonation rather than direct grants on the federated principal. The
@@ -65,20 +81,26 @@ def build_document(audience: str, service_account: str, token_file: str) -> dict
     be reproduced against a principal:// member, and revoking access is one
     binding rather than a sweep.
     """
-    return {
+    domain = credential_proxy_client.normalize_universe_domain(universe_domain)
+    document = {
         "type": "external_account",
         "audience": audience,
         # The projected token is a JWT, and STS has to be told so -- the default
         # for a file source is an opaque token, which the provider rejects with
         # an error that names neither the token nor the format.
         "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
-        "token_url": STS_TOKEN_URL,
-        "service_account_impersonation_url": IMPERSONATION_URL.format(email=service_account),
+        "token_url": STS_TOKEN_URL_TEMPLATE.format(universe_domain=domain),
+        "service_account_impersonation_url": IMPERSONATION_URL_TEMPLATE.format(
+            universe_domain=domain, email=service_account
+        ),
         "credential_source": {
             "file": token_file,
             "format": {"type": "text"},
         },
     }
+    if domain != DEFAULT_UNIVERSE_DOMAIN:
+        document["universe_domain"] = domain
+    return document
 
 
 def write_document(path: str, document: dict) -> None:
@@ -219,8 +241,15 @@ def fetch_identity_token(audience: str, path: str = "") -> str | None:
         {"Content-Type": "application/x-www-form-urlencoded"},
     )
 
+    doc_universe = document.get("universe_domain")
+    domain = (
+        credential_proxy_client.normalize_universe_domain(doc_universe)
+        if isinstance(doc_universe, str) and doc_universe.strip()
+        else credential_proxy_client.google_universe_domain()
+    )
+    id_token_url = ID_TOKEN_URL_TEMPLATE.format(universe_domain=domain, email=email)
     minted = _post(
-        ID_TOKEN_URL.format(email=email),
+        id_token_url,
         json.dumps({"audience": audience, "includeEmail": True}).encode("utf-8"),
         {
             "Authorization": "Bearer " + federated["access_token"],
@@ -277,7 +306,11 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    write_document(credential_file, build_document(audience, service_account, token_file))
+    domain = credential_proxy_client.google_universe_domain()
+    write_document(
+        credential_file,
+        build_document(audience, service_account, token_file, universe_domain=domain),
+    )
     # No secret in this line: the audience is a resource name and the service
     # account is an email, both of which are already in the pod spec. It is here
     # because "which identity is this container using" is the first question

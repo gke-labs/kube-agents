@@ -1797,8 +1797,11 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 3 {
-		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 4 {
+		t.Fatalf("expected 4 Ingress rules (the agent namespace, the broker to the audit-report store, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	}
+	if !reflect.DeepEqual(netpol.Spec.Ingress[1], auditReportStoreIngressRule(agent)) {
+		t.Errorf("expected the second Ingress rule to be the audit-report store's, got %v", netpol.Spec.Ingress[1])
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -1806,7 +1809,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	// The collector's rule: the watcher's metrics port alone, from the
 	// gke-gmp-system namespace and nothing narrower, matching the LiteLLM
 	// policy's scrape rule for the same collector.
-	scrape := netpol.Spec.Ingress[1]
+	scrape := netpol.Spec.Ingress[2]
 	if len(scrape.Ports) != 1 || scrape.Ports[0].Port == nil || scrape.Ports[0].Port.IntVal != 9095 {
 		t.Errorf("expected the collector ingress rule to admit port 9095 alone, got %v", scrape.Ports)
 	}
@@ -1918,8 +1921,11 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	if len(netpol.Spec.Ingress) != 3 {
-		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 4 {
+		t.Fatalf("expected 4 Ingress rules (the agent namespace, the broker to the audit-report store, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	}
+	if !reflect.DeepEqual(netpol.Spec.Ingress[1], auditReportStoreIngressRule(agent)) {
+		t.Errorf("expected the second Ingress rule to be the audit-report store's, got %v", netpol.Spec.Ingress[1])
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))

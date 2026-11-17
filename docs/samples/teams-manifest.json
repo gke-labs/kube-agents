@@ -54,6 +54,6 @@
       "isNotificationOnly": false
     }
   ],
-  "permissions": ["identity", "message.read"],
+  "permissions": ["identity"],
   "validDomains": ["smba.trafficmanager.net", "*.botframework.com"]
 }

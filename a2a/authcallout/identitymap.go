@@ -21,6 +21,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -67,6 +68,18 @@ const (
 type Grants struct {
 	Publish   []string `json:"publish"`
 	Subscribe []string `json:"subscribe"`
+	// DenyPublish and DenySubscribe subtract from the allows on their side:
+	// the server enforces a subject only if an allow matches it and no deny
+	// does. They only narrow. An entry still needs a non-empty allow on both
+	// sides (validate), so a deny never stands for "everything but", and an
+	// entry whose grants are derived (a narrowed one) carries none.
+	DenyPublish   []string `json:"denyPublish,omitempty"`
+	DenySubscribe []string `json:"denySubscribe,omitempty"`
+}
+
+// hasAny reports whether g names any subject, allow or deny.
+func (g Grants) hasAny() bool {
+	return len(g.Publish) > 0 || len(g.Subscribe) > 0 || len(g.DenyPublish) > 0 || len(g.DenySubscribe) > 0
 }
 
 // Identity is one entry in the map: a Kubernetes ServiceAccount, the NATS user
@@ -125,6 +138,15 @@ type Identity struct {
 	// profile has no durables left, so a tier would select nothing. Set only
 	// with that narrowing.
 	Draining []string `json:"draining,omitempty"`
+	// NotAfter, when set, is the instant this entry stops authenticating
+	// anything, and every JWT minted from it expires by then: the server
+	// closes a connection when its JWT expires, so a connection made just
+	// before NotAfter does not outlive it. The operator sets it on the bus
+	// migration's per-run principals at the run's deadline, so a run that
+	// overstays it, or an operator that never removes the entry, leaves no
+	// working credential behind. Only on an entry that names its grants: a
+	// narrowed entry's lifetime is its pod's and its task credential's.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -300,12 +322,17 @@ func (id Identity) validate() error {
 	if id.Narrowing != NarrowingDispatcher && len(id.Draining) > 0 {
 		return fmt.Errorf("user %q lists draining profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
 	}
-	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+	// Deny entries count: a narrowed entry carrying only a deny would still
+	// be a grant someone wrote into the map.
+	hasGrants := id.Grants.hasAny()
 	// The profile fields mean something only under NarrowingProfile. On any
 	// other entry they would be read by nothing, and a field the callout
 	// silently ignores is a grant someone believes exists.
 	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil || id.Tier != "") {
 		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
+	}
+	if id.NotAfter != nil && id.Narrowing != "" {
+		return fmt.Errorf("user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", id.User, id.Narrowing)
 	}
 	switch id.Narrowing {
 	case "":
@@ -320,9 +347,10 @@ func (id Identity) validate() error {
 		//
 		// This is checked per side rather than across both because the
 		// server is per side. There is deliberately no way to spell "may
-		// publish nothing" here: Grants carries no deny list, so a
-		// principal that must not publish cannot be expressed as an empty
-		// allow list and has to be refused rather than silently widened.
+		// publish nothing" here: the deny lists only subtract from a
+		// non-empty allow, so a principal that must not publish cannot be
+		// expressed as an empty allow list, with or without a deny, and has
+		// to be refused rather than silently widened.
 		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
 			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
@@ -336,15 +364,15 @@ func (id Identity) validate() error {
 		// new name. An entry that is unusable without its claim cannot be
 		// widened by editing the map alone.
 		if hasGrants {
-			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
-				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 		}
 	case NarrowingProfile:
 		// The same fail-closed shape as NarrowingPod: the map carries the
 		// profile and its topics, never subjects.
 		if hasGrants {
-			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
-				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 		}
 		if err := validateProfileEntry(id); err != nil {
 			return err
@@ -360,6 +388,12 @@ func (id Identity) validate() error {
 		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
 			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+		// No deny on the dispatcher's entry for now: its grants are also the
+		// base a bucket connection's are built from, and a deny there would
+		// need its own reasoning about what reaches each bucket.
+		if len(id.Grants.DenyPublish) > 0 || len(id.Grants.DenySubscribe) > 0 {
+			return fmt.Errorf("user %q narrows on %q and may not carry deny lists", id.User, id.Narrowing)
 		}
 		if err := validateDispatcherEntry(id); err != nil {
 			return err
