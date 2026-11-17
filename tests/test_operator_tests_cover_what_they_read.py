@@ -38,14 +38,22 @@ _KNOWN_UNCOVERED = (
     "a2a/gateway",
     "a2a/hermes-bridge",
     "a2a/lib",
-    "agents/cluster",
+    "agents",
+    "deploy/shared",
+    "docs/designs",
+    "examples",
+    "hack",
 )
 
-# A string literal that climbs out of the module, as in
+# A string literal that climbs to the repository root, as in
 # `"../../../charts/kube-agents/files/flagged-pods.yaml"`; group 1 is the
-# repository path after the climb. A path built with filepath.Join from parts
-# is not seen, so prefer literals for these reads.
-_RELATIVE_READ = re.compile(r"""["'](?:\.\./)+((?:charts|a2a|agents|bench|deploy|terraform)/[A-Za-z0-9_.\-/]+)""")
+# repository path after the climb. Tests sit at least three levels below the
+# root (k8s-operator/internal/controller), so three or more `../` leave the
+# module, and the climb can end in any top-level directory.
+_RELATIVE_READ = re.compile(r"""["'](?:\.\./){3,}([A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*)""")
+# The same climb written as filepath.Join("..", "..", "..", "deploy", "shared", ...):
+# group 1 is the quoted parts after the last "..".
+_JOINED_READ = re.compile(r"""filepath\.Join\(\s*(?:"\.\."\s*,\s*){3,}((?:"[A-Za-z0-9_.\-]+"\s*,?\s*)+)""")
 
 
 def _operator_filter() -> list[str]:
@@ -60,8 +68,11 @@ def _operator_filter() -> list[str]:
 def _outside_reads() -> set[str]:
     reads = set()
     for test in OPERATOR.rglob("*_test.go"):
-        for match in _RELATIVE_READ.finditer(test.read_text()):
+        text = test.read_text()
+        for match in _RELATIVE_READ.finditer(text):
             reads.add(match.group(1))
+        for match in _JOINED_READ.finditer(text):
+            reads.add("/".join(re.findall(r'"([^"]+)"', match.group(1))))
     return reads
 
 
