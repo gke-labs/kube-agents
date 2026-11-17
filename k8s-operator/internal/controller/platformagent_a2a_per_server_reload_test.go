@@ -824,6 +824,57 @@ func TestATLSChangeDuringAReloadFoldsEveryServer(t *testing.T) {
 	}
 }
 
+// With no write time of the operator's on the Secret, no pod is taken as
+// created after the write, however new it is.
+func TestWithNoWriteTimeARecreatedPodDoesntConfirm(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	r, agent, sts, _ := a2aRecordedCluster(t, asked, asked)
+	r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return time.Time{}, false }
+	pod := &corev1.Pod{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: sts.Name + "-2"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.ResourceVersion, pod.UID, pod.CreationTimestamp = "", "new", metav1.NewTime(asked.Add(time.Hour))
+	if err := r.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	v := map[string]a2aBusVarz{}
+	for i := range 3 {
+		v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: t1}
+	}
+	r.busVarz = varzOf(v)
+	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.reloaded {
+		t.Fatal("a recreated pod confirmed with no write time to compare against")
+	}
+}
+
+// A load time a second after a restart's start is the load at start, not a
+// reload.
+func TestALoadOneSecondAfterStartIsNotAReload(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 30, 0, time.UTC)
+	r, agent, sts, _ := a2aRecordedCluster(t, asked, asked.Add(time.Second))
+	v := map[string]a2aBusVarz{}
+	for i := range 3 {
+		v[sts.Name+"-"+strconv.Itoa(i)] = a2aBusVarz{Start: t0, Loaded: t1}
+	}
+	v[sts.Name+"-1"] = a2aBusVarz{Start: "2026-11-17T08:01:00Z", Loaded: "2026-11-17T08:01:01Z"}
+	r.busVarz = varzOf(v)
+	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.reloaded {
+		t.Fatal("a load time a second after the start was taken as a reload")
+	}
+}
+
 // A server already re-armed folds again on a TLS change: the TLS reload's
 // move must re-arm it, not confirm it.
 func TestATLSChangeFoldsAReArmedServerToo(t *testing.T) {
