@@ -81,7 +81,7 @@ const (
 	// Named without credential words, which gosec's G101 reads as a
 	// hardcoded credential.
 	auditReportStoreTokenVolume    = "audit-report-store-ksa"
-	auditReportStoreTokenMountPath = "/var/run/secrets/kubeagents/audit-report-store"
+	auditReportStoreTokenMountPath = "/var/run/secrets/kubeagents/audit-report-store" // #nosec G101 -- Mount path, not a credential
 
 	// On agent-api-auth: the switch start-services.sh reads, and the one
 	// subject the listener accepts.
