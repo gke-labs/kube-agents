@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -146,78 +147,109 @@ func TestADrainingProfileKeepsTheGatewaysDeny(t *testing.T) {
 	}
 }
 
-// Binding a profile changes the config Secret but not the pod template, so
-// the bus isn't rolled. The pass records a pending reload on the Secret; a
-// config_load_time that moves clears it, and one that doesn't move within the
-// bound gets the bus pod restarted.
+// Binding a profile changes the config Secret but not the pod template, on
+// one server and on a cluster alike, so no server restarts and no cluster
+// rolls. The pass records a pending reload on the Secret, with a baseline per
+// server; it clears only once every server's config_load_time has moved.
 func TestBindingAProfileReloadsTheBusInsteadOfRollingIt(t *testing.T) {
-	agent := a2aSingleServerTestAgent()
-	cl := fake.NewClientBuilder().
-		WithScheme(setupScheme()).
-		WithObjects(agent, chartProfileNamespace(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	loaded := "2026-11-09T22:00:00Z"
-	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(),
-		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return loaded, nil }}
-	ctx := context.Background()
-	theCalloutIsServing(t, ctx, cl, r, agent)
-	pass := func() a2aProvisionState {
-		t.Helper()
-		st, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return st
-	}
-	read := func() (*corev1.Secret, string) {
-		t.Helper()
-		var secret corev1.Secret
-		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, &secret); err != nil {
-			t.Fatal(err)
-		}
-		var sts appsv1.StatefulSet
-		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &sts); err != nil {
-			t.Fatal(err)
-		}
-		return &secret, sts.Spec.Template.Annotations[a2aConfigHashAnnotation]
-	}
-	pass()
-	pass()
-	_, hashBefore := read()
-	profile := testAgentProfile(agent.Namespace, "tse")
-	if err := cl.Create(ctx, &profile); err != nil {
-		t.Fatal(err)
-	}
-	st := pass()
-	if st.busHeld {
-		t.Fatal("a bound profile held the bus for a roll")
-	}
-	secret, hashAfter := read()
-	if hashAfter != hashBefore {
-		t.Fatal("a bound profile moved the pod template's hash, so the bus would roll")
-	}
-	if !strings.Contains(string(secret.Data["nats.conf"]), "a2a.tasks.tse.*.supervisor") {
-		t.Fatal("the config Secret carries no deny for the bound profile")
-	}
-	if secret.Annotations[a2aBusReloadBaselineAnnotation] != loaded || secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
-		t.Fatalf("no pending reload recorded on the Secret: %v", secret.Annotations)
-	}
-	if st.busReloadRequeue <= 0 {
-		t.Fatal("a pending reload asked for no recheck")
-	}
-	// Not landed yet: still pending.
-	pass()
-	if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
-		t.Fatal("the pending reload was dropped before config_load_time moved")
-	}
-	loaded = "2026-11-09T22:00:41Z"
-	if st := pass(); st.busReloadRequeue != 0 {
-		t.Fatal("a landed reload still asks for a recheck")
-	}
-	if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] != "" {
-		t.Fatalf("a landed reload left its pending record: %v", secret.Annotations)
+	for _, agent := range []*agentv1alpha1.PlatformAgent{a2aSingleServerTestAgent(), a2aTestAgentWithBusReplicas(3)} {
+		servers := int(a2aNATSReplicas(agent))
+		t.Run(strconv.Itoa(servers)+" servers", func(t *testing.T) {
+			cl := fake.NewClientBuilder().
+				WithScheme(setupScheme()).
+				WithObjects(agent, chartProfileNamespace(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			loaded := map[string]string{}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(),
+				busConfigLoadTime: func(_ context.Context, _ *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error) {
+					return loaded[pod.Name], nil
+				}}
+			ctx := context.Background()
+			theCalloutIsServing(t, ctx, cl, r, agent)
+			pass := func() a2aProvisionState {
+				t.Helper()
+				st, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return st
+			}
+			read := func() (*corev1.Secret, *appsv1.StatefulSet) {
+				t.Helper()
+				var secret corev1.Secret
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, &secret); err != nil {
+					t.Fatal(err)
+				}
+				var sts appsv1.StatefulSet
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &sts); err != nil {
+					t.Fatal(err)
+				}
+				return &secret, &sts
+			}
+			pass()
+			pass()
+			_, sts := read()
+			hashBefore := sts.Spec.Template.Annotations[a2aConfigHashAnnotation]
+			var names []string
+			for i := range servers {
+				name := sts.Name + "-" + strconv.Itoa(i)
+				names = append(names, name)
+				loaded[name] = "2026-11-09T22:00:00Z"
+				if err := cl.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Name: name, Namespace: agent.Namespace,
+					OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID, Controller: ptr.To(true)}},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			profile := testAgentProfile(agent.Namespace, "tse")
+			if err := cl.Create(ctx, &profile); err != nil {
+				t.Fatal(err)
+			}
+			st := pass()
+			if st.busHeld {
+				t.Fatal("a bound profile held the bus for a roll")
+			}
+			secret, sts := read()
+			if sts.Spec.Template.Annotations[a2aConfigHashAnnotation] != hashBefore {
+				t.Fatal("a bound profile moved the pod template's hash, so the bus would roll")
+			}
+			if got, ok := sts.Spec.Template.Annotations[a2aConfigProfilesAnnotation]; ok {
+				t.Fatalf("the pod template lists profiles %q; a profile change would roll it", got)
+			}
+			if !strings.Contains(string(secret.Data["nats.conf"]), "a2a.tasks.tse.*.supervisor") {
+				t.Fatal("the config Secret carries no deny for the bound profile")
+			}
+			state, pending := readA2ABusReloadState(secret.Annotations, sts.Name)
+			if !pending || len(state.baselines) != servers {
+				t.Fatalf("no pending reload with a baseline per server recorded on the Secret: %v", secret.Annotations)
+			}
+			for _, name := range names {
+				if state.baselines[name] != "2026-11-09T22:00:00Z" {
+					t.Fatalf("baseline for %s = %q, want the load time read before the write", name, state.baselines[name])
+				}
+			}
+			if st.busReloadRequeue <= 0 {
+				t.Fatal("a pending reload asked for no recheck")
+			}
+			// Every server but the last has reloaded: still pending.
+			for _, name := range names[:len(names)-1] {
+				loaded[name] = "2026-11-09T22:00:41Z"
+			}
+			pass()
+			if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+				t.Fatal("the pending reload was dropped before every server's config_load_time moved")
+			}
+			loaded[names[len(names)-1]] = "2026-11-09T22:00:42Z"
+			if st := pass(); st.busReloadRequeue != 0 {
+				t.Fatal("a landed reload still asks for a recheck")
+			}
+			if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] != "" {
+				t.Fatalf("a landed reload left its pending record: %v", secret.Annotations)
+			}
+		})
 	}
 }
 
@@ -374,7 +406,7 @@ func TestAFailedRestartKeepsThePendingReload(t *testing.T) {
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(),
-		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }}
+		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t0", nil }}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
@@ -431,7 +463,24 @@ func TestAFailedRestartKeepsThePendingReload(t *testing.T) {
 	if err := cl.Get(ctx, key, &secret); err != nil {
 		t.Fatal(err)
 	}
+	// Fail closed: the record stays until the restarted server is read on
+	// the new config, so a profile held on it stays held meanwhile.
+	if secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+		t.Fatal("the pending reload was dropped before the restarted server was read")
+	}
+	restarted := pod.DeepCopy()
+	restarted.ResourceVersion, restarted.UID = "", "pod-2"
+	restarted.CreationTimestamp = metav1.NewTime(time.Now().Add(time.Minute))
+	if err := cl.Create(ctx, restarted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, key, &secret); err != nil {
+		t.Fatal(err)
+	}
 	if secret.Annotations[a2aBusReloadRequestedAnnotation] != "" {
-		t.Fatal("the pending reload outlived its restart")
+		t.Fatal("the pending reload outlived the restarted server's first read")
 	}
 }
