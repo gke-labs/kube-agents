@@ -347,8 +347,8 @@ Options:
   --gcp-project-id ID      GCP Target Project ID
   --gke-cluster-name NAME  GKE Target Cluster Name
   --gcp-region REGION      GKE GCP Region
-  --universe-domain DOMAIN Cloud universe API domain (default: googleapis.com,
-                           or the install's UNIVERSE_DOMAIN / gcloud core/universe_domain)
+  --universe-domain DOMAIN Cloud universe API domain (default: the install's
+                           UNIVERSE_DOMAIN in install.env, else googleapis.com)
   --agent-namespace NS     Kubernetes namespace the release lives in
                            (default: the install's own, else kubeagents-system)
   --image-tag TAG          Validated immutable release tag or full commit SHA.

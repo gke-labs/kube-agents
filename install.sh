@@ -117,6 +117,11 @@ readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 readonly DEFAULT_VPC_NETWORK_NAME="default"
 readonly GITEA_MAX_NAMESPACE_LENGTH=40
 readonly GITEA_MAX_HOST_LENGTH=253
+readonly STOCKOUT_INVESTIGATOR_PROMPT_DESC="GKE Stockout Investigator watches cluster-autoscaler noScaleUp Cloud Logging events for capacity or quota failures, diagnoses the root cause, and opens a GitOps remediation PR or posts diagnostics to your chat channel."
+readonly STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE="No Google Chat or Slack home channel is configured yet, so proactive stockout alerts cannot be delivered immediately (they stay queued in HomeChannelUnset until a home channel is set); defaulting to No."
+readonly STOCKOUT_INVESTIGATOR_MANAGE_IAM_NOTE="MANAGE_IAM=false is set, and the GKE Stockout Investigator requires Terraform-managed Pub/Sub IAM bindings; defaulting to No."
+readonly STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR="GKE Stockout Investigator requires MANAGE_IAM=true (it binds Pub/Sub IAM roles); set MANAGE_IAM=true in install.env first."
+readonly STOCKOUT_INVESTIGATOR_PROMPT_LABEL="Enable GKE Stockout Investigator for automated scale-up failure diagnostics?"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -468,8 +473,11 @@ PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
 PARAM_UNIVERSE_DOMAIN="${UNIVERSE_DOMAIN:-}"
 PARAM_UNIVERSE_DOMAIN_PASSED="false"
 PARAM_VPC_NETWORK="${VPC_NETWORK:-}"
+PARAM_VPC_NETWORK_PASSED="false"
 PARAM_VPC_SUBNETWORK="${VPC_SUBNETWORK:-}"
+PARAM_VPC_SUBNETWORK_PASSED="false"
 PARAM_ALLOW_EXTERNAL_MODEL_EGRESS="${ALLOW_EXTERNAL_MODEL_EGRESS:-}"
+PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED="false"
 # Only consulted when this run creates the cluster. Against one that already
 # exists the tfvars generator's live probe decides the shape; see
 # write_tfvars_from_state in scripts/installer/installer_common.sh. Empty
@@ -484,6 +492,7 @@ PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_MANAGE_IAM="${MANAGE_IAM:-}"
+PARAM_MANAGE_IAM_PASSED="false"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -670,6 +679,14 @@ SOVEREIGN_FLAG_PASSED="false"
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+SHELL_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="false"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="false"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="false"
+STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="false"
+if [ -n "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR}" ]; then
+  PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="true"
+fi
 # Not filled by resolve_shared_defaults, and PARAM_ENABLE_GKE_BACKUP_PLAN below
 # is the pattern: warn_flag_beats_unrecorded_file_value reads an empty PARAM as
 # "nobody chose", and that is the only thing that keeps the destroyed-ingress
@@ -929,7 +946,8 @@ Flags for AI Agents & Automation:
                                 bitbucket-datacenter: required, the instance's hostname; the
                                 instance must serve at the root path on port 443
   --gitops-token-file=PATH      File holding the forge's access token: GitLab (scopes: api,
-                                write_repository), Gitea (read and write repository scope),
+                                write_repository), Gitea (scopes: write:repository, write:issue,
+                                read:user),
                                 Bitbucket Cloud (an API token with scopes, or an access token),
                                 or Bitbucket Data Center (a project HTTP access token with
                                 Repository write); read into the Kubernetes Secret after the
@@ -1066,7 +1084,9 @@ Flags for AI Agents & Automation:
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
-                                Enable GKE Stockout Investigator AgentPlugin (default: false)
+                                Enable GKE Stockout Investigator AgentPlugin (interactive installs
+                                ask, defaulting to yes when a chat home channel is configured;
+                                non-interactive default: false)
   --enable-drift-detector[=true|false]
                                 Report cluster changes made outside git. Exports this
                                 project's GKE audit log to Pub/Sub and starts the
@@ -1236,6 +1256,14 @@ require_scope_flag_value() {
   exit 1
 }
 
+require_space_flag_value() {
+  local flag="$1" val="${2-}" argc="$3"
+  if [ "$argc" -lt 2 ] || [ -z "$val" ] || [[ "$val" == -* ]]; then
+    print_error "${flag} requires a value."
+    exit 1
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1244,35 +1272,38 @@ parse_args() {
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --gcp-project-id) require_space_flag_value "$1" "${2-}" "$#"; PARAM_PROJECT_ID="$2"; shift 2 ;;
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --gcp-region) require_space_flag_value "$1" "${2-}" "$#"; PARAM_REGION="$2"; shift 2 ;;
       --universe-domain=*)
         PARAM_UNIVERSE_DOMAIN="${1#*=}"; PARAM_UNIVERSE_DOMAIN_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "${1%%=*}" "$PARAM_UNIVERSE_DOMAIN"; shift ;;
       --universe-domain)
+        require_space_flag_value "$1" "${2-}" "$#"
         PARAM_UNIVERSE_DOMAIN="$2"; PARAM_UNIVERSE_DOMAIN_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "$1" "$PARAM_UNIVERSE_DOMAIN"; shift 2 ;;
       --vpc-network=*)
-        PARAM_VPC_NETWORK="${1#*=}"; SOVEREIGN_FLAG_PASSED="true"
+        PARAM_VPC_NETWORK="${1#*=}"; PARAM_VPC_NETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "${1%%=*}" "$PARAM_VPC_NETWORK"; shift ;;
       --vpc-network)
-        PARAM_VPC_NETWORK="$2"; SOVEREIGN_FLAG_PASSED="true"
+        require_space_flag_value "$1" "${2-}" "$#"
+        PARAM_VPC_NETWORK="$2"; PARAM_VPC_NETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "$1" "$PARAM_VPC_NETWORK"; shift 2 ;;
       --vpc-subnetwork=*)
-        PARAM_VPC_SUBNETWORK="${1#*=}"; SOVEREIGN_FLAG_PASSED="true"
+        PARAM_VPC_SUBNETWORK="${1#*=}"; PARAM_VPC_SUBNETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "${1%%=*}" "$PARAM_VPC_SUBNETWORK"; shift ;;
       --vpc-subnetwork)
-        PARAM_VPC_SUBNETWORK="$2"; SOVEREIGN_FLAG_PASSED="true"
+        require_space_flag_value "$1" "${2-}" "$#"
+        PARAM_VPC_SUBNETWORK="$2"; PARAM_VPC_SUBNETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         require_defaulted_flag_value "$1" "$PARAM_VPC_SUBNETWORK"; shift 2 ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
-      --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
+      --gke-cluster-name) require_space_flag_value "$1" "${2-}" "$#"; PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --allow-external-model-egress|--allow-external-model-egress=*)
-        PARAM_ALLOW_EXTERNAL_MODEL_EGRESS="$(flag_bool_value "$1")"; SOVEREIGN_FLAG_PASSED="true"
+        PARAM_ALLOW_EXTERNAL_MODEL_EGRESS="$(flag_bool_value "$1")"; PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ALLOW_EXTERNAL_MODEL_EGRESS"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --litellm-redaction|--litellm-redaction=*)
@@ -1311,9 +1342,9 @@ parse_args() {
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --manage-iam|--manage-iam=*)
-        PARAM_MANAGE_IAM="$(flag_bool_value "$1")"; SOVEREIGN_FLAG_PASSED="true"
+        PARAM_MANAGE_IAM="$(flag_bool_value "$1")"; PARAM_MANAGE_IAM_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
         validate_bool_flag_value "${1%%=*}" "$PARAM_MANAGE_IAM"; shift ;;
-      --no-manage-iam) PARAM_MANAGE_IAM="false"; SOVEREIGN_FLAG_PASSED="true"; shift ;;
+      --no-manage-iam) PARAM_MANAGE_IAM="false"; PARAM_MANAGE_IAM_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"; shift ;;
       --scope-projects=*)
         PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
@@ -1374,7 +1405,10 @@ parse_args() {
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="true"
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="true"
+        shift ;;
       --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
         PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
@@ -2165,7 +2199,7 @@ warn_unrecorded_interview_answers() {
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+    USER_PROFILE_ENABLED ENABLE_STOCKOUT_INVESTIGATOR GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
     GITOPS_IDENTITY UNIVERSE_DOMAIN ALLOW_EXTERNAL_MODEL_EGRESS VPC_NETWORK VPC_SUBNETWORK)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
@@ -2183,13 +2217,38 @@ warn_unrecorded_interview_answers() {
     if ! install_env_records_key "$file" "$key"; then
       if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
         drifted="${drifted}${drifted:+ }${key}"
-      elif [ "$key" = "UNIVERSE_DOMAIN" ] && is_custom_universe_domain "${UNIVERSE_DOMAIN:-}"; then
+      elif [ "$key" = "UNIVERSE_DOMAIN" ] && [ "${PARAM_UNIVERSE_DOMAIN_PASSED:-false}" != "true" ] && is_custom_universe_domain "${UNIVERSE_DOMAIN:-}"; then
         drifted="${drifted}${drifted:+ }${key}"
-      elif [ "$key" = "ALLOW_EXTERNAL_MODEL_EGRESS" ] && is_truthy "${ALLOW_EXTERNAL_MODEL_EGRESS:-}"; then
+      elif [ "$key" = "ALLOW_EXTERNAL_MODEL_EGRESS" ] && [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" != "true" ] && is_truthy "${ALLOW_EXTERNAL_MODEL_EGRESS:-}"; then
         drifted="${drifted}${drifted:+ }${key}"
-      elif [[ "$key" == VPC_* ]] && [ -n "${!key:-}" ]; then
+      elif [ "$key" = "VPC_NETWORK" ] && [ "${PARAM_VPC_NETWORK_PASSED:-false}" != "true" ] && [ -n "${VPC_NETWORK:-}" ]; then
         drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "VPC_SUBNETWORK" ] && [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" != "true" ] && [ -n "${VPC_SUBNETWORK:-}" ]; then
+        drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" != "true" ] && [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" != "true" ]; then
+        # An install.env written before this key existed resolves absent
+        # ENABLE_STOCKOUT_INVESTIGATOR as false in write_tfvars_from_state,
+        # unless the calling shell still exports ENABLE_STOCKOUT_INVESTIGATOR=true.
+        if is_truthy "${ENABLE_STOCKOUT_INVESTIGATOR:-false}" || { [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE:-false}" = "true" ] && is_truthy "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; }; then
+          drifted="${drifted}${drifted:+ }${key}"
+        fi
       fi
+      continue
+    fi
+    if [ "$key" = "UNIVERSE_DOMAIN" ] && [ "${PARAM_UNIVERSE_DOMAIN_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "ALLOW_EXTERNAL_MODEL_EGRESS" ] && [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "VPC_NETWORK" ] && [ "${PARAM_VPC_NETWORK_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "VPC_SUBNETWORK" ] && [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && { [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ] || [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" = "true" ]; }; then
+      # CLI flag or shell-export disagreement is already reported by warn_flag_beats_unrecorded_file_value.
       continue
     fi
     recorded="$(recorded_install_env_value "$file" "$key")"
@@ -2197,7 +2256,17 @@ warn_unrecorded_interview_answers() {
       MEMORY) current="${PARAM_MEMORY:-}" ;;
       *) current="${!key:-}" ;;
     esac
-    [ "$recorded" != "$current" ] || continue
+    if [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ]; then
+      # An empty recorded line resolves to DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR (false),
+      # matching write_tfvars_from_state rather than diverging from interactive No.
+      [ -n "$recorded" ] || recorded="${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR:-false}"
+      local recorded_bool="false" current_bool="false"
+      is_truthy "$recorded" && recorded_bool="true"
+      is_truthy "$current" && current_bool="true"
+      [ "$recorded_bool" != "$current_bool" ] || continue
+    else
+      [ "$recorded" != "$current" ] || continue
+    fi
     # The GitHub GitOps keys follow the answer when the run commits
     # (record_github_gitops_keys), so they are not drift to report.
     case "$key" in
@@ -2232,7 +2301,10 @@ warn_unrecorded_interview_answers() {
         ;;
     esac
   done
-  print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you."
+  case " $drifted " in
+    *" UNIVERSE_DOMAIN "* | *" VPC_NETWORK "* | *" VPC_SUBNETWORK "*) ;;
+    *) print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you." ;;
+  esac
 }
 
 # The one answer checked on every run, TTY or not, and unlike the interview
@@ -2795,6 +2867,52 @@ bootstrap_install_env_file() {
     if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
       print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
     fi
+    # Resolve stockout flag/shell-export drift before warn_unrecorded_interview_answers
+    # so STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP prevents duplicate warnings when both apply.
+    STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="false"
+    local stockout_chosen="" stockout_recorded="" stockout_later="" stockout_restorer="" stockout_consequence="" stockout_source_label="--enable-stockout-investigator"
+    if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE:-false}" != "true" ]; then
+      stockout_chosen="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-}"
+    fi
+    if [ -n "$stockout_chosen" ]; then
+      read_recorded_install_env_values "$destination" ENABLE_STOCKOUT_INVESTIGATOR
+      stockout_recorded="$(recorded_install_env_value "$destination" ENABLE_STOCKOUT_INVESTIGATOR 2>/dev/null || true)"
+      if install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR; then
+        stockout_later="${stockout_recorded:-${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}}"
+        stockout_restorer="$destination"
+      elif [ -n "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-}" ] && { { is_truthy "$stockout_chosen" && ! is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; } || { ! is_truthy "$stockout_chosen" && is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; }; }; then
+        stockout_later="$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"
+        stockout_restorer="the ENABLE_STOCKOUT_INVESTIGATOR=${SHELL_ENABLE_STOCKOUT_INVESTIGATOR} this shell exports"
+      else
+        stockout_later="$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR"
+        stockout_restorer="the shipped ENABLE_STOCKOUT_INVESTIGATOR default (${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR})"
+      fi
+      if is_truthy "$stockout_chosen"; then
+        if is_truthy "$stockout_later"; then
+          stockout_chosen=""
+        elif ! install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR && is_truthy "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+          if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" != "true" ]; then
+            stockout_source_label="ENABLE_STOCKOUT_INVESTIGATOR"
+          fi
+          stockout_consequence="A later upgrade.sh run or another shell without ENABLE_STOCKOUT_INVESTIGATOR exported renders the stockout investigator from ${stockout_restorer}, so it deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        elif [ -n "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-}" ] && ! install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR && ! is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; then
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer} (and in other shells from the shipped default (${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR})), so the next upgrade.sh or --menu apply deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        else
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer}, so the next upgrade.sh or --menu apply deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        fi
+      elif is_truthy "$stockout_later"; then
+        if install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR; then
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer}, so the next upgrade.sh or --menu apply re-enables the stockout investigator this run turned off."
+        else
+          stockout_consequence="A later run without it re-reads ${stockout_restorer}, which re-enables the stockout investigator this run turned off."
+        fi
+      else
+        stockout_chosen=""
+      fi
+    fi
+    if [ -n "$stockout_chosen" ]; then
+      STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="true"
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
@@ -2814,26 +2932,39 @@ bootstrap_install_env_file() {
         false \
         "every later install.sh, upgrade.sh and uninstall.sh run"
     fi
-    warn_flag_beats_unrecorded_file_value "$destination" ALLOW_EXTERNAL_MODEL_EGRESS --allow-external-model-egress \
-      "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS:-}" \
-      "A later run without it reads ALLOW_EXTERNAL_MODEL_EGRESS from ${destination}, so upgrade.sh and --menu refuse external model egress unless the file records true." \
-      true \
-      "every later install.sh run"
-    warn_flag_beats_unrecorded_file_value "$destination" MANAGE_IAM --manage-iam \
-      "${PARAM_MANAGE_IAM:-}" \
-      "A later run without it reads MANAGE_IAM from ${destination}, which would tell Terraform to manage or recreate pre-provisioned IAM resources unless the file records false." \
-      true \
-      "every later install.sh, upgrade.sh and uninstall.sh run"
-    warn_flag_beats_unrecorded_file_value "$destination" VPC_NETWORK --vpc-network \
-      "${PARAM_VPC_NETWORK:-}" \
-      "A later run without it omits vpc_network from terraform.tfvars unless ${destination} records VPC_NETWORK." \
-      false \
-      "every later install.sh run"
-    warn_flag_beats_unrecorded_file_value "$destination" VPC_SUBNETWORK --vpc-subnetwork \
-      "${PARAM_VPC_SUBNETWORK:-}" \
-      "A later run without it omits vpc_subnetwork from terraform.tfvars unless ${destination} records VPC_SUBNETWORK." \
-      false \
-      "every later install.sh run"
+    if [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" ALLOW_EXTERNAL_MODEL_EGRESS --allow-external-model-egress \
+        "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS:-}" \
+        "A later run without it reads ALLOW_EXTERNAL_MODEL_EGRESS from ${destination}, so upgrade.sh and --menu refuse external model egress unless the file records true." \
+        true \
+        "every later install.sh run"
+    fi
+    if [ "${PARAM_MANAGE_IAM_PASSED:-false}" = "true" ]; then
+      local manage_iam_recorded=""
+      manage_iam_recorded="$(recorded_install_env_value "$destination" MANAGE_IAM 2>/dev/null || true)"
+      if ! is_truthy "${PARAM_MANAGE_IAM:-true}" || { [ -n "$manage_iam_recorded" ] && ! is_truthy "$manage_iam_recorded"; }; then
+        warn_flag_beats_unrecorded_file_value "$destination" MANAGE_IAM --manage-iam \
+          "${PARAM_MANAGE_IAM:-}" \
+          "A later run without it reads MANAGE_IAM from ${destination}, which defaults an unrecorded or blank key to true and tells Terraform to manage IAM resources." \
+          true \
+          "every later install.sh run" \
+          true
+      fi
+    fi
+    if [ "${PARAM_VPC_NETWORK_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" VPC_NETWORK --vpc-network \
+        "${PARAM_VPC_NETWORK:-}" \
+        "A later run without it omits vpc_network from terraform.tfvars unless ${destination} records VPC_NETWORK." \
+        false \
+        "every later install.sh run"
+    fi
+    if [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" VPC_SUBNETWORK --vpc-subnetwork \
+        "${PARAM_VPC_SUBNETWORK:-}" \
+        "A later run without it omits vpc_subnetwork from terraform.tfvars unless ${destination} records VPC_SUBNETWORK." \
+        false \
+        "every later install.sh run"
+    fi
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
       "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
@@ -2849,6 +2980,11 @@ bootstrap_install_env_file() {
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_STOCKOUT_INVESTIGATOR "$stockout_source_label" \
+      "$stockout_chosen" \
+      "$stockout_consequence" \
+      true \
+      "every later install.sh run (upgrade.sh takes no such flag, or save the setting with './install.sh --menu')"
     # Five consequence strings, unlike every other call here, which take one.
     # This key is the only one whose consequence varies, and it varies on
     # three things at once.
@@ -3661,11 +3797,11 @@ resolve_shared_defaults() {
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
-  PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  # No PARAM_ENABLE_DRIFT_DETECTOR. Empty has to survive this function and
-  # reach bootstrap_install_env_file's guard as "nobody chose"; its two
-  # readers, write_env_var below and the generator, each apply
-  # DEFAULT_ENABLE_DRIFT_DETECTOR themselves.
+  # No PARAM_ENABLE_STOCKOUT_INVESTIGATOR or PARAM_ENABLE_DRIFT_DETECTOR. Empty
+  # has to survive this function and reach bootstrap_install_env_file's guard as
+  # "nobody chose"; their downstream readers apply
+  # DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR and DEFAULT_ENABLE_DRIFT_DETECTOR
+  # themselves.
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -5646,7 +5782,7 @@ interview_gitea_forge() {
     has_controlling_tty || exit 1
   done
   print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
-  print_info "It needs repository read and write scope on the Gitea repository."
+  print_info "It needs scopes write:repository, write:issue, and read:user on the Gitea account."
 }
 
 # True for a forge whose credential is an access token the administrator puts
@@ -5947,6 +6083,10 @@ validate_gitea_forge_flags() {
     PARAM_GITOPS_REPO="$path"
   elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     print_error "A Gitea install needs --gitops-repo: the repository's path (owner/repo)."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITOPS_READ_TOKEN_FILE (GITLAB_READ_TOKEN_FILE) is not supported with --gitops-forge=gitea; omit it and include read access on --gitops-token-file."
     return 1
   fi
   validate_gitops_token_inputs || return 1
@@ -6269,7 +6409,7 @@ validate_github_forge_flags() {
     return 1
   fi
   if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
-    print_error "GITLAB_READ_TOKEN_FILE (GITOPS_READ_TOKEN_FILE) applies only with --gitops-forge=gitlab, gitea, bitbucket or bitbucket-datacenter."
+    print_error "GITLAB_READ_TOKEN_FILE (GITOPS_READ_TOKEN_FILE) applies only with --gitops-forge=gitlab, bitbucket or bitbucket-datacenter."
     return 1
   fi
   case "${PARAM_GITOPS_HOST:-}" in
@@ -6747,7 +6887,7 @@ create_gitlab_token_secret() {
   fi
   local scopes="scopes: api, write_repository"
   case "${GITOPS_FORGE:-gitlab}" in
-    gitea) scopes="an access token with repository read and write scope" ;;
+    gitea) scopes="an access token with scopes write:repository, write:issue, and read:user" ;;
     bitbucket) scopes="an API token with the read and write repository and pull request scopes, or an access token" ;;
     bitbucket-datacenter) scopes="a project HTTP access token with Repository write" ;;
   esac
@@ -6797,7 +6937,11 @@ create_gitlab_read_token_secret() {
         print_error "Could not remove key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}'. It holds the read token of the forge this install used before. Remove it: kubectl patch secret ${name} -n ${namespace} --type json -p '[{\"op\":\"remove\",\"path\":\"/data/${GITLAB_READ_TOKEN_SECRET_KEY}\"}]'"
         return 1
       fi
-      print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before. Give the ${label} read token with GITOPS_READ_TOKEN_FILE to read private context repositories."
+      if [ "${GITOPS_FORGE:-gitlab}" = "gitea" ]; then
+        print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before."
+      else
+        print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before. Give the ${label} read token with GITOPS_READ_TOKEN_FILE to read private context repositories."
+      fi
     fi
     return 0
   fi
@@ -7259,6 +7403,12 @@ run_menu_system() {
   # that default on would make this show a dashboard nobody deployed, so the
   # two have to be reconsidered together.
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  local enable_stockout_investigator="${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  if is_truthy "$enable_stockout_investigator"; then
+    enable_stockout_investigator="true"
+  else
+    enable_stockout_investigator="false"
+  fi
   local github_org="${GITOPS_ORG:-${GITHUB_ORG:-}}"
   local github_repo="${GITOPS_REPO:-${GITHUB_REPO:-}}"
   if ! gitops_forge_uses_token "${GITOPS_FORGE:-github}"; then
@@ -7283,13 +7433,14 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")$([ -n "$litellm_env_secret_name" ] && echo " (credentials Secret: ${litellm_env_secret_name})" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} $([ "$enable_stockout_investigator" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
 
     local menu_choice=""
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
       "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / OpenAI-compatible)" \
-      "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
+      "🛡️ Modify Security, Permission Boundaries & Stockout Investigator (gVisor / IAM / Alerts)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
       "🚪 Exit Control Panel" \
@@ -7389,9 +7540,10 @@ run_menu_system() {
         ;;
       4)
         local p_opt=""
-        prompt_menu "Select GCP IAM Permission Set:" \
+        prompt_menu "Select Security / Capability Option:" \
           "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
+          "Toggle GKE Stockout Investigator (currently $([ "$enable_stockout_investigator" = "true" ] && echo "ENABLED" || echo "DISABLED"))" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
@@ -7403,6 +7555,17 @@ run_menu_system() {
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
             warn_on_overreaching_custom_roles "$custom_roles"
+            ;;
+          3)
+            if [ "$enable_stockout_investigator" = "true" ]; then
+              enable_stockout_investigator="false"
+              print_success "GKE Stockout Investigator disabled."
+            elif ! is_truthy "${MANAGE_IAM:-${DEFAULT_MANAGE_IAM:-true}}"; then
+              print_error "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR"
+            else
+              enable_stockout_investigator="true"
+              print_success "GKE Stockout Investigator enabled!"
+            fi
             ;;
         esac
         ;;
@@ -7459,8 +7622,8 @@ run_menu_system() {
           # Armed before the write, so a failed write leaves no copy either; if
           # the write succeeded (-s) and a later step exits via on_error, puts
           # install.env back as it was before deleting the backup.
-          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
-          trap "if [ -s $(printf '%q' "$install_env_before") ]; then (umask 077; cat $(printf '%q' "$install_env_before") >$(printf '%q' "${INSTALL_ENV_FILE}.tmp")) && mv -f $(printf '%q' "${INSTALL_ENV_FILE}.tmp") $(printf '%q' "$INSTALL_ENV_FILE"); fi; rm -f $(printf '%q' "$install_env_before")" EXIT
+          # shellcheck disable=SC2064 # expand backup/env paths now: the local is gone at exit; \$? stays deferred to exit time.
+          trap "if [ \$? -ne 0 ] && [ -s $(printf '%q' "$install_env_before") ]; then (umask 077; cat $(printf '%q' "$install_env_before") >$(printf '%q' "${INSTALL_ENV_FILE}.tmp")) && mv -f $(printf '%q' "${INSTALL_ENV_FILE}.tmp") $(printf '%q' "$INSTALL_ENV_FILE"); fi; rm -f $(printf '%q' "$install_env_before")" EXIT
           cat "$INSTALL_ENV_FILE" >"$install_env_before"
         fi
 
@@ -7510,6 +7673,7 @@ run_menu_system() {
         fi
         save_env_var ENABLE_GVISOR "$enable_gvisor"
         save_env_var HERMES_DASHBOARD_ENABLED "$enable_webui"
+        save_env_var ENABLE_STOCKOUT_INVESTIGATOR "${enable_stockout_investigator:-${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}}"
         save_env_var GITOPS_ORG "$github_org"
         save_env_var GITOPS_REPO "$github_repo"
         save_env_var GITHUB_APP_ID "$github_app_id"
@@ -7661,6 +7825,93 @@ apply_agent_namespace_override() {
   fi
 }
 
+# Prompt whether to enable the GKE Stockout Investigator AgentPlugin during
+# interactive installs. Skips under --non-interactive, without a controlling
+# TTY, when --enable-stockout-investigator / --enable-stockout was passed on
+# the CLI, or when MANAGE_IAM=false (unless ENABLE_STOCKOUT_INVESTIGATOR is
+# already truthy, where it defaults to No and refuses Yes). Defaults to yes
+# when MANAGE_IAM=true and an enabled Google Chat or Slack home channel is
+# configured (or follows the loaded install.env / environment setting when
+# already set), and no otherwise.
+prompt_stockout_investigator() {
+  local google_chat_on="${1:-false}"
+  local google_chat_home="${2:-}"
+  local slack_on="${3:-false}"
+  local slack_home="${4:-}"
+  local project_name="${5:-}"
+  local manage_iam_mode="${6:-true}"
+
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    return 0
+  fi
+  if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ]; then
+    return 0
+  fi
+  if ! is_truthy "$manage_iam_mode" && ! is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+    return 0
+  fi
+
+  local has_home_channel="false"
+  if { [ "$google_chat_on" = "true" ] && [ -n "$(trim_go_space "$google_chat_home")" ]; } ||
+    { [ "$slack_on" = "true" ] && [ -n "$(trim_go_space "$slack_home")" ]; }; then
+    has_home_channel="true"
+  fi
+
+  local default_yes="false"
+  if ! is_truthy "$manage_iam_mode"; then
+    default_yes="false"
+  elif [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" = "true" ]; then
+    if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+      default_yes="true"
+    fi
+  elif [ "$has_home_channel" = "true" ]; then
+    default_yes="true"
+  fi
+
+  print_info "$STOCKOUT_INVESTIGATOR_PROMPT_DESC"
+  print_info "Provisioning enables the Pub/Sub platform adapter and creates a Cloud Logging sink, Pub/Sub topic, and pull subscription${project_name:+ in ${project_name}}."
+  if ! is_truthy "$manage_iam_mode"; then
+    print_info "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_NOTE"
+  elif [ "$has_home_channel" != "true" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ]; then
+    print_info "$STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE"
+  fi
+
+  local prompt_suffix="(y/N)" default_letter="n"
+  if [ "$default_yes" = "true" ]; then
+    prompt_suffix="(Y/n)"
+    default_letter="y"
+  fi
+
+  local stockout_choice="" normalized_choice=""
+  while true; do
+    prompt_read "${STOCKOUT_INVESTIGATOR_PROMPT_LABEL} ${prompt_suffix}" stockout_choice "$default_letter"
+    normalized_choice="$(printf '%s' "$stockout_choice" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized_choice" in
+      y | yes)
+        if ! is_truthy "$manage_iam_mode"; then
+          print_error "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR"
+          continue
+        fi
+        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "true" ]; then
+          PARAM_ENABLE_STOCKOUT_INVESTIGATOR="true"
+        fi
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="true"
+        break
+        ;;
+      n | no)
+        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "false" ] || is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+          PARAM_ENABLE_STOCKOUT_INVESTIGATOR="false"
+        fi
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="true"
+        break
+        ;;
+      *)
+        print_error "Please enter y or n."
+        ;;
+    esac
+  done
+}
+
 main() {
   parse_args "$@"
   apply_agent_namespace_override
@@ -7689,6 +7940,10 @@ main() {
     if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
       print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
       print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
+      exit 1
+    fi
+    if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}"; then
+      print_error "--menu takes no --enable-stockout-investigator: toggle GKE Stockout Investigator inside the menu (Option 4 -> Option 3), or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -9111,6 +9366,7 @@ main() {
     if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
       PARAM_MEMORY_EXPLICIT="true"
     fi
+    prompt_stockout_investigator "$google_chat_enabled" "$google_chat_home_channel" "$slack_enabled" "$slack_home_channel" "$project_id" "$manage_iam"
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -9289,7 +9545,11 @@ main() {
   fi
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
-  export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  # Conditional, like ENABLE_DRIFT_DETECTOR below: a run that did not say
+  # leaves the recorded value (or, with none, the default) to the generator.
+  if [ -n "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-}" ]; then
+    export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  fi
   # Conditional, like ENABLE_GKE_BACKUP_PLAN above and for the same reason:
   # resolve_shared_defaults leaves this PARAM empty when nothing chose, so an
   # unconditional export would write an empty value over whatever install.env
@@ -9471,6 +9731,11 @@ main() {
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
+  if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"; then
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Enabled (Pub/Sub adapter + noScaleUp sink)"
+  else
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Disabled (enable later with --enable-stockout-investigator, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)"
+  fi
   # Only shown for a mirrored install: on a default one both lines restate the
   # defaults. The second line is the one worth seeing before confirming, because
   # a mirror that covers only the first-party images fails at cert-manager, with
@@ -9863,6 +10128,11 @@ main() {
   fi
   if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
     print_web_console_access "$namespace"
+  fi
+  if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"; then
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} ${C_GREEN}Enabled${C_RESET} (monitoring cluster-autoscaler noScaleUp events)"
+  else
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Disabled (enable with ${C_BOLD}--enable-stockout-investigator${C_RESET}, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)"
   fi
 
   print_chat_setup_checklists

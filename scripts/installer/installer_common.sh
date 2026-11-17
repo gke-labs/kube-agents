@@ -744,7 +744,7 @@ openai_compatible_cidr_refusal() {
   fi
   if [[ "$address" == *:* ]]; then
     local groups
-    if ! groups="$(ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
+    if ! groups="$(trap - ERR; ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
       printf "'%s' is not an IPv6 CIDR" "$cidr"
       return 0
     fi
@@ -847,7 +847,7 @@ validate_openai_compatible_inputs() {
     return 1
   fi
   local host_port host port
-  if ! host_port="$(openai_compatible_url_host_port "$api_base")"; then
+  if ! host_port="$(trap - ERR; openai_compatible_url_host_port "$api_base")"; then
     # Not echoed: the userinfo this refuses may be the key itself.
     print_error "OPENAI_COMPATIBLE_API_BASE is not an http:// or https:// URL with a host, an optional port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}, and no userinfo, query or fragment before the path (a key belongs in OPENAI_COMPATIBLE_API_KEY)."
     return 1
@@ -1008,7 +1008,7 @@ render_footprint_summary() {
     echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
     return 1
   fi
-  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  probe_dir="$(trap - ERR; mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
   # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
@@ -1033,7 +1033,7 @@ render_footprint_summary() {
     set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
   fi
   local rendered rc=0
-  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rendered="$(trap - ERR; helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
   rm -rf "$probe_dir"
   if [ "$rc" -ne 0 ]; then
     printf '%s\n' "$rendered" >&2
@@ -1084,8 +1084,8 @@ print_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
   namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
   notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
-  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
-  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+  err_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(trap - ERR; render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
     if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
       print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
@@ -3495,7 +3495,7 @@ enable_scope_selector_apis() {
   [ -n "$(scope_selector_apis)" ] || return 0
   local project="${1:-${PROJECT_ID:-}}" missing rc=0 reason
   reason="$(scope_selector_apis_reason)"
-  missing="$(scope_selector_apis_missing "$project")" || rc=$?
+  missing="$(trap - ERR; scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     missing="$(scope_selector_apis)"
     print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan reads when it ${reason}, and which is idempotent..."
@@ -5318,7 +5318,7 @@ write_tfvars_from_state() {
       return 1
     fi
     if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
-      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+      redaction_rules="$(trap - ERR; hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
     fi
   fi
   # The scoped service account pool, for the same reason: a misspelt switch

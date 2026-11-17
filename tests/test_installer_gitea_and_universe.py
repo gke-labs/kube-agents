@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -237,6 +238,7 @@ class SovereignRuntimeHelpersTest(unittest.TestCase):
         self.assertEqual(match.group(1), PARTITIONED_PROJECT)
 
 
+@unittest.skipUnless(shutil.which("helm"), "helm CLI not installed")
 class GithubMinterChartPartitionedProjectTest(unittest.TestCase):
     """Helm template rendering for github-minter with standard and partitioned projects."""
 
@@ -770,6 +772,92 @@ class InstallerUniverseAndGiteaTest(unittest.TestCase):
         )
         self.assertEqual(san.returncode, 0, san.stderr)
         self.assertIn("AFTER_BAD=<unset>", san.stdout)
+
+    def test_stockout_prompt_and_drift_adoption_respect_manage_iam_and_partitioned_project(self) -> None:
+        # Under MANAGE_IAM=false with no prior ENABLE_STOCKOUT_INVESTIGATOR, interactive
+        # prompt_stockout_investigator skips prompting even when a Slack home channel is set.
+        skip_prompt = self._run_install_func(
+            "has_controlling_tty() { return 0; }\n"
+            "prompt_read() { echo 'UNEXPECTED_PROMPT'; exit 9; }\n"
+            'PARAM_NON_INTERACTIVE="false" PARAM_ENABLE_STOCKOUT_INVESTIGATOR="" '
+            'PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="false" '
+            'PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="false"\n'
+            f'prompt_stockout_investigator "false" "" "true" "C01234567" "{PARTITIONED_PROJECT}" "false"\n'
+            'echo "SKIP_VAL=${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-<unset>}"\n'
+        )
+        self.assertEqual(skip_prompt.returncode, 0, skip_prompt.stdout + skip_prompt.stderr)
+        self.assertIn("SKIP_VAL=<unset>", skip_prompt.stdout)
+        self.assertNotIn("UNEXPECTED_PROMPT", skip_prompt.stdout)
+
+        # When ENABLE_STOCKOUT_INVESTIGATOR=true was already set alongside MANAGE_IAM=false,
+        # prompt_stockout_investigator refuses 'y', defaults to No (y/N), and resets to false.
+        repair_prompt = self._run_install_func(
+            "has_controlling_tty() { return 0; }\n"
+            "ASK_N=0\n"
+            "prompt_read() {\n"
+            "  ASK_N=$((ASK_N + 1))\n"
+            '  if [ "$ASK_N" -eq 1 ]; then printf -v "$2" "%s" "y"; else printf -v "$2" "%s" "$3"; fi\n'
+            "}\n"
+            'PARAM_NON_INTERACTIVE="false" PARAM_ENABLE_STOCKOUT_INVESTIGATOR="true" '
+            'PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="false" '
+            'PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="true"\n'
+            f'prompt_stockout_investigator "false" "" "true" "C01234567" "{PARTITIONED_PROJECT}" "false"\n'
+            'echo "REPAIRED_VAL=${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-<unset>} ASK_N=$ASK_N"\n'
+        )
+        self.assertEqual(repair_prompt.returncode, 0, repair_prompt.stdout + repair_prompt.stderr)
+        self.assertIn("MANAGE_IAM=false is set", repair_prompt.stdout + repair_prompt.stderr)
+        self.assertIn("requires MANAGE_IAM=true", repair_prompt.stdout + repair_prompt.stderr)
+        self.assertIn("REPAIRED_VAL=false ASK_N=2", repair_prompt.stdout)
+
+        # Space-separated value flags reject missing or flag-shaped values; Gitea rejects GITOPS_READ_TOKEN_FILE.
+        missing_arg = self._run_install_func("parse_args --vpc-network --dry-run\n")
+        self.assertNotEqual(missing_arg.returncode, 0)
+        self.assertIn("--vpc-network requires a value", missing_arg.stdout + missing_arg.stderr)
+
+        read_tok_refused = self._run_install_func(
+            f'PARAM_GITOPS_FORGE=gitea PARAM_GITOPS_HOST="{GITEA_HOST}" '
+            f'PARAM_GITOPS_REPO="{GITEA_REPO}" PARAM_GITLAB_READ_TOKEN_FILE="/tmp/r.tok" '
+            "PARAM_NON_INTERACTIVE=true validate_gitops_forge_flags\n"
+        )
+        self.assertNotEqual(read_tok_refused.returncode, 0)
+        self.assertIn("GITOPS_READ_TOKEN_FILE", read_tok_refused.stdout + read_tok_refused.stderr)
+
+        # _guard_pubsub_trio_adoption formats partitioned source-sink import names with ':' -> '-'.
+        lifecycle_sh = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+        lifecycle_funcs = self._tmp / "lifecycle_funcs.sh"
+        lifecycle_funcs.write_text(
+            re.sub(
+                r'^case "\$\{1:-\}" in\b.*',
+                "",
+                lifecycle_sh.read_text(encoding="utf-8").replace(
+                    '$(dirname "${BASH_SOURCE[0]}")', str(lifecycle_sh.parent)
+                ),
+                flags=re.MULTILINE | re.DOTALL,
+            ),
+            encoding="utf-8",
+        )
+        guard_proc = _run_installer_bash(
+            f'source "{lifecycle_funcs}"\n'
+            "load_state() { STATE_LIST=''; }\n"
+            "gcloud() { return 0; }\n"
+            "tfvar() {\n"
+            '  case "$1" in\n'
+            '    enable_drift_pubsub) echo "true" ;;\n'
+            f'    project_id) echo "{PARTITIONED_PROJECT}" ;;\n'
+            '    drift_pubsub_topic) echo "platform-agent-drift-audit" ;;\n'
+            '    drift_pubsub_subscription) echo "platform-agent-drift-audit-sub" ;;\n'
+            '    drift_pubsub_sink) echo "platform-agent-drift-audit-sink" ;;\n'
+            '  esac\n'
+            "}\n"
+            "guard_drift_adoption\n",
+            get_isolated_test_env(),
+        )
+        self.assertEqual(guard_proc.returncode, 1, guard_proc.stdout + guard_proc.stderr)
+        self.assertIn(
+            'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit["<listed project>"]\' '
+            "projects/<listed project>/sinks/platform-agent-drift-audit-sink-part0-sample-project",
+            guard_proc.stdout + guard_proc.stderr,
+        )
 
 
 if __name__ == "__main__":

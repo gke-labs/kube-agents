@@ -20,7 +20,9 @@ install without the interview.
   `vpc_subnetwork` wire cluster creation onto custom VPCs when no `default` VPC
   exists, and any `model_provider` outside `openai_compatible` and `vertex_ai`
   requires `allow_external_model_egress = true` (set `manage_iam = false` —
-  alongside `enable_drift_detector = false` and an existing cluster or
+  keeping `enable_drift_detector`, `enable_drift_pubsub`,
+  `enable_stockout_investigator`, `enable_google_chat`, `enable_github_minter`,
+  and `scoped_pool_enabled` `false`, with an existing cluster or
   `enable_database_encryption = false` — when an IAM administrator
   pre-provisions the agent GSA and its IAM/Workload Identity bindings outside
   Terraform).
@@ -327,9 +329,11 @@ install's own and the state is what went missing, a repointed
 could not establish); delete the leftovers if that is what they are (it prints
 the `gcloud` commands); or leave the detector off for this install with
 `ENABLE_DRIFT_DETECTOR=false`. The stockout trio
-(`stockout_pubsub_*`) has the same shape but is still adopted, because
-`enable_stockout_investigator` stays off unless asked for: a second install
-that turns it on names its own three. Renaming a subscription already in state is a
+(`stockout_pubsub_*`) has the same shape and is refused the same way
+(`guard_stockout_adoption`): it names `TF_VAR_stockout_pubsub_topic`,
+`TF_VAR_stockout_pubsub_subscription`, and `TF_VAR_stockout_pubsub_sink`, the
+`terraform import` and `gcloud` delete commands, or
+`ENABLE_STOCKOUT_INVESTIGATOR=false`. Renaming a subscription already in state is a
 different failure, and `guard_pubsub_subscription` refuses it for the Chat,
 drift and stockout subscriptions alike, while the feature's flag is on: `name`
 and `topic` are ForceNew on `google_pubsub_subscription`, so the apply would
@@ -1141,7 +1145,7 @@ What each one does that raw Terraform cannot:
 | `deletion_protection = true` cannot be overridden by a destroy alone                                                                               | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                                                                                                                              |
 | The helm provider reports a release destroyed when it cannot reach the cluster                                                                     | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched                                                                                                             |
 | A Pub/Sub topic or subscription that already exists makes the create 409                                                                           | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                                                                                                                                   |
-| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                                                          | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                                                                                                                              |
+| The stockout topic, subscription and sink survive a partial teardown or collide across installs the same way                                       | `tf-apply` refuses instead of importing (`guard_stockout_adoption`): an import cannot tell a leftover from another live install's trio, and two investigators on one subscription split autoscaler alerts across installs                                                                                                                                                                      |
 | The drift trio does too, but the detector is on by default, so every second install in a project hits it                                           | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                                                                                                                                  |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for

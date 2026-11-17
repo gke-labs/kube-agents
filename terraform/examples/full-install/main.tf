@@ -1382,12 +1382,13 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition = var.manage_iam || (
         !var.enable_drift_detector &&
+        !var.enable_drift_pubsub &&
         !var.enable_stockout_investigator &&
         !var.enable_google_chat &&
         !var.enable_github_minter &&
         !(var.create_cluster && var.enable_database_encryption)
       )
-      error_message = "manage_iam = false cannot apply IAM grants required by: ${join(", ", compact([var.enable_drift_detector ? "enable_drift_detector (set ENABLE_DRIFT_DETECTOR=false in install.env)" : "", var.enable_stockout_investigator ? "enable_stockout_investigator" : "", var.enable_google_chat ? "enable_google_chat" : "", var.enable_github_minter ? "enable_github_minter (use a PAT-backed forge or omit --github-app-id)" : "", (var.create_cluster && var.enable_database_encryption) ? "create_cluster with enable_database_encryption (install onto an existing cluster or set TF_VAR_enable_database_encryption=false)" : ""]))}. Disable those features or set manage_iam = true."
+      error_message = "manage_iam = false cannot apply IAM grants required by: ${join(", ", compact([var.enable_drift_detector ? "enable_drift_detector (set ENABLE_DRIFT_DETECTOR=false in install.env)" : "", (!var.enable_drift_detector && var.enable_drift_pubsub) ? "enable_drift_pubsub" : "", var.enable_stockout_investigator ? "enable_stockout_investigator" : "", var.enable_google_chat ? "enable_google_chat" : "", var.enable_github_minter ? "enable_github_minter (use a PAT-backed forge or omit --github-app-id)" : "", (var.create_cluster && var.enable_database_encryption) ? "create_cluster with enable_database_encryption (install onto an existing cluster or set TF_VAR_enable_database_encryption=false)" : ""]))}. Disable those features or set manage_iam = true."
     }
     precondition {
       condition     = !local.custom_universe || contains(["openai_compatible", "vertex_ai"], var.model_provider) || var.allow_external_model_egress
