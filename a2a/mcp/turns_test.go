@@ -180,8 +180,12 @@ type gatewayScenario struct {
 	// profileChild, with delegate: the child is submitted on a2a.submit, as
 	// for an AgentProfile with the profile dispatcher on (#5494).
 	profileChild bool
-	decoys       bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
-	frames       *frameLog // when set, every frame the gateway reads is recorded
+	// profileDelegates, on an addressed turn: the profile root hands work to
+	// another profile (a delegate artifact) and then finishes with its own
+	// result, as a profile parent does once its children end.
+	profileDelegates bool
+	decoys           bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	frames           *frameLog // when set, every frame the gateway reads is recorded
 	// after, when set, runs once the turn's tasks are published, on its
 	// own goroutine, with the gateway's connection: a card's posts come
 	// from there (publishNotify).
@@ -292,6 +296,14 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 				_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s0", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: "task-stray", InReplyTo: "page-0123"}))
 			}
 			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: root, InReplyTo: f.MessageID}))
+			if sc.profileDelegates {
+				publishStatus(t, js, addressed.Addressee, root, lib.StateSubmitted, false)
+				publishStatus(t, js, addressed.Addressee, root, lib.StateWorking, false)
+				publishArtifact(t, js, addressed.Addressee, root, lib.ArtifactDelegate, "cluster: look at the node pool")
+				publishResult(t, js, addressed.Addressee, root, answerText)
+				publishStatus(t, js, addressed.Addressee, root, lib.StateCompleted, true)
+				return
+			}
 			publishRun(t, js, addressed.Addressee, root, answerText, sc.finish)
 			return
 		}
@@ -762,22 +774,24 @@ func TestTurnToolsRefuseBadInput(t *testing.T) {
 		tool string
 		args map[string]any
 	}{
-		"an empty message":                 {ToolSendMessage, map[string]any{"text": "  "}},
-		"an oversized message":             {ToolSendMessage, map[string]any{"text": strings.Repeat("x", consoleTextCap+1)}},
-		"a wildcard token":                 {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "*"}},
-		"a dotted token":                   {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "a.b"}},
-		"get without a task":               {ToolTaskControl, map[string]any{"action": "get"}},
-		"a wildcard task id":               {ToolTaskControl, map[string]any{"action": "get", "task": ">"}},
-		"a wildcard addressee":             {ToolTaskControl, map[string]any{"action": "get", "task": "*/task-x"}},
-		"an unknown action":                {ToolTaskControl, map[string]any{"action": "steer"}},
-		"parameters without an addressee":  {ToolSendMessage, map[string]any{"text": "hi", "parameters": map[string]any{"cluster": "c1"}}},
-		"a blank addressee":                {ToolSendMessage, map[string]any{"text": "hi", "addressee": "  "}},
-		"a wildcard addressee on send":     {ToolSendMessage, map[string]any{"text": "hi", "addressee": "*"}},
-		"a dotted addressee":               {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster.x"}},
-		"an addressee with a space":        {ToolSendMessage, map[string]any{"text": "hi", "addressee": "the cluster"}},
-		"a parameter that is not a string": {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster", "parameters": map[string]any{"cluster": 3}}},
-		"an addressee on a stop":           {ToolSendMessage, map[string]any{"text": "stop", "addressee": "cluster"}},
-		"an addressee on a bare /session":  {ToolSendMessage, map[string]any{"text": "/session", "addressee": "cluster"}},
+		"an empty message":                        {ToolSendMessage, map[string]any{"text": "  "}},
+		"an oversized message":                    {ToolSendMessage, map[string]any{"text": strings.Repeat("x", consoleTextCap+1)}},
+		"a wildcard token":                        {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "*"}},
+		"a dotted token":                          {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "a.b"}},
+		"get without a task":                      {ToolTaskControl, map[string]any{"action": "get"}},
+		"a wildcard task id":                      {ToolTaskControl, map[string]any{"action": "get", "task": ">"}},
+		"a wildcard addressee":                    {ToolTaskControl, map[string]any{"action": "get", "task": "*/task-x"}},
+		"an unknown action":                       {ToolTaskControl, map[string]any{"action": "steer"}},
+		"parameters without an addressee":         {ToolSendMessage, map[string]any{"text": "hi", "parameters": map[string]any{"cluster": "c1"}}},
+		"a blank addressee":                       {ToolSendMessage, map[string]any{"text": "hi", "addressee": "  "}},
+		"a wildcard addressee on send":            {ToolSendMessage, map[string]any{"text": "hi", "addressee": "*"}},
+		"a dotted addressee":                      {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster.x"}},
+		"an addressee with a space":               {ToolSendMessage, map[string]any{"text": "hi", "addressee": "the cluster"}},
+		"a parameter that is not a string":        {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster", "parameters": map[string]any{"cluster": 3}}},
+		"an addressee on a stop":                  {ToolSendMessage, map[string]any{"text": "stop", "addressee": "cluster"}},
+		"an addressee on a bare /session":         {ToolSendMessage, map[string]any{"text": "/session", "addressee": "cluster"}},
+		"an addressee on /session with a message": {ToolSendMessage, map[string]any{"text": "/session list the pods", "addressee": "cluster"}},
+		"an addressee on /session off":            {ToolSendMessage, map[string]any{"text": "/session off", "addressee": "cluster"}},
 	} {
 		start := time.Now()
 		res := callTool(t, s, args.tool, args.args)
@@ -2973,6 +2987,28 @@ func TestAnAddressedTurnIsAnsweredFromTheProfileTask(t *testing.T) {
 	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
 	if elapsed := time.Since(start); elapsed > noticeGrace {
 		t.Errorf("the answer took %s; it must not wait out the notice grace", elapsed)
+	}
+}
+
+// An addressed turn whose profile task delegated, and then finished with its
+// own result, is answered from that result at once: a profile parent ends
+// after its children, so no wake follows and the chain has ended.
+func TestAnAddressedTurnWhoseProfileDelegatedIsAnsweredAtOnce(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{profileDelegates: true})
+	start := time.Now()
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text": "why is checkout crash-looping?", "addressee": "cluster", "wait_seconds": 30,
+		"parameters": map[string]any{"project": "p1", "location": "us-central1", "cluster": "c1"},
+	})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	if strings.Contains(res.Content[0].Text, "still running") {
+		t.Errorf("a finished profile parent was reported as still running:\n%s", res.Content[0].Text)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("the answer took %s; it waited for a wake that never comes", elapsed)
 	}
 }
 

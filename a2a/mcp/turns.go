@@ -1439,6 +1439,13 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		// address without a word.
 		return res, nil, fmt.Errorf("%q is a command for the conversation, not a task; send it without addressee", strings.TrimSpace(text))
 	}
+	if _, ok := chattext.IsSessionCommand(strings.TrimSpace(text)); ok && to.Addressee != "" {
+		// "/session <message>" asks for a session, which an addressed turn
+		// isn't: unless sessions are the install's default route, the
+		// gateway reads it as the session command and drops the profile
+		// and its parameters. Refused here whatever the install's default.
+		return res, nil, fmt.Errorf("%q asks for a session; an addressed turn goes to the %s profile as a new task, so send the message without /session, or without addressee", strings.TrimSpace(text), to.Addressee)
+	}
 	if settled {
 		res, err := b.sendSettled(ctx, convs, token, text)
 		return res, nil, err
@@ -2461,6 +2468,14 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 		return out, false, nil
 	}
 	if !delegated(t) {
+		return out, true, nil
+	}
+	if w != nil && w.addressed {
+		// An addressed turn's root is the profile task. A profile parent
+		// waits for the tasks it delegated and answers with its own result
+		// (the gateway ends its chain only after its children), so its end
+		// is the chain's: no wake follows, and nothing of its children's
+		// arrives after it.
 		return out, true, nil
 	}
 	ended := false
