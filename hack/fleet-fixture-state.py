@@ -57,9 +57,10 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM) is published as `<role>.confirmed`
-alone, and its subjects are read with `gcloud compute instances list` or
-`gcloud compute firewall-rules list` in the project. `serial_contains` reads
+world-open firewall rule and its VM, the peered jumbo-frame network) is
+published as `<role>.confirmed` alone, and its subjects are read with
+`gcloud compute instances list`, `gcloud compute firewall-rules list` or
+`gcloud compute networks list` in the project. `serial_contains` reads
 an instance subject's serial port 1 output as well, with `gcloud compute
 instances get-serial-port-output`: the startup-fail VM's failure line is
 printed at boot only, and the buffer that holds it rotates within weeks.
@@ -132,9 +133,11 @@ CLUSTER_SUBJECT = "cluster"
 # cluster carries. Its subjects are `<kind>/<name-prefix>*`, read with
 # `gcloud compute <collection> list` in the project, and this is the kind to
 # collection map. The runner's probe grammar (hack/fleet-kubeconfigs.sh,
-# PROJECT_PROBE) accepts the same two kinds.
-PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules"}
-PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+# PROJECT_PROBE) accepts the same three kinds. A network's listing carries
+# its `peerings`, which is how the declared-mtu-peering role reads both
+# halves of its peering, one list per network.
+PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}
+PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;

@@ -1069,9 +1069,15 @@ FLEET_RECONCILER_ROLES = {
     # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs
     # compute.backendServices.*, compute.healthChecks.* and compute.instanceGroups.use.
     "roles/compute.loadBalancerAdmin",
-    # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
-    # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
+    # securityAdmin: the stack plants VPC firewall rules (`world_open` and
+    # `world_open_deny_remote`, main.tf), and the create needs compute.firewalls.* and
+    # compute.networks.updatePolicy.
     "roles/compute.securityAdmin",
+    # networkAdmin: the stack plants a VPC network and peers it with `default`
+    # (`mtu_peer_declared`, main.tf), and the create needs compute.networks.create,
+    # .delete, .addPeering, .removePeering and .updatePeering, which no other role
+    # here carries.
+    "roles/compute.networkAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
@@ -1289,7 +1295,7 @@ _UNREAD_PATTERNS = (
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs eight projects at once, and one wave of 429s would read
+    # the scan runs ten projects at once, and one wave of 429s would read
     # as several drifted. gRPC's retryable statuses, as gcloud prints them
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.

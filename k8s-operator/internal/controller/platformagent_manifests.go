@@ -167,6 +167,12 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
+	// systemMetadataStorageSize is the request of the namespace's system-metadata
+	// claim, and the floor for small PersistentVolumeClaims the operator renders.
+	// Hyperdisk Balanced (hyperdisk-balanced), the default StorageClass on C3-only
+	// GKE clusters, rejects CreateVolume below 4 GB with HTTP 400 InvalidArgument
+	// rather than rounding up, leaving unbound 1Gi claims permanently Pending.
+	systemMetadataStorageSize = "4Gi"
 	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
 	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
 	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
@@ -2579,7 +2585,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("1Gi"),
+					corev1.ResourceStorage: resource.MustParse(systemMetadataStorageSize),
 				},
 			},
 		},
@@ -3365,7 +3371,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 		kept = extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar ||
+				e.Name == agentv1alpha1.GoogleCloudUniverseDomainEnv || e.Name == agentv1alpha1.CloudSDKUniverseDomainEnv ||
+				e.Name == agentv1alpha1.KubeProxyUniverseDomainEnv || strings.HasPrefix(e.Name, agentv1alpha1.CloudSDKEndpointOverridesEnvPrefix) {
 				continue
 			}
 			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
@@ -3593,6 +3601,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: strings.Join(opts.enabledProfiles, ","),
 		})
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
+		})
+	}
 	// The Hermes Google Chat and Slack platforms are off: the gateway holds
 	// them (a2aChatArmed, a2aSlackArmed), so the agent-side callers that
 	// used to `hermes send` a proactive post route it to the gateway's
@@ -3741,7 +3755,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
-	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
+	// of its own, from the first render (a2aBridgeInPod). It takes the executor environment every task-executing
 	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
 	if a2aBridgeInPod(agent) {
 		for _, c := range containers {
@@ -4544,16 +4558,20 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts three of the image's four peer services — the API authenticator,
-		// the k8s-event-watcher, and the drift-detector where it is enabled. See
+		// Starts the image's peer services for this pod: the API authenticator,
+		// the k8s-event-watcher, the drift-detector where it is enabled, and the
+		// audit-report store listener (on the pod IP, port 8700, behind the
+		// gateway policy and its own token check). See
 		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports: []corev1.ContainerPort{
+		Ports: append([]corev1.ContainerPort{
 			{Name: "proxy-api", ContainerPort: 8643},
 			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
 			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
-		},
+			// And the audit-report store listener's, which the Service
+			// <agent>-report-store targets by name.
+		}, auditReportStoreSidecarPorts(agent)...),
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
 		// whether the pod is healthy or not, and there is no /healthz to ask
@@ -4628,6 +4646,12 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
+		})
+	}
 	// The rules reach the watcher as a file from a ConfigMap, which the
 	// watcher reads again every minute, so a change to the list applies
 	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
@@ -4646,6 +4670,10 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
 		)
 	}
+	// The audit-report store listener's switch and subject
+	// (audit_report_store.go). This container runs it: the PVC and the pod's
+	// API-audience token, which the listener reads the JWKS with, are here.
+	envVars = append(envVars, auditReportStoreSidecarEnv(agent)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
@@ -4891,6 +4919,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	)
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
+		})
+	}
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
 		// `tokenFile` rather than `--token`, since the kubelet rotates the
@@ -5201,13 +5235,20 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// in the render would fail to say so.
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
+		agentv1alpha1.GoogleCloudUniverseDomainEnv,
+		agentv1alpha1.CloudSDKUniverseDomainEnv,
+		agentv1alpha1.KubeProxyUniverseDomainEnv,
 	} {
+		reserved[name] = struct{}{}
+	}
+	// The audit-report store's names (auditReportStoreEnvNames).
+	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {
-		if _, found := reserved[env.Name]; !found {
+		if _, found := reserved[env.Name]; !found && !agentv1alpha1.IsSensitiveEnvVar(env.Name) {
 			result = append(result, env)
 		}
 	}
@@ -6733,32 +6774,51 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // actually calls the forge, is not covered by it; how the broker's egress should
 // be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	universe := effectiveUniverseDomain(agent)
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
-		"googleapis.com",
-		"*.googleapis.com",
-		"accounts.google.com",
-		"*.gstatic.com",
-		// GKE DNS-based control plane endpoints. get-credentials prefers these
-		// over the IP endpoint wherever a cluster publishes one that accepts
-		// external traffic, so the kubeconfig names a Google frontend rather
-		// than an address in apiCIDRs. Without this the pod authenticates
-		// against the control plane it can no longer reach: rule 6 covers the
-		// IP endpoints only, and FQDN mode is exactly when the blanket
-		// 0.0.0.0/0:443 rule is withheld.
-		//
-		// A pattern wildcard spans one label and no dots, so the two-label
-		// form is what actually matches an endpoint: the hostname is
-		// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
-		// wildcard in this list needs exactly one label, so nothing here
-		// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
-		"*.gke.goog",
-		"*.*.gke.goog",
-		// Container & Artifact Registries (Plugin OCI images)
-		"gcr.io",
-		"*.gcr.io",
-		"pkg.dev",
-		"*.pkg.dev",
+		universe,
+		"*." + universe,
+	}
+	if isCustomUniverseDomain(universe) {
+		// In a custom universe_domain, Artifact Registry (<region>-docker.pkg.<universe>
+		// or, when universe starts with "apis-", <region>-docker.pkg-<suffix>) and GKE
+		// DNS control-plane endpoints (<cluster>.<region>.gke.<universe> or
+		// <cluster>.<region>.gke-<suffix>) sit outside commercial pkg.dev / gke.goog.
+		patterns = append(patterns, "*.*."+universe, "*.*.*."+universe)
+		if gkeSuffix, ok := strings.CutPrefix(universe, apisUniverseDomainPrefix); ok && gkeSuffix != "" {
+			patterns = append(patterns,
+				gkeSingleWildcardHostPrefix+gkeSuffix,
+				gkeDoubleWildcardHostPrefix+gkeSuffix,
+				pkgBareHostPrefix+gkeSuffix,
+				pkgSingleWildcardHostPrefix+gkeSuffix,
+			)
+		}
+	} else {
+		patterns = append(patterns,
+			"accounts.google.com",
+			"*.gstatic.com",
+			// GKE DNS-based control plane endpoints. get-credentials prefers these
+			// over the IP endpoint wherever a cluster publishes one that accepts
+			// external traffic, so the kubeconfig names a Google frontend rather
+			// than an address in apiCIDRs. Without this the pod authenticates
+			// against the control plane it can no longer reach: rule 6 covers the
+			// IP endpoints only, and FQDN mode is exactly when the blanket
+			// 0.0.0.0/0:443 rule is withheld.
+			//
+			// A pattern wildcard spans one label and no dots, so the two-label
+			// form is what actually matches an endpoint: the hostname is
+			// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
+			// wildcard in this list needs exactly one label, so nothing here
+			// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
+			"*.gke.goog",
+			"*.*.gke.goog",
+			// Container & Artifact Registries (Plugin OCI images)
+			"gcr.io",
+			"*.gcr.io",
+			"pkg.dev",
+			"*.pkg.dev",
+		)
 	}
 	// GitOps & Source Control: derived from the forge declaration, so a forge
 	// at a customer-chosen hostname is reachable without a literal here. Kept
@@ -7097,6 +7157,13 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			Port:     ptr.To(intstr.FromInt32(dashboardPort)),
 		})
 	}
+
+	// The audit-report store listener on agent-api-auth: the broker's pods
+	// alone, to its port (auditReportStoreIngressRule). Here rather than in a
+	// policy of its own, so a rollback to an operator that renders this policy
+	// without it drops it, and spec.networkPolicy.enabled false takes it with
+	// the policy.
+	ingressRules = append(ingressRules, auditReportStoreIngressRule(agent))
 
 	// The managed-Prometheus collector, scraping the event watcher's metrics
 	// port on the agent-api-auth sidecar. A rule of its own rather than a port
