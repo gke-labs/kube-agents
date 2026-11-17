@@ -5227,6 +5227,107 @@ def test_a_5xx_answer_is_retried_before_it_is_returned(monkeypatch):
     assert pauses == []
 
 
+def test_a_rate_limit_is_waited_out_for_the_window_the_forge_names(monkeypatch):
+    """#6105: concurrent smoke runs drain one App installation's budget for
+    minutes. Inside a check, a rate-limited answer to the grading token waits
+    for Retry-After, else X-RateLimit-Reset, else a default, and is read again,
+    from one budget the check's reads share; a permission 403 is answered at
+    once, and outside a check or under another token nothing waits."""
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    grading = {"yes": True}
+    monkeypatch.setattr(verifiers, "_grading_token", lambda token: grading["yes"])
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener_for(code, body, headers, recover_after):
+        calls = {"n": 0}
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                calls["n"] += 1
+                if calls["n"] <= recover_after:
+                    raise verifiers.urllib.error.HTTPError(_api(), code, "x", headers, io.BytesIO(body))
+                return _Response()
+
+        monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _Opener())
+        return calls
+
+    limited = b'{"message": "API rate limit exceeded for installation ID 1."}'
+    cases = [
+        (403, limited, {"X-RateLimit-Reset": "1120"}, [121.0]),
+        (403, b'{"message": "Resource not accessible"}', {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1009"}, [10.0]),
+        (429, b"{}", {"Retry-After": "30"}, [30.0]),
+        (403, limited, {}, [verifiers._RATE_LIMIT_DEFAULT_WAIT_SEC]),
+    ]
+    def in_check(budget=verifiers._RATE_LIMIT_WAIT_BUDGET_SEC):
+        cell = [budget]
+        token = verifiers._rate_limit_budget.set(cell)
+        try:
+            return verifiers._http_get_json(_api(), "tok", 30.0), cell[0]
+        finally:
+            verifiers._rate_limit_budget.reset(token)
+
+    for code, body, headers, waits in cases:
+        pauses.clear()
+        opener_for(code, body, headers, recover_after=1)
+        assert in_check()[0] == (200, {"number": 7})
+        assert pauses == waits
+
+    pauses.clear()
+    calls = opener_for(403, limited, {"Retry-After": "100"}, recover_after=99)
+    (status, _), left = in_check()
+    assert (status, pauses, left, calls["n"]) == (403, [100.0], 80.0, 2), "a second 100 s wait would pass the budget"
+    assert verifiers._last_read_rate_limited.get() is True
+
+    for name, call in (
+        ("outside a check", lambda: verifiers._http_get_json(_api(), "tok", 30.0)),
+        ("permission 403", lambda: in_check()[0]),
+        ("another token", lambda: in_check()[0]),
+    ):
+        pauses.clear()
+        grading["yes"] = name != "another token"
+        body = b'{"message": "Resource not accessible by integration"}' if name == "permission 403" else limited
+        calls = opener_for(403, body, {"Retry-After": "5"}, recover_after=99)
+        assert call()[0] == 403, name
+        assert (pauses, calls["n"]) == ([], 1), name
+
+
+def test_a_rate_limit_past_the_waits_does_not_read_as_a_missing_grant(monkeypatch):
+    """#6105: the check's own words read a 403 as a missing permission. Every
+    read rate limited under the grading token leads with that instead."""
+
+    class _Check:
+        @verifiers._marks_forge_unavailable
+        def verify(self, timeout_sec):
+            verifiers._note_forge_read(True, "answered 403, rate limited")
+            return VerificationResult(success=False, status="error", reason="the token needs `pull_requests: read`", elapsed_time=0.0)
+
+    reason = _Check().verify(1.0).reason
+    assert verifiers._rate_limit_budget.get() is None, "the budget is the check's alone"
+    assert reason.startswith(f"{forges.FORGE_UNAVAILABLE_MARKER} (answered 403, rate limited): the grading token was rate limited")
+    assert "does not apply" in reason
+
+    class _Outage:
+        @verifiers._marks_forge_unavailable
+        def verify(self, timeout_sec):
+            verifiers._note_forge_read(True, "answered 502")
+            return VerificationResult(success=False, status="error", reason="GitHub answered 502", elapsed_time=0.0)
+
+    assert _Outage().verify(1.0).reason == f"{forges.FORGE_UNAVAILABLE_MARKER} (answered 502): GitHub answered 502"
+
+
 def test_the_ledger_verifier_is_published_as_an_entry_point():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
@@ -7144,7 +7245,26 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
         assert verifiers._forge_get_json("https://forge.example/x", sent, 1.0)[0] == 429
     finally:
         verifiers._forge_unavailable.reset(token)
-    assert seen == [(noted, "answered 429")]
+    assert seen == [(noted, "answered 429, rate limited" if noted else "answered 429")]
+
+
+def test_a_403_rate_limited_only_by_its_headers_is_noted_as_a_rate_limit(monkeypatch):
+    """#6105: a 403 whose body names no rate limit but whose
+    X-RateLimit-Remaining is 0 is the limit, not a missing grant."""
+    monkeypatch.setattr(verifiers, "_grading_token", lambda token: True)
+
+    def fake_get(url, tok, timeout):
+        verifiers._last_read_rate_limited.set(True)
+        return 403, {"message": "Resource not accessible by integration"}
+
+    monkeypatch.setattr(verifiers, "_http_get_json", fake_get)
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        verifiers._forge_get_json("https://forge.example/x", "ghs_fake", 1.0)
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == [(True, "answered 403, rate limited")]
 
 
 def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):

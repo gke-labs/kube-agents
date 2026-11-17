@@ -235,6 +235,15 @@ _HTTP_SERVER_ERROR_FLOOR = 500
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_FORBIDDEN = 403
 _RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
+# Inside a forge-reading check, a read the grading token was rate limited on
+# waits for the window the forge names (Retry-After, else GitHub's
+# X-RateLimit-Reset) and is read again, within _FORGE_READ_ATTEMPTS: concurrent
+# smoke runs share one App installation's hourly budget and drain it for
+# minutes at a time (#6105). Every read of one check shares this many seconds
+# of waiting, well inside the unit's lock allowance (UNIT_LOCK_ALLOWANCE_SECONDS
+# in hack/ci-eval-pr.sh); a window longer than what is left is not waited for.
+_RATE_LIMIT_WAIT_BUDGET_SEC = 180.0
+_RATE_LIMIT_DEFAULT_WAIT_SEC = 60.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -4287,8 +4296,10 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     ``status="error"`` rather than a fail — an unreachable API is the absence
     of an observation, not a violation. A transport failure or a 5xx answer is
     retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
-    forge fault does not become that error; any other HTTP answer is returned
-    on the first try.
+    forge fault does not become that error. Inside a forge-reading check, a
+    rate limit on the grading token is waited out and read again, from the
+    check's shared budget (_RATE_LIMIT_WAIT_BUDGET_SEC). Any other HTTP answer
+    is returned on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -4315,6 +4326,8 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         # self-managed GitLab or the GHES proxy.
         handlers.append(urllib.request.HTTPSHandler(context=context))
     opener = urllib.request.build_opener(*handlers)
+    budget = _rate_limit_budget.get() if _grading_token(token) else None
+    _last_read_rate_limited.set(False)
     for attempt in range(1, _FORGE_READ_ATTEMPTS + 1):
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -4330,6 +4343,12 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             if exc.code >= _HTTP_SERVER_ERROR_FLOOR and attempt < _FORGE_READ_ATTEMPTS:
                 time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
                 continue
+            wait = _rate_limit_wait(exc.code, payload, exc.headers)
+            if wait is not None and budget is not None and attempt < _FORGE_READ_ATTEMPTS and wait <= budget[0]:
+                budget[0] -= wait
+                time.sleep(wait)
+                continue
+            _last_read_rate_limited.set(wait is not None)
             return exc.code, payload
         except json.JSONDecodeError as exc:
             raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
@@ -4353,6 +4372,51 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     raise AssertionError("unreachable")
 
 
+# Seconds of rate-limit waiting the current check has left, shared by its
+# reads; None outside a forge-reading check's verify, where nothing waits.
+_rate_limit_budget: ContextVar[list[float] | None] = ContextVar("rate_limit_budget", default=None)
+# Whether the answer _http_get_json last returned was a rate limit, headers
+# included (X-RateLimit-Remaining: 0), for _forge_get_json's note.
+_last_read_rate_limited: ContextVar[bool] = ContextVar("last_read_rate_limited", default=False)
+
+
+def _grading_token(token: str) -> bool:
+    """Whether ``token`` is the CI-minted grading token on GitHub (the ledger
+    App's installation, which the agent cannot spend). The token the read
+    sent, not the variable: read_token falls back to BENCH_GITHUB_TOKEN when
+    the file holds no usable token."""
+    return forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(forges.FORGE_GITHUB, os.environ)
+
+
+def _rate_limited(status: int, payload: Any, headers: Any = None) -> bool:
+    """A 429, or a 403 whose message names a rate limit or whose
+    X-RateLimit-Remaining is 0: the forge limiting the caller, not refusing it."""
+    if status == _HTTP_TOO_MANY_REQUESTS:
+        return True
+    if status != _HTTP_FORBIDDEN:
+        return False
+    message = payload.get("message") if isinstance(payload, dict) else None
+    remaining = headers.get("X-RateLimit-Remaining") if headers is not None else None
+    return (isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))) or str(remaining).strip() == "0"
+
+
+def _rate_limit_wait(status: int, payload: Any, headers: Any) -> float | None:
+    """Seconds to wait before reading a rate-limited answer again, from
+    Retry-After or X-RateLimit-Reset (epoch seconds), else a default; None when
+    the answer is not a rate limit."""
+    if not _rate_limited(status, payload, headers):
+        return None
+    headers = headers if headers is not None else {}
+    for name, since_now in (("Retry-After", False), ("X-RateLimit-Reset", True)):
+        try:
+            value = float(str(headers.get(name)).strip())
+        except ValueError:
+            continue
+        # One second past the reset, so the read lands in the new window.
+        return max(1.0, value - time.time() + 1.0 if since_now else value)
+    return _RATE_LIMIT_DEFAULT_WAIT_SEC
+
+
 # The forge reads of the check being verified that did not answer 2xx, each as
 # (transient, what): transient when the read says nothing about the run (see
 # _forge_get_json). None outside a forge-reading check's verify.
@@ -4374,23 +4438,23 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     resolve or refuses the connection, an unknown forge) is noted as not
     transient, and keeps the check's error plain unless the check drops it as
     not behind the error."""
+    _last_read_rate_limited.set(False)
     try:
         status, payload = _http_get_json(url, token, timeout)
     except OSError as exc:
         _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
         raise
     if status // 100 != 2:
-        message = payload.get("message") if isinstance(payload, dict) else None
-        rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
-            status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
-        )
-        # The token this read sent, not the variable: read_token falls back
-        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
-            forges.FORGE_GITHUB, os.environ
-        )
-        _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
+        rate_limited = _rate_limited(status, payload) or _last_read_rate_limited.get()
+        if rate_limited and _grading_token(token):
+            _note_forge_read(True, f"answered {status}{_RATE_LIMITED_SUFFIX}")
+        else:
+            _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR, f"answered {status}")
     return status, payload
+
+
+# How a noted read reads when the grading token's rate limit outlasted the waits.
+_RATE_LIMITED_SUFFIX = ", rate limited"
 
 
 def _forge_transport_failure(exc: OSError) -> bool:
@@ -4492,15 +4556,24 @@ def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult])
     @wraps(verify)
     def marked(self: Any, timeout_sec: float) -> VerificationResult:
         token = _forge_unavailable.set([])
+        budget = _rate_limit_budget.set([_RATE_LIMIT_WAIT_BUDGET_SEC])
         try:
             result = verify(self, timeout_sec)
             noted = _forge_unavailable.get() or []
         finally:
+            _rate_limit_budget.reset(budget)
             _forge_unavailable.reset(token)
         if result.status != "error" or not noted or not all(transient for transient, _ in noted):
             return result
         what = ", ".join(what for _, what in noted)
-        return result.model_copy(update={"reason": f"{forges.FORGE_UNAVAILABLE_MARKER} ({what}): {result.reason}"})
+        reason = result.reason
+        if all(what.endswith(_RATE_LIMITED_SUFFIX) for _, what in noted):
+            # The check's own words read a 403 as a missing grant (#6105).
+            reason = (
+                "the grading token was rate limited past the retries, so this check could not "
+                f"be evaluated; any permission the check names next does not apply: {reason}"
+            )
+        return result.model_copy(update={"reason": f"{forges.FORGE_UNAVAILABLE_MARKER} ({what}): {reason}"})
 
     return marked
 
