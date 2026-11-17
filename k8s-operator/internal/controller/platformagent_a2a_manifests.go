@@ -5114,6 +5114,22 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	return n
 }
 
+// sessionQuantity is one of the session pod's resolved requests (request
+// true) or limits, as the gateway's env carries it.
+func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name corev1.ResourceName) string {
+	var override *corev1.ResourceRequirements
+	if limits := agentTuning(agent); limits != nil {
+		override = limits.SessionResources
+	}
+	resolved := agentv1alpha1.ResolveSessionResources(override)
+	set := resolved.Limits
+	if request {
+		set = resolved.Requests
+	}
+	q := set[name]
+	return q.String()
+}
+
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
 		return *limits.MaxSessions
@@ -6880,6 +6896,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The session pod's requests and limits (#2371), always all four,
+		// resolved per key over the defaults (ResolveSessionResources), so
+		// the rendered Deployment states what the gateway will request.
+		{Name: "A2A_SESSION_CPU_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceMemory)},
+		{Name: "A2A_SESSION_CPU_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceMemory)},
 		// The relay binds the durable the provision Job created (#4173).
 		{Name: a2aGatewayRelayPrecreatedEnvVar, Value: "true"},
 		// The busy notice's threshold, rendered explicitly
@@ -7360,6 +7383,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
+	r.noteA2ABusSingleServer(ctx, agent)
 	// A count change (a migration's phase moving the bus between one server
 	// and three) leaves streams that are not there until the migration puts
 	// them back, so the provisioned-once record no longer describes the

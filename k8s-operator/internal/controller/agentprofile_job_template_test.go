@@ -164,8 +164,16 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if ref == nil {
 		t.Fatal("the unattended profile names no Job template in the dispatch config")
 	}
-	if ref.Name != dispatchJobTemplatePrefix+"tse" {
-		t.Errorf("the config names %s, want the policy's param for tse", ref.Name)
+	// The written ref carries the hash alone (#5479); the dispatcher derives
+	// the param's name, which the operator still knows in memory.
+	if ref.Name != "" || ref.Hash == "" {
+		t.Errorf("the config's ref is %+v, want the hash alone", ref)
+	}
+	mem, _ := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	for _, p := range mem.Profiles {
+		if p.Name == "tse" && (p.JobTemplateRef == nil || p.JobTemplateRef.Name != dispatchJobTemplatePrefix+"tse") {
+			t.Errorf("the operator's own ref %+v doesn't name the policy's param", p.JobTemplateRef)
+		}
 	}
 	inConfig := dispatchJobTemplates(agent, profiles, false)["tse"]
 	if strings.Contains(cm.Data[a2aDispatchConfigKey], "containers") {

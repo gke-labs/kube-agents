@@ -100,9 +100,8 @@ release-candidate pipeline within three hours and stops the tag. The pipeline th
 suite again on a `spec.mode: today` install, where a failure reds the run but gates no tag
 ([`tests/e2e/README.md`](../tests/e2e/README.md#-running-in-github-actions-ci)). Both `rc-release-pipeline.yml` and `staging-promotion-pipeline.yml`
 reach the suite through the same reusable `e2e-run.yml`; `e2e-gchat-test.yml` and
-`e2e-manual-runner.yml` are the by-hand callers. `autopush-next-e2e-gchat.yml` runs `gchat_agent_test.py` every three hours against the
-long-lived `autopush-next` environment, outside any gate, and skips until that environment is
-provisioned for it. `tests/e2e/operator/agentplugins_e2e_test.py` is
+`e2e-manual-runner.yml` are the by-hand callers.
+`tests/e2e/operator/agentplugins_e2e_test.py` is
 the exception inside the exception: it is the whole of the `agent-plugin` suite and is in the
 `nightly` E2E test set too, and `staging-promotion-pipeline.yml` runs `agent-plugin` as tolerated coverage
 rather than as its gate — so the scheduler dispatches the pipeline daily when an eligible
