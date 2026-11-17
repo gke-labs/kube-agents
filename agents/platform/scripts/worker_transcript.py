@@ -636,6 +636,47 @@ GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
 SCRIPT_LONG_FLAG = "--command"
+# Other tools' token printers: for each binary, the subcommand paths that
+# print a token. A path counts where the tool's subcommand can start, behind
+# the tool's own flags and their values (`_first_operands`), and its words
+# stand together (`kubectl -n ci create token builder`). The same words
+# behind another subcommand are arguments (`gh search issues auth token`),
+# and so is a path word behind a flag (`kubectl create -f token`).
+TOKEN_PRINTER_PATHS = {
+    "gh": (("auth", "token"),),
+    "az": (("account", "get-access-token"),),
+    "aws": (("sts", "get-session-token"),),
+    "kubectl": (("create", "token"),),
+    "oc": (("create", "token"),),
+}
+# Another language's print of its whole environment, as inline code
+# (`python3 -c '...os.environ...'`, `node -e '...process.env...'`), also
+# behind a tool that runs the interpreter (`uv run python -c ...`). Served,
+# because they print no value of the whole: a read of one variable by a
+# literal name (`os.environ["HOME"]`, `process.env.HOME`), a method that
+# reads or sets one (`.get(`, `.setdefault(`, `.pop(`, `.update(`), `.keys()`
+# and `Object.keys(...)`, a membership test of a literal name
+# (`"X" in os.environ`), and the environment handed on or taken apart
+# (`env=os.environ`, `env={**os.environ, ...}`, `{env: process.env}`,
+# `const { NAME } = process.env`). A subscript by a variable withholds
+# (`os.environ[k]` in a loop over the names). A code file and code on
+# standard input are not read.
+PYTHON_BINARY_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?)$")
+PYTHON_CODE_FLAG = "c"
+PYTHON_ENVIRONMENT_RE = re.compile(
+    r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b(?!\s*(?:\[\s*['"]|\.(?:get|setdefault|pop|update|keys)\s*\())"""
+)
+PYTHON_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\benv\s*=\s*(?:\{\*\*|dict\()?|['"]\s+(?:not\s+)?in\s+)$""")
+NODE_BINARIES = frozenset(("node", "nodejs"))
+NODE_CODE_FLAGS = ("e", "p")
+NODE_CODE_LONG_FLAGS = frozenset(("--eval", "--print"))
+NODE_ENVIRONMENT_RE = re.compile(r"""(?<!\w)process\.env\b(?!\s*(?:\.[A-Za-z_$]|\[\s*['"]))""")
+NODE_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\benv\s*:\s*|\}\s*=\s*|Object\.keys\(|['"]\s+in\s+)$""")
+# How much text ahead of the environment's name the served forms are read in.
+CODE_LOOKBACK_CHARS = 32
+# Tools that run a command in a project's environment (`uv run python ...`,
+# `npx node ...`): any later word that names a command may be it.
+PACKAGE_RUNNER_WORDS = frozenset(("uv", "poetry", "pipenv", "npx"))
 # The environment: `env` with no command behind its options, and `printenv`,
 # `export`, `declare`, `typeset` or `readonly` with no name, print all of it;
 # bare `set` prints every variable. With a name, `printenv` and a declaring
@@ -704,9 +745,9 @@ EVAL_WORD_JOIN = " "
 # NAME`).
 REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl"))
 REMOTE_COMMAND_VERBS = frozenset(("exec", "run"))
-OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock"))
+OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock")) | PACKAGE_RUNNER_WORDS
 OPERAND_AND_COMMAND_WIDTH = 2
-REMOTE_NAMED_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | SHELL_BINARIES
+REMOTE_NAMED_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | SHELL_BINARIES | NODE_BINARIES | frozenset(TOKEN_PRINTER_PATHS)
 # A word that may be an argument names a command by its bare name or by a path into a `bin` directory.
 BINARY_DIRECTORY_SUFFIX = "bin"
 FIND_BINARY = "find"
@@ -721,6 +762,8 @@ COMMAND_READING_WORDS = (
     | REMOTE_COMMAND_WORDS
     | OPERAND_COMMAND_WORDS
     | SCRIPT_FLAG_WORDS
+    | NODE_BINARIES
+    | frozenset(TOKEN_PRINTER_PATHS)
     | frozenset((TRAP_BUILTIN, EVAL_BUILTIN, FIND_BINARY))
 )
 OPTION_PREFIXES = ("-", "+")
@@ -763,14 +806,20 @@ HERE_STRING_OPERATOR = "<<<"
 # first character of a word, outside quotes.
 SHELL_MARK_RE = re.compile(r"\\.|['\"#`]|\$\(", re.DOTALL)
 SHELL_ESCAPE_CHAR = "\\"
-SHELL_SINGLE_QUOTE = "'"
 SHELL_COMMENT_CHAR = "#"
 COMMENT_LEAD_CHARS = frozenset(" \t\n;|&()")
 # No script without one of these fragments, or `/proc/`, is withheld by this
 # rule. Quotes, backslashes and a continuation's line break can stand inside
 # a shell word (`e"n"v`), so the fragments are looked for in the text without
 # them.
-TOKEN_OR_ENVIRONMENT_FRAGMENTS = tuple(sorted(TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | GCLOUD_TOKEN_PRINTERS | frozenset((ENVIRON_FILE,))))
+TOKEN_OR_ENVIRONMENT_FRAGMENTS = tuple(
+    sorted(
+        TOKEN_OR_ENVIRONMENT_COMMAND_WORDS
+        | GCLOUD_TOKEN_PRINTERS
+        | frozenset((ENVIRON_FILE,))
+        | frozenset(path[-1] for paths in TOKEN_PRINTER_PATHS.values() for path in paths)
+    )
+)
 SHELL_QUOTING_CHARS_REMOVED = str.maketrans("", "", "\"'\\\n")
 PROC_DIRECTORY = "/proc/"
 # A line that cannot be read as words withholds on this much: a token printer
@@ -1925,6 +1974,33 @@ def _gcloud_prints_token(rest: Sequence[str]) -> bool:
     return False
 
 
+def _runs_token_printer(paths: Sequence[Sequence[str]], words: Sequence[str], behind: int) -> bool:
+    """Whether the words from `behind` on run one of a tool's token-printer paths (see `TOKEN_PRINTER_PATHS`)."""
+    return any(tuple(words[start : start + len(path)]) == tuple(path) for start in _first_operands(words, behind) for path in paths)
+
+
+def _code_prints_environment(code: str, environment_re: "re.Pattern[str]", served_before_re: "re.Pattern[str]") -> bool:
+    """Whether inline code uses a language's whole environment (see `PYTHON_BINARY_RE`)."""
+    for found in environment_re.finditer(code):
+        if not served_before_re.search(code[max(0, found.start() - CODE_LOOKBACK_CHARS) : found.start()]):
+            return True
+    return False
+
+
+def _interpreter_prints_environment(base: str, rest: Sequence[str]) -> bool:
+    """Whether an interpreter's inline code, among the words after it, prints its whole environment."""
+    if PYTHON_BINARY_RE.match(base):
+        if any(_is_flag_cluster_with(word, PYTHON_CODE_FLAG) for word in rest):
+            return any(_code_prints_environment(word, PYTHON_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE) for word in rest)
+    elif base in NODE_BINARIES:
+        if any(
+            word.partition(EQUALS_SEPARATOR)[0] in NODE_CODE_LONG_FLAGS or any(_is_flag_cluster_with(word, flag) for flag in NODE_CODE_FLAGS)
+            for word in rest
+        ):
+            return any(_code_prints_environment(word, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE) for word in rest)
+    return False
+
+
 def _flag_values(words: Sequence[str], flag: str) -> List[str]:
     """The values of `flag` among `words`: `flag=value`, and the word behind a bare `flag`."""
     joined = flag + EQUALS_SEPARATOR
@@ -1975,13 +2051,17 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
             continue
         read.add(start)
         base = _base_word(words[start])
-        if base not in COMMAND_READING_WORDS:
+        if base not in COMMAND_READING_WORDS and not PYTHON_BINARY_RE.match(base):
             continue
         steps += len(words) - start
         if steps > MAX_READ_STEPS:
             return any(_is_named_word(word, TOKEN_OR_ENVIRONMENT_COMMAND_WORDS) for word in words)
         behind = start + 1
         rest = words[behind:]
+        if base in TOKEN_PRINTER_PATHS and _runs_token_printer(TOKEN_PRINTER_PATHS[base], words, behind):
+            return True
+        if _interpreter_prints_environment(base, rest):
+            return True
         if base in SCRIPT_FLAG_WORDS:
             script_flag = next((index for index, word in enumerate(rest) if _is_flag_cluster_with(word, SHELL_SCRIPT_FLAG)), None)
             if script_flag is not None:
@@ -2019,7 +2099,11 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
                     starts.append((behind + dashes + OPERAND_AND_COMMAND_WIDTH, False))
                 named_among = rest[:dashes]
             if base in OPERAND_COMMAND_WORDS or not REMOTE_COMMAND_VERBS.isdisjoint(rest):
-                starts.extend((behind + index, False) for index, word in enumerate(named_among) if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS))
+                starts.extend(
+                    (behind + index, False)
+                    for index, word in enumerate(named_among)
+                    if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word))
+                )
         elif base == EVAL_BUILTIN:
             if _quoted_script_prints(EVAL_WORD_JOIN.join(rest), depth, budget):
                 return True
