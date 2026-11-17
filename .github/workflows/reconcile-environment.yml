@@ -45,8 +45,9 @@ on:
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
       # render. Off by default, because on an environment that should exist a
-      # missing one is the failure. A caller drops it once the environment is
-      # provisioned, so that clearing its variables reds the run again.
+      # missing one is the failure. No workflow passes it today; a caller that
+      # does should drop it once its environment is provisioned, so that
+      # clearing its variables reds the run again.
       skip_unconfigured:
         description: "Skip, rather than fail, when the GitHub environment or its GCP_PROJECT_ID is missing"
         required: false
