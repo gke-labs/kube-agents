@@ -117,6 +117,11 @@ type tierVerdict struct {
 	// draining are tiers that left the profile and still drain, each until
 	// its end (decideDrains); never in renderable.
 	draining map[string]time.Time
+	// ending are the draining tiers an administrator is ending now
+	// (endTierDrainAnnotation, #5850), and appliedEnding the tiers the applied
+	// dispatch config already marks ending, whose annotation entries the
+	// AgentProfile controller then consumes (consumeEndTierDrain).
+	ending, appliedEnding map[string]bool
 }
 
 // decideTiers decides p's tiers from cat, with rendered the tiers it was last
@@ -275,6 +280,13 @@ func narrowedCopy(p *agentv1alpha1.AgentProfile, v tierVerdict) *agentv1alpha1.A
 	}
 	cp.Annotations[renderedTierModesAnnotation] = strings.Join(pairs, ",")
 	cp.Annotations[drainingTiersAnnotation] = strings.Join(ends, ",")
+	var ending []string
+	for _, tier := range drains {
+		if v.ending[tier] {
+			ending = append(ending, tier)
+		}
+	}
+	cp.Annotations[endingTiersAnnotation] = strings.Join(ending, ",")
 	return cp
 }
 
