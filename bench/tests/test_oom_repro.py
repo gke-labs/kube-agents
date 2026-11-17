@@ -586,7 +586,8 @@ def test_a_scenario_refuses_to_start_without_a_host_context(tmp_path, capsys, co
 
 def test_fleet_names_lists_only_the_labelled_clusters_of_the_prefix(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "oom-02\noom-01\n")
+    listed = "oom-02\noom-01\noom-l-01\noom-team\n"  # oom-l-01 belongs to a fleet made with --prefix oom-l-
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or listed)
     fleet = cli.Fleet(cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "delete"]))
     assert fleet.names() == ["oom-01", "oom-02"]
     listing = calls[0]
@@ -610,17 +611,17 @@ def test_a_refused_lease_starts_nothing_and_releases_nothing(monkeypatch):
 
 def test_two_failed_renewals_in_a_row_mark_the_lease_lost(monkeypatch):
     import subprocess as sp
-    calls = []
+    calls, renewals = [], iter([1, 0, 1, 1])  # the success between the first two failures resets the count
 
     def fake_run(argv, **k):
         calls.append(argv)
-        return sp.CompletedProcess(argv, 1 if "renew" in argv else 0, "", "renew refused")
+        return sp.CompletedProcess(argv, next(renewals) if "renew" in argv else 0, "", "renew refused")
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr(cli, "SECONDS_PER_MINUTE", 0.001)  # a renewal every 20 ms
     with cli.lease(FakeHost(), "note") as lost:
         assert lost.wait(10)
-    assert sum("renew" in argv for argv in calls) == 2
+    assert sum("renew" in argv for argv in calls) == 4
 
 
 def test_watcher_runc_removes_the_runtime_class_and_puts_it_back(monkeypatch, tmp_path):
@@ -632,7 +633,10 @@ def test_watcher_runc_removes_the_runtime_class_and_puts_it_back(monkeypatch, tm
         listings = [[]]  # no gateway pod before the run, so the pod the new limits rolled is not restarted
 
         def platform_agent(self):
-            return {"spec": {"deployment": {"availability": {"runtimeClassName": "gvisor"}}}}
+            if not self.patches:
+                return {"spec": {"deployment": {"availability": {"runtimeClassName": "gvisor"}}}}
+            # As the scenario leaves it: its limits added, the runtime class removed.
+            return {"spec": {"deployment": {"availability": {}, "agentAPIAuth": {"resources": {"limits": limits}}}}}
 
         def pods(self, selector):
             return self.listings.pop(0) if self.listings else [gateway]
@@ -641,7 +645,8 @@ def test_watcher_runc_removes_the_runtime_class_and_puts_it_back(monkeypatch, tm
     fake_install(monkeypatch, host)
     cli.watcher(cli.parse(["--host-context", "c", "--out", str(tmp_path), "watcher", "--runc", "--seconds", "0"]))
     assert host.patches[1:] == [[{"op": "remove", "path": "/spec/deployment/availability/runtimeClassName"}],
-                                [{"op": "add", "path": "/spec/deployment/availability/runtimeClassName",
+                                [{"op": "remove", "path": "/spec/deployment/agentAPIAuth"},
+                                 {"op": "add", "path": "/spec/deployment/availability/runtimeClassName",
                                   "value": "gvisor"}]]
 
 
@@ -669,3 +674,9 @@ def test_poll_records_each_kill_of_one_pod_and_only_in_the_watched_container(mon
     recorder = cli.Recorder(Host(), tmp_path, cli.SHELL_SELECTOR, cli.SHELL_CONTAINER)
     recorder.poll()
     assert [(k["container"], k["restarts"]) for k in recorder.events] == [("shell", 1), ("shell", 2)]
+
+
+def test_the_default_output_directory_is_git_ignored():
+    from pathlib import Path
+    ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text().splitlines()
+    assert f"{cli.DEFAULT_OUT}/" in ignored

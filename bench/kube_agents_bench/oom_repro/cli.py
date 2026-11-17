@@ -98,6 +98,9 @@ DEFAULT_PREFIX = "oom-"
 NETWORK = "default"
 FLEET_LABEL_KEY = "purpose"
 FLEET_LABEL_VALUE = "oom-repro"
+# What follows the prefix in a fleet cluster's name (fleet create writes two digits); fleet commands
+# take only that shape, so a fleet whose prefix starts with this one (oom-l- under oom-) is not theirs.
+FLEET_CLUSTER_NUMBER = "[0-9]+"
 FLEET_KUBECONFIG = "fleet.kubeconfig"
 CREATE_KUBECONFIG_FORMAT = "create-{cluster}.kubeconfig"
 # Real nodes: GKE scales kube-dns and konnectivity with the node count, KWOK's own fake nodes
@@ -225,7 +228,8 @@ class Fleet:
         out = run(["gcloud", "container", "clusters", "list", "--project", self.project,
                    "--filter", f"resourceLabels.{FLEET_LABEL_KEY}={FLEET_LABEL_VALUE} AND name~^{self.prefix}",
                    "--format", "value(name)"])
-        return sorted(out.split())
+        own = re.compile(rf"{re.escape(self.prefix)}{FLEET_CLUSTER_NUMBER}")
+        return sorted(name for name in out.split() if own.fullmatch(name))
 
     def context(self, cluster: str) -> str:
         return f"gke_{self.project}_{self.zone}_{cluster}"
@@ -366,8 +370,8 @@ def fleet_delete(args: argparse.Namespace) -> None:
     fleet = Fleet(args)
     for name in fleet.names():
         run(["gcloud", "container", "clusters", "delete", name, "--zone", fleet.zone, "--project", fleet.project, "-q"])
-    # Only subnets this harness names: <prefix><two digits>-subnet, on its network, in its region.
-    shape = re.compile(rf"^{re.escape(fleet.prefix)}[0-9]+{re.escape(SUBNET_FORMAT.format(cluster=''))}$")
+    # Only subnets this harness names: <prefix><number>-subnet, on its network, in its region.
+    shape = re.compile(rf"^{re.escape(fleet.prefix)}{FLEET_CLUSTER_NUMBER}{re.escape(SUBNET_FORMAT.format(cluster=''))}$")
     listed = run(["gcloud", "compute", "networks", "subnets", "list", "--project", fleet.project,
                   "--network", NETWORK, "--regions", fleet.region, "--format", "value(name)"]).split()
     subnets = [name for name in listed if shape.match(name)]
