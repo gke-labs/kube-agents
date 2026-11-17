@@ -63,7 +63,7 @@ flowchart TB
     end
     AGENT -->|ssh| SHELL
     SHELL -->|"HTTPS kubectl + bearer token"| KPROXY
-    SHELL -->|"HTTP (structured argv, relayed GETs) + bearer token"| ENVOY
+    SHELL -->|"HTTP (structured argv, relayed reads) + bearer token"| ENVOY
     AGENT -->|"chat, MCP and Pub/Sub relays + bearer token"| ENVOY
     ENVOY -->|private Unix socket| RUNTIME
 ```
@@ -236,7 +236,7 @@ None is mounted in the dashboard.
 ## Request paths
 
 - **CLI commands** — the sandbox forwards `gcloud` to the broker (while `kubectl` routes through `<name>-kube-proxy`); the broker also runs `git`, and the forge CLI of any configured forge that declares one, on its own behalf for the version-control verbs. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
-- **Cloud API reads** — `GET /v1/gcp/<host>/<path>` relays one Google REST read named in `api_policy.API_READ_ROUTES` on the broker's identity, with the caller's headers dropped and the credential-substituting query keys stripped. Today those routes are Cloud Monitoring, Managed Prometheus and Cloud Trace reads, and the GKE cluster list and get the Cluster Agent reconcile makes. Another host, a write, a sibling path or a token endpoint is refused with a `gcp.api.*` rule. `credential_proxy_client.ApiSession` is the client. See [`designs/gcp-api-relay.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gcp-api-relay.md).
+- **Cloud API reads** — `GET /v1/gcp/<host>/<path>` relays one Google REST read named in `api_policy.API_READ_ROUTES` on the broker's identity, with the caller's headers dropped and the credential-substituting query keys stripped. Today those routes are Cloud Monitoring, Managed Prometheus and Cloud Trace reads, and the GKE cluster list and get the Cluster Agent reconcile makes. One more read is a `POST`: Cloud Logging's `entries:list`, for one project's log entries. The broker checks its JSON body and forwards its own copy of it. Another host, a write, a sibling path or a token endpoint is refused with a `gcp.api.*` rule. `credential_proxy_client.ApiSession` is the client. See [`designs/gcp-api-relay.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gcp-api-relay.md).
 - **Chat** — Slack, Google Chat, and Microsoft Teams adapters send credential-free payloads to Envoy. The credential runtime owns the platform tokens (`SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN`, Google Chat app credentials, and `TEAMS_APP_ID`/`TEAMS_APP_PASSWORD`) and performs the external API calls, enforcing method/host guards, tenant checks, and payload limits. A Slack-armed A2A gateway reads the Slack tokens as Secret-backed env itself and applies `allowedUsers` itself.
 - **PlatformAgent API** — the Service targets port 8643 on `agent-api-auth` in the gateway Pod, which validates the external bearer key and forwards to the agent API on loopback (port 8642) with a non-secret sentinel. The real key never reaches `platform-agent`.
 - **GitHub** — the broker obtains a Google OIDC identity token and calls [Minty](/kube-agents/deploy/token-minter/), which brokers a repository-scoped GitHub App installation token with a maximum one-hour lifetime. The App's private key stays in Cloud KMS.

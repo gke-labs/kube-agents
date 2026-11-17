@@ -725,7 +725,8 @@ MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
 PINNED_BASE_REF_PREFIX = "refs/heads/"
 PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
-# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
+# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>` (and `POST`
+# for a read the policy names with a body check). The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
 # the two sides cannot spell it differently. `api_policy` decides what may be
 # relayed; these bound how. docs/designs/gcp-api-relay.md argues each value.
@@ -767,8 +768,17 @@ API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token",
 # two. Every header the caller sent is dropped.
 API_RELAY_ACCEPT = "application/json"
 API_RELAY_UPSTREAM_PORT = 443
-# The method the MCP relay forwards with. The Cloud API relay never sends it.
+# The method the MCP relay forwards with, and the Cloud API relay for a route
+# with a body check (api_policy.API_BODY_METHOD).
 API_RELAY_POST = "POST"
+# The body of a relayed POST read (api_policy.API_BODY_METHOD routes). The cap is
+# the broker's own: a Logging `entries:list` body is a resource name, a filter
+# and a page token, a few kilobytes as `gcloud` sends it. The broker forwards its
+# own re-serialisation of the body the policy passed, as JSON.
+API_RELAY_MAX_BODY_BYTES = 16 * 1024
+API_RELAY_BODY_CONTENT_TYPE = "application/json"
+API_RELAY_BAD_BODY = "API_RELAY_BAD_BODY"
+API_RELAY_BODY_TOO_LARGE = "API_RELAY_BODY_TOO_LARGE"
 
 # The remote MCP relay, `POST /v1/mcp/<server>`. `mcp_policy` decides what is
 # relayed; it shares the Cloud API relay's credential, connect timeout,
@@ -3006,8 +3016,9 @@ def exec_pod_serves(method: str, path: str) -> bool:
     tier: the command route, the Cloud API relay's reads, the admission route
     and the readiness probe. The metrics listener is a server of its own and
     does not pass through here. Everything else is the stateful broker's.
-    A POST to the Cloud API relay passes too: the relay refuses it by policy
-    and writes the audit line, as the stateful broker does (do_POST).
+    A POST to the Cloud API relay passes too: the relay forwards the one read
+    its policy names with a body check, refuses every other by policy, and
+    writes the audit line, as the stateful broker does (do_POST).
     """
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
@@ -6072,9 +6083,10 @@ class GoogleApiRelay:
         `OSError` and `http.client.HTTPException` through for the handler to
         answer 502; redirects are not followed, the 3xx comes back as a status.
 
-        `body` and `headers` are the MCP relay's: a POST of a body the broker
-        re-serialised itself, with the extra headers it chose. The Cloud API
-        relay passes neither, and its request is byte-for-byte what it was.
+        `body` and `headers` are for a POST of a body the broker re-serialised
+        itself, with the extra headers it chose: the MCP relay's message, and
+        the Cloud API relay's read with a body. A Cloud API `GET` passes
+        neither, and its request is byte-for-byte what it was.
         """
         deadline = time.monotonic() + API_RELAY_DEADLINE_S
         connection = self.connection(host)
@@ -14107,9 +14119,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self._exec_pod_refuses("POST", principal):
             return
         if self.path.startswith(API_RELAY_PREFIX):
-            # Reaches the relay so that the refusal is the policy's
+            # Reaches the relay so that a refusal is the policy's
             # `gcp.api.method`, named in the audit line, rather than a 404
-            # that reads as "no such route". The body is never read.
+            # that reads as "no such route". The body is read only for a
+            # route the policy allowed with a body check.
             self._handle_api_relay()
             return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
@@ -14892,11 +14905,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
+        Also `POST /v1/gcp/<host>/<path>` for a read the policy names with a
+        body check (Logging `entries:list`): the body is read only after the
+        policy allowed the host and the path, held to API_RELAY_MAX_BODY_BYTES,
+        parsed, checked by `api_policy.evaluate_body`, and forwarded as the
+        broker's own re-serialisation, never as the caller's bytes.
+
         The second shape the broker speaks, beside the argv of `/v1/exec`. The
         caller is already authenticated and its role checked against
         ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
         normal-form check on the caller's text, the `api_policy` decision, the
-        upstream request with exactly the broker's two headers, and the
+        upstream request with exactly the broker's two headers (and its own
+        `Content-Type` on a read with a body), and the
         passthrough of the upstream's status, `Content-Type` and body (a 2xx body
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
@@ -14910,13 +14930,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         """
         principal = self.principal
         request_id = str(uuid.uuid4())
-        if self.command != api_policy.API_READ_METHOD:
-            # A POST is refused below without its body being read, and closing
-            # on unread bytes sends a reset that can swallow the 403. Same
-            # bounded drain the agent API proxy uses for its pre-auth 401.
-            drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
+        problem = api_relay_target_problem(host, path, parts.query)
+        decision = (
+            None
+            if problem is not None
+            else api_policy.evaluate(
+                self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
+            )
+        )
+        has_body = decision is not None and decision.allowed and api_policy.carries_body(decision.rule_id)
+        if self.command != api_policy.API_READ_METHOD and not has_body:
+            # Every other POST is refused below without its body being read, and
+            # closing on unread bytes sends a reset that can swallow the 403. Same
+            # bounded drain the agent API proxy uses for its pre-auth 401.
+            drain_request_body(self, self.max_request_bytes)
         # Same width as the exec line, for the same reason: this value is the
         # TokenReview's, and a truncated identity names the wrong ServiceAccount.
         principal_label = _sanitize_for_logging(
@@ -14943,7 +14972,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
             extra=audit(AUDIT_STATUS_STARTED),
         )
-        problem = api_relay_target_problem(host, path, parts.query)
         if problem is not None:
             code, reason = problem
             LOGGER.warning(
@@ -14954,9 +14982,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
         # below log it as-is; `path` is never logged again.
-        decision = api_policy.evaluate(
-            self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
-        )
         if not decision.allowed:
             LOGGER.warning(
                 "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
@@ -14972,6 +14997,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        forwarded_body: bytes | None = None
+        if has_body:
+            forwarded_body = self._api_relay_body(request_id, decision.rule_id, audit)
+            if forwarded_body is None:
+                return
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -15004,7 +15034,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        upstream = self._relay_fetch("api", request_id, host, target, authorization, audit)
+        upstream = self._relay_fetch(
+            "api", request_id, host, target, authorization, audit,
+            **(
+                {"body": forwarded_body, "headers": (("Content-Type", API_RELAY_BODY_CONTENT_TYPE),)}
+                if forwarded_body is not None
+                else {}
+            ),
+        )
         if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
@@ -15088,6 +15125,83 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream.body)))
         self._end_headers()
         self.wfile.write(upstream.body)
+
+    def _api_relay_body(
+        self, request_id: str, rule_id: str, audit: Callable[..., dict[str, Any]]
+    ) -> bytes | None:
+        """The body the broker forwards for the allowed route `rule_id`, or None after answering.
+
+        The caller's body is read up to API_RELAY_MAX_BODY_BYTES, parsed as JSON
+        and held to the route's body check. What is returned is the broker's own
+        serialisation of the object that passed, so a duplicate key, a comment
+        or any byte the parser dropped never reaches the upstream.
+        """
+        # The length `parse_request` framed the request with: None when it cannot
+        # be framed (a Transfer-Encoding, a length that is not a number, two
+        # lengths that disagree), which is never read as a body here.
+        length = getattr(self, "_body_length", None)
+        refusal: tuple[HTTPStatus, str, str] | None = None
+        parsed: Any = None
+        if length is None:
+            # Nothing to drain: a body with no usable length cannot be read to
+            # its end, and the server closes the connection after the answer.
+            refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body has no usable Content-Length")
+        elif length > API_RELAY_MAX_BODY_BYTES:
+            drain_request_body(self, self.max_request_bytes)
+            refusal = (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                API_RELAY_BODY_TOO_LARGE,
+                f"the request body is longer than {API_RELAY_MAX_BODY_BYTES} bytes",
+            )
+        else:
+            try:
+                raw = self.rfile.read(length)
+            except OSError:
+                # The body stalled past the request's read deadline, or the peer
+                # reset. The connection is the server's to close; the audit trail
+                # still gets this request's verdict.
+                LOGGER.warning(
+                    "api rejected request_id=%s code=%s reason=%s",
+                    request_id, API_RELAY_BAD_BODY, "the request body did not arrive",
+                    extra=audit(AUDIT_STATUS_REJECTED),
+                )
+                raise
+            if len(raw) < length:
+                # The peer closed its side before the length it announced: what
+                # arrived is not the request, even where it parses.
+                refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body did not arrive")
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, RecursionError):
+                    # UnicodeDecodeError is a ValueError; a body nested past the
+                    # parser's depth is a RecursionError.
+                    refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body is not JSON")
+        if refusal is not None:
+            status, code, reason = refusal
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason,
+                extra=audit(AUDIT_STATUS_REJECTED),
+            )
+            self._json(status, {"error": reason, "code": code})
+            return None
+        decision = api_policy.evaluate_body(rule_id, parsed)
+        if not decision.allowed:
+            LOGGER.warning(
+                "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=decision.rule_id),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return None
+        return json.dumps(parsed, separators=(",", ":")).encode()
 
     def _handle_mcp_relay(self) -> None:
         """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
