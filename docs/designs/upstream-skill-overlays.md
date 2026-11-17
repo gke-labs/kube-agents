@@ -266,7 +266,7 @@ flowchart LR
 
 ### The presubmit check
 
-- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is missing, empty or starts with `TODO`. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
+- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is missing, empty or starts with `TODO`. An id in that line must be a case folder in `bench/tasks/`. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
 - Reads only committed files: no network, so it cannot fail because GitHub is slow.
 - Patches are refreshed on every sync, so the check applies them without merging; a patch that needs a merge to apply is itself a failure.
 
@@ -307,7 +307,7 @@ The [`edit-mirrored-skill`](../../.agents/skills/edit-mirrored-skill/SKILL.md) s
 | Task                                     | Steps                                                                                                                                                                                                                                                           |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Make a new change                        | Edit `agents/platform/skills/<skill>/…`; run `make skills-refresh SKILL=<skill>`; fill in the new patch's headers; commit patch and skill, with the eval record below.                                                                                          |
-| Adjust an existing change                | Edit the skill; run `make skills-refresh SKILL=<skill> PATCH=<nnnn>` to fold the edit into that patch; add the PR's case to its `Eval-Case:` line.                                                                                                              |
+| Adjust an existing change                | Edit the skill; run `make skills-refresh SKILL=<skill> PATCH=<nnnn>` to fold the edit into that patch; add the PR's case to its `Eval-Case:` line, in place of a `none (<reason>)`.                                                                             |
 | Edit the appended section                | Edit it in the skill; `refresh` writes it back to `append.md`.                                                                                                                                                                                                  |
 | Remove a change or edit the overlay      | Delete or edit the patch (or `append.md`); run `make skills-generate SKILL=<skill>`. Offline.                                                                                                                                                                   |
 | Change lines an earlier patch introduced | Fold the edit into that patch with `PATCH=<nnnn>`; it is the same reason. `refresh` warns when a new patch changes lines from an earlier one. A new patch stacked on an earlier one still applies, in filename order, but breaks if the earlier one is deleted. |
@@ -329,7 +329,7 @@ Every PR that changes what the agent reads from a mirrored skill — a sync or a
 | Header   | The `Eval-Case:` line of each patch the PR adds or changes names the case.                           |
 
 - Exempt: PRs that leave every generated skill byte-identical, such as the four migration PRs below, and a patch that only fixes a lint finding in a script without changing what it does; the PR states it in one line.
-- `Eval-Case:` holds the case id(s) of the pull request that added the patch, and of a later one that changed what it does, or `none (<reason>)` for an exempt one. It names that pull request's case; it does not say the case tested the patch alone.
+- `Eval-Case:` holds the case id(s) of the pull request that added the patch, and of a later one that changed what it does, or `none (<reason>)` alone for a patch with no case. It names that pull request's case; it does not say the case tested the patch alone.
 - Most mirrored skills have no case of their own today, so the first sync or patch for a skill usually adds one; later changes to the skill can reuse it when it is red for their reason.
 - `refresh` notes when upstream has changed the skill since its pin and suggests running `make skills-sync SKILL=<skill>` in its own commit or PR. It never syncs on its own: an edit and an upstream update stay separate changes, each reviewed and validated on its own.
 
@@ -342,6 +342,7 @@ What `make skills-check` reports when a step is skipped:
 | The upstream copy was edited by hand                                                           | the copy no longer matches the sha256 in its lock | revert it; sync to change it                                             |
 | A patch no longer applies (an earlier patch it depends on was deleted, or a hand edit clashes) | the overlay cannot be applied in filename order   | delete it too, regenerate, then redo its edit with `make skills-refresh` |
 | A patch's `Eval-Case:` line is missing or was not filled in                                    | no such line, or one that is empty or `TODO`      | name the pull request's case(s), or `none (<reason>)`                    |
+| An `Eval-Case:` id is mistyped, its case was renamed or removed, or `none` has no reason       | the value names no folder in `bench/tasks/`       | name the case's folder, or `none (<reason>)`                             |
 
 ### Skills this repository writes
 

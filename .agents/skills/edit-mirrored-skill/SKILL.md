@@ -64,7 +64,8 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
 1. Edit files under `agents/platform/skills/<skill>/`.
 2. If the edit serves the same reason as an existing patch, run
    `make skills-refresh SKILL=<skill> PATCH=<nnnn>`. If it succeeds, add this pull request's eval
-   case to that patch's `Eval-Case:` line (step 5), and stop here. If it fails with
+   case to that patch's `Eval-Case:` line (step 5; an id replaces a `none (<reason>)` value), and
+   stop here. If it fails with
    `conflicts with a later patch`, a later patch depends on those lines: go to step 3, keep the
    new patch even if refresh warns, and skip step 4.
 3. Otherwise run `make skills-refresh SKILL=<skill> MSG="<subject>"`. It writes the next
@@ -77,11 +78,12 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
      this line, so state the intent, not the edit. Name a related earlier patch if there is one.
    - `Local-Issue:`: the issue that asked for it, not the pull request.
    - `Eval-Case:`: the eval case id(s) under **Live validation** of the pull request that adds the
-     patch, comma-separated (an id is a folder name in `bench/tasks/`), or `none (<reason>)` when
-     that pull request states an exemption. The line names the case of the pull request that added
+     patch, comma-separated (an id is a folder name in `bench/tasks/`), or `none (<reason>)` alone
+     when the patch has no case: that pull request states an exemption, or the case was removed
+     later. The line names the case of the pull request that added
      the patch, and of a later one that changed what it does (a fold, step 2). It does not say the
      case tested this patch alone. `make skills-check` fails while the line is missing, empty or
-     starts with `TODO`.
+     starts with `TODO`, and when an id names no folder in `bench/tasks/`.
    - `Retire-When:`: the upstream change that makes the patch unnecessary, or `never; <reason>`.
    - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, `none filed yet` if the
      fix is general but not reported yet, or `none (specific to this repository)`.
@@ -143,11 +145,12 @@ a skill otherwise, patch it at its current pin ("Make a change").
 
 ## Fix a failing check
 
-| `make skills-check` reports                     | Cause                                        | Fix                                                                                       |
-| ----------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| the committed skill differs from copy + overlay | the skill was edited and no patch records it | `make skills-refresh SKILL=<skill>`                                                       |
-| the committed skill differs from copy + overlay | a patch or `append.md` was edited            | `make skills-generate SKILL=<skill>`                                                      |
-| a skill document is over 40,000 characters      | the generated skill grew past the size limit | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
-| the copy does not match its lock                | the upstream copy was edited by hand         | revert the copy; change it only through a sync                                            |
-| a patch no longer applies                       | a patch it builds on was deleted or edited   | "Remove a change", step 3                                                                 |
-| fill in the `Eval-Case:` header of a patch      | the line is missing, empty or `TODO`         | "Make a change", step 5                                                                   |
+| `make skills-check` reports                     | Cause                                                                       | Fix                                                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| the committed skill differs from copy + overlay | the skill was edited and no patch records it                                | `make skills-refresh SKILL=<skill>`                                                       |
+| the committed skill differs from copy + overlay | a patch or `append.md` was edited                                           | `make skills-generate SKILL=<skill>`                                                      |
+| a skill document is over 40,000 characters      | the generated skill grew past the size limit                                | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
+| the copy does not match its lock                | the upstream copy was edited by hand                                        | revert the copy; change it only through a sync                                            |
+| a patch no longer applies                       | a patch it builds on was deleted or edited                                  | "Remove a change", step 3                                                                 |
+| fill in the `Eval-Case:` header of a patch      | the line is missing, empty or `TODO`                                        | "Make a change", step 5                                                                   |
+| the `Eval-Case:` header names no case folder    | an id is mistyped, its case was renamed or removed, or `none` has no reason | name the case's folder in `bench/tasks/`, or `none (<reason>)`                            |
