@@ -559,3 +559,23 @@ func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
 		t.Error("a profile with no template runs as Jobs")
 	}
 }
+
+// profileSupervisorForm is empty or "profile" (#5301), and the subject a
+// config gives a profile's terminal follows it.
+func TestTheSupervisorFormIsEmptyOrProfile(t *testing.T) {
+	c := validDispatchConfig()
+	if got := c.SupervisorSubjectFor("tse", "t1"); got != TaskSupervisorSubject("tse", "t1") {
+		t.Errorf("unset form: %q", got)
+	}
+	c.ProfileSupervisorForm = ProfileSupervisorFormProfile
+	if err := c.Validate(); err != nil {
+		t.Errorf("the profile form was refused: %v", err)
+	}
+	if got := c.SupervisorSubjectFor("tse", "t1"); got != ProfileSupervisorSubject("tse", "t1") {
+		t.Errorf("profile form: %q", got)
+	}
+	c.ProfileSupervisorForm = "six"
+	if err := c.Validate(); err == nil {
+		t.Error("an unknown profileSupervisorForm validated")
+	}
+}

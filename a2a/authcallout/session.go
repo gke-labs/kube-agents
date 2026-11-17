@@ -215,10 +215,11 @@ func validSessionName(pod string) error {
 		return fmt.Errorf("pod name %q is not a single subject token (a dot-free DNS-1123 label)", pod)
 	}
 	// "p" marks a profile task's six-token supervisor subject
-	// (a2a.tasks.p.<profile>.<task>.supervisor, #5301). A session pod's
-	// grants are keyed on its name in the addressee token, so one named "p"
-	// would hold grants under that marker. Real pod names carry hyphens and
-	// never collide; this says so rather than relying on it.
+	// (a2a.tasks.p.<profile>.<task>.supervisor, #5301). A session's grants
+	// are keyed on its name in the addressee token. They are five-token
+	// today, so none would reach the marker's six-token subjects, but a
+	// future grant shaped like a2a.tasks.<addressee>.> would. Defence in
+	// depth: real pod names carry hyphens and never collide.
 	if pod == lib.TaskProfileSupervisorToken {
 		return fmt.Errorf("pod name %q is the profile supervisor marker and can't be a session's addressee", pod)
 	}

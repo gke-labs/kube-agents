@@ -129,15 +129,3 @@ func TestTheTerminalTakesTheConfiguredSupervisorForm(t *testing.T) {
 		})
 	}
 }
-
-func TestOnlyTheProfileFormIsAValidSupervisorForm(t *testing.T) {
-	c := oneProfile("tse", 2, "tse-0").src.Config()
-	c.ProfileSupervisorForm = "six"
-	if err := c.Validate(); err == nil {
-		t.Error("an unknown profileSupervisorForm validated")
-	}
-	c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile
-	if err := c.Validate(); err != nil {
-		t.Errorf("the profile form was refused: %v", err)
-	}
-}
