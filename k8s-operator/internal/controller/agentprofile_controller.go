@@ -496,6 +496,12 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
 		}
 		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p), probe); err != nil {
+			if errors.Is(err, errDurableAwaitingRecheck) {
+				// Not the connection's fault: the bus answered. The bus
+				// retry comes back and re-creates the durable if it is
+				// still missing (#6283).
+				return reasonAgentProfileBusError, "the agent card is published; a durable is being re-checked before it is re-created: " + err.Error(), err
+			}
 			// Drop the connection: callout grants are fixed when it opens,
 			// and one opened before the callout served the map that grants
 			// the operator its durables would be refused forever. The retry

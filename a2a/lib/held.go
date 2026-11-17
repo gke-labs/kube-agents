@@ -86,6 +86,15 @@ const (
 // it for the bind window the way a missing durable is. errors.Is against it.
 var ErrHeldBindRefused = errors.New("held durable refused")
 
+// ErrHeldConsumerNotReCreated is EnsureHeldConsumer declining to re-create a
+// durable its caller says existed, after a lookup answered "not found": a new
+// stream leader can answer that for a durable whose assignment hasn't
+// reached it yet (after a replica change), and a re-created durable starts
+// over from the stream's first message with a fresh ack floor. The caller
+// looks again later and passes Existed false once it means a re-create
+// (#6283).
+var ErrHeldConsumerNotReCreated = errors.New("held consumer existed and was not found; not re-created on one lookup")
+
 // HeldConsumerConfig is a held durable as the operator creates it.
 type HeldConsumerConfig struct {
 	Stream  string
@@ -102,6 +111,12 @@ type HeldConsumerConfig struct {
 	// holder's heartbeat renews it, so it bounds how long a dead holder keeps
 	// a task, not how long a task may run.
 	AckWait time.Duration
+	// Existed says the durable was made before. A lookup that can't find it
+	// then returns ErrHeldConsumerNotReCreated rather than creating it, so a
+	// late assignment on a new stream leader doesn't cost the durable its
+	// ack floor. The operator's profile durables follow the same rule
+	// (k8s-operator ensureDurableGated).
+	Existed bool
 }
 
 func (h HeldConsumerConfig) ackWait() time.Duration {
@@ -134,6 +149,9 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 	existing, err := js.Consumer(ctx, cfg.Stream, cfg.Durable)
 	switch {
 	case errors.Is(err, jetstream.ErrConsumerNotFound):
+		if cfg.Existed {
+			return fmt.Errorf("held consumer %s on %s: %w", cfg.Durable, cfg.Stream, ErrHeldConsumerNotReCreated)
+		}
 	case err != nil:
 		return fmt.Errorf("held consumer %s on %s: look it up: %w", cfg.Durable, cfg.Stream, err)
 	default:

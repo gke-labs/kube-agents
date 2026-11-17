@@ -398,6 +398,12 @@ leave open:
   and before its `rejected` terminal, so a restart never re-admits a refusal already reported.
   A submission that finds a tombstone is acked and nothing else: it is never offered,
   adopted or given a second terminal, so a grant given since never runs a task once refused.
+  The operator re-creates a profile durable only when it is really gone: a durable whose tier
+  is in the profile's `status.renderedTiers`, found missing, is re-created only if it is still
+  missing on a pass 30s later (`durableRecreateDelay`), since a new stream leader can answer
+  "not found" before the durable's assignment reaches it, as after a replica change (#6283).
+  A tier new to the profile gets its durables at once. `lib.EnsureHeldConsumer` takes the same
+  rule as `HeldConsumerConfig.Existed`.
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,

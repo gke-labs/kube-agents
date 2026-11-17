@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -54,6 +55,61 @@ type profileDurable struct {
 	name          string
 	filter        string
 	maxAckPending int
+	// existed is a durable the operator has made before: its tier is in the
+	// profile's status.renderedTiers. A lookup that can't find one is
+	// re-checked before it is re-created (durableRecheck); a tier new to
+	// the profile gets its durable at once.
+	existed bool
+}
+
+// durableRecreateDelay is how long a durable that existed must stay "not
+// found" before the operator re-creates it: two passes, a bus retry apart
+// (agentProfileBusRetry). A re-created durable starts from the stream's
+// first message with a fresh ack floor, and a lookup can answer "not found"
+// for a durable that exists while a new stream leader hasn't received its
+// assignment yet, as after the one-to-three bus migration raises the
+// stream's replicas (#6174, #6283). The dispatcher acks a replay of a
+// settled submit (its lease tombstone), so a re-create costs a re-offer,
+// not a re-run, but a durable that is only late doesn't need one.
+const durableRecreateDelay = 30 * time.Second
+
+// errDurableAwaitingRecheck is a durable that existed, now not found, not
+// yet re-created: the reconcile retries on the bus retry and re-creates it
+// once it is still missing durableRecreateDelay later.
+var errDurableAwaitingRecheck = errors.New("it existed before and a lookup can't find it now; the operator looks again before re-creating it (a new stream leader may not have its assignment yet)")
+
+// durableRecheck remembers when each durable that existed was first found
+// missing. In memory: an operator restart starts the wait over, which only
+// delays a re-create.
+type durableRecheck struct {
+	mu           sync.Mutex
+	firstMissing map[string]time.Time
+	now          func() time.Time
+}
+
+func newDurableRecheck() *durableRecheck {
+	return &durableRecheck{firstMissing: map[string]time.Time{}, now: time.Now}
+}
+
+// due reports whether name, found missing now, has been missing for
+// durableRecreateDelay; the first miss starts the wait.
+func (g *durableRecheck) due(name string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.now()
+	first, ok := g.firstMissing[name]
+	if !ok {
+		g.firstMissing[name] = now
+		return false
+	}
+	return now.Sub(first) >= durableRecreateDelay
+}
+
+// clear forgets name's miss: it was found, or made.
+func (g *durableRecheck) clear(name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.firstMissing, name)
 }
 
 // profileDurableFilter is lib.ProfileDurableFilter.
@@ -73,6 +129,7 @@ func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
 				name:          profileDurableName(p.Name, tier, kind),
 				filter:        profileDurableFilter(p.Name, tier, kind),
 				maxAckPending: int(p.Spec.Concurrency),
+				existed:       slices.Contains(p.Status.RenderedTiers, tier),
 			})
 		}
 	}
@@ -107,9 +164,19 @@ func profileDurableNamesFor(profile string, tiers []string) []string {
 // pace from AckWait when it bound. A consumer under the name that doesn't
 // carry the held marker isn't this operator's, and is refused.
 func ensureDurable(ctx context.Context, js jetstream.JetStream, d profileDurable) error {
+	return ensureDurableGated(ctx, js, d, nil)
+}
+
+// ensureDurableGated is ensureDurable with gate deciding when a durable
+// that existed, now not found, is re-created (durableRecheck). A nil gate
+// creates it at once.
+func ensureDurableGated(ctx context.Context, js jetstream.JetStream, d profileDurable, gate *durableRecheck) error {
 	existing, err := js.Consumer(ctx, a2aProfileSubmitStream, d.name)
 	switch {
 	case errors.Is(err, jetstream.ErrConsumerNotFound):
+		if d.existed && gate != nil && !gate.due(d.name) {
+			return fmt.Errorf("durable %s: %w", d.name, errDurableAwaitingRecheck)
+		}
 	case err != nil:
 		return fmt.Errorf("durable %s: look it up: %w", d.name, err)
 	default:
@@ -127,6 +194,9 @@ func ensureDurable(ctx context.Context, js jetstream.JetStream, d profileDurable
 			// and that is set says someone else made the consumer.
 			return fmt.Errorf("a consumer named %s exists on %s that %s, which the operator never sets; it doesn't adopt it", d.name, a2aProfileSubmitStream, heldConfigTampered(old))
 		case old.MaxAckPending == d.maxAckPending:
+			if gate != nil {
+				gate.clear(d.name)
+			}
 			return nil
 		}
 	}
@@ -143,6 +213,9 @@ func ensureDurable(ctx context.Context, js jetstream.JetStream, d profileDurable
 	}
 	if err != nil {
 		return fmt.Errorf("durable %s: %w", d.name, err)
+	}
+	if gate != nil {
+		gate.clear(d.name)
 	}
 	return nil
 }
@@ -218,11 +291,18 @@ func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alph
 	}
 	ctx, cancel := context.WithTimeout(ctx, cardBusTimeout)
 	defer cancel()
-	return syncDurables(ctx, js, profile, want, probe)
+	return syncDurablesGated(ctx, js, profile, want, probe, n.recheck)
 }
 
-// syncDurables is SyncDurables on a JetStream handle.
+// syncDurables is SyncDurables on a JetStream handle, re-creating a missing
+// durable at once.
 func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable, probe []string) error {
+	return syncDurablesGated(ctx, js, profile, want, probe, nil)
+}
+
+// syncDurablesGated is syncDurables with gate holding back the re-create of
+// a durable that existed (ensureDurableGated).
+func syncDurablesGated(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable, probe []string, gate *durableRecheck) error {
 	keep := map[string]bool{}
 	for _, d := range want {
 		keep[d.name] = true
@@ -237,10 +317,17 @@ func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, w
 			return err
 		}
 	}
+	// Every wanted durable is tried: one held back for a re-check doesn't
+	// keep the rest from being made or updated.
+	var held error
 	for _, d := range want {
-		if err := ensureDurable(ctx, js, d); err != nil {
+		err := ensureDurableGated(ctx, js, d, gate)
+		switch {
+		case errors.Is(err, errDurableAwaitingRecheck):
+			held = err
+		case err != nil:
 			return err
 		}
 	}
-	return nil
+	return held
 }

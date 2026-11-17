@@ -684,6 +684,9 @@ type fakeDirectory struct {
 	// it fail as a connection opened under an older map would.
 	durables        map[string][]profileDurable
 	durablesRefused bool
+	// durablesRechecking makes it answer as a durable held back for a
+	// re-check does (errDurableAwaitingRecheck).
+	durablesRechecking bool
 }
 
 func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets, namespace) }
@@ -691,6 +694,9 @@ func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets,
 func (f *fakeDirectory) SyncDurables(_ context.Context, _ *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, _ []string) error {
 	if f.down || f.durablesRefused {
 		return errors.New("permissions violation")
+	}
+	if f.durablesRechecking {
+		return errors.Join(errors.New("durable profile-"+profile+"-read-top"), errDurableAwaitingRecheck)
 	}
 	if f.durables == nil {
 		f.durables = map[string][]profileDurable{}
@@ -1616,6 +1622,25 @@ func TestAFailedDurableSyncDropsTheBusConnection(t *testing.T) {
 	h.reconcile(agent.Namespace, "auditor")
 	if got := h.dir.durables["auditor"]; len(got) != 2 {
 		t.Errorf("after the reconnect the durables = %+v, want read top and child", got)
+	}
+}
+
+// A durable held back for a re-check keeps the bus connection, which
+// answered: only a refused sync drops it (#6283). The pass comes back on the
+// bus retry.
+func TestADurableReCheckKeepsTheBusConnection(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.dir.durablesRechecking = true
+	res := h.reconcile(agent.Namespace, "auditor")
+	if slices.Contains(h.dir.forgets, agent.Namespace) {
+		t.Errorf("a durable re-check dropped the connection: forgets = %v", h.dir.forgets)
+	}
+	if res.RequeueAfter != agentProfileBusRetry {
+		t.Errorf("RequeueAfter %s, want the bus retry %s", res.RequeueAfter, agentProfileBusRetry)
 	}
 }
 
