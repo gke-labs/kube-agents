@@ -582,7 +582,8 @@ CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
 # The checks whose remediation gives a flag a value that only the cluster's
 # owner can supply, and those flags. The drift SOP forbids a copied range for
 # authorized networks, so a literal one in a carried command is one a run
-# copied. `public-control-plane` is not here: its SOP does not forbid one.
+# copied. The compliance SOP also leaves `public-control-plane`'s list to a
+# human; that check has no row, so its carried range is not judged.
 OWNER_SUPPLIED_FLAGS: dict[str, tuple[str, ...]] = {
     "authorized-networks": ("--master-authorized-networks",),
 }
