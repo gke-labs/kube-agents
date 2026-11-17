@@ -338,15 +338,13 @@ def patch_why(path):
 
 
 def eval_case_unfilled(path):
-    """True when the patch has an Eval-Case: line that is empty or still the placeholder.
+    """True when any Eval-Case: line of the patch header is empty or still the placeholder.
 
     A patch with no such line passes: patches written before the line existed carry none.
     """
-    for line in patch_header(read_exact(path)).splitlines():
-        if line.startswith(EVAL_CASE_PREFIX):
-            value = line[len(EVAL_CASE_PREFIX):].strip()
-            return not value or value.startswith(HEADER_PLACEHOLDER)
-    return False
+    values = [line[len(EVAL_CASE_PREFIX):].strip()
+              for line in patch_header(read_exact(path)).splitlines() if line.startswith(EVAL_CASE_PREFIX)]
+    return any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
 
 
 def separator_for(text):

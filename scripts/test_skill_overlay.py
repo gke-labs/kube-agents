@@ -167,6 +167,9 @@ class Scenario(unittest.TestCase):
             out = self.run_tool("check", expect=1)
             self.assertIn("fill in the Eval-Case: header of 0002-fix-typo.patch", out)
             self.assertNotIn("0001-use-location.patch", out)
+        # A filled line above the unfilled one does not hide it.
+        patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: case-one\nEval-Case: TODO"))
+        self.assertIn("fill in the Eval-Case: header of 0002-fix-typo.patch", self.run_tool("check", expect=1))
         patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: case-one, case-two"))
         self.assertIn("ok: 2", self.run_tool("check"))
 
