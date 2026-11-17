@@ -37,10 +37,33 @@ import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
 
+# A URL's userinfo, the part between "<scheme>://" and "@": it can carry a
+# credential, so nothing this script logs keeps it.
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#@]+@")
+
+
+def redact_url(text: str) -> str:
+    """text with the userinfo of every URL in it replaced by [REDACTED]."""
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+
+
+def redact_remote(remote: str) -> str:
+    """A git remote as it may be logged: redact_url, then, in any word that is
+    not a URL, everything before its last "@". A remote that did not parse may
+    carry a credential in a shape no URL grammar names."""
+
+    def word(token: str) -> str:
+        if "://" in token or "@" not in token:
+            return token
+        return "[REDACTED]@" + token.rsplit("@", 1)[1]
+
+    return re.sub(r"\S+", lambda m: word(m.group(0)), redact_url(remote))
+
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
+    # Every line is redacted here, whatever its caller formatted into it.
+    print(f"[{timestamp}] [SRE-AUTH] {redact_url(msg)}", file=sys.stderr, flush=True)
 
 
 TOKEN_BROKER_URL = os.getenv(
@@ -362,10 +385,10 @@ def github_repo_from_remote(url: str) -> str | None:
     """
     ref = repo_ref.try_parse(url)
     if ref is None:
-        log(f"Ignoring git remote: '{url}' is not a repository URL.")
+        log(f"Ignoring git remote: '{redact_remote(url)}' is not a repository URL.")
         return None
     if not ref.host_stated:
-        log(f"Ignoring git remote: '{url}' names no host.")
+        log(f"Ignoring git remote: '{redact_remote(url)}' names no host.")
         return None
     if not ref.is_github:
         log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
