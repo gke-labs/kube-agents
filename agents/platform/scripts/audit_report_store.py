@@ -119,10 +119,26 @@ AUDIENCE = "kubeagents-audit-report-store"
 # pods (the exec tier among them), so the subject alone is not the broker.
 ALLOWED_SUBJECT_ENV = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
 ALLOWED_POD_PREFIX_ENV = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
-# What a Deployment pod's name adds to its Deployment's: `<rs hash>-<suffix>`.
-# Exactly two segments, so `<agent>-credential-proxy-exec-<hash>-<suffix>`,
-# the exec tier's, does not pass under the broker's prefix.
-DEPLOYMENT_POD_SUFFIX_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+\Z")
+# How Kubernetes names a Deployment's pod, modelled exactly. The ReplicaSet is
+# `<deployment>-<pod-template-hash>` and its pods' generateName is that plus
+# "-"; the API server's SimpleNameGenerator cuts a generateName to
+# POD_GENERATE_NAME_MAX_BASE characters and then adds
+# POD_GENERATE_NAME_RANDOM_LENGTH random ones. So a broker pod is named
+# (P + hash + "-")[:58] + random, with P the prefix the operator renders
+# (`<agent>-credential-proxy-`). For an agent name of about 30 characters or
+# more the "-" after the hash is cut, and from about 41 the prefix itself.
+POD_GENERATE_NAME_MAX_BASE = 58  # 63 (a DNS label) minus the random suffix
+POD_GENERATE_NAME_RANDOM_LENGTH = 5
+POD_TEMPLATE_HASH_MIN_LENGTH = 1
+POD_TEMPLATE_HASH_MAX_LENGTH = 10  # a uint32, safe-encoded
+_POD_NAME_PART_RE = re.compile(r"[a-z0-9]*\Z")
+# The exec tier's pods share the broker's ServiceAccount and are named
+# `<agent>-credential-proxy-exec-tier-<hash>-<random>`, under the broker's
+# prefix. Their remainder after it begins with this, which no pod-template
+# hash does (its alphabet has no vowels), so a name whose remainder begins
+# with it is refused at every length, including where the truncation would
+# otherwise leave a bare "exec" that reads as a hash.
+EXEC_TIER_REMAINDER_PREFIX = "exec"
 # Where the JWKS comes from and the token it is read with: fixed, never from
 # the environment, for the same reason as the root. A CR that could move the
 # API server would be handed the pod's own token and could answer with a JWKS
@@ -345,14 +361,47 @@ class TokenVerifier:
         kube = claims.get("kubernetes.io")
         pod = kube.get("pod") if isinstance(kube, dict) else None
         pod_name = pod.get("name") if isinstance(pod, dict) else None
-        if (
-            not prefix
-            or not isinstance(pod_name, str)
-            or not pod_name.startswith(prefix)
-            or not DEPLOYMENT_POD_SUFFIX_RE.match(pod_name[len(prefix):])
-        ):
+        if not isinstance(pod_name, str) or not is_broker_pod_name(prefix, pod_name):
             raise AuthRefused(403, "the token is not bound to a broker pod")
         return subject
+
+
+def _lower_alnum(text: str) -> bool:
+    return bool(_POD_NAME_PART_RE.match(text))
+
+
+def is_broker_pod_name(prefix: str, pod_name: str) -> bool:
+    """Whether (prefix + hash + "-")[:58] + random can produce `pod_name`.
+
+    The hash is POD_TEMPLATE_HASH_MIN_LENGTH to POD_TEMPLATE_HASH_MAX_LENGTH
+    lowercase alphanumerics and the random part POD_GENERATE_NAME_RANDOM_LENGTH.
+    A name whose remainder after the prefix begins with
+    EXEC_TIER_REMAINDER_PREFIX is refused: that is the exec tier's.
+    """
+    if not prefix or len(pod_name) <= POD_GENERATE_NAME_RANDOM_LENGTH:
+        return False
+    if pod_name.startswith(prefix) and pod_name[len(prefix):].startswith(EXEC_TIER_REMAINDER_PREFIX):
+        return False
+    base, random_part = pod_name[:-POD_GENERATE_NAME_RANDOM_LENGTH], pod_name[-POD_GENERATE_NAME_RANDOM_LENGTH:]
+    if not _lower_alnum(random_part) or len(base) > POD_GENERATE_NAME_MAX_BASE:
+        return False
+    if len(prefix) >= POD_GENERATE_NAME_MAX_BASE:
+        # The prefix itself was cut: nothing of the hash is left to check.
+        return base == prefix[:POD_GENERATE_NAME_MAX_BASE]
+    if not base.startswith(prefix):
+        return False
+    rest = base[len(prefix):]
+    if len(base) < POD_GENERATE_NAME_MAX_BASE or rest.endswith("-"):
+        # Not cut, or cut exactly after the "-": rest is the whole hash and "-".
+        pod_hash = rest[:-1]
+        return (
+            rest.endswith("-")
+            and POD_TEMPLATE_HASH_MIN_LENGTH <= len(pod_hash) <= POD_TEMPLATE_HASH_MAX_LENGTH
+            and _lower_alnum(pod_hash)
+        )
+    # Cut inside the hash or just before its "-": rest is the hash's first
+    # characters.
+    return len(rest) <= POD_TEMPLATE_HASH_MAX_LENGTH and _lower_alnum(rest)
 
 
 def _signature_valid(alg: str, key: dict, signing_input: bytes, signature: bytes) -> bool:
@@ -565,10 +614,22 @@ def _read_at(dir_fd: int, name: str) -> bytes:
         if exc.errno in _SYMLINK_ERRNOS:
             raise _symlink_refusal(name) from None
         raise
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    # Checked on the raw fd, before fdopen: fdopen refuses a directory itself
+    # (IsADirectoryError, a 500), and the fd must close on every path.
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _symlink_refusal(name)
-        data = handle.read(REPORT_MAX_BYTES + 1)
+        chunks = []
+        remaining = REPORT_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
     if len(data) > REPORT_MAX_BYTES:
         raise Refused(409, f"a stored entry is over {REPORT_MAX_BYTES} bytes")
     return data
@@ -619,6 +680,24 @@ def _all_ring_names(runs_fd: int) -> list[str]:
         except FileNotFoundError:
             continue
     return sorted(names)
+
+
+def _ring_holds(runs_fd: int, data: bytes) -> bool:
+    """Whether a ring entry is byte-identical to `data`, newest first, stopping at the first match.
+
+    An entry that cannot be read (over REPORT_MAX_BYTES, which the file
+    store's writer does not cap, gone, or no longer a regular file) is a
+    non-match, never an error: one bad old entry must not refuse every PUT
+    latest until it ages out. `data` is at most REPORT_MAX_BYTES, so it can
+    equal no oversized entry anyway.
+    """
+    for entry in reversed(_ring_names(runs_fd)):
+        try:
+            if _read_at(runs_fd, entry) == data:
+                return True
+        except (Refused, OSError):
+            continue
+    return False
 
 
 def _ring_of(root: str, parts: list[str]) -> list[str]:
@@ -754,7 +833,7 @@ def _handle_store(
                 except _Missing:
                     raise Refused(409, "latest must be a copy of a run in the ring") from None
                 try:
-                    if not any(_read_at(runs_fd, entry) == data for entry in _ring_names(runs_fd)):
+                    if not _ring_holds(runs_fd, data):
                         raise Refused(409, "latest must be a copy of a run in the ring")
                 finally:
                     os.close(runs_fd)

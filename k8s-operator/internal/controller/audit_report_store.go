@@ -87,10 +87,15 @@ const (
 	// subject the listener accepts.
 	auditReportStoreEnabledEnv        = "AUDIT_REPORT_STORE_ENABLED"
 	auditReportStoreAllowedSubjectEnv = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
-	// And the name prefix of the broker Deployment's pods, which the token's
-	// kubernetes.io.pod.name claim must carry: the broker's ServiceAccount is
-	// shared with the exec tier and kube-proxy, so the subject alone is not
-	// the broker.
+	// And the name prefix of the broker Deployment's pods, `<agent>-credential-proxy-`:
+	// the broker's ServiceAccount is shared with the exec tier and kube-proxy,
+	// so the subject alone is not the broker. The listener
+	// (audit_report_store.is_broker_pod_name) accepts the token's
+	// kubernetes.io.pod.name claim only if it is (prefix + hash + "-")[:58]
+	// plus 5 random characters, the API server's generateName cut, so long
+	// agent names still pass; and it refuses a name whose remainder after the
+	// prefix begins with "exec", the exec tier's pods, at every length where
+	// the tier can exist (credentialProxyExecTierMaxAgentName).
 	auditReportStoreAllowedPodPrefixEnv = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
 	// On the broker: where the listener is, and the token it presents.
 	auditReportStoreURLEnv       = "AUDIT_REPORT_STORE_URL"
