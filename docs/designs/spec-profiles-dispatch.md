@@ -521,7 +521,7 @@ leave open:
   Job admission policy holds each Job to (`jobTemplateRef`), and `perTier: true` (#5646):
   the profile has one per live tier, each under its tier's ServiceAccount. The
   unattended-mode tier's param is the profile's own, `kube-agents-dispatch-job-profile-<profile>`,
-  and any other tier's is `kube-agents-dispatch-job-tier-<profile>-<tier>`, where only
+  and any other tier's is `kube-agents-dispatch-job-tier-<profile>.<tier>`, where only
   permit-carrying tasks run. The dispatcher derives each name from the task's (profile,
   tier), never from the config (#5479), and holds the template's own profile and tier labels
   to the task's. It reads that object when it launches the Job, with `get` alone on those
@@ -533,7 +533,11 @@ leave open:
   unchanged: it holds a Job to the template of the ServiceAccount it runs as, and those are
   unique per (profile, tier). It reads every param on each Job, so admitting one takes
   longer as params grow: about 1.3s at 2,500 one-tier profiles and 2.5s at 2,500 two-tier
-  ones, measured in envtest, against a Job's cold start of 30 to 90s. Any mismatch, a
+  ones, against a Job's cold start of 30 to 90s. Those are measurements, not a gate:
+  `TestTheJobPolicyAtTwentyFiveHundredTwoTierProfiles` (envtest) logs them only when
+  `KUBE_AGENTS_JOB_POLICY_SCALE` is set, and asserts no bound. A param whose rendering,
+  labels, template and defaulting API server are all current isn't defaulted or applied
+  again on the next pass. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the
   dispatcher's health as a Job admission error, and leaves every other profile alone. The
   operator writes params before the config, so the usual transient is a param ahead of the
