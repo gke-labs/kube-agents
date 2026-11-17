@@ -40,12 +40,25 @@ func (f *fakeReportStore) calls() []string {
 	return append([]string(nil), f.asked...)
 }
 
-// storedEnvelope is a scheduled run's envelope as finish writes it, started
-// when it finished, decoded as the relay decodes the broker's answer.
+// goodRunTask is the task id goodScheduleSubmit's run is minted under.
+var goodRunTask = triggerTaskID(goodScheduleSubmit().IdempotencyKey, 0)
+
+// storedEnvelope is the envelope goodScheduleSubmit's run's finish stores,
+// stamped by the broker as that run's, decoded as the relay decodes the
+// broker's answer.
 func storedEnvelope(t *testing.T, auditID string, finished time.Time, report string) *reportEnvelope {
 	t.Helper()
-	return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"repo":"acme/gitops","started_at":%q,"finished_at":%q,"scheduled":true,"status":"OK","new_ids":["a"],%s}`,
+	return stampedEnvelope(t, reportStoreWriterSchedule+auditID+":"+goodRunTask, auditID, finished, report)
+}
+
+// stampedEnvelope is a scheduled-looking envelope with writer as the
+// broker's stamp ("" for none).
+func stampedEnvelope(t *testing.T, writer, auditID string, finished time.Time, report string) *reportEnvelope {
+	t.Helper()
+	env := envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"repo":"acme/gitops","started_at":%q,"finished_at":%q,"scheduled":true,"status":"OK","new_ids":["a"],%s}`,
 		auditID, finished.Format(time.RFC3339Nano), finished.Format(time.RFC3339Nano), report))
+	env.Writer = writer
+	return env
 }
 
 // envelopeOf decodes raw as the relay decodes the broker's answer.
@@ -128,10 +141,21 @@ func TestAStoredReportThatIsNotTheRunsFallsBackToItsResult(t *testing.T) {
 			return storedEnvelope(t, "cost-audit", now, storedReportJSON), nil
 		},
 		"an earlier run's": func(id string) (*reportEnvelope, error) {
-			return storedEnvelope(t, id, now.Add(-24*time.Hour), storedReportJSON), nil
+			return stampedEnvelope(t, reportStoreWriterSchedule+id+":task-0123456789abcdef", id, now.Add(-24*time.Hour), storedReportJSON), nil
 		},
-		"a future finish": func(id string) (*reportEnvelope, error) {
-			return storedEnvelope(t, id, now.Add(time.Hour), storedReportJSON), nil
+		"a stamp naming another audit": func(id string) (*reportEnvelope, error) {
+			return stampedEnvelope(t, reportStoreWriterSchedule+"cost-audit:"+goodRunTask, id, now, storedReportJSON), nil
+		},
+		"an on-demand run that says scheduled": func(id string) (*reportEnvelope, error) {
+			// The shell's run passed finish --scheduled inside this run's
+			// window: the body says scheduled, the broker says shell.
+			return stampedEnvelope(t, "shell", id, now, storedReportJSON), nil
+		},
+		"no stamp": func(id string) (*reportEnvelope, error) {
+			return stampedEnvelope(t, "", id, now, storedReportJSON), nil
+		},
+		"a body that claims the stamp": func(id string) (*reportEnvelope, error) {
+			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"writer":%q,"X-Report-Writer":%q,%s}`, id, reportStoreWriterSchedule+id+":"+goodRunTask, reportStoreWriterSchedule+id+":"+goodRunTask, storedReportJSON)), nil
 		},
 		"no report object": func(id string) (*reportEnvelope, error) { return storedEnvelope(t, id, now, `"x":1`), nil },
 		"another schema": func(id string) (*reportEnvelope, error) {
@@ -139,15 +163,6 @@ func TestAStoredReportThatIsNotTheRunsFallsBackToItsResult(t *testing.T) {
 		},
 		"an empty text": func(id string) (*reportEnvelope, error) {
 			return storedEnvelope(t, id, now, `"report":{"schema":"kube-agents.report/v1","text":"  "}`), nil
-		},
-		"an on-demand run's": func(id string) (*reportEnvelope, error) {
-			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":%q,"finished_at":%q,"scheduled":false,%s}`, id, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), storedReportJSON)), nil
-		},
-		"a run started before this one": func(id string) (*reportEnvelope, error) {
-			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":%q,"finished_at":%q,"scheduled":true,%s}`, id, now.Add(-time.Hour).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), storedReportJSON)), nil
-		},
-		"no started_at": func(id string) (*reportEnvelope, error) {
-			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":null,"finished_at":%q,"scheduled":true,%s}`, id, now.Format(time.RFC3339Nano), storedReportJSON)), nil
 		},
 	}
 	for name, answer := range cases {
@@ -180,9 +195,9 @@ func TestOnlyABuiltinScheduleRunReadsTheStore(t *testing.T) {
 	g := &Gateway{reportStore: store, scheduleClock: time.Now, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	started := time.Now().UTC().Add(-time.Minute)
 	for name, ref := range map[string]TaskRef{
-		"a user schedule":         {TriggerOrigin: "user", TriggerStream: "compliance-audit", StartedAt: started},
-		"an entry with no stream": {TriggerOrigin: lib.TriggerOriginBuiltin, StartedAt: started},
-		"an entry with no origin": {TriggerStream: "compliance-audit", StartedAt: started},
+		"a user schedule":         {TriggerOrigin: "user", TriggerStream: "compliance-audit", StartedAt: started, ID: goodRunTask},
+		"an entry with no stream": {TriggerOrigin: lib.TriggerOriginBuiltin, StartedAt: started, ID: goodRunTask},
+		"an entry with no origin": {TriggerStream: "compliance-audit", StartedAt: started, ID: goodRunTask},
 	} {
 		if got := g.storedReportFor(context.Background(), ref, nil); got != nil {
 			t.Errorf("%s: read %+v from the store", name, got)
@@ -191,7 +206,7 @@ func TestOnlyABuiltinScheduleRunReadsTheStore(t *testing.T) {
 	if asked := store.calls(); len(asked) != 0 {
 		t.Fatalf("asked the store for %q", asked)
 	}
-	builtin := TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: started}
+	builtin := TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: started, ID: goodRunTask}
 	if got := g.storedReportFor(context.Background(), builtin, nil); got == nil || string(got.Card) != storedCard {
 		t.Fatalf("builtin run read %+v, want the stored report", got)
 	}
@@ -210,7 +225,7 @@ func TestAStoredCardOverItsCapPostsTheTextAlone(t *testing.T) {
 	g.reportStore = &fakeReportStore{answer: func(id string) (*reportEnvelope, error) {
 		return storedEnvelope(t, id, time.Now().UTC(), `"report":{"schema":"kube-agents.report/v1","card":`+big+`,"text":"Two findings."}`), nil
 	}}
-	got := g.storedReportFor(context.Background(), TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: time.Now().Add(-time.Minute)}, nil)
+	got := g.storedReportFor(context.Background(), TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: time.Now().Add(-time.Minute), ID: goodRunTask}, nil)
 	if got == nil || got.Text != "Two findings." || len(got.Card) != 0 {
 		t.Fatalf("read %+v, want the text with no card", got)
 	}
@@ -232,6 +247,7 @@ func TestTheBrokerReaderAsksForThePublishKeyWithAFreshToken(t *testing.T) {
 		if st == http.StatusTemporaryRedirect {
 			w.Header().Set("Location", "/elsewhere")
 		}
+		w.Header().Set("X-Report-Writer", "builtin-schedule:compliance-audit:task-abc")
 		w.WriteHeader(st)
 		_, _ = io.WriteString(w, b)
 	}))
@@ -245,7 +261,7 @@ func TestTheBrokerReaderAsksForThePublishKeyWithAFreshToken(t *testing.T) {
 		t.Fatal("no reader for a URL and a token file")
 	}
 	env, err := s.latest(context.Background(), "compliance-audit")
-	if err != nil || env.AuditID != "compliance-audit" || env.Report == nil || env.Report.Text != "t" {
+	if err != nil || env.AuditID != "compliance-audit" || env.Report == nil || env.Report.Text != "t" || env.Writer != "builtin-schedule:compliance-audit:task-abc" {
 		t.Fatalf("latest = %+v, %v", env, err)
 	}
 	if err := os.WriteFile(tokenFile, []byte("tok-2"), 0o600); err != nil {
@@ -312,7 +328,7 @@ func TestASilentStoredReportNeedsNoText(t *testing.T) {
 	g.reportStore = &fakeReportStore{answer: func(id string) (*reportEnvelope, error) {
 		return storedEnvelope(t, id, time.Now().UTC(), `"report":{"schema":"kube-agents.report/v1","card":null,"text":"","silent":true}`), nil
 	}}
-	got := g.storedReportFor(context.Background(), TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: time.Now().Add(-time.Minute)}, nil)
+	got := g.storedReportFor(context.Background(), TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: time.Now().Add(-time.Minute), ID: goodRunTask}, nil)
 	if got == nil || !got.Silent || got.Text != scheduledSilentMarker || len(got.Card) != 0 {
 		t.Fatalf("read %+v, want a silent report with no card", got)
 	}
