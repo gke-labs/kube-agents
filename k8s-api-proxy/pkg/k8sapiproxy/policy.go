@@ -179,6 +179,10 @@ var readWriteVerbs = sets.New(verbGet, verbList, verbWatch, verbCreate, verbUpda
 // upgradeSubresources stream over a protocol upgrade, or reach a pod, node or service directly.
 var upgradeSubresources = sets.New("exec", "attach", "portforward", "proxy")
 
+// longRunningSubresources are the subresources kube-apiserver also counts as long-running
+// and leaves out of its own max-in-flight limit.
+var longRunningSubresources = upgradeSubresources.Union(sets.New(subLog))
+
 // mintingSubresources mint credentials, change who a pod runs as or where it runs, or approve
 // a certificate. Refused in every mode.
 var mintingSubresources = sets.New(subEphemeralContainers, subBinding, subToken, subApproval)

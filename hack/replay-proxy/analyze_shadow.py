@@ -1008,7 +1008,8 @@ def summarize(
 def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines = [
         f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly,"
-        f" {report['nightly_untrusted_requests']} nightly-untrusted, never a source);"
+        f" {report['nightly_untrusted_requests']} nightly-untrusted, {report['replay_lane_requests']} replay-lane,"
+        f" the last two never a source);"
         f" presubmit prompt tokens: {report['presubmit_prompt_tokens']}",
         f"skipped lines: {skipped}; merge times given: {report['merge_times_given']}",
         "",

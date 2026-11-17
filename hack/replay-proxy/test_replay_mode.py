@@ -186,7 +186,8 @@ class SlotCheckCostTest(SlotCacheCase):
         for length, expected in ((3, 1), (5, 1)):
             calls.clear()
             body = {"model": "m", "messages": turn[:length]}
-            digests, seen = replay.diagnosis.first_seen_with_digests(body["messages"], time.time())
+            digests, _ = replay.diagnosis.first_seen_with_digests(body["messages"], time.time())
+            seen = replay.prefix_first_seen(body, digests, time.time())
             self.assertTrue(replay.answers_recorded(body, body["messages"], digests, seen, time.time()))
             self.assertEqual(len(calls), expected, f"{length} messages")
 
@@ -302,11 +303,13 @@ class VariantContextTest(AnalyzeCase):
         return {"role": "assistant", "content": said, "tool_calls": [
             {"id": call_id, "type": "function", "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}]}
 
-    def fork(self, opening, result, settings=None, later=0):
+    def fork(self, opening, result, settings=None, later=0, seen_before=()):
         """Two recordings answer `opening` in other words; the second goes on to `result` `later` seconds on.
 
         A replay that was served the first recording's answer then asks for the
-        second recording's next step. Returns the replay's lookup.
+        second recording's next step. Returns the replay's lookup. The replay
+        proxy first looks up each (body, time) of `seen_before`, another
+        conversation it served earlier.
         """
         settings = settings or {}
         asked = dict(settings, model="m", messages=opening)
@@ -317,6 +320,8 @@ class VariantContextTest(AnalyzeCase):
         went_on = dict(asked, messages=opening + [second, {"role": "tool", "tool_call_id": "call_2", "content": result}])
         recorder.analyze(went_on, CLOCK + later, self.upstream({"role": "assistant", "content": "All listed."}))
         replay = self.proxy("replay", "r")
+        for body, at in seen_before:
+            replay.lookup(body, at)
         replay.lookup(asked, CLOCK)  # the replay's own earlier request, served the first answer
         replayed = dict(asked, messages=opening + [first, {"role": "tool", "tool_call_id": "call_1", "content": result}])
         return replay.lookup(replayed, CLOCK + later)
@@ -331,6 +336,26 @@ class VariantContextTest(AnalyzeCase):
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - 50 * MINUTE))
         opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
         self.assert_served(self.fork(opening, "a.txt", later=20 * MINUTE))
+
+    def test_a_message_another_conversation_sent_earlier(self):
+        # A skill's text is the same in every conversation. Normalized as of when
+        # another conversation sent it ten minutes before, this card's
+        # timestamps read as future ones and the answer as never recorded.
+        skill = {"role": "user", "content": "skill cluster-agent-lifecycle: create and tear down profiles"}
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}, skill]
+        other = {"model": "m", "messages": [{"role": "user", "content": "card t_cccccccc opened"}, skill]}
+        self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
+
+    def test_the_same_messages_under_other_settings_earlier(self):
+        # Another conversation sent these very messages ten minutes before, with
+        # another model. A prefix is the settings and the messages, so its time
+        # is this conversation's own; keyed by the messages alone, the card's
+        # timestamp would read as a future one and the answer as never recorded.
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
+        other = {"model": "another-model", "messages": opening}
+        self.assert_served(self.fork(opening, "a.txt", later=MINUTE, seen_before=[(other, CLOCK - 10 * MINUTE)]))
 
     def test_a_cidr_only_in_a_later_message(self):
         opening = [{"role": "user", "content": "node 10.1.2.3 is cordoned"}]
@@ -402,6 +427,34 @@ class BoundValueTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], [])
 
 
+class SkillViewOrderTest(AnalyzeCase):
+    """A skill_view result listing the skill's files in another directory order still matches its recording."""
+
+    @staticmethod
+    def body(references):
+        call = {"id": "call_1__thought__c2ln", "type": "function",
+                "function": {"name": "skill_view", "arguments": json.dumps({"name": "fleet-audit"})}}
+        result = json.dumps({"success": True, "name": "fleet-audit", "content": "# fleet-audit",
+                             "linked_files": {"references": references}})
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "audit the fleet"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__c2ln", "content": result},
+        ]}
+
+    def test_the_turn_after_skill_view_is_served_from_another_pods_order(self):
+        answer = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_2__thought__eHl6", "type": "function", "function": {
+                "name": "skill_view", "arguments": json.dumps({"name": "fleet-audit", "file_path": "references/ledger.md"})}}]}
+        recorded = self.body(["references/ledger.md", "references/finish.md"])
+        self.assertEqual(self.recorded(recorded, answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(self.body(["references/finish.md", "references/ledger.md"]), time.time())
+        self.assertIsNone(refused)
+        self.assertEqual(hit[3], "exact")
+        self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"])["file_path"],
+                         "references/ledger.md")
+
+
 class RunNameTest(AnalyzeCase):
     """The eval pool project, a repository commit, a clone directory and a GKE operation are bound like ids."""
 
@@ -434,6 +487,30 @@ class RunNameTest(AnalyzeCase):
                 hit, _ = self.proxy().lookup(self.body(shown.format(replayed)), time.time())
                 self.assertIsNotNone(hit)
                 self.assertEqual(hit[0]["content"], said.format(replayed, replayed))
+
+    def test_the_next_request_holding_the_served_answer_still_matches(self):
+        # The answer names the value outside the shape that bound it, so only the
+        # whole-token swap finds it; turn 2 sends each run's own text back.
+        for shown, recorded, replayed, said in (
+            ("searched gke-agentic/kube-agents-evals-3-infra@{}", "c99b1ab", "4f1e414", "git -C repo checkout {}"),
+            ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q", "mv clone-{} done"),
+        ):
+            with self.subTest(said=said):
+                self.setUp()
+                first = self.body(shown.format(recorded))
+                answer = {"role": "assistant", "content": said.format(recorded)}
+                self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+                first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+                self.recorded(first, {"role": "assistant", "content": "Done."})
+
+                replay = self.proxy()
+                echoed = self.body(shown.format(replayed))
+                hit, _ = replay.lookup(echoed, time.time())
+                self.assertEqual(hit[0]["content"], said.format(replayed))
+                echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+                hit, refused = replay.lookup(echoed, time.time())
+                self.assertIsNone(refused)
+                self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
 
     def test_the_project_in_tool_arguments_is_served_with_this_runs_value(self):
         def answer(project):
@@ -518,6 +595,193 @@ class RunNameTest(AnalyzeCase):
             {"kind": "queued", "created_at": 1793700100, "payload": {"note": "Queued: the system is busy."}}]})
         line = self.recorded(self.body(card), {"role": "assistant", "content": "It waited from 1793700100."})
         self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+
+class SimilarFilesTest(AnalyzeCase):
+    """A read_file not-found result listing other similar files still matches its recording."""
+
+    @staticmethod
+    def body(similar):
+        call = {"id": "call_1__thought__cmVh", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "/opt/data/AGENTS.md"})}}
+        result = {"content": "", "total_lines": 0, "file_size": 0, "truncated": False, "is_binary": False,
+                  "is_image": False, "error": "File not found: /opt/data/AGENTS.md"}
+        if similar:
+            result["similar_files"] = similar
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "look at the inventory"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__cmVh", "content": json.dumps(result)},
+        ]}
+
+    @staticmethod
+    def answer(tool, arguments):
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_2__thought__eHl6", "type": "function", "function": {"name": tool, "arguments": json.dumps(arguments)}}]}
+
+    def test_the_next_turn_is_served_whatever_the_list_held(self):
+        answer = self.answer("skill_view", {"name": "support-escalation-bundle"})
+        recorded = self.body(["/opt/data/INVENTORY.md", "/opt/data/SETTINGS.md"])
+        self.assertEqual(self.recorded(recorded, answer)["unstorable"], [])
+        for similar in (["/opt/data/SETTINGS.md"], None):
+            with self.subTest(similar=similar):
+                hit, refused = self.proxy().lookup(self.body(similar), time.time())
+                self.assertIsNone(refused)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[3], "exact")
+                self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]),
+                                 {"name": "support-escalation-bundle"})
+
+    def test_an_answer_reading_a_listed_file_is_not_stored(self):
+        # Served to a run whose list lacked INVENTORY.md, it would read a file that run was never shown.
+        for arguments in ({"path": "/opt/data/INVENTORY.md"}, {"command": "cd /opt/data && cat INVENTORY.md"}):
+            with self.subTest(arguments=arguments):
+                self.setUp()
+                tool = "read_file" if "path" in arguments else "terminal"
+                line = self.recorded(self.body(["/opt/data/INVENTORY.md", "/opt/data/SETTINGS.md"]),
+                                     self.answer(tool, arguments))
+                self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_a_listed_name_holding_a_bound_identifier_is_not_stored(self):
+        body = self.body(["/opt/data/kube-agents-evals-22-notes.md"])
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        line = self.recorded(body, self.answer("read_file", {"path": "/opt/data/kube-agents-evals-22-notes.md"}))
+        self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_an_answer_naming_a_file_only_this_runs_list_holds_is_not_served(self):
+        # Recorded where INVENTORY.md did not exist yet; this run's list shows another agent wrote it.
+        answer = self.answer("write_file", {"path": "/opt/data/INVENTORY.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(self.body(None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/INVENTORY.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
+        # A run whose list does not name it is served the write.
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/SETTINGS.md"]), time.time())
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+
+    def test_this_runs_listed_name_is_read_in_the_answer_as_served(self):
+        # Saved, the name is `⟦EVALPROJECT_1⟧-notes.md`; restored with this run's project, it is the listed file.
+        def body(project, similar):
+            asked = self.body(similar)
+            asked["messages"][0]["content"] = f"look at the inventory for {project}"
+            return asked
+
+        answer = self.answer("write_file", {"path": "/opt/data/kube-agents-evals-22-notes.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(body("kube-agents-evals-22", None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(
+            body("kube-agents-evals-23", ["/opt/data/kube-agents-evals-23-notes.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
+
+
+class KanbanCreateQueueTest(AnalyzeCase):
+    """A front door's kanban_create result matches its recording whether its card waited for a slot or not."""
+
+    @staticmethod
+    def body(queued, running=5):
+        call = {"id": "call_1__thought__Y3Jl", "type": "function",
+                "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-a"})}}
+        result = {"ok": True, "task_id": "t_d07508c5", "status": "ready", "workspace_kind": "scratch",
+                  "workspace_path": None, "project_id": None, "subscribed": True}
+        if queued is not None:
+            result["queued"] = queued
+        if queued:
+            result["queue"] = {"running": running, "limit": 5}
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "triage seeded-a"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__Y3Jl", "content": json.dumps(result)},
+        ]}
+
+    TALKS = ("It's queued and will start when a worker frees up.", "waiting for a slot (5 of 5 in use)",
+             "queued behind 5 running")
+
+    def test_the_ack_is_served_whether_or_not_the_card_waited(self):
+        for recorded, replayed in ((True, None), (None, True), (True, False)):
+            with self.subTest(recorded=recorded, replayed=replayed):
+                self.setUp()
+                answer = {"role": "assistant", "content": "I'm checking seeded-a."}
+                self.assertEqual(self.recorded(self.body(recorded), answer)["unstorable"], [])
+                hit, refused = self.proxy().lookup(self.body(replayed), time.time())
+                self.assertIsNone(refused)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[3], "exact")
+                self.assertEqual(hit[0]["content"], "I'm checking seeded-a.")
+
+    def test_an_answer_talking_about_the_wait_is_not_stored_after_a_queued_create(self):
+        # Served to a run whose card had a free slot, it would announce a wait that run does not have.
+        for said in self.TALKS:
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(True), {"role": "assistant", "content": said})
+                self.assertIn("talks_about_dropped_queue", line["unstorable"])
+                self.assertIsNone(self.proxy().lookup(self.body(None), time.time())[0])
+
+    def test_the_count_guard_still_refuses_a_quoted_count(self):
+        line = self.recorded(self.body(True), {"role": "assistant", "content": "queued behind 5 running"})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number", "talks_about_dropped_queue"])
+
+    def test_the_same_words_are_stored_after_a_create_that_did_not_wait(self):
+        for queued in (False, None):
+            for said in self.TALKS:
+                with self.subTest(queued=queued, said=said):
+                    self.setUp()
+                    self.assertEqual(self.recorded(self.body(queued), {"role": "assistant", "content": said})["unstorable"], [])
+
+
+class SpentProposalTest(AnalyzeCase):
+    """An earlier run's proposal number and revision in submit_suggestion's notice don't fork the key."""
+
+    @staticmethod
+    def body(number, revision):
+        call = {"id": "call_1__thought__cHJl", "type": "function", "function": {
+            "name": "terminal", "arguments": json.dumps({"command": "python3 submit_suggestion.py prepare --branch b"})}}
+        notice = (f"[2026-11-12 02:08:09] [SRE-AUTH] 'platform-agent/b' was the source of "
+                  f"https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}, which is closed. That "
+                  f"proposal's last revision, {revision}, is not in 'main', so it was squash-merged or closed rather "
+                  "than merged whole. The repository no longer holds the branch, so the name is free.")
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "propose the fix"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__cHJl",
+             "content": json.dumps({"output": notice, "exit_code": 0, "error": None})},
+        ]}
+
+    def test_the_next_turn_is_served_with_this_runs_revision(self):
+        said = "The spent branch was last at {}; writing the change on a fresh copy."
+        self.assertEqual(self.recorded(self.body(1399, "3ef98c4e29cf"),
+                                       {"role": "assistant", "content": said.format("3ef98c4e29cf")})["unstorable"], [])
+        replay = self.proxy()
+        echoed = self.body(1398, "141a5bb53467")
+        hit, refused = replay.lookup(echoed, time.time())
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0]["content"], said.format("141a5bb53467"))
+
+    def test_the_turn_after_a_served_revision_still_matches(self):
+        said = "Last at {}."
+        first = self.body(1399, "3ef98c4e29cf")
+        answer = {"role": "assistant", "content": said.format("3ef98c4e29cf")}
+        self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+        first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+        self.assertEqual(self.recorded(first, {"role": "assistant", "content": "Done."})["unstorable"], [])
+        replay = self.proxy()
+        echoed = self.body(1398, "141a5bb53467")
+        hit, _ = replay.lookup(echoed, time.time())
+        self.assertIsNotNone(hit)
+        echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+        hit, refused = replay.lookup(echoed, time.time())
+        self.assertIsNone(refused)
+        self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
+    def test_an_answer_naming_the_proposal_number_is_not_stored(self):
+        for said in ("vcs.py proposal view 1399 --repo gke-agentic/kube-agents-evals-22-infra",
+                     "First PR (closed): https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/1399"):
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(1399, "3ef98c4e29cf"), {"role": "assistant", "content": said})
+                self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
 
 
 class ReasoningTest(AnalyzeCase):

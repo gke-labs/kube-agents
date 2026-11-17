@@ -604,6 +604,58 @@ class KubectlRawPathTest(unittest.TestCase):
                 self.assertEqual(urllib.parse.parse_qsl(text, keep_blank_values=True), command_policy._query_pairs(text))
 
 
+class KubectlSecretReadRefusalTest(unittest.TestCase):
+    """The credential broker does not strip Secret data, so command_policy refuses Secret reads."""
+
+    RULE = command_policy.KUBERNETES_SECRET_READ_RULE
+
+    def test_secret_reads_are_refused_across_read_verbs_and_spellings(self):
+        for argv in (
+            ["kubectl", "get", "secret"],
+            ["kubectl", "get", "secrets"],
+            ["kubectl", "get", "Secret", "my-secret", "-o", "yaml"],
+            ["kubectl", "get", "secrets/my-secret", "-o", "json"],
+            ["kubectl", "get", "secret.v1.", "-n", "default"],
+            ["kubectl", "get", "secrets.v1./my-secret"],
+            ["kubectl", "get", "pods,secrets"],
+            ["kubectl", "get", "po,secret/my-secret"],
+            ["kubectl", "describe", "secret", "my-secret"],
+            ["kubectl", "describe", "secrets/my-secret"],
+            ["kubectl", "events", "--for=secret/my-secret"],
+            ["kubectl", "events", "--for", "secrets/my-secret"],
+            ["kubectl", "wait", "--for=jsonpath={.data.token}", "secret/my-secret"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+
+    def test_manifest_input_flags_are_refused_on_resource_read_verbs(self):
+        for argv, expected_flag in (
+            (["kubectl", "get", "-f", "secret.yaml"], "-f"),
+            (["kubectl", "get", "--filename=secret.yaml"], "--filename"),
+            (["kubectl", "get", "-Rf", "."], "-f"),
+            (["kubectl", "describe", "-k", "."], "-k"),
+            (["kubectl", "wait", "--kustomize=.", "--for=condition=Ready"], "--kustomize"),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+                self.assertEqual(expected_flag, decision.offending_flag)
+
+    def test_non_secret_reads_and_logs_follow_remain_allowed(self):
+        for argv in (
+            ["kubectl", "get", "pods"],
+            ["kubectl", "get", "configmaps/my-cm"],
+            ["kubectl", "describe", "pod", "my-pod"],
+            ["kubectl", "events", "--for=pod/my-pod"],
+            ["kubectl", "logs", "-f", "my-pod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+
 class KubectlKubercTest(unittest.TestCase):
     """--kuberc is a flags file, and it launders the impersonation refusal."""
 
@@ -1603,6 +1655,81 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed)
                 self.assertEqual(expected_rule_id, decision.rule_id)
+
+
+class GcloudBillingAccountFlagTest(unittest.TestCase):
+    """`--billing-account` names a scope above a project. The flag walker knows
+    it for every command, because `billing budgets list` requires it; the policy
+    lets it through on that command only. `logging read` takes the flag too, and
+    with it reads a billing account's logs and not a project's."""
+
+    RULE = "gcp.billing-account-forbidden"
+    FLAG = "--billing-account"
+    BUDGETS = ("billing", "budgets", "list")
+    ASSET_SEARCH_NEEDS = ["--scope=projects/p", "--asset-types=container.googleapis.com/Cluster"]
+
+    def test_logging_read_refuses_a_billing_account_in_every_spelling(self):
+        for argv in (
+            ["gcloud", "logging", "read", "q", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "logging", "read", "q", "--billing-account", "012345-6789AB-CDEF01"],
+            ["gcloud", "--billing-account=012345-6789AB-CDEF01", "logging", "read", "q"],
+            ["gcloud", "logging", "read", "q", "--project=p", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "logging", "read", "q", "--billing-account=012345-6789AB-CDEF01", "--limit=5", "--format=json"],
+            # Where another flag's value would stand: gcloud still reads it as the flag.
+            ["gcloud", "logging", "read", "q", "--format", "--billing-account=012345-6789AB-CDEF01"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(self.RULE, decision.rule_id)
+                self.assertEqual(self.FLAG, decision.offending_flag)
+                self.assertIn("--project", decision.message, "the refusal says what reads a project's logs")
+
+    def test_logging_read_still_reads_a_project(self):
+        for argv in (
+            ["gcloud", "logging", "read", "q"],
+            ["gcloud", "logging", "read", "q", "--project=p"],
+            ["gcloud", "logging", "read", "q", "--project", "p", "--limit=5", "--order=asc", "--freshness=1h", "--format=json"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed)
+
+    def test_the_other_scopes_above_a_project_stay_refused_on_logging_read(self):
+        """These were never listed for the flag walker; the cases keep them so."""
+        for flags in (["--folder=123"], ["--organization=123"], ["--bucket=b", "--location=global", "--view=v"],
+                      ["--resource-names=folders/123"]):
+            with self.subTest(flags=flags):
+                self.assertFalse(evaluate(["gcloud", "logging", "read", "q", *flags]).allowed)
+
+    def test_billing_budgets_list_keeps_its_billing_account(self):
+        for argv in (
+            ["gcloud", "billing", "budgets", "list", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "billing", "budgets", "list", "--billing-account", "012345-6789AB-CDEF01", "--format=json"],
+            ["gcloud", "--billing-account=012345-6789AB-CDEF01", "billing", "budgets", "list", "--quiet"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed)
+
+    def test_only_billing_budgets_list_passes_the_flag(self):
+        """Every allowlisted read. The flag passes on one command; a change that
+        lets it through on a second one, an entry added later included, goes
+        red here."""
+        passes = set()
+        for command in sorted(command_policy.GCLOUD_READ_COMMANDS):
+            needs = self.ASSET_SEARCH_NEEDS if command == ("asset", "search-all-resources") else []
+            with self.subTest(command=" ".join(command)):
+                self.assertTrue(evaluate(["gcloud", *command, *needs]).allowed, "the command alone is an allowed read")
+                decision = evaluate(["gcloud", *command, *needs, f"{self.FLAG}=012345-6789AB-CDEF01"])
+                if decision.allowed:
+                    passes.add(command)
+                else:
+                    self.assertEqual(self.RULE, decision.rule_id)
+        self.assertEqual({self.BUDGETS}, passes)
+
+    def test_a_write_keeps_its_own_refusal(self):
+        decision = evaluate(["gcloud", "billing", "budgets", "create", "--billing-account=012345-6789AB-CDEF01"])
+        self.assertFalse(decision.allowed)
+        self.assertNotEqual(self.RULE, decision.rule_id, "the read-only rule answers first, as before")
 
 
 class RefusalCostIsBounded(unittest.TestCase):

@@ -89,13 +89,6 @@ PROW_YAML_URL = (
     "prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml"
 )
 PROW_JOB = "pull-kube-agents-smoke-test"
-#: Prow's list before oss-test-infra took the widened one. It skips a subset of what the gate
-#: skips, so no pull request waits on it; delete this once Prow carries SMOKE_SKIP_RE.
-PROW_BEFORE = (
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
-    r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
-    r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
-)
 
 
 def tracked():
@@ -311,6 +304,11 @@ class SkipListTest(unittest.TestCase):
 
 
 class ProwCopyTest(unittest.TestCase):
+    """Needs the network, on purpose: Prow's copy of the skip pattern lives in another repository
+    (PROW_YAML_URL), and only the live file shows that the two copies are still equal. The read is
+    one anonymous GET. Where the file cannot be read (the host is unreachable, or it answers with
+    an error) the test is skipped, with the reason."""
+
     def test_prow_skips_the_same_paths(self):
         try:
             with urllib.request.urlopen(PROW_YAML_URL, timeout=20) as response:
@@ -321,14 +319,7 @@ class ProwCopyTest(unittest.TestCase):
             pattern = prow_skip_pattern(text)
         except (ValueError, AttributeError):
             self.fail(f"no skip_if_only_changed for {PROW_JOB} in {PROW_YAML_URL}; fix prow_skip_pattern")
-        if pattern == PROW_BEFORE:
-            self.skipTest("Prow still carries the list from before SMOKE_SKIP_RE widened")
         self.assertEqual(pattern, gate.SMOKE_SKIP_RE.pattern)
-
-    def test_prows_old_list_skips_nothing_the_gate_does_not(self):
-        old = re.compile(PROW_BEFORE)
-        files = tracked()
-        self.assertEqual([p for p in files if old.search(p) and not gate.SMOKE_SKIP_RE.search(p)], [])
 
 
 if __name__ == "__main__":

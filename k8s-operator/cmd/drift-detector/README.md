@@ -247,7 +247,8 @@ oversize batch again when it is redelivered, at every deadline. On a profile clu
 read goes through the same broker, which relays a named read only for the kinds in its table
 (`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
 the six GitOps sync objects the agent can read itself, never a Secret. A named Pod is relayed only as its
-owner projection, for the event watcher, so the join's full read of a Pod is refused under
+[owner projection](../../../docs/site/src/content/docs/reference/credential-isolation.md#request-paths),
+for the event watcher, so the join's full read of a Pod is refused under
 `kubernetes.watcher.accept`. A Pod record, like a record of a kind outside the table,
 comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
 judgement: a GitOps-managed object of an unlisted kind (a Flux HelmRelease, say) is reported without
@@ -718,7 +719,7 @@ before the restart. Two rules keep a person's edit in that window carded: the ku
 and the daemon's, which cards every late row of a principal with fewer than three late rows in the
 digest. What is left without a card of its own is three or more late non-kubectl changes by one
 principal, which the digest names under that principal. On an install with no chat platform enabled
-(a `next` install whose only chat platform has no home channel counts) the digest is one card on the
+the digest is one card on the
 task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
 health report names it while it stays blocked; that report reaches a person once the install
 has chat. One card per burst: the digest closes 60 seconds after its newest row or 10

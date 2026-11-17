@@ -74,7 +74,7 @@ main-b to main-e periodics, `ci-kube-agents-eval-nightly-main-b` to
 `-main-e`, and when the writers part runs as three thirds the writers-b and
 writers-c periodics, `ci-kube-agents-eval-nightly-writers-b` and
 `-writers-c`, whose runs are `nightly` runs too, told apart by `job`) and the forge lanes: the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
-pull-request build against a GitLab repository, with its today and next nightlies) and the self-managed
+pull-request build against a GitLab repository, with its next-mode nightly) and the self-managed
 GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`,
 each with a next-mode weekly job). All archive the same
 layout and are collected from the moment they start running.
@@ -179,9 +179,9 @@ layout and are collected from the moment they start running.
       (`classify.py`, `health.py`) count it apart from the storm reps — it is
       not lost to 429s — and outside every pass-rate denominator; `classify.py`
       classes a case whose ungraded reps are all of this kind
-      `delegation-ceiling`. The run page, the PR view and the PR comment's
-      result cell count it in a case's total and name it apart; the Cases
-      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      `delegation-ceiling`. The run page and the PR view count it in a case's
+      total and name it apart; the Cases page's per-run counts
+      (`render.rep_counts`) still fold it into `infra`.
       An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
       **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
       because the lease-time seeded-fleet scan saw a fixture the case needs
@@ -189,6 +189,13 @@ layout and are collected from the moment they start running.
       The same readers count it apart from the storm and the ceiling, and
       `classify.py` classes a case whose ungraded reps are all of this kind
       `fixture-drift`.
+      An `infra` rep whose `reason` leads with `KUBE_AGENTS_FORGE_UNAVAILABLE`
+      is a **forge** rep: every check that errored did so because a forge read
+      failed for a while during grading (a 5xx, a dropped connection, a GitHub
+      rate limit on grading's own token). The same readers count it apart
+      from the storm and outside every pass-rate denominator, and
+      `classify.py` classes a case whose ungraded reps are forge reps, with no
+      storm rep beside them, `forge-unavailable`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -464,6 +471,17 @@ side.
 
 Additive, optional, and safe to omit — consumers must default them.
 
+- `slack_overhead` — the Slack lane's overhead per night, newest first,
+  read with `--slack-lane-prefix` from the Slack lane
+  (`ci-kube-agents-eval-nightly-slack`) and merged by build over
+  `--merge-with`'s list, so a failed read keeps it; absent until the lane has
+  recorded one. Each entry is
+  `{build_id, date, delivery_lag_s, post_s, first_ack_p50_s, first_ack_p95_s}`
+  from the build's `artifacts/slack-lane/slack-overhead.json`
+  (`hack/slack-lane/overhead.py`), `date` the night it belongs to (`nightly.night_day` of its start), for
+  the newest `SLACK_OVERHEAD_NIGHTS` (14) builds; a file that records an error is
+  left out, and a value is `null` when the night recorded no sample of it.
+  `nightly.py` reads it into `nights[].slack` and `nights[].cases[].slack_e2e_s`.
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
   page labels itself `STALE`. Emitted only when the collector is invoked
   with `--stale-after-s` (the 15-minute refresh job passes its cadence plus
@@ -508,7 +526,7 @@ Additive, optional, and safe to omit — consumers must default them.
   "finished": "<iso8601>",
   "duration_s": 15006,
   "project": "kube-agents-evals-10",
-  "artifacts_url": "https://oss.gprow.dev/view/gs/...",
+  "artifacts_url": "https://oss.gprow.dev/view/gs/... | https://console.cloud.google.com/storage/browser/...",
   "pass_rate": 0.9,
   "baseline_rate": null,
   "margin": null,
@@ -529,6 +547,15 @@ Additive, optional, and safe to omit — consumers must default them.
   from before the gate landed carry a `staging_` tag, the deploy tag the job
   then triggered on, and records after it carry the `evalcand_` tag the
   nightly now pushes ahead of the deploy. Nothing reads the prefix.
+- `releases[].gcs_base` — the build directory the release was read from, as
+  `runs[].gcs_base`: present only on a release read from a bucket Deck
+  cannot read, which the lane's own archive is once it moves to
+  `gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/`
+  (`--rc-glob` names it and the old `gs://kube-agents-prow` archive both,
+  the old one until the newest `--rc-limit` builds are all in the new
+  one). The Brief's row links the Cloud Console for such a
+  release, and for an `artifacts_url` whose Spyglass link points into a
+  private bucket; a release from the old bucket keeps its Spyglass link.
 - `verdict` — the eval's, which is still not the job's, though they now
   mostly agree: the job runs the driver bare, so a `RED` candidate leaves a
   `FAILURE` in `result`. They part on `NOT RUN`, which is written on three
@@ -576,7 +603,8 @@ what the renderer does with them.
   task results; an `infra` rep whose `reason` leads with
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
-  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `metrics.ceiling_reps` instead; one whose `reason` leads with
+  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane
@@ -609,6 +637,7 @@ what the renderer does with them.
   nightly issues link such a run's build and transcripts in the Cloud
   Console; a run without the field, in `gs://kube-agents-prow` or from
   before the field, keeps its Spyglass link, which still renders it.
+  `releases[].gcs_base` is the same field for the release-candidate lane.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -636,7 +665,8 @@ what the renderer does with them.
   and the list through to `brief.json`, where the run page and the Brief's
   run rows label the run and the Reds tile says how many of the gate's reds
   were not evaluated. A gate case that failed every graded repetition
-  on the same run is named in the lede and the comment (the suite's roster
+  on the same run is named in the run page's lede; the comment adds one
+  unnamed sentence pointing at the run page (the suite's roster
   is the branch's; the dashboard's can be newer). `health.py` carries both
   on `Run`, keeps them through `--trim`, and its `pr_caused_reds` never
   counts such a run as the pull request's own, collapsed gate case or not,
@@ -700,9 +730,10 @@ what the renderer does with them.
   record) is the same note, and any other failure is the refusal line, as
   it is for the presubmit. A listing that hangs past `GCLOUD_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
-- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
-  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
-  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+- `--gitlab-nightly-prefix [<gs prefix>]` — a GitLab nightly periodic's
+  prefix (the lane's retired today-mode `ci-kube-agents-eval-nightly-gitlab`;
+  the workflow no longer passes it, and the next-mode nightly comes in
+  through `--lane-nightly-prefix`), read as `--nightly-prefix` is (the prefix is its index, `pr`
   null, `log_url` set, the nightly's rule on a listing that fails) but
   tagged `tier: "gitlab"`, above that nightly job's own watermark: a
   lane's pull-request job and each of its nightlies are sources of one
@@ -717,8 +748,7 @@ what the renderer does with them.
 - `--lane-nightly-prefix <tier>=<gs prefix>` (repeatable) — a forge lane's
   scheduled job at any cadence (a nightly, or the self-managed lanes' weekly
   jobs), read as `--gitlab-nightly-prefix` is but tagged with `<tier>`; a
-  lane may name several (the GitLab lane's today and next nightlies), each
-  above its own job's watermark.
+  lane may name several, each above its own job's watermark.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -728,8 +758,9 @@ what the renderer does with them.
   prefix's last segment (or `--nightly-job`). Given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/`
   (the nightly's own bucket; the presubmit has its own,
-  `gs://kube-agents-evals-presubmit-logs`, and the RC lane stays on the
-  cluster default `gs://kube-agents-prow`); omitted, no
+  `gs://kube-agents-evals-presubmit-logs`, which the RC lane moves to as
+  well, under `logs/`, its builds from before the move in the cluster
+  default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
   touching the bucket). A prefix that does not list is read three ways. A
   prefix with no objects (`gcloud storage ls` says "matched no objects") is a job
@@ -948,7 +979,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture, forge}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -1042,8 +1073,9 @@ is a build that never finished, not one still running. `releases[]` is `data.jso
 at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,
 verdict, result, started, duration_s, artifacts_url, pass_rate,
 baseline_rate, margin, cases{passed, graded, infra}}` — `artifacts_url`
-only when it is `https://`, else `null`; `cases` `null` when no task
-parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
+only when it is `https://`, else `null`, and the Cloud Console's bucket
+browser for a release with `gcs_base` or a Spyglass link into a private
+bucket; `cases` `null` when no task parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
 the current verdict, `history` the ticks and the incidents derived from
 them, `merges` the recent first-parent commits of the checkout (`null`
 when the checkout is shallow or has no git; the Brief then omits "what
@@ -1057,7 +1089,7 @@ each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
 previous_build, parts[], missing_parts[], running_parts[],
-verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, cases[]}`. A
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, slack?, cases[]}`. A
 night is one nightly run, or the runs of one date of the parts `nightly.py`
 names in `PARTS` (main, main-b to main-e, writers, writers-b, writers-c):
 a run's date is the UTC date of its start plus 15 minutes
@@ -1106,7 +1138,7 @@ verdict for the night, though `newly_failing` still lists what the parts on
 record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
-infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape}` with `state` in `pass|partial|fail|infra`
+infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape, slack_e2e_s?}` with `state` in `pass|partial|fail|infra`
 by the strip's rule over the task's reps (no `reps` key: the task's result
 is one rep), `reason` the first failing rep's grader text (`null` on a
 pass), and `turn1_p50_s` / `agent_p50_s` the median of the task's reps'
@@ -1124,7 +1156,15 @@ bot_messages_p50, words_before_answer_p50, answer_words_p50}`: `n` the reps
 that carried one with both flags, each flag the number of them it was true on, and each
 count's nearest-rank median (`null` when no rep carried it); `null` when no
 rep carried a shape. The night's `shape` is the same over every such rep of
-the night's `cases[]`. Reported, never a verdict. `expected` counts the cases `nightly_active` on this checkout,
+the night's `cases[]`. Reported, never a verdict. When the Slack lane recorded
+its overhead on the night's date (data.json's `slack_overhead`), each case
+carries `slack_e2e_s`, its estimated end-to-end Slack time (`agent_p50_s` plus
+that night's delivery lag plus its `shape.bot_messages_p50` times a post's time,
+`slack_estimate.py`), and the night carries `slack`: `{e2e_p50_s, e2e_p95_s,
+e2e_p95_7n_s, first_ack_p50_s, first_ack_p95_s, delivery_lag_s, post_s,
+build_id}`, `e2e_p95_7n_s` the mean p95 of up to 7 dates that carry one, the
+night's own and the dates before it (a same-date re-run counted once). Absent
+without an overhead that night. Advisory. `expected` counts the cases `nightly_active` on this checkout,
 less any case a part of the night dropped on the inject lane
 (`runs[].lane_excluded`); `missing[]` names the expected cases the night did
 not record.
@@ -1317,10 +1357,20 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. A `tracking_issues`
+entry is `#N` for an issue of this repository (one `case-notes.yaml` names,
+or one the bot filed here) and the full URL of one the bot filed or adopted
+in the issues repository; `issues_repo` names that repository
+(`ghcli.DEFAULT_REPO`, `KUBE_AGENTS_ISSUES_REPO` when set) and is
+informational: the pages read nothing from it, a reference carries its own
+repository. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`storm` the `incident` also carries `causes`, the repetitions' own words for
+how they died with counts (`[[words, n], …]`, every phrasing, commonest first,
+scrubbed and cut as the periodics' quoted log line is), which the Chat
+sentence names short. For
 `lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
@@ -1448,10 +1498,14 @@ the link the message is built from, from `WATCHED`. The reconcile's report,
 `{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
 budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
 finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
-{outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
+{outcome, detail, started_at?, finished_at?, allowlist_unused[]?,
+startup_fail_reset?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+when its plan was read; `startup_fail_reset` is `{result: reset|failed|skipped,
+instance?, zone?, detail?}`, with the fixture refresh on and not on a dry run: the run resets
+the VM after each project whose state it read, whatever the plan outcome; after a failed
+state read it records `failed` and tries no reset; an interrupted project is not reset; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
 over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
 from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could
@@ -1475,14 +1529,18 @@ daily passed having reached every project the failed build named, at the same
 `fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
 is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
-failed itself, so its own note is the current story and nothing clears; `by`
+failed itself on a build that owes a hand step, so its own note is the current
+story and nothing clears (a later failure the next run retries writes none of
+its own unless a project persists, and silences nothing); `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,
-`summary`), what the clear cites. A failed build whose report is absent or
-cut short is never recovered by a pass, and a silence ends when a later daily
-passes without reaching the projects. The
+`summary`, `passed`), what the clear cites; a later daily that failed
+elsewhere but applied the projects at the same tree is a recovery too, cited
+with `passed` false. A failed build whose report is absent or cut short is
+never recovered, and a silence ends when a later daily passes without reaching
+the projects, or fails without reaching them on a build that owes no hand step. The
 entry is carried from the previous tick while `build` is still the job's
 latest, unchanged on a tick blind to either job, so neither re-opens the
-failure, and a silence becomes a recovery once a later pass reaches the
+failure, and a silence becomes a recovery once a later run reaches the
 projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
@@ -1495,8 +1553,12 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the reconciles and for the certification slice), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+failure for the certification slice and the replay lane, and for the reconciles
+the first failure that owes a hand step, otherwise a project at `PERSISTENT_AFTER`
+consecutive runs: [`ci-health.md`](../../docs/ci-health.md), "The watched
+periodics"), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`) or, for the postsubmit reconcile, a
+`periodics_superseded` recovery, not on a sub-threshold failure, and
 a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
@@ -1571,8 +1633,10 @@ release-candidate job, which is a postsubmit, so its `started.json` carries no
 | 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
 
 Captured from
-`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`
-— which is also where the job name the collector globs for is verifiable, since
+`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`,
+the archive the lane logs to before it moves to
+`gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/` — either
+prefix is where the job name the collector globs for is verifiable, since
 nothing in this repository declares it (the job lives in
 `GoogleCloudPlatform/oss-test-infra`). A wrong name degrades to an empty
 `releases[]` rather than an error, so check the path before changing it.

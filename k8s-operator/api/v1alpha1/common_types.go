@@ -31,7 +31,7 @@ import (
 const (
 	// A2ABusTokenAudience is the audience every A2A bus token is bound to. The
 	// operator projects a ServiceAccount token for it into the platform-agent
-	// container under `mode: next`, and the auth callout accepts no other
+	// container, and the auth callout accepts no other
 	// audience. It lives here rather than in the controller because the
 	// validating webhook needs the same value: a user-authored volume that
 	// projects a token for this audience under any name is the bus credential
@@ -53,10 +53,47 @@ const (
 	a2aNATSCASuffix      = "-ca"
 
 	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
+
+	// DefaultUniverseDomain is Google Cloud's commercial API universe domain.
+	DefaultUniverseDomain = "googleapis.com"
+	// MaxUniverseDomainLength is the DNS hostname length cap enforced on
+	// Google Cloud universe domain values across spec, metadata, and env inputs.
+	MaxUniverseDomainLength = 253
+	// GoogleCloudUniverseDomainEnv is the Google Cloud client-library
+	// environment variable naming the active API universe domain.
+	GoogleCloudUniverseDomainEnv = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+	// CloudSDKUniverseDomainEnv is the Google Cloud SDK environment variable
+	// naming the active core/universe_domain property.
+	CloudSDKUniverseDomainEnv = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+	// KubeProxyUniverseDomainEnv is the k8s-api-proxy environment variable
+	// naming the active Google Cloud universe domain.
+	KubeProxyUniverseDomainEnv = "KUBE_PROXY_UNIVERSE_DOMAIN"
+	// CloudSDKEndpointOverridesEnvPrefix is the prefix for gcloud per-service
+	// API endpoint overrides (CLOUDSDK_API_ENDPOINT_OVERRIDES_<SERVICE>).
+	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
 
+var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
+// lowercases the candidate, and validates it as a multi-label DNS hostname of
+// at most MaxUniverseDomainLength bytes.
+func NormalizeUniverseDomain(raw string) (string, bool) {
+	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// IsValidUniverseDomain reports whether raw is already a canonical lower-case
+// multi-label DNS hostname within MaxUniverseDomainLength.
+func IsValidUniverseDomain(raw string) bool {
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+}
+
 // A2ANATSName is the name of the NATS objects the operator renders for a
-// PlatformAgent under `mode: next`, and the stem of A2ACredsSecretName.
+// PlatformAgent, and the stem of A2ACredsSecretName.
 func A2ANATSName(agentName string) string { return agentName + a2aNATSNameSuffix }
 
 // A2ACredsSecretName is the Secret holding the bus's static passwords
@@ -141,7 +178,7 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
-	// The A2A bus wiring the operator renders under `mode: next`. The agent
+	// The A2A bus wiring the operator renders. The agent
 	// container's credential is a projected ServiceAccount token since A5, not
 	// a password, but the address is still the thing that decides who receives
 	// it: a CR-set NATS_URL would send the bearer token to a server of the
@@ -176,13 +213,16 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. The operator renders it exactly when
-	// the next stack holds the chat backend; an override either way leaves
-	// posts going to a platform that is not there.
+	// the gateway's chat.notify route. It holds every platform whose route is
+	// armed under the next stack with a home channel set on the CR,
+	// comma-separated, Chat first; the agent adds a learned Slack channel and
+	// sends home posts to every armed route when no platform has a home. An
+	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
-	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route, and names
-	// the platform in the cron relay's refusal when no home channel is set.
+	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
+	// comma-separated. The kanban notifier reports back on it to the gateway
+	// conversation a card was filed in, and the agent sends home posts to
+	// every armed route when no platform has a home channel.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS":     {},
 	"KUBE_AGENTS_ENABLED_PROFILES": {},
@@ -195,6 +235,23 @@ var SensitiveEnvVars = map[string]struct{}{
 	"NATS_USER":         {},
 	"NATS_PASSWORD":     {},
 	"VCS_FORGES_CONFIG": {},
+	// Universe-domain variables decide which Google API host receives the
+	// credential proxy's cloud-platform access token and which universe the
+	// watchers and relays address. Only spec.harness.universeDomain (or the
+	// operator's metadata-server detection) may set them; a spec.deployment.env
+	// entry would redirect Google tokens outside the install's universe.
+	GoogleCloudUniverseDomainEnv: {},
+	CloudSDKUniverseDomainEnv:    {},
+	KubeProxyUniverseDomainEnv:   {},
+}
+
+// IsSensitiveEnvVar reports whether name is reserved in SensitiveEnvVars or
+// carries a reserved Cloud SDK endpoint-override prefix.
+func IsSensitiveEnvVar(name string) bool {
+	if _, ok := SensitiveEnvVars[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, CloudSDKEndpointOverridesEnvPrefix)
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -250,7 +307,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // route that is cheaper than it.
 //
 // Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
-// platform-agent container presents to the bus under `mode: next`, and it is
+// platform-agent container presents to the bus, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the
 // agent's bus identity. One that also holds bridge-password would hold the
@@ -433,6 +490,21 @@ type HarnessSpec struct {
 	// localhost:8080. See buildCredentialProxyEnv.
 	// +required
 	ProjectID string `json:"projectId,omitempty"`
+
+	// UniverseDomain is the Google Cloud API universe domain for this install
+	// (for example, "googleapis.com" on standard Google Cloud, or a custom API
+	// domain on Google Cloud Dedicated / Sovereign Cloud). When omitted, the
+	// operator probes the GKE metadata server
+	// (/computeMetadata/v1/universe/universe-domain) and falls back to
+	// "googleapis.com" outside GCE/GKE. One PlatformAgent spans a single
+	// universe domain: when set and the host metadata server reports a
+	// different universe domain, the operator refuses the mismatch and marks
+	// the CR Degraded with reason UniverseDomainMismatch rather than sending
+	// tokens across universe boundaries.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`
+	// +optional
+	UniverseDomain string `json:"universeDomain,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
@@ -947,15 +1019,14 @@ type TuningSpec struct {
 	Admission *AdmissionSpec `json:"admission,omitempty"`
 
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
-	// It only means something under mode: next - a today install renders neither
-	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+	// "Delegate:" makes pod
 	// creation user-triggerable from chat and threads are free, so the principal
 	// map bounds WHO can spawn and this bounds HOW MANY.
 	//
 	// Unset means 10, the operator's default - a "busy day" sizing: at the
-	// session-pod shape (250m CPU / 512Mi requests) ten concurrent sessions
-	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
-	// preemption.
+	// session-pod shape's default requests (150m CPU / 320Mi, SessionResources)
+	// ten concurrent sessions hold 1.5 CPU / 3.2Gi, which a small dev cluster
+	// absorbs without preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
@@ -979,7 +1050,7 @@ type TuningSpec struct {
 	// cannot hold the configured concurrency refuses a legitimate session's
 	// consumer create at load. That one is capacity, not a control - it is
 	// sized to fit this cap rather than to enforce it - and because
-	// provisioning never edits an existing stream, an install whose TASKS
+	// provisioning never changes an existing stream's max_consumers, an install whose TASKS
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
@@ -1019,6 +1090,47 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// SessionResources are the A2A session pods' CPU and memory requests and
+	// limits (#2371). Each of requests.cpu, requests.memory, limits.cpu and
+	// limits.memory is this field's if set to a positive quantity, else its
+	// default (150m, 320Mi, 2 and 2Gi), independently; a zero or negative key
+	// keeps its default. A request set alone above its default limit raises
+	// the limit to match; otherwise a request above its limit is lowered to
+	// it (ResolveSessionResources). Only cpu and memory are read. Ephemeral
+	// storage isn't set here. What it costs: the session cap multiplies the
+	// requests, and on Autopilot the requests are billed (on Autopilot
+	// without Pod bursting, its per-pod minimums of 250m and 512Mi apply
+	// instead). A change rolls the gateway; session pods already running keep
+	// their shape until they respawn.
+	// +kubebuilder:validation:XValidation:rule="!has(self.requests) || self.requests.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.requests may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.limits) || self.limits.all(k, k == 'cpu' || k == 'memory')",message="sessionResources.limits may set only cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="!has(self.claims) || size(self.claims) == 0",message="sessionResources may not set claims"
+	// +optional
+	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
+
+	// BusReplicas is how many NATS servers run the A2A bus,
+	// and so how many copies JetStream keeps of every stream and bucket: 3
+	// runs a cluster with R3 streams, which keeps the bus up through a node
+	// drain, upgrade or eviction that moves one server; 1 runs a single
+	// server with R1 streams, which is down for as long as its pod restarts.
+	// 1 is for a throwaway, single-node or cost-bound install that accepts
+	// that outage; it saves two NATS pods and two 40Gi volumes.
+	//
+	// Unset, an install keeps the count its bus already runs, so an install
+	// whose bus predates the three-server default stays on one
+	// server, and a new bus gets three (status.busReplicas shows which applies).
+	//
+	// Set, it decides the count of a bus that does not exist yet. On an
+	// existing bus, a change between 1 and 3 starts a migration that keeps
+	// the bus's data (status.busMigration, the A2ABusMigrating condition):
+	// the bus keeps the count it runs until the migration converts it, and
+	// the admission webhook refuses another change while one runs. One server
+	// to three freezes writes for the window, since it copies the streams
+	// (docs/designs/spec-nats-deployment.md).
+	// +kubebuilder:validation:Enum=1;3
+	// +optional
+	BusReplicas *int `json:"busReplicas,omitempty"`
 
 	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
 	// concurrent profile tasks and the warm workers kept per interactive
@@ -1113,6 +1225,11 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultBusReplicas is the NATS server count of a new bus when
+// spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
+// streams. An existing bus keeps its own count.
+const DefaultBusReplicas = 3
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -1559,7 +1676,13 @@ type CredentialProxyExecSpec struct {
 	// positive count the shell sandbox, the profile workers and the session
 	// pods under the cluster view are given the tier's address for /v1/exec
 	// and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
-	// memory, with no override. A change between 0 and a positive value
+	// memory, with no override, so each one needs a node with that much free,
+	// and the pods that turning the tier on restarts (below) need room to start
+	// again. A replica that cannot be scheduled shows in the
+	// CredentialProxyExecReady condition (reason Unschedulable, with the
+	// scheduler's message), and callers that cannot reach the tier fall back to
+	// the stateful broker.
+	// A change between 0 and a positive value
 	// restarts the shell sandbox, the profile warm pools, and under the
 	// cluster view the A2A gateway, which read the tier's address when they
 	// start; a change between two positive values rewrites the count the pods
@@ -1676,7 +1799,7 @@ type AvailabilitySpec struct {
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 
-	// A2AGateway is the A2A gateway's availability, under mode next.
+	// A2AGateway is the A2A gateway's availability.
 	// +optional
 	A2AGateway *A2AGatewayAvailabilitySpec `json:"a2aGateway,omitempty"`
 }
@@ -1892,6 +2015,18 @@ type SecuritySpec struct {
 	// Ignored for any other egressPolicy value.
 	// +optional
 	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+
+	// DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+	// reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+	//
+	// True omits `secrets` from the ClusterRole.
+	// False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+	// strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+	// Absent (nil) grants `secrets` on a new install where the ClusterRole does
+	// not exist yet (when the operator holds `list` and `watch` on `secrets`).
+	// On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+	// +optional
+	DisallowSecretsRead *bool `json:"disallowSecretsRead,omitempty"`
 }
 
 // WorkloadIdentityFederationSpec names the pool the proxy federates through and
@@ -2423,7 +2558,7 @@ type TelemetrySpec struct {
 	// PeopleSeen keeps one hashed key and a last-active time per verified
 	// chat person in the gateway's people bucket, for 30 days after their
 	// last turn, and serves the people seen in the last 7 and 30 days as
-	// kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+	// kubeagents_a2a_gateway_people_seen. False writes no
 	// key, deletes every key the bucket holds at the gateway's next start,
 	// and serves no sample.
 	// +kubebuilder:default=true
@@ -2708,6 +2843,12 @@ type AgentStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// ObservedVersion is the image tag or digest from the reconciled gateway
+	// workload's platform-agent container (for example, "v0.12.3", "sha-abc1234",
+	// or "sha256:..."), stripped of any registry host and repository path.
+	// +optional
+	ObservedVersion string `json:"observedVersion,omitempty"`
+
 	// Address is the fully qualified domain name (FQDN) of the agent service.
 	// +optional
 	Address string `json:"address,omitempty"`
@@ -2745,6 +2886,23 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state and the data volume's usage.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+
+	// BusReplicas is the A2A bus's NATS server count:
+	// the count the bus runs, which only a migration changes (BusMigration);
+	// for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived on
+	// every reconcile, so it is a reading of the bus rather than a setting;
+	// it is not a claim that a bus is running, and with the claims deleted it
+	// no longer decides anything.
+	// +optional
+	BusReplicas int32 `json:"busReplicas,omitempty"`
+
+	// BusMigration is the A2A bus's server-count migration under spec.mode:
+	// next, while one runs or since the last one ended: setting
+	// spec.harness.tuning.busReplicas to another count on an existing bus
+	// starts one, and it converts the bus without emptying it. Unset when no
+	// migration has run.
+	// +optional
+	BusMigration *BusMigrationStatus `json:"busMigration,omitempty"`
 
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
@@ -2786,11 +2944,26 @@ type AgentStatus struct {
 	// +optional
 	Inference *InferenceStatus `json:"inference,omitempty"`
 
+	// ResolvedUniverseDomain is the Google Cloud API universe domain the
+	// operator resolved for this install from spec.harness.universeDomain or
+	// from the GKE metadata server (/computeMetadata/v1/universe/universe-domain).
+	// Written by the Ready status update; absent before a pass reaches it, when
+	// spec.harness.universeDomain is unset and the metadata server did not
+	// answer (for example on kind), and while the served CRD predates the field.
+	// +optional
+	ResolvedUniverseDomain string `json:"resolvedUniverseDomain,omitempty"`
+
+	// UniverseDomainSource reports how ResolvedUniverseDomain was determined
+	// ("Spec" when spec.harness.universeDomain is set, "Discovered" when read
+	// from the GKE metadata server). Absent alongside ResolvedUniverseDomain.
+	// +optional
+	UniverseDomainSource string `json:"universeDomainSource,omitempty"`
+
 	// ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age,
 	// in seconds, when the A2A provision Job last found it longer than this
 	// operator creates the stream with (0 when the stream has no age limit).
 	// It is absent when the stream is no longer than that, or before a report.
-	// Provisioning never edits an existing stream, so one an older operator
+	// Provisioning never changes an existing stream's max age, so one an older operator
 	// created longer, or one edited by hand, can keep submissions longer than
 	// this operator would, and the dispatcher is told the longer of the two
 	// (up to a year): a finished task's tombstone has to outlive its
@@ -2798,6 +2971,121 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+}
+
+// BusMigrationRetry is one retry of a Failed bus migration run: when it was
+// asked for, and the failure it retried.
+type BusMigrationRetry struct {
+	// At is when the retry was asked for.
+	At metav1.Time `json:"at"`
+	// FailedIn is the phase the retried attempt failed in.
+	FailedIn string `json:"failedIn"`
+	// Cause is why the retried attempt failed.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+}
+
+// BusMigrationStatus is one migration of the A2A bus between one NATS server
+// and three.
+type BusMigrationStatus struct {
+	// Leg is the direction: OneToThree (snapshot and restore, behind a write
+	// freeze) or ThreeToOne (in place).
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	Leg string `json:"leg"`
+
+	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+	// principals.
+	RunID string `json:"runID"`
+
+	// Phase is where the migration is. Done converted the bus with its data;
+	// Abandoned left it at its old count with its data; Failed stopped where
+	// a person has to act, and Message says what.
+	Phase string `json:"phase"`
+
+	// Abandoning is set once the migration is on its way back to the old
+	// count.
+	// +optional
+	Abandoning bool `json:"abandoning,omitempty"`
+
+	// StartedAt is when the migration began.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Deadline is the deadline of the stretch the run is on: when an
+	// unfinished phase counts as failed, and when the migration's bus
+	// credentials stop working. Its Jobs stop a few minutes before it. A
+	// run that turns back gets one fresh deadline for its way back
+	// (ForwardDeadline keeps the first), and a retry another.
+	Deadline metav1.Time `json:"deadline"`
+
+	// Message is the manual step a Failed migration names.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Cause is why the run turned back: the phase that failed, and whether
+	// it was still running at Deadline. Set at the first failure and kept
+	// until a retry, which moves it into Retries.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+
+	// ForwardDeadline is the deadline the run went forward under, kept once
+	// it turned back and Deadline became its way back's.
+	// +optional
+	ForwardDeadline *metav1.Time `json:"forwardDeadline,omitempty"`
+
+	// PhaseDeadline is a deadline the current phase has of its own, shorter
+	// than Deadline, which applies as well: the one to three leg's
+	// Converting phase has 15 minutes to get three servers Ready, since the
+	// bus is write-frozen and its only copy is on the staging claim while it
+	// waits. Unset in every other phase.
+	// +optional
+	PhaseDeadline *metav1.Time `json:"phaseDeadline,omitempty"`
+
+	// FailedIn is the phase a Failed run failed in. A run that failed inside
+	// the one to three leg's write freeze keeps the freeze, with its
+	// snapshot, until a person retries it or gives it up, each with an
+	// annotation on the PlatformAgent naming this run (the A2ABusMigrating
+	// condition says which). A Failed run blocks any new migration until
+	// then.
+	// +optional
+	FailedIn string `json:"failedIn,omitempty"`
+
+	// Retries records each retry of a Failed run, oldest first, at most
+	// three.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	Retries []BusMigrationRetry `json:"retries,omitempty"`
+
+	// GivenUp is set when a person gave a Failed run up: its freeze is
+	// lifted, and streams it did not put back are recreated empty.
+	// +optional
+	GivenUp bool `json:"givenUp,omitempty"`
+
+	// Cleared lists the provisioned streams the latest Clearing phase has
+	// deleted, ahead of the conversion or of the rollback after a failed
+	// restore (a failed conversion rolls back on the forward clear's
+	// record). A restore starts only once it names every one.
+	// +optional
+	Cleared []string `json:"cleared,omitempty"`
+
+	// FreezeConfirmed is set once every callout replica serves the write
+	// freeze's identity map, and only then does the bus render without its
+	// static application users and restart into the freeze.
+	// +optional
+	FreezeConfirmed bool `json:"freezeConfirmed,omitempty"`
+
+	// Warnings are what the restore found and restored anyway: a stream
+	// lacking a subject a fresh install has, or a field outside the
+	// restore's policy that differs from a fresh install. Together they are
+	// reported once, in one Warning Event. At most 4 KiB of them; the last says
+	// how many more there were.
+	// +optional
+	Warnings []string `json:"warnings,omitempty"`
+
+	// ObservedGeneration is the PlatformAgent generation that started this
+	// migration. A migration that ended without converting is not started
+	// again until busReplicas asks for another count, or the
+	// bus-migration-start annotation names the run.
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
@@ -2810,8 +3098,9 @@ type AgentStatus struct {
 // SessionsTotal, ChatSessionsTotal, RemediationsProposedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
 // ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
-// plugin's and, on a next install, the A2A gateway's metrics
-// listeners, and the six proposal readings (RemediationsMergedTotal,
+// plugin's and the A2A gateway's metrics
+// listeners, InputTokensTotal, OutputTokensTotal and SpendMicrosUSDTotal from
+// the inference gateway's (LiteLLM's), and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
 // ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
 // the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
@@ -2826,8 +3115,8 @@ type AgentUsageStatus struct {
 	// delivered (its k8s_event_watcher_triage_sessions_total; a session
 	// whose inject was filtered, suppressed or failed is not counted) plus
 	// the chat conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus the
-	// A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total). A
 	// chat conversation that resumes after the session store's retention
 	// window (seven days by default) counts again. Read every five minutes
 	// and kept monotonic across restarts, like toolExecutionsTotal.
@@ -2836,9 +3125,9 @@ type AgentUsageStatus struct {
 
 	// ChatSessionsTotal is the chat half of SessionsTotal: the chat
 	// conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus
-	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
-	// install), without the event watcher's triage sessions. A re-seed from
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total), without the event watcher's
+	// triage sessions. A re-seed from
 	// a status that carries no chatSessionsTotal (an install with triage
 	// sessions and no chat yet, or a served CRD that holds the field back)
 	// seeds those triage sessions into the chat half, and the counter keeps
@@ -2923,8 +3212,8 @@ type AgentUsageStatus struct {
 	// does. Read every five minutes from the chat_metrics plugin's
 	// kubeagents_chat_messages_inbound_total on the platform-agent container
 	// of the gateway pod that runs Hermes (above one replica, the leader
-	// alone), summed across the pods that have led, and, on a next-mode
-	// install, from the A2A gateway's
+	// alone), summed across the pods that have led, and from the A2A
+	// gateway's
 	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
 	// ingress is that gateway's there; kept monotonic the same way as
 	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
@@ -2977,10 +3266,10 @@ type AgentUsageStatus struct {
 	// connection error, the gateway timeout) or a provider authentication
 	// failure, counted by the chat_metrics plugin's
 	// kubeagents_chat_turns_errored_total on the gateway pod that runs
-	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// Hermes; and an A2A task that ended failed or
 	// rejected, read from the A2A gateway's
 	// kubeagents_a2a_gateway_task_terminals_total under those two states.
-	// That family carries no platform, so on next it counts every A2A task's
+	// That family carries no platform, so it counts every A2A task's
 	// terminal, a door's program-to-program task included, not chat alone;
 	// rejected is a task the executor refused, counted as the design asks.
 	// Read every five minutes and kept monotonic the same way as
@@ -3012,7 +3301,7 @@ type AgentUsageStatus struct {
 	// counts again, and a reaction before the first inbound message after a
 	// start is not counted), into the chat_metrics plugin's
 	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
-	// reaction events. On a next-mode install the A2A gateway's
+	// reaction events. The A2A gateway's
 	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
 	// it: one count each time a verified sender's rating of one of its
 	// answers becomes Bad answer, so a repeated tap adds nothing. Read every
@@ -3026,11 +3315,42 @@ type AgentUsageStatus struct {
 	// so a repeated tap adds nothing:
 	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
 	// over its other labels; read every five minutes and kept monotonic the
-	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
-	// install this stays at 0. Does not move LastActiveTime: the message the
+	// same way as ToolExecutionsTotal. The Hermes gateway counts no thumbs-up,
+	// so only ratings through the A2A gateway move it. Does not move LastActiveTime: the message the
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
+	// InputTokensTotal is the cumulative count of prompt tokens the inference
+	// gateway (LiteLLM) billed for the install's model calls, every model and
+	// every caller together. Read every five minutes from each LiteLLM pod's
+	// litellm_input_tokens_metric_total (or litellm_input_tokens_metric on a
+	// release that names it so), summed over its labels and across pods, and
+	// kept monotonic the same way as ToolExecutionsTotal, so a LiteLLM restart,
+	// which starts the pod's own counter at zero again, does not reset it. A
+	// per-poll delta ceiling sized for tokens applies, far above the one the
+	// other counters take. Does not move LastActiveTime: memory consolidation
+	// and the scheduled jobs bill through LiteLLM with nobody asking. Absent
+	// while the served CRD predates it.
+	// +optional
+	InputTokensTotal int64 `json:"inputTokensTotal,omitempty"`
+	// OutputTokensTotal is the cumulative count of completion tokens the
+	// inference gateway billed for the install's model calls: LiteLLM's
+	// litellm_output_tokens_metric_total (or litellm_output_tokens_metric),
+	// read, summed and kept monotonic as InputTokensTotal is. Does not move
+	// LastActiveTime. Absent while the served CRD predates it.
+	// +optional
+	OutputTokensTotal int64 `json:"outputTokensTotal,omitempty"`
+	// SpendMicrosUSDTotal is the cumulative spend the inference gateway
+	// attributes to the install's model calls, in micro-dollars (one USD is
+	// 1,000,000 micros), so the field stays an integer: LiteLLM's
+	// litellm_spend_metric_total (or litellm_spend_metric), a dollar figure
+	// LiteLLM computes from its own price map, summed over its labels, scaled
+	// and rounded to micros before it is folded, and kept monotonic as
+	// InputTokensTotal is. A model LiteLLM has no price for adds nothing here
+	// while its tokens still count above. Does not move LastActiveTime. Absent
+	// while the served CRD predates it.
+	// +optional
+	SpendMicrosUSDTotal int64 `json:"spendMicrosUSDTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -3069,13 +3389,13 @@ type AgentUsageStatus struct {
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
-	// wrote on the chat platform it serves within the last 7 days:
+	// wrote on the chat platforms it serves within the last 7 days:
 	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
-	// chat platform the install enables is served through Hermes (Google Chat
-	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// chat platform the install enables is served through Hermes (Microsoft
+	// Teams), and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional
@@ -3213,8 +3533,9 @@ type AgentUsageStatus struct {
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
 	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
-	// was, and the six proposal readings never move it.
+	// NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
+	// totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
+	// leave it where it was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

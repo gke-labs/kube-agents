@@ -7,10 +7,12 @@
 > 2026-11-06, and the verifier findings block and run in the hourly pool-state scan. The flip on
 > 2026-11-06 moved the three APIs into `REQUIRED_APIS` and section 1's enable block and made the
 > findings blocking; sections 1, 4 and 8 keep the original plan as history. On 2026-11-06
-> `post-kube-agents-eval-rc` (GoogleCloudPlatform/oss-test-infra#2774) and the two Argon smoke
+> `post-kube-agents-eval-rc` (GoogleCloudPlatform/oss-test-infra#2774) and the two newer-model smoke
 > presubmits `pull-kube-agents-smoke-test` and `-today` (GoogleCloudPlatform/oss-test-infra#2775)
-> moved the same way, so "Presubmits stay on Vertex" below is history too: only the Claude and
-> Flash smoke jobs and the forge smoke variants stay on Vertex AI. One item stays open: the
+> moved the same way, so "Presubmits stay on Vertex" below is history too. Since then each
+> lane reads its provider and model from the build cluster's eval-model Secret
+> (`docs/ci-pool-projects.md` 5.10), and a Prow job without them stops at the deploy instead of
+> falling through to the scripts' default. One item stays open: the
 > version key does not carry the serving provider (#4932). The one precondition that could
 > have made the design moot was probed on 2026-11-04 (see "What the probe showed").
 
@@ -20,7 +22,7 @@ The nightly eval periodics grade `main` against the catalog every night. Their a
 calls go through LiteLLM to Vertex AI, and the Vertex project is at Tier 0, so the nightly is
 rate-limited on the very thing it measures. The team's Gemini Developer API access is at Tier 3,
 and the tier comes from the billing account every eval pool project shares, so an API key minted
-in any pool project carries Tier 3 limits: on `gemini-4-argon`, 10,000 requests and 20,000,000
+in any pool project carries Tier 3 limits: on the nightly's model, 10,000 requests and 20,000,000
 input tokens per minute, per project.
 
 This change moves the nightly agent's model calls to the Gemini Developer API, with one API key
@@ -31,7 +33,7 @@ it is. Presubmits stay on Vertex.
 
 The evals ran on the Developer API before. On 2026-09-02 every smoke run went red on 429s: the
 single shared key's fixed Tier 3 quota was 8,000,000 input tokens per minute for
-`gemini-3.1-pro`, and five concurrent builds drawing ~94k-token turns shared one minute window
+the model then in use, and five concurrent builds drawing ~94k-token turns shared one minute window
 (#1097; the diagnosis is on #1184). The move to Vertex was the fix, because Vertex's dynamic
 shared quota had no fixed wall. Vertex is now the wall.
 
@@ -55,9 +57,9 @@ Creating the key was refused until the operator held `roles/serviceusage.apiKeys
 projects' only human owners are the pool owners, and the folder roles the operator holds
 (`folderAdmin`, `folderEditor` on folder `564593885529`, which holds the whole pool) do not carry
 it. With `apiKeysAdmin` and `secretmanager.admin` granted at that folder, a key restricted to
-`generativelanguage.googleapis.com` was created, `models/gemini-4-argon` answered `models.get`
+`generativelanguage.googleapis.com` was created, the nightly's model answered `models.get`
 (input limit 1,048,576 tokens) and `generateContent` with a 200, and the project's quota table
-lists the paid-tier buckets for `gemini-4-argon`: tier 3 at 20,000,000 input tokens and 10,000 requests per minute,
+lists its paid-tier buckets: tier 3 at 20,000,000 input tokens and 10,000 requests per minute,
 tier 2 at 8,000,000, with the free-tier buckets absent, as a billed project's are. The quota
 listing names every tier's limit, not which tier the project is in; that is read once per pool
 project in AI Studio's rate-limit page, and the first night's 429 count is the proof that matters.
@@ -82,11 +84,11 @@ folder-level grants above give for every pool project. The repair section names 
 - The judge. It keeps the shared key from the job env (`JUDGE_API_KEY` in `hack/ci-eval-pr.sh`)
   and is pinned independently of the agent; nothing here touches its serving path.
 - The presubmits. They stayed on Vertex for this design; they had the same Tier 0 problem and
-  were the follow-on the per-project keys made possible. The two Argon smoke presubmits moved on
+  were the follow-on the per-project keys made possible. The two newer-model smoke presubmits moved on
   2026-11-06 (see the status above).
-- The model. `gemini-4-argon` stays; `MODEL_DEFAULT_NAME` and `AGENT_MODEL_OVERRIDE` do not
+- The model. The nightly's model stays; `MODEL_DEFAULT_NAME` and `AGENT_MODEL_OVERRIDE` do not
   change on the jobs that export them. `ci-kube-agents-eval-nightly-gitlab-next` exports
-  neither and so runs the deploy's default, `gemini-3.1-pro-preview`; the job-env change gives it
+  neither and so runs the deploy's default; the job-env change gives it
   the same two exports as its siblings, so every nightly agrees on the model.
 - The evidence-store version key. It names the agent model, the judge, and the harness, not the
   serving path, and none of those change. Nights after the switch pool with nights before it in
@@ -234,8 +236,8 @@ project, and the share of cached input tokens, come from the project's own usage
 Monitoring's quota usage for the Generative Language API, and AI Studio's usage page for the
 project, both of which report per minute. The expected result is zero 429s and a peak minute well
 under 20M for every leased project. If the peak minute is within a factor of two of the wall,
-parallelism comes down before anything else is tried. The three numbers go on the issue that
-tracks the move, beside the last Vertex night's.
+parallelism comes down before anything else is tried. The three numbers go on the dashboard digest; the
+issue that tracks the move names the night and its build id.
 
 ### 8. Documentation
 

@@ -236,8 +236,9 @@ SCHEMA_VERSION = 1
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
-# cluster default gs://kube-agents-prow the RC lane logs to (the presubmit
-# has its own as well): the nightly runs as an identity that cannot write that one (night one
+# cluster default gs://kube-agents-prow (the presubmit has its own as well,
+# and the RC lane moves from the cluster default into that one, under
+# logs/): the nightly runs as an identity that cannot write that one (night one
 # died in initupload on a 403), so its job overrides the bucket and
 # github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
 # differs; Prow's path strategy still puts a periodic under logs/<job>/.
@@ -279,6 +280,17 @@ DEFAULT_NIGHTLY_WRITERS_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITER
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
+# The Slack lane's nightly (oss-test-infra: ci-kube-agents-eval-nightly-slack)
+# writes the night's Slack overhead (hack/slack-lane/overhead.py) into its
+# artifacts; slack_overheads_from_gcs reads the newest SLACK_OVERHEAD_NIGHTS of
+# them into data.json's slack_overhead (SCHEMA.md), which nightly.py turns into
+# each case's estimated end-to-end Slack time (slack_estimate.py). Read only
+# with --slack-lane-prefix, and carried forward from --merge-with's file.
+SLACK_LANE_JOB = "ci-kube-agents-eval-nightly-slack"
+SLACK_LANE_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{SLACK_LANE_JOB}/"
+SLACK_OVERHEAD_FILE = "artifacts/slack-lane/slack-overhead.json"
+SLACK_OVERHEAD_NIGHTS = 14
+SLACK_OVERHEAD_KEYS = ("delivery_lag_s", "post_s", "first_ack_p50_s", "first_ack_p95_s")
 # Where Prow's Spyglass shows a build directory (links.py).
 SPYGLASS_VIEW = links.SPYGLASS_VIEW
 # What `gcloud storage ls` says about a prefix that exists but holds nothing
@@ -575,8 +587,10 @@ _FINAL_VERDICT = re.compile(
 #   Tier:        nightly
 #   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
-# The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
-# or BUILD_ID), so it is optional here. The whole banner is absent when the
+# The Artifacts line is the Console's bucket browser instead for a build in a
+# private bucket (links.py); either way it is one token, taken as it is. It
+# is absent when the driver ran outside Prow (no JOB_NAME or BUILD_ID), so it
+# is optional here. The whole banner is absent when the
 # driver exited on one of its early guards, which build_release reports as a
 # release with no verdict rather than dropping -- a resolver that has been
 # broken for a month must not read as a month with no releases.
@@ -1686,6 +1700,38 @@ def _gcs_reader(base: str, gcloud: str):
     return reader
 
 
+def slack_overheads_from_gcs(gcloud: str = DEFAULT_GCLOUD, prefix: str = SLACK_LANE_PREFIX,
+                             limit: int = SLACK_OVERHEAD_NIGHTS, known: frozenset = frozenset()) -> list[dict]:
+    """The Slack lane's recorded overhead per build, newest first: ``{build_id, date, ...}``
+    with SLACK_OVERHEAD_KEYS. A build with no overhead file, one that records an error, or
+    no lane at all yields nothing, so the pages stay quiet until the lane runs. A build in
+    ``known`` (already in the prior data.json) is not read again."""
+    listing = _gcloud_storage(["ls", prefix], gcloud)
+    out = []
+    newest = sorted(_build_dirs(listing or ""), key=lambda b: int(b[0]), reverse=True)[:limit]
+    for build_id, base in [(b, base) for b, base in newest if b not in known]:
+        read = _gcs_reader(base, gcloud)
+        started, text = _started_at(read("started.json")), read(SLACK_OVERHEAD_FILE)
+        try:
+            doc = json.loads(text) if started and text else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and "error" not in doc:
+            # Dated as the nightlies are (nightly.night_day), so it meets its own night.
+            day = nightly.night_day(started)
+            out.append(_slack_overhead_entry(build_id, day.isoformat(), doc))
+    return out
+
+
+def _slack_overhead_entry(build_id: str, date, doc: dict) -> dict:
+    """One slack_overhead entry, each SLACK_OVERHEAD_KEYS value a finite number or None:
+    json.loads accepts NaN and Infinity, and json.dumps would write them into the inlined
+    page, where JSON.parse refuses them (trend._mean's rule)."""
+    def finite(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+    return {"build_id": build_id, "date": date, **{k: finite(doc.get(k)) for k in SLACK_OVERHEAD_KEYS}}
+
+
 def records_location(base: str) -> bool:
     """Whether a run read from `base` carries `gcs_base`: only for a bucket
     Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
@@ -2078,31 +2124,51 @@ def releases_from_gcs(
     release is final (build_release records nothing without a finished.json),
     so re-reading one buys nothing and costs three gcloud storage calls.
     """
-    releases = []
+    # Every glob is listed before anything is read, and the trim to `limit`
+    # is taken across them all, by build id: it is the same trim the caller
+    # applies to releases[] (collect's rc_limit), so a build the caller would
+    # drop is never read. Trimming each glob on its own would re-read, on
+    # every tick, the old bucket's builds that the newer bucket's had already
+    # pushed out of releases[].
+    dirs = []
     for glob in rc_globs:
-        listing = _gcloud_storage(["ls", glob], gcloud)
+        listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
-            print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
+            # An empty prefix is the lane's archive before its first build
+            # lands there, or the old one once its builds are reaped: a
+            # note, not a failed listing.
+            if _NO_OBJECTS.search(stderr or ""):
+                print(f"note: {glob}: no release-candidate builds listed", file=sys.stderr)
+            else:
+                print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        dirs = sorted(_build_dirs(listing), key=lambda d: int(d[0]), reverse=True)
-        if len(dirs) > limit:
-            print(
-                f"note: {glob}: {len(dirs)} release-candidate builds listed,"
-                f" reading the newest {limit}",
-                file=sys.stderr,
-            )
-            dirs = dirs[:limit]
-        dirs = [d for d in dirs if d[0] not in known]
-        for build_id, line in dirs:
-            try:
-                release = build_release(build_id, _gcs_reader(line, gcloud))
-            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
-                print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
-                continue
-            if release is None:
-                print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
-                continue
-            releases.append(release)
+        dirs.extend(_build_dirs(listing))
+    dirs = sorted(dirs, key=lambda d: int(d[0]), reverse=True)
+    if len(dirs) > limit:
+        print(
+            f"note: {len(dirs)} release-candidate builds listed under {len(rc_globs)} prefix(es),"
+            f" reading the newest {limit}",
+            file=sys.stderr,
+        )
+        dirs = dirs[:limit]
+    dirs = [d for d in dirs if d[0] not in known]
+    releases = []
+    for build_id, line in dirs:
+        try:
+            release = build_release(build_id, _gcs_reader(line, gcloud))
+        except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+            print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
+            continue
+        if release is None:
+            print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
+            continue
+        # Where the build lives, by the same rule as runs[] (SCHEMA.md,
+        # releases[].gcs_base): only for a bucket Deck cannot read, so the
+        # Brief's row links the Console; a release in the old bucket
+        # keeps its Spyglass artifacts_url, which still renders it.
+        if records_location(line):
+            release["gcs_base"] = line
+        releases.append(release)
     return releases
 
 
@@ -2455,6 +2521,7 @@ def collect(
     gitlab_nightly_prefix: str | None = None,
     lane_globs: dict[str, list[str]] | None = None,
     lane_nightly_prefixes: dict[str, list[str]] | None = None,
+    slack_lane_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2559,6 +2626,7 @@ def collect(
     # their own schedules, so one watermark per tier would skip the slower
     # job's builds once the faster one is past them.
     lane_after: dict[tuple[str, str | None, bool], int | None] = {}
+    prior_data: dict | None = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gcloud)
         if prior_data is not None:
@@ -2847,6 +2915,15 @@ def collect(
         # Trimmed as well as read-bounded: without this the carried-forward
         # list grows without limit as the RC archive does.
         data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
+    # The Slack lane's overhead, newest first: this scan's read merged over the
+    # prior file's by build, so a failed read keeps what was there.
+    prior_overhead = (prior_data or {}).get("slack_overhead")
+    known = [_slack_overhead_entry(o["build_id"], o.get("date"), o) for o in prior_overhead if isinstance(o, dict)
+             and isinstance(o.get("build_id"), str) and o["build_id"].isdecimal()] if isinstance(prior_overhead, list) else []
+    fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix, known=frozenset(o["build_id"] for o in known)) if slack_lane_prefix else []
+    by_build = {o["build_id"]: o for o in known} | {o["build_id"]: o for o in fresh}
+    if by_build:
+        data["slack_overhead"] = sorted(by_build.values(), key=lambda o: int(o["build_id"]), reverse=True)[:SLACK_OVERHEAD_NIGHTS]
     return data
 
 
@@ -3003,6 +3080,16 @@ def main(argv: list[str] | None = None) -> int:
         " job, on a watermark of their own",
     )
     parser.add_argument(
+        "--slack-lane-prefix",
+        nargs="?",
+        const=SLACK_LANE_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also read the Slack lane's per-night overhead (slack-overhead.json) from this"
+        f" Prow log prefix into slack_overhead. Given without a value: {SLACK_LANE_PREFIX}."
+        " Omitted: none read, and --merge-with's list is carried forward",
+    )
+    parser.add_argument(
         "--nightly-writers-c-prefix",
         nargs="?",
         const=DEFAULT_NIGHTLY_WRITERS_C_PREFIX,
@@ -3025,7 +3112,9 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="GS_GLOB",
-        help="gs:// glob of release-candidate build dirs, e.g."
+        help="gs:// glob of release-candidate build dirs:"
+        " gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*"
+        " (the lane's bucket) and, for the builds from before it moved there,"
         " gs://kube-agents-prow/logs/post-kube-agents-eval-rc/* . Collected"
         " into releases[], never into runs[]: a candidate is judged against"
         " main's window, not added to it (repeatable)",
@@ -3137,6 +3226,7 @@ def main(argv: list[str] | None = None) -> int:
         gcloud=args.gcloud,
         gh=args.gh or None,
         merge_with=args.merge_with,
+        slack_lane_prefix=args.slack_lane_prefix,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
         index_prefix=args.index_prefix,

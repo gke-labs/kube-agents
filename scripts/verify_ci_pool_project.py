@@ -540,14 +540,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -564,6 +564,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -573,9 +576,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings."""
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -591,6 +595,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
+    "stockout-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -598,6 +603,7 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+    ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
 )
 # checkout-gateway's declaration, which provisioning seeds beside the note
 # (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
@@ -700,13 +706,18 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
-# What this script's probe mint asks for: the same three reads the eval's
+# What this script's probe mint asks for: the same four reads the eval's
 # grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
 # holds the two equal). An omitted body would mint the installation's whole
 # grant, which includes issues: write (2026-09-22, the ledger reset) and
 # pull_requests and contents write (2026-10-01, the repository reset) on every
 # pool repository; a read probe has no business holding that.
-LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
+LEDGER_READ_PERMISSIONS = {
+    "issues": "read",
+    "pull_requests": "read",
+    "contents": "read",
+    "metadata": "read",
+}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -815,11 +826,9 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # GEMINI_KEY_ACCESSOR_ROLE on it.
 GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
 # Every finding check_gemini_api_key emits. None is lease-silent: the health
-# bot classes a run that leased a project with one as the pool's. The runs that
-# export MODEL_PROVIDER=gemini read the key: the five eval nightlies, the RC
-# postsubmit and the two Argon smoke presubmits (pull-kube-agents-smoke-test
-# and -today). pull-kube-agents-smoke-test-claude, -flash and the forge smoke variants
-# stay on Vertex AI and do not read it. A missing secret or accessor grant
+# bot classes a run that leased a project with one as the pool's. The runs whose
+# eval-model pair names provider gemini read the key (docs/ci-pool-projects.md
+# 5.10); a lane whose pair names vertex_ai does not. A missing secret or accessor grant
 # stops hack/ci-deploy.sh at its FATAL line before Helm; a restriction finding,
 # or a key deleted while its secret remains, fails at the first agent call.
 GEMINI_KEY_FINDINGS = frozenset(
@@ -837,9 +846,10 @@ GEMINI_KEY_FINDINGS = frozenset(
 PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 
 # The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
-# ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
-# subnets, addresses and alert policies that a killed run left in a free
-# project. It holds one project-level custom role with exactly
+# ci-kube-agents-compute-sweep on main) lists and deletes the plant clusters,
+# forwarding rules, service attachments, backend services, health checks,
+# networks, subnets, addresses and alert policies that a killed run left in a
+# free project. It holds one project-level custom role with exactly
 # COMPUTE_SWEEP_PERMISSIONS, and nothing else on the project.
 # roles/compute.networkAdmin also covers the sweep, but it holds almost a
 # thousand permissions. A project without the grant fails every
@@ -886,6 +896,38 @@ COMPUTE_SWEEP_PERMISSIONS = frozenset({
     # list repairs it (docs/ci-pool-projects.md section 5.7).
     "monitoring.alertPolicies.list",
     "monitoring.alertPolicies.delete",
+    # `gcloud container clusters list`, and `clusters delete --async` for a
+    # cluster labelled managed-by=kube-agents-bench. No container.operations.get:
+    # with --async gcloud returns before any operation read.
+    "container.clusters.list",
+    "container.clusters.delete",
+    # `gcloud compute forwarding-rules list` (an aggregated list; both scopes
+    # held so a global plant rule cannot hide in a partial list), and
+    # `forwarding-rules delete --region` or `--global`. A PSC consumer
+    # endpoint (a rule whose target is a service attachment) is deleted under
+    # pscDelete, a producer rule under delete.
+    "compute.forwardingRules.list",
+    "compute.forwardingRules.delete",
+    "compute.forwardingRules.pscDelete",
+    "compute.globalForwardingRules.list",
+    "compute.globalForwardingRules.delete",
+    "compute.globalForwardingRules.pscDelete",
+    # `gcloud compute service-attachments list`, and `service-attachments
+    # delete --region` (regional only).
+    "compute.serviceAttachments.list",
+    "compute.serviceAttachments.delete",
+    # `gcloud compute backend-services list` (aggregated), and
+    # `backend-services delete --region` or `--global`.
+    "compute.backendServices.list",
+    "compute.backendServices.delete",
+    "compute.regionBackendServices.list",
+    "compute.regionBackendServices.delete",
+    # `gcloud compute health-checks list` (aggregated), and `health-checks
+    # delete --region` or `--global`.
+    "compute.healthChecks.list",
+    "compute.healthChecks.delete",
+    "compute.regionHealthChecks.list",
+    "compute.regionHealthChecks.delete",
 })
 
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
@@ -1020,6 +1062,8 @@ FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-pr
 FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    # The reconcile's reset of that VM needs compute.instances.reset, which
+    # this role also grants.
     "roles/compute.instanceAdmin.v1",
     # loadBalancerAdmin: the stack plants a backend service and a health check on the
     # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs
@@ -1245,7 +1289,7 @@ _UNREAD_PATTERNS = (
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs eight projects at once, and one wave of 429s would read
+    # the scan runs ten projects at once, and one wave of 429s would read
     # as several drifted. gRPC's retryable statuses, as gcloud prints them
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.
@@ -1763,8 +1807,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
     # hack/ci-deploy.sh's per-lease helm upgrade annotates the
     # kubeagents-litellm KSA with this GSA, so a project missing the pair
-    # reds every run on Vertex AI that leases it (the Claude and Flash smoke
-    # jobs and the forge smoke variants) at the deploy's model-call gate (#1097).
+    # reds every run on Vertex AI that leases it (the lanes whose eval-model pair
+    # names vertex_ai, docs/ci-pool-projects.md 5.10) at the deploy's model-call gate (#1097).
     litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -4027,7 +4071,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
     pins, whatever the App is granted.
     """
 

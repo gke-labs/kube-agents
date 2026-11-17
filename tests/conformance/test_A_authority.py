@@ -14,6 +14,9 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import email.message
+import types
 import re
 import textwrap
 import unittest
@@ -355,8 +358,7 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
 
     The first is darkness: with the operator's flag unset, the rendered object
     set contains no inject Service, no inject env on the gateway and no inject
-    NetworkPolicy. The same rule `mode: next` follows, and asserted the same
-    way -- audited rather than commented. The operator's own tests assert the
+    NetworkPolicy -- audited rather than commented. The operator's own tests assert the
     rendered objects; what this adds is that the flag cannot come from a
     `PlatformAgent`, which is a cross-module claim about where the switch
     lives.
@@ -473,6 +475,56 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
+        # A report credential (#5619) is the one task credential with no
+        # target. Its verdict is task_credential's, pinned by the golden
+        # fixtures in the Python suite (that module needs `cryptography`, which
+        # this suite doesn't import); this is the handler's gate on what an
+        # admitted one may reach, driven through _admit_task with a gate that
+        # admits a stand-in for it.
+        cp = h.credential_proxy
+        report_task = types.SimpleNamespace(report_only=True)
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        class AdmitsAReportCredential:
+            def admit(self, principal, token):
+                return dataclasses.replace(principal, task=report_task, task_target=None)
+
+        def admit(method: str, path: str) -> tuple[bool, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = email.message.Message()
+            handler.headers[cp.TASK_CREDENTIAL_HEADER] = "a-report-credential"
+            handler.command, handler.path = method, path
+            handler.profile_gate = AdmitsAReportCredential()
+            replies: list = []
+            handler._json = lambda status, body: replies.append((status, body))
+            return handler._admit_task(principal), replies
+
+        for method, path in (
+            ("POST", "/v1/exec"),
+            ("POST", h.mcp_policy.MCP_RELAY_PREFIX + "gke"),
+            ("GET", cp.API_RELAY_PREFIX + "projects/proj-a"),
+            ("POST", "/v1/vcs/issue-view"),
+            ("GET", "/v1/a-route-added-later"),
+            ("PUT", "/v1/audit-reports/a/%2e%2e/latest"),
+        ):
+            with self.subTest(method=method, path=path):
+                admitted, replies = admit(method, path)
+                self.assertFalse(admitted)
+                self.assertEqual(cp.RULE_REPORT_CREDENTIAL_ROUTE, replies[0][1]["rule"])
+        admitted, replies = admit("GET", "/v1/audit-reports/compliance-audit/acme%2Fgitops/latest")
+        self.assertTrue(admitted, replies)
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            with self.subTest(pattern=pattern.pattern):
+                self.assertIn(method, ("GET", "PUT", "DELETE"))
+                self.assertTrue(pattern.pattern.startswith(cp.AUDIT_REPORTS_PREFIX), pattern.pattern)
+        # The MCP relay, which the gate already closes, reads it as no task too.
+        decision, _ = cp.mcp_relay_decision(
+            dataclasses.replace(principal, task=report_task), "developer_knowledge",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_documents"}},
+        )
+        self.assertFalse(decision.allowed)
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
@@ -663,7 +715,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
 
 
 class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
-    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    """A3 on the gateway's Slack backend: the allowlist is the
     admission gate, and the principal is either the IdP identity the admin's
     map joins to the member id, or the member id Slack asserted, qualified
     `slack:`.  The map is an override and not a gate, so three things carry
@@ -731,9 +783,10 @@ RBAC_GROUP = "rbac.authorization.k8s.io"
 #
 #   system:auth-delegator  built-in: tokenreviews/create and
 #                          subjectaccessreviews/create, both of which only ask
-#                          the API server questions. Bound to the mode: next
-#                          auth callout's ServiceAccount so it can validate the
-#                          tokens bus clients present.
+#                          the API server questions. Bound to the auth
+#                          callout's ServiceAccount so it can validate the
+#                          tokens bus clients present (C5 pins that binding's
+#                          name and subject).
 #
 # `view` is deliberately NOT here. The operator held bind over it until #387
 # removed the rule, and leaving the name behind would make re-adding that grant
@@ -1789,6 +1842,146 @@ class A4DelegationAttenuates(unittest.TestCase):
                     rule.get("resourceNames"),
                     "an unrestricted bind grant reached a delivery path",
                 )
+
+    def test_A4_only_cluster_administrators_write_tiers(self) -> None:
+        """A tier is authority: whoever writes one sets what tasks at it may do.
+
+        The Tier CRD (#3659) is for cluster administrators alone, so:
+
+          - no Role or ClusterRole in the goldens or in the chart's own
+            templates names `tiers`, by name or by a wildcard group, resource
+            or subresource, at any verb;
+          - the operator's RBAC, on both delivery paths (role.yaml plus the
+            leader-election Role for kustomize, operator-rbac.yaml for the
+            chart), reads tiers and writes their status, and nothing more,
+            counting wildcard rules;
+          - nothing in the chart or the operator's config aggregates a role
+            that reaches tiers into `admin`, `edit` or `view`, which would
+            hand tiers to every namespace admin by default.
+
+        Every rule read from a chart template must have plain apiGroups,
+        resources and verbs: a templated field would leave the predicate
+        reading a placeholder.
+
+        The goldens render the whole stack, so the read covers the A2A
+        gateway's and callout's Roles (buildA2AGatewayRole,
+        buildA2ACalloutRole) beside the tier roles. Not covered: the scope
+        publisher's Role (buildScopePublisherRole), rendered only while its
+        Job may run, and the dispatcher roles; no golden carries either.
+        """
+        def reaches_tiers(rule: dict) -> set[str]:
+            """The tier resources a rule reaches, wildcards included."""
+            groups = set(rule.get("apiGroups") or [])
+            if not groups & {"kubeagents.x-k8s.io", "*"}:
+                return set()
+            out = set()
+            for resource in rule.get("resources") or []:
+                if resource == "*":
+                    out |= {"tiers", "tiers/status"}
+                elif resource == "tiers" or resource.startswith("tiers/"):
+                    out.add(resource)
+                elif resource.startswith("*/"):
+                    # RBAC matches `*/<sub>` against that subresource of every
+                    # resource in the group: `*/finalizers` is tiers/finalizers.
+                    out.add("tiers/" + resource[2:])
+            return out
+
+        def rules_of(where: str, role: dict) -> list:
+            """A role's rules, refusing any whose fields a template filled in."""
+            rules = role.get("rules") or []
+            self.assertIsInstance(rules, list, f"{where}: rules is templated")
+            for rule in rules:
+                for field in ("apiGroups", "resources", "verbs"):
+                    # repr, as in the ceiling test above: a field that is one
+                    # whole expression parses as a scalar string.
+                    self.assertNotIn(
+                        h.HELM_PLACEHOLDER,
+                        repr(rule.get(field)),
+                        f"{where}: {field} is templated, so what this rule "
+                        "reaches depends on a value this parse cannot see",
+                    )
+            return rules
+
+        def template_documents(text: str) -> tuple[dict, ...]:
+            """A chart template read the way helm_documents reads one, after
+            dropping the multi-line {{/* */}} comments a line-based pass can't."""
+            text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
+            body = "\n".join(line for line in text.splitlines() if not h._HELM_DIRECTIVE.match(line))
+            return tuple(d for d in yaml.safe_load_all(h._HELM_EXPRESSION.sub(h.HELM_PLACEHOLDER, body))
+                         if isinstance(d, dict))
+
+        product_roles = []
+        goldens = dict(h.golden_documents(), golden_settled=h.yaml_documents("golden_settled"))
+        for name, documents in goldens.items():
+            for kind in ("Role", "ClusterRole"):
+                product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
+        # The settled golden is read for the A2A roles in it: losing them would
+        # leave this checking the base roles alone.
+        settled_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_settled"}
+        for a2a_role in ("platformagent-a2a-gateway", "platformagent-a2a-callout"):
+            self.assertIn(a2a_role, settled_roles, "the settled golden no longer renders the A2A roles A4 reads")
+        # The chart's own roles (the web console's, the cleanup hook's). A
+        # template that declares a role and won't parse fails here rather than
+        # being skipped, since a skipped role is an unchecked one.
+        chart_templates = h.REPO_ROOT / "charts/kube-agents/templates"
+        chart_roles = 0
+        for path in sorted(chart_templates.glob("*.yaml")):
+            text = path.read_text()
+            if path.name == "operator-rbac.yaml" or not re.search(r"^kind:\s*(Cluster)?Role\s*$", text, re.M):
+                continue
+            documents = template_documents(text)
+            for kind in ("Role", "ClusterRole"):
+                roles = h.objects_of_kind(documents, kind)
+                chart_roles += len(roles)
+                product_roles += [(path.name, role) for role in roles]
+        self.assertGreater(chart_roles, 0, "no chart role was read; the chart's templates moved")
+        checked = 0
+        for name, role in product_roles:
+            for rule in rules_of(f"{name}: {role['metadata']['name']}", role):
+                checked += 1
+                with self.subTest(source=name, role=role["metadata"]["name"], rule=rule):
+                    self.assertFalse(reaches_tiers(rule), "a product role reaches tiers")
+        self.assertGreater(checked, 0, "no product role was read; the goldens or the chart moved")
+
+        # Each delivery path read whole: the chart's operator-rbac.yaml carries
+        # the leader-election Role beside the ClusterRole, so the kustomize
+        # side reads both of the files config/rbac/kustomization.yaml ships.
+        want = {"tiers": {"get", "list", "watch"}, "tiers/status": {"get", "update", "patch"}}
+        for source, documents in (("kustomize", h.yaml_documents("operator_clusterrole")
+                                   + h.yaml_documents("operator_leader_election_role")),
+                                  ("chart_operator_rbac", h.helm_documents("chart_operator_rbac"))):
+            got: dict[str, set[str]] = {}
+            for kind in ("Role", "ClusterRole"):
+                for role in h.objects_of_kind(documents, kind):
+                    for rule in rules_of(source, role):
+                        for resource in reaches_tiers(rule):
+                            got.setdefault(resource, set()).update(rule.get("verbs") or [])
+            with self.subTest(source=source):
+                self.assertEqual(got, want, f"{source}: the operator's verbs on tiers")
+
+        # A document carrying an aggregate-to label is parsed and its rules put
+        # through reaches_tiers: a wildcard resource never spells `tiers`, so a
+        # text search for the word passes the role that matters most.
+        aggregating = re.compile(r"rbac\.authorization\.k8s\.io/aggregate-to-(admin|edit|view)")
+        roots = [h.REPO_ROOT / "charts/kube-agents/templates", h.REPO_ROOT / "k8s-operator/config"]
+        scanned = 0
+        for root in roots:
+            for path in sorted(root.rglob("*.yaml")):
+                scanned += 1
+                where = str(path.relative_to(h.REPO_ROOT))
+                for document in re.split(r"^---\s*$", path.read_text(), flags=re.M):
+                    if not aggregating.search(document):
+                        continue
+                    for parsed in template_documents(document):
+                        for kind in ("Role", "ClusterRole"):
+                            for role in h.objects_of_kind((parsed,), kind):
+                                for rule in rules_of(where, role):
+                                    with self.subTest(path=where, rule=rule):
+                                        self.assertFalse(
+                                            reaches_tiers(rule),
+                                            "a role reaching tiers aggregates into admin, edit or view",
+                                        )
+        self.assertGreater(scanned, 0)
 
     def test_A4_triggering_is_covered_by_the_A3_inject_finding(self) -> None:
         """The second half of A4 has one instance in this codebase, already named.

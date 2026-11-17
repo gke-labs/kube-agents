@@ -41,16 +41,11 @@ import (
 // file, it existed only as a sidecar the CR declared on spec.deployment.sidecars,
 // and only CI declared one (hack/ci-deploy.sh), so a stock `next` install had no
 // executor and answered nothing. The bridge is release surface now, so the
-// operator renders it beside the agent container under `next`, the way the
-// agent's other next-only wiring is rendered (a2aAgentSurface: next, and version
-// skew, where a frozen bus that is still running keeps its executor). Under
-// `today` nothing is rendered.
+// operator renders it beside the agent container on every install.
 //
 // A CR that declares its own bridge sidecar keeps it: the declared one wins and
 // the operator renders none (a2aBridgeDeclared says what counts as declared), so
-// an install that already carries one does not get two bridges. Such a declared sidecar is still
-// copied into the pod without regard to the mode, so it still crash-loops on a
-// flip to `today` (a2a/docs/hermes-bridge.md); the rendered one does not.
+// an install that already carries one does not get two bridges.
 //
 // The rendered container is the agent container with the bridge's own settings
 // on top, exactly as ci-deploy.sh built the declared one: the agent's env and
@@ -185,20 +180,31 @@ func a2aIsBridgeSidecar(c corev1.Container) bool {
 // agent: the agent carries its next-only wiring, and the CR declares no bridge
 // of its own.
 func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aAgentSurface(agent) && !a2aBridgeDeclared(agent)
+	return !a2aBridgeDeclared(agent)
 }
 
-// a2aBridgeInPod reports whether the rendered bridge is in the pod yet: it is
-// rendered, and the bus has been provisioned once (BusProvisioned). Before
-// that the bridge has no bus to connect to and no runtime-state bucket, exits,
-// and would hold the agent pod in CrashLoopBackOff through every install's
-// bring-up. Withheld until then, the way the gateway Deployment is withheld
-// until the callout serves (a2aGatewayWaitsForCallout). The TASKS budget does
-// not wait: it counts the bridge from the first render (a2aBridgeSidecars), so
-// the first provisioning Job is already sized for it and the bridge's arrival
-// does not re-render the Job.
+// a2aBridgeInPod reports whether the rendered bridge is in the pod: from the
+// first render, whether or not the bus is provisioned yet. Until it is, the
+// bridge waits for the bus and its runtime-state bucket instead of exiting
+// (waitForBus in a2a/hermes-bridge), and the agent pod is Ready meanwhile:
+// the agent's own API serves without the bus, and BusProvisioned says the bus
+// is not there yet. It used to be withheld until BusProvisioned, which put the
+// bridge in the pod template a pass after the provisioning Job and so rolled
+// the agent Deployment a second time on every fresh install (#5962). The TASKS
+// budget counts the bridge from the first render too (a2aBridgeSidecars).
+//
+// One exception, from the bus migration (#4488): a run given up has the
+// provision Job recreate, empty, the streams it did not put back, so the
+// bridge leaves the pod until the bus is provisioned again and comes back to
+// the recreated streams, rather than hold the ones the run gave up on. A run
+// in progress keeps the bridge: the streams come through it. The record goes
+// when the stack is torn down, so a later bring-up is a first render again.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent) && busProvisioned(agent)
+	if !a2aBridgeRendered(agent) {
+		return false
+	}
+	run := agent.Status.BusMigration
+	return !(run != nil && run.GivenUp && !busProvisioned(agent))
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment

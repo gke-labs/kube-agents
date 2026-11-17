@@ -22,11 +22,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -240,7 +243,23 @@ func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
 const natsConfFixturePath = "../../../a2a/authcallout/testdata/rendered-nats.conf"
 
 func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	// A single-server render: the callout suite starts one server from this
+	// file, and a cluster block would have it wait for peers that do not
+	// exist. TestTheRenderedClusterFormsOverVerifiedRoutes runs the cluster.
+	agent := authMapTestAgent()
+	if agent.Spec.Harness == nil {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	}
+	if agent.Spec.Harness.Tuning == nil {
+		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+
+	// The two values the pod supplies and a test process cannot: the server
+	// name, from the pod's env, and a pid file on the pod's data volume.
+	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-nats-0", 1)
+	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: ""`, 1)
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these
@@ -414,6 +433,39 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"7": {"account", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+}
+
+// The schema constant is the newest version the table records, and each
+// version's keys include every key of the one before it: a map shape is only
+// ever extended. Two pull requests that each claim the next number for
+// different fields meet here (or as a duplicate map key) rather than in a
+// callout that refuses the merged map.
+func TestTheIdentityMapSchemaTableOnlyGrows(t *testing.T) {
+	var versions []int
+	for v := range a2aIdentityMapSchemaKeys {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("schema version %q is not a number", v)
+		}
+		versions = append(versions, n)
+	}
+	slices.Sort(versions)
+	if got := strconv.Itoa(versions[len(versions)-1]); got != a2aIdentityMapSchema {
+		t.Errorf("a2aIdentityMapSchema is %q, but the newest version recorded is %s", a2aIdentityMapSchema, got)
+	}
+	for i := 1; i < len(versions); i++ {
+		prev, cur := a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i-1])], a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i])]
+		for _, k := range prev {
+			if !slices.Contains(cur, k) {
+				t.Errorf("schema %d drops %q, which %d had", versions[i], k, versions[i-1])
+			}
+		}
+		if len(cur) <= len(prev) {
+			t.Errorf("schema %d adds no key over %d", versions[i], versions[i-1])
+		}
+	}
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -441,14 +493,30 @@ func a2aJSONKeys(v any, into map[string]bool) {
 // read it.
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
+	// With a three-to-one run in its pin phase, so the per-run principal and
+	// its notAfter are rendered too; the run does not freeze, so the profile
+	// below is still in the map.
+	agent.Status.BusReplicas = 3
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
 
-	// With a profile that has topics, so every key the renderer can emit is
+	// With a profile that has topics, and the dispatcher's bucketed entry
+	// with a draining profile, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema
 	// and roll nothing.
-	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	auditor := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
 		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
-	})})
+	})
+	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
+		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
+	cms, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{auditor}, draining)
+	if err != nil || len(cms) != 1 {
+		t.Fatalf("rendering the auth map: %d shards, %v", len(cms), err)
+	}
+	cm := cms[0]
 	var doc any
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
 		t.Fatalf("decoding the rendered auth map: %v", err)

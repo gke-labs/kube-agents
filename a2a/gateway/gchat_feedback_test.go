@@ -111,11 +111,11 @@ func TestGchatRatedAnswerEndsWithFeedbackButtons(t *testing.T) {
 	if r := a.ratingOf(name); r.task != "t-root" || r.chosen != "" {
 		t.Errorf("ratingOf = %+v, want t-root unchosen", r)
 	}
-	a.mu.Lock()
-	kept := a.uxLocked().questions[name].layout
-	a.mu.Unlock()
-	if keptJSON, _ := json.Marshal(kept.Widgets); string(keptJSON) != string(raw) {
-		t.Errorf("the remembered question carries\n %s\nwant the layout without rating buttons\n %s", keptJSON, raw)
+	// The record is the layout as sent, rating buttons included.
+	kept, remembered, _ := a.layoutOf(name)
+	sent, _ := json.Marshal(callBody(t, f.call(0))["accessoryWidgets"])
+	if keptJSON, _ := json.Marshal(kept.Widgets); !remembered || string(keptJSON) != string(sent) {
+		t.Errorf("the record carries\n %s\nwant the layout as sent, rating buttons included\n %s", keptJSON, sent)
 	}
 }
 
@@ -206,19 +206,76 @@ func TestGchatRefusedRatedAnswerPostsWithoutTheButtons(t *testing.T) {
 	}
 }
 
-func TestGchatHomePostDrawsNoRatingButtons(t *testing.T) {
+// A post the agent made on its own in the home space carries the rating
+// buttons after its own, labelled for a post; unmarked, it carries none.
+func TestGchatHomePostDrawsRatingButtonsAfterItsOwn(t *testing.T) {
+	const post = feedbackPostAlertPrefix + "0123456789abcdef"
 	a, f, _ := newFeedbackGchatAdapter(t)
-	name, _, err := a.PostNotifyMessage("spaces/S1", "", OutMessage{Text: "x", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	name, _, err := a.PostNotifyMessage("spaces/S1", "", OutMessage{Text: "x", Chat: gchatFeedbackQuestion(), Feedback: post})
 	if err != nil {
+		t.Fatal(err)
+	}
+	buttons := bodyButtons(t, callBody(t, f.call(0)))
+	if len(buttons) != 5 || classifyGchatButton(buttons[2]) == gchatButtonRating {
+		t.Fatalf("buttons = %+v, want the 3 drawn then 2 rating", buttons)
+	}
+	for i, want := range []string{"Useful", "Not useful"} {
+		b := buttons[3+i]
+		if classifyGchatButton(b) != gchatButtonRating || b.AltText != want || buttonParams(b)["task"] != post {
+			t.Errorf("rating button %d = %+v, want %q for %s", i, b, want, post)
+		}
+	}
+	if r := a.ratingOf(name); r.task != post {
+		t.Errorf("ratingOf(home post) = %+v", r)
+	}
+
+	a, f, _ = newFeedbackGchatAdapter(t)
+	if _, _, err := a.PostNotifyMessage("spaces/S1", "", OutMessage{Text: "x", Chat: gchatFeedbackQuestion()}); err != nil {
 		t.Fatal(err)
 	}
 	for _, b := range bodyButtons(t, callBody(t, f.call(0))) {
 		if classifyGchatButton(b) == gchatButtonRating {
-			t.Errorf("a home post carries a rating button: %+v", b)
+			t.Errorf("an unmarked home post carries a rating button: %+v", b)
 		}
 	}
-	if r := a.ratingOf(name); r.task != "" {
-		t.Errorf("ratingOf(home post) = %+v", r)
+}
+
+// An edit Chat refuses with the rating buttons is patched once more without
+// them, its own buttons kept, and is not remembered as rated.
+func TestGchatRefusedRatedEditKeepsItsLayout(t *testing.T) {
+	const post = feedbackPostAlertPrefix + "2"
+	a, f, _ := newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 400, reason: "too many buttons"}, map[string]any{}}
+	if err := a.EditNotifyMessage("spaces/S1", "", "spaces/S1/messages/m9", OutMessage{Text: "x", Chat: gchatFeedbackQuestion(), Feedback: post}); err != nil {
+		t.Fatal(err)
+	}
+	buttons := bodyButtons(t, callBody(t, f.call(1)))
+	if len(buttons) != 3 {
+		t.Fatalf("second patch buttons = %+v, want the 3 drawn alone", buttons)
+	}
+	if r := a.ratingOf("spaces/S1/messages/m9"); r.task != "" {
+		t.Errorf("an edit without the buttons is remembered as rated: %+v", r)
+	}
+}
+
+// A plain text home report is its text and the rating buttons, and the
+// edit that rewrites a rated home alert keeps them.
+func TestGchatHomeTextPostAndItsEditKeepTheRating(t *testing.T) {
+	const post = feedbackPostReportPrefix + "1"
+	a, f, _ := newFeedbackGchatAdapter(t)
+	name, _, err := a.PostNotifyMessage("spaces/S1", "", OutMessage{Text: "Nightly: 3 clusters healthy.", Feedback: post})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buttons := bodyButtons(t, callBody(t, f.call(0))); len(buttons) != 2 || buttonParams(buttons[0])["task"] != post {
+		t.Fatalf("buttons = %+v, want the two rating buttons", buttons)
+	}
+	if err := a.EditNotifyMessage("spaces/S1", "", name, OutMessage{Text: "x", Chat: gchatFeedbackQuestion(), Feedback: post}); err != nil {
+		t.Fatal(err)
+	}
+	buttons := bodyButtons(t, callBody(t, f.call(1)))
+	if len(buttons) != 5 || classifyGchatButton(buttons[4]) != gchatButtonRating {
+		t.Errorf("edit buttons = %+v, want the 3 drawn then the 2 rating", buttons)
 	}
 }
 
@@ -1310,13 +1367,13 @@ func TestGchatRatingPatchNeverLandsOverTheAnsweredRewrite(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		a.mu.Lock()
-		_, shown := a.uxLocked().shown[name]
+		_, rewritten := a.uxLocked().lines[name]
 		a.mu.Unlock()
-		if relayCallCount(f) >= 3 && shown {
+		if relayCallCount(f) >= 3 && rewritten {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("relay calls = %d, shown = %v; want the create, two patches and the rewrite on record", relayCallCount(f), shown)
+			t.Fatalf("relay calls = %d, rewritten = %v; want the create, two patches and the rewrite on record", relayCallCount(f), rewritten)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1508,17 +1565,14 @@ func TestGchatMessageButtonsTellTheKindsApartByFunction(t *testing.T) {
 		m.AccessoryWidgets[0].ButtonList.Buttons = buttons
 		return m
 	}
-	links, label, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root"}), 1, "fallback")
-	if len(links) != 1 || links[0].Text != "board" || links[0].URL != "https://x.example/b" {
-		t.Errorf("links = %+v, want the link alone", links)
-	}
+	label, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root"}), 1, "fallback")
 	if label != "Skip" {
 		t.Errorf("label = %q, want the choice at index 1", label)
 	}
 	if rating != (gchatRating{task: "t-root"}) {
 		t.Errorf("rating = %+v, want t-root unchosen", rating)
 	}
-	if _, _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{task: "t-root", chosen: "down"}) {
+	if _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{task: "t-root", chosen: "down"}) {
 		t.Errorf("rating with 👎 FILLED = %+v, want chosen down", rating)
 	}
 }

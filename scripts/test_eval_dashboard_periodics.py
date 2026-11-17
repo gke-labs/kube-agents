@@ -108,6 +108,7 @@ def archive(job, builds, podinfo=None, log=None):
 
 
 CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
+REPLAY_LANE = periodics.WATCHED_BY_JOB["ci-kube-agents-eval-replay-lane"]
 
 
 def archive_at(root, builds):
@@ -129,26 +130,29 @@ def finished(when, passed=True):
 
 class FetchTest(unittest.TestCase):
     def test_a_job_that_logs_beside_the_nightlies_is_read_from_its_own_bucket(self):
-        # The certification slice is decorated like the nightlies, so its
-        # builds live under EVAL_NIGHTLY_LOGS_ROOT; a read under the
-        # periodic-logs root would find nothing and the lane would be unwatched
-        # without anyone knowing.
-        root = f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT.job}"
-        # The newest build is still running (no finished.json), so the read
-        # walks back through the `ls` of the job's builds; that listing, the
-        # pointer, finished.json and the failure-cause reads must all stay
-        # under the job's own root.
-        objects = archive_at(root, {"301": None, "300": finished(NOW - timedelta(days=2), passed=False)})
-        gcloud = FakeGcloud(objects)
-        with tempfile.TemporaryDirectory() as tmp:
-            reading = periodics.fetch(pathlib.Path(tmp), watched=(CERT,), runner=gcloud)[CERT.job]
-        self.assertEqual((reading["build"], reading["passed"], reading["artifact"]), ("300", False, None))
-        self.assertIn("ls", [call[2] for call in gcloud.calls], "the walk-back listing ran")
-        self.assertTrue(all(call[-1].startswith(root) for call in gcloud.calls), gcloud.calls)
+        # The certification slice and the replay lane are decorated like the
+        # nightlies, so their builds live under EVAL_NIGHTLY_LOGS_ROOT; a read
+        # under the periodic-logs root would find nothing and the lane would be
+        # unwatched without anyone knowing.
+        for job in (CERT, REPLAY_LANE):
+            with self.subTest(job=job.job):
+                root = f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{job.job}"
+                # The newest build is still running (no finished.json), so the read
+                # walks back through the `ls` of the job's builds; that listing, the
+                # pointer, finished.json and the failure-cause reads must all stay
+                # under the job's own root.
+                objects = archive_at(root, {"301": None, "300": finished(NOW - timedelta(days=2), passed=False)})
+                gcloud = FakeGcloud(objects)
+                with tempfile.TemporaryDirectory() as tmp:
+                    reading = periodics.fetch(pathlib.Path(tmp), watched=(job,), runner=gcloud)[job.job]
+                self.assertEqual((reading["build"], reading["passed"], reading["artifact"]), ("300", False, None))
+                self.assertIn("ls", [call[2] for call in gcloud.calls], "the walk-back listing ran")
+                self.assertTrue(all(call[-1].startswith(root) for call in gcloud.calls), gcloud.calls)
         self.assertNotIn(periodics.LOGS_ROOT, "".join(call[-1] for call in gcloud.calls))
         self.assertEqual(periodics.history_url(CERT.job, CERT.logs_root), f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{CERT.job}")
         self.assertEqual(periodics.history_url(DAILY.job), f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{DAILY.job}")
         self.assertEqual(CERT.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
+        self.assertEqual(REPLAY_LANE.stale_after, timedelta(hours=36), "a daily run: one missed morning reads STALE")
 
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
         report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}
@@ -615,15 +619,17 @@ class AssessTest(unittest.TestCase):
 
     def test_a_failed_postsubmit_is_retired_once_a_later_daily_has_dealt_with_its_projects(self):
         # The postsubmit has no window to retire it. A later daily that
-        # reached the projects it failed on is the recovery; one that passed
-        # without reaching them is not; one that failed is the current story
-        # about the fleet, so the older failure is not news beside it.
+        # reached the projects it failed on is the recovery (a pass, or a run
+        # that failed elsewhere and applied them); one that passed without
+        # reaching them is not; one that failed on a build that owes a hand
+        # step, without reaching them, is the current story about the fleet,
+        # so the older failure is not news beside it.
         failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
         reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: reached})
         # The run the recovery was decided on rides with it: what the clear
         # cites, whether or not the tick that sends it read the daily.
-        by = {key: periodics.runs({DAILY.job: reached})[DAILY.job][key] for key in ("build", "finished_at", "summary")}
+        by = {key: periodics.runs({DAILY.job: reached})[DAILY.job][key] for key in ("build", "finished_at", "summary", "passed")}
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": True, "by": by}})
         self.assertEqual(by["build"], "100")
         self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}, superseded=decided), {})
@@ -660,12 +666,42 @@ class AssessTest(unittest.TestCase):
         unread = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"error": periodics.REPORT_UNREADABLE})
         self.assertEqual(periodics.superseded_jobs({POST.job: unread, DAILY.job: reached}), {})
         self.assertEqual(periodics.superseded_jobs({POST.job: self.reading(POST, NOW - timedelta(days=2), passed=False, artifact=None), DAILY.job: reached}), {})
-        # A failed daily silences the older note but is no recovery.
-        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        # A failed daily that is itself news silences the older note but is no recovery.
+        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}})
         decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed})
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": False}})
         notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {}, superseded=decided)
         self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
+        # A failed daily the next run retries writes no note of its own, so it
+        # silences nothing: the postsubmit's hand step stays in the notes.
+        daily_retry = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1, "not_reached": 1}, "outcomes": {"kube-agents-evals-2": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}, "kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_retry}), {})
+        refused = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "refused", "detail": "delete x"}}})
+        readings = {POST.job: refused, DAILY.job: daily_retry}
+        self.assertEqual(sorted(periodics.assess(readings, NOW, {}, streaks=periodics.streaks(readings, None), superseded=periodics.superseded_jobs(readings))), [POST.job])
+        # A daily that failed elsewhere but reached and applied the project at
+        # the same tree is the recovery, cited like a pass; one in which the
+        # project failed again, or was not held, is not, whatever else it did.
+        applied_elsewhere_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, build="200", artifact={"fleet_tree": "t1", "summary": {"applied": 1, "failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": "2 to add"}, "kube-agents-evals-2": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}}})
+        decided = periodics.superseded_jobs({POST.job: refused, DAILY.job: applied_elsewhere_failed})
+        self.assertEqual((decided[POST.job]["recovery"], decided[POST.job]["by"]["build"], decided[POST.job]["by"]["passed"]), (True, "200", False))
+        self.assertEqual(periodics.assess({POST.job: refused, DAILY.job: applied_elsewhere_failed}, NOW, {}, streaks=periodics.streaks({POST.job: refused, DAILY.job: applied_elsewhere_failed}, None), superseded=decided), {})
+        failed_again = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: failed_again}), {})
+        other_tree_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t0", "summary": {"applied": 1, "failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "x"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: other_tree_failed}), {})
+        # A failed run that applied the project while owing a hand step elsewhere recovers rather than silences.
+        locked_elsewhere = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: locked_elsewhere})[POST.job]["recovery"], True)
+        # A failed build naming no project still needs a whole pass that passed.
+        whole_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "mode": "all", "visited": 2, "mapped": 2, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "x"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: whole_failed}), {})
+        # A silence carried from a daily that was news ends on the next daily
+        # that is not: the carried map is not kept over a retry-shaped failure.
+        silenced = periodics.superseded_jobs({POST.job: refused, DAILY.job: daily_failed})
+        self.assertEqual(silenced, {POST.job: {"build": "100", "recovery": False}})
+        self.assertEqual(periodics.superseded_jobs(readings, silenced), {})
+        self.assertEqual(sorted(periodics.assess(readings, NOW, {}, streaks=periodics.streaks(readings, None), superseded=periodics.superseded_jobs(readings, silenced))), [POST.job])
         earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: earlier_daily}), {})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed}), {})
@@ -966,6 +1002,67 @@ class AssessTest(unittest.TestCase):
         # Without streaks (a caller that has none), a failed build is a note as before.
         self.assertIn(SWEEP.job, periodics.assess({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, NOW, None))
 
+    def test_a_reconcile_failure_the_next_run_retries_is_news_once_a_project_fails_twice(self):
+        def reading(build, outcomes, **report):
+            return {"job": DAILY.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
+                    "artifact": dict({"exit": "failed", "mode": "all", "outcomes": outcomes, "error": "%d project(s) not reconciled" % len(outcomes)}, **report)}
+        token = {"outcome": "failed", "detail": "tofu apply exit 1: Error: Invalid credentials (plan token expired)"}
+        stockout = {"outcome": "failed", "detail": "tofu apply exit 1: ZONE_RESOURCE_POOL_EXHAUSTED"}
+        self.assertEqual({p.job for p in periodics.WATCHED if p.actionable_or_persistent}, {DAILY.job, POST.job})
+        # Run 1: one project's failure the next run retries is not news, but it is counted.
+        readings = {DAILY.job: reading("1", {"kube-agents-evals-40": token, "kube-agents-evals-2": {"outcome": "applied", "detail": "2 to add"}})}
+        streaks = periodics.streaks(readings, None)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-40": 1})
+        # Run 2 failing a different project, evals-40 applied: still not news.
+        readings = {DAILY.job: reading("2", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": {"outcome": "applied", "detail": "1 to add"}})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        # Run 3 failing evals-2 again: news, led by the project and its count.
+        readings = {DAILY.job: reading("3", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": token})}
+        streaks = periodics.streaks(readings, streaks)
+        note = periodics.assess(readings, NOW, None, streaks=streaks)[DAILY.job]
+        self.assertEqual(note["detail"][0], f"kube-agents-evals-2: failed in 2 consecutive checks (failed (tofu apply exit 1: ZONE_RESOURCE_POOL_EXHAUSTED)); next: {periodics.RECONCILE_NEXT_STEP['failed']}")
+        self.assertEqual(note["detail"][1], f"kube-agents-evals-40: failed (tofu apply exit 1: Error: Invalid credentials (plan token expired)); next: {periodics.RECONCILE_NEXT_STEP['failed']}")
+        # A hand step beside a persisting project keeps its own next step.
+        locked = {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}
+        both = periodics.assess({DAILY.job: reading("3", {"kube-agents-evals-2": stockout, "kube-agents-evals-3": locked})}, NOW, None, streaks=streaks)[DAILY.job]
+        self.assertEqual(both["detail"][1], f"kube-agents-evals-3: failed (Error acquiring the state lock: ID 1); next: {periodics.RECONCILE_NEXT_STEP_LOCKED}")
+        self.assertEqual(note["detail"][-1], "run: 2 project(s) not reconciled")
+        # A clean run clears the counts; the next one-off is silent again.
+        streaks = periodics.streaks({DAILY.job: dict(reading("4", {}), passed=True)}, streaks)
+        readings = {DAILY.job: reading("5", {"kube-agents-evals-2": stockout})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        # A project a failed run listed as busy or not reached keeps its count:
+        # the reconcile's report names every mapped project, unlike the sweep's.
+        held = {"outcome": "not_reached", "detail": "not free in Boskos before the run's budget ran out"}
+        streaks = periodics.streaks({DAILY.job: reading("5b", {"kube-agents-evals-2": held, "kube-agents-evals-40": token})}, streaks)
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-2": 1, "kube-agents-evals-40": 1})
+        readings = {DAILY.job: reading("5c", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": {"outcome": "busy", "detail": "leased"}})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-2": 2, "kube-agents-evals-40": 1})
+        self.assertIn(DAILY.job, periodics.assess(readings, NOW, None, streaks=streaks))
+        # Shapes that owe a hand step are news on their first build, with the report's own lines.
+        first = periodics.streaks({DAILY.job: reading("6", {})}, None)
+        for name, outcomes, report in (
+            ("refused", {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}, {}),
+            ("locked", {"kube-agents-evals-3": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}, {}),
+            ("unmapped", {"kube-agents-evals-99": {"outcome": "failed", "detail": "not a mapped pool project"}}, {}),
+            ("runner", {"kube-agents-evals-3": {"outcome": "failed", "detail": "could not run tofu (No such file)"}}, {}),
+            ("no project reached", {"kube-agents-evals-3": {"outcome": "not_reached", "detail": "Boskos unreachable"}}, {"visited": 0}),
+            ("main check", {"kube-agents-evals-3": stockout}, {"main_check_error": "git fetch failed"}),
+            ("unreadable", None, None),
+        ):
+            with self.subTest(name):
+                r = reading("6", outcomes, **report) if outcomes is not None else dict(reading("6", {}), artifact={"error": periodics.REPORT_UNREADABLE})
+                self.assertIn(DAILY.job, periodics.assess({DAILY.job: r}, NOW, None, streaks=first), name)
+        self.assertEqual(periodics.assess({DAILY.job: reading("6", {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}})}, NOW, None, streaks=first)[DAILY.job]["detail"][0],
+                         f"kube-agents-evals-3: refused (delete x); next: {periodics.RECONCILE_NEXT_STEP['refused']}")
+        # A run that wrote no report, and a tick with no counts to carry, note a one-off as before.
+        self.assertIn(DAILY.job, periodics.assess({DAILY.job: dict(reading("6", {}), artifact=None)}, NOW, None, streaks=first))
+        self.assertIn(DAILY.job, periodics.assess({DAILY.job: reading("1", {"kube-agents-evals-40": token})}, NOW, None))
+
 
 class WorkflowWiring(unittest.TestCase):
     def test_the_15_minute_tick_fetches_the_readings_and_hands_them_to_health(self):
@@ -1048,7 +1145,8 @@ class WorkflowWiring(unittest.TestCase):
         # can check; a rename there is a rename here.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1",
+             "ci-kube-agents-eval-replay-lane"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))

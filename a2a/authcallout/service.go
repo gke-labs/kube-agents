@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
+	lib "github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
@@ -109,11 +110,14 @@ type Config struct {
 	// GrantTTL bounds an issued connection's life.
 	//
 	// This is the deployment's revocation window, and it is the only one it
-	// has. Permissions are fixed when a connection authenticates and the
-	// callout is never consulted again, so a narrowed grant or a removed
-	// identity does not reach a connection that is already established —
-	// until it expires and the client reconnects, re-presenting a token the
-	// cluster gets to refuse. Zero means the default; a grant that never
+	// has. Permissions are fixed when a connection authenticates, so a
+	// narrowed grant or a removed identity does not reach a connection that
+	// is already established — until it expires and the client reconnects,
+	// re-presenting a token the cluster gets to refuse. The one other time
+	// the callout is consulted for a live connection is a server config
+	// reload, which runs it again for every connection it authenticated. On
+	// nats-server 2.10.29 those connections were dropped at the reload and
+	// reconnected through the callout within a second. Zero means the default; a grant that never
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
@@ -171,7 +175,7 @@ type Config struct {
 
 // envTaskCredentialMaxLifetimeName is the variable ParseTaskCredentialMaxLifetime
 // reads, named in its errors so a refusal says which setting to fix.
-const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 // ParseTaskCredentialMaxLifetime reads the task credential lifetime #4121's
 // operator will render (time.Duration.String, e.g. "6h0m0s"). Empty is
@@ -425,7 +429,9 @@ func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 		// "Authorization Violation" whether its token was bad, the callout
 		// was down, or the response was malformed — so this log line and
 		// the $SYS disconnect advisory are the only places the reason
-		// exists. Log the identity, never the token.
+		// exists. Log the identity, never the token nor the password: the
+		// reason is built from what the client sent, so no step below may
+		// format either into it (ParseDispatcherBucketCredential once did).
 		s.log.Warn("refusing a connection",
 			"reason", err,
 			"host", req.ClientInformation.Host,
@@ -506,9 +512,9 @@ type decision struct {
 	perms   *jwt.Permissions
 	user    string
 
-	// task and notAfter are set on a profile worker's task connection
-	// alone: the task its grants are scoped to, and its credential's
-	// expiry, which caps the minted JWT's (see mint).
+	// task is set on a profile worker's task connection alone: the task
+	// its grants are scoped to. notAfter caps the minted JWT's expiry (see
+	// mint): the task credential's expiry there, or the entry's NotAfter.
 	task     string
 	notAfter time.Time
 
@@ -531,8 +537,9 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// A profile worker's task connection presents a second credential, the
 	// task credential, and it rides the password beside a token. So: a token
 	// is the ServiceAccount token and the password, if any, the task
-	// credential; with no token, the password is the ServiceAccount token
-	// and there is no task credential.
+	// credential (or, on the dispatcher's entry, a bucket selector "<b>/32",
+	// which is not a credential); with no token, the password is the
+	// ServiceAccount token and there is no task credential.
 	//
 	// Why the password and not CONNECT's jwt field, which nats-server
 	// v2.15.1 also forwards to the callout in this (non-operator) mode:
@@ -577,17 +584,60 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return decision{}, fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
 	}
 
-	// A task credential means something only on a profile worker's entry.
-	// Anywhere else it is refused, not ignored: a client presenting one
-	// believes it is getting a task's scope.
-	if taskToken != "" && id.Narrowing != NarrowingProfile {
-		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's", att.ServiceAccount)
+	// A password beside a token means something only on a profile worker's
+	// entry (a task credential) or the dispatcher's (a bucket). Anywhere else
+	// it is refused, not ignored: a client presenting one believes it is
+	// getting a narrower scope.
+	if taskToken != "" && id.Narrowing != NarrowingProfile && id.Narrowing != NarrowingDispatcher {
+		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's or the dispatcher's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
 	var task string
 	var notAfter time.Time
-	if id.Narrowing != "" {
+	// An entry past its NotAfter authenticates nothing, whatever the map
+	// still says; one before it mints no JWT that outlives it.
+	if id.NotAfter != nil {
+		if !s.now().Before(*id.NotAfter) {
+			return decision{}, fmt.Errorf("%s's entry expired at %s", att.ServiceAccount, id.NotAfter.UTC().Format(time.RFC3339))
+		}
+		notAfter = *id.NotAfter
+	}
+	if id.Narrowing == NarrowingDispatcher {
+		// The dispatcher's users are the map's own (its entry's user, or
+		// that user's bucket users, which the map reserves), not a pod
+		// name, so the narrowed-pod reserved check below does not apply.
+		if taskToken != "" {
+			bucket, err := lib.ParseDispatcherBucketCredential(taskToken)
+			if err != nil {
+				// Refused, never served the control connection's grants:
+				// the client asked for a bucket and gets it or nothing.
+				return decision{}, fmt.Errorf("%s presented a dispatcher bucket that was refused: %w", att.ServiceAccount, err)
+			}
+			user = dispatcherBucketUser(id.User, bucket)
+			// The map reserves the bucket users against its own entries and
+			// profiles (validateIdentities), but not against the static
+			// principals and addressees this callout was started with. Nor
+			// can it check the draining names against them, and a draining
+			// name becomes a2a.tasks.<name>.*.supervisor. A bucket user that
+			// is a reserved name refuses the connection. A draining name
+			// that is one is left out of the grants rather than refusing:
+			// one such name must not stop every bucket (#5553, round 1).
+			if kind, ok := s.reserved[user]; ok {
+				return decision{}, fmt.Errorf("%s asked for dispatcher bucket user %q, which is the name of %s", att.ServiceAccount, user, kind)
+			}
+			kept := id
+			kept.Draining = nil
+			for _, p := range id.Draining {
+				if kind, ok := s.reserved[p]; ok {
+					s.log.Warn("dispatcher draining profile left out of its bucket grants: it is a reserved name", "profile", p, "reserved", kind)
+					continue
+				}
+				kept.Draining = append(kept.Draining, p)
+			}
+			grants = dispatcherBucketGrants(m, kept, bucket)
+		}
+	} else if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what
 		// the cluster attested about this connection specifically. The
 		// default arm cannot be reached through a parsed map — validate
@@ -800,6 +850,6 @@ func (s *Service) mint(req *jwt.AuthorizationRequestClaims, d decision) (string,
 }
 
 func (s *Service) grantExpiry() time.Time {
-	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL))
+	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL)) // #nosec G404 -- jitter on an expiry, not a secret
 	return s.now().Add(s.grantTTL - jitter)
 }

@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -123,6 +124,34 @@ func (l *a2aServerLog) refusedSubscribe(user, subject string) bool {
 	return l.refused("Subscription", user, subject)
 }
 
+// a2aSingleServerTestConf makes a rendered nats.conf startable as ONE embedded
+// server: the per-pod server_name ($POD_NAME, which the pod's env supplies)
+// becomes a literal, and a multi-server render's cluster block is dropped,
+// since a lone server with routes to a Service that does not resolve here
+// would wait for a JetStream quorum it can never reach; and the pid file moves
+// to a temp dir. Everything else is the
+// render's own. TestTheRenderedClusterFormsOverVerifiedRoutes is what runs
+// the cluster block itself.
+func a2aSingleServerTestConf(t *testing.T, conf string) string {
+	t.Helper()
+	if !strings.Contains(conf, "server_name: $POD_NAME") {
+		t.Fatal("the rendered nats.conf no longer takes server_name from $POD_NAME; the substitution below would be inert")
+	}
+	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-0", 1)
+	// The pid file lives on the pod's data volume, which a test process
+	// cannot write; a server that cannot write it does not start.
+	pid := `pid_file: "` + a2aNATSPIDFile + `"`
+	if !strings.Contains(conf, pid) {
+		t.Fatal("the rendered nats.conf no longer writes its pid to " + a2aNATSPIDFile + "; the substitution below would be inert")
+	}
+	conf = strings.Replace(conf, pid, `pid_file: "`+filepath.Join(t.TempDir(), "nats-server.pid")+`"`, 1)
+	return a2aClusterBlockRe.ReplaceAllString(conf, "")
+}
+
+// a2aClusterBlockRe matches renderA2ANATSCluster's block: from "cluster {" at
+// the start of a line to the first closing brace at the start of a line.
+var a2aClusterBlockRe = regexp.MustCompile(`(?ms)^cluster \{\n.*?^\}\n`)
+
 // a2aStartRenderedServer runs an embedded nats-server on conf, the nats.conf
 // the operator renders, changing only what a test process cannot honour: the
 // listen ports (random), the websocket listener (off) and the store directory
@@ -143,7 +172,7 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "nats.conf")
-	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, a2aSingleServerTestConf(t, conf))), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts, err := natsserver.ProcessConfigFile(path)
@@ -157,6 +186,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 	opts.Websocket.Port = 0
 	opts.StoreDir = store
 	opts.NoSigs = true
+	// The rendered pid_file is the pod's path.
+	opts.PidFile = filepath.Join(t.TempDir(), "nats.pid")
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("nats-server refused the rendered config: %v", err)
@@ -168,7 +199,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 		t.Fatal("embedded nats-server did not come up")
 	}
 	// The evidence names the server it came from: the module pin here and
-	// the image tag the operator deploys are independent, and the tag floats.
+	// the image the operator deploys (pinned by tag and digest) are
+	// independent, so their server versions can differ.
 	t.Logf("embedded nats-server %s (the operator deploys %s)", natsserver.VERSION, defaultA2ANATSImage)
 	return s, log
 }
@@ -215,7 +247,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 	return []jetstream.StreamConfig{
 		{Name: "TASKS", Subjects: []string{"a2a.tasks.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 72 * time.Hour, MaxBytes: 21474836480, Replicas: 1,
+			MaxAge: 72 * time.Hour, MaxBytes: a2aTasksMaxBytes, Replicas: 1,
 			MaxConsumers:      a2aTasksMaxConsumers(a2aTestAgent()),
 			MaxMsgsPerSubject: a2aTasksMaxMsgsPerSubject, AllowDirect: true},
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
@@ -226,7 +258,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 720 * time.Hour, MaxBytes: 5368709120, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+			MaxAge: 720 * time.Hour, MaxBytes: a2aTopicsJournalMaxBytes, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 	}
 }
 
@@ -372,13 +404,22 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
 	// The ack landed, read from web's side, the observer for every consumer
-	// in this test.
+	// in this test. Ack is fire-and-forget, as it is in the bridge, so the
+	// server may not have processed it yet: wait for the floor to move rather
+	// than read it once (#5860).
 	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := relayView.Info(ctx); err != nil || info.AckFloor.Consumer != 1 {
-		t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+	var info *jetstream.ConsumerInfo
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		info, err = relayView.Info(ctx)
+		if err == nil && info.AckFloor.Consumer == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+		}
 	}
 
 	_, err = js.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`), jetstream.WithMsgID("e1"))

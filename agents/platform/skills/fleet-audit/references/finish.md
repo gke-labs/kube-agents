@@ -63,10 +63,10 @@ objects whose `Ready` condition is `False`, to a cluster that serves a kind they
 Connector kind for compliance, `ContainerCluster` or `ContainerNodePool` for the other three. A
 cluster whose read failed, also at the discovery, gets `kcc_unread` with the reason. You copy
 neither into the document. `finish` reads them: any fix whose finding's own object is among them
-gets a last paragraph that starts "**Config Connector is not applying this file.**" (it names the
-declaring file when the fix is not a manifest fix of it) or, when `finish` finds no single
-declaration, "**Config Connector is not applying the declaration of this object.**". The fix keeps
-its kind. Do not write either paragraph yourself, and do not copy it from an earlier ledger:
+gets a last paragraph. It starts "**Config Connector is not applying this file.**" for a manifest
+fix of the declaring file, "**Config Connector is not applying `<path>`.**" for any other fix when
+one file declares the object, or "**Config Connector is not applying the declaration of this
+object.**". The fix keeps its kind. Do not write the paragraph yourself, and do not copy it from an earlier ledger:
 `finish` removes it and writes it again from this run's manifest.
 
 The script validates the document, reconciles every finding against the pull requests already open
@@ -119,7 +119,9 @@ Add `--dry-run` to validate and print the rendered ledger body — and every PR 
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
 degradation as the real run, so the branch names it names are the branch names it would create,
 except a PodDisruptionBudget `finish` would write for a declared `no-pdb` finding, which only the
-real run plans. It
+real run plans. The `## Safety checks` section a `no-pdb` fix's body gets while
+`KUBEAGENTS_AUTOMERGE` is not `off` is also left out: it reads the cluster, and only the real run
+does. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.

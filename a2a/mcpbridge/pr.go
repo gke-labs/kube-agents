@@ -42,7 +42,7 @@ const (
 	bearerPrefix            = "Bearer "
 	gitCredentialsRelPath   = ".git-credentials"
 	envGHToken              = "GH_TOKEN"
-	envGitHubToken          = "GITHUB_TOKEN"
+	envGitHubToken          = "GITHUB_TOKEN" // #nosec G101 -- an env var name, not a credential
 	ghBinary                = "gh"
 	ghCmdPR                 = "pr"
 	ghSubcmdView            = "view"

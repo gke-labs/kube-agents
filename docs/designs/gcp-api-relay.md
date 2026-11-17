@@ -19,7 +19,8 @@ already has, with the same caller authentication, refusal shape and audit line a
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
 Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
 for the observability skill's trace helpers, and then the GKE `projects.locations.clusters` list and
-get, for the Cluster Agent reconcile (#3703), with their answers projected. A collector's one-function change is to obtain its
+get, for the Cluster Agent reconcile (#3703; stall_watch's cluster listing reads the list, #5598; the shim's `get-credentials` check reads the
+get too, #5447), with their answers projected. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -150,10 +151,18 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
-   writes `api disabled request_id=%s rule=%s`. These records carry the log's envelope only;
-   the `audit` mapping the exec route attaches to its records (the site's
-   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)) is
-   not attached on this route.
+   writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
+   `audit` mapping the exec route attaches to its records (the site's
+   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)), so
+   a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
+   `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
+   ran; the `subcommand` is the service word of a host the table names (`monitoring`,
+   `cloudtrace`, `container`) and `other` for any other host. The first line is `started`; the
+   verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
+   `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
+   `failed` for the disabled relay, a credential the broker cannot obtain and each upstream
+   failure. A `failed` record carries `duration_ms` only when the upstream answered (an
+   answer over the cap, a redirect, a body the projection cannot read). The mapping never carries the host, the path or the query.
 
 Named constants, declared at the top of `credential_proxy.py` per the engineering rules:
 
@@ -197,7 +206,10 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
 `query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
 `traces/<id>` get (the id held to 32 lower-case hex characters), and the GKE
-`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; location
+`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; stall_watch reads the list too, #5598; the get is
+also the shim's check that a cluster exists before it answers a `get-credentials`, #5447, sent with
+the `X-Kube-Agents-Get-Credentials-Check` header, on which the broker refuses the get for a cluster
+`spec.scope.exclude.clusters` names; the header only narrows, and a read without it is unchanged; location
 `-` or a region or zone, cluster name in GKE's grammar, both answers projected to each
 cluster's `name`, `location`, `status` and `id`, so `masterAuth` is never relayed), each with a comment saying
 which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials

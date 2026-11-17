@@ -650,11 +650,16 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             "GKE_PROJECT_ID",
             "GKE_CLUSTER_NAME",
             "GKE_LOCATION",
+            "GOOGLE_CLOUD_UNIVERSE_DOMAIN",
             # The collectors' scope guard reads it in the session; set on the
             # container alone it never reaches them (#2840's strict pass).
             "KUBEAGENTS_SCOPE_DECLARED",
             # The audits' auto-promotion switch, read by audit_report.py in the session.
             "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
+            # The earned-autonomy switches, read by kubeagents_switches.py in the session.
+            "KUBEAGENTS_POST_MERGE_CHECK",
+            "KUBEAGENTS_AUTOMERGE",
+            "KUBEAGENTS_DIAL",
         }
         self.assertTrue(
             required.issubset(names),
@@ -675,6 +680,20 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         self.assertIn('SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"', content)
         self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true\}" >"\$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"')
         self.assertIn('chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"', content)
+
+    def test_the_autonomy_switches_are_written_as_root_owned_files_defaulting_off(self) -> None:
+        """kubeagents_switches.py reads these files before the forwarded variables, so a
+        session cannot turn a switch on (test_kubeagents_switches.py holds its paths to these)."""
+        content = _ENTRYPOINT.read_text()
+        chmod = 'chmod 0644 "$SANDBOX_POST_MERGE_CHECK_FILE" "$SANDBOX_AUTOMERGE_FILE" "$SANDBOX_DIAL_FILE"'
+        self.assertIn(chmod, content)
+        for name, path in (
+            ("POST_MERGE_CHECK", "/run/kube-agents-sandbox/post-merge-check"),
+            ("AUTOMERGE", "/run/kube-agents-sandbox/automerge"),
+            ("DIAL", "/run/kube-agents-sandbox/dial"),
+        ):
+            self.assertIn(f'SANDBOX_{name}_FILE="{path}"', content)
+            self.assertIn(f"printf '%s\\n' \"${{KUBEAGENTS_{name}:-off}}\" >\"$SANDBOX_{name}_FILE\"", content)
 
 
 class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
@@ -808,6 +827,64 @@ class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
         )
         default_kc = existing_kc.read_text()
         self.assertNotIn("gke_fleet-proj_us-east1_hardlinked", default_kc)
+
+
+class SandboxEntrypointKubeconfigLockTest(_SandboxEntrypointHarness):
+    """The lock credential_proxy_client.py takes beside the default kubeconfig is on the volume.
+    One left by a client from before only the kubeconfig's owner made it can belong to root, and
+    the agent user cannot open that; the entrypoint removes it before any session starts."""
+
+    def _start_with_kube_proxy(self) -> None:
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+
+    def test_a_kubeconfig_lock_left_on_the_volume_is_removed(self) -> None:
+        """A client from before only the kubeconfig's owner made the lock left one owned by the
+        first caller; after a root `kubectl --context`, one the agent user could not open."""
+        lock = self.data / "..kubeconfig.lock"
+        lock.touch(mode=0o600)
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.exists())
+        self.assertNotIn("kubeconfig lock", self.result.stderr)
+        self.assertIn("gke_my-proj_us-central1-a_default", (self.data / ".kubeconfig").read_text())
+
+    def test_a_link_under_the_locks_name_is_removed_and_not_followed(self) -> None:
+        target = self.tmp / "elsewhere"
+        target.write_text("keep\n")
+        lock = self.data / "..kubeconfig.lock"
+        lock.symlink_to(target)
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.is_symlink())
+        self.assertEqual("keep\n", target.read_text())
+
+    def test_a_link_to_nothing_under_the_locks_name_is_removed(self) -> None:
+        lock = self.data / "..kubeconfig.lock"
+        lock.symlink_to(self.tmp / "nowhere")
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.is_symlink())
+
+    def test_a_folder_under_the_locks_name_and_other_files_are_left(self) -> None:
+        folder = self.data / "..kubeconfig.lock"
+        folder.mkdir()
+        (folder / "inside").write_text("keep\n")
+        record = self.data / "..kubeconfig.contexts-registered"
+        record.write_text("gke_a_b_c 0 0\n")
+        self._start_with_kube_proxy()
+        self.assertEqual("keep\n", (folder / "inside").read_text())
+        self.assertEqual("gke_a_b_c 0 0\n", record.read_text())
+        self.assertNotIn("kubeconfig lock", self.result.stderr, "a folder is not touched, so nothing fails")
+        self.assertIn("gke_my-proj_us-central1-a_default", (self.data / ".kubeconfig").read_text())
+
+    def test_without_the_kube_proxy_the_lock_is_left(self) -> None:
+        lock = self.data / "..kubeconfig.lock"
+        lock.touch(mode=0o600)
+        self._run(". profiles/platform")
+        self.assertTrue(lock.exists())
 
 
 if __name__ == "__main__":

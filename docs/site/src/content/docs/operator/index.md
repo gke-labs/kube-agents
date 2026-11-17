@@ -13,7 +13,7 @@ Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-
 
 ```text
 k8s-operator/
-├── api/v1alpha1/           # PlatformAgent type definitions (Kubebuilder)
+├── api/v1alpha1/           # CRD type definitions (Kubebuilder)
 ├── cmd/                    # manager entrypoint
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
@@ -28,7 +28,8 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
-- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`AgentProfile`** — declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load, and an `AgentProfile` lists the tiers it runs at in `allowedTiers`; people aren't mapped to tiers yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -42,7 +43,7 @@ The controller reconciles a `PlatformAgent` into:
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - A `ConfigMap` (named `<name>-usage-counters`) holding the totals and per-pod baseline behind `status.usage`'s counters, owned by the CR, so it is collected with it, and written outside the reconcile loop; the operator writes it on the leader, at most once per five-minute poll, when a total or the per-pod baseline changed; a quiet poll writes nothing.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and version control (`forges` and the `repositories` on them — GitOps, managed and read-only context — with `github` as a deprecated alias).
-- Under `spec.mode: next`, additionally the A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, added once the bus is provisioned unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- The A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, from the first render unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -179,9 +180,9 @@ refusals among them. Re-apply with `make deploy IMG=$IMG` once the cause is fixe
 
 ## An image ahead of its ClusterRole
 
-The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
-the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
-is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
+The webhook port above is one instance of a general skew: `make deploy` ships the operator's RBAC objects
+with the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
+is upgraded on its next pod reschedule while the applied roles stay put, and the first verb
 the newer controller needs that the older role lacks fails every reconcile with `forbidden`.
 Two things say so.
 
@@ -194,7 +195,11 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. Reconciles continue; the steps that need the missing verb still fail
+`Degraded` for another reason. The namespaced write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it, and in its profile namespace once that
+namespace exists. A denial there is learned after startup,
+logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
+the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and
 triggers no reconcile, so the condition follows the next reconcile after the probe notices: every
 five minutes while the condition stands and the reconcile completes, or, while the reconcile itself

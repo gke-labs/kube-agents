@@ -177,7 +177,13 @@ RBAC at runtime. Consequences:
     `kubeagents-system` (or the team namespace). (The controller does mint RBAC — `reconcileRBAC` creates the
     agent's `kubeagents:minimal:*` ClusterRole and binding, and its two namespaced Roles — but it
     stamps only the `app.kubernetes.io/*` labels and never `kube-agents/tier`, so it is not the
-    labeler and its objects are outside the first policy's selector. Assuming it minted none is
+    labeler and its objects are outside the first policy's selector. On new installs,
+    `kubeagents:minimal:*` grants read-only `get`/`list`/`watch` on `secrets` unless
+    `spec.security.disallowSecretsRead: true` is set; model-executing containers mount no default-audience
+    API server token and reach the API server through `<agent>-kube-proxy`, which enforces
+    `KUBE_PROXY_REDACT_SECRETS=true`, while the credential broker's command policy refuses `Secret` reads
+    and the gateway's `agent-api-auth` sidecar uses its in-cluster token only for event and CR watching.
+    Assuming it minted none is
     what let the second policy be written so that it denied the controller's own binding.)
   - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —
     not by a label the author controls. `matchConstraints` on `roles`/`clusterroles` alone never see

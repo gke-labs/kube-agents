@@ -47,10 +47,10 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 | `MODEL_PROVIDER`       | Default `MODEL_DEFAULT_NAME`   | Notes                                                                                                                                 |
 | ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `gemini` (default)     | `gemini-3.5-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
+| `gemini` (default)     | `gemini-3.8-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
 | `anthropic`            | `claude-opus-5`                | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
 | `openai`               | `gpt-5.4`                      | Uses `OPENAI_API_KEY`.                                                                                                                |
-| `vertex_ai`            | `gemini-3.5-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
+| `vertex_ai`            | `gemini-3.8-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
 | `openai_compatible`    | none; required                 | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
 | `sap`                  | `anthropic--claude-4.5-sonnet` | OAuth2 client credentials from a Secret you create. See [below](#sap-ai-core).                                                        |
 | any other LiteLLM slug | none; required                 | `azure`, `bedrock`, `databricks`, ...; credentials from the same Secret. See [below](#other-litellm-providers).                       |
@@ -63,7 +63,7 @@ To change the default on an installed system, re-run the installer with `--menu`
 
 ```bash
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 make -C k8s-operator deploy-litellm
 ```
 
@@ -77,7 +77,7 @@ Either way the agent picks up the new model on its next request without any chan
 model_list:
   - model_name: model-default
     litellm_params:
-      model: gemini/gemini-3.5-flash
+      model: gemini/gemini-3.8-flash
       max_tokens: 8192
 ```
 
@@ -89,6 +89,32 @@ The gateway supplies the value as a fallback default when a request omits `max_t
 
 On non-adaptive Anthropic Claude models, LiteLLM maps `fallback.reasoningEffort` (`low`, `medium`, `high`) to `thinking.budget_tokens` (`1024`, `2048`, `4096`), and Anthropic requires `max_tokens > thinking.budget_tokens`. When setting `litellm.maxTokens` alongside `fallback.reasoningEffort` on a Claude model, set `maxTokens` strictly above that effort budget (for example, `> 4096` for `high`).
 
+### Setting a spend ceiling
+
+`LITELLM_BUDGET_USD` is the most the gateway spends, in US dollars as LiteLLM's cost map prices each response, in every window of `LITELLM_BUDGET_PERIOD` (a LiteLLM duration: a whole number and `s`, `m`, `h`, `d`, `w` or `mo`; the default is `1d`). Set both in `install.env` (there is no flag) and re-run `upgrade.sh`; they reach the Terraform example as `litellm_budget` and the chart as `litellm.budget.usd` and `litellm.budget.period`. On a direct Helm install set them through a values file or `--set-json litellm.budget.usd=25`: `--set` passes a decimal as a string, which the schema refuses.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. On, the amount is at least `0.01`: the installer, the Terraform example and the chart's schema all refuse less, before any apply, because a smaller amount splits into per-replica shares the chart cannot render.
+
+The chart renders the ceiling as LiteLLM's provider budget for the one provider every alias routes to, with the amount split evenly across `litellm.replicaCount`. With `MODEL_PROVIDER=vertex_ai`, `LITELLM_BUDGET_USD=10` and the default two replicas the config reads:
+
+```yaml
+router_settings:
+  provider_budget_config:
+    vertex_ai:
+      budget_limit: 5.0000
+      time_period: "1d"
+```
+
+LiteLLM counts spend per gateway process, in memory, and the chart runs no Redis to share the count, so each replica holds one share. Uneven traffic can make one replica refuse before the install has spent the whole amount. The ceiling is a bound on a runaway, not a ledger. LiteLLM checks the share before a call and charges the call's cost after the call completes. Every call in flight when a share is crossed therefore completes and is charged, so a replica can end a window over its share by the cost of those calls. The Platform Agent runs several workers, and a streamed turn lasts minutes.
+
+A rolling update adds a third pod with a share of its own while it lasts, and a gateway restart or rollout starts that pod's count over.
+
+A replica whose share is spent refuses every model call until its window ends. The first window of a gateway process starts when the pod starts, not at its first spend; once a window has expired, the next spend opens the next one. The caller gets HTTP 429 with `No deployments available - crossed budget: Exceeded budget for provider vertex_ai: <spend> >= <limit>`, and the gateway logs the same line. The agent's turn fails as it does on a rate limit; nothing on the `PlatformAgent` reports the state yet.
+
+Each gateway pod exports the remaining share as `litellm_provider_remaining_budget_metric{api_provider="vertex_ai"}` on its `/metrics`, which the chart's `PodMonitoring` collects. The series appears at the pod's first routing decision and is set on every one: the share less the spend charged so far, at or below `0` while the replica refuses, negative by the in-flight overshoot. `sum` it over the gateway pods for the install's remaining budget. The per-key and per-team budget series keep reading `inf`: they describe LiteLLM virtual keys, which this install does not use.
+
+A model that LiteLLM's cost map does not price costs `0` on every call, so `litellm_spend_metric` does not move and the ceiling is never reached. Check that the series moves on your model before you rely on the ceiling. A ceiling whose per-replica share would round to `0.0000` fails the render, because LiteLLM reads a `budget_limit` of `0` as no limit; raise the amount or lower `litellm.replicaCount`. Why the ceiling is split rather than shared, and what is still to come on the `PlatformAgent`: [`docs/designs/gateway-spend-cap.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gateway-spend-cap.md).
+
 ### Fallback alias and parameter dropping
 
 Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.
@@ -97,7 +123,7 @@ Two chart blocks, both off by default, add a fallback alias and router retry lim
 
 `litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys).
 
-`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`.
+`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. Measured on Vertex `gemini-3.5-flash`, a `600`-second request cap covered `99.96%` of streams while `300` seconds covers `99.57%`.
 
 The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
 
@@ -140,11 +166,13 @@ A fallback is not silent. The gateway's reply carries `x-litellm-attempted-fallb
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       reasoning_effort: "high"
 ```
 
 LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` or `vertex_ai`, it becomes `thinkingConfig.thinkingLevel` on the request to Google. On Claude it becomes adaptive thinking with that effort, and OpenAI and `openai_compatible` servers receive `reasoning_effort` as written. A model that LiteLLM does not treat as a reasoning model, such as `gemini-2.0-flash`, fails every request with `UnsupportedParamsError`, so leave the value empty for one.
+
+A vLLM server passes the value to the model's chat template, which decides what each level means. GLM-5.3's template, for example, recognizes only `low` and `high`. Anything else, `medium` included, runs at `max`, its default and slowest level, with no error. vLLM's Gemma 4 template has no effort field: every value is ignored, and thinking is a server-side template setting. Check the served model's template before relying on a level.
 
 At the default, empty, no `reasoning_effort` is rendered and the model thinks at its own default level; a Gemini 2.5 or 3.x model keeps the `thinking` key described in [Gemini's thoughts](#geminis-thoughts). The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
 
@@ -195,7 +223,7 @@ Gemini thinks before it answers whether or not a request asks it to, but it retu
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       thinking: { "type": "enabled" }
 ```
 
@@ -205,7 +233,7 @@ No other model gets the key. LiteLLM refuses it on a model it does not treat as 
 
 ### Replayed thinking on Gemini
 
-A client that turns thinking on, as Claude Code does in the session pods of an install on the `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought. Gemini then read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
+A client that turns thinking on, as Claude Code does in an install's session pods, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought. Gemini then read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
 
 Both the chart and the kustomize base still load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. It removes more than the upstream fix does. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s) bound for a Gemini model`.
 
@@ -318,7 +346,7 @@ Two things differ from the API-key providers:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
-  --model-default-name=gemini-3.5-flash \
+  --model-default-name=gemini-3.8-flash \
   --vertex-project-id=my-gcp-project \
   --vertex-location=us-east4   # both optional: project defaults to the install's, location to "global"
 ```

@@ -18,10 +18,12 @@
 # test, every one `surfaced` except a row marked `plant_state: queued`, and
 # resolve them again on destroy.
 #
-# Three rows share check, project and cluster, so they are one gathered line of
-# the nudge's message, which names only the first of them by id. The other two
-# share the project and differ in cluster or in check, so they are lines of their
-# own, and a decision on the first line must leave them alone.
+# In findings.json, three rows share check, project and cluster, so they are one
+# gathered line of the nudge's message, which names only the first of them by id.
+# The other two share the project and differ in cluster or in check, so they are
+# lines of their own, and a decision on the first line must leave them alone.
+# findings-unnamed.json has the same shape under its own project, with a fourth
+# row on the first line left `queued`.
 #
 # queue.py does the work inside the agent container, through the Session KV
 # server's own findings routes on loopback: the routes every build of that

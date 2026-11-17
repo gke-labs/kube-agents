@@ -78,11 +78,12 @@ const (
 	// equals either audience above.
 	credentialProxyA2AChatAudience = "kubeagents-credential-proxy-a2a-chat" // #nosec G101 -- Token audience name, not a credential
 	// credentialProxySessionAudience is the session pod's, under
-	// a2aSessionClusterViewEnvVar. A third audience for the same reason as
-	// the second: the session ServiceAccount is on the callers list, so only
-	// the audience can tell a session token from the shell's, and the
-	// broker's `session` role (exec only, kubectl and gcloud only) hangs off
-	// it. Spelled identically in credential_proxy.py and a2a/gateway/spawn.go.
+	// a2aSessionClusterViewEnvVar. A distinct audience so neither
+	// <agent>-kube-proxy nor the credential broker confuses a session token
+	// with the shell's: <agent>-kube-proxy binds it to the session
+	// ServiceAccount for kubectl, and the broker's `session` role (exec
+	// only, gcloud only) hangs off it. Spelled identically in
+	// kube_proxy_manifests.go, credential_proxy.py, and a2a/gateway/spawn.go.
 	credentialProxySessionAudience = "kubeagents-credential-proxy-session" // #nosec G101 -- Token audience name, not a credential
 
 	// credentialProxyTokenMountPath is where the agent container finds the

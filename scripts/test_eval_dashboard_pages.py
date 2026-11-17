@@ -1013,9 +1013,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
         self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
-        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        # The GitLab lane's next nightly is a table of its own.
         self.assertIn("1 night on record: 0 green, 1 not", page)
-        self.assertIn("No night of", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
@@ -1037,6 +1036,34 @@ class BrowserTest(unittest.TestCase):
         self.assertIn(f"<span>{CRASHLOOP_TRIO[1]}</span>", page, "two passes and a ceiling rep is a pass, listed by name")
         self.assertNotIn("all 0 reps", page)
         self.assertNotIn("0 reps lost", page)
+
+    def test_a_case_lost_to_a_forge_outage_says_so_on_the_run_page(self):
+        """Forge reps sit under their own key in `reps` (#5342); the card is
+        tagged and worded as a forge outage, not as unexplained or lost."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "forge", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps not graded: a forge read failed during grading", page)
+        self.assertIn('class="tag storm">forge unavailable<', page)
+        self.assertNotIn('class="tag unclear">unexplained<', page)
+
+    def test_a_forge_and_ceiling_mix_counts_only_the_kinds_it_has(self):
+        """No "0 lost before grading" when no repetition was lost to the storm."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        task["reps"] = [{"n": 1, "result": "infra", "reason": forge}] + [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "forge-ceiling", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps ungraded: 2 at the delegation ceiling, 1 not graded, forge unavailable", page)
+        self.assertNotIn("0 lost before grading", page)
 
     def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
         health = health_doc(
@@ -1175,6 +1202,28 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("rca-names-the-oom", app)
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
+
+    def test_history_lists_an_issue_once_whether_a_tick_wrote_its_number_or_its_url(self):
+        """health-history.jsonl across a rollout: the tick before wrote
+        "#1300", the tick after its URL; the incident names the issue once."""
+        ticks = [dict(health_doc("OUTAGE"), tick="2026-09-08T09:00:00Z", tracking_issues=["#1300"]),
+                 dict(health_doc("OUTAGE"), tick="2026-09-08T09:15:00Z", tracking_issues=["https://github.com/gke-labs/kube-agents/issues/1300", "#1278"])]
+        path = pathlib.Path(self.tmp.name) / "history.jsonl"
+        path.write_text("".join(json.dumps(t) + "\n" for t in ticks))
+        [incident] = render.history_incidents(render.load_health_history(path))
+        self.assertEqual(incident["tracking_issues"], ["#1300", "#1278"])
+
+    def test_a_tracking_issue_given_as_a_url_links_there_and_names_another_repository(self):
+        """health.json's tracking_issues: a bare #N is this repository's
+        (case-notes.yaml); the bot's own issues arrive as full URLs and may
+        live in the issues repository, which the link text then names."""
+        doc = health_doc("OUTAGE")
+        doc["tracking_issues"] = ["#1278", "https://github.com/gke-labs/kube-agents/issues/1300", "https://github.com/gke-labs/kube-agents-eval-triage/issues/12"]
+        out = render_to(pathlib.Path(self.tmp.name) / "issue-urls", self.data, health=doc)
+        app = dom_text(out / "index.html")
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1278">#1278</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1300">#1300</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents-eval-triage/issues/12">gke-labs/kube-agents-eval-triage#12</a>', app)
         self.assertIn("Runs in this window", app)
         self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
@@ -1239,6 +1288,29 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("repetitions are being lost to API quota", app)
         self.assertIn("Why we think it's a quota storm", app)
         self.assertIn("Retest after Tue 10:30 AM ET", app)
+
+    def test_a_storm_brief_does_not_quote_a_forge_outage_as_its_evidence(self):
+        """'What the agent saw' under a storm quotes a storm case only (#5342):
+        a forge-unavailable case is the forge's, not the quota storm's."""
+        data = copy.deepcopy(self.data)
+        # The forge case is the only ungraded case with a reason to quote.
+        for other in data["runs"]:
+            for t in other.get("tasks") or []:
+                for r in t.get("reps") or []:
+                    if r.get("result") == "infra":
+                        r["reason"] = None
+        run = next(r for r in data["runs"] if r["build_id"] == "2095859789312561152")
+        task = run["tasks"][0]
+        task["result"] = "infra"
+        reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: forge-evidence-check: answered 503"
+        task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
+        health = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],
+                            since="2026-09-04T18:00:00+00:00",
+                            incident={"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-04T18:30:00+00:00", "window_end": "2026-09-04T19:00:00+00:00"})
+        out = render_to(pathlib.Path(self.tmp.name) / "storm-forge", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("What the agent saw", app)
+        self.assertNotIn("forge-evidence-check", app)
 
     def test_setup_deaths_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since=SETUP_DEATHS_SINCE), "setup")
@@ -1825,7 +1897,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
-        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["releases"] = [
+            RC_RELEASE,
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            # A release read from the lane's private bucket (SCHEMA.md,
+            # releases[].gcs_base): its row links the Console, not Spyglass.
+            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+        ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
         # branch's earlier run) sits inside the live window: no Grid column.
@@ -2010,6 +2090,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
         self.assertIn("90.0%", app)
         self.assertIn("baselines maturing", app)

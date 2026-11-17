@@ -81,7 +81,9 @@ class SubmittedPayloadTestCase(unittest.TestCase):
             captured["payload"] = json.loads(request.data.decode("utf-8"))
             return RecordingResponse(json.dumps(body).encode("utf-8"))
 
-        with patch.dict("os.environ", environ, clear=False):
+        # An empty KUBECONFIG unless the test names one: the ambient value is
+        # not the test's input, and the shim refuses a file with no context.
+        with patch.dict("os.environ", {"KUBECONFIG": "", **environ}, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                     captured["exit_code"] = credential_proxy_client.execute(endpoint, argv)
@@ -879,6 +881,35 @@ class TestShellAncestry(unittest.TestCase):
         )
 
 
+class TestClusterTargetRecord(unittest.TestCase):
+    """`ClusterTarget` keeps the frozen dataclass's behaviour it replaced (#5578)."""
+
+    def test_it_is_an_immutable_value(self):
+        import copy
+        import pickle
+
+        target = credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-a")
+        same = credential_proxy_client.ClusterTarget(cluster="cluster-a", project="proj-a", location="us-central1")
+        self.assertEqual(target, same)
+        self.assertEqual(hash(target), hash(same))
+        self.assertEqual(1, len({target, same}))
+        self.assertNotEqual(target, credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-b"))
+        self.assertNotEqual(target, ("proj-a", "us-central1", "cluster-a"))
+        self.assertEqual(
+            "ClusterTarget(project='proj-a', location='us-central1', cluster='cluster-a')", repr(target)
+        )
+        self.assertEqual("gke_proj-a_us-central1_cluster-a", target.context_name)
+        for name in ("project", "context_name", "other"):
+            with self.subTest(name=name), self.assertRaises(AttributeError):
+                setattr(target, name, "x")
+        with self.assertRaises(AttributeError):
+            del target.project
+        for clone in (copy.copy(target), copy.deepcopy(target), pickle.loads(pickle.dumps(target))):
+            self.assertEqual(target, clone)
+        with self.assertRaises(TypeError):
+            credential_proxy_client.ClusterTarget("proj-a", "us-central1")
+
+
 class TestContextGrammar(unittest.TestCase):
     """The grammar both sides hold the name to, tested where it now lives."""
 
@@ -960,11 +991,19 @@ class StdinGateTest(unittest.TestCase):
             captured["body"] = json.loads(request.data)
             return RecordingResponse(json.dumps({"exitCode": 0}).encode())
 
-        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+        with patch.dict("os.environ", {"KUBECONFIG": ""}, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open):
             credential_proxy_client.execute(
                 "http://127.0.0.1:8765", ["kubectl", "apply", "-f", "-"], stdin="kind: X\n"
             )
         self.assertEqual(captured["body"]["stdin"], "kind: X\n")
+
+
+class BodyThatDrops(io.BytesIO):
+    """A refusal body whose connection closes while it is read."""
+
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"")
 
 
 class VcsCallErrorTest(unittest.TestCase):
@@ -993,6 +1032,34 @@ class VcsCallErrorTest(unittest.TestCase):
         with self._refuse(404, {"error": "not available", "code": "VCS_UNAVAILABLE"}):
             with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
                 credential_proxy_client.vcs_call(self.endpoint, "snapshot", {})
+
+    def _held_refusal(self, status, stream):
+        """An HTTPError the test keeps hold of. Held, it is not collected, so a body
+        that reads as closed was closed by `vcs_call` and not by the interpreter."""
+        error = urllib.error.HTTPError(self.endpoint + "/v1/vcs/publish", status, "refused", {}, stream)
+        self.addCleanup(error.close)
+        return error
+
+    def test_the_refusal_is_closed_once_its_body_is_read_on_every_way_out(self):
+        cases = (
+            ("a refusal", 409, io.BytesIO(b'{"error": "the base branch moved", "code": "BASE_MOVED"}'),
+             credential_proxy_client.WorkspaceRequestError),
+            ("no version control", 404, io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE"}'),
+             credential_proxy_client.WorkspaceUnavailable),
+            ("a body that is not JSON", 502, io.BytesIO(b"<html>bad gateway</html>"),
+             credential_proxy_client.WorkspaceRequestError),
+            ("a body that drops", 500, BodyThatDrops(), credential_proxy_client.BrokerDisconnected),
+        )
+        for name, status, stream, raised in cases:
+            with self.subTest(name):
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                    with self.assertRaises(raised) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+                if raised is credential_proxy_client.WorkspaceRequestError:
+                    # The status is read off the error after the close.
+                    self.assertEqual(caught.exception.status, status)
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -1053,7 +1120,7 @@ class TestCallerCredential(SubmittedPayloadTestCase):
             return RecordingResponse(b"{}")
 
         stderr = io.StringIO()
-        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token"}
+        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token", "KUBECONFIG": ""}
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stderr", new=stderr):
@@ -1125,7 +1192,9 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual("a.b.next", sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_no_header_outside_a_task_or_after_it(self):
-        sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        sent = self.run_shim(
+            ["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": ""}
+        )
         self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
         # The adapter removed the file at the task's end: no task, no header,
         # and the broker answers local-only commands only.
@@ -2204,6 +2273,133 @@ class TestShimEntryRouting(unittest.TestCase):
         self.assertEqual(1, named.returncode)
         self.assertIn("credential proxy unavailable", named.stderr, "no fallback for a named endpoint")
 
+    def test_a_call_through_a_tool_name_does_not_import_what_it_does_not_use(self):
+        """Each import is on every brokered call's clock (#5578)."""
+        completed = self.run_shim(
+            ["-I", "-X", "importtime", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines() if line.startswith("import time:")}
+        self.assertIn("http.client", imported, "the check reads the import list")
+        for module in ("argparse", "dataclasses", "inspect"):
+            with self.subTest(module=module):
+                self.assertNotIn(module, imported)
+
+    def test_the_explicit_form_still_parses_its_arguments(self):
+        """`argparse` is imported in `parse_args`, the explicit form's only use of it."""
+        completed = self.run_shim(
+            [str(self.shim), "--endpoint", self.live, "gcloud", "config", "get-value", "project"],
+            {},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["gcloud", "config", "get-value", "project"], self.requests[-1]["argv"])
+        refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
+        self.assertEqual(2, refused.returncode)
+        self.assertIn("invalid choice", refused.stderr)
+
+
+class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
+    """The images install a launcher that imports the client as a module, so
+    the client starts from bytecode the build compiled. Every case of
+    `TestShimEntryRouting` runs again here through the launcher, laid out as
+    the images lay it out; the cases below compare it with the single file."""
+
+    LAUNCHER = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "credential-proxy-exec.py"
+
+    def setUp(self):
+        super().setUp()
+        self.single = self.root / "single" / "credential-proxy-exec"
+        self.single.parent.mkdir()
+        self.shim.rename(self.single)
+        (self.root / "kubectl").unlink()
+        (self.single.parent / "gcloud").symlink_to(self.single)
+        libexec = self.root.resolve() / "libexec"
+        libexec.mkdir()
+        self.launcher = libexec / "credential-proxy-exec"
+        shutil.copy(self.LAUNCHER, self.launcher)
+        self.module = libexec / "credential_proxy_client.py"
+        shutil.copy(credential_proxy_client.__file__, self.module)
+        # The same bare environment as `run_shim`: a PYTHONPYCACHEPREFIX or
+        # PYTHONOPTIMIZE of the caller's would put the bytecode where the shim
+        # does not look.
+        subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", "--invalidation-mode", "unchecked-hash", str(self.module)],
+            env={"PATH": os.environ["PATH"]}, check=True, capture_output=True, timeout=60,
+        )
+        self.bytecode = libexec / "__pycache__" / f"credential_proxy_client.{sys.implementation.cache_tag}.pyc"
+        self.assertTrue(self.bytecode.is_file())
+        # As the sandbox image links it: a name on PATH, to the launcher's name
+        # in another folder, to the launcher.
+        self.shim.symlink_to(self.launcher)
+        for name in ("kubectl", "gcloud"):
+            (self.root / name).symlink_to(self.shim)
+
+    def both(self, flags, name, args, environ):
+        """The same command through the single file and through the launcher."""
+        return [
+            self.run_shim([*flags, str(folder / name), *args], {"PYTHONDONTWRITEBYTECODE": "1", **environ})
+            for folder in (self.single.parent, self.root)
+        ]
+
+    def test_the_client_is_loaded_from_the_bytecode_the_build_compiled(self):
+        completed = self.run_shim(
+            ["-v", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr[-2000:])
+        self.assertIn(f"code object from {str(self.bytecode)!r}", completed.stderr)
+
+    def test_the_bytecode_is_loaded_without_a_look_at_the_source(self):
+        """`unchecked-hash`: no stat and no hash of the source at a start. The
+        price is that an edit of the module does nothing until it is compiled
+        again."""
+        with open(self.module, "a") as source:
+            source.write("\nraise SystemExit(99)\n")
+        completed = self.run_shim([str(self.root / "kubectl"), "get", "pods"], {"CREDENTIAL_PROXY_URL": self.live})
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+
+    def test_without_the_bytecode_the_launcher_still_runs_the_client(self):
+        shutil.rmtree(self.bytecode.parent)
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertFalse(self.bytecode.parent.exists(), "and it writes none")
+
+    def test_it_answers_as_the_single_file_does(self):
+        cases = {
+            "a tool name with no broker": ([], "gcloud", ["config", "get-value", "project"], {}),
+            "a tool name": ([], "gcloud", ["config", "get-value", "project"], {"CREDENTIAL_PROXY_URL": self.live}),
+            "the help": ([], "credential-proxy-exec", ["--help"], {}),
+            "the explicit form": ([], "credential-proxy-exec", ["--endpoint", self.live, "kubectl", "get", "pods"], {}),
+            "a tool that is not supported": ([], "credential-proxy-exec", ["--endpoint", self.live, "rm", "-rf", "/"], {}),
+            "an unreachable endpoint": ([], "credential-proxy-exec", ["--endpoint", self.closed, "kubectl", "get", "pods"], {}),
+            "the kubectl wrapper's isolated call": (["-I"], "credential-proxy-exec", ["--ensure-kubectl-context", "get", "pods"], {}),
+        }
+        for label, (flags, name, args, environ) in cases.items():
+            with self.subTest(label):
+                single, launched = self.both(flags, name, args, environ)
+                self.assertEqual(
+                    (single.returncode, single.stdout, single.stderr),
+                    (launched.returncode, launched.stdout, launched.stderr),
+                )
+
+    def test_stdin_reaches_the_broker_as_it_does_from_the_single_file(self):
+        for folder in (self.single.parent, self.root):
+            completed = subprocess.run(
+                [sys.executable, str(folder / "credential-proxy-exec"), "--endpoint", self.live, "kubectl", "apply", "-f", "-"],
+                env={"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home")},
+                input="kind: ConfigMap\n", capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+        single, launched = self.requests[-2:]
+        self.assertEqual("kind: ConfigMap\n", launched["stdin"])
+        self.assertEqual(single["stdin"], launched["stdin"])
+        self.assertEqual(single["argv"], launched["argv"])
+
 
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
 class TestRealShellCommandLines(unittest.TestCase):
@@ -2708,6 +2904,78 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual(1, len(broker.requests))
         self.assertEqual("argv is required", err.strip())
 
+    def held_refusal(self, status, body, headers=None):
+        """An HTTPError the test keeps hold of, and its body. Held, the error is not
+        collected, so a body that reads as closed was closed by the shim and not by the
+        interpreter."""
+        stream = body if isinstance(body, io.BytesIO) else io.BytesIO(
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
+        error = urllib.error.HTTPError("http://broker.invalid/v1/exec", status, "refused", headers or {}, stream)
+        self.addCleanup(error.close)
+        return error, stream
+
+    def run_shim_over(self, replies):
+        """The shim over `replies`, each an HTTPError it raises or a reply body it reads."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=replies), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_printed_refusal_is_closed_and_its_text_was_read_first(self):
+        error, stream = self.held_refusal(400, {"error": "argv is required"})
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertEqual("argv is required", err.strip())
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_with_no_json_body_is_closed(self):
+        error, stream = self.held_refusal(500, b"<html>internal error</html>")
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("credential proxy error (HTTP 500): non-JSON response", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_whose_body_drops_is_closed(self):
+        error, stream = self.held_refusal(503, BodyThatDrops())
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("the connection dropped while the refusal was read", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_each_retried_refusal_is_closed_and_its_retry_after_still_sets_the_wait(self):
+        # Five 429s: four waits, then the throttling line. The status and the
+        # Retry-After header are read off each error after it is closed.
+        held = [self.held_refusal(429, PRESSURE, {"Retry-After": "4"}) for _ in range(5)]
+        code, _, err = self.run_shim_over([error for error, _ in held])
+        self.assertEqual(1, code)
+        self.assertEqual(4, len(self.sleeps))
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+        self.assertIn("gave up after 5 attempts (HTTP 429)", err.strip().splitlines()[-1])
+        self.assertEqual([True] * 5, [stream.closed for _, stream in held], "the shim left a refusal open")
+
+    def test_a_refusal_that_is_retried_into_a_reply_is_closed(self):
+        error, stream = self.held_refusal(503, BUSY_SLOT)
+        code, out, err = self.run_shim_over([error, io.BytesIO(json.dumps(OK).encode())])
+        self.assertEqual(0, code, err)
+        self.assertEqual(OK["stdout"], out)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_the_status_headers_and_payload_stay_on_a_closed_refusal(self):
+        error, stream = self.held_refusal(429, PRESSURE, {"Retry-After": "4"})
+        payload = credential_proxy_client._refusal_payload(error)
+        self.assertTrue(stream.closed)
+        self.assertEqual(PRESSURE, payload)
+        self.assertEqual(PRESSURE, error.shim_payload)
+        self.assertFalse(error.shim_dropped)
+        self.assertEqual(429, error.code)
+        self.assertEqual("4", error.headers.get("Retry-After"))
+
 
 class RetryScheduleTest(unittest.TestCase):
     """The delay and the refusal filter, without a server."""
@@ -2963,6 +3231,164 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertEqual([], self.sleeps)
 
 
+class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
+    """Worker pods (UID 1000 with /home/node) initialize and merge ~/.kube/config."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.worker_home = self.root / "home" / "node"
+        self.worker_home.mkdir(parents=True)
+        self.worker_kubeconfig = self.worker_home / ".kube" / "config"
+        self.shared_kubeconfig = self.root / "opt" / "data" / ".kubeconfig"
+
+    def test_caller_default_kubeconfig_path_distinguishes_worker_from_shell_sandbox(self):
+        with patch.object(credential_proxy_client.os, "geteuid", return_value=1000), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            self.assertEqual(self.worker_kubeconfig, credential_proxy_client._caller_default_kubeconfig_path())
+            shutil.rmtree(self.worker_home)
+            self.assertEqual(self.shared_kubeconfig, credential_proxy_client._caller_default_kubeconfig_path())
+
+    def test_ensure_kube_proxy_context_initializes_host_kubeconfig_and_merges_target(self):
+        env = {
+            "KUBE_PROXY_URL": self.PROXY_URL,
+            "KUBE_PROXY_HOST_CONTEXT": self.HOST_CTX,
+            "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+            "KUBECONFIG": "",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                ["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"]
+            )
+        self.assertTrue(self.worker_kubeconfig.is_file())
+        text = self.worker_kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+    def test_ensure_kube_proxy_context_creates_kubeconfig_when_host_context_is_unset(self):
+        env = {
+            "KUBE_PROXY_URL": self.PROXY_URL,
+            "KUBE_PROXY_HOST_CONTEXT": "",
+            "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+            "KUBECONFIG": "",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                ["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"]
+            )
+        self.assertTrue(self.worker_kubeconfig.is_file())
+        text = self.worker_kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.TARGET_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+
+class KubeconfigLockOwnerTest(unittest.TestCase):
+    """Only the kubeconfig's owner makes the lock beside it. A caller that does
+    not own the file cannot change it, and a lock that root made is one the
+    agent user cannot open: its later merges stopped without a word."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.PROXY_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        self.lock = self.root / "..kubeconfig.lock"
+        self.record = self.root / "..kubeconfig.contexts-registered"
+
+    def merge(self, path=None, as_uid=None):
+        """One merge of TARGET_CTX; returns what it wrote to stderr."""
+        stderr = io.StringIO()
+        uid = os.geteuid() if as_uid is None else as_uid
+        with patch.object(credential_proxy_client.os, "geteuid", return_value=uid), \
+                patch.object(credential_proxy_client.sys, "stderr", stderr):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                path or self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        return stderr.getvalue()
+
+    def test_a_caller_that_does_not_own_the_kubeconfig_makes_no_lock(self):
+        before = self.kubeconfig.read_bytes()
+        self.assertEqual("", self.merge(as_uid=os.geteuid() + 1), "refused, which is no failure to report")
+        self.assertEqual([self.kubeconfig.name], sorted(p.name for p in self.root.iterdir()))
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_the_owners_merge_after_a_run_by_another_caller_registers_and_records(self):
+        self.merge(as_uid=os.geteuid() + 1)
+        self.assertEqual("", self.merge())
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", self.kubeconfig.read_text(encoding="utf-8"))
+        self.assertEqual(os.geteuid(), self.lock.stat().st_uid)
+        self.assertEqual([self.TARGET_CTX], [line.split(" ", 1)[0] for line in self.record.read_text(encoding="utf-8").splitlines()])
+
+    def test_a_kubeconfig_that_is_not_a_regular_file_gets_no_lock(self):
+        cases = {"missing": self.root / "missing" / "config", "a folder": self.root / "folder" / "config"}
+        cases["missing"].parent.mkdir()
+        cases["a folder"].mkdir(parents=True)
+        link = self.root / "linked" / "config"
+        link.parent.mkdir()
+        link.symlink_to(self.kubeconfig)
+        cases["a symlink"] = link
+        before = self.kubeconfig.read_bytes()
+        for label, path in cases.items():
+            with self.subTest(label):
+                self.assertEqual("", self.merge(path=path))
+                self.assertEqual([], [p.name for p in path.parent.iterdir() if p.name != path.name])
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_an_owner_who_cannot_open_the_lock_is_told(self):
+        """A folder under the lock's name: no caller can open that, root included."""
+        self.lock.mkdir()
+        before = self.kubeconfig.read_bytes()
+        said = self.merge()
+        self.assertEqual(1, len(said.splitlines()), said)
+        self.assertTrue(said.startswith("credential proxy: "), said)
+        for part in (str(self.lock), f"(owned by uid {os.geteuid()})", self.TARGET_CTX, str(self.kubeconfig)):
+            with self.subTest(part):
+                self.assertIn(part, said)
+        self.assertEqual(before, self.kubeconfig.read_bytes(), "nothing is merged without the lock")
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a file whatever its mode")
+    def test_a_lock_the_owner_has_no_right_to_open_is_reported_too(self):
+        """What a root run left before the owner check came first, as near as a test gets:
+        a lock file the caller cannot open."""
+        self.lock.touch(mode=0o000)
+        self.assertIn(f"{self.lock} (owned by uid {os.geteuid()}): Permission denied", self.merge())
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes to a folder whatever its mode")
+    def test_a_lock_that_cannot_be_made_names_no_owner(self):
+        self.root.chmod(0o500)
+        self.addCleanup(self.root.chmod, 0o700)
+        self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
+
+
 class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
     """The exec body carries the card or session id the shim runs under, so the
     broker can count the run's commands; absent when there is none."""
@@ -3079,6 +3505,219 @@ class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertEqual("no\n", err)
                 self.assertEqual(1, len(opened))
+
+
+class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
+    """With the kube-api proxy in use, a get-credentials that names its cluster
+    in full is answered in the shim: one relay read checks the cluster exists
+    and is running, and the kube-proxy kubeconfig is written as after a broker
+    call (#5447). Every other case goes to the broker as before."""
+
+    ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    BASE = ["gcloud", "container", "clusters", "get-credentials", "ka-a"]
+    CONTEXT = "gke_acme-prod_us-central1-a_ka-a"
+    FULL = ["--location=us-central1-a", "--project=acme-prod"]
+    DEFAULT_KUBECONFIG = (
+        "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+        "clusters:\n- name: in-cluster\n  cluster:\n    server: https://kube-proxy.kubeagents-system.svc:8443/clusters/in-cluster\n"
+        "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+        "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /token\n"
+    )
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        token = self.directory / "token"
+        token.write_text("caller-token", encoding="utf-8")
+        self.env = {
+            "KUBE_PROXY_URL": "https://kube-proxy.kubeagents-system.svc:8443",
+            "KUBE_PROXY_CA_FILE": "/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(token),
+            credential_proxy_client.TASK_TOKEN_FILE_ENV: "",
+            "KUBECONFIG": "",
+        }
+        self.default = self.directory / "default"
+        self.default.write_text(self.DEFAULT_KUBECONFIG, encoding="utf-8")
+        patcher = patch.object(credential_proxy_client, "_default_kubeconfig_candidates", return_value=[self.default])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_shim(self, argv, status=200, body=None, raises=None, env=None):
+        relay = Mock()
+        if raises is not None:
+            relay._get_once.side_effect = raises
+        else:
+            answer = {"name": "ka-a", "location": "us-central1-a", "status": "RUNNING"} if body is None else body
+            read = Mock(side_effect=answer) if isinstance(answer, Exception) else Mock(return_value=answer)
+            relay._get_once.return_value = Mock(status_code=status, json=read)
+        broker = Mock(return_value=RecordingResponse(json.dumps({"exitCode": 0}).encode("utf-8")))
+        stderr = io.StringIO()
+        landed = Mock()
+        with patch.dict("os.environ", {**self.env, **(env or {})}, clear=False), \
+                patch.object(credential_proxy_client, "ApiSession", return_value=relay) as session, \
+                patch.object(credential_proxy_client, "open_broker_request", broker), \
+                patch.object(credential_proxy_client, "land_implicit_kubeconfig", landed), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute(self.ENDPOINT, argv)
+        return {"code": code, "relay": relay, "session": session, "broker": broker,
+                "stderr": stderr.getvalue(), "landed": landed}
+
+    def test_a_cluster_named_in_full_is_answered_without_the_broker(self):
+        destination = self.directory / "out.yaml"
+        sent = self.run_shim(self.BASE + ["--location", "us-central1-a", "--project", "acme-prod",
+                                          f"--kubeconfig={destination}"])
+        self.assertEqual(0, sent["code"])
+        sent["broker"].assert_not_called()
+        sent["relay"]._get_once.assert_called_once()
+        self.assertEqual(
+            "https://container.googleapis.com/v1/projects/acme-prod/locations/us-central1-a/clusters/ka-a",
+            sent["relay"]._get_once.call_args.args[0],
+        )
+        self.assertEqual(
+            "Fetching cluster endpoint and auth data.\nkubeconfig entry generated for ka-a.\n", sent["stderr"]
+        )
+        sent["landed"].assert_not_called()
+
+    def test_the_check_is_one_attempt_at_executes_broker(self):
+        # A named endpoint gives the session no fallback, and `_get_once` makes
+        # one attempt: a draining or busy refusal is not retried here, and the
+        # exec tier's fallback stays `execute`'s.
+        sent = self.run_shim(self.BASE + self.FULL)
+        sent["session"].assert_called_once_with(self.ENDPOINT)
+        sent["relay"].get.assert_not_called()
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS,
+            sent["relay"]._get_once.call_args.kwargs["timeout"],
+        )
+        # The header that lets the broker refuse an excluded cluster's read.
+        self.assertEqual(
+            {credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER: "1"},
+            sent["relay"]._get_once.call_args.kwargs["headers"],
+        )
+
+    def test_get_once_sends_the_extra_headers_beside_the_credential(self):
+        http = Mock()
+        http.get.return_value = Mock(status_code=200)
+        with patch.dict("os.environ", self.env, clear=False):
+            session = credential_proxy_client.ApiSession(self.ENDPOINT, http=http)
+            session._get_once("https://container.googleapis.com/v1/projects/p/locations/l/clusters/c",
+                              timeout=5, headers={"X-Extra": "1"})
+        sent = http.get.call_args.kwargs["headers"]
+        self.assertEqual("1", sent["X-Extra"])
+        self.assertEqual("Bearer caller-token", sent["Authorization"])
+
+    def test_an_excluded_cluster_refusal_goes_to_the_broker(self):
+        # The broker refuses the checked read for a cluster the install
+        # excludes; its get-credentials then refuses the cluster itself (#5305).
+        refusal = {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": "scope.excluded-cluster"}
+        sent = self.run_shim(self.BASE + self.FULL, status=403, body=refusal)
+        sent["broker"].assert_called_once()
+        self.assertNotIn("kubeconfig entry generated", sent["stderr"])
+
+    def test_the_kubeconfig_is_the_one_a_broker_answer_is_rewritten_to(self):
+        broker_shaped = (
+            "apiVersion: v1\nkind: Config\n"
+            f"current-context: {self.CONTEXT}\n"
+            f"clusters:\n- name: {self.CONTEXT}\n  cluster:\n    server: https://203.0.113.10\n"
+            f"contexts:\n- name: {self.CONTEXT}\n  context:\n    cluster: {self.CONTEXT}\n    user: {self.CONTEXT}\n"
+            f"users:\n- name: {self.CONTEXT}\n  user:\n    exec:\n      command: gke-gcloud-auth-plugin\n"
+        )
+        destination = self.directory / "out.yaml"
+        self.run_shim(self.BASE + self.FULL + ["--kubeconfig", str(destination)])
+        with patch.dict("os.environ", self.env, clear=False):
+            expected = credential_proxy_client.rewrite_kubeconfig_for_kube_proxy(broker_shaped)
+        self.assertEqual(expected, destination.read_text(encoding="utf-8"))
+
+    def test_the_context_is_merged_into_the_default_kubeconfig_keeping_its_current_context(self):
+        self.run_shim(self.BASE + self.FULL + ["--kubeconfig", str(self.directory / "out.yaml")])
+        merged = self.default.read_text(encoding="utf-8")
+        self.assertIn(f"https://kube-proxy.kubeagents-system.svc:8443/clusters/{self.CONTEXT}", merged)
+        self.assertEqual("in-cluster", credential_proxy_client.read_current_context(merged))
+
+    def test_zone_and_location_for_the_same_cluster_write_the_same_context(self):
+        contexts = []
+        for flag in ("--zone", "--location", "-z", "--region"):
+            destination = self.directory / f"{flag.strip('-')}.yaml"
+            self.run_shim(self.BASE + [flag, "us-central1-a", "--project=acme-prod", "--kubeconfig", str(destination)])
+            contexts.append(credential_proxy_client.read_current_context(destination.read_text(encoding="utf-8")))
+        self.assertEqual({self.CONTEXT}, set(contexts))
+
+    def test_the_bare_flags_and_a_release_track_are_answered_too(self):
+        for argv in (
+            self.BASE + self.FULL + ["--internal-ip", "--quiet"],
+            self.BASE + self.FULL + ["--dns-endpoint", "-q"],
+            ["gcloud", "beta", *self.BASE[1:], *self.FULL],
+        ):
+            with self.subTest(argv=argv):
+                sent = self.run_shim(argv)
+                self.assertEqual(0, sent["code"])
+                sent["broker"].assert_not_called()
+
+    def test_a_context_less_call_lands_like_a_broker_answer(self):
+        sent = self.run_shim(self.BASE + self.FULL)
+        self.assertEqual(0, sent["code"])
+        sent["broker"].assert_not_called()
+        sent["landed"].assert_called_once()
+        landed = sent["landed"].call_args.args[0]
+        self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(landed))
+
+    def test_a_kubeconfig_env_is_the_destination(self):
+        destination = self.directory / "env.yaml"
+        sent = self.run_shim(self.BASE + self.FULL, env={"KUBECONFIG": str(destination)})
+        self.assertEqual(0, sent["code"])
+        sent["landed"].assert_not_called()
+        self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(destination.read_text(encoding="utf-8")))
+
+    def test_any_answer_but_a_running_cluster_goes_to_the_broker(self):
+        # A 404 included: gcloud's own error names the cluster and, for a wrong
+        # location, the right one.
+        destination = self.directory / "out.yaml"
+        argv = self.BASE + self.FULL + ["--kubeconfig", str(destination)]
+        for name, kwargs in (
+            ("not found", {"status": 404, "body": {"error": {"code": 404}}}),
+            ("refused", {"status": 403}),
+            ("busy or draining", {"status": 503, "body": {"code": "CREDENTIAL_PROXY_BUSY", "bound": "draining"}}),
+            ("upstream error", {"status": 500}),
+            ("provisioning", {"body": {"name": "ka-a", "status": "PROVISIONING"}}),
+            ("no status", {"body": {"name": "ka-a"}}),
+            ("not a mapping", {"body": ["ka-a"]}),
+            ("not JSON", {"body": ValueError("no JSON")}),
+            ("unreachable", {"raises": ConnectionError("no route")}),
+            ("slow", {"raises": TimeoutError("read timed out")}),
+        ):
+            with self.subTest(name):
+                sent = self.run_shim(argv, **kwargs)
+                sent["broker"].assert_called_once()
+                self.assertNotIn("kubeconfig entry generated", sent["stderr"])
+                self.assertNotIn(self.CONTEXT, self.default.read_text(encoding="utf-8"))
+
+    def test_the_broker_answers_what_the_shim_cannot_name_in_full(self):
+        cases = {
+            "no kube-api proxy": (self.BASE + self.FULL, {"KUBE_PROXY_URL": ""}),
+            "no project": (self.BASE + ["--location=us-central1-a"], None),
+            "no location": (self.BASE + ["--project=acme-prod"], None),
+            "two locations": (self.BASE + ["--zone=us-central1-a", "--location=us-east1", "--project=acme-prod"], None),
+            "the same location twice": (self.BASE + ["--zone=us-central1-a", "--location=us-central1-a", "--project=acme-prod"], None),
+            "two projects": (self.BASE + self.FULL + ["--project=acme-prod"], None),
+            "an unknown flag": (self.BASE + self.FULL + ["--format=json"], None),
+            "a bare flag with a value": (self.BASE + self.FULL + ["--internal-ip=yes"], None),
+            "a valued flag with no value": (self.BASE + ["--project=acme-prod", "--location"], None),
+            "an end of flags": (self.BASE + self.FULL + ["--"], None),
+            "two clusters": (self.BASE + ["ka-b", *self.FULL], None),
+            "an upper-case cluster": (self.BASE[:-1] + ["KA-A", *self.FULL], None),
+        }
+        for name, (argv, env) in cases.items():
+            with self.subTest(name):
+                sent = self.run_shim(argv, env=env)
+                sent["broker"].assert_called_once()
+                sent["relay"]._get_once.assert_not_called()
+
+    def test_a_profile_task_stays_with_the_broker(self):
+        token = self.directory / "task-token"
+        token.write_text("a.b.c", encoding="utf-8")
+        sent = self.run_shim(self.BASE + self.FULL, env={credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token)})
+        sent["broker"].assert_called_once()
+        sent["relay"]._get_once.assert_not_called()
 
 
 if __name__ == "__main__":

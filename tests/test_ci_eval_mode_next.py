@@ -31,6 +31,7 @@ _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 _NAMESPACE = "kubeagents-system"
 _AGENT_TOKEN = "agent-api-key"
 _INJECT_TOKEN = "door-bearer-token"
+_A2A_DOOR_TOKEN = "a2a-door-bearer-token-never-echoed"
 
 # A kubectl that answers the two Secret reads the section can make, with the
 # encoded values the real API returns for a jsonpath into .data, and records
@@ -42,6 +43,7 @@ _KUBECTL_STUB = textwrap.dedent(
       case "$*" in
         *"secret platform-agent-secrets "*) printf '%s' '{base64.b64encode(_AGENT_TOKEN.encode()).decode()}' ;;
         *"secret platform-agent-a2a-inject "*) [ -n "${{INJECT_SECRET_MISSING:-}}" ] && return 1; printf '%s' '{base64.b64encode(_INJECT_TOKEN.encode()).decode()}' ;;
+        *"secret platform-agent-a2a-door "*) [ -n "${{DOOR_SECRET_MISSING:-}}" ] && return 1; printf '%s' '{base64.b64encode(_A2A_DOOR_TOKEN.encode()).decode()}' ;;
         *) echo "unexpected kubectl call: $*" >&2; return 1 ;;
       esac
     }}
@@ -145,7 +147,9 @@ def go_constant(name: str) -> str:
     return match.group(1)
 
 
-def run_section(mode_next: str | None, secret_missing: bool = False, rollback_lane: str | None = None) -> subprocess.CompletedProcess:
+def run_section(
+    mode_next: str | None, secret_missing: bool = False, rollback_lane: str | None = None, door_secret_missing: bool = False
+) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -153,11 +157,12 @@ def run_section(mode_next: str | None, secret_missing: bool = False, rollback_la
             # shell running the tests happens to export: the flag, and the two
             # variables the flag-set path exports, which a developer who drove
             # the door by hand has in their shell.
-            "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE AGENT_TRANSPORT AGENT_INJECT_TOKEN",
+            "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE AGENT_TRANSPORT AGENT_INJECT_TOKEN AGENT_A2A_DOOR_TOKEN",
             f'export TARGET_NAMESPACE="{_NAMESPACE}"',
             'export AGENT_SERVICE_NAME="platform-agent"',
             "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
             'export INJECT_SECRET_MISSING="1"' if secret_missing else "",
+            'export DOOR_SECRET_MISSING="1"' if door_secret_missing else "",
             "" if rollback_lane is None else f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
             _KUBECTL_STUB,
             constants_block(),
@@ -165,6 +170,8 @@ def run_section(mode_next: str | None, secret_missing: bool = False, rollback_la
             'echo "TOKEN=${PLATFORM_AGENT_TOKEN:-<unset>}"',
             'echo "TRANSPORT=${AGENT_TRANSPORT:-<unset>}"',
             'echo "INJECT_TOKEN=${AGENT_INJECT_TOKEN:-<unset>}"',
+            '[ -n "${AGENT_A2A_DOOR_TOKEN:-}" ] && echo "DOOR_TOKEN_SET=1" || echo "DOOR_TOKEN_SET=0"',
+            '[ "${AGENT_A2A_DOOR_TOKEN:-}" = "' + _A2A_DOOR_TOKEN + '" ] && echo "DOOR_TOKEN_OK=1" || echo "DOOR_TOKEN_OK=0"',
         ]
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
@@ -256,11 +263,32 @@ class FlagSetIsInjectTest(unittest.TestCase):
         self.assertEqual(out["TRANSPORT"], "inject")
         self.assertEqual(out["INJECT_TOKEN"], _INJECT_TOKEN)
         calls = kubectl_calls(result)
-        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(len(calls), 3, calls)
         self.assertEqual(
             calls[1],
             f"get secret platform-agent-a2a-inject -n {_NAMESPACE} -o jsonpath={{.data.token}}",
         )
+        self.assertEqual(calls[2], f"get secret platform-agent-a2a-door -n {_NAMESPACE} -o jsonpath={{.data.token}}")
+        self.assertEqual((out["DOOR_TOKEN_SET"], out["DOOR_TOKEN_OK"]), ("1", "1"))
+        # The A2A door's token is exported for the harness, never printed.
+        self.assertNotIn(_A2A_DOOR_TOKEN, result.stdout + result.stderr)
+
+    def test_a_missing_a2a_door_secret_warns_and_runs_on(self) -> None:
+        """Only the card-wait stopped ask goes through the A2A door (#5407):
+        without its token that one case is infrastructure, not the run."""
+        result = run_section("1", door_secret_missing=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual(out["TRANSPORT"], "inject")
+        self.assertEqual(out["DOOR_TOKEN_SET"], "0")
+        self.assertIn("platform-agent-a2a-door", result.stderr)
+
+    def test_the_a2a_door_secret_names_are_the_operators_and_the_harnesss(self) -> None:
+        c = constants()
+        self.assertEqual(c["EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX"], "-a2a-door")
+        # The operator names the door's Secret with a2aDoorName.
+        self.assertIn('return agent.Name + "-a2a-door"', text(_A2A_MANIFESTS))
+        self.assertEqual(c["EVAL_A2A_DOOR_TOKEN_SECRET_KEY"], "token")
 
     def test_the_inject_tunnels_base_is_the_harnesss_variable_and_clear_of_the_api_range(self) -> None:
         """The harness owns one port-forward per process and tears it down at

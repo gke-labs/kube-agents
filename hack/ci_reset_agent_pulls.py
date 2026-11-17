@@ -30,17 +30,29 @@ What goes, and what stays:
 * every branch but the default, whatever its name, unless an open pull request
   that stays still has it as head. A pool repository is a fixture nothing else
   keeps branches in.
-* a file in PLANTED_STACK_FILES on the default branch that carries the stack
-  label (`managed-by: kube-agents-bench` on a line of its own). The one entry
-  is the Kustomize root that bench/tf/prebuilt/kustomize-overlay-declaration
-  plants for obtainability-pdb-kustomize-overlay and removes at its destroy.
-  Two things leave it: a unit killed before that destroy, and a teardown
-  that failed (devops-bench logs a teardown error and goes on, and the state
-  is the run's own, so nothing applies the destroy again). Then
-  obtainability-major-pdb-auto-pr's fix is manual on that project at every
-  run. A file at that path without the label stays. The GitHub path only:
-  the GitLab path (hack/ci_gitlab_forge.py) deletes no file, and the stack
-  writes to GitHub only.
+* a file in planted_stack_files() on the default branch that carries the
+  stack label (`managed-by: kube-agents-bench` on a line of its own, as YAML
+  or as a JSON member). planted_stack_files() names the Kustomize root that
+  bench/tf/prebuilt/kustomize-overlay-declaration plants for
+  obtainability-pdb-kustomize-overlay; a leftover makes
+  obtainability-major-pdb-auto-pr's fix manual on that project at every run.
+  It names the four files of the payments HelmRelease directory that
+  bench/tf/prebuilt/context-repository-owns-the-fix plants for
+  remediation-context-repository-owns-the-fix. It also names the Config
+  Connector declaration that bench/tf/prebuilt/kcc-stalled-declaration
+  plants for fleet-audit-manifest-fix-names-stalled-config-connector, at
+  clusters/<seeded-a cluster>/provisioning/pinned-inference-pool.yaml; a
+  leftover gives every other stockout audit on that project a declaration
+  for the pool. Its path holds the real name of the seeded-a cluster, which
+  the caller gives as --kcc-cluster (the .fleet-context that
+  hack/fleet-kubeconfigs.sh wrote, as the stack's own inputs); without it,
+  the name the fleet's default cluster_prefix gives. Each stack removes its
+  own files at its destroy. Two things leave them: a unit killed before that
+  destroy, and a teardown that failed (devops-bench logs a teardown error and
+  goes on, and the state is the run's own, so nothing applies the destroy
+  again). A file at such a path without the label stays. The GitHub path
+  only: the GitLab path (hack/ci_gitlab_forge.py) deletes no file, and the
+  stacks write to GitHub only.
 
 Never any repository but the leased project's: `expected_repo` refuses a pair
 that does not match, and the token the caller minted is narrowed to that one
@@ -56,6 +68,7 @@ import argparse
 import base64
 import http.client
 import json
+import math
 import os
 import pathlib
 import sys
@@ -89,17 +102,52 @@ describe = sweep.boskos_pool.describe
 # request's fault and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
+# The evals repositories share one App installation, so one hourly REST budget
+# (#6105): when it runs out, every call answers a marked 403 until the reset
+# GitHub names in X-RateLimit-Reset, minutes away. A limited call waits for
+# that reset (or the Retry-After it asks), never more than
+# RATE_LIMIT_WAIT_SLICE_SECONDS at a time and RATE_LIMIT_BUDGET_SECONDS in all
+# for this run, then gives up with RateLimitExhausted: the repository was
+# never reached, which is GitHub's weather, not the run's.
+RATE_LIMIT_BUDGET_SECONDS = 900
+RATE_LIMIT_WAIT_SLICE_SECONDS = 300
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60
+# A reset GitHub names as already past (a clock ahead, or the old epoch just
+# after the reset), or a Retry-After of 0, still waits this long while budget
+# is left, rather than reading as a spent budget.
+RATE_LIMIT_FLOOR_SECONDS = 5
+RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 # The files a case stack plants on the default branch and that this reset
 # deletes when a killed unit left them, and the label that makes such a file
 # the stack's. bench/tf/prebuilt/kustomize-overlay-declaration/plant.py writes
-# the same path and label; scripts/test_ci_eval_agent_pulls_reset.py holds
-# them equal.
-PLANTED_STACK_FILES = ("clusters/seeded-a/seeded-reliability/kustomization.yaml",)
+# the first path, bench/tf/prebuilt/context-repository-owns-the-fix/plant.py
+# the four under the pool's host cluster directory, and
+# bench/tf/prebuilt/kcc-stalled-declaration/plant.py the Config Connector
+# declaration (KCC_DECLARATION_PATH), each with the label;
+# scripts/test_ci_eval_agent_pulls_reset.py holds them equal.
+POOL_HOST_CLUSTER = "platform-agent-host"
+CONTEXT_FIX_DIRECTORY = f"clusters/{POOL_HOST_CLUSTER}/demo-shop/payments"
+PLANTED_STACK_FILES = (
+    "clusters/seeded-a/seeded-reliability/kustomization.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/source.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/release.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/values.enc.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/legacy-env.yaml",
+)
+# The Config Connector declaration's path, by the name of the seeded cluster
+# that runs Config Connector (KCC_FLEET_SLOT in hack/ci-eval-pr.sh), and that
+# name under the fleet's default cluster_prefix (bench/tf/fleet/variables.tf).
+KCC_DECLARATION_PATH = "clusters/{cluster}/provisioning/pinned-inference-pool.yaml"
+DEFAULT_KCC_CLUSTER = "seeded-a"
 STACK_LABEL_KEY = "managed-by"
 STACK_LABEL_VALUE = "kube-agents-bench"
+# The label as a YAML line and as a JSON member (the Config Connector stack
+# commits JSON); a JSON member can carry a trailing comma.
+STACK_LABEL_LINES = (f"{STACK_LABEL_KEY}: {STACK_LABEL_VALUE}", f'"{STACK_LABEL_KEY}": "{STACK_LABEL_VALUE}"')
+JSON_MEMBER_SEPARATOR = ","
 STACK_FILE_DELETE_MESSAGE = "test(bench): remove {path}, which an eval stack left behind (reset {scope})"
 HTTP_NOT_FOUND = 404
 RECORD_SCHEMA_VERSION = 1
@@ -109,6 +157,36 @@ pause = time.sleep
 ResetError = ledgers.ResetError
 
 
+class RateLimitExhausted(Exception):
+    """GitHub's rate limit outlasted RATE_LIMIT_BUDGET_SECONDS of waiting."""
+
+
+# Seconds of rate-limit waiting this process has spent (limit_wait).
+_rate_limit_waited = 0.0
+now = time.time
+
+
+def limit_wait(exc: urllib.error.HTTPError) -> float:
+    """How long to wait before trying a rate-limited call again: the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
+    default; at most one slice, and at most what is left of the budget. Zero
+    when the budget is spent."""
+    headers = getattr(exc, "headers", None) or {}
+    wait: float = RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    for header, offset in ((sweep.RETRY_AFTER_HEADER, None), (RATELIMIT_RESET_HEADER, now())):
+        try:
+            value = float(headers.get(header))
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value):
+            # nan compares false to everything, so min/max would keep it.
+            continue
+        wait = value if offset is None else value - offset + 1
+        break
+    left = max(0.0, RATE_LIMIT_BUDGET_SECONDS - _rate_limit_waited)
+    return min(max(wait, RATE_LIMIT_FLOOR_SECONDS), RATE_LIMIT_WAIT_SLICE_SECONDS, left)
+
+
 def transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= RETRYABLE_STATUS_FLOOR
@@ -116,8 +194,12 @@ def transient(exc: BaseException) -> bool:
 
 
 def call(method: str, path: str, token: str, body: dict | None = None):
-    """One GitHub call, tried again after a transient answer or a marked limit."""
-    for delay in (*RETRY_DELAYS_SECONDS, None):
+    """One GitHub call, tried again after a transient answer, and after a
+    marked limit until the limit resets or the rate-limit budget is spent
+    (limit_wait), when it raises RateLimitExhausted."""
+    global _rate_limit_waited
+    delays = list(RETRY_DELAYS_SECONDS)
+    while True:
         try:
             return ledgers.api(method, path, token, body)
         except CALL_FAULTS as exc:
@@ -125,13 +207,21 @@ def call(method: str, path: str, token: str, body: dict | None = None):
             # exception (boskos_pool.error_body), so the answer is the same
             # for the log line and the record afterwards.
             limited = isinstance(exc, urllib.error.HTTPError) and is_rate_limited(exc)
-            if delay is None or not (limited or transient(exc)):
-                raise
             if limited:
-                delay = retry_after(exc)
-            print(f"  {method} {path} answered {describe(exc)}; trying again in {delay}s", file=sys.stderr)
+                delay = limit_wait(exc)
+                if delay <= 0:
+                    raise RateLimitExhausted(
+                        f"GitHub's rate limit on {method} {path} outlasted {RATE_LIMIT_BUDGET_SECONDS}s of "
+                        f"waiting ({describe(exc)}); the evals repositories share one App installation's "
+                        "hourly budget (#6105)"
+                    ) from exc
+                _rate_limit_waited += delay
+            elif transient(exc) and delays:
+                delay = delays.pop(0)
+            else:
+                raise
+            print(f"  {method} {path} answered {describe(exc)}; trying again in {delay:.0f}s", file=sys.stderr)
             pause(delay)
-    raise AssertionError("unreachable")
 
 
 def is_agent_pull_request(pull: dict, repo: str) -> bool:
@@ -240,8 +330,13 @@ def planted_stack_file(repo: str, path: str, branch: str, token: str) -> tuple[d
         text = base64.b64decode(str(entry.get("content") or "")).decode("utf-8")
     except (ValueError, UnicodeDecodeError) as exc:
         raise ResetError(f"GitHub answered the contents read of {path} in {repo} with content that does not decode: {exc}") from exc
-    label = f"{STACK_LABEL_KEY}: {STACK_LABEL_VALUE}"
-    return entry, any(line.strip() == label for line in text.splitlines())
+    return entry, any(line.strip().removesuffix(JSON_MEMBER_SEPARATOR) in STACK_LABEL_LINES for line in text.splitlines())
+
+
+def planted_stack_files(kcc_cluster: str = "") -> tuple[str, ...]:
+    """Every path a case stack plants, the Config Connector declaration under
+    `kcc_cluster`, or under DEFAULT_KCC_CLUSTER when that is empty."""
+    return (*PLANTED_STACK_FILES, KCC_DECLARATION_PATH.format(cluster=kcc_cluster or DEFAULT_KCC_CLUSTER))
 
 
 def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
@@ -275,9 +370,14 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
     }
 
 
-def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: bool, record: dict | None = None) -> dict:
+def reset(
+    repo: str, project: str, build: str, scope: str, token: str, dry_run: bool, record: dict | None = None, kcc_cluster: str = ""
+) -> dict:
     """Close, delete, read back. Fills and returns the record; `clean` says
     whether the repository is now what a unit may start on."""
+    global _rate_limit_waited
+    _rate_limit_waited = 0.0  # one rate-limit budget per reset
+    stack_paths = planted_stack_files(kcc_cluster)
     if record is None:
         record = new_record(repo, project, build, scope, dry_run)
     ledgers.expected_repo(repo, project)
@@ -338,9 +438,9 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
             record["undeleted"].append(name)
             continue
         record["deleted"].append(name)
-    # A file a killed stack unit left on the default branch (PLANTED_STACK_FILES).
+    # A file a killed stack unit left on the default branch (planted_stack_files).
     stack_files = []
-    for path in PLANTED_STACK_FILES:
+    for path in stack_paths:
         entry, ours = planted_stack_file(repo, path, default, token)
         if entry is None:
             continue
@@ -376,7 +476,7 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
     for pull in after_pulls:
         heads_after |= _branches_in_use(pull, repo)
     still_branches = [name for name in branches(repo, token) if name != default and name not in heads_after]
-    still_files = [path for path in PLANTED_STACK_FILES if planted_stack_file(repo, path, default, token)[1]]
+    still_files = [path for path in stack_paths if planted_stack_file(repo, path, default, token)[1]]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
     record["clean"] = not still_agent and not still_branches and not still_files
@@ -411,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--host", default=None, help="gitlab only: the instance's hostname (default gitlab.com); a self-managed GitLab (kube-agents#3682)")
     parser.add_argument("--ca-file", default=None, help="gitlab only: a PEM CA to trust for --host, the instance's private CA")
+    parser.add_argument(
+        "--kcc-cluster", default="",
+        help=f"github only: the seeded cluster that runs Config Connector, whose planted declaration this deletes (default {DEFAULT_KCC_CLUSTER})",
+    )
     args = parser.parse_args(argv)
     if args.forge != ledgers.FORGE_GITLAB and (args.host or args.ca_file):
         parser.error("--host and --ca-file apply to --forge gitlab only")
@@ -430,11 +534,18 @@ def main(argv: list[str] | None = None) -> int:
             gitlab.configure_ca(args.ca_file)
             gitlab.reset_merge_requests(args.repo, args.project, args.build, args.scope, token, args.dry_run, record, host=host)
         else:
-            reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
+            reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record, kcc_cluster=args.kcc_cluster)
     except ResetError as exc:
         record["error"] = str(exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except RateLimitExhausted as exc:
+        # GitHub's shared limit outlasted the wait: named as the limit, not
+        # as the token's reach, and the repository is not clean (#6105).
+        record["error"] = str(exc)
+        record["rate_limited"] = True
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     except limited as exc:
         # GitLab's limit, reported as the GitHub path reports its HTTPError:
         # in the record and on stderr, and the repository is not clean.

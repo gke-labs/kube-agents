@@ -113,6 +113,7 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 // fixture, which lib validates strictly.
 func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // the flag-off render's fixture
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()
 	tse := testAgentProfile(agent.Namespace, "tse")
@@ -137,7 +138,7 @@ func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 	if gone == nil || len(gone.Durables) != 0 || gone.DrainingUntil.IsZero() {
 		t.Fatalf("the dispatch config's draining profile is %+v", gone)
 	}
-	if !strings.Contains(cm.Data[a2aDispatchConfigKey], `"drainingUntil": "2026-11-06T12:45:00Z"`) {
+	if !strings.Contains(cm.Data[a2aDispatchConfigKey], `"drainingUntil":"2026-11-06T12:45:00Z"`) {
 		t.Errorf("drainingUntil is not rendered in RFC 3339:\n%s", cm.Data[a2aDispatchConfigKey])
 	}
 
@@ -236,6 +237,7 @@ func TestTheReconcileDrainsWhatTheAppliedConfigListed(t *testing.T) {
 // from the one set read for the pass.
 func TestTheReconcileRendersADroppedProfileDrainingInBothPlaces(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // reads the draining grants off the flag-off entry
 	withOperatorBusPrincipal(t)
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)

@@ -92,6 +92,8 @@ def _clean_env(monkeypatch):
         "PROW_JOB_ID",
         "AGENT_TRANSPORT",
         "EVAL_ROLLBACK_LANE",
+        "MODEL_PROVIDER",
+        "EVAL_REASONING_EFFORT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -1551,6 +1553,18 @@ def test_the_mode_is_read_off_the_run_without_the_environment(kanban_task, tmp_p
         rec.setdefault("trajectory", []).append({"name": "inject.task"})
 
     doc = graded_case(kanban_task, [make_run(mutate=injected)], tmp_path / "case.json", store_with(tmp_path / "empty"))
+    assert doc["version_key"] == NEXT_KEY
+
+
+def test_an_a2a_door_run_files_under_next_without_the_environment(kanban_task, tmp_path, monkeypatch, make_run):
+    """A card-wait stopped ask goes through the A2A door, which only a next
+    install has, so its record files under next with no inject task marker."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+
+    def through_the_door(rec):
+        rec.setdefault("trajectory", []).append({"name": "a2a_door.send", "args": {"task": "t-1"}})
+
+    doc = graded_case(kanban_task, [make_run(mutate=through_the_door)], tmp_path / "case.json", store_with(tmp_path / "empty"))
     assert doc["version_key"] == NEXT_KEY
 
 

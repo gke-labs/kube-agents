@@ -127,7 +127,11 @@ are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
 kubectl cost table the shell's admission charges, which the operator passes only as a short
-lowercase word, before either reaches that Pod. A name earns a
+lowercase word, before either reaches that Pod. The three
+earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -298,17 +302,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                                                                                                            | Credential runtime          |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------- |
-| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` as `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER` as a lowercase word, only | Yes                         |
-| Slack tokens                     | No                                                                                                                 | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                                                                                                                 | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env                                                                                             | Yes, API key only           |
-| Automatic KSA token mount        | Disabled                                                                                                           | Disabled                    |
-| Explicit projected KSA token     | Broker audience only                                                                                               | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                                                                                                                 | Private `emptyDir`          |
-| GitHub installation token/cache  | No                                                                                                                 | Private `emptyDir`          |
-| Agent workspace                  | Yes                                                                                                                | No, the broker owns its own |
+| Data                             | Sandbox                                                    | Credential runtime          |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
+| `spec.deployment.env`            | Five names only, which the operator normalises (see above) | Yes                         |
+| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                        | No, the broker owns its own |
 
 ### The loopback-only exception
 
@@ -332,6 +336,13 @@ means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing
 it anywhere else would mean shipping the plaintext address out of the sandbox
 first, which is exactly what it exists to prevent.
+
+The sandbox holds one more Secret-backed value, `A2A_ACTIVITY_SECRET`: the key
+hermes signs its tool-call deliveries to the bridge sidecar's loopback door with.
+It is pod-scoped like the two above, and hermes needs it in its own process. The
+activity signing key is withheld from child processes: `_run_env` in
+`agent_common_server.py` drops it from every child it spawns, so the gcloud,
+kubectl and hermes CLI children see only the two Session KV values.
 
 Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
@@ -802,11 +813,27 @@ on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
+With the kube-api proxy in use (`KUBE_PROXY_URL` set in the shell sandbox),
+the shim answers a `get-credentials` that names its cluster, one location and
+`--project` itself (#5447). One `/v1/gcp/` read of the cluster (the relay's
+`gcp.api.container.clusters-get` route, on the broker's identity) checks that
+the cluster exists and is running. Then the shim writes the same kube-proxy
+kubeconfig it builds from a broker answer. No broker command runs, so there is
+no command audit line (the relay's line names the principal and the path) and
+no managed kubeconfig is filed for that cluster. Any other answer, any other
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
+
 Consequences:
 
 - Naming a cluster is not additional authority. `get-credentials` is bound by
   the same Workload Identity the broker already holds, so the sandbox can only
-  name clusters that identity could already reach.
+  name clusters that identity could already reach. The relay read that answers
+  a `get-credentials` in the shim runs on that identity too.
 - Only GKE contexts are supported, because the context name is what makes
   regeneration possible. A pin the proxy cannot regenerate from — no
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
@@ -1208,7 +1235,8 @@ gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespa
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
 
 The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
-the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+the envelope keys and, on the records of the exec route, the Cloud API relay and the feedback
+route, the `tool_execution_audit` fields the site's
 [observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
@@ -1235,7 +1263,8 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, a lowercase word), secret volume, credential-state
+   normalised to `true` or `false`, `KUBEAGENTS_KUBECTL_COST_TIER`, a lowercase word, and the
+   three earned-autonomy switches, normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

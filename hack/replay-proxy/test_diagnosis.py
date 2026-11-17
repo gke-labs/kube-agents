@@ -35,6 +35,17 @@ def user(content):
 
 
 class DiagnosisHasherTest(unittest.TestCase):
+    def test_a_served_answer_in_history_hashes_as_the_recording_did(self):
+        # The diagnosis hashes key an assistant message as the request key does
+        # (Normalizer.walk_message), so an echoed answer doesn't read as diverged.
+        def turn(sha):
+            return [user("go"), {"role": "tool", "tool_call_id": "call_1", "content": f"cloned acme/app@{sha}"},
+                    {"role": "assistant", "content": f"git -C app checkout {sha}"}]
+
+        recorded = diagnosis.DiagnosisHasher().hashes(turn("c99b1ab"), NOW)
+        replayed = diagnosis.DiagnosisHasher().hashes(turn("4f1e414"), NOW)
+        self.assertEqual(recorded, replayed)
+
     def test_a_later_cidr_does_not_change_earlier_messages(self):
         hasher = diagnosis.DiagnosisHasher()
         first = [user("pod ip 10.4.0.12"), user("ok")]

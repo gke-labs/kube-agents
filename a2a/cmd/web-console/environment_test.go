@@ -265,7 +265,7 @@ func TestEnvironmentDoesNotCacheACancelledRefresh(t *testing.T) {
 
 func TestRolloutDeploymentsFollowTheInstallNames(t *testing.T) {
 	got := rolloutDeployments("ops-agent", "ka-prod")
-	for _, name := range []string{"ka-prod-controller-manager", "ops-agent-gateway", "ops-agent-credential-proxy", "litellm"} {
+	for _, name := range []string{"ka-prod-controller-manager", "ops-agent-gateway", "ops-agent-credential-proxy", "ops-agent-credential-proxy-exec-tier", "litellm"} {
 		if !got[name] {
 			t.Errorf("%s missing from %v", name, got)
 		}
@@ -307,5 +307,81 @@ func TestInstallVersionFollowsThePlatformAgentTag(t *testing.T) {
 	env := s.readEnvironment(t.Context())
 	if env.Versions.ImageTag != "0.12.0" || env.Versions.ChartVersion != "0.8.0" || env.Versions.AppVersion != "v0.8.0" {
 		t.Fatalf("readEnvironment versions %+v, want ImageTag 0.12.0 from the PlatformAgent and ChartVersion/AppVersion preserved from the chart", env.Versions)
+	}
+}
+
+func TestEnvironmentCarriesTheUsageBlock(t *testing.T) {
+	api := fakeUsageStatusAPI(t, fullUsageStatus)
+	defer api.Close()
+	_, s := setupServer(t)
+	s.cfg.PodNamespace, s.cfg.PlatformAgentName = "kubeagents-system", "platform-agent"
+	s.kube = &kubeClient{base: api.URL, client: api.Client()}
+	rec := serve(s.routes(), httptest.NewRequest(http.MethodGet, "http://localhost:8080/api/environment", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, decoy := range usageDecoys {
+		if strings.Contains(body, decoy) {
+			t.Errorf("the environment response carried %q: %s", decoy, body)
+		}
+	}
+	got := decode[environmentResponse](t, rec)
+	if got.Usage == nil {
+		t.Fatalf("no usage in %s", body)
+	}
+	if _, named := got.Unavailable["usage"]; named {
+		t.Errorf("usage was read and still named unavailable: %v", got.Unavailable)
+	}
+	for _, list := range [][]string{usageCounters, usageOriginFields, usageTotalFields, usageTimestampFields} {
+		for _, field := range list {
+			if field == "backgroundTasksGaveUpTotal" {
+				continue
+			}
+			if _, has := got.Usage.Fields[field]; !has {
+				t.Errorf("usage.fields lacks %q", field)
+			}
+		}
+	}
+	for _, key := range []string{usageTopToolsKey, usageActiveInterfacesField} {
+		if _, has := got.Usage.Fields[key]; !has {
+			t.Errorf("usage.fields lacks %q", key)
+		}
+	}
+	if strings.Join(got.Usage.Lines, "\n") != strings.Join(fullUsageLines, "\n") {
+		t.Errorf("usage.lines:\n%s", strings.Join(got.Usage.Lines, "\n"))
+	}
+}
+
+func TestEnvironmentNamesAMissingUsageBlock(t *testing.T) {
+	api := fakeUsageStatusAPI(t, "")
+	defer api.Close()
+	_, s := setupServer(t)
+	s.cfg.PodNamespace, s.cfg.PlatformAgentName = "kubeagents-system", "platform-agent"
+	s.kube = &kubeClient{base: api.URL, client: api.Client()}
+	got := decode[environmentResponse](t, serve(s.routes(), httptest.NewRequest(http.MethodGet, "http://localhost:8080/api/environment", nil)))
+	if got.Usage != nil || got.Unavailable["usage"] != usageAbsentReason {
+		t.Errorf("usage = %+v, unavailable = %v; want no usage and the absent reason", got.Usage, got.Unavailable)
+	}
+	if got.Install.Phase != "Ready" {
+		t.Errorf("the install block should still be read: %+v", got.Install)
+	}
+}
+
+func TestEnvironmentNamesUsageWhenThePlatformAgentReadFails(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/platformagents/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"metadata":{},"items":[]}`)
+	}))
+	defer api.Close()
+	_, s := setupServer(t)
+	s.cfg.PodNamespace, s.cfg.PlatformAgentName = "kubeagents-system", "platform-agent"
+	s.kube = &kubeClient{base: api.URL, client: api.Client()}
+	got := decode[environmentResponse](t, serve(s.routes(), httptest.NewRequest(http.MethodGet, "http://localhost:8080/api/environment", nil)))
+	if got.Usage != nil || !strings.Contains(got.Unavailable["usage"], "HTTP 403") || !strings.Contains(got.Unavailable["install"], "HTTP 403") {
+		t.Errorf("usage = %+v, unavailable = %v", got.Usage, got.Unavailable)
 	}
 }

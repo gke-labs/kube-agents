@@ -1,4 +1,10 @@
 locals {
+  # A zonal Standard cluster this composition creates: one node in its default
+  # pool (standard_node_count is per zone), too few for a three-server A2A bus.
+  # An adopted cluster's node count is not known here, so it keeps the
+  # operator's default, which holds a running bus at its count.
+  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
+
   # iam, monitoring, and logging are here because Terraform must enable every
   # API its own resources call, where gcloud enables them implicitly.
   base_apis = [
@@ -101,7 +107,31 @@ locals {
   # https://<host>/api/v3 from this declaration. github = null removes the
   # alias from the release values. A github.com install (gitops_host empty)
   # renders the alias, as before.
-  gitops_is_ghes = !local.gitops_is_gitlab && var.gitops_host != ""
+  # A Bitbucket GitOps repository, Cloud or Data Center: one forge named after
+  # its provider, with the token Secret, the workspace or project key as its
+  # namespace, and the repository slug on it as the gitops role. Cloud has one
+  # host and no CA; Data Center names its host and may name a CA Secret.
+  # identity is the account an access token acts as (see gitops_identity).
+  gitops_is_bitbucket = contains(["bitbucket", "bitbucket-datacenter"], var.gitops_forge)
+  gitops_repo_parts   = split("/", var.gitops_repo_path)
+  bitbucket_forges = [merge(
+    {
+      name           = var.gitops_forge
+      provider       = var.gitops_forge
+      namespace      = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[0] : ""
+      credentialsRef = { name = var.gitops_token_secret_name != "" ? var.gitops_token_secret_name : "bitbucket-forge-token" }
+    },
+    var.gitops_forge == "bitbucket-datacenter" ? { host = var.gitops_host } : {},
+    var.gitops_ca_secret_name != "" ? { caBundleRef = { name = var.gitops_ca_secret_name } } : {},
+    var.gitops_identity != "" ? { identity = var.gitops_identity } : {}
+  )]
+  bitbucket_repositories = [{
+    forge      = var.gitops_forge
+    repository = length(local.gitops_repo_parts) == 2 ? local.gitops_repo_parts[1] : var.gitops_repo_path
+    role       = "gitops"
+  }]
+
+  gitops_is_ghes = var.gitops_forge == "github" && var.gitops_host != ""
   ghes_forges = [merge(
     { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
     var.github_ca_secret_name != "" ? { caBundleRef = { name = var.github_ca_secret_name } } : {}
@@ -132,10 +162,12 @@ locals {
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
+    local.gitops_is_bitbucket ? { forges = local.bitbucket_forges } : {},
+    local.gitops_is_bitbucket ? { repositories = local.bitbucket_repositories } : {},
     local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
     local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
     local.gitops_is_ghes ? { github = null } : {},
-    (!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
+    (!local.gitops_is_gitlab && !local.gitops_is_bitbucket && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
       github = merge(
         local.github_org != "" ? { org = local.github_org } : {},
         var.github_repo != "" ? { gitRepo = var.github_repo } : {}
@@ -347,13 +379,13 @@ locals {
 # A warning rather than a precondition: setting image_registry without
 # third_party_image_registry is a valid configuration if the operator only
 # intends to mirror first-party images. But third-party images (cert-manager,
-# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight, and the cleanup hook)
 # will remain on upstream public registries. On restricted or air-gapped clusters,
 # operators must be informed so deployments do not fail on ImagePullBackOff.
 check "unmirrored_third_party_images" {
   assert {
     condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
-    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
   }
 }
 
@@ -751,6 +783,7 @@ module "github_minter" {
   location           = var.location
   namespace          = var.namespace
   service_account_id = var.github_minter_service_account_id
+  ksa_name           = var.github_minter_ksa_name
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
   # The owning install, which lifecycle.sh's adoption step checks before it
@@ -967,9 +1000,10 @@ resource "helm_release" "kube_agents" {
     }
     # The sandbox is built from this repository at the same commit as the
     # agent and the operator, so it takes image_tag with them. It needs its own
-    # entry because the operator does not derive it: unlike the credential
-    # broker, which comes from the agent image with the trailing name swapped,
-    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # entry because the chart always names it in AGENT_SANDBOX_IMAGE, which
+    # wins over the operator's own derivation: unlike the credential broker,
+    # which comes from the agent image with the trailing name swapped, nothing
+    # moves the sandbox with the agent image.
     # Leaving it out pins the sandbox to Chart.appVersion while everything
     # around it moves, which fails the pull rather than running the wrong code.
     agentSandbox = {
@@ -1035,12 +1069,17 @@ resource "helm_release" "kube_agents" {
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
         }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
+        }
       } : {}
     )
-    # merge(), so "today" adds no key and the values this composition hands the
-    # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null. The storage size
-    # works the same way: the default adds no key, and the CR carries no
+    # merge(), so the default storage size adds no key and the CR carries no
     # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
@@ -1084,6 +1123,14 @@ resource "helm_release" "kube_agents" {
             subscription = module.drift_pubsub[0].subscription_name
             enabled      = var.enable_drift_detector ? true : null
           }
+        } : {},
+        # A one-server A2A bus where the cluster cannot hold three: the bus's
+        # three NATS servers each need their own node, and a zonal Standard
+        # cluster's default pool is one node, so the second server would wait
+        # Pending and the bus would never form. extra_helm_values can still
+        # set busReplicas (the second document deep-merges over this one).
+        local.bus_single_server ? {
+          tuning = { busReplicas = 1 }
         } : {}
       )
       deployment = merge(
@@ -1117,6 +1164,7 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        disallowSecretsRead = var.disallow_secrets_read
         # The mapping the credential broker selects from, one row per project
         # the module provisioned a member for. It has to reach the cluster as
         # data rather than being recomputed there: the broker refuses a
@@ -1166,8 +1214,6 @@ resource "helm_release" "kube_agents" {
       integration = local.platform_agent_integration
       }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
       storage = { size = var.platform_agent_storage_size }
-      }, var.platform_agent_mode == "today" ? {} : {
-      mode = var.platform_agent_mode
     })
     # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
     # minty rule ConfigMap, github-app-credentials Secret); the GCP half is
@@ -1197,8 +1243,11 @@ resource "helm_release" "kube_agents" {
       # github_minter_service_account_id would create one GSA and have the pod
       # impersonate another. Only when the module exists: a null here would
       # be a Helm null, which deletes the chart default instead of keeping it.
+      # ksaName from the same variable as the module's ksa_name, so the
+      # binding and the pod name one KSA.
       var.enable_github_minter ? {
         gsaName = module.github_minter[0].service_account_id
+        ksaName = var.github_minter_ksa_name
       } : {}
     )
     # The browser chat page for installs with no chat platform. Its image
@@ -1303,6 +1352,43 @@ resource "helm_release" "kube_agents" {
       error_message = "gitops_forge = \"gitlab\" needs gitlab_repo set, and github_repo and enable_github_minter left unset: a GitLab install has no GitHub App."
     }
 
+    # A Bitbucket install has no GitHub App either, and names its repository
+    # as workspace/slug (Cloud) or KEY/slug (Data Center), the grammars of the
+    # operator's bitbucketWorkspaceRegex and bitbucketProjectKeyRegex.
+    precondition {
+      condition = !local.gitops_is_bitbucket || (var.github_repo == "" && !var.enable_github_minter && (
+        var.gitops_forge == "bitbucket"
+        ? can(regex("^[a-z0-9][a-z0-9_-]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+        : can(regex("^[A-Za-z][A-Za-z0-9_]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+      ))
+      error_message = "gitops_forge = \"bitbucket\" needs gitops_repo_path as workspace/repo-slug, and \"bitbucket-datacenter\" as PROJECTKEY/repo-slug; github_repo and enable_github_minter stay unset: a Bitbucket install has no GitHub App."
+    }
+
+    # Bitbucket Cloud is bitbucket.org only, with the public CAs; a Data
+    # Center instance names its host, which is never a hosted service's.
+    precondition {
+      condition     = var.gitops_forge != "bitbucket" || (var.gitops_host == "" && var.gitops_ca_secret_name == "")
+      error_message = "gitops_forge = \"bitbucket\" is Bitbucket Cloud at bitbucket.org: leave gitops_host and gitops_ca_secret_name unset. For a Data Center instance, use gitops_forge = \"bitbucket-datacenter\"."
+    }
+    precondition {
+      condition     = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
+      error_message = "gitops_forge = \"bitbucket-datacenter\" needs gitops_host: the instance's own hostname, not bitbucket.org or another hosted service's domain."
+    }
+    precondition {
+      condition     = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
+      error_message = "gitops_identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces."
+    }
+    # The CRD's grammar for identity, on both Bitbucket providers.
+    precondition {
+      condition     = var.gitops_identity == "" || can(regex("^[A-Za-z0-9._@+{}-]{1,255}$", var.gitops_identity))
+      error_message = "gitops_identity is 1 to 255 letters, digits and . _ @ + { } -."
+    }
+    # The Bitbucket inputs under another forge would be dropped silently.
+    precondition {
+      condition     = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
+      error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\" or \"bitbucket-datacenter\"; set it, or leave them unset."
+    }
+
     # The reverse: GitLab inputs under the default forge would be dropped,
     # applying a CR with no GitOps repository and no error. gitops_host is
     # the github forge's too: a GitHub Enterprise Server host.
@@ -1324,8 +1410,8 @@ resource "helm_release" "kube_agents" {
     # it; github.com is the default and needs no host; and a GitLab host is
     # not GitHub's.
     precondition {
-      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
-      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com|bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like), gitlab.com, or a Bitbucket or Atlassian domain is not one."
     }
 
     # On a GitHub Enterprise Server, github_repo is required, as owner/name

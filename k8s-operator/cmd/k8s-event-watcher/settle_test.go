@@ -92,6 +92,7 @@ func settleFailed(t0 time.Time, message string, lasted time.Duration, count int)
 
 const (
 	hostIPUnknownEvent = "Error: host IP unknown; known addresses: [{Hostname gk3-wolfram-std-02-pool-1-cc370783-lgp8}]"
+	etcHostsGoneEvent  = "Error: open /var/lib/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: no such file or directory"
 	startErrorEvent    = `Error: failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: "migrate": executable file not found in $PATH: unknown`
 )
 
@@ -104,6 +105,11 @@ func TestSettleAppliesToFailedOnlyForARetriedConfigError(t *testing.T) {
 		want    bool
 	}{
 		{hostIPUnknownEvent, true},
+		{etcHostsGoneEvent, true},
+		{"Error: open /data/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: no such file or directory", true},
+		{"Error: open /etc/hosts: no such file or directory", false},
+		{"Error: open /var/lib/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: permission denied", false},
+		{"pod quoted it: Error: open /var/lib/kubelet/pods/x/etc-hosts: no such file or directory", false},
 		{startErrorEvent, false},
 		{`Error: secret "db-creds" not found`, false},
 		{"Error: ErrImagePull", false},
@@ -131,42 +137,55 @@ func failedDispatcher(t *testing.T, now *time.Time) (*dispatcher, *metrics, *int
 	return disp, m, injectCount
 }
 
-// TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown is the alert
-// that prompted it: a DaemonSet pod on a node the autoscaler was deleting
-// gets one Failed "host IP unknown" and is gone. It is held and counted
-// self_resolved; the same message repeating past the period (a node that
-// really has no IP) is forwarded; and a one-shot start error, which kubelet
-// does not retry under restartPolicy Never, still fires on its first sighting.
-func TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown(t *testing.T) {
-	t0 := time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC)
+// TestDispatcherSettleHoldsAOneShotRetriedConfigError covers each message on
+// retriedConfigError with the alert that put it there: a DaemonSet pod on a
+// node the autoscaler was deleting gets one Failed "host IP unknown", and an
+// Autopilot balloon pod deleted a second after it was created gets one Failed
+// writing its etc-hosts. Each is held and counted self_resolved, and the same
+// message repeating past the period (a node that really has no IP) is
+// forwarded. A one-shot start error, which kubelet does not retry under
+// restartPolicy Never, still fires on its first sighting.
+func TestDispatcherSettleHoldsAOneShotRetriedConfigError(t *testing.T) {
 	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		t0      time.Time
+		message string
+	}{
+		{"host IP unknown from a node scale-down", time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC), hostIPUnknownEvent},
+		{"etc-hosts from a pod deleted mid-start", time.Date(2026, 11, 5, 23, 42, 18, 0, time.UTC), etcHostsGoneEvent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t0 := tc.t0
+			now := t0
+			disp, m, injectCount := failedDispatcher(t, &now)
+			disp.Dispatch(ctx, settleFailed(t0, tc.message, 0, 1))
+			if *injectCount != 0 {
+				t.Fatalf("a one-shot %q fired %d injects; want 0", tc.message, *injectCount)
+			}
+			if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateSettle))); got != 1 {
+				t.Errorf("events_filtered_total{gate=settle} = %v; want 1", got)
+			}
+			now = t0.Add(2*time.Minute + settleQuietSlack)
+			disp.Sweep(ctx)
+			if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
+				t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
+			}
 
+			now = t0
+			lasting, _, lastingCount := failedDispatcher(t, &now)
+			for i, lasted := range []time.Duration{0, 30 * time.Second, 90 * time.Second, 130 * time.Second} {
+				now = t0.Add(lasted)
+				lasting.Dispatch(ctx, settleFailed(t0, tc.message, lasted, i+1))
+			}
+			if *lastingCount != 1 {
+				t.Errorf("a %q lasting past the period fired %d injects; want 1", tc.message, *lastingCount)
+			}
+		})
+	}
+
+	t0 := time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC)
 	now := t0
-	disp, m, injectCount := failedDispatcher(t, &now)
-	disp.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, 0, 1))
-	if *injectCount != 0 {
-		t.Fatalf("a one-shot host IP unknown fired %d injects; want 0", *injectCount)
-	}
-	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateSettle))); got != 1 {
-		t.Errorf("events_filtered_total{gate=settle} = %v; want 1", got)
-	}
-	now = t0.Add(2*time.Minute + settleQuietSlack)
-	disp.Sweep(ctx)
-	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
-		t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
-	}
-
-	now = t0
-	lasting, _, lastingCount := failedDispatcher(t, &now)
-	for i, lasted := range []time.Duration{0, 30 * time.Second, 90 * time.Second, 130 * time.Second} {
-		now = t0.Add(lasted)
-		lasting.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, lasted, i+1))
-	}
-	if *lastingCount != 1 {
-		t.Errorf("a host IP unknown lasting past the period fired %d injects; want 1", *lastingCount)
-	}
-
-	now = t0
 	start, _, startCount := failedDispatcher(t, &now)
 	start.Dispatch(ctx, settleFailed(t0, startErrorEvent, 0, 1))
 	if *startCount != 1 {

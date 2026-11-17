@@ -37,6 +37,7 @@ from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import board_health_card
 import board_snapshot
 import chat_notify
+import clean_merges
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -64,6 +65,9 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# Joins the per-platform no-route refusals when the gateway holds more than one
+# backend with no home channel; chat_delivery_watch reads refusals joined by it.
+NO_CHAT_ROUTE_JOIN = "; "
 
 # The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
 # per session, written once under ORIGIN_KEY in its metadata, with the chat
@@ -83,6 +87,15 @@ ORIGIN_PLATFORM_MAX_CHARS = 64
 ORIGIN_JOB_ID_MAX_CHARS = 256
 PROPOSAL_URL_MAX_CHARS = 2048
 PROPOSAL_OPENED_AT_MAX_CHARS = 64
+# The post-merge check's records (design gke-labs/kube-agents#5054, step 1,
+# "Record it"): one row per fix pull request, written when its proposal is
+# claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
+# fix the check knows, by the fleet audit's check id, which is the first segment
+# of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
+# derived from that id here, never taken from the caller. The pr_opened plugin
+# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
+POST_MERGE_KINDS = ("no-pdb",)
+POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
 ORIGIN_COMPRESSION_END_REASON = "compression"
@@ -618,7 +631,9 @@ CHAT_REPORT_MAX_BYTES = 1024 * 1024
 # created at runtime keeps posting its final message.
 IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
 # The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
-# every scheduled delivery and `report_to_chat` never does.
+# every scheduled delivery, and onboarding's lost-summaries stage
+# (bootstrap_delivery.resend_lost_summaries) when it re-posts a first-run
+# audit that found no home channel; `report_to_chat` never does.
 SCHEDULER_LEG_KEY = "also_delivered_to"
 # deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
 # delivery is the scheduler's failure line for the run.
@@ -1051,6 +1066,40 @@ WORKLOAD_INCIDENT_INDEX_TERM = (
 PR_OPENED_EVENT_KIND = "pr_opened"
 PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
+_PROPOSAL_URL_PREFIX_RE = re.compile(r"https?://[^/\s]+/")
+_PROPOSAL_URL_MARKERS = ("/pull/", "/-/merge_requests/", "/pulls/", "/pull-requests/")
+_PROPOSAL_URL_TAIL_REFUSED = ("/-/", "/issues/", "/pull/", "/pulls/", "/pull-requests/", "/merge_requests/")
+
+
+def proposal_url_parts(url: str) -> tuple[str, int] | None:
+    """``(repository url, number)``, PROPOSAL_URL_RE's two groups, when it matches ``url``; else None.
+
+    The same answer as that pattern, found by string search rather than a
+    backtracking match, for text a caller sends: its ``\\S+`` before the
+    marker alternation is polynomial on a crafted url.
+    """
+    prefix = _PROPOSAL_URL_PREFIX_RE.match(url)
+    if prefix is None or any(c.isspace() for c in url):
+        return None
+    rest = url[prefix.end():]
+    found = []
+    for marker in _PROPOSAL_URL_MARKERS:
+        at = rest.find(marker, 1)
+        while at != -1:
+            found.append((at, marker))
+            at = rest.find(marker, at + 1)
+    # The pattern's greedy group takes the last marker that leaves a valid tail.
+    for at, marker in sorted(found, reverse=True):
+        start = end = at + len(marker)
+        while end < len(rest) and rest[end].isdecimal():
+            end += 1
+        tail = rest[end:]
+        if end == start or (tail and tail[0] not in "/?#"):
+            continue
+        if any(refused in tail[1:] for refused in _PROPOSAL_URL_TAIL_REFUSED):
+            continue
+        return url[: prefix.end() + at], int(rest[start:end])
+    return None
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
 # The forge lookup's budget for the whole search; past it the event is
@@ -1230,6 +1279,11 @@ DRIFT_ALERT_EMOJI = "🔀"
 # shape rather than leaving the column blank and the recap with nothing to
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
+
+# The titles a drift triage gives its two usual options. A title is the button
+# slack_ux_incident draws for the option, so these are what a person presses.
+DRIFT_REVERT_TITLE = "Put Git's version back"
+DRIFT_KEEP_TITLE = "Keep it · update Git"
 
 # What a drift card says when the install has no usable GitOps repository
 # registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
@@ -1855,6 +1909,54 @@ def init_db() -> None:
                 )
                 """
             )
+            # The post-merge check's records, one per fix pull request: what it
+            # fixes, where it came from and which thread asked, written at open
+            # (POST /v1/post-merge/records). The environment, merge, edit,
+            # revert and outcome columns are filled later by the check itself.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS post_merge_records (
+                    url             TEXT PRIMARY KEY,
+                    repo            TEXT,
+                    number          INTEGER,
+                    kind            TEXT,
+                    finding_id      TEXT,
+                    project         TEXT,
+                    location        TEXT,
+                    cluster         TEXT,
+                    namespace       TEXT,
+                    object          TEXT,
+                    environment     TEXT,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    opened_at       TEXT,
+                    task_id         TEXT,
+                    thread_platform TEXT,
+                    thread_chat_id  TEXT,
+                    thread_id       TEXT,
+                    merged_at       TEXT,
+                    merge_commit    TEXT,
+                    closed_at       TEXT,
+                    merge_checked_at TEXT,
+                    applied_at      TEXT,
+                    sync_state      TEXT,
+                    health_baseline TEXT,
+                    health_result   TEXT,
+                    health_detail   TEXT,
+                    health_at       TEXT,
+                    health_checked_at TEXT,
+                    human_edited    INTEGER,
+                    reverted_at     TEXT,
+                    outcome         TEXT,
+                    outcome_at      TEXT,
+                    outcome_detail  TEXT,
+                    reported_at     TEXT,
+                    followup_state  TEXT,
+                    followup_attempts INTEGER,
+                    followup_detail TEXT
+                )
+                """
+            )
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -1894,6 +1996,7 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     # the next sweep re-offers. Their lifecycle is `state`, not age.
     # `cron_job_origins` and `proposals_opened` are absent too: a job's origin
     # holds for as long as the job exists, and the ledger is a durable count.
+    # So is `post_merge_records`: each row is a durable record of a fix pull request.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -2869,15 +2972,17 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform ``chat_notify.routed_platform()``
-    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
-    ``spec.mode: next`` the
-    managed scope says that platform's Hermes consumer is off because the A2A
-    gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to, with a home channel or
-    (when it is the only chat platform) without one, the gateway keeping the
-    refused posts for a digest. The operator renders the variable only then,
-    and it is reserved against every other source.
+    One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
+    names, from ``A2A_NOTIFY_PLATFORM``, ``A2A_NOTIFY_CONVERSATIONS`` and the
+    projected home-channel file. The managed scope says each such
+    platform's Hermes consumer is off because the
+    A2A gateway holds its backend, and posts to it go through the gateway
+    instead, so each is still a platform this install posts to. The operator
+    lists the armed routes with a CR home channel; ``routed_platforms()`` adds
+    Slack when the file names a channel, and takes every armed route when no
+    platform has a home, the gateway keeping the refused posts for a digest.
+    The alert takes the first of them. The variables are the operator's, and
+    they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -2922,8 +3027,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
-    projected home-channel file) resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM`, the
+    projected home-channel file, or with neither, the `A2A_NOTIFY_CONVERSATIONS`
+    fallback) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -2977,17 +3083,21 @@ def _no_chat_route_error() -> str:
     It reaches `last_delivery_error` through the relay adapter and the 502, and
     from there the dashboard, `hermes cron list`, the cronjob tool's reply in
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
-    backend whether or not a home channel is set, so with one named the cause is
-    the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither. A pod the operator has routed
-    never reaches this: its send goes to the gateway, whose refusal says the
-    post is kept.
+    backends whether or not a home channel is set, so with any named the cause
+    is the missing home channel, one sentence per platform; without one this
+    cannot tell no chat from a misconfigured one, so it guesses at neither.
+    :func:`relay_cron_report` never reaches the per-platform branch:
+    ``chat_notify.routed_platforms()`` is empty only when no route is armed, and
+    then ``gateway_platforms()`` is empty too. The branch stays because
+    ``chat_delivery_watch.platforms_from`` reads its wording from ledger rows
+    that older pods wrote.
     """
-    platform = chat_notify.gateway_platform()
-    setting = HOME_CHANNEL_SETTINGS.get(platform)
-    if setting:
-        return f"composed but not delivered to {platform} (no home channel: set {setting})"
-    return NO_CHAT_ROUTE_ERROR
+    refusals = [
+        f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
+        for platform in chat_notify.gateway_platforms()
+        if platform in HOME_CHANNEL_SETTINGS
+    ]
+    return NO_CHAT_ROUTE_JOIN.join(refusals) or NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -4499,6 +4609,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
         f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
         f"they are the ones above.\n\n"
+        f"**Title those two with these exact words,** because each title becomes the button a person presses in "
+        f"chat: the revert is `{DRIFT_REVERT_TITLE}`, and changing git to declare what is now live is "
+        f"`{DRIFT_KEEP_TITLE}`. The same words title a lone **Proposed fix** that does one of them. Any other "
+        f"option gets a short title of its own.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -4517,8 +4631,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"<object> on <cluster> was changed outside Git.\n\n"
+        f"<1-2 sentences: which field went from what to what, at what time and by whom, then whether the change "
+        f"still stands and what it means now>\n\n"
         f"## Why\n\n"
+        f"```diff\n"
+        f"- <field>: <its value before the change, or 'not shown by the cluster'>\n"
+        f"+ <field>: <its value now>\n"
+        f"```\n\n"
         f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
         f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
@@ -6367,12 +6487,10 @@ def relay_cron_report(
 
     An install with no chat route gets no send at all, where the fallback to
     DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
-    with neither platform, or a pod rendered before the operator routed its only
-    platform without a home channel (a routed pod sends, and the gateway refuses
-    and keeps the post). The error
-    names the platform and the setting that arms it, in the wording
-    `chat_delivery_watch` reads the platform from; see
-    :func:`_no_chat_route_error`.
+    with no armed route. An armed route with no home channel is routed through
+    the fallback, sends, and the gateway refuses and keeps the post. The
+    platform-naming wording of :func:`_no_chat_route_error` is reached only
+    with no armed route, so this path never produces it; see that function.
 
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
@@ -6593,7 +6711,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     """Relay a specialist's finished scheduled report to chat, and say whether it landed.
 
     Synchronous on purpose, unlike `/inject`. This route's caller is not an agent
-    turn waiting on a tool result — it is the cron scheduler's delivery step, and
+    turn waiting on a tool result — it is the cron scheduler's delivery step (or
+    onboarding's lost-summaries stage re-posting one of its deliveries), and
     its return value is what decides whether the run is recorded as delivered.
     Answering `accepted` before doing the work made every failure past this line
     invisible: `hermes send` exiting non-zero, unparseable `--json` stdout, or an
@@ -8347,6 +8466,115 @@ def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
     return {"recorded": cursor.rowcount > 0}
 
 
+def _bounded_text(request_data: Dict[str, Any], field: str) -> str:
+    """``field`` as a string of at most POST_MERGE_FIELD_MAX_CHARS, empty when absent, else a 400."""
+    value = request_data.get(field) or ""
+    if not isinstance(value, str) or len(value) > POST_MERGE_FIELD_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be a string of at most {POST_MERGE_FIELD_MAX_CHARS} characters"
+        )
+    return value.strip()
+
+
+def _cluster_coordinates(cluster: str) -> tuple[str, str]:
+    """``(project, location)`` of the managed cluster named ``cluster``; empty when no profile names it or they disagree.
+
+    ``cluster`` is the bare GKE name or the fleet audit's qualified
+    ``<project>/<location>/<name>``; a qualified name matches only the profile
+    whose identity has all three. Read from the Cluster Agent profiles'
+    ``cluster_identity`` stamp, the fleet's own record of each cluster, rather
+    than from the caller.
+    """
+    import cluster_agent_profile
+
+    found = set()
+    profiles = board_snapshot.PROFILES_DIR
+    if not cluster or not profiles.is_dir():
+        return "", ""
+    parts = cluster.split("/")
+    if len(parts) == 3 and all(parts):
+        want = {"project": parts[0], "location": parts[1], "cluster": parts[2]}
+    elif len(parts) == 1:
+        want = {"cluster": cluster}
+    else:
+        return "", ""
+    for home in sorted(profiles.iterdir()):
+        try:
+            identity = cluster_agent_profile.read_cluster_identity(home)
+        except Exception:  # noqa: BLE001 — an unreadable profile names no cluster
+            continue
+        if identity and all(identity[key] == value for key, value in want.items()):
+            found.add((identity["project"], identity["location"]))
+    return found.pop() if len(found) == 1 else ("", "")
+
+
+@app.post("/v1/post-merge/records", dependencies=[Depends(verify_api_key)])
+def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Record one fix pull request for the post-merge check; the first record of a url stands.
+
+    The url must be a pull request url (PROPOSAL_URL_RE). The finding it fixes
+    (``finding_id``, ``cluster``, ``namespace``, ``object``) must be of a kind
+    the check knows: the kind is the finding id's first segment (POST_MERGE_KINDS),
+    and a ``kind`` the caller sends is ignored. The cluster's project and location
+    come from the Cluster Agent profiles (:func:`_cluster_coordinates`). 200 either
+    way, so a retry after a lost answer is not told it failed.
+    """
+    url = request_data.get("url")
+    parts = proposal_url_parts(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
+    if parts is None:
+        raise HTTPException(status_code=400, detail="url must be a pull request url")
+    repository, number = parts
+    sent_number = request_data.get("number")
+    if sent_number is not None and sent_number != number:
+        raise HTTPException(status_code=400, detail="number must match the pull request url")
+    finding_id = _bounded_text(request_data, "finding_id")
+    kind = finding_id.split(".", 1)[0]
+    if kind not in POST_MERGE_KINDS:
+        raise HTTPException(
+            status_code=400, detail=f"finding_id must name a finding of one of {list(POST_MERGE_KINDS)}"
+        )
+    cluster = _bounded_text(request_data, "cluster")
+    workload = _bounded_text(request_data, "object")
+    if not cluster or not workload:
+        raise HTTPException(status_code=400, detail="cluster and object must name the workload the fix is for")
+    origin, platform = _origin_fields(request_data)
+    opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
+        )
+    project, location = _cluster_coordinates(cluster)
+    row = (
+        url.strip(),
+        repository,
+        number,
+        kind,
+        finding_id,
+        project,
+        location,
+        cluster,
+        _bounded_text(request_data, "namespace"),
+        workload,
+        _bounded_text(request_data, "environment"),
+        origin,
+        platform,
+        opened_at,
+        _bounded_text(request_data, "task_id"),
+        _bounded_text(request_data, "thread_platform"),
+        _bounded_text(request_data, "thread_chat_id"),
+        _bounded_text(request_data, "thread_id"),
+    )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO post_merge_records (url, repo, number, kind, finding_id, project, location, "
+                "cluster, namespace, object, environment, origin, origin_platform, opened_at, task_id, "
+                "thread_platform, thread_chat_id, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+    return {"recorded": cursor.rowcount > 0}
+
+
 @app.get("/v1/proposals/opened/counts", dependencies=[Depends(verify_api_key)])
 def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
     """`{origin: {platform: n}}` for every origin in ORIGINS, an origin with no row as `{"": 0}`."""
@@ -9847,6 +10075,13 @@ CARD_STOP_BUSY_TIMEOUT_S = 3.0
 # The bound on the answer: see the section comment. The bridge's request
 # timeout and the gateway's wait for the control task sit above it.
 CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+# The bound on a call that joins a running stop (_card_stop_single_flight):
+# the call's one deadline covers both its wait and, when the joined answer
+# can't be reused, its own stop, which then runs on what is left of it; each
+# can overrun the deadline by a board busy timeout and a second. Under the
+# bridge's 35 s request timeout (DefaultCardStopTimeout in
+# a2a/hermes-bridge/cardstop.go), so a joined stop still answers the cancel.
+CARD_STOP_JOIN_WORST_CASE_S = CARD_STOP_WORST_CASE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
 # Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
 CARD_STOP_KILL_GRACE_SECONDS = 3.0
 CARD_STOP_KILL_POLL_SECONDS = 0.1
@@ -9895,8 +10130,8 @@ def _card_stop_clock() -> float:
 class _Budget:
     """The call's deadline. `hit` records that something was not started for it."""
 
-    def __init__(self) -> None:
-        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+    def __init__(self, deadline: Optional[float] = None) -> None:
+        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S if deadline is None else deadline
         self.hit = False
 
     def left(self) -> float:
@@ -10419,8 +10654,12 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
     was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
-    an archived card is not open.
+    within CARD_STOP_WORST_CASE_S, or CARD_STOP_JOIN_WORST_CASE_S for a call that
+    joins a running stop. A call while another for the same session
+    and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one, with no
+    card open in the conversation's tree now, answers with that stop's result marked
+    `joined` (_card_stop_single_flight). Past that, calling it again stops
+    nothing new, since an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
@@ -10432,8 +10671,166 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         raise HTTPException(status_code=400, detail="conversation or context_id is too long")
     if session_id != _conversation_session_id(context_id):
         raise HTTPException(status_code=400, detail="context_id is not this session's")
+    return _card_stop_single_flight(
+        session_id, conversation, lambda deadline: _stop_session_cards_now(session_id, conversation, deadline)
+    )
 
-    budget = _Budget()
+
+# A conversation's card stop is single-flight (#5528). With the gateway's
+# card-stop control armed, a typed console or MCP stop runs two stops on one
+# session at once: the control's and the hermes-bridge's cancel archive. The
+# second to arrive would find the cards archived and answer "stopped 0", and
+# the caller would read the two answers as contradicting each other. So a stop
+# that arrives while one for the same session and conversation is running
+# waits for it, and one that arrives within CARD_STOP_JOIN_WINDOW_S of a
+# finished stop looks at it; either answers with that stop's result, marked
+# `joined`, only when the result is complete (nothing failed, pending,
+# unresolved, past the deadline or truncated) and no card in the
+# conversation's tree is open now. A complete stop left nothing open, so an
+# open card is one filed since: real new work, which gets a fresh stop, as
+# does anything a partial stop may have left running. Read by status, not by
+# created_at, whose whole-second stamps can't tell a card filed just before
+# the stop from one filed just after. Anything uncertain scans afresh.
+CARD_STOP_JOIN_WINDOW_S = 60.0
+
+
+class _CardStopFlight:
+    """One stop for a (session, conversation): its result or error, and when
+    it ended."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.finished_at: Optional[float] = None  # monotonic
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[HTTPException] = None
+
+
+_card_stop_flights_lock = threading.Lock()
+_card_stop_flights: Dict[tuple, _CardStopFlight] = {}
+
+
+def _joined(flight: _CardStopFlight) -> Dict[str, Any]:
+    if flight.error is not None:
+        raise flight.error
+    out = dict(flight.result or {})
+    out["joined"] = True
+    return out
+
+
+def _card_stop_result_complete(result: Optional[Dict[str, Any]]) -> bool:
+    """Whether a stop's result can stand in for another stop: everything it
+    found stopped or settled, nothing failed, pending, unresolved or past the
+    deadline, and the set not truncated. A partial stop is never reused."""
+    if not result:
+        return False
+    return not (
+        result.get("failed")
+        or result.get("pending")
+        or result.get("unresolved")
+        or result.get("errors")
+        or result.get("deadline")
+        or result.get("truncated")
+    )
+
+
+def _card_stop_reusable(flight: _CardStopFlight, session_id: str, conversation: str) -> bool:
+    """A finished flight's result answers this call only when it is complete
+    and no card in the conversation's tree is open now (CARD_STOP_JOIN_WINDOW_S's
+    comment); anything else needs a fresh stop (fail closed)."""
+    return (
+        flight.error is None
+        and _card_stop_result_complete(flight.result)
+        and not _card_stop_tree_has_open_card(session_id, conversation)
+    )
+
+
+def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[str, Any]:
+    # One deadline for the whole call, so a call that joins a running stop
+    # and then has to stop for itself still answers within
+    # CARD_STOP_JOIN_WORST_CASE_S: run(deadline) gets what is left of it.
+    deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+    key = (session_id, conversation)
+    with _card_stop_flights_lock:
+        flight = _card_stop_flights.get(key)
+        recent = (
+            flight
+            if flight is not None
+            and flight.done.is_set()
+            and flight.finished_at is not None
+            and time.monotonic() - flight.finished_at < CARD_STOP_JOIN_WINDOW_S
+            else None
+        )
+    if recent is not None and _card_stop_reusable(recent, session_id, conversation):
+        return _joined(recent)
+    # Register this stop, unless one is running for the conversation: then
+    # wait for it and take its answer only if it is reusable, else register
+    # afresh. Checked and registered under one lock, so two callers that
+    # arrive together never both scan. Bounded: a racing stop is joined at
+    # most twice before this call scans for itself regardless.
+    for attempt in range(3):
+        own: Optional[_CardStopFlight] = _CardStopFlight()
+        with _card_stop_flights_lock:
+            racing = _card_stop_flights.get(key)
+            if attempt < 2 and racing is not None and not racing.done.is_set():
+                own = None
+            else:
+                _card_stop_flights[key] = own
+                # Bounded: drop finished flights past the window.
+                now = time.monotonic()
+                for k in [
+                    k
+                    for k, f in _card_stop_flights.items()
+                    if f.finished_at is not None and now - f.finished_at >= CARD_STOP_JOIN_WINDOW_S
+                ]:
+                    del _card_stop_flights[k]
+        if own is not None:
+            break
+        # Waited on until this call's own deadline, plus the slack a busy
+        # board connection adds; a stop still running past that (it can't
+        # be, but a wedged board connection is not ours to trust) gets this
+        # call a 503 rather than a longer wait.
+        wait = max(0.0, deadline - _card_stop_clock()) + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+        if not racing.done.wait(wait):
+            raise HTTPException(status_code=503, detail="a card stop for this conversation is still running")
+        if _card_stop_reusable(racing, session_id, conversation):
+            return _joined(racing)
+    try:
+        own.result = run(deadline)
+        return own.result
+    except HTTPException as exc:
+        own.error = exc
+        raise
+    except Exception:
+        own.error = HTTPException(status_code=500, detail="the card stop failed")
+        raise
+    finally:
+        own.finished_at = time.monotonic()
+        own.done.set()
+
+
+def _card_stop_tree_has_open_card(session_id: str, conversation: str) -> bool:
+    """Whether the conversation's card tree holds a card that is not done or
+    archived (CARD_STOP_SETTLED_STATUSES). Any failure to read it, or a tree
+    too large to read whole, answers True, so the caller scans afresh."""
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return False
+    try:
+        _, connect_tracked = _hermes_kanban()
+        conn = _card_stop_connect(connect_tracked, board)
+        with closing(conn):
+            sessions = [session_id, *_compression_descendants(session_id)]
+            tree = _collect_card_tree(conn, sessions, session_id, conversation, _Budget())
+    except Exception:
+        return True
+    if tree.truncated:
+        return True  # a tree too large to read whole may hold an open card
+    return any(card.get("status") not in CARD_STOP_SETTLED_STATUSES for card in tree.cards.values())
+
+def _stop_session_cards_now(session_id: str, conversation: str, deadline: Optional[float] = None) -> Dict[str, Any]:
+    """One stop of the conversation's cards: the route's body, run through
+    _card_stop_single_flight, on the call's deadline (_Budget)."""
+    budget = _Budget(deadline)
     result: Dict[str, Any] = {
         "session_id": session_id,
         "board": False,
@@ -10826,6 +11223,21 @@ def get_board() -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 
+@app.get("/v1/post-merge/clean-merges", dependencies=[Depends(verify_api_key)])
+def get_clean_merges(repo: str = "") -> Dict[str, Any]:
+    """Clean merges per repository, kind of fix and environment (`clean_merges.py`), for the offer and the dial.
+
+    `repo` narrows the answer to one repository. A database that cannot be read,
+    or a records table without a column the count needs, is a 503, never zero
+    clean merges.
+    """
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+            return clean_merges.track_record(conn, datetime.now(timezone.utc), repo=repo.strip() or None)
+    except (sqlite3.Error, clean_merges.SchemaIncomplete) as exc:
+        raise HTTPException(status_code=503, detail=f"the post-merge records could not be read: {exc}") from None
+
+
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
 def get_ranked_findings() -> Dict[str, Any]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -10865,7 +11277,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
 def get_finding_additions(day: str = "") -> Dict[str, Any]:
-    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    """Items added on a UTC day (default today) by class, and the line of each, across every state (§7.2)."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:

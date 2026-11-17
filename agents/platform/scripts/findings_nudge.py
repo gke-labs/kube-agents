@@ -46,11 +46,15 @@ posts as a failure) once a UTC day; later failures that day go to stderr and
 exit 0.
 
 The bookkeeping is best-effort, and what a failed write costs: an addition
-whose mark fails is not offered again the same day (the state file remembers
-it), still counts against that day's limit, and holds additions back as a
-pending item of its class would, though the stop-add notice does not name it.
-Unlike a recorded addition, it counts only while undecided: a decision on it
-the same day refunds its slot. It is offered as new the next day. If the state file cannot be written
+whose marks all fail is not offered again the same day (the state file
+remembers it), still counts against that day's limit, and holds additions back
+as a pending item of its class would, though the stop-add notice does not name
+it. Unlike a recorded addition, it counts only while undecided: a decision on
+it the same day refunds its slot. It is offered as new the next day. When only
+some of an addition's marks fail, the addition is on record: a member left new
+waits for the next day and does not count again; a non-critical one does not
+stop additions, and a critical one holds non-criticals back as a critical
+waiting for the budget does. If the state file cannot be written
 either, the same additions and the daily part are posted again every hour.
 """
 
@@ -91,10 +95,18 @@ PROFILES_DIR = "profiles"
 STATE_FILE = ".findings_nudge_state.json"
 DAILY_KEY = "daily_section"
 FAILURE_KEY = "failure_reported"
-# {"day": <UTC date>, "keys": [<item key>, ...]}: what was added today, so a
-# mark that failed does not announce the same item again an hour later, and
-# the item still counts against the day and holds additions back (`pace`).
+# {"day": <UTC date>, "keys": [<item key>, ...], "ids": [<member id>, ...]}:
+# what was added today and the members it named, so a mark that failed does
+# not announce the same item again an hour later, and the item still counts
+# against the day and holds additions back (`pace`). A row that joins the line
+# later is not one of the ids, so it does not hold anything back. An item
+# whose additions today are all in the queue's record (some marks succeeded)
+# does not count again; it waits for tomorrow (`pace`). A record an
+# older build wrote today has no "ids"; the key alone decides until the day ends.
 ANNOUNCED_KEY = "announced"
+ANNOUNCED_DAY = "day"
+ANNOUNCED_KEYS = "keys"
+ANNOUNCED_IDS = "ids"
 # The run id sent with an addition's marks: one per run, so the members of an
 # item marked one by one are one addition.
 RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -398,8 +410,19 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         if why:
             sys.stderr.write(why + "\n")
         announced = state.get(ANNOUNCED_KEY) if isinstance(state.get(ANNOUNCED_KEY), dict) else {}
-        announced_keys = (announced.get("keys") or []) if announced.get("day") == today else []
-        plan = fq.pace(rows, now, fq.pacing_limits(os.environ), added_today, may_add=not held, announced=announced_keys)
+        todays = announced if announced.get(ANNOUNCED_DAY) == today else {}
+        keys = todays.get(ANNOUNCED_KEYS)
+        announced_keys = keys if isinstance(keys, list) and all(isinstance(key, list) for key in keys) else []
+        if not todays:
+            announced_ids = []
+        elif isinstance(todays.get(ANNOUNCED_IDS), list):
+            announced_ids = todays[ANNOUNCED_IDS]
+        else:
+            announced_ids = None
+        plan = fq.pace(
+            rows, now, fq.pacing_limits(os.environ), added_today,
+            may_add=not held, announced=announced_keys, announced_ids=announced_ids,
+        )
         daily = now.hour >= fq.REMIND_HOUR and state.get(DAILY_KEY) != today
         open_count = len({fq.item_key(row) for row in rows if not fq.rolled_up(row)}) + plan.rolled_up
         message = compose(plan, open_count, daily)
@@ -414,7 +437,10 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
     # Before the marks, so a mark that raises cannot cost the record that the
     # message went out.
     if plan.add:
-        state[ANNOUNCED_KEY] = {"day": today, "keys": announced_keys + [list(item.key) for item in plan.add]}
+        record = {ANNOUNCED_DAY: today, ANNOUNCED_KEYS: announced_keys + [list(item.key) for item in plan.add]}
+        if announced_ids is not None:
+            record[ANNOUNCED_IDS] = announced_ids + [str(member.get("id")) for item in plan.add for member in item.members]
+        state[ANNOUNCED_KEY] = record
     if daily:
         state[DAILY_KEY] = today
     if plan.add or daily:

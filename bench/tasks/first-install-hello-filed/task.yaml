@@ -1,0 +1,213 @@
+---
+id: first-install-hello-filed
+name: The first-install hello, report already filed as an issue, answers first and links it once
+fixtures: []
+# The greeting a new user gets on their first chat turn when nobody wrote to the
+# install within a day of its first inventory sweep, so the delivery stage filed
+# the ranked report as a ledger issue in the GitOps repository instead of
+# posting it into a thread (agents/chat/scripts/bootstrap_delivery.py). The
+# bootstrap_onboarding plugin then greets that turn once with a pointer to the
+# issue (agents/chat/defaults/onboarding/report_filed.md): the same opener,
+# read-only and pull-request points and one question as its siblings, plus the
+# issue's address exactly once, after the opener. The stack arms the plugin's
+# eval seam with the filed variant, which carries the address; the plugin reads
+# and writes no record for it, so the install's own onboarding state is untouched.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/first-install-hello"
+  teardown: true
+  variables:
+    case_suffix: "filed"
+    variant: "filed"
+    filed_url: "https://github.com/example-org/gitops/issues/75"
+    phrase: "set you up last week"
+validated: false
+domain: chat-and-routing
+owner: lapis2002
+tool_calls_optional: true
+prompt: "hi! priya here, set you up last week"
+expected_output: |
+  critical requirements:
+  - One short message that opens "Hi there", because the API server carries no
+    Slack profile name and the typed "priya" is not one, and introduces itself as kube-agents,
+    with no internal agent names and no architecture.
+  - After that opener it says the first-run inventory report was ready before
+    anyone wrote, so it was filed as an issue, and gives the issue's address
+    https://github.com/example-org/gitops/issues/75 exactly once, never as the
+    first words. It says it only read the clusters, so nothing changed, and that
+    any change it thinks should be made comes as a pull request for the team to
+    review. It does not say the results are in this chat, that it is still
+    looking, or that it will post the findings later.
+  - It ends on exactly one question, an offer to start on a finding. It asks for
+    nothing else: no SOPs, runbooks, governance or time zone.
+  - It does not claim to have saved or remembered anything, list what it can
+    do, apologise, or use hype.
+verification_spec:
+  - name: greets-with-the-fallback-without-a-profile-name
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["hi there"]
+      forbidden_phrases: ["priya"]
+      forbidden_patterns: ['\A(?!\s*hi there)']
+
+  - name: says-it-is-kube-agents
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kube-agents"]
+
+  - name: links-the-issue-exactly-once
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["github.com/example-org/gitops/issues/75"]
+      forbidden_patterns:
+        - 'github\.com/example-org/gitops/issues/75[\s\S]*github\.com/example-org/gitops/issues/75'
+
+  # Answer first: the address comes after the opener, never as the first
+  # words. The opener closes on the wave, with no sentence punctuation of its
+  # own, so the first pattern forbids the address anywhere before a wave or a
+  # sentence end, and the second forbids it within the three words that follow
+  # the wave.
+  - name: the-link-is-not-the-first-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\A[^👋.!?]*github\.com/example-org/gitops/issues/75'
+        - '👋\s*(?:\S+\s+){0,2}\S*github\.com/example-org/gitops/issues/75'
+
+  - name: says-the-report-was-filed-as-an-issue
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["filed", "as an issue", "in an issue"]
+
+  - name: says-it-only-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "read-only",
+          "only reading",
+          "only read",
+          "nothing in your clusters",
+          "won't change",
+          "nothing changed",
+          "not changing",
+        ]
+
+  - name: says-changes-come-as-pull-requests
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["pull request", "as a pr", "a pr for"]
+
+  # The report is in the issue, not in this chat; a paraphrase of the
+  # instruction's "instead of being posted into a chat thread" is allowed, a
+  # claim that the results sit in the chat is not.
+  - name: does-not-place-the-report-in-this-chat
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - "(results|findings|summary|report) (is|are|follows?|sits?) in (this|the) chat"
+        - "still (running|looking|scanning)"
+        - "\\b(i'?ll|i will|will) (post|share|send) (what|the (results|findings|summary))"
+
+  - name: asks-one-question-and-ends-on-it
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\?[\s\S]*\?'
+        - '[^?\s]\s*\Z'
+
+  # This case's request has home_channel_set false, so the plugin adds no
+  # sentence about scheduled reports. A greeting that says it anyway tells the user
+  # something the install did not do.
+  - name: no-scheduled-report-claim
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ["scheduled report"]
+
+  - name: at-most-sixty-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A\s*(?:\S+\s+){60}\S']
+
+  - name: no-architecture
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        [
+          "planning agent",
+          "platform agent",
+          "cluster agent",
+          "specialist",
+          "kanban",
+          "hierarchy",
+        ]
+
+  - name: no-stacked-asks
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        ['\bsops?\b', '\brunbooks?\b', "time ?zone", "governance"]
+
+  - name: claims-no-save
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\b(saved|remember(ed)?|noted|stored)\b']
+
+  - name: no-capability-list
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?m)^\s*(?:[-•]|\d+[.)])\s'
+        # A second line of text: the instruction asks for one message of at most
+        # 60 words in plain sentences, which is one paragraph. The normaliser
+        # deletes `*`, so a `*` bullet cannot be told from an indented line;
+        # counting lines needs neither, and catches a list whatever opens it.
+        - '\S[^\n]*\n\s*\S'
+        - "i can help( you)? with"
+
+  - name: no-apology-hype-or-filler
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\b(sorry|apologi[sz]e)'
+        - '\b(excited|thrilled|delighted|supercharge|seamless)'
+        - "let me know"
+        - "good (morning|afternoon|evening)"

@@ -34,13 +34,10 @@ half of the first:
   `WATCHER_NAMED_READS`; pods are not, so the first-sorted pod's metadata is
   reach this rule adds. One more GET reads one named Pod's metadata, under a
   JSON `PartialObjectMetadata` Accept on every range, for the event watcher's
-  owner lookup; the broker relays only its projection (`project_pod_metadata`:
-  the controller ownerReference's kind and name when it is one of
-  `POD_METADATA_OWNER_KINDS`, a ReplicaSet only with its `pod-template-hash`
-  label, which is relayed with it), never the Pod's name or UID, an
-  annotation, another label, another owner or managedFields. No other list, no
-  watch of anything else (the deprecated `watch/<resource>` paths included), no
-  subresource, never a Secret.
+  owner lookup; the broker relays only its projection (`project_pod_metadata`;
+  the `POD_METADATA_KIND` comment names each field it keeps, and why). No
+  other list, no watch of anything else (the deprecated `watch/<resource>`
+  paths included), no subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -53,6 +50,7 @@ import re
 from typing import Any
 
 from command_policy import Decision
+import credential_proxy_client
 
 WATCHER_GCP_PREFIX = "/v1/watcher/gcp/"
 WATCHER_K8S_PREFIX = "/v1/k8s/"
@@ -64,8 +62,11 @@ PLATFORM_PUBSUB_PREFIX = "/v1/pubsub/gcp/"
 METHOD_GET = "GET"
 METHOD_POST = "POST"
 
-GKE_HOST = "container.googleapis.com"
-PUBSUB_HOST = "pubsub.googleapis.com"
+DEFAULT_UNIVERSE_DOMAIN = credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
+GKE_SERVICE_NAME = "container"
+PUBSUB_SERVICE_NAME = "pubsub"
+GKE_HOST = f"{GKE_SERVICE_NAME}.{DEFAULT_UNIVERSE_DOMAIN}"
+PUBSUB_HOST = f"{PUBSUB_SERVICE_NAME}.{DEFAULT_UNIVERSE_DOMAIN}"
 
 # Rule ids, in the order the evaluators answer.
 RULE_GCP_METHOD = "gcp.watcher.method"
@@ -404,6 +405,14 @@ _PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules(
 )
 
 
+def gke_host(universe_domain: str = DEFAULT_UNIVERSE_DOMAIN) -> str:
+    return credential_proxy_client.google_api_host(GKE_SERVICE_NAME, universe_domain)
+
+
+def pubsub_host(universe_domain: str = DEFAULT_UNIVERSE_DOMAIN) -> str:
+    return credential_proxy_client.google_api_host(PUBSUB_SERVICE_NAME, universe_domain)
+
+
 def _evaluate_subscription_call(
     method: str, path: str, body: bytes, subscriptions: frozenset[str], rules: _SubscriptionRules
 ) -> Decision:
@@ -423,35 +432,62 @@ def _evaluate_subscription_call(
     return Decision(allowed=True, rule_id=rules.allowed_prefix + verb.replace(":", "-"), message="")
 
 
-def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: str) -> Decision:
+def evaluate_gcp(
+    method: str,
+    host: str,
+    path: str,
+    body: bytes,
+    subscription: str,
+    *,
+    universe_domain: str = DEFAULT_UNIVERSE_DOMAIN,
+) -> Decision:
     """Allow or refuse one `/v1/watcher/gcp/` call.
 
     `subscription` is the configured `projects/<p>/subscriptions/<s>`; empty
-    means the drift detector is off and every Pub/Sub call is refused.
+    means the drift detector is off and every Pub/Sub call is refused. When
+    `universe_domain` is not `googleapis.com`, commercial `*.googleapis.com`
+    hosts are refused so custom-universe tokens never cross universes.
     """
     if method not in (METHOD_GET, METHOD_POST):
         return _refuse(RULE_GCP_METHOD, "The watcher relay forwards GET and POST only.")
-    if host == GKE_HOST:
+    try:
+        expected_gke = gke_host(universe_domain)
+        expected_pubsub = pubsub_host(universe_domain)
+    except ValueError:
+        return _refuse(RULE_GCP_ROUTE, "The watcher relay reaches the GKE and Pub/Sub APIs only.")
+    if host == expected_gke:
         if method == METHOD_GET and _GKE_CLUSTER_GET.fullmatch(path):
             return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
-    if host == PUBSUB_HOST:
+    if host == expected_pubsub:
         allowed = frozenset({subscription}) if subscription else frozenset()
         return _evaluate_subscription_call(method, path, body, allowed, _WATCHER_SUBSCRIPTION_RULES)
     return _refuse(RULE_GCP_ROUTE, "The watcher relay reaches the GKE and Pub/Sub APIs only.")
 
 
-def evaluate_pubsub(method: str, host: str, path: str, body: bytes, subscriptions: frozenset[str]) -> Decision:
+def evaluate_pubsub(
+    method: str,
+    host: str,
+    path: str,
+    body: bytes,
+    subscriptions: frozenset[str],
+    *,
+    universe_domain: str = DEFAULT_UNIVERSE_DOMAIN,
+) -> Decision:
     """Allow or refuse one `/v1/pubsub/gcp/` call for the gateway's platform adapter.
 
     `subscriptions` is the set of `projects/<p>/subscriptions/<s>` the operator
     rendered from the AgentPlugin configs; empty means no plugin route the
-    operator could qualify, and every call is refused. Pub/Sub is the only host: the
-    adapter has no business with the GKE API.
+    operator could qualify, and every call is refused. Pub/Sub in
+    `universe_domain` is the only host: the adapter has no business with the GKE API.
     """
     if method not in (METHOD_GET, METHOD_POST):
         return _refuse(RULE_PUBSUB_METHOD, "The platform Pub/Sub relay forwards GET and POST only.")
-    if host != PUBSUB_HOST:
+    try:
+        expected_pubsub = pubsub_host(universe_domain)
+    except ValueError:
+        return _refuse(RULE_PUBSUB_ROUTE, "The platform Pub/Sub relay reaches the Pub/Sub API only.")
+    if host != expected_pubsub:
         return _refuse(RULE_PUBSUB_ROUTE, "The platform Pub/Sub relay reaches the Pub/Sub API only.")
     return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)
 

@@ -484,7 +484,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		return swarmRead{}, nil
 	}
 	start := state.FirstSeq
-	if limit := uint64(swarmTaskLimit); state.LastSeq >= limit && state.LastSeq-limit+1 > start {
+	if limit := uint64(swarmTaskLimit); state.LastSeq >= limit && state.LastSeq-limit+1 > start { // #nosec G115 -- swarmTaskLimit is a positive count
 		start = state.LastSeq - limit + 1
 	}
 	var (

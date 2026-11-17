@@ -51,6 +51,13 @@ MONITORING_DELAY_SECONDS = 240
 REGISTRATION_POLL_SECONDS = 60
 # Time for a restarted watcher to list and sync every cluster before it is asked what it watches.
 WATCHER_START_SECONDS = 180
+# The shortest time the runner gives the watcher, before giving up, to pick up a profile written
+# after it started (it stops at the first match): one --profiles-rescan tick (1 minute by default)
+# plus the new cluster's initial list.
+WATCHER_RESCAN_SECONDS = 180
+# Opens the watch error that says a gateway restart was needed (settings.restart_unwatched_watcher):
+# the watcher's rescan did not pick up the fleet, which is the defect #3932 described.
+WATCHER_RESTARTED_NOTE = "event watcher needed a gateway restart"
 WATCHER_POLL_SECONDS = 30
 # How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
 TRIGGER_DRAIN_SECONDS = 1800
@@ -280,12 +287,15 @@ class Runner:
     def wait_registered(self, count: int) -> None:
         """Wait for a Cluster Agent profile per test cluster, then make the event watcher watch exactly them.
 
-        The watcher builds its watch set once, at start, from the profiles that
-        exist then: a profile the reconcile scaffolds later is not watched, and
-        a deleted cluster stays watched, until the watcher restarts. So once the
-        profiles match, a watch set that differs from the test fleet is fixed by
-        restarting the gateway pod, which is what an operator would have to do.
-        Whatever is still wrong after that is recorded on every run of the level.
+        The watcher re-reads the profiles directory every ``--profiles-rescan``
+        (1 minute by default), starting a watcher for each new profile and
+        stopping the one for each removed profile. So once the profiles match,
+        the runner waits at least ``WATCHER_RESCAN_SECONDS`` (or
+        ``watcher_wait_seconds``, if longer) for the watch set to match the test
+        fleet, and restarts nothing. A watch set that still differs is recorded
+        on every run of the level. With ``restart_unwatched_watcher`` set, the
+        runner then restarts the gateway pod, the workaround from before the
+        rescan, and records that a restart was needed.
         With ``trigger_reconcile`` set, a profile set that differs from the fleet
         runs the reconcile at once instead of waiting for its hourly tick.
         """
@@ -313,20 +323,28 @@ class Runner:
             LOG.info("waiting for Cluster Agent profiles: %s of %s", len(profiles & names), count)
             time.sleep(REGISTRATION_POLL_SECONDS)
             profiles = self.install.profile_clusters()
-        test_watched = self.test_clusters(self.install.watched_clusters())
+        test_watched = self._wait_watched(names, minimum=WATCHER_RESCAN_SECONDS)
+        if test_watched == names:
+            return
+        if not self.settings.get("restart_unwatched_watcher"):
+            self.watch_errors.append(f"event watcher watches {sorted(test_watched)}, test fleet is {sorted(names)}, "
+                                     "after its profile rescan, without a restart")
+            return
+        LOG.warning("event watcher watches %s, test fleet is %s after its profile rescan; restarting the gateway "
+                    "(restart_unwatched_watcher)", sorted(test_watched), sorted(names))
+        self.watch_errors.append(f"{WATCHER_RESTARTED_NOTE}: it watched {sorted(test_watched)} "
+                                 f"of {sorted(names)} after its profile rescan")
+        operations.restart(self.install.context, self.install.namespace)
+        time.sleep(WATCHER_START_SECONDS)
+        test_watched = self._wait_watched(names)
         if test_watched != names:
-            LOG.warning("event watcher watches %s, test fleet is %s; restarting the gateway so it re-reads profiles",
-                        sorted(test_watched), sorted(names))
-            operations.restart(self.install.context, self.install.namespace)
-            time.sleep(WATCHER_START_SECONDS)
-            test_watched = self._wait_watched(names)
-            if test_watched != names:
-                self.watch_errors.append(f"event watcher watches {sorted(test_watched)}, test fleet is {sorted(names)}")
+            self.watch_errors.append(f"event watcher watches {sorted(test_watched)}, test fleet is {sorted(names)}")
 
-    def _wait_watched(self, names: set[str]) -> set[str]:
-        """The test clusters the watcher reports as up, polled until they are ``names`` or
-        ``watcher_wait_seconds`` (default 0: one look) runs out; a large fleet takes longer to sync."""
-        deadline = time.monotonic() + float(self.settings.get("watcher_wait_seconds", 0))
+    def _wait_watched(self, names: set[str], minimum: float = 0) -> set[str]:
+        """The test clusters the watcher reports as up, polled until they are ``names`` or the
+        larger of ``watcher_wait_seconds`` (default 0: one look) and ``minimum`` runs out; a large
+        fleet takes longer to sync."""
+        deadline = time.monotonic() + max(float(self.settings.get("watcher_wait_seconds", 0)), minimum)
         while True:
             watched = self.test_clusters(self.install.watched_clusters())
             if watched == names or time.monotonic() >= deadline:
@@ -718,7 +736,8 @@ class Runner:
                         self.preflight()
                         if spec.operation.kind != "reset_soak":
                             # A reset (or a restart the agent did itself) leaves the watcher on the host
-                            # cluster only; every other operation is measured with the fleet watched.
+                            # cluster until the reconcile re-scaffolds the profiles and the watcher's
+                            # rescan picks them up; every other operation is measured with the fleet watched.
                             self.wait_registered(int(values["clusters"]))
                         record = self.execute(spec, values)
                     except Exception:  # one failed run is skipped; its key stays pending for a resume

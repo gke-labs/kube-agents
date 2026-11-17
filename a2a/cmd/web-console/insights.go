@@ -17,13 +17,18 @@ limitations under the License.
 // GET /api/insights: the banner's model, token usage and cost, the agent's
 // identity, and the cluster.
 //
-// Usage comes from LiteLLM's Prometheus endpoint. This install's LiteLLM has
-// no database, so its spend API is not there; the prometheus callback is. Its
-// counters live in each replica's memory, so the console reads every replica
-// and adds them up. The total covers the time since each replica last
-// restarted, and the page says so. Replicas are found by a DNS lookup of a
-// headless Service the chart renders for the console. That needs no
-// Kubernetes API access and no RBAC.
+// Usage comes from two places. The operator keeps token and spend totals
+// since install on the PlatformAgent's status.usage, carried across LiteLLM's
+// restarts; when the console can read them (usage.go, through the service
+// account the chart grants it) they are the banner's headline, and the page
+// says so. The live reading comes from LiteLLM's Prometheus endpoint. This
+// install's LiteLLM has no database, so its spend API is not there; the
+// prometheus callback is. Its counters live in each replica's memory, so the
+// console reads every replica and adds them up. That total covers the time
+// since each replica last restarted; it is the headline when the status
+// carries no totals, and rides beside them as "live" otherwise. Replicas are
+// found by a DNS lookup of a headless Service the chart renders for the
+// console. That needs no Kubernetes API access and no RBAC.
 //
 // Default model and identity values are passed in by the chart at install
 // time; preferred model and reasoning overrides are read from the
@@ -59,7 +64,7 @@ const (
 	// The LiteLLM counters the banner adds up. Each has one series per
 	// model, key and team label set; every series is summed.
 	metricInputTokens  = "litellm_input_tokens_metric_total"
-	metricOutputTokens = "litellm_output_tokens_metric_total"
+	metricOutputTokens = "litellm_output_tokens_metric_total" // #nosec G101 -- a metric name, not a credential
 	metricTotalTokens  = "litellm_total_tokens_metric_total"
 	metricSpendUSD     = "litellm_spend_metric_total"
 
@@ -102,16 +107,28 @@ type modelInfo struct {
 	ReasoningLevel string `json:"reasoning_level,omitempty"`
 }
 
-// usageInfo is token usage and estimated spend summed across the LiteLLM
-// replicas that answered. Error explains a missing or partial read.
+// usageReading is one reading of token usage and estimated spend: the
+// banner's headline, or the live replica scrape beside it.
+type usageReading struct {
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	TotalTokens  int64   `json:"total_tokens"`
+	SpendUSD     float64 `json:"spend_usd"`
+}
+
+// usageInfo is the banner's usage: the headline reading and where it came
+// from (Source: usageSourcePlatformAgent for the operator's totals since
+// install, usageSourceLiteLLM for the replicas summed since each last
+// restarted, empty when neither read anything), how many replicas the scrape
+// found and read, and Error, which explains a missing or partial scrape.
+// Live is the scrape's own reading when the headline is the operator's.
 type usageInfo struct {
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	TotalTokens   int64   `json:"total_tokens"`
-	SpendUSD      float64 `json:"spend_usd"`
-	ReplicasRead  int     `json:"replicas_read"`
-	ReplicasFound int     `json:"replicas_found"`
-	Error         string  `json:"error"`
+	usageReading
+	Source        string        `json:"source,omitempty"`
+	ReplicasRead  int           `json:"replicas_read"`
+	ReplicasFound int           `json:"replicas_found"`
+	Error         string        `json:"error"`
+	Live          *usageReading `json:"live,omitempty"`
 }
 
 type identityInfo struct {
@@ -410,12 +427,44 @@ func (s *server) currentUsage(ctx context.Context) usageInfo {
 	s.usage.mu.Unlock()
 
 	v := s.readUsage(ctx)
-	if v.ReplicasRead > 0 && ctx.Err() == nil {
+	if totals, ok := s.readUsageTotals(ctx); ok {
+		if v.ReplicasRead > 0 {
+			live := v.usageReading
+			v.Live = &live
+		}
+		v.usageReading = usageReading{
+			InputTokens:  totals.InputTokens,
+			OutputTokens: totals.OutputTokens,
+			TotalTokens:  totals.InputTokens + totals.OutputTokens,
+			SpendUSD:     float64(totals.SpendMicrosUSD) / usageMicrosPerUSD,
+		}
+		v.Source = usageSourcePlatformAgent
+	}
+	if (v.ReplicasRead > 0 || v.Source == usageSourcePlatformAgent) && ctx.Err() == nil {
 		s.usage.mu.Lock()
 		s.usage.value, s.usage.readAt = v, time.Now()
 		s.usage.mu.Unlock()
 	}
 	return v
+}
+
+// readUsageTotals reads the three totals since install off the
+// PlatformAgent's status.usage. No kube client, no namespace, a failed read
+// and a status with no total all yield false, and the scrape stays the
+// headline.
+func (s *server) readUsageTotals(ctx context.Context) (usageTotals, bool) {
+	if s.kube == nil || s.cfg.PodNamespace == "" {
+		return usageTotals{}, false
+	}
+	var pa struct {
+		Status struct {
+			Usage map[string]any `json:"usage"`
+		} `json:"status"`
+	}
+	if err := s.kube.get(ctx, fmt.Sprintf(platformAgentsAPIPath, s.cfg.PodNamespace, s.cfg.PlatformAgentName), &pa); err != nil {
+		return usageTotals{}, false
+	}
+	return usageTotalsOf(decodeUsage(pa.Status.Usage))
 }
 
 // readUsage finds every LiteLLM replica and sums their counters. A replica
@@ -478,6 +527,9 @@ func (s *server) readUsage(ctx context.Context) usageInfo {
 	out.OutputTokens = int64(math.Round(sums[metricOutputTokens]))
 	out.TotalTokens = int64(math.Round(sums[metricTotalTokens]))
 	out.SpendUSD = sums[metricSpendUSD]
+	if out.ReplicasRead > 0 {
+		out.Source = usageSourceLiteLLM
+	}
 	switch {
 	case len(failures) > 0 && out.ReplicasFound > len(addrs):
 		out.Error = fmt.Sprintf("%d of %d LiteLLM replicas could not be read (%d over the %d-replica cap were skipped): %s",

@@ -17,7 +17,7 @@ at the instance. These tests hold the installer to that:
   CA when it starts, is restarted.
 
 The Terraform rendering itself is in
-terraform/examples/full-install/tests/github_enterprise.tftest.hcl.
+terraform/examples/full-install/tftests/github_enterprise.tftest.hcl.
 """
 
 import base64
@@ -162,7 +162,7 @@ class GhesFlagsTest(_Tmp):
         tok = self._ca("tok", "x")
         proc = self._validate(self._ghes(PARAM_GITLAB_TOKEN_FILE=str(tok)))
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
-        self.assertIn("--gitlab-token-file applies only with --gitops-forge=gitlab", proc.stdout + proc.stderr)
+        self.assertIn("--gitlab-token-file (--gitops-token-file) applies only with --gitops-forge=gitlab", proc.stdout + proc.stderr)
 
     def test_a_ca_file_names_the_github_secret(self):
         ca = self._ca()

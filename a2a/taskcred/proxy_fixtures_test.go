@@ -27,7 +27,8 @@ import (
 //
 // The two verdicts differ only where the proxy is deliberately stricter:
 // a credential with no target (Verify accepts it for this audience; a proxy
-// credential with no target confines nothing), and the encodings the Python
+// credential with no target confines nothing, so the proxy takes one only as
+// a report credential: tier unattended and a trigger, #5619), and the encodings the Python
 // verifier refuses (non-canonical base64url, a JSON null, header keys beyond
 // typ and alg).
 //
@@ -81,13 +82,14 @@ type proxyFixture struct {
 }
 
 type proxyFixtureClaims struct {
-	Task    string  `json:"task"`
-	Profile string  `json:"profile"`
-	Tier    string  `json:"tier"`
-	Pod     string  `json:"pod"`
-	PodUID  string  `json:"pod_uid"`
-	Expires int64   `json:"exp"`
-	Target  *Target `json:"target"`
+	Task    string   `json:"task"`
+	Profile string   `json:"profile"`
+	Tier    string   `json:"tier"`
+	Pod     string   `json:"pod"`
+	PodUID  string   `json:"pod_uid"`
+	Expires int64    `json:"exp"`
+	Target  *Target  `json:"target"`
+	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
 // fixtureKey is a task-signing key from a fixed 32-byte seed.
@@ -160,15 +162,81 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "the second of two trusted keys (rotation)", Token: sign(base), Now: fixtureNow, GoOK: true, ProxyOK: true,
 		Trusted: []string{otherPub, pub}, Claims: wantClaims})
 	add(proxyFixture{Name: "expired inside the skew", Token: sign(base), Now: exp + 29, GoOK: true, ProxyOK: true, Claims: wantClaims})
+	trig := `,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`
+	withTrigger := func(trigger string) string {
+		return edited(trig, trig+`,"trigger":`+trigger)
+	}
+	builtin := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin, Stream: "compliance-audit"}
+	builtinClaims := *wantClaims
+	builtinClaims.Trigger = &builtin
+	add(proxyFixture{Name: "a builtin schedule trigger", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &builtinClaims})
+	collector := Trigger{Name: "stall-watch", Origin: TriggerOriginBuiltin}
+	collectorClaims := *wantClaims
+	collectorClaims.Trigger = &collector
+	add(proxyFixture{Name: "a collector trigger with no stream", Token: withTrigger(`{"name":"stall-watch","origin":"builtin"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &collectorClaims})
+	noStream := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin}
+	noStreamClaims := *wantClaims
+	noStreamClaims.Trigger = &noStream
+	// A built-in schedule's script run (#5622): both readers take the script.
+	scripted := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin, Stream: "compliance-audit", Script: "compliance-audit"}
+	scriptedClaims := *wantClaims
+	scriptedClaims.Trigger = &scripted
+	add(proxyFixture{Name: "a builtin schedule trigger naming a script", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &scriptedClaims})
+	add(proxyFixture{Name: "a schedule trigger with an explicit empty stream", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":""}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &noStreamClaims})
+	mintedTrigger, err := Mint(kp, Claims{
+		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
+		Expires: mintNow.Add(10 * time.Minute), Target: &fixtureTarget, Trigger: &builtin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintedTriggerClaims := mintedClaims
+	mintedTriggerClaims.Trigger = &builtin
+	add(proxyFixture{Name: "a trigger minted by taskcred.Mint", Token: mintedTrigger, Now: mintNow.Unix(), GoOK: true, ProxyOK: true, Claims: &mintedTriggerClaims})
 	add(proxyFixture{Name: "a lowercase typ (jwt/v2 upper-cases it)", Token: signWithHeader(t, kp, `{"typ":"jwt","alg":"ed25519-nkey"}`, base),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: wantClaims})
+
+	// A report credential (#5619): no target, which the proxy takes only from
+	// an unattended task a trigger started, and holds to the audit-report routes.
+	report := func(tier, trigger string) string {
+		edits := []string{`"tier":"read"`, `"tier":"` + tier + `"`}
+		if trigger == "" {
+			edits = append(edits, trig, ``)
+		} else {
+			edits = append(edits, trig, `,"trigger":`+trigger)
+		}
+		return edited(edits...)
+	}
+	reportClaims := func(trigger Trigger) *proxyFixtureClaims {
+		c := *wantClaims
+		c.Tier, c.Target, c.Trigger = "unattended", nil, &trigger
+		return &c
+	}
+	add(proxyFixture{Name: "a report credential: unattended, a builtin schedule trigger, no target",
+		Token: report("unattended", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(builtin)})
+	add(proxyFixture{Name: "a report credential: unattended, a collector trigger, no target",
+		Token: report("unattended", `{"name":"stall-watch","origin":"builtin"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(collector)})
 
 	// Go accepts, the proxy refuses: stricter by design.
 	noTarget := edited(`,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`, ``)
 	add(proxyFixture{Name: "no target", Token: noTarget, Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "no target, a trigger, at the read tier",
+		Token: report("read", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "no target, unattended, no trigger", Token: report("unattended", ""), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null target, unattended, a trigger",
+		Token: edited(`"tier":"read"`, `"tier":"unattended"`, trig, `,"target":null,"trigger":{"name":"stall-watch","origin":"builtin"}`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null trigger stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"builtin","stream":null}`), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null trigger", Token: withTrigger(`null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a non-canonical base64url signature", Token: nonCanonicalSignature(t, sign(base)), Now: fixtureNow, GoOK: true})
 
 	// Signature and issuer.
@@ -199,6 +267,9 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("an unknown top-level claim", edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","grants":"a2a.>"`)))
 	add(refused("an unknown nats claim", edited(`"tier":"read"`, `"tier":"read","grants":"a2a.>"`)))
 	add(refused("an unknown target claim", edited(`"cluster":"cluster-a"`, `"cluster":"cluster-a","server":"https://x"`)))
+	add(refused("an unknown trigger claim", withTrigger(`{"name":"schedule/a","origin":"builtin","scope":"fleet"}`)))
+	add(refused("a case-variant trigger key", withTrigger(`{"Name":"schedule/a","origin":"builtin"}`)))
+	add(refused("a duplicate trigger key", withTrigger(`{"name":"schedule/b","name":"schedule/a","origin":"builtin"}`)))
 	add(refused("a NaN", edited(`"version":2`, `"version":NaN`)))
 
 	// Types.
@@ -237,6 +308,32 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a pod name past 63 bytes", edited(`"pod":"auditor-read-x7k2p"`, `"pod":"`+strings.Repeat("p", 64)+`"`)))
 	add(refused("a pod_uid with a slash", edited(`"pod_uid":"0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"`, `"pod_uid":"a/b"`)))
 	add(refused("a target field with a space", edited(`"project":"proj-a"`, `"project":"proj a"`)))
+	add(refused("a trigger that is not an object", withTrigger(`"schedule/a"`)))
+	add(refused("a trigger with no name", withTrigger(`{"origin":"builtin"}`)))
+	add(refused("a trigger name with a dot", withTrigger(`{"name":"schedule/a.b","origin":"builtin"}`)))
+	add(refused("a trigger name with three segments", withTrigger(`{"name":"schedule/a/b","origin":"builtin"}`)))
+	add(refused("a trigger with an unknown origin", withTrigger(`{"name":"schedule/a","origin":"admin"}`)))
+	add(refused("a trigger with no origin", withTrigger(`{"name":"schedule/a"}`)))
+	add(refused("a trigger stream under another path", withTrigger(`{"name":"schedule/a","origin":"builtin","stream":"team/a"}`)))
+	add(refused("a trigger with a user origin", withTrigger(`{"name":"schedule/a","origin":"user"}`)))
+	add(refused("a trigger naming another schedule's stream", withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"ai-security-audit"}`)))
+	add(refused("a trigger stream on a bare source", withTrigger(`{"name":"stall-watch","origin":"builtin","stream":"stall-watch"}`)))
+	add(refused("a trigger stream with a doubled user prefix", withTrigger(`{"name":"schedule/x","origin":"builtin","stream":"user/user/x"}`)))
+	add(refused("a trigger name with an empty schedule", withTrigger(`{"name":"schedule/","origin":"builtin"}`)))
+	add(refused("a trigger name past 63 bytes", withTrigger(`{"name":"schedule/`+strings.Repeat("a", 64)+`","origin":"builtin"}`)))
+	add(refused("an uppercase trigger name", withTrigger(`{"name":"Schedule/a","origin":"builtin"}`)))
+	add(refused("a non-ASCII trigger name", withTrigger(`{"name":"schedule/caf\u00e9","origin":"builtin"}`)))
+	add(refused("a trigger script that is a path", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"/opt/scripts/run.sh"}`)))
+	add(refused("a trigger script on a collector trigger", withTrigger(`{"name":"stall-watch","origin":"builtin","script":"stall-watch"}`)))
+	add(refused("a trigger script on a bare schedule trigger", withTrigger(`{"name":"schedule","origin":"builtin","script":"compliance-audit"}`)))
+	add(refused("an upper-case trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"Run"}`)))
+	add(refused("a dotted trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"run.sh"}`)))
+	add(refused("a non-ASCII trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"caf\u00e9"}`)))
+	add(refused("an over-long trigger script", withTrigger(`{"name":"schedule/a","origin":"builtin","script":"`+strings.Repeat("a", 64)+`"}`)))
+	add(refused("a case-variant trigger script key", withTrigger(`{"name":"schedule/a","origin":"builtin","SCRIPT":"a"}`)))
+	// As a null stream: Go reads it as none, the stricter proxy refuses it.
+	add(proxyFixture{Name: "a null trigger script", Token: withTrigger(`{"name":"schedule/nightly","origin":"builtin","script":null}`), Now: fixtureNow, GoOK: true})
+	add(refused("a trigger origin as a number", withTrigger(`{"name":"schedule/a","origin":1}`)))
 	add(refused("an empty target field", edited(`"cluster":"cluster-a"`, `"cluster":""`)))
 
 	return proxyFixtureFile{
@@ -312,7 +409,9 @@ func TestCredentialProxyFixtures(t *testing.T) {
 		if err == nil && c.Claims != nil {
 			w := c.Claims
 			if got.Task != w.Task || got.Profile != w.Profile || got.Tier != w.Tier || got.Pod != w.Pod ||
-				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target {
+				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires ||
+				(got.Target == nil) != (w.Target == nil) || (got.Target != nil && *got.Target != *w.Target) ||
+				(got.Trigger == nil) != (w.Trigger == nil) || (got.Trigger != nil && *got.Trigger != *w.Trigger) {
 				t.Errorf("%s: claims = %+v (target %+v), fixture says %+v", c.Name, got, got.Target, w)
 			}
 		}

@@ -787,10 +787,15 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 			provider = strings.ToLower(strings.TrimSpace(existingList[0].Provider))
 		}
 	}
-	if provider == "" && forge != "" {
+	// A declared forge decides its own provider (an empty one reads as
+	// github); the request's provider only matters for a forge not declared.
+	if forge != "" {
 		for _, f := range forges {
-			if f.Name == forge && f.Provider != "" {
+			if f.Name == forge {
 				provider = strings.ToLower(strings.TrimSpace(f.Provider))
+				if provider == "" {
+					provider = "github"
+				}
 				break
 			}
 		}
@@ -832,6 +837,16 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		category = inferCategory(repoName, role)
 	}
 
+	// The browse link is built on the declared forge's host, as a refresh
+	// builds it: Gitea and Bitbucket Data Center have no default host.
+	forgeHost := ""
+	for _, f := range forges {
+		if f.Name == forge {
+			forgeHost = f.Host
+			break
+		}
+	}
+
 	// If making this repo 'gitops', demote any previous gitops repo to 'managed'
 	if role == "gitops" {
 		for i := range existingList {
@@ -852,6 +867,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 			existingList[i].BaseBranch = baseBranch
 			existingList[i].Provider = provider
 			existingList[i].Forge = forge
+			existingList[i].Host = forgeHost
 			existingList[i].URL = repositoryURL(existingList[i])
 			found = true
 			break
@@ -861,6 +877,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		newInfo := repositoryInfo{
 			Forge:      forge,
 			Provider:   provider,
+			Host:       forgeHost,
 			Repository: repoName,
 			Role:       role,
 			BaseBranch: baseBranch,

@@ -119,28 +119,28 @@ var (
 	// other info string (yaml, json, text) marks an inert block.
 	shellLangs      = map[string]bool{"bash": true, "sh": true, "shell": true, "zsh": true}
 	transcriptLangs = map[string]bool{"": true, "console": true}
-	// The read tables below have to be a subset of what the credential
-	// broker lets a session run: agents/platform/scripts/command_policy.py
-	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, GCLOUD_READ_COMMANDS),
-	// narrowed for the session role by credential_proxy.py
-	// (SESSION_KUBECTL_REFUSED_VERBS). A block left unmarked is one the
-	// preamble tells the model to run, so a read here that the broker refuses
-	// is a refusal the model walks into. TestReadTablesAreASubsetOfTheBroker
-	// reads those tables from the Python source and fails on drift.
+	// The read tables below have to be a subset of what the session pod can
+	// run: `<agent>-kube-proxy` (`read-only-dry-run` in k8s-api-proxy) for
+	// kubectl and `agents/platform/scripts/command_policy.py`
+	// (GCLOUD_READ_COMMANDS) for gcloud, kept within the broker's read tables
+	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, SESSION_KUBECTL_REFUSED_VERBS).
+	// A block left unmarked is one the preamble tells the model to run, so a
+	// read here that kube-proxy or the broker refuses is a refusal the model
+	// walks into. TestReadTablesAreASubsetOfTheBroker checks subset inclusion
+	// against the Python tables and fails on drift.
 	//
 	// kubectlReadCommands are the kubectl verbs, and verb-subverb pairs, that
-	// only read. The classifier is an allowlist: a verb not named here is
-	// treated as a write, so a new skill step fails toward "propose" rather
-	// than "run". A group verb with a writing member (`auth reconcile`,
-	// `config use-context`, `rollout restart`) is listed only by its reading
-	// pairs. `config view` is not one: the broker refuses it because
-	// `--flatten` prints the token. `wait` and `rollout status` are reads the
-	// broker refuses a session, because both hold a broker slot until they
-	// finish.
+	// only read and that kube-proxy admits. The classifier is an allowlist: a
+	// verb not named here is treated as a write, so a new skill step fails
+	// toward "propose" rather than "run". A group verb with a writing member
+	// (`auth reconcile`, `config use-context`, `rollout restart`) is listed
+	// only by its reading pairs. `auth can-i` and `auth whoami` are omitted
+	// because kube-proxy refuses selfsubjectaccessreviews and
+	// selfsubjectreviews (`reviewResources` in policy.go). `config view` is
+	// omitted too, alongside `wait` and `rollout status`.
 	kubectlReadCommands = map[string]bool{
 		"api-resources": true, "api-versions": true, "cluster-info": true, "describe": true,
 		"events": true, "explain": true, "get": true, "logs": true, "top": true, "version": true,
-		"auth can-i": true, "auth whoami": true,
 		"config current-context": true, "config get-contexts": true,
 		"rollout history": true,
 	}
