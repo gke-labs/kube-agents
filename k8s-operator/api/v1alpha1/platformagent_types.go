@@ -504,8 +504,8 @@ type TeamsSpec struct {
 	// A2A_TEAMS_BACKEND switch), the home its chat.notify route posts alerts
 	// and reports into. A conversation id: "19:..." (a channel ends in
 	// @thread.tacv2, a group or meeting chat in @thread.v2) or "a:..." (a
-	// personal chat); the gateway refuses any other shape, and only a channel
-	// home threads its posts.
+	// personal chat), never a thread (no ";messageid="); the gateway refuses
+	// any other shape, and only a channel home threads its posts.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 

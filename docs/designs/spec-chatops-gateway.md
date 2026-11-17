@@ -3075,7 +3075,9 @@ posts a kanban card's report back into the Teams conversation it came from (the 
 subject beside the other three) and a proactive post into `homeChannel`, a Teams conversation
 id (`19:…` or `a:…`, the rule `teamsIsConversationID` and the operator's `a2aTeamsHomeConversation`
 share); a top-level post into a channel home lands in the thread it starts, a post into a group
-chat, a personal chat or a thread-shaped home lands where it was sent. The agent's delivery
+chat or a personal chat lands where it was sent, and a thread-shaped home is refused on both
+sides (every message in a thread shares one key, so the relay would store every report under it
+and the bridge splice the last one into every turn there). The agent's delivery
 resolvers (`chat_platforms.py`, `session_kv_server.py`) name Teams only while the gateway routes
 it (`ROUTE_ONLY_PLATFORMS`), so alerts and cron reports reach the Teams home on this path and
 the Hermes path is unchanged. A Teams personal or group chat, whose key every message shares,

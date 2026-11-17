@@ -61,7 +61,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   once over its loopback API: by the Session KV server itself for the `k8s-evt-*` sessions it creates (it writes their
   `platform: k8s-watcher` today), at the first inject since the create call carries no body,
   `event` or `drift` from the payload's kind; a watcher in shared mode injects into a session the operator named and the server never created, so that session has no record and its work resolves as `other`, which is accepted since nothing in the repository sets that mode; by the hermes-bridge for every `a2a-*` session, before its first turn (the bridge opens a
-  session through the first turn's header), from the backend (`chat` for `gchat`, `slack` and
+  session through the first turn's header), from the backend (`chat` for `gchat`, `slack`, `teams` and
   `discord`, `console` for `console`, `api` for the doors), a write beside the route record; by the `session_store` plugin for the Hermes
   platform sessions it already records (`chat`). The record carries the chat platform beside the origin under its own key,
   `origin_platform`, since `platform` is already a `session_store` key that the Session KV server

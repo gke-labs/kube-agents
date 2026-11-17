@@ -664,6 +664,15 @@ func teamsIsConversationID(id string) bool {
 	return false
 }
 
+// teamsIsHomeConversationID is teamsIsConversationID for teams.homeChannel:
+// a channel, group or personal chat, never a thread. Every message in a
+// thread shares one key, so a thread home would have the relay store every
+// report under it and the bridge splice the last one into every turn there;
+// the operator applies the same rule (a2aTeamsHomeConversation).
+func teamsIsHomeConversationID(id string) bool {
+	return teamsIsConversationID(id) && !strings.Contains(id, teamsThreadToken)
+}
+
 // teamsIsChannelID reports a channel conversation id with no thread suffix:
 // the one place a top-level post starts a thread.
 func teamsIsChannelID(id string) bool {

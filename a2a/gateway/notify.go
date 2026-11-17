@@ -322,8 +322,8 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 // requests only; a thread under the home is the home with its
 // ";messageid=" suffix, which is how Teams names a channel thread.
 func NewTeamsNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
-	if home != "" && !teamsIsConversationID(home) {
-		return nil, fmt.Errorf("notify: home channel %q is not a Teams conversation id", home)
+	if home != "" && !teamsIsHomeConversationID(home) {
+		return nil, fmt.Errorf("notify: home channel %q is not a Teams channel, group or personal chat id", home)
 	}
 	if log == nil {
 		log = slog.Default()

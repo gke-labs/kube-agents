@@ -282,7 +282,7 @@ func TestTeamsJoinsTheNotifyPlatforms(t *testing.T) {
 	}
 	// A home the gateway refuses (NewTeamsNotifier: whitespace inside, or a
 	// URL) drops the whole route there, so the agent is told of neither.
-	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2"} {
+	for _, malformed := range []string{"19:a b@thread.tacv2", "https://teams.microsoft.com/l/channel/x", "spaces/AAA", "C0123ABCD", "19:", "a:", "19:abc@thread.tacv2/General?groupId=1", "19:a\u00a0b@thread.tacv2", teamsTestHome + ";messageid=1794603936403"} {
 		agent.Spec.Integration.Teams.HomeChannel = malformed
 		if got := a2aNotifyPlatforms(agent); len(got) != 0 {
 			t.Errorf("notify platforms %v with home %q, which the gateway refuses", got, malformed)
@@ -291,7 +291,7 @@ func TestTeamsJoinsTheNotifyPlatforms(t *testing.T) {
 			t.Errorf("home platforms %v with home %q", got, malformed)
 		}
 	}
-	for _, good := range []string{teamsTestHome, teamsTestHome + ";messageid=1794603936403", "19:group@thread.v2", "a:1UxxASmI_WSV5PQj3K0Nd3K292l62BfKLXmPpH6cQlZN7Ogxu7L_EoFVo9EhRcJ4ybzI"} {
+	for _, good := range []string{teamsTestHome, "19:group@thread.v2", "a:1UxxASmI_WSV5PQj3K0Nd3K292l62BfKLXmPpH6cQlZN7Ogxu7L_EoFVo9EhRcJ4ybzI"} {
 		agent.Spec.Integration.Teams.HomeChannel = good
 		if got := a2aNotifyHomePlatforms(agent); strings.Join(got, ",") != a2aNotifyPlatformTeams {
 			t.Errorf("home platforms %v with home %q, which the gateway takes", got, good)
@@ -371,5 +371,33 @@ func TestTheBrokerLearnsTheTeamsConsumerFromTheOperator(t *testing.T) {
 func TestTheExecTierDropsTheTeamsCallerWord(t *testing.T) {
 	if !credentialProxyExecTierEnvDropped[credentialProxyTeamsA2ACallerEnvVar] {
 		t.Fatalf("%s is copied onto exec-tier pods", credentialProxyTeamsA2ACallerEnvVar)
+	}
+}
+
+// TestTheTeamsTargetAllowlistReachesTheGateway: the CR's teams.allowedUsers
+// gates a session's delegation to the platform agent as Chat's and Slack's
+// lists do (A2A_TARGET_ALLOWED_USERS_TEAMS, lowercased): rendered while the
+// backend is armed and allow-all is off, empty for an empty list (admits
+// nobody), absent under allow-all and on the Hermes path.
+func TestTheTeamsTargetAllowlistReachesTheGateway(t *testing.T) {
+	t.Setenv(a2aTeamsBackendEnvVar, "true")
+	agent := teamsTestAgent(true)
+	agent.Spec.Integration.Teams.AllowedUsers = []string{" 05E62547-5EE7-41BE-9639-155D9212BE8F ", "29:1abc"}
+	env := envMapOf(a2aTargetAllowlistEnv(agent))
+	if got := env[a2aTargetAllowedUsersTeamsEnvVar].Value; got != "05e62547-5ee7-41be-9639-155d9212be8f,29:1abc" {
+		t.Errorf("rendered %q", got)
+	}
+	agent.Spec.Integration.Teams.AllowedUsers = nil
+	if v, ok := envMapOf(a2aTargetAllowlistEnv(agent))[a2aTargetAllowedUsersTeamsEnvVar]; !ok || v.Value != "" {
+		t.Errorf("an empty list with allow-all off must render empty (admits nobody): %v %q", ok, v.Value)
+	}
+	agent.Spec.Integration.Teams.AllowAllUsers = ptr.To(true)
+	if _, ok := envMapOf(a2aTargetAllowlistEnv(agent))[a2aTargetAllowedUsersTeamsEnvVar]; ok {
+		t.Error("rendered under allow-all")
+	}
+	t.Setenv(a2aTeamsBackendEnvVar, "")
+	agent.Spec.Integration.Teams.AllowAllUsers = ptr.To(false)
+	if _, ok := envMapOf(a2aTargetAllowlistEnv(agent))[a2aTargetAllowedUsersTeamsEnvVar]; ok {
+		t.Error("rendered while Teams is on Hermes")
 	}
 }

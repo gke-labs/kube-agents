@@ -362,6 +362,7 @@ const (
 	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
+	a2aTargetAllowedUsersTeamsEnvVar = "A2A_TARGET_ALLOWED_USERS_TEAMS"
 
 	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
 	// as backend:user=tier, comma-separated, plaintext like the allowlists:
@@ -730,7 +731,10 @@ const (
 	a2aTeamsHomeGroupPrefix    = "19:"
 	a2aTeamsHomePersonalPrefix = "a:"
 	a2aTeamsHomeRefused        = "/?#%\\"
-	a2aTeamsTokenPathEnvVar    = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
+	// A thread's own id carries this; a home must be a channel, group or
+	// personal chat, since every message in a thread shares one key.
+	a2aTeamsHomeThreadToken = ";messageid="
+	a2aTeamsTokenPathEnvVar = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
 	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
@@ -1571,9 +1575,10 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
-// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
-// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
-// renders nothing: the gateway reads no var as "all authenticated users",
+// a2aTargetAllowlistEnv renders the CR's Chat, Slack and, with the gateway's
+// Teams backend armed, Teams allowlists for the gateway. An absent list, or
+// the allow-all spelling allowAllUsers accepts (for Teams, the CRD's explicit
+// allowAllUsers switch), renders nothing: the gateway reads no var as "all authenticated users",
 // which is what the CR field promises. Any other list renders, even one that
 // is blank after trimming: the gateway reads a set-but-empty var as a list
 // with no members, so a list of blanks admits nobody, the rule #2207 set for
@@ -1602,6 +1607,12 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	}
 	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
 		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	// Teams: the same list the ingress gate reads (lowercased, as the
+	// gateway compares it), unless the CR's explicit allow-all switch is on;
+	// an empty list with the switch off renders empty and admits nobody.
+	if a2aTeamsArmed(agent) && !(integ.Teams.AllowAllUsers != nil && *integ.Teams.AllowAllUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersTeamsEnvVar, Value: join(integ.Teams.AllowedUsers, true)})
 	}
 	return env
 }
@@ -1755,7 +1766,7 @@ func a2aTeamsHomeConversation(agent *agentv1alpha1.PlatformAgent) string {
 		return ""
 	}
 	home := strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel)
-	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
+	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.Contains(home, a2aTeamsHomeThreadToken) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
 		return ""
 	}
 	for _, prefix := range []string{a2aTeamsHomeGroupPrefix, a2aTeamsHomePersonalPrefix} {

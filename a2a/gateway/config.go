@@ -31,7 +31,7 @@ const attributionSaltInfo = "a2a-attribution-salt"
 const attributionSaltLen = 32
 
 // The mux keys and conversation prefixes, exported for cmd/gateway, which
-// builds one adapter per backend: Backends returns the first three, and the
+// builds one adapter per backend: Backends returns the first four, and the
 // console is the essential backend beside them.
 const (
 	BackendGchat   = gchatBackend
@@ -1058,6 +1058,9 @@ func FromEnv() (*Config, error) {
 	}
 	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
 		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
+	}
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersTeams); ok {
+		platformLists[teamsBackend] = append([]string{}, splitList(raw)...)
 	}
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
