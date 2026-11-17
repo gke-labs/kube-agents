@@ -11,8 +11,9 @@ next drift fails here rather than in a nightly run that greps for strings
 nobody emits.
 
 `references/report-example.json` in each copy of the skill is a real document
-from leeway v0.1.5's own report collector (unchanged in v0.1.6) (its `TestCollect_CauseAttribution`
-fixture plus three more clusters), with the bench fixture names replaced.
+from leeway v0.1.5's own report collector (its `TestCollect_CauseAttribution`
+fixture plus three more clusters), with the bench fixture names replaced; the
+schema is unchanged in v0.1.6.
 Regenerate it from leeway when the schema moves, and update VOCABULARY below
 from `pkg/leeway/{cause,intent,remediation,finding}.go` in the same change.
 """
@@ -35,7 +36,7 @@ FLEET_FIXTURES = REPO_ROOT / "docs/designs/fleet-fixtures.yaml"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
 LEEWAY_VERSION = "v0.1.6"
 
-# leeway v0.1.6 (go-steer/leeway@547f65a; unchanged since v0.1.5), pkg/leeway: the strings a report
+# leeway v0.1.6 (go-steer/leeway@547f65a), pkg/leeway, unchanged since v0.1.5: the strings a report
 # carries in these fields. The kind inventory is frozen by leeway's schema;
 # the rest changes only with a leeway release.
 VOCABULARY = {

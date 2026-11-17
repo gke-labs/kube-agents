@@ -186,7 +186,8 @@ CLUSTER_TIMEOUT_FORMAT = "{seconds}s"
 # so a short call never gives a cluster less than leeway would on its own.
 MIN_CLUSTER_TIMEOUT_SECONDS = 60
 # The ceiling, so one cluster whose read stalls rather than fails spends at most
-# this much of the tick: five stalled projects still fit TICK_BUDGET_SECONDS.
+# this much of the tick: five projects each with one stalled cluster still fit
+# TICK_BUDGET_SECONDS.
 MAX_CLUSTER_TIMEOUT_SECONDS = 300
 # Held back from the call's sandbox timeout for leeway's start-up and report
 # assembly, so the per-cluster deadline fires before the sandbox kills the call.
@@ -198,7 +199,8 @@ LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project
 PROJECT_TIMEOUT_SECONDS = 900
 TICK_BUDGET_SECONDS = 2700
 # The least a project call is started with: enough for one cluster's floor plus
-# the overhead, so even a budget-cut call lets leeway's deadline fire first.
+# the overhead, so a budget-cut call of one wave (one or two clusters) lets
+# leeway's deadline fire before the sandbox kills the call.
 MIN_PROJECT_RUN_SECONDS = MIN_CLUSTER_TIMEOUT_SECONDS + LEEWAY_OVERHEAD_SECONDS
 STDERR_EXCERPT_CHARS = 300
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
@@ -537,9 +539,10 @@ def cluster_timeout_seconds(call_timeout: int, cluster_count: int) -> int:
     the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`, between
     `MIN_CLUSTER_TIMEOUT_SECONDS` and `MAX_CLUSTER_TIMEOUT_SECONDS`. A slow
     cluster then ends as a per-cluster `error` row instead of the sandbox
-    killing the whole call and discarding the clusters that finished. A call
-    with so many clusters that the floor wins (more than about 28 at the full
-    call timeout) can still overrun the sandbox timeout, as it could before.
+    killing the whole call and discarding the clusters that finished. When the
+    floor wins, a call of several waves can still overrun the sandbox timeout,
+    as it could before: more than about 28 clusters at the full call timeout,
+    or a few clusters in a call the tick budget has cut short.
     """
     waves = math.ceil(max(cluster_count, 1) / PARALLELISM)
     share = (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves

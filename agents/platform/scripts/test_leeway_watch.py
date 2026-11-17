@@ -1730,7 +1730,7 @@ class ClusterTimeoutTests(unittest.TestCase):
         self.assertEqual(watch.cluster_timeout_seconds(900, 100), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
         self.assertEqual(watch.cluster_timeout_seconds(60, 1), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
 
-    def test_a_started_call_always_lets_the_cluster_deadline_fire_first(self) -> None:
+    def test_the_smallest_started_call_of_one_wave_lets_the_cluster_deadline_fire_first(self) -> None:
         # The smallest call sweep_fleet starts leaves room for one cluster's
         # floor and leeway's overhead inside the sandbox timeout.
         smallest = watch.MIN_PROJECT_RUN_SECONDS
@@ -1770,6 +1770,38 @@ class ClusterTimeoutTests(unittest.TestCase):
 
         argv = seen_argv[0]
         self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "170s")
+
+    def test_a_call_starts_only_with_the_floor_plus_overhead_left(self) -> None:
+        # One second short of MIN_PROJECT_RUN_SECONDS the tick budget is spent
+        # and leeway is not run; at it, the call runs with the floor.
+        for left, runs in ((watch.MIN_PROJECT_RUN_SECONDS - 1, False), (watch.MIN_PROJECT_RUN_SECONDS, True)):
+            with self.subTest(left=left):
+                seen_argv: list[list[str]] = []
+
+                def fake_run(argv, **kw):
+                    seen_argv.append(list(argv))
+                    return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}]))
+
+                with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                    os.environ,
+                    {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "p1/us-central1/c1", watch.PROJECTS_ENV: ""},
+                    clear=False,
+                ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), mock.patch.object(
+                    watch.time, "monotonic", return_value=0.0
+                ):
+                    if runs:
+                        watch.sweep_fleet({}, T0, deadline=float(left))
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            watch.sweep_fleet({}, T0, deadline=float(left))
+
+                if runs:
+                    argv = seen_argv[0]
+                    self.assertEqual(
+                        argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], f"{watch.MIN_CLUSTER_TIMEOUT_SECONDS}s"
+                    )
+                else:
+                    self.assertEqual(seen_argv, [])
 
 
 class RosterTest(unittest.TestCase):
