@@ -339,16 +339,22 @@ func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *age
 		replicas = *sts.Spec.Replicas
 	}
 	if sts.Status.ObservedGeneration < sts.Generation || sts.Status.UpdatedReplicas < replicas ||
+		sts.Status.Replicas > replicas ||
 		(sts.Status.CurrentRevision != "" && sts.Status.CurrentRevision != sts.Status.UpdateRevision) {
 		return false, nil
 	}
-	for i := range int(replicas) {
+	// Every ordinal a server may still hold: one past what the StatefulSet
+	// asks for (a scale-down unfinished) still serves its old config.
+	for i := range max(int(replicas), int(sts.Status.Replicas), a2aNATSMaxReplicas) {
 		pod := &corev1.Pod{}
 		if err := reader.Get(ctx, types.NamespacedName{Name: sts.Name + "-" + strconv.Itoa(i), Namespace: sts.Namespace}, pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
 			return false, err
+		}
+		if i >= int(replicas) {
+			return false, nil
 		}
 		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil {
 			return false, nil

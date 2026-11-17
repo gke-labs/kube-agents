@@ -229,30 +229,41 @@ func (s a2aBusReloadState) stamp(config *corev1.Secret) {
 	}
 }
 
-// a2aBusServer is one bus server the StatefulSet asks for: its pod name, and
-// the pod if one by that name exists and the live StatefulSet controls it.
+// a2aBusServer is one bus server: its pod name, and the pod if one by that
+// name exists and the live StatefulSet controls it. extra marks a pod at an
+// ordinal past what the StatefulSet asks for (a scale-down unfinished, or a
+// pod left over), which still serves whatever config it started with.
 type a2aBusServer struct {
-	name string
-	pod  *corev1.Pod
+	name  string
+	pod   *corev1.Pod
+	extra bool
 }
 
 // serving reports whether the server's pod exists, is the StatefulSet's and
 // isn't terminating.
 func (s a2aBusServer) serving() bool { return s.pod != nil && s.pod.DeletionTimestamp == nil }
 
-// a2aBusServers lists the servers the live StatefulSet asks for, by ordinal.
+// a2aBusServers lists the servers the live StatefulSet asks for, by ordinal,
+// and after them every pod that exists at a higher ordinal up to the most the
+// bus ever runs (a2aNATSMaxReplicas) or the StatefulSet still counts, marked
+// extra: during a scale-down (a three to one migration, say) those pods still
+// serve, and nothing confirms what they loaded.
 func (r *PlatformAgentReconciler) a2aBusServers(ctx context.Context, sts *appsv1.StatefulSet) ([]a2aBusServer, error) {
 	replicas := 1
 	if sts.Spec.Replicas != nil {
 		replicas = int(*sts.Spec.Replicas)
 	}
+	ordinals := max(replicas, int(sts.Status.Replicas), a2aNATSMaxReplicas)
 	out := make([]a2aBusServer, 0, replicas)
-	for i := range replicas {
+	for i := range ordinals {
 		name := sts.Name + "-" + strconv.Itoa(i)
 		pod := &corev1.Pod{}
 		err := r.podReader().Get(ctx, types.NamespacedName{Name: name, Namespace: sts.Namespace}, pod)
 		switch {
 		case errors.IsNotFound(err):
+			if i >= replicas {
+				continue
+			}
 			pod = nil
 		case err != nil:
 			return nil, err
@@ -263,7 +274,7 @@ func (r *PlatformAgentReconciler) a2aBusServers(ctx context.Context, sts *appsv1
 				pod = nil
 			}
 		}
-		out = append(out, a2aBusServer{name: name, pod: pod})
+		out = append(out, a2aBusServer{name: name, pod: pod, extra: i >= replicas})
 	}
 	return out, nil
 }
@@ -360,7 +371,9 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	confirmed := map[string]bool{}
 	readable := map[string]bool{}
 	for _, s := range servers {
-		if !s.serving() {
+		if !s.serving() || s.extra {
+			// An extra pod is on its way out with whatever it loaded: the
+			// reload isn't confirmed while it serves.
 			continue
 		}
 		loaded, err := r.a2aBusConfigLoadTime(ctx, agent, s.pod)
@@ -409,6 +422,13 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 // predates the write, and only when every other server's pod is serving and
 // Ready. None qualifies while any other server is down or still starting.
 func a2aBusStragglerToRestart(servers []a2aBusServer, state a2aBusReloadState, confirmed map[string]bool) (a2aBusServer, bool) {
+	for _, s := range servers {
+		if s.extra {
+			// A scale-down is under way: the StatefulSet removes that pod
+			// itself, and a restart now would only cost quorum.
+			return a2aBusServer{}, false
+		}
+	}
 	for i, s := range servers {
 		if confirmed[s.name] || !s.serving() || startedAfter(s.pod, state.requestedAt) {
 			continue

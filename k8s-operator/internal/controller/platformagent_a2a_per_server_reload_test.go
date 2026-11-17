@@ -284,3 +284,53 @@ func TestASingleServerTakesTheSamePath(t *testing.T) {
 		t.Fatalf("plan = %+v, want the one server's move confirming", plan)
 	}
 }
+
+// A scale-down (three to one, say) leaves pods past spec.replicas serving the
+// config they started with. While one exists, the reload isn't confirmed,
+// nothing is restarted, and the hold reads the bus as not settled.
+func TestAScaleDownsLeftoverServerKeepsTheHold(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	agent := a2aSingleServerTestAgent()
+	sts := buildA2ANATSStatefulSet(agent, "h1")
+	sts.UID = "sts-uid"
+	sts.Status.Replicas = 3
+	owner := []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID, Controller: ptr.To(true)}}
+	old := metav1.NewTime(time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	pod := func(i int) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: sts.Name + "-" + strconv.Itoa(i), Namespace: agent.Namespace, UID: types.UID("pod-" + strconv.Itoa(i)), CreationTimestamp: old, OwnerReferences: owner},
+			Status:     corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), baselines: map[string]string{sts.Name + "-0": "t0"}}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace},
+		Data:       map[string][]byte{a2aNATSConfKey: []byte("new")},
+	}
+	state.stamp(secret)
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts, secret, pod(0), pod(2)).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4),
+		busConfigLoadTime: loadTimes(map[string]string{sts.Name + "-0": "t1", sts.Name + "-2": "t0"})}
+	for _, at := range []time.Duration{time.Minute, a2aBusReloadBound} {
+		plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(at))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.reloaded || plan.restart != "" {
+			t.Fatalf("at %s: plan = %+v with %s-2 still serving; want pending and nothing restarted", at, plan, sts.Name)
+		}
+	}
+
+	// The hold: a previous list recorded, the StatefulSet otherwise settled
+	// on its one replica, and pod -2 still there.
+	b := newHoldBus(agent)
+	b.sts.Generation, b.sts.Status.ObservedGeneration, b.sts.Status.UpdatedReplicas = 1, 1, 1
+	b.sts.Status.CurrentRevision, b.sts.Status.UpdateRevision = "bus-a", "bus-a"
+	b.plainRevision(t, "bus-a")
+	b.pod(0, "bus-a")
+	b.pod(2, "bus-a")
+	b.configSecret(map[string]string{a2aConfigProfilesAnnotation: "x,y", a2aBusPreviousProfilesAnnotation: "x"})
+	if got := loadedList(loadedOrFatal(t, b.client(), b.agent)); got != "x" {
+		t.Fatalf("loaded = %q with a leftover server, want x: the new profile must stay held", got)
+	}
+}
