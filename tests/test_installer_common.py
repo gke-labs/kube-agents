@@ -3920,6 +3920,14 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'constraint="$(trap - ERR; _scope_policy_denying_asset_api ', 1),
         (_INSTALLER_COMMON, 'reason="$(trap - ERR; _scope_container_can_set_iam ', 6),
         (_INSTALLER_COMMON, 'token="$(trap - ERR; _scope_terraform_access_token)"', 2),
+        (_INSTALLER_COMMON, 'rendered="$(trap - ERR; helm template ', 1),
+        (_INSTALLER_COMMON, 'summary="$(trap - ERR; render_footprint_summary ', 1),
+        (_INSTALLER_COMMON, 'groups="$(trap - ERR; ipv6_groups ', 1),
+        (_INSTALLER_COMMON, 'missing="$(trap - ERR; scope_selector_apis_missing ', 1),
+        (_INSTALLER_COMMON, 'host_port="$(trap - ERR; openai_compatible_url_host_port ', 1),
+        (_INSTALLER_COMMON, 'redaction_rules="$(trap - ERR; hcl_redaction_rules ', 1),
+        (_INSTALLER_COMMON, 'probe_dir="$(trap - ERR; mktemp -d ', 1),
+        (_INSTALLER_COMMON, 'err_file="$(trap - ERR; mktemp ', 1),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
