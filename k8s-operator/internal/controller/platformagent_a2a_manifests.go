@@ -306,7 +306,9 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
+	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep    = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -3075,6 +3077,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					Annotations: map[string]string{a2aConfigHashAnnotation: confHash},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 					AutomountServiceAccountToken: ptr.To(false),
 					// The reloader signals nats-server by PID.
 					ShareProcessNamespace: ptr.To(true),
@@ -3496,8 +3499,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// whose own fence keeps them to the bus, LiteLLM and
 					// DNS (agentprofile_namespace.go).
 					profileNamespacePeer(agent),
-					// The MCP server, under its flag (a2aMCPNATSPeers).
-				}, append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...)...),
+					// The MCP server and OKF curator, under their flags.
+				}, append(append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...), a2aCuratorNATSPeers(agent)...)...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -4330,7 +4333,8 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					RestartPolicy:    corev1.RestartPolicyNever,
 					// Its own ServiceAccount, holding no RBAC at all: the
 					// token exists to authenticate to the bus, not to talk to
 					// the API server. Automount stays off and the bus token is
@@ -6580,6 +6584,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if credentialProxyExecTierEnabled(agent) {
 			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 		}
+		if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+		}
 	}
 
 	// The chat backends. The Discord reference is the default for a gateway
@@ -6856,6 +6863,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
+	if len(pullRefs) > 0 {
+		refNames := make([]string, 0, len(pullRefs))
+		for _, ref := range pullRefs {
+			refNames = append(refNames, ref.Name)
+		}
+		env = append(env, corev1.EnvVar{
+			Name:  a2aImagePullRefsEnvVar,
+			Value: strings.Join(refNames, a2aImagePullRefsSep),
+		})
+	}
 
 	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -6874,6 +6892,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: pullRefs,
 					// ndots:3, see brokerCallerPodDNSConfig.
 					DNSConfig: brokerCallerPodDNSConfig(),
 					// The gateway runs as its own ServiceAccount with the
@@ -7037,6 +7056,11 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// drainEndRequeue is when the earliest tier drain ends (#3659, #5850):
+	// the tier's teardown is that pass's, and nothing watched moves when a
+	// drain's end passes, so the pass has to be asked for. An ended drain
+	// (end-tier-drain) is minutes away, not hours.
+	drainEndRequeue time.Duration
 	// profileHoldRequeue is when to check again on a newly bound profile
 	// held until every bus server has loaded its config
 	// (a2aDispatchableProfiles). Zero when none is held.
@@ -7133,6 +7157,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aMCPDoorEnabled() {
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
+	}
+	if a2aCuratorEnabled() {
+		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -7271,6 +7298,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
+	state.drainEndRequeue = earliestDrainEnd(profiles, time.Now())
 	// The profiles still draining (#5074), read once from the applied
 	// dispatch config for both renders: the identity map keeps their
 	// .supervisor grant exactly as long as the dispatch config lists them.
@@ -7478,6 +7506,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
+	}
+
+	// The OKF memory curator, under A2A_CURATOR, after the fences and ahead of
+	// the gateway hold.
+	if err := r.reconcileA2ACurator(ctx, agent, state.busHeld); err != nil {
+		return state, err
 	}
 
 	// The scope publisher: its static objects, its Job on schedule, and the

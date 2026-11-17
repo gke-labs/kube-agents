@@ -466,7 +466,8 @@ class GateTest(unittest.TestCase):
         self.calls = pathlib.Path(self.tmp.name) / "kubectl-calls"
         self.calls.write_text("")
 
-    def run_gate(self, cr: str = _CR_READY, rollout_rc: int = 0, cr_first: str = "", cr_first_reads: int = 0, **scenario) -> subprocess.CompletedProcess:
+    def run_gate(self, cr: str = _CR_READY, rollout_rc: int = 0, cr_first: str = "", cr_first_reads: int = 0,
+                 gateway_replaced: bool = False, **scenario) -> subprocess.CompletedProcess:
         self.scenario.update(scenario)
         script = "\n".join(
             [
@@ -482,7 +483,11 @@ class GateTest(unittest.TestCase):
                 '  case "$1" in',
                 '    port-forward) exec sleep 600 ;;',
                 f'    rollout) return {rollout_rc} ;;',
-                '    get) case "$*" in *platformagent*jsonpath*)',
+                # The gateway's pod: "uid-1", or "uid-2" once a tunnel has been
+                # opened when the case replaces it (#6040).
+                '    get) case "$*" in *"get pods"*)',
+                '      if [ "${FAKE_GATEWAY_REPLACED}" = "1" ] && grep -q "^kubectl port-forward" "${KUBECTL_CALLS}"; then echo "uid-2"; else echo "uid-1"; fi ;;',
+                '    *platformagent*jsonpath*)',
                 '      if [ "$(grep -c "^kubectl get platformagent" "${KUBECTL_CALLS}")" -le "${FAKE_CR_FIRST_READS}" ]; then printf "%s" "${FAKE_CR_FIRST}"; else printf "%s" "${FAKE_CR}"; fi ;;',
                 '    esac ;;',
                 '  esac',
@@ -497,11 +502,16 @@ class GateTest(unittest.TestCase):
                     WEB_CONSOLE_PF_LOG=f'"{self.tmp.name}/pf.log"',
                 ),
                 shell_function(_CI_DEPLOY, "report_cr_status"),
+                # The one-replacement tolerance (#6040); its constants come in
+                # with constants_block.
+                shell_function(_CI_DEPLOY, "gateway_pod_uids"),
+                shell_function(_CI_DEPLOY, "await_gateway_replacement"),
                 lifted(*_GATE_SECTION),
                 'echo "REACHED 6b"',
             ]
         )
-        env = {**os.environ, "KUBECTL_CALLS": str(self.calls), "FAKE_CR": cr, "FAKE_CR_FIRST": cr_first, "FAKE_CR_FIRST_READS": str(cr_first_reads)}
+        env = {**os.environ, "KUBECTL_CALLS": str(self.calls), "FAKE_CR": cr, "FAKE_CR_FIRST": cr_first, "FAKE_CR_FIRST_READS": str(cr_first_reads),
+               "FAKE_GATEWAY_REPLACED": "1" if gateway_replaced else "0"}
         return run_bash(script, env=env)
 
     def kubectl_calls(self, prefix: str) -> list[str]:
@@ -553,6 +563,19 @@ class GateTest(unittest.TestCase):
         # The failure dump: the console's log and the CR's status.
         self.assertTrue(self.kubectl_calls(f"logs -n {_NAMESPACE} deployment/{_CONSOLE_NAME}"))
         self.assertTrue((pathlib.Path(self.tmp.name) / "platformagent-status-web-console-today.yaml").exists())
+
+    def test_a_failure_during_a_gateway_replacement_waits_once_and_keeps_the_attempt(self) -> None:
+        """#6040: the console's chat reaches the agent gateway pod. When that pod
+        was replaced, even a refusal is retried once, after the rollout, and the
+        attempt is not spent."""
+        result = self.run_gate(chat_statuses=[403, 200], gateway_replaced=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the agent gateway pod was replaced during the web console gate (today)", result.stdout)
+        self.assertIn("the replacement is up, retrying without spending the attempt", result.stdout)
+        self.assertIn("(attempt 1/5;", result.stdout)
+        self.assertEqual(len(self.kubectl_calls(f"rollout status deployment/platform-agent-gateway -n {_NAMESPACE}")), 1)
+        self.assertEqual(len(self.kubectl_calls("port-forward")), 2)
+        self.assertTrue(self.kubectl_calls(f"get pods -n {_NAMESPACE} -l app=platform-agent-gateway --field-selector=status.phase=Running"))
 
     def test_a_504_then_a_200_is_retried_through_a_fresh_tunnel(self) -> None:
         result = self.run_gate(chat_statuses=[504, 200])

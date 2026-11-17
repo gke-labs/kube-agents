@@ -2584,6 +2584,73 @@ class CollaborationTest(unittest.TestCase):
         vcs_broker.set_dial_level("explain")
         self.assertTrue(vcs_broker.dial_reported())
 
+    def test_the_auto_merge_label_is_refused_below_auto_merge(self):
+        environ = self._dial()
+        adding = (
+            {"labels": ["kube-agents:auto-merge"]}, {"labelsAdd": [" KUBE-AGENTS:Auto-Merge "]},
+            {"labels": "kube-agents:auto-merge"},
+            # The GitLab adapter joins the list with commas, so one element can carry two labels.
+            {"labelsAdd": ["bug,kube-agents:auto-merge"]}, {"labels": "bug, Kube-Agents:auto-merge"},
+        )
+        for level in ("explain", "propose"):
+            vcs_broker.set_dial_level(level)
+            for payload in adding:
+                with self.subTest(level=level, payload=payload), self.assertRaises(vcs_broker.WorkspaceError) as caught:
+                    vcs_broker.refuse_dial_gated_labels(payload, environ)
+                self.assertEqual((caught.exception.status, caught.exception.fields["code"]), (403, "DIAL_AUTOMERGE_OFF"))
+            vcs_broker.refuse_dial_gated_labels({"labelsRemove": ["kube-agents:auto-merge"], "labels": ["bug"]}, environ)
+        vcs_broker.set_dial_level("automerge")
+        vcs_broker.refuse_dial_gated_labels({"labels": ["kube-agents:auto-merge"]}, environ)
+        vcs_broker.refuse_dial_gated_labels({"labels": ["kube-agents:auto-merge"]}, {vcs_broker.DIAL_ENV: "off"})
+
+    def test_the_gated_label_is_the_rules_files_label(self):
+        source = (Path(vcs_broker.__file__).parent / "automation_rules.py").read_text(encoding="utf-8")
+        self.assertIn('AUTOMERGE_LABEL = "kube-agents:auto-merge"', source)
+        self.assertEqual(frozenset({"kube-agents:auto-merge"}), vcs_broker.DIAL_GATED_LABELS)
+
+    def test_every_forge_write_verb_refuses_the_label_before_it_binds(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("propose")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda p, r: None)
+        with mock.patch.dict(os.environ, environ), mock.patch.object(broker, "_bind", side_effect=AssertionError("bound")):
+            for method in ("proposal_create", "proposal_update", "issue_create", "issue_update"):
+                with self.subTest(method=method), self.assertRaises(vcs_broker.WorkspaceError):
+                    getattr(broker, method)({"repository": "acme/infra", "number": 1, "labelsAdd": ["kube-agents:auto-merge"], "labels": ["kube-agents:auto-merge"]})
+
+    def test_a_list_filter_on_the_label_is_a_read_and_passes(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("propose")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda p, r: None)
+        with mock.patch.dict(os.environ, environ), mock.patch.object(broker, "_bind", side_effect=RuntimeError("bound")):
+            for method in ("proposal_list", "issue_list"):
+                with self.subTest(method=method), self.assertRaisesRegex(RuntimeError, "bound"):
+                    getattr(broker, method)({"repository": "acme/infra", "labels": ["kube-agents:auto-merge"]})
+
+    def test_the_practice_label_asks_the_dial_once_both_exist(self):
+        # The practice label's verb and this refusal land separately; whichever
+        # merges second must make that verb refuse while dial_allows_automerge()
+        # is False. Skipped until the verb exists, then a tripwire: a call (not a
+        # comment) in the verb or its refusal helper.
+        import ast
+        import inspect
+        import textwrap
+
+        methods = [getattr(vcs_broker.VcsBroker, name, None) for name in ("proposal_practice_label", "_practice_refusal")]
+        methods = [m for m in methods if m is not None]
+        if not methods:
+            self.skipTest("the practice label is not in vcs_broker yet")
+        calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            for m in methods
+            for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(m))))
+            if isinstance(node, ast.Call)
+        }
+        self.assertIn("dial_allows_automerge", calls)
+
     def test_set_dial_level_refuses_anything_but_a_level(self):
         self._dial()
         for level in ("", "EXPLAIN", "on", "none"):

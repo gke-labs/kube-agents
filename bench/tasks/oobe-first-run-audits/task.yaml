@@ -30,7 +30,9 @@
 # and passes once the stage marked all five audits due, each has a run since its mark
 # that got going (running, completed, or ended after its start), and each started only after the one before it
 # ended. On an image without the job nothing starts them, which is this case's red;
-# so is a fresh install whose stage skipped them, which the red names.
+# so is a fresh install whose stage skipped them, which the red names. A second
+# objective reads the same records and fails when a run the stage marked due ended
+# in a state other than completed: that audit filed no report.
 #
 # Isolation class: reads the install under test on an eval lease. On a long-lived
 # install it writes to it: it replaces
@@ -93,12 +95,23 @@ verification_spec:
   # the stage marked due that got going (running, completed, or ended after its start) counts, provided it started
   # after the previous audit in the chain ended; a scheduled run the stage did not
   # mark does not, unless the stage recorded the audit as adopted (a run completed
-  # since the sweep), which counts as had. How each run ends is graded by the audit
-  # cases.
+  # since the sweep), which counts as had. How each run ends is the next objective's.
   - name: first-run-audits-started
     role: objective
     check:
       type: oobe_audits_started
+  # The same read. A run the stage marked due that ended in a state other than
+  # completed filed no report, and the chain can still finish inside the wait, so
+  # the objective above passes over it. A run still going has not ended and is not
+  # graded: the stage is done once its last audit is running, and a later
+  # repetition reads that run's end.
+  - name: no-first-run-audit-ended-uncompleted
+    role: objective
+    # assert, not the converge default: a run that ended does not change, so polling
+    # a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: oobe_audits_ended
   # The turn must not start an audit itself: the verifier cannot tell a run the
   # session started from one the stage started. The turn reaches the Planning
   # Agent, which holds no cron or terminal tool; its one route to an audit is a

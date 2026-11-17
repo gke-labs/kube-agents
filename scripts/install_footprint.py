@@ -124,6 +124,7 @@ A2A_WORKLOADS = (
 )
 FLAGGED_LABELS = {
     "mcp": "MCP server",
+    "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {
     "true": "With the operator's `{env}=true`",
