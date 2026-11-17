@@ -48,16 +48,33 @@ from unittest import mock
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "hack" / "fleet-fixture-state.py"
 _CATALOG = _REPO / "bench" / "tf" / "fleet" / "fixtures.json"
+# The pool verifier: the one copy of what provisioning seeds into a pool
+# project's GitOps repository, which the script's repository subject reads
+# through (#5827).
+_VERIFIER = _REPO / "scripts" / "verify_ci_pool_project.py"
 
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location("fleet_fixture_state", _SCRIPT)
+def _load_module(path=_SCRIPT, name="fleet_fixture_state"):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 ffs = _load_module()
+verifier = _load_module(_VERIFIER, "verify_ci_pool_project")
+
+# The declared-intent note as the fixture gate reads it: its path in the pool
+# repository, the blob sha of the six-item content provisioning seeds, and
+# the blob the forty registered projects carried after the sixth declaration
+# landed (#5827), which the gate must read as drift.
+_NOTE_PATH = verifier.GITOPS_INTENT_NOTE_PATH
+_NOTE_SUBJECT = f"repository/{_NOTE_PATH}"
+_SEEDED_NOTE_SHA = verifier.gitops_seeded_blob_sha(_NOTE_PATH)
+_FIVE_ITEM_NOTE_SHA = "3c5790d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
+_POOL_REPO = "gke-agentic/kube-agents-evals-infra"
+# The catalog roles that carry the note assertion: every declared-* role.
+_NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
 
 
 class _SteppedClock:
@@ -199,6 +216,43 @@ elif args[:2] == ["container", "get-server-config"]:
 else:
     print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
     sys.exit(64)
+'''
+
+# The gh stub: `gh api repos/<org>/<repo>[/contents/<path>]`, answered from
+# world["github"] = {"<org>/<repo>": {"<path>": "<blob sha>"}}. No "github"
+# key is a gh with no credential (exit 4, as gh prints it); a repository
+# absent from the map is gh's 404, which it answers alike for a private
+# repository the token cannot see; "UNREACHABLE" is a transport failure.
+_STUB_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write("gh " + " ".join(args) + "\n")
+world = json.load(open(os.environ["STUB_WORLD"]))
+github = world.get("github")
+if github is None:
+    print("To get started with GitHub CLI, please run:  gh auth login", file=sys.stderr)
+    print("Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.", file=sys.stderr)
+    sys.exit(4)
+if github == "UNREACHABLE":
+    print('Get "https://api.github.com/repos/x": dial tcp 140.82.112.5:443: i/o timeout', file=sys.stderr)
+    sys.exit(1)
+target = next(a for a in args[args.index("api") + 1:] if not a.startswith("-") and not a.startswith("Accept:"))
+parts = target.split("/", 3)
+slug = f"{parts[1]}/{parts[2]}"
+repo = github.get(slug)
+if repo is None:
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+if len(parts) == 3:
+    print(json.dumps({"full_name": slug, "default_branch": "main"}))
+    sys.exit(0)
+path = parts[3][len("contents/"):]
+sha = repo.get(path)
+if sha is None:
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({"sha": sha, "path": path, "type": "file", "size": 1456, "encoding": "base64", "content": ""}))
 '''
 
 
@@ -364,6 +418,9 @@ def _cluster_b(*, master: str = "1.33.4-gke.1134000", channel: str | None = "REG
 def _healthy_world() -> dict:
     """Every role in its designed state, as the stubs answer it."""
     return {
+        # The pool repository, with the declared-intent note as provisioning
+        # seeds it: the blob the four declared-* roles assert on.
+        "github": {_POOL_REPO: {_NOTE_PATH: _SEEDED_NOTE_SHA}},
         "kubectl": {
             "pod?app=payments-api": _pods(_pod(restarts=3, last_reason="OOMKilled")),
             "deployment/checkout-gateway": {"status": {"readyReplicas": 2, "replicas": 2}},
@@ -551,6 +608,12 @@ def _healthy_world() -> dict:
                 {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
                 {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["22", "3389"]}]},
             ],
+            # The peered pair as `networks list` prints it: `default` on GCP's
+            # 1460 default, which the listing omits, and the jumbo-frame VPC.
+            "networks": [
+                {"name": "default", "peerings": [{"name": "default-to-mtu-peer-declared", "network": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/global/networks/mtu-peer-declared", "state": "ACTIVE"}]},
+                {"name": "mtu-peer-declared", "mtu": 8896, "peerings": [{"name": "mtu-peer-declared-to-default", "network": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/global/networks/default", "state": "ACTIVE"}]},
+            ],
         },
         # Each instance's serial port 1 output, by name. The startup-fail VM's
         # holds the boot that ran its script.
@@ -581,7 +644,7 @@ class _Harness(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("kubectl", _STUB_KUBECTL), ("gcloud", _STUB_GCLOUD)):
+        for name, body in (("kubectl", _STUB_KUBECTL), ("gcloud", _STUB_GCLOUD), ("gh", _STUB_GH)):
             stub = self.bin / name
             stub.write_text(body, encoding="utf-8")
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
@@ -914,7 +977,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 49 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 50 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -944,7 +1007,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "49 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "50 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -976,7 +1039,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "48 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "49 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -1002,7 +1065,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "49 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "50 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -1026,7 +1089,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "49 role(s) in their designed state" in done.stderr, done.stderr
+        assert "50 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -1040,7 +1103,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "49 role(s) in their designed state" in done.stderr, done.stderr
+        assert "50 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -1056,7 +1119,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "48 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "49 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -1069,7 +1132,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "49 role(s) in their designed state" in done.stderr, done.stderr
+        assert "50 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -1101,7 +1164,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "49 role(s) in their designed state" in done.stderr, done.stderr
+        assert "50 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1292,7 +1355,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "49 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "50 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1497,7 +1560,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "38 role(s) in their designed state, 0 drifted, 11 not checked" in done.stderr
+        assert "39 role(s) in their designed state, 0 drifted, 11 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1542,7 +1605,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "49 role(s) in their designed state" in done.stderr
+        assert "50 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1734,8 +1797,44 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "47 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "48 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
         assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
+
+    def test_the_peered_networks_are_read_in_the_project(self):
+        done = self.run_script(_healthy_world())
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        log = self.log.read_text()
+        # One list per network: the fixture's own and `default`, its peer.
+        assert log.count("gcloud compute networks list --project kube-agents-evals --filter=name ~ ^mtu-peer-declared --format json") == 1
+        assert log.count("gcloud compute networks list --project kube-agents-evals --filter=name ~ ^default --format json") == 1
+
+    def test_a_missing_peering_is_drift(self):
+        # A peering is two one-way halves, and a half alone reads INACTIVE;
+        # the collector compares ACTIVE peerings only, so either half gone is
+        # the posture gone.
+        for side, peering in ((0, "default-to-mtu-peer-declared"), (1, "mtu-peer-declared-to-default")):
+            with self.subTest(peering=peering):
+                world = _healthy_world()
+                world["compute"]["networks"][side]["peerings"] = []
+                world["compute"]["networks"][1 - side]["peerings"][0]["state"] = "INACTIVE"
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {"declared-mtu-peering"}, done.stderr
+                assert f"peerings[?(@.name=='{peering}')].state any_eq \"ACTIVE\"" in self.drift_files()["declared-mtu-peering"]
+
+    def test_a_changed_mtu_is_drift(self):
+        # The posture is the mismatch: the jumbo network back at 1460 ends
+        # it, and so does `default` raised to meet it.
+        world = _healthy_world()
+        world["compute"]["networks"][1]["mtu"] = 1460
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"declared-mtu-peering"}, done.stderr
+        assert "network/mtu-peer-declared* mtu any_eq 8896: observed 1460" in self.drift_files()["declared-mtu-peering"]
+        world = _healthy_world()
+        world["compute"]["networks"][0]["mtu"] = 8896
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"declared-mtu-peering"}, done.stderr
+        assert "network/default* mtu none_eq 8896" in self.drift_files()["declared-mtu-peering"]
 
     def test_a_project_role_without_its_confirmed_list_is_not_asserted(self):
         self.provision(roles=[role for role in self.catalog["roles"] if role != "startup-fail-vm"])
@@ -1759,6 +1858,167 @@ class ProjectScopedRoleTest(_Harness):
         path.write_text(json.dumps(catalog))
         with self.assertRaises(ffs.CatalogError):
             ffs.load_assertions(path)
+
+
+class RepositorySubjectTest(_Harness):
+    """The declared-intent note in the pool project's GitOps repository is a
+    fixture the declared-* roles depend on (#5827): forty registered projects
+    carried the five-item note after the sixth declaration landed, the audit
+    filed the pool as a finding, and the case graded `fail` because the scan
+    read the node pools only. The `repository/<path>` subject reads the file
+    out of the repository through the pool verifier, and the `as_seeded` op
+    holds its blob to the one provisioning seeds."""
+
+    def _note_lines(self, files: dict[str, str]) -> dict[str, str]:
+        return {role: next(line for line in body.splitlines() if line.startswith(_NOTE_SUBJECT)) for role, body in files.items()}
+
+    def _gh_calls(self) -> list[str]:
+        return [line for line in self.log.read_text().splitlines() if line.startswith("gh ")]
+
+    def test_the_subject_and_the_op_are_the_catalogs_vocabulary(self):
+        # scripts/test_eval_rosters.py reads this constant to learn the scan
+        # asserts on pool repositories; bench/kube_agents_bench/fixture_drift.py
+        # matches drift lines on it.
+        assert ffs.REPOSITORY_SUBJECT == "repository"
+        assert ffs.OP_AS_SEEDED in ffs.OPS_WITHOUT_VALUE and ffs.OP_AS_SEEDED in ffs.OPS_WITHOUT_PATH
+        roles = ffs.load_assertions(_CATALOG)
+        on_note = {role for role, spec in roles.items() if any(e["subject"] == _NOTE_SUBJECT for e in spec["state"])}
+        assert on_note == _NOTE_ROLES
+        for role in on_note:
+            entry = next(e for e in roles[role]["state"] if e["subject"] == _NOTE_SUBJECT)
+            assert entry["op"] == ffs.OP_AS_SEEDED and entry["why"], (role, entry)
+
+    def test_the_seeded_note_converges_and_is_read_once_for_every_role_on_it(self):
+        done = self.run_script(_healthy_world())
+        assert done.returncode == 0, done.stderr
+        assert "0 drifted, 0 not checked" in done.stderr, done.stderr
+        assert self._gh_calls() == [f"gh api repos/{_POOL_REPO}/contents/{_NOTE_PATH}"], self._gh_calls()
+
+    def test_the_five_item_note_is_drift_on_every_declared_role(self):
+        world = _healthy_world()
+        world["github"][_POOL_REPO][_NOTE_PATH] = _FIVE_ITEM_NOTE_SHA
+        report = self.tmp / "report.json"
+        done = self.run_script(world, "--report", str(report))
+        assert done.returncode == 0, done.stderr
+        files = self.drift_files()
+        assert set(files) == _NOTE_ROLES, (files, done.stderr)
+        for role, line in self._note_lines(files).items():
+            assert line.startswith(f"{_NOTE_SUBJECT} as_seeded: observed blob {_FIVE_ITEM_NOTE_SHA[:8]}, seeded blob {_SEEDED_NOTE_SHA[:8]}"), (role, line)
+            # The repair is the verifier's own replace command, with the live
+            # file's sha; the line names what prints it rather than carrying
+            # the multi-line note inline.
+            assert f'print(v.gitops_note_seed_command("{_POOL_REPO}", "{_FIVE_ITEM_NOTE_SHA}"))' in line, line
+            assert "(why:" in line
+        assert f"{len(_NOTE_ROLES)} drifted" in done.stderr
+        # The in-cluster assertions of the same roles still held: the note is
+        # the only line, so the reason the gate records is the note's.
+        for role, body in files.items():
+            assert body.count("\n") == 1, (role, body)
+        doc = json.loads(report.read_text())
+        for role in _NOTE_ROLES:
+            assert doc["roles"][role]["state"] == "drifted"
+            assert doc["roles"][role]["detail"][0].startswith(_NOTE_SUBJECT), doc["roles"][role]
+
+    def test_a_missing_note_in_a_visible_repository_is_drift(self):
+        world = _healthy_world()
+        world["github"][_POOL_REPO] = {}
+        done = self.run_script(world)
+        files = self.drift_files()
+        assert set(files) == _NOTE_ROLES, (files, done.stderr)
+        for line in self._note_lines(files).values():
+            assert f"{_NOTE_SUBJECT} as_seeded: observed nothing" in line, line
+            # No live sha: the printed command seeds rather than replaces.
+            assert f'print(v.gitops_note_seed_command("{_POOL_REPO}", ""))' in line, line
+        # The 404 was told from an invisible repository by one more read.
+        assert self._gh_calls() == [f"gh api repos/{_POOL_REPO}/contents/{_NOTE_PATH}", f"gh api repos/{_POOL_REPO}"], self._gh_calls()
+
+    def test_a_repository_the_credential_cannot_see_is_not_checked(self):
+        # gh answers 404 for a private repository the token cannot see as it
+        # does for a missing file; only a repository that answers is evidence.
+        world = _healthy_world()
+        world["github"] = {}
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert f"{len(_NOTE_ROLES)} not checked" in done.stderr, done.stderr
+        for role in _NOTE_ROLES:
+            assert f"fixture role '{role}' could not be checked" in done.stderr
+        assert "not visible to this credential" in done.stderr, done.stderr
+
+    def test_no_credential_leaves_the_note_unasserted_and_the_roles_on_their_cluster_state(self):
+        # The hourly scan's case, and a laptop with no gh login: the pass has
+        # nothing to read the repository with, so the assertion is not made,
+        # the role rests on what the identity can read, and the report says
+        # what was left out. Not "not checked": that verdict would hold a
+        # fixture_drift incident on the role open forever on the hourly scan
+        # and drop the digest's clean line for good.
+        world = _healthy_world()
+        del world["github"]
+        report = self.tmp / "report.json"
+        done = self.run_script(world, "--report", str(report))
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        assert "0 drifted, 0 not checked" in done.stderr, done.stderr
+        assert done.stderr.count("WARNING") == 1 and "not asserted" in done.stderr and "gh auth login" in done.stderr, done.stderr
+        doc = json.loads(report.read_text())
+        assert [u["subject"] for u in doc["unasserted"]] == [_NOTE_SUBJECT], doc["unasserted"]
+        assert set(doc["unasserted"][0]["roles"]) == _NOTE_ROLES
+        assert all(doc["roles"][role]["state"] == "converged" for role in _NOTE_ROLES)
+        assert len(self._gh_calls()) == 1, self._gh_calls()
+        # A cluster assertion out of shape on the same role is still drift
+        # (the stub answers the PDB list for no-pdb-workload's namespace too).
+        world["kubectl"]["poddisruptionbudget?"] = {"items": [{"metadata": {"name": "added"}}]}
+        self.run_script(world)
+        assert "declared-no-pdb-workload" in self.drift_files()
+        assert "poddisruptionbudget?" in self.drift_files()["declared-no-pdb-workload"]
+
+    def test_a_healthy_report_carries_no_unasserted_list(self):
+        report = self.tmp / "report.json"
+        self.run_script(_healthy_world(), "--report", str(report))
+        assert json.loads(report.read_text())["unasserted"] == []
+
+    def test_a_transport_failure_is_not_checked(self):
+        world = _healthy_world()
+        world["github"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert f"{len(_NOTE_ROLES)} not checked" in done.stderr, done.stderr
+
+    def test_a_note_drift_does_not_hold_the_wait(self):
+        # Only an operator's replace clears it; a wait sees nothing converge.
+        # One pass: a held wait would re-read the note every second of the
+        # sixty, so the one contents read is the evidence (not the clock,
+        # which a loaded machine stretches).
+        world = _healthy_world()
+        world["github"][_POOL_REPO][_NOTE_PATH] = _FIVE_ITEM_NOTE_SHA
+        done = self.run_script(world, "--wait", "60", "--interval", "1")
+        assert set(self.drift_files()) == _NOTE_ROLES, done.stderr
+        assert len(self._gh_calls()) == 1, self._gh_calls()
+
+    def test_a_note_drift_beside_a_healed_cluster_fixture_is_still_drift(self):
+        world = _healthy_world()
+        world["github"][_POOL_REPO][_NOTE_PATH] = _FIVE_ITEM_NOTE_SHA
+        world["kubectl"]["poddisruptionbudget?"] = {"items": [{"metadata": {"name": "added"}}]}
+        self.run_script(world)
+        body = self.drift_files()["declared-no-pdb-workload"]
+        assert _NOTE_SUBJECT in body and "poddisruptionbudget?" in body, body
+
+    def test_the_catalog_refuses_the_op_off_the_repository_and_a_path_nobody_seeds(self):
+        for role, entry in (
+            ("declared-no-pdb-workload", {"subject": "deployment/notification-relay", "op": "as_seeded"}),
+            ("declared-no-pdb-workload", {"subject": "repository/knowledge/other.md", "op": "as_seeded"}),
+            ("declared-no-pdb-workload", {"subject": _NOTE_SUBJECT, "op": "absent"}),
+            ("declared-no-pdb-workload", {"subject": _NOTE_SUBJECT, "op": "as_seeded", "value": "x"}),
+            ("declared-no-pdb-workload", {"subject": _NOTE_SUBJECT, "op": "as_seeded", "path": "sha"}),
+            ("declared-no-pdb-workload", {"subject": "repository/../etc/passwd", "op": "as_seeded"}),
+            ("startup-fail-vm", {"subject": _NOTE_SUBJECT, "op": "absent"}),
+        ):
+            with self.subTest(role=role, entry=entry):
+                catalog = json.loads(_CATALOG.read_text())
+                catalog["roles"][role]["state"].append(entry)
+                path = self.tmp / "bad.json"
+                path.write_text(json.dumps(catalog))
+                with self.assertRaises(ffs.CatalogError):
+                    ffs.load_assertions(path)
 
 
 class ReportTest(_Harness):
@@ -1832,13 +2092,14 @@ class ReportTest(_Harness):
                 "zonal-skew-scheduling": "converged",
                 "zonal-skew-volume": "converged",
                 "world-open-ingress": "converged",
+                "declared-mtu-peering": "converged",
             },
         )
         self.assertEqual(doc["roles"]["no-pdb-workload"]["detail"], self.drift_files()["no-pdb-workload"].splitlines())
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 43, "drifted": 1, "unchecked": 4})
+        self.assertEqual(doc["summary"], {"converged": 44, "drifted": 1, "unchecked": 4})
         self.assertEqual(doc["roles"]["startup-fail-vm"]["cluster_slot"], None)
         self.assertIn("1 drifted, 4 not checked", done.stderr)
 

@@ -20,6 +20,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _NS_TEMPLATE = "templates/profiles-namespace.yaml"
 _CR_TEMPLATE = "templates/platform-agent-cr.yaml"
+_RBAC_TEMPLATE = "templates/operator-rbac.yaml"
 _HELM = shutil.which("helm")
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
@@ -58,6 +59,38 @@ class ProfilesNamespaceRenderTest(unittest.TestCase):
         # the profile namespace (profileNamespaceExists in the operator).
         self.assertEqual(docs[0]["metadata"]["labels"]["app.kubernetes.io/component"], "profiles")
         self.assertEqual(docs[0]["metadata"]["annotations"]["meta.helm.sh/release-namespace"], _RELEASE_NS)
+
+    def test_the_operator_gets_its_write_role_in_the_profile_namespace_whatever_the_mode(self):
+        # The chart renders the profile namespace on every install with a
+        # platform agent, and the operator renders into it whatever spec.mode
+        # says, so the operator's namespaced Role and RoleBinding render there
+        # whenever the namespace does, with the rules the install namespace's
+        # copy has. They used to render there under mode next only.
+        profile_ns = f"{_RELEASE_NS}-profiles"
+        for mode in (None, "today", "next"):
+            with self.subTest(mode=mode):
+                overrides = [] if mode is None else [f"platformAgent.mode={mode}"]
+                docs = _docs(_RBAC_TEMPLATE, *overrides)
+                by_ns = {}
+                for d in docs:
+                    by_ns.setdefault(d["metadata"].get("namespace"), {})[(d["kind"], d["metadata"]["name"])] = d
+                in_ns = by_ns.get(profile_ns, {})
+                role = in_ns.get(("Role", "ka-operator-namespaced-role"))
+                binding = in_ns.get(("RoleBinding", "ka-operator-namespaced-rolebinding"))
+                self.assertIsNotNone(role, sorted(in_ns))
+                self.assertIsNotNone(binding, sorted(in_ns))
+                self.assertEqual(binding["roleRef"]["name"], "ka-operator-namespaced-role")
+                self.assertEqual(binding["subjects"][0]["name"], "ka-operator-sa")
+                install_role = by_ns.get(_RELEASE_NS, {}).get(("Role", "ka-operator-namespaced-role"))
+                self.assertIsNotNone(install_role)
+                self.assertEqual(role["rules"], install_role["rules"])
+
+    def test_without_a_platform_agent_there_is_no_profile_namespace_role(self):
+        docs = _docs(_RBAC_TEMPLATE, "platformAgent.enabled=false")
+        self.assertFalse(
+            [d for d in docs if d["metadata"].get("namespace") == f"{_RELEASE_NS}-profiles"],
+            "no profile namespace, so nothing of the operator's renders into it",
+        )
 
     def test_a_release_namespace_too_long_for_the_suffix_fails_at_render(self):
         args = [_HELM, "template", "ka", str(_CHART), "-n", "a" * 55, *_REQUIRED]
