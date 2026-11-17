@@ -35,6 +35,7 @@ from tests.testing.common import (
     create_minimal_tools_bin,
     create_mock_git_repo,
     get_isolated_test_env,
+    installer_report_env,
 )
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
@@ -107,27 +108,12 @@ def _run_installer_bash(body, env, cwd=_REPO_ROOT):
 def setUpModule():
     # No test here runs the real gcloud: a gcloud call that a test leaves
     # unstubbed goes to a stand-in, and the stand-in fails the module.
-    global _NO_GCLOUD, _REPORT_DIR, _REPORT_ENV_BEFORE
-    # write_json_report runs for real in many tests here, by a direct call and
-    # through the ERR handler. Its report goes to a file of this run of the
-    # module. The path a real install writes is one fixed file, which two runs
-    # of this module at the same time would share. The directory first and the
-    # variable last, so that a step that fails here leaves nothing set.
-    _REPORT_DIR = tempfile.TemporaryDirectory()
+    global _NO_GCLOUD
     _NO_GCLOUD = no_live_gcloud.install()
-    _REPORT_ENV_BEFORE = os.environ.get(_INSTALL_REPORT_FILE_ENV)
-    os.environ[_INSTALL_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / "kube-agents-install-report.json")
 
 
 def tearDownModule():
-    if _REPORT_ENV_BEFORE is None:
-        os.environ.pop(_INSTALL_REPORT_FILE_ENV, None)
-    else:
-        os.environ[_INSTALL_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
-    try:
-        _REPORT_DIR.cleanup()
-    finally:
-        _NO_GCLOUD.uninstall()
+    _NO_GCLOUD.uninstall()
 
 
 class TestNoLiveGcloud(unittest.TestCase):
@@ -505,7 +491,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                 "HOME": str(home_dir),
                 "PATH": os.environ["PATH"],
                 # A refused checkout ends in the ERR handler, which writes the report.
-                _INSTALL_REPORT_FILE_ENV: os.environ[_INSTALL_REPORT_FILE_ENV],
+                **installer_report_env(),
             },
             cwd=str(outside_dir),
         )
