@@ -106,7 +106,12 @@ const (
 	// minute by default) plus the delay of its configMapAndSecretChange-
 	// DetectionStrategy (Watch by default, whose cache can serve a value up
 	// to its TTL old). A server that started more than this after the config
-	// was written read the new file at start.
+	// was written read the new file at start. The two times come from
+	// different clocks: start from the node's (as nats-server reports it),
+	// the write from the API server's (managedFields). A node clock running
+	// ahead by more than the window's slack over the actual lag could pass a
+	// server that read the old file; NTP-synced GKE nodes stay within a
+	// second, far inside the margin above the kubelet's defaults.
 	a2aBusKubeletSyncWindow = 90 * time.Second
 	// a2aBusReloadAfterStart is how far past a server's start a load time
 	// must be to be a reload rather than the load at start, which nats-server
