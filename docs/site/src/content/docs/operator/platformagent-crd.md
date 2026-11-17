@@ -1877,7 +1877,7 @@ Ready is counted against `spec.replicas`, not against the pods that exist. The c
 
 ### What `DispatcherJobMode` reports
 
-`DispatcherJobMode` says whether the profile dispatcher runs profile tasks as Jobs: unattended tasks, and at any tier the tasks that carry a confirmed change's write permit, each in its own one-pod Job. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. That Role grants create, read and delete on Jobs, and `get` on the `DispatchJobTemplate` objects it builds each Job from. Without it, unattended tasks have no worker and the dispatcher refuses them at admission (`no-worker`), and a confirmed change is refused with `change-needs-job`. The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
+`DispatcherJobMode` says whether the profile dispatcher runs profile tasks as Jobs: unattended tasks, and confirmed changes at any tier. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. That Role grants create, read and delete on Jobs, and `get` on the `DispatchJobTemplate` objects it builds each Job from. Without it, the dispatcher refuses unattended tasks at admission (`no-worker`) and confirmed changes (`change-needs-job`). The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
 
 **Reasons.**
 

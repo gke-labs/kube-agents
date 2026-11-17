@@ -33,6 +33,7 @@ const (
 	jobProfileAnnotation = "kubeagents.x-k8s.io/dispatch-profile"
 	jobTierAnnotation    = "kubeagents.x-k8s.io/dispatch-tier"
 	jobTaskAnnotation    = "kubeagents.x-k8s.io/dispatch-task"
+	jobKindAnnotation    = "kubeagents.x-k8s.io/dispatch-kind"
 )
 
 // KubeJobs is the binary's JobRunner: one Job per unattended task in the
@@ -146,15 +147,33 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 
 // JobName is the task's Job name: a hash of its whole key, kind included, so
 // it is the same after a restart, fits a label value, carries nothing a
-// caller chose, and no two held tasks share one (#5646).
+// caller chose, and no two held tasks share one (#5646). The key is hashed as
+// a JSON array, so no two keys encode alike whatever their fields hold.
 func JobName(profile, tier, kind, taskID string) string {
-	sum := sha256.Sum256([]byte(profile + "/" + tier + "/" + kind + "/" + taskID))
+	raw, _ := json.Marshal([]string{profile, tier, kind, taskID})
+	sum := sha256.Sum256(raw)
 	return "dispatch-" + hex.EncodeToString(sum[:10])
 }
 
+// validJobKey says every part of a task's key is a subject token, the only
+// keys a Job is made, found or deleted for. The lib client refuses to publish
+// a submission whose profile, tier or task id isn't one (Client.PublishSeq), and
+// only the gateway may publish submissions, but ParseSubmitSubject, which the
+// dispatcher keys a task by, checks only the kind, so the key is checked here
+// again before it names a Job.
+func validJobKey(profile, tier, kind, taskID string) error {
+	for _, part := range []string{profile, tier, kind, taskID} {
+		if !lib.ValidSubjectToken(part) {
+			return fmt.Errorf("the task key %q/%q/%q/%q has a part that is not a subject token, so it names no Job", profile, tier, kind, taskID)
+		}
+	}
+	return nil
+}
+
 // legacyJobName is the name a dispatcher from before the kind was in it gave
-// the task's Job. Delete removes that one too, so a Job such a dispatcher
-// launched before an upgrade is still cleaned up; to go a release on.
+// the task's Job, its key joined with slashes. Delete removes a Job under it
+// only when the Job's own annotations say it is this task's; to go a release
+// on.
 func legacyJobName(profile, tier, taskID string) string {
 	sum := sha256.Sum256([]byte(profile + "/" + tier + "/" + taskID))
 	return "dispatch-" + hex.EncodeToString(sum[:10])
@@ -170,6 +189,9 @@ var ErrJobRefusedByPolicy = errors.New("the dispatcher Job admission policy refu
 const jobPolicyName = "kube-agents-a2a-dispatcher-job"
 
 func (k *KubeJobs) Launch(ctx context.Context, profile, tier, kind, taskID string) (time.Time, error) {
+	if err := validJobKey(profile, tier, kind, taskID); err != nil {
+		return time.Time{}, err
+	}
 	cfg := k.config()
 	var prof *lib.DispatchProfile
 	for i := range cfg.Profiles {
@@ -234,6 +256,7 @@ func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.R
 			Annotations: map[string]string{
 				jobProfileAnnotation: profile,
 				jobTierAnnotation:    tier,
+				jobKindAnnotation:    kind,
 				jobTaskAnnotation:    taskID,
 			},
 		},
@@ -247,6 +270,9 @@ func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.R
 }
 
 func (k *KubeJobs) Pod(ctx context.Context, profile, tier, kind, taskID string) (string, bool, error) {
+	if err := validJobKey(profile, tier, kind, taskID); err != nil {
+		return "", false, err
+	}
 	ns, name := k.config().ProfileNamespace, JobName(profile, tier, kind, taskID)
 	job, err := k.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 	switch {
@@ -288,13 +314,44 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, kind, taskID string) 
 }
 
 func (k *KubeJobs) Delete(ctx context.Context, profile, tier, kind, taskID string) error {
-	var errs []error
-	for _, name := range []string{JobName(profile, tier, kind, taskID), legacyJobName(profile, tier, taskID)} {
-		err := k.kube.BatchV1().Jobs(k.config().ProfileNamespace).Delete(ctx, name,
-			metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationBackground)})
-		if err != nil && !apierrors.IsNotFound(err) {
-			errs = append(errs, err)
-		}
+	if err := validJobKey(profile, tier, kind, taskID); err != nil {
+		return err
 	}
-	return errors.Join(errs...)
+	jobs := k.kube.BatchV1().Jobs(k.config().ProfileNamespace)
+	err := jobs.Delete(ctx, JobName(profile, tier, kind, taskID),
+		metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationBackground)})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return k.deleteLegacy(ctx, profile, tier, kind, taskID)
+}
+
+// deleteLegacy deletes the Job a dispatcher from before the kind was in the
+// name launched for this task, and only that one: the Job under the legacy
+// name must say, by its own annotations, that it is this (profile, tier,
+// task)'s, and of this kind if it names one (an older Job names none), and
+// the delete is held to the UID that was read, so a Job made under the name
+// meanwhile is left alone.
+func (k *KubeJobs) deleteLegacy(ctx context.Context, profile, tier, kind, taskID string) error {
+	jobs := k.kube.BatchV1().Jobs(k.config().ProfileNamespace)
+	old, err := jobs.Get(ctx, legacyJobName(profile, tier, taskID), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	a := old.Annotations
+	if a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobTaskAnnotation] != taskID ||
+		(a[jobKindAnnotation] != "" && a[jobKindAnnotation] != kind) {
+		return nil
+	}
+	err = jobs.Delete(ctx, old.Name, metav1.DeleteOptions{
+		PropagationPolicy: ptr.To(metav1.DeletePropagationBackground),
+		Preconditions:     &metav1.Preconditions{UID: &old.UID},
+	})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	return err
 }
