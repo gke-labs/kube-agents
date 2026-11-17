@@ -64,7 +64,8 @@ const (
 	// deploy/sandbox/sshd_config. Above 1024 so the daemon does not need
 	// CAP_NET_BIND_SERVICE, and not 22 so nothing in the cluster mistakes it for
 	// a node.
-	shellSandboxPort = 2222
+	shellSandboxPort      = 2222
+	shellSandboxComponent = "shell-sandbox"
 
 	// Operator-level override for installs mirroring images into a private
 	// registry, matching the "override" field of the agent-sandbox entry in
@@ -622,6 +623,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	for k, v := range labels {
 		podLabels[k] = v
 	}
+	podLabels["kubeagents.x-k8s.io/component"] = shellSandboxComponent
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{

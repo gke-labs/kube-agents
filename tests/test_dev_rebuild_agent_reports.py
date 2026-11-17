@@ -1,4 +1,5 @@
-"""dev_rebuild_agent.sh reports a refused image update and takes the default agent on a closed stdin."""
+"""dev_rebuild_agent.sh reports a refused image update, takes the default agent on a closed stdin,
+and builds the three images that go under one dev tag."""
 
 import os
 import pathlib
@@ -6,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+
+import yaml
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path("scripts/dev/dev_rebuild_agent.sh")
@@ -17,7 +20,11 @@ VARS_FILE = pathlib.Path("scripts/installer/vars.sh")
 RUN_TIMEOUT_SECONDS = 60
 SUCCESS_LINE = "Redeployment triggered successfully"
 STEP_FAILED_LINE = "Failed to execute step: 4. Trigger Redeployment in GKE"
+REGISTRY = "us-east4-docker.pkg.dev/dev-project/kube-agents"
+BRIDGE_DOCKERFILE = "a2a/Dockerfile.hermes-bridge"
+BRIDGE_BUILD_CONFIG = "scripts/dev/cloudbuild-hermes-bridge.yaml"
 STUB_GCLOUD = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GCLOUD_CALLS"
 case "$*" in
   "config get-value project"*) echo "dev-project" ;;
 esac
@@ -62,6 +69,22 @@ case "$*" in
 esac
 exit 0
 """
+# Records each call. A call that holds $STUB_DOCKER_FAIL_ON fails; every other one succeeds.
+STUB_DOCKER = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$DOCKER_CALLS"
+if [ -n "${STUB_DOCKER_FAIL_ON:-}" ]; then
+  case "$*" in *"$STUB_DOCKER_FAIL_ON"*) exit 1 ;; esac
+fi
+exit 0
+"""
+WORKER_POOL = "projects/dev-project/locations/us-east4/workerPools/dev-pool"
+STEP_BUILD_FAILED_LINE = "Failed to execute step: 2. Build & Push Agent Image"
+
+
+def substitutions(call: str) -> dict[str, str]:
+    """The `--substitutions` of one recorded `gcloud builds submit` call."""
+    [word] = [word for word in call.split() if word.startswith("--substitutions=")]
+    return dict(pair.split("=", 1) for pair in word.split("=", 1)[1].split(","))
 
 
 class DevRebuildAgentReportsTest(unittest.TestCase):
@@ -75,11 +98,13 @@ class DevRebuildAgentReportsTest(unittest.TestCase):
         (self.root / VARS_FILE).unlink(missing_ok=True)
         stub_bin = self.root / "bin"
         stub_bin.mkdir()
-        for name, text in (("gcloud", STUB_GCLOUD), ("kubectl", STUB_KUBECTL)):
+        for name, text in (("gcloud", STUB_GCLOUD), ("kubectl", STUB_KUBECTL), ("docker", STUB_DOCKER)):
             stub = stub_bin / name
             stub.write_text(text)
             stub.chmod(0o755)
         self.calls = self.root / "kubectl-calls.log"
+        self.gcloud_calls = self.root / "gcloud-calls.log"
+        self.docker_calls = self.root / "docker-calls.log"
         self.env = {
             **{k: v for k, v in os.environ.items() if k in ("TMPDIR", "LANG", "LC_ALL")},
             "PATH": f"{stub_bin}:/usr/bin:/bin",
@@ -88,11 +113,14 @@ class DevRebuildAgentReportsTest(unittest.TestCase):
             "REGION": "us-east4",
             "CLUSTER_NAME": "dev-cluster",
             "KUBECTL_CALLS": str(self.calls),
+            "GCLOUD_CALLS": str(self.gcloud_calls),
+            "DOCKER_CALLS": str(self.docker_calls),
         }
 
-    def run_script(self, *args, set_image_exit=0, with_callout=False, get_deployment_exit=0):
+    def run_script(self, *args, set_image_exit=0, with_callout=False, get_deployment_exit=0, extra_env=None):
         env = {
             **self.env,
+            **(extra_env or {}),
             "STUB_SET_IMAGE_EXIT": str(set_image_exit),
             "STUB_WITH_CALLOUT": str(int(with_callout)),
             "STUB_GET_DEPLOYMENT_EXIT": str(get_deployment_exit),
@@ -138,6 +166,80 @@ class DevRebuildAgentReportsTest(unittest.TestCase):
         proc = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(SUCCESS_LINE, proc.stdout)
+
+    def deployed_agent_image(self) -> str:
+        """The agent image that the script put on the Deployment: what the bridge must match."""
+        [call] = [call for call in self.calls.read_text().splitlines() if call.startswith("set image")]
+        [image] = [word.split("=", 1)[1] for word in call.split() if word.startswith("platform-agent=")]
+        return image
+
+    def test_the_cloud_build_path_builds_the_bridge_from_the_agent_image_it_just_built(self):
+        proc = self.run_script("platform")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        builds = [call for call in self.gcloud_calls.read_text().splitlines() if call.startswith("builds submit")]
+        self.assertEqual(len(builds), 3, builds)
+        agent, proxy, bridge = (substitutions(call) for call in builds)
+        self.assertEqual(agent["_TARGET"], "platform")
+        self.assertEqual(proxy["_TARGET"], "credential-proxy")
+        self.assertIn(f"--config={BRIDGE_BUILD_CONFIG}", builds[2].split())
+        agent_uri = self.deployed_agent_image()
+        tag = agent_uri.rsplit(":", 1)[1]
+        self.assertEqual(agent_uri, f"{REGISTRY}/platform-agent:{tag}")
+        self.assertEqual(agent["_IMAGE_URI"], agent_uri)
+        # The operator takes the bridge from the deployed agent image: same path, same tag.
+        self.assertEqual(bridge, {"_BRIDGE_URI": f"{REGISTRY}/hermes-bridge:{tag}", "_PLATFORM_URI": agent_uri})
+        self.assertIn(f"{REGISTRY}/hermes-bridge:{tag}", proc.stdout)
+
+    def test_the_bridge_build_config_takes_what_the_script_sends_and_pushes_the_image(self):
+        self.run_script("platform")
+        [bridge] = [call for call in self.gcloud_calls.read_text().splitlines() if BRIDGE_BUILD_CONFIG in call]
+        config = yaml.safe_load((REPO / BRIDGE_BUILD_CONFIG).read_text())
+        self.assertEqual(set(config["substitutions"]), set(substitutions(bridge)))
+        self.assertEqual(config["images"], ["$_BRIDGE_URI"])
+        [step] = config["steps"]
+        args = step["args"]
+        self.assertEqual(args[0], "build")
+        self.assertEqual(args[args.index("-t") + 1], "$_BRIDGE_URI")
+        self.assertEqual(args[args.index("--build-arg") + 1], "PLATFORM_AGENT_IMAGE=$_PLATFORM_URI")
+        self.assertEqual(args[args.index("-f") + 1], BRIDGE_DOCKERFILE)
+        self.assertEqual(args[args.index("--platform") + 1], "linux/amd64")
+        # The context is the a2a module, where the Dockerfile's `COPY . .` reads from.
+        self.assertEqual(args[-1], "a2a")
+        self.assertTrue((REPO / BRIDGE_DOCKERFILE).is_file())
+
+    def test_the_worker_pool_reaches_all_three_builds(self):
+        proc = self.run_script("platform", extra_env={"CLOUD_BUILD_WORKER_POOL": WORKER_POOL})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        builds = [call for call in self.gcloud_calls.read_text().splitlines() if call.startswith("builds submit")]
+        self.assertEqual(len(builds), 3, builds)
+        for call in builds:
+            self.assertIn(f"--worker-pool={WORKER_POOL}", call.split(), call)
+
+    def test_the_local_path_builds_and_pushes_the_bridge_after_the_agent_image_is_pushed(self):
+        proc = self.run_script("platform", "--local")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.docker_calls.read_text().splitlines()
+        agent_uri = self.deployed_agent_image()
+        tag = agent_uri.rsplit(":", 1)[1]
+        bridge_uri = f"{REGISTRY}/hermes-bridge:{tag}"
+        [bridge_build] = [index for index, call in enumerate(calls) if call.startswith("build ") and BRIDGE_DOCKERFILE in call]
+        words = calls[bridge_build].split()
+        # One tag only, and it is the tag of the deployed agent image, not `latest`.
+        self.assertEqual([words[index + 1] for index, word in enumerate(words) if word == "-t"], [bridge_uri])
+        self.assertIn(f"PLATFORM_AGENT_IMAGE={agent_uri}", words)
+        self.assertEqual(words[words.index("--platform") + 1], "linux/amd64")
+        self.assertEqual(words[-1], str(self.root / "a2a"))
+        self.assertLess(calls.index(f"push {agent_uri}"), bridge_build)
+        self.assertGreater(calls.index(f"push {bridge_uri}"), bridge_build)
+
+    def test_a_failed_bridge_build_stops_the_run_before_the_redeploy(self):
+        proc = self.run_script("platform", "--local", extra_env={"STUB_DOCKER_FAIL_ON": BRIDGE_DOCKERFILE})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(STEP_BUILD_FAILED_LINE, proc.stdout + proc.stderr)
+        self.assertNotIn(SUCCESS_LINE, proc.stdout)
+        self.assertFalse([call for call in self.docker_calls.read_text().splitlines() if call.startswith("push ") and "hermes-bridge" in call])
+        kubectl_calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        self.assertFalse([call for call in kubectl_calls if call.startswith(("set image", "patch "))])
 
 
 if __name__ == "__main__":

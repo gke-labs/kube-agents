@@ -14,20 +14,19 @@ on:
         options:
           - "rc"
           - "nightly"
-          # autopush, autopush-next and staging are here as the escape hatch
+          # autopush and staging are here as the escape hatch
           # for when an in-place reconcile cannot converge — #1117's Option B.
           # They are long-lived and this workflow DESTROYS what it finds, so
           # they are dispatch-only and guarded by confirm_destroy below.
           # `Shared: Reconcile Environment` is the routine way to move them.
           - "autopush"
-          - "autopush-next"
           - "staging"
       rc_tag:
         description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
         required: true
         type: string
       confirm_destroy:
-        description: "For autopush/autopush-next/staging only: type the environment name to confirm the teardown"
+        description: "For autopush/staging only: type the environment name to confirm the teardown"
         required: false
         default: ""
         type: string
@@ -111,7 +110,7 @@ jobs:
         # workflow_call from a scheduled parent that targeted a long-lived
         # environment would skip both guards and destroy it unannounced. No
         # caller passes these today; the gate is what keeps that true.
-        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging'
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
         env:
           TARGET: ${{ inputs.github_environment }}
           CONFIRM: ${{ inputs.confirm_destroy }}
@@ -195,7 +194,7 @@ jobs:
       # Only the long-lived environments. `rc` and `nightly` are rebuilt every
       # pipeline run and nobody live-tests against them.
       - name: Refuse while somebody is live-testing
-        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging'
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
         env:
           # Configured in GitHub Environment Variables (vars.KUBE_AGENTS_KUBECTL_TIMEOUT).
           # Overrides the default 8s kubectl timeout in live_test_lease.py to accommodate
@@ -504,7 +503,7 @@ jobs:
           # every run and carry no allowlist by design, so they stay exempt —
           # the same long-lived/ephemeral split `render_install_env.sh` draws
           # with --strict.
-          LONG_LIVED_ENVIRONMENT: ${{ (inputs.github_environment == 'autopush' || inputs.github_environment == 'autopush-next' || inputs.github_environment == 'staging') && 'true' || '' }}
+          LONG_LIVED_ENVIRONMENT: ${{ (inputs.github_environment == 'autopush' || inputs.github_environment == 'staging') && 'true' || '' }}
           SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
           SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

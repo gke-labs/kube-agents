@@ -610,6 +610,12 @@ class RetryTest(unittest.TestCase):
         with mock.patch.object(helper, "_rate_limit_waited", 0.0):
             self.assertEqual(helper.limit_wait(nan), helper.RATE_LIMIT_DEFAULT_WAIT_SECONDS)
 
+    def test_a_secondary_limit_with_budget_left_waits_the_default(self):
+        # The reset is the wait only when the hourly budget is spent (#6177).
+        secondary = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}, io.BytesIO(b'{"message":"secondary rate limit"}'))
+        with mock.patch.object(helper, "now", lambda: 1000.0), mock.patch.object(helper, "_rate_limit_waited", 0.0):
+            self.assertEqual(helper.limit_wait(secondary), helper.RATE_LIMIT_DEFAULT_WAIT_SECONDS)
+
     def test_each_reset_starts_with_a_full_budget(self):
         # A budget an earlier reset spent doesn't carry into the next.
         github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
