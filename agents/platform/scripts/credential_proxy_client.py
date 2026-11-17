@@ -369,7 +369,10 @@ KUBECONFIG_FLAG = "--kubeconfig"
 
 
 def normalize_universe_domain(raw: str | None) -> str:
-    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank."""
+    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank.
+
+    Refuses a domain under `googleapis.com`: such a value names hosts of the commercial universe.
+    """
     trimmed = (raw or "").strip()
     if not trimmed:
         return DEFAULT_UNIVERSE_DOMAIN
@@ -381,6 +384,14 @@ def normalize_universe_domain(raw: str | None) -> str:
     ):
         raise ValueError(
             f"universe domain {raw!r} must be a lowercase DNS domain with at least two labels"
+        )
+    if cleaned.endswith(_GOOGLE_API_SUFFIX):
+        # `<service>.mtls.googleapis.com` and the like are hosts of the commercial
+        # universe. As a universe domain such a value would pass the rule that a
+        # custom universe refuses the commercial hosts, and stay in the commercial one.
+        raise ValueError(
+            f"universe domain {raw!r} is under {DEFAULT_UNIVERSE_DOMAIN}, which is the "
+            f"commercial universe and not another one; use {DEFAULT_UNIVERSE_DOMAIN}"
         )
     return cleaned
 
