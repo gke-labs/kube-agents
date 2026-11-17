@@ -336,6 +336,13 @@ which also run in the sandbox, before any identity is written to disk; hashing
 it anywhere else would mean shipping the plaintext address out of the sandbox
 first, which is exactly what it exists to prevent.
 
+The sandbox holds one more Secret-backed value, `A2A_ACTIVITY_SECRET`: the key
+hermes signs its tool-call deliveries to the bridge sidecar's loopback door with.
+It is pod-scoped like the two above, and hermes needs it in its own process. The
+activity signing key is withheld from child processes: `_run_env` in
+`agent_common_server.py` drops it from every child it spawns, so the gcloud,
+kubectl and hermes CLI children see only the two Session KV values.
+
 Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields

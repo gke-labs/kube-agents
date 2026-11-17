@@ -64,6 +64,11 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# install.sh's variable for the report file, a seam for tests, and the path a
+# real install writes, which INSTALL.md and the install skill tell an agent to
+# read.
+_INSTALL_REPORT_FILE_ENV = "KUBE_AGENTS_INSTALL_REPORT_FILE"
+_INSTALL_REPORT_DEFAULT_FILE = "/tmp/kube-agents-install-report.json"
 # What `gcloud container clusters describe` prints for a cluster that does not
 # exist, and for one it could not read.
 _GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
@@ -102,12 +107,27 @@ def _run_installer_bash(body, env, cwd=_REPO_ROOT):
 def setUpModule():
     # No test here runs the real gcloud: a gcloud call that a test leaves
     # unstubbed goes to a stand-in, and the stand-in fails the module.
-    global _NO_GCLOUD
+    global _NO_GCLOUD, _REPORT_DIR, _REPORT_ENV_BEFORE
+    # write_json_report runs for real in many tests here, by a direct call and
+    # through the ERR handler. Its report goes to a file of this run of the
+    # module. The path a real install writes is one fixed file, which two runs
+    # of this module at the same time would share. The directory first and the
+    # variable last, so that a step that fails here leaves nothing set.
+    _REPORT_DIR = tempfile.TemporaryDirectory()
     _NO_GCLOUD = no_live_gcloud.install()
+    _REPORT_ENV_BEFORE = os.environ.get(_INSTALL_REPORT_FILE_ENV)
+    os.environ[_INSTALL_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / "kube-agents-install-report.json")
 
 
 def tearDownModule():
-    _NO_GCLOUD.uninstall()
+    if _REPORT_ENV_BEFORE is None:
+        os.environ.pop(_INSTALL_REPORT_FILE_ENV, None)
+    else:
+        os.environ[_INSTALL_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
+    try:
+        _REPORT_DIR.cleanup()
+    finally:
+        _NO_GCLOUD.uninstall()
 
 
 class TestNoLiveGcloud(unittest.TestCase):
@@ -481,7 +501,12 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={
+                "HOME": str(home_dir),
+                "PATH": os.environ["PATH"],
+                # A refused checkout ends in the ERR handler, which writes the report.
+                _INSTALL_REPORT_FILE_ENV: os.environ[_INSTALL_REPORT_FILE_ENV],
+            },
             cwd=str(outside_dir),
         )
 
@@ -3282,12 +3307,29 @@ PARAM_GENERATE_ONLY="true"
 PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
+
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real install writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_json_report with the
+        variable unset would write that file."""
+        source = _INSTALL_SH.read_text()
+        self.assertEqual(
+            source.count(_INSTALL_REPORT_DEFAULT_FILE), 1, "install.sh names the report path in one place"
+        )
+        self.assertEqual(
+            source.count(
+                f'  local report_file="${{{_INSTALL_REPORT_FILE_ENV}:-{_INSTALL_REPORT_DEFAULT_FILE}}}"\n'
+            ),
+            1,
+            "write_json_report takes the variable, then the documented path",
+        )
+        self.assertIn(_INSTALL_REPORT_DEFAULT_FILE, (_REPO_ROOT / "INSTALL.md").read_text())
 
     def test_write_json_report_records_network_policy_enforcement(self):
         """The choice to install without enforcement outlives the terminal (#1682)."""
@@ -3298,7 +3340,7 @@ PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
 write_json_report "SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -9660,6 +9702,8 @@ class RunLifecycleApplyTrapTest(unittest.TestCase):
         self._tmp_path = pathlib.Path(tmp.name)
         self._empty_install_env = self._tmp_path / "install.env"
         self._empty_install_env.write_text("")
+        # Where _run_func sends the report: a file of this test.
+        self._report_file = self._tmp_path / "report.json"
 
     def _run_func(self, func_call, cwd=None):
         setup = f"""
@@ -9669,7 +9713,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 """
         overrides = {
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
-            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
         }
         full_env = get_isolated_test_env(overrides=overrides)
         return subprocess.run(
@@ -9779,11 +9823,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """
         lib = self._tmp_path / "helper_lib.sh"
         lib.write_text("library_probe() {\n  false\n}\n")
-        # Same file the other write_json_report tests read, removed first so
-        # the assertions below read this run's report and not the one the
-        # previous test left behind.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
 
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -9917,9 +9957,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         inherited trap in this shape, so there this asserts the contract
         without exercising the check; the unhandled case below does.
         """
-        # Same file the other write_json_report tests read.
-        report = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report.unlink(missing_ok=True)
+        report = self._report_file
         proc = self._run_func(
             "probe() { false; }\n"
             'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
@@ -9942,10 +9980,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         hand the caller a clean exit. The parent's trap then fires at the
         assignment and prints the one banner.
         """
-        # Same file the other write_json_report tests read, removed first so
-        # the report assertion reads this run's and not the previous test's.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(
             'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
             'x="$(probe)"\n'

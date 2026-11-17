@@ -113,6 +113,52 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.commit("start", row=row("0.9.0", "an old change"))
         self.repo.tag("0.9.0")
 
+    def test_order_reads_the_table_alone_by_version_number_and_allows_a_release_twice(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*rows_: str, other: str = "") -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(rows_) + "\n" + other
+        # Two rows of one release, and 0.10.0 above 0.9.0 by number (not by string).
+        ordered = page(row("pending", "p"), row("0.10.0", "a"), row("0.10.0", "b"), row("0.9.0", "c"))
+        self.assertEqual(check.order_problems(ordered), [])
+        disordered = page(row("0.9.0", "c"), row("0.10.0", "a"))
+        self.assertEqual(len(check.order_problems(disordered)), 1)
+        # A version row in another table on the page, after this one, is neither checked (its 0.40.0
+        # would sit below 0.9.0) nor counted as the table's.
+        other = "## Versions\n\n| Version | Supported |\n| --- | --- |\n| 0.40.0 | yes |\n\n"
+        self.assertEqual(check.order_problems(page(row("0.10.0", "a"), row("0.9.0", "c"), other=other)), [])
+        self.assertEqual([r.change for r in check.table_rows(page(row("0.9.0", "c"), other=other))], ["c"])
+
+    def test_a_disorder_already_on_main_warns_a_pull_request_that_leaves_the_page_alone(self):
+        self.repo.commit("feat: a", row=row("pending", "change a"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b", row=row("pending", "change b"))
+        self.repo.tag("1.1.0")
+        self.repo.rows = [row("1.0.0", "change a"), row("1.1.0", "change b")] + self.repo.rows[2:]
+        self.repo.write_page()
+        self.repo.commit("docs: out of order", code=False)
+        self.repo.pull_request(page=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 0)
+        self.assertIn("warning: ", err)
+        self.assertIn("runs newest first", err)
+
+    def test_a_newer_release_row_below_an_older_one_fails_and_pending_rows_are_not_placed(self):
+        self.repo.commit("feat: a", row=row("pending", "change a"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b", row=row("pending", "change b"))
+        self.repo.tag("1.1.0")
+        self.repo.rows = [row("1.0.0", "change a"), row("pending", "change c"), row("1.1.0", "change b")] + self.repo.rows[2:]
+        self.repo.write_page()
+        self.repo.commit("docs: out of order", code=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the row "change b" is labelled 1.1.0 but sits below a 1.0.0 row', err)
+        self.repo.rows = [row("pending", "change c"), row("1.1.0", "change b"), row("1.0.0", "change a")] + self.repo.rows[3:]
+        self.repo.write_page()
+        self.repo.commit("docs: in order", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
     def test_a_row_its_release_contains_passes(self):
         self.repo.commit("feat: a", row=row("1.0.0", "change a"))
         self.repo.tag("1.0.0")

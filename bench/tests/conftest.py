@@ -60,6 +60,16 @@ def _no_forge_from_the_shell(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_forge_rate_limit_wait(monkeypatch):
+    """A grading read under a rate limit waits for the reset (#6105); in
+    tests it doesn't, unless the test sets a budget and stubs the sleep."""
+    from kube_agents_bench import verifiers
+
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    monkeypatch.setattr(verifiers, "_forge_rate_limit_waited", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _no_grader_sha_from_the_shell(monkeypatch):
     """`bench-gate suite` reads EVAL_GRADER_SHA, which hack/ci-eval-pr.sh
     exports; a shell that has it would add a key and a line to every suite

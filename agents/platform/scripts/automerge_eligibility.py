@@ -12,10 +12,13 @@ adds itself, because nothing the sandbox reports can be trusted for that:
   wrote by hand is not the generated fix.
 - `added_file_from_diff` and `path_fits`: the pull request adds that one file,
   under its own name, in its cluster's own tree, and changes nothing else.
+- `PRACTICE_LABEL` and `AUTOMERGE_LABEL` are the labels, which only the broker
+  writes (`vcs_broker.VcsBroker.proposal_practice_label`):
+  `reserved_label_refusal` is how every caller-reachable verb refuses them.
 
 `fleet-audit/scripts/test_broker_budget_parity.py` holds the format to the
 audit's. Stdlib only: the credential-proxy image ships this directory and
-nothing from the fleet-audit skill. Nothing calls it yet.
+nothing from the fleet-audit skill.
 """
 
 from __future__ import annotations
@@ -24,6 +27,23 @@ import json
 import re
 from typing import Any, NamedTuple
 
+#: The labels the broker puts on a fix pull request it judged eligible: the
+#: first while `KUBEAGENTS_AUTOMERGE` is `practice`, which nothing acts on, the
+#: second while it is `on`, which the customer's pipeline may merge on.
+#: Reserved: no caller may add, remove, ensure or set either.
+PRACTICE_LABEL = "kube-agents:would-auto-merge"
+AUTOMERGE_LABEL = "kube-agents:auto-merge"
+RESERVED_LABELS = (PRACTICE_LABEL, AUTOMERGE_LABEL)
+LABEL_FOR_SWITCH = {"practice": PRACTICE_LABEL, "on": AUTOMERGE_LABEL}
+LABELLING_SWITCH_VALUES = frozenset(LABEL_FOR_SWITCH)
+LABEL_COLOR = "c5def5"
+LABEL_DESCRIPTIONS = {
+    PRACTICE_LABEL: "kube-agents would let this fix merge without a review (practice)",
+    AUTOMERGE_LABEL: "kube-agents judged this fix safe to merge without a review",
+}
+#: The payload fields that write a proposal's or an issue's labels. A filter
+#: (`excludeLabels`, and `labels` on a list verb) only reads, and may name the label.
+LABEL_WRITE_FIELDS = ("labels", "labelsAdd", "labelsRemove")
 #: The fix type the rules file names (`automation_rules.KNOWN_FIX_TYPES`).
 FIX_TYPE = "no-pdb"
 #: The workloads a budget can count through their scale subresource, and so the
@@ -68,6 +88,34 @@ class Budget(NamedTuple):
     name: str
     namespace: str
     selector: dict
+
+
+def reserved_label_refusal(verb: str, payload: Any) -> str | None:
+    """Why a caller's `verb` with `payload` may not run, or None.
+
+    Any label write naming one of `RESERVED_LABELS`, in any case and with any
+    surrounding space, and a `label-ensure` of one: the broker alone decides
+    who carries them.
+    """
+    if not isinstance(payload, dict):
+        return None
+    reserved = {label.casefold() for label in RESERVED_LABELS}
+    named = [payload.get("name")] if verb == "label-ensure" else []
+    for field in LABEL_WRITE_FIELDS:
+        if field == "labels" and verb.endswith("-list"):
+            continue
+        value = payload.get(field)
+        named += value if isinstance(value, list) else [value]
+    # Split on commas too: a forge that takes labels as one comma-joined
+    # parameter (GitLab's `add_labels`) reads `x,<label>` as two labels.
+    names = [part for label in named if isinstance(label, str) for part in label.split(",")]
+    if any(name.strip().casefold() in reserved for name in names):
+        return (
+            f"The labels {' and '.join(RESERVED_LABELS)} are reserved: the credential broker "
+            "applies them itself to a fix it judged safe to merge (proposal-practice-label), "
+            "and no request may add, remove or create them."
+        )
+    return None
 
 
 def render_budget(cluster: str, obj: str, namespace: str, selector: dict, finding_id: str) -> tuple[str, str]:
