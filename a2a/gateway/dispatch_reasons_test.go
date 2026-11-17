@@ -39,8 +39,9 @@ func TestEveryDispatchRefusalReadsAsOnePlainLine(t *testing.T) {
 		dispatch.ReasonParentUnchecked,
 		dispatch.ReasonParentCycle,
 		dispatch.ReasonOutsideParentScope,
-		// dispatch.ReasonStopped is left out: it ends the task canceled, and
-		// the room reads a canceled task as its own notice (noticeCanceled).
+		// dispatch.ReasonStopped and dispatch.ReasonTierEnded are left out:
+		// each ends the task canceled, and the room reads a canceled task as
+		// its own notice (noticeCanceled).
 	} {
 		_, sentence := reasonSentences[reason]
 		if !sentence && !reasonDetailShown[reason] {

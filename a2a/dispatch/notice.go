@@ -30,6 +30,9 @@ const (
 	// a write permit on its credential while its tier has no Job runner: a
 	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
 	ReasonChangeNeedsJob = "change-needs-job"
+	// ReasonTierEnded ends a held task whose tier an administrator ended
+	// the drain of (lib.DrainingTier.Ending, #5850): canceled, not failed.
+	ReasonTierEnded = "tier-ended"
 	// The re-check of a child whose parent is an AgentProfile task (#5686):
 	// the gateway checks the same at mint, and the dispatcher holds a child
 	// an older gateway sent, or one that breaks either rule, to them.
