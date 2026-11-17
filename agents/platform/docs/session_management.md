@@ -439,8 +439,12 @@ object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload)
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
 (`health_baseline`) for the health window, a later step. A workload that is gone or cannot be judged
 fails with the reason in `health_result` and `health_detail`; any other read failure is kept and
-retried. The edit, revert and outcome
-columns are left for the later steps. `cleanup_old_records` leaves the table: each row
+retried. `post_merge_edited.py fill`, under the same switch and per-run cap and likewise unscheduled,
+fills `human_edited` for each merged record without one: `1` when anyone but the install, a person or
+another automation such as a dependency bot, committed to the pull request or requested changes on it
+(the pull-request sweep's rule, read through `proposal-commits` and `proposal-reviews`), `0` when
+neither happened, and `NULL` when either cannot be read in full. It asks again next run, until a day after the
+merge. The revert and outcome columns are left for the later steps. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
 `GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
