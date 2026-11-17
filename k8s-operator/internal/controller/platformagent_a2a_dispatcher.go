@@ -597,6 +597,10 @@ type a2aDispatchConfig struct {
 	// age, the longer of the constant the provision script creates it with
 	// and the live stream's as its Job reports it (dispatchSubmitRetentionSeconds).
 	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
+	// ProfileSupervisorForm is lib.DispatchConfig's (#5301): "profile" once
+	// the six-token form is safe to write (a2aProfileSupervisorFormFor),
+	// empty otherwise.
+	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
 	Profiles               []a2aDispatchProfile `json:"profiles"`
 	// JobLabels go on every Job the dispatcher creates (lib.DispatchConfig
 	// JobLabels): the agent's, so a teardown deletes only this agent's
@@ -932,10 +936,17 @@ func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // buildA2ADispatchConfigMapWith is buildA2ADispatchConfigMap with the
 // profiles' Job templates.
 func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
+	return buildA2ADispatchConfigMapForm(agent, profiles, jobTemplates, draining, "")
+}
+
+// buildA2ADispatchConfigMapForm is buildA2ADispatchConfigMapWith with the
+// profile supervisor form the dispatcher is to write (#5301).
+func buildA2ADispatchConfigMapForm(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile, supervisorForm string) (*corev1.ConfigMap, error) {
 	cfg, err := desiredDispatchConfigWith(agent, profiles, jobTemplates, draining)
 	if err != nil {
 		return nil, err
 	}
+	cfg.ProfileSupervisorForm = supervisorForm
 	// Compact, not indented: indentation roughly doubles a Job template, and
 	// the whole config has to fit one ConfigMap (gke-labs/kube-agents#5479).
 	body, err := json.Marshal(cfg)
@@ -967,7 +978,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 // profiles given: reconcileA2AStack reads them once a pass and hands the same
 // set to the identity map, so the two never disagree on a profile's grant.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (profileErr error, err error) {
-	_, profileErr, err = r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileNamespaceReady, draining)
+	_, profileErr, err = r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileNamespaceReady, draining, "")
 	return profileErr, err
 }
 
@@ -980,7 +991,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Con
 // nothing, or a teardown that failed partway. Returned with the errors too,
 // since a step after the Jobs Role failing doesn't undo what the pass did to
 // it.
-func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
+func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile, supervisorForm string) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
 	// Past the size one identity-map shard can carry, the map leaves the
 	// dispatcher's entry out, so it is torn down as though switched off; the
 	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381). The
@@ -1121,7 +1132,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 			r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileJobResources, "AgentProfile "+profiles[i].Name+": "+problem)
 		}
 	}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates, draining)
+	cm, err := buildA2ADispatchConfigMapForm(agent, profiles, jobTemplates, draining, supervisorForm)
 	if err != nil {
 		return jobModeVerdict, nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}

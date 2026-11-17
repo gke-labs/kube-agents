@@ -376,7 +376,12 @@ const (
 	a2aGatewayRelayDurable       = "gateway-relay"
 	a2aGatewayEventsFilter       = "a2a.tasks.*.*.events"
 	a2aGatewaySupervisorFilter   = "a2a.tasks.*.*.supervisor"
-	a2aGatewayRelayMaxAckPending = 8192
+	// a2aGatewayProfileSupervisorFilter is the relay's third filter, a
+	// profile task's six-token supervisor subject (#5301). The gateway
+	// accepts the durable with or without it (#5644); the provision Job
+	// adds it only once every reader that can run watches both forms.
+	a2aGatewayProfileSupervisorFilter = "a2a.tasks.p.*.*.supervisor"
+	a2aGatewayRelayMaxAckPending      = 8192
 )
 
 // a2aBridgeDurable is the bridge's intake durable, and a2aBridgeIntakeFilter

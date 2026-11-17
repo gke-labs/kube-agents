@@ -508,7 +508,11 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	profiles = profiles[:len(profiles)-len(a2aDispatcherCeilingRefused(agent, profiles))]
 	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
-	for i := 0; i < 300; i++ {
+	// 240: enough to take the config past one ConfigMap while the identity
+	// entry stays under its own ceiling. Each profile's grant names both
+	// supervisor forms since #5301, so the entry grows faster per drain
+	// than it did at 300.
+	for i := 0; i < 240; i++ {
 		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
 	}
 	entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
@@ -517,7 +521,7 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	}
 	cond, over, err := a2aDispatcherCeiling(agent, profiles, draining)
 	if err != nil || !over {
-		t.Fatalf("over=%v err=%v: 300 draining entries past the config's reserve didn't read as over", over, err)
+		t.Fatalf("over=%v err=%v: 240 draining entries past the config's reserve didn't read as over", over, err)
 	}
 	if cond.Reason != dispatcherCeilingReasonOver || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
 		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
