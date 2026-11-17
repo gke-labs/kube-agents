@@ -447,9 +447,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. On a single server the gateway's per-profile
-deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
-profile change rolls the servers (below).
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash on every server count, since a reload applies it and is confirmed server by
+server (below).
 
 Layout:
 
@@ -1215,17 +1215,25 @@ writes a new `nats.conf` into the pod, the reloader sends nats-server the reload
 and the server applies the new users and permissions to the connections it already holds.
 It also runs the auth callout again for each connection the callout authenticated; on
 2.10.29 those connections dropped at the reload and reconnected within a second.
-The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
-added, removed or done draining changes the config Secret and not the template: the bus is
-reloaded, not rolled. Every other config change still rolls it. The operator records the
-reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. A config written while a reload is still
+The pod template's config hash leaves out the per-profile gateway deny, on one server and
+on a cluster alike, so an AgentProfile added, removed or done draining changes the config
+Secret and not the template: every server is reloaded, and none is restarted or rolled.
+Every other config change still rolls the bus. The operator records the reload it asked for
+on the Secret, with the `config_load_time` it read from each server just before writing,
+read by pod IP (a Service answers from whichever server it picks, and the per-pod names
+under the routes Service don't resolve). It confirms the reload when every server's value
+has moved, and a server whose pod started after the write runs it from the start. A server
+it can't read, or whose value hasn't moved, hasn't loaded the config: the reload stays
+pending, and so does the profile hold below, until every server is confirmed. A pod at an
+ordinal past what the StatefulSet asks for (a scale-down under way) keeps it pending too. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
 restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
 kubelet write, so a restarted wait usually sees no further move, and nothing the server
 reports says whether the newest write was in the one it saw. If the value hasn't moved
-within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
-the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+within three minutes, or can't be read, the operator deletes that server's pod so it restarts
+onto the new config: one server per pass, only while every other server is Ready, so a
+cluster keeps quorum, and never a pod that started after the write. The pending record stays
+until the restarted server is read on the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
 restart is kept even then: confirming by the absence of a move would admit a profile whose
 deny the server might not hold. The kubelet takes up to about a minute to write
@@ -1237,11 +1245,13 @@ door, serves the same certificate from the same files (below).
 **A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
 grant and the agent card take a newly bound AgentProfile only once every bus server has
 loaded the config carrying its deny; until then the profile's `CardPublished` condition is
-`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
-servers, the pod template records the profile list, and the operator reads the revision
-each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
-them). On one server the config Secret records the previous list while a reload is pending
-or the pod restarts, and the profile counts as loaded once the server is on the new config.
+`False` with reason `BusConfigPending`. The config Secret records the previous list while a
+reload is pending on any server or a server restarts, and the profile counts as loaded once
+every server is on the new config. An earlier operator rolled a cluster onto each profile
+change instead and recorded the list on the pod template; while any server still runs, or
+the StatefulSet's update revision is, a revision carrying that list (an upgrade's roll
+unfinished), the loaded set is also narrowed to what every such revision lists, read from
+the StatefulSet's ControllerRevisions (the operator's one `get` on them).
 Only the way in waits: a profile the dispatch config already lists live, or whose card is
 already published, stays, and a removed profile keeps its deny while it drains, as before.
 
