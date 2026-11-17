@@ -180,7 +180,7 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //     $JS.ACK on them to ack, nak and send the in-progress heartbeats a held
 //     message lives on. No CONSUMER.CREATE: the durables are the operator's.
 //     Each durable is named rather than PROFILE_SUBMITS.*, so a dispatcher
-//     reads only the durables its config lists. The grants are fixed for a
+//     reads only the durables its config derives. The grants are fixed for a
 //     connection, so the dispatcher reconnects when its config adds a
 //     durable (contract on #3655).
 //   - PROFILE_LEASES, which it alone writes: put and delete on $KV, INFO and
@@ -601,7 +601,10 @@ type a2aDispatchConfig struct {
 
 // a2aDispatchJobTemplateRef is lib.DispatchJobTemplateRef.
 type a2aDispatchJobTemplateRef struct {
-	Name string `json:"name"`
+	// Name is the param's name, kept here for the operator's own use and not
+	// written (#5479): it is always the profile's own param, which the
+	// dispatcher derives (lib.DispatchJobTemplateName).
+	Name string `json:"-"`
 	Hash string `json:"hash"`
 }
 
@@ -616,8 +619,13 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter `json:"parameters,omitempty"`
 	// Scripts is lib.DispatchProfile's: the profile's spec.scripts (#5622).
-	Scripts  []a2aDispatchScript  `json:"scripts,omitempty"`
-	Durables []a2aDispatchDurable `json:"durables"`
+	Scripts []a2aDispatchScript `json:"scripts,omitempty"`
+	// Durables are the shared durables the operator creates for the profile,
+	// one per (tier, kind), which its grant names list
+	// (dispatcherGrantNames). They aren't written (#5479): the dispatcher
+	// derives the same set from tiers and drainingTiers, pinned by the
+	// shared fixture a2a/lib/testdata/rendered-dispatch-durables.json.
+	Durables []a2aDispatchDurable `json:"-"`
 	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
 	// profile's unattended Jobs from, and the rendering it holds
 	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing

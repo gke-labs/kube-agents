@@ -805,7 +805,8 @@ The session manager is the demo's chatops code generalized from one-shot workers
 long-lived sessions. Four operations:
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
-shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egress
+shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by
+`spec.harness.tuning.sessionResources` (#2371); egress
 fenced (8/31) to DNS, the bus, and LiteLLM, except, under the operator's
 `A2A_SESSION_CLUSTER_VIEW` flag, the credential broker (`spec-mode-switch.md`) - the
 deployment spec owns the policy),

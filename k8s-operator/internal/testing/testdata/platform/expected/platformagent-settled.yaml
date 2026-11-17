@@ -1733,6 +1733,35 @@ spec:
   policyTypes:
     - Ingress
 ---
+apiVersion: v1
+data:
+  bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-mcp-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  sys-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  web-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-creds
+  name: platformagent-a2a-nats-creds
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -2791,35 +2820,6 @@ spec:
   policyTypes:
     - Ingress
     - Egress
----
-apiVersion: v1
-data:
-  bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  console-mcp-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  sys-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  web-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-kind: Secret
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: nats-creds
-  name: platformagent-a2a-nats-creds
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
 ---
 apiVersion: v1
 data:
@@ -6227,6 +6227,14 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_SESSION_CPU_REQUEST
+              value: 150m
+            - name: A2A_SESSION_MEMORY_REQUEST
+              value: 320Mi
+            - name: A2A_SESSION_CPU_LIMIT
+              value: "2"
+            - name: A2A_SESSION_MEMORY_LIMIT
+              value: 2Gi
             - name: A2A_GATEWAY_RELAY_PRECREATED
               value: "true"
             - name: A2A_BUSY_NOTICE_AT

@@ -2499,6 +2499,11 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.SessionResources != nil {
+		in, out := &in.SessionResources, &out.SessionResources
+		*out = new(v1.ResourceRequirements)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.BusReplicas != nil {
 		in, out := &in.BusReplicas, &out.BusReplicas
 		*out = new(int)

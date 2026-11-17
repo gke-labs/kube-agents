@@ -13,6 +13,9 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // attributionSaltInfo is the HKDF info string that binds the derived
@@ -662,8 +665,9 @@ type Config struct {
 	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
-	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
-	// a small dev cluster absorbs without preemption. Raising it buys more
+	// default requests (150m/320Mi, SessionResources) ten concurrent sessions
+	// hold 1.5 CPU / 3.2Gi, which a small dev cluster absorbs without
+	// preemption. Raising it buys more
 	// concurrent delegations at that per-pod price plus model-quota
 	// contention; lowering it turns busy-hour delegations into refusals
 	// sooner - a UX decision, not a safety one, because this cap is the
@@ -672,6 +676,16 @@ type Config struct {
 	// ignores its own cap and cannot ignore that one), which is also what
 	// bounds the count-then-create race between concurrent conversations.
 	MaxSessions int
+
+	// SessionResources are the session pod's CPU and memory requests and
+	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
+	// the operator renders resolved from spec.harness.tuning.sessionResources
+	// (always all four). An unset variable takes spawn.go's default (the
+	// operator module's DefaultSession* constants, held equal by a test). A
+	// request above its limit is refused at start: the operator never
+	// renders one, so it's a hand-set value the API server would refuse at
+	// every spawn.
+	SessionResources corev1.ResourceRequirements
 
 	// DelegationDepthMax bounds how deep a delegation chain may run
 	// (A2A_DELEGATION_DEPTH_MAX). A human turn is depth 0, a child its
@@ -999,6 +1013,11 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	sessionResources, err := sessionResourcesFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	cfg.SessionResources = sessionResources
 	depthMax := envOr("A2A_DELEGATION_DEPTH_MAX", strconv.Itoa(defaultDelegationDepthMax))
 	dm, err := strconv.Atoi(depthMax)
 	if err != nil || dm < 1 {
@@ -1223,4 +1242,63 @@ func (c *Config) validateCapabilityCeiling() error {
 		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
 	}
 	return nil
+}
+
+// sessionResourcesFromEnv reads the session pod's requests and limits from
+// A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, each defaulting to spawn.go's
+// value, and refuses an unparsable quantity or a request above its limit.
+func sessionResourcesFromEnv() (corev1.ResourceRequirements, error) {
+	read := func(env, def string) (resource.Quantity, error) {
+		raw := strings.TrimSpace(envOr(env, def))
+		q, err := resource.ParseQuantity(raw)
+		if err != nil || q.Sign() <= 0 {
+			return resource.Quantity{}, fmt.Errorf("%s %q: need a positive Kubernetes quantity", env, raw)
+		}
+		return q, nil
+	}
+	out := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+	for _, f := range []struct {
+		set  corev1.ResourceList
+		name corev1.ResourceName
+		env  string
+		def  string
+	}{
+		{out.Requests, corev1.ResourceCPU, "A2A_SESSION_CPU_REQUEST", workerCPURequest},
+		{out.Requests, corev1.ResourceMemory, "A2A_SESSION_MEMORY_REQUEST", workerMemoryRequest},
+		{out.Limits, corev1.ResourceCPU, "A2A_SESSION_CPU_LIMIT", workerCPULimit},
+		{out.Limits, corev1.ResourceMemory, "A2A_SESSION_MEMORY_LIMIT", workerMemoryLimit},
+	} {
+		q, err := read(f.env, f.def)
+		if err != nil {
+			return corev1.ResourceRequirements{}, err
+		}
+		f.set[f.name] = q
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if req, lim := out.Requests[name], out.Limits[name]; req.Cmp(lim) > 0 {
+			return corev1.ResourceRequirements{}, fmt.Errorf("the session %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return out, nil
+}
+
+// sessionResources is c's session pod requests and limits, each unset one
+// at spawn.go's default (a Config built without LoadConfig, as tests do).
+func (c *Config) sessionResources() corev1.ResourceRequirements {
+	pick := func(set corev1.ResourceList, name corev1.ResourceName, def string) resource.Quantity {
+		if q, ok := set[name]; ok && !q.IsZero() {
+			return q.DeepCopy()
+		}
+		return resource.MustParse(def)
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    pick(c.SessionResources.Requests, corev1.ResourceCPU, workerCPURequest),
+			corev1.ResourceMemory: pick(c.SessionResources.Requests, corev1.ResourceMemory, workerMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    pick(c.SessionResources.Limits, corev1.ResourceCPU, workerCPULimit),
+			corev1.ResourceMemory: pick(c.SessionResources.Limits, corev1.ResourceMemory, workerMemoryLimit),
+		},
+	}
 }
