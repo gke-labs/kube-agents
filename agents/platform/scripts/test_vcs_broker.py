@@ -5022,6 +5022,31 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
         self.assertIn("DEC-2026-003", str(caught.exception))
 
+        work3, cloned3 = self.clone_locally("work3")
+        git(work3, "checkout", "--quiet", "-b", "platform-agent/oversize-checkout-lock-name")
+        (work3 / "clusters" / "prod" / "checkout-lock.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      hostNetwork: true\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n"
+            + (padding * 4200),
+            encoding="utf-8",
+        )
+        git(work3, "add", "-A")
+        git(work3, "commit", "--quiet", "-m", "pad checkout-lock.yaml past 4MiB")
+        bundle3 = self.bundle_of(work3, "platform-agent/oversize-checkout-lock-name", cloned3["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught_lock:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/oversize-checkout-lock-name",
+                "target": "main",
+                "baseRevision": cloned3["revision"],
+                "bundleBase64": bundle3,
+            })
+        self.assertEqual(caught_lock.exception.status, 409)
+        self.assertEqual(caught_lock.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("DEC-2026-003", str(caught_lock.exception))
+
     def test_publish_invokes_on_decision_memory_check_callback(self):
         self._seed_guard_on_main()
         verdicts: list[str] = []
