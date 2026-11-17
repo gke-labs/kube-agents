@@ -723,7 +723,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	candidates := subtract(verdict.missing, record.Stopped)
 	if len(candidates) == 0 {
 		streak.missing, streak.misses = nil, 0
-		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore, p.stoppedMessage(record, last))
+		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore, stoppedMessage(record))
 	}
 	shared := map[string]bool{}
 	for _, name := range candidates {
@@ -1026,7 +1026,7 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 
 // stoppedMessage is the condition's message while only stopped names are
 // missing.
-func (p *BusStreamPoller) stoppedMessage(record busReprovisionRecord, _ *busReprovisionAttempt) string {
+func stoppedMessage(record busReprovisionRecord) string {
 	return fmt.Sprintf("Missing from the A2A bus: %s. An earlier re-run of the provision Job left them missing, so the operator will not re-run it again for them; a loss of any other stream is still re-run, and that re-run retries these too. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
 		strings.Join(record.Stopped, ", "), busStreamsReprovisionAnnotation)
 }
@@ -1071,15 +1071,6 @@ func subtract(a, b []string) []string {
 		}
 	}
 	return out
-}
-
-func overlaps(a, b []string) bool {
-	for _, name := range a {
-		if slices.Contains(b, name) {
-			return true
-		}
-	}
-	return false
 }
 
 type busJobState int
