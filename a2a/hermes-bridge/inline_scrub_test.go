@@ -754,6 +754,9 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		"password: correct horse secret*: staple":  "password: [redacted]",
 		"password: correct horse token * : staple": "password: [redacted]",
 		"PASSWORD*= HOST=db.example":               "PASSWORD*= HOST=db.example",
+		// A quoted key ending in _ still matches, as at main.
+		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
+		`"DB_PASSWORD_": "Synth3tic-Pass-0001"`: `"DB_PASSWORD_": "[redacted]"`,
 	} {
 		if got := scrubInlineSecrets(in); got != want {
 			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
