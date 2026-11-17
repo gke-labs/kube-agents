@@ -2,6 +2,8 @@
 
 **Status:** design, not built.
 
+**Author:** haoxuw
+
 ## High level summary
 
 A test fleet is a set of GKE clusters that a kube-agents install watches during a test. This
@@ -86,7 +88,18 @@ The rules behind the numbers:
 - **Simple traffic.** Each Deployment has two replicas of a small HTTP server (`busybox httpd`)
   behind a Service. Each CronJob runs every 5 minutes; its Pod sends a few HTTP requests to one of
   its cluster's Services and exits, after 60 to 180 seconds. The traffic is light, but it is real:
-  Pods start, serve, log and end, and Endpoints change.
+  client Pods start, send requests, log and end, and the servers answer them.
+- **Clients that do not fail.** The planted Pods must stay the only failures: at 100 starts a
+  minute, clients that failed 1 % of the time would add about 60 failures an hour. The script ends
+  with `sleep`, and each request ends in `|| true`, so it exits 0 even when a Service has no ready
+  endpoint. The Pod has `restartPolicy: Never` and its Job `backoffLimit: 0`, so nothing restarts
+  it and no `BackOff` event opens a triage incident. Only `activeDeadlineSeconds`, a minute past the
+  longest lifetime, can end a client as a failed Job, when the client hangs.
+- **Finished Jobs do not pile up.** Each CronJob keeps no finished Job past 2 minutes:
+  `successfulJobsHistoryLimit: 0` and `failedJobsHistoryLimit: 1` cap the history, and
+  `ttlSecondsAfterFinished: 120` deletes any finished Job with its Pod. Finished client Pods
+  therefore add at most about 200 at M to the Pods the audits list, where the default history would
+  keep about 1,500.
 - **Churn.** The CronJobs' start minutes are spread evenly over the 5 minutes (`0-59/5`, `1-59/5`,
   and so on), so 500 CronJobs give 100 Pod starts in every minute, about 12 a minute in each
   cluster. Five identical `*/5` schedules would start all 500 Pods in the same minute. The
@@ -100,9 +113,12 @@ The rules behind the numbers:
   1), so the audits and the stall watch have real findings. M has 5, as the real-install test did.
   At 20 failing Pods that test measured $69.5 of triage tokens in one hour, so the count stays low.
 - **Machine type.** `n1-standard-1` (1 vCPU, 3.75 GB) for every node, at every size, so only the
-  counts change between sizes. The workloads need little CPU, and N1 machines draw on the general
-  CPU quota: 500 vCPU at L fits it, where 500 nodes of a 2-vCPU E2 type would need 1,000 vCPU of
-  the separate, smaller E2 quota.
+  counts change between sizes. The workloads need little CPU. N1 and not E2, because the earlier
+  scale runs found the zone out of E2 and then N2 machines for hours
+  ([`agent-harness-bottlenecks.md`](agent-harness-bottlenecks.md), Phase 2), and this fleet is built
+  in one zone every night. Quota is not the reason: in the projects checked, E2 nodes draw on the
+  general `CPUS` quota too, not on the smaller `E2_CPUS` one. N1 costs about 40 % more a node than
+  `e2-medium`.
 
 The sizes live in one file, `bench/scale/fleet-sizes.yaml`, as M's values and the two multipliers.
 The runner reads the size from `SCALE_FLEET_SIZE` (`S`, `M` or `L`, default `M`).
@@ -146,9 +162,10 @@ About 3 to 3.5 hours in total at M. The churn runs from step 2 to step 5.
 `upgrade-retrospective`. The other five (`security-patch-orchestrator` and
 `fleet-consistency-drift`, which are weekly, and three daily audits) wait for their schedules, so
 the runner starts them: it marks one due every 5 minutes from 5 minutes after the install starts,
-through the same `cron.jobs.trigger_job` call the first-run flow uses. Production staggers audits
-30 minutes apart; a 5-minute stagger packs the same ten runs into the hour, so the burst is denser
-than a real morning. The burst window therefore holds one run of all ten audits.
+through the same `cron.jobs.trigger_job` call the first-run flow uses. Production spaces the daily
+audits 15 to 55 minutes apart, from 06:20 to 09:20 UTC; a 5-minute stagger packs the same ten runs
+into the hour, so the burst is denser than a real morning. The burst window therefore holds one run
+of all ten audits.
 
 **The window's length.** The burst window is 1 hour nominal. It ends when the last of the ten
 audits ends, but not before 1 hour and not after 3 hours from the install's start, so the soak
@@ -197,10 +214,22 @@ S has no scheduled run; it is for a run by hand on a smaller budget.
 project rather than the eval pool: L needs 16 clusters and 500 vCPU, and the eval jobs lease the
 pool's projects. This repository holds the script they run, `hack/ci-scale-nightly.sh`.
 
-**Quota and network.** At L: 16 clusters, 500 nodes, 500 vCPU of the general CPU quota, 500 node IP
-addresses. Each
-cluster gets its own subnet and small Pod and Service ranges, as Phase 4 did
-(`bench/scale/phase4.yaml`), so the project's default network does not cap the cluster count.
+**Quota and network.** At L: 16 clusters, 500 nodes, 500 vCPU of the general `CPUS` quota and 15 TB
+of standard disk (`DISKS_TOTAL_GB`). The nodes have no external address, so they take none of the
+project's address quota; Cloud NAT gives them the way out to pull the image. The fleet joins one
+standing VPC network, created once, and each cluster gets its own subnet. Each size has its own
+address block, so S, M and L never overlap, and the project's default network does not cap the
+cluster count:
+
+| Range         | A cluster             | Why                                                                              |
+| ------------- | --------------------- | -------------------------------------------------------------------------------- |
+| Nodes         | a /24 subnet          | Room for the 32 nodes a cluster has at most.                                     |
+| Pods          | a /16 secondary range | `max_pods_per_node: 32` gives each node a /26, so the 32 nodes fill a /21 of it. |
+| Services      | a /20 secondary range | Room for about 190 Services a cluster, at every size.                            |
+| Control plane | a /28                 | The private endpoint's peering range.                                            |
+
+32 Pods a node is more than twice the 13 a node the workloads place. GKE's default of 110 Pods a
+node would take a /24 a node, a /19 for 32 nodes.
 
 ## The verdict
 
@@ -213,17 +242,21 @@ The run writes `scale-verdict.json`. It is red when any check fails:
 | The first-run flow ends | The inventory scan settles and each audit in `FIRST_RUN_AUDITS` has an ended run within 3 hours of the install's start, as `oobe.py` records them.             |
 | The run itself is sound | The fleet reached its size, the churn ran at its rate (within 10 %), and the teardown deleted every test cluster.                                              |
 
-A red run goes to haoxuw, the owner of the `harness-scale` row in `docs/designs/domains.yaml`.
-The last check keeps a broken fixture from reading as a pass or as a regression. Kubernetes keeps an
-event for about an hour, so the runner reads `SandboxChanged` events and the nodes' `OOMKilling`
-lines from Cloud Logging over the whole run, not from the API at the end. Restarts and OOMKilled
-terminations come from the Pods' status, which the runner already collects.
+A red run goes to haoxuw, the owner of this design.
+The last check keeps a broken fixture from reading as a pass or as a regression. A zone short of
+N1 machines shows in one of two ways: a node pool the zone cannot fill fails the build, and the run
+stops before its windows as a build failure, not a red verdict; a fleet built short fails the last
+check, so the verdict names the fixture, not the install. Kubernetes keeps an event for about an
+hour, so the runner reads `SandboxChanged` events and the nodes' `OOMKilling` lines from Cloud
+Logging over the whole run, not from the API at the end. Restarts and OOMKilled terminations come
+from the Pods' status, which the runner already collects.
 
 ## How the fleet is built, and who may build it
 
 The sized fleet follows the seeded fleet's pattern (`bench/tf/fleet/`, `docs/ci-pool-projects.md`
 section 6), with one difference: the seeded fleet stands, and the sized fleet is built and deleted
-on every run, because 250 nodes standing all month would cost about 25 times a nightly's nodes.
+on every run, because 250 nodes standing all month would cost about 8 times what the M runs' nodes
+cost in a month.
 
 | Part                | Seeded fleet                                                                                           | Sized fleet                                                                                                                                                                                                                                                   |
 | ------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -292,17 +325,34 @@ and they keep any later billing data attributable to a run.
 ## Cost
 
 List prices, which the cost record replaces with the Catalog API's figures from the first run: an
-on-demand `n1-standard-1` node is about $0.048 an hour in us-central1, and a GKE cluster fee is $0.10
-an hour.
+on-demand `n1-standard-1` node is about $0.048 an hour in us-central1, a GKE cluster fee is $0.10
+an hour, and a standard persistent disk is $0.04 a GB a month.
 
-| Size | Runs a month | Nodes | Hours a run | Node cost a run | Cluster fees a run | Infrastructure a month |
-| ---- | ------------ | ----- | ----------- | --------------- | ------------------ | ---------------------- |
-| M    | about 26     | 250   | about 3.5   | ≈ $42           | ≈ $3               | ≈ $1,150               |
-| L    | about 4.3    | 500   | about 4     | ≈ $95           | ≈ $6               | ≈ $440                 |
+| Size | Runs a month | Nodes | Hours a run | Node cost a run | Cluster fees a run | Boot disks a run | Infrastructure a month |
+| ---- | ------------ | ----- | ----------- | --------------- | ------------------ | ---------------- | ---------------------- |
+| M    | about 26     | 250   | about 3.5   | ≈ $42           | ≈ $3               | ≈ $1.40          | ≈ $1,200               |
+| L    | about 4.3    | 500   | about 4     | ≈ $96           | ≈ $6               | ≈ $3.30          | ≈ $455                 |
 
-Model tokens come on top. At 40 clusters the real-install test measured $111 of tokens in its first
-5 hours; M has 8 clusters and a 2-hour run, so its tokens should cost much less. The cost record
-gives the real figure for every run.
+Each node's boot disk is 30 GB of `pd-standard`, set in the fleet stack; GKE's default, 100 GB of
+`pd-balanced`, would cost about $12 a run at M. A burst window that reaches its 3-hour cap adds 2
+hours to a run: about 5.5 hours at M (about $66 of nodes) and 6 hours at L (about $144).
+
+The table is an upper bound, because it prices every node for the whole run. Four runs by hand on
+2026-11-16 and 11-17, two at M and two at L, on `main`'s commit `544e2db2c`, measured less. Their
+cost records count each node from its creation until the record is taken, before the teardown, and
+gave $31 to $35 a run for the fleet at M and $63 to $66 at L.
+
+Two costs come on top of the table:
+
+- **Model tokens.** The same four runs spent $23 to $51 of model tokens a run at M and $32 to $37
+  at L, by LiteLLM's spend counter. At M's 26 runs that is about $600 to $1,300 a month, about as
+  much as the nodes. The two L runs held the install at the `medium` tier, for the reason below.
+- **The host install.** It stands between runs. On two `e2-standard-4` nodes, with the zonal
+  cluster fee, Managed Prometheus, disks and volumes, it costs about $330 a month before the model.
+  That host holds the `medium` tier only. The `fleet` tier, which L runs, needs nodes that fit a
+  4-vCPU proxy request (`e2-standard-8` or larger), so L nights need the larger host pools, which
+  cost more. The install's audits and watchers keep running between runs, against no test fleet,
+  and their tokens fall outside each run's cost record.
 
 ## Rollout
 
@@ -323,8 +373,10 @@ same projects the presubmit leases. The lease is what keeps the two apart:
    trace of it.
 2. Each pool project is provisioned for it as for the seeded fleet:
    `scripts/provision_ci_pool_project.sh` creates the nodes' service account and the state prefix,
-   and checks the CPU quota for M (250 vCPU of N1); `scripts/verify_ci_pool_project.py` checks
-   them, so a project without them fails verification before it is leased.
+   and checks the quota for M (250 vCPU of the general `CPUS` quota and 7.5 TB of standard disk,
+   `DISKS_TOTAL_GB`);
+   `scripts/verify_ci_pool_project.py` checks them, so a project without them fails verification
+   before it is leased.
 3. `sized-fleet-runner` holds its roles on every pool project, as `seeded-fleet-reconciler` does.
 4. A case that needs the sized fleet names the fixture role `sized-fleet-m` and is registered in
    the nightly lists only.
@@ -342,9 +394,10 @@ sized-fleet cases on the blocking roster, admitted by the roster's own rules
 Each item is its own pull request after this design merges.
 
 1. **Sizes and the fleet stack.** `bench/scale/fleet-sizes.yaml`; `bench/tf/sized-fleet/` (the
-   subnets, the clusters, one node pool of `n1-standard-1` nodes each, the labels) and
-   `hack/sized_fleet.py up` and `down`; `fixtures.py` gains the HTTP Deployments with their
-   Services, the CronJob clients with spread start minutes, and the failing Pods; the
+   subnets with the ranges above, the clusters, one node pool of `n1-standard-1` nodes with 30 GB
+   standard disks each, the labels) and `hack/sized_fleet.py up` and `down`; `fixtures.py` gains
+   the HTTP Deployments with their Services, the CronJob clients with spread start minutes and the
+   settings that keep them from failing, and the failing Pods; the
    `sized-fleet-*` roles in the fixture catalogue and in `hack/fleet-kubeconfigs.sh`. One live M
    run by hand is the evidence.
 2. **The run plan and the verdict.** `bench/scale/nightly.yaml` (the five steps and the two
@@ -364,6 +417,7 @@ Each item is its own pull request after this design merges.
 
 ## Open questions
 
-- **The Prow job's time limit.** A run takes 3 to 4 hours, longer than most eval nightlies.
+- **The Prow job's time limit.** A run takes 3 to 4 hours, longer than most eval nightlies, and
+  about 5.5 hours at M or 6 at L when the burst window reaches its 3-hour cap.
 - **Typical runs.** The install is reset each night, so every audit run is a first run, which reads
   every cluster as new. A weekly run without the reset would measure typical runs.
