@@ -76,10 +76,33 @@ func (k *KubeJobs) getJobTemplate(ctx context.Context, namespace, name string) (
 		Namespace(namespace).Resource(dispatchJobTemplateResource).Name(name).DoRaw(ctx)
 }
 
-// jobTemplate is prof's pod template: from the DispatchJobTemplate its
-// reference names, only while that object carries the reference's hash, or
-// from the inline copy an older operator sends.
-func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.DispatchProfile) (json.RawMessage, error) {
+// unattendedModeTier is the tier whose template is prof's own param
+// (lib.DispatchJobTemplateName): its unattended-mode tier, a Tier resource's
+// when the config names one, else the built-in.
+func unattendedModeTier(prof *lib.DispatchProfile) string {
+	if prof.UnattendedTier != "" {
+		return prof.UnattendedTier
+	}
+	return DefaultUnattendedTier
+}
+
+// jobTemplateName is the param that holds prof's template at tier, derived
+// from (profile, tier), never read from the config, so a config can't point
+// a task at another profile's or another tier's template: the profile's own
+// param for its unattended-mode tier (and for any tier, under a reference
+// that isn't per tier, which covers that one tier alone), else the tier's
+// (#5646).
+func jobTemplateName(prof *lib.DispatchProfile, tier string) string {
+	if !prof.JobTemplatesPerTier() || tier == unattendedModeTier(prof) {
+		return lib.DispatchJobTemplateName(prof.Name)
+	}
+	return lib.DispatchJobTierTemplateName(prof.Name, tier)
+}
+
+// jobTemplate is prof's pod template at tier: from the DispatchJobTemplate
+// its reference names, only while that object carries the reference's hash,
+// or from the inline copy an older operator sends.
+func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.DispatchProfile, tier string) (json.RawMessage, error) {
 	ref := prof.JobTemplateRef
 	if ref == nil {
 		return prof.JobTemplate, nil
@@ -87,10 +110,10 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	// A profile's template is its own param: a reference to another
 	// profile's is refused rather than followed.
 	// A hash-only reference (#5479) names the profile's own param.
-	name := ref.NameFor(prof.Name)
-	if name != lib.DispatchJobTemplateName(prof.Name) {
-		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, name)
+	if ref.Name != "" && ref.Name != lib.DispatchJobTemplateName(prof.Name) {
+		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, ref.Name)
 	}
+	name := jobTemplateName(prof, tier)
 	raw, err := k.getTemplate(ctx, namespace, name)
 	if apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("%w: profile %s's %s is not there", ErrJobTemplateNotCurrent, prof.Name, name)
@@ -121,9 +144,18 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	return obj.Spec.Template, nil
 }
 
-// JobName is the task's Job name: a hash of its key, so it is the same after
-// a restart, fits a label value, and carries nothing a caller chose.
-func JobName(profile, tier, taskID string) string {
+// JobName is the task's Job name: a hash of its whole key, kind included, so
+// it is the same after a restart, fits a label value, carries nothing a
+// caller chose, and no two held tasks share one (#5646).
+func JobName(profile, tier, kind, taskID string) string {
+	sum := sha256.Sum256([]byte(profile + "/" + tier + "/" + kind + "/" + taskID))
+	return "dispatch-" + hex.EncodeToString(sum[:10])
+}
+
+// legacyJobName is the name a dispatcher from before the kind was in it gave
+// the task's Job. Delete removes that one too, so a Job such a dispatcher
+// launched before an upgrade is still cleaned up; to go a release on.
+func legacyJobName(profile, tier, taskID string) string {
 	sum := sha256.Sum256([]byte(profile + "/" + tier + "/" + taskID))
 	return "dispatch-" + hex.EncodeToString(sum[:10])
 }
@@ -137,7 +169,7 @@ var ErrJobRefusedByPolicy = errors.New("the dispatcher Job admission policy refu
 // refusals name it.
 const jobPolicyName = "kube-agents-a2a-dispatcher-job"
 
-func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) (time.Time, error) {
+func (k *KubeJobs) Launch(ctx context.Context, profile, tier, kind, taskID string) (time.Time, error) {
 	cfg := k.config()
 	var prof *lib.DispatchProfile
 	for i := range cfg.Profiles {
@@ -145,14 +177,14 @@ func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) (ti
 			prof = &cfg.Profiles[i]
 		}
 	}
-	if prof == nil || !prof.HasJobTemplate() {
-		return time.Time{}, fmt.Errorf("profile %s has no Job template in the dispatch config", profile)
+	if prof == nil || !prof.HasJobTemplate(tier) {
+		return time.Time{}, fmt.Errorf("profile %s has no Job template for tier %s in the dispatch config", profile, tier)
 	}
-	tmpl, err := k.jobTemplate(ctx, cfg.ProfileNamespace, prof)
+	tmpl, err := k.jobTemplate(ctx, cfg.ProfileNamespace, prof, tier)
 	if err != nil {
 		return time.Time{}, err
 	}
-	job, err := buildJob(cfg, prof, tmpl, tier, taskID)
+	job, err := buildJob(cfg, prof, tmpl, tier, kind, taskID)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -173,12 +205,18 @@ func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) (ti
 }
 
 // buildJob is the task's Job from cfg and prof's template. The template is
-// not touched.
-func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.RawMessage, tier, taskID string) (*batchv1.Job, error) {
+// not touched. It must be the (profile, tier)'s own, by the worker labels the
+// operator renders on it: a template for another tier runs as that tier's
+// ServiceAccount, which the admission policy would admit (#5646).
+func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.RawMessage, tier, kind, taskID string) (*batchv1.Job, error) {
 	profile := prof.Name
 	var tmpl corev1.PodTemplateSpec
 	if err := json.Unmarshal(template, &tmpl); err != nil {
 		return nil, fmt.Errorf("profile %s's Job template: %w", profile, err)
+	}
+	if got := tmpl.Labels[lib.ProfileTierLabel]; got != tier || tmpl.Labels[lib.ProfileNameLabel] != profile {
+		return nil, fmt.Errorf("%w: profile %s's Job template for tier %s is labelled profile %q, tier %q",
+			ErrJobTemplateNotCurrent, profile, tier, tmpl.Labels[lib.ProfileNameLabel], got)
 	}
 	labels := maps.Clone(cfg.JobLabels)
 	if labels == nil {
@@ -190,7 +228,7 @@ func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.R
 	deadline := int64(max(prof.ActiveDeadlineSeconds, 1)) + int64(jobStart(cfg).Seconds()) + int64(stopGrace(cfg).Seconds())
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      JobName(profile, tier, taskID),
+			Name:      JobName(profile, tier, kind, taskID),
 			Namespace: cfg.ProfileNamespace,
 			Labels:    labels,
 			Annotations: map[string]string{
@@ -208,8 +246,8 @@ func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.R
 	}, nil
 }
 
-func (k *KubeJobs) Pod(ctx context.Context, profile, tier, taskID string) (string, bool, error) {
-	ns, name := k.config().ProfileNamespace, JobName(profile, tier, taskID)
+func (k *KubeJobs) Pod(ctx context.Context, profile, tier, kind, taskID string) (string, bool, error) {
+	ns, name := k.config().ProfileNamespace, JobName(profile, tier, kind, taskID)
 	job, err := k.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
@@ -249,11 +287,14 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, taskID string) (strin
 	return "", false, nil
 }
 
-func (k *KubeJobs) Delete(ctx context.Context, profile, tier, taskID string) error {
-	err := k.kube.BatchV1().Jobs(k.config().ProfileNamespace).Delete(ctx, JobName(profile, tier, taskID),
-		metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationBackground)})
-	if apierrors.IsNotFound(err) {
-		return nil
+func (k *KubeJobs) Delete(ctx context.Context, profile, tier, kind, taskID string) error {
+	var errs []error
+	for _, name := range []string{JobName(profile, tier, kind, taskID), legacyJobName(profile, tier, taskID)} {
+		err := k.kube.BatchV1().Jobs(k.config().ProfileNamespace).Delete(ctx, name,
+			metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationBackground)})
+		if err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, err)
+		}
 	}
-	return err
+	return errors.Join(errs...)
 }

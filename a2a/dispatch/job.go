@@ -28,12 +28,12 @@ type JobRunner interface {
 	// Launch creates the task's Job, or finds the one already created, and
 	// says when it was created (zero if it can't tell): the Job's own
 	// deadline counts from then.
-	Launch(ctx context.Context, profile, tier, taskID string) (created time.Time, err error)
+	Launch(ctx context.Context, profile, tier, kind, taskID string) (created time.Time, err error)
 	// Pod is the Job's pod once it is Ready and "" before. failed is a Job
 	// that will never have a Ready pod (its pod failed, or it is gone).
-	Pod(ctx context.Context, profile, tier, taskID string) (pod string, failed bool, err error)
+	Pod(ctx context.Context, profile, tier, kind, taskID string) (pod string, failed bool, err error)
 	// Delete removes the Job and its pod; a Job already gone is no error.
-	Delete(ctx context.Context, profile, tier, taskID string) error
+	Delete(ctx context.Context, profile, tier, kind, taskID string) error
 }
 
 // UseJobs sets the JobRunner unattended tasks run on. Set it before Run.
@@ -65,7 +65,7 @@ func jobStart(cfg lib.DispatchConfig) time.Duration {
 func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
 	prof lib.DispatchProfile, h *holding) (rec lib.LeaseRecord, key string, ended bool, err error) {
 	noWorker := func(detail string) (lib.LeaseRecord, string, bool, error) {
-		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.kind, h.taskID); err != nil {
 			log.Warn("delete the task's Job", "err", err)
 		}
 		d.breakers.expired(snap, h.profile, h.tier, d.now())
@@ -79,7 +79,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	}
 	h.lease, h.renew = seconds(snap.LeaseSeconds), seconds(snap.RenewSeconds)
 	stoppedJob := func() (lib.LeaseRecord, string, bool, error) {
-		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.kind, h.taskID); err != nil {
 			log.Warn("delete the stopped task's Job", "err", err)
 		}
 		return lib.LeaseRecord{}, "", false, errStopped
@@ -91,7 +91,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	if stopped {
 		return stoppedJob()
 	}
-	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID)
+	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.kind, h.taskID)
 	if err != nil {
 		if errors.Is(err, ErrJobRefusedByPolicy) || errors.Is(err, ErrJobTemplateNotCurrent) {
 			d.jobRefused(log, err)
@@ -113,7 +113,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		if stopped {
 			return stoppedJob()
 		}
-		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.taskID)
+		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.kind, h.taskID)
 		pollErr = err
 		switch {
 		case err != nil:
@@ -142,6 +142,13 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		}
 	}
 	d.mu.Lock()
+	if d.podHeldLocked(h, pod) {
+		// A Job's pod is the task's own (#5646): one another holding here
+		// already has is never offered a second task, whose credentials
+		// would then bind to a pod running someone else's.
+		d.mu.Unlock()
+		return noWorker(fmt.Sprintf("the task's Job worker %s already holds another task", pod))
+	}
 	ch := d.registerOfferLocked(h, pod)
 	d.mu.Unlock()
 	rec, key, taken, err := d.offerTo(ctx, log, envelope, snap, prof, h, pod, ch, seconds(snap.AcceptTimeoutSeconds))
@@ -170,7 +177,7 @@ func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
 	if !h.onJob || d.jobs == nil || ctx.Err() != nil {
 		return
 	}
-	if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+	if err := d.jobs.Delete(ctx, h.profile, h.tier, h.kind, h.taskID); err != nil {
 		log.Warn("delete the finished task's Job", "err", err)
 	}
 }
@@ -187,7 +194,7 @@ func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, hk 
 	if d.jobs == nil || !d.mayHaveJob(hk) {
 		return
 	}
-	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
+	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.kind, hk.taskID); err != nil {
 		log.Warn("delete the Job of a task never started", "err", err)
 	}
 }
@@ -208,6 +215,17 @@ func (d *Dispatcher) dropUnconfirmedJob(ctx context.Context, log *slog.Logger, h
 	if !found {
 		d.dropUnstartedJob(ctx, log, hk)
 	}
+}
+
+// podHeldLocked is whether a holding other than h has pod. Call with d.mu
+// held.
+func (d *Dispatcher) podHeldLocked(h *holding, pod string) bool {
+	for _, other := range d.active {
+		if other != h && other.pod == pod {
+			return true
+		}
+	}
+	return false
 }
 
 // jobRefusedHint is what the dispatcher says when the Job admission policy
@@ -234,9 +252,10 @@ func (d *Dispatcher) jobAdmitted() {
 
 // mayHaveJob is whether hk's task could have a Job: its tier is unattended
 // for its profile (Config.unattendedFor, which reads the profile's own
-// unattended-mode tier, #3659), or the config no longer lists the profile,
-// so its tier's mode can't be told and a delete, which is no error for a Job
-// that was never made, is the safe answer.
+// unattended-mode tier, #3659), the profile's templates are per tier, so a
+// permit-carrying task at any tier may have one (#5646), or the config no
+// longer lists the profile, so its tier's mode can't be told and a delete,
+// which is no error for a Job that was never made, is the safe answer.
 func (d *Dispatcher) mayHaveJob(hk holdKey) bool {
 	if d.cfg.unattended(hk.tier) {
 		return true
@@ -246,10 +265,13 @@ func (d *Dispatcher) mayHaveJob(hk holdKey) bool {
 }
 
 // jobPossible is whether a task of prof at tier could run on a Job: the tier
-// is unattended for the profile, or the profile no longer lists it. A
-// custom unattended-mode tier dropped from the profile leaves UnattendedTier
-// empty, so its mode can't be told any more, and its Jobs must still be
-// deleted (#3659); a delete of a Job never made is no error.
+// is unattended for the profile, the profile has a template per tier (a
+// permit-carrying task runs on a Job at any tier, #5646), or the profile no
+// longer lists the tier. A custom unattended-mode tier dropped from the
+// profile leaves UnattendedTier empty, so its mode can't be told any more,
+// and its Jobs must still be deleted (#3659); a delete of a Job never made
+// is no error. Not held to the current template: a task's Job is found by
+// its name, whatever the config says now.
 func (c Config) jobPossible(prof lib.DispatchProfile, tier string) bool {
-	return c.unattendedFor(prof, tier) || !slices.Contains(prof.Tiers, tier)
+	return c.unattendedFor(prof, tier) || prof.JobTemplatesPerTier() || !slices.Contains(prof.Tiers, tier)
 }

@@ -859,7 +859,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobRunner(prof, h.tier) {
+	// A permit-carrying task runs only in its own one-pod Job, at any tier
+	// and of any kind (#5646): admission refused one with no Job runner for
+	// its tier (change-needs-job), and the mint gives a pool pod no permit.
+	if (h.unattended || carriesPermit(h.changeRequested, h.cluster)) && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
@@ -870,6 +873,16 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 			return
 		}
 	} else {
+		// A submission is replaced under the same subject (admission reads
+		// changeRequested from each delivery), so an earlier pass may have
+		// launched a Job for this task while it carried a permit. That Job
+		// goes before the task is offered to a pool pod, or its pod would wait
+		// for an offer until its deadline, outside every cap. Only a profile
+		// with templates per tier runs such a task on a Job off the
+		// unattended side.
+		if prof.JobTemplatesPerTier() {
+			d.dropUnstartedJob(ctx, log, hk)
+		}
 		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	}
 	if errors.Is(err, errStopped) {
@@ -1251,7 +1264,8 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
 			ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
-			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
+			OnJob: h.onJob}
 		if err := d.putLease(ctx, key, rec); err != nil {
 			// Unrecorded, the task can't be confirmed: a restart
 			// would not know it had started.
@@ -1392,7 +1406,11 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier), onJob: d.cfg.jobPossible(prof, hk.tier) && d.jobs != nil,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier),
+		// The record says (#5646); one from an older dispatcher doesn't, and
+		// its task ran on a Job only at an unattended tier. A delete of a Job
+		// never made is no error.
+		onJob: d.jobs != nil && (rec.OnJob || d.cfg.jobPossible(prof, hk.tier)),
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()

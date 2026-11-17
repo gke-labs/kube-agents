@@ -78,13 +78,18 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 	return len(d.pool.Pods(prof.Name, tier)) == 0
 }
 
-// jobRunner reports whether a task of prof's at tier runs in a Job of its
-// own: Job mode (a JobRunner and the profile's Job template, which the
-// operator renders only where the chart installed the Job admission policy)
-// at an unattended tier. Placement and the permit refusal both read it, so
-// a task admitted for a permit is one placement puts on a Job.
+// jobRunner reports whether a task of prof's at tier can run in a Job of its
+// own: Job mode (a JobRunner, and a Job template for the tier, which the
+// operator renders only where the chart installed the Job admission policy).
+// An unattended tier's template is the profile's own; any other tier has one
+// only when the profile's templates are per tier (#5646), for the tasks that
+// carry a permit. Placement and the permit refusal both read it, so a task
+// admitted for a permit is one placement puts on a Job.
 func (d *Dispatcher) jobRunner(prof lib.DispatchProfile, tier string) bool {
-	return d.cfg.unattendedFor(prof, tier) && d.jobs != nil && prof.HasJobTemplate()
+	if d.jobs == nil || !prof.HasJobTemplate(tier) {
+		return false
+	}
+	return d.cfg.unattendedFor(prof, tier) || prof.JobTemplatesPerTier()
 }
 
 // carriesPermit reports whether a task's credential-proxy credential would
