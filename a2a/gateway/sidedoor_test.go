@@ -194,6 +194,7 @@ func TestSideDoorStopsWhenEitherHalfDoes(t *testing.T) {
 // gateway exits on it. The door fails to bind and stops at once; the chat
 // half takes a moment to stop once told, and Run must not return before it.
 func TestSideDoorWaitsForTheOtherHalfToStop(t *testing.T) {
+	t.Parallel()
 	primary, door, composite := newSideDoorRig(t)
 	door.listen = "127.0.0.1:-1"
 	primary.stopDelay = 300 * time.Millisecond

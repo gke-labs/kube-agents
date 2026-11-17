@@ -81,7 +81,9 @@ class SubmittedPayloadTestCase(unittest.TestCase):
             captured["payload"] = json.loads(request.data.decode("utf-8"))
             return RecordingResponse(json.dumps(body).encode("utf-8"))
 
-        with patch.dict("os.environ", environ, clear=False):
+        # An empty KUBECONFIG unless the test names one: the ambient value is
+        # not the test's input, and the shim refuses a file with no context.
+        with patch.dict("os.environ", {"KUBECONFIG": "", **environ}, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                     captured["exit_code"] = credential_proxy_client.execute(endpoint, argv)
@@ -989,11 +991,19 @@ class StdinGateTest(unittest.TestCase):
             captured["body"] = json.loads(request.data)
             return RecordingResponse(json.dumps({"exitCode": 0}).encode())
 
-        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+        with patch.dict("os.environ", {"KUBECONFIG": ""}, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open):
             credential_proxy_client.execute(
                 "http://127.0.0.1:8765", ["kubectl", "apply", "-f", "-"], stdin="kind: X\n"
             )
         self.assertEqual(captured["body"]["stdin"], "kind: X\n")
+
+
+class BodyThatDrops(io.BytesIO):
+    """A refusal body whose connection closes while it is read."""
+
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"")
 
 
 class VcsCallErrorTest(unittest.TestCase):
@@ -1022,6 +1032,34 @@ class VcsCallErrorTest(unittest.TestCase):
         with self._refuse(404, {"error": "not available", "code": "VCS_UNAVAILABLE"}):
             with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
                 credential_proxy_client.vcs_call(self.endpoint, "snapshot", {})
+
+    def _held_refusal(self, status, stream):
+        """An HTTPError the test keeps hold of. Held, it is not collected, so a body
+        that reads as closed was closed by `vcs_call` and not by the interpreter."""
+        error = urllib.error.HTTPError(self.endpoint + "/v1/vcs/publish", status, "refused", {}, stream)
+        self.addCleanup(error.close)
+        return error
+
+    def test_the_refusal_is_closed_once_its_body_is_read_on_every_way_out(self):
+        cases = (
+            ("a refusal", 409, io.BytesIO(b'{"error": "the base branch moved", "code": "BASE_MOVED"}'),
+             credential_proxy_client.WorkspaceRequestError),
+            ("no version control", 404, io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE"}'),
+             credential_proxy_client.WorkspaceUnavailable),
+            ("a body that is not JSON", 502, io.BytesIO(b"<html>bad gateway</html>"),
+             credential_proxy_client.WorkspaceRequestError),
+            ("a body that drops", 500, BodyThatDrops(), credential_proxy_client.BrokerDisconnected),
+        )
+        for name, status, stream, raised in cases:
+            with self.subTest(name):
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                    with self.assertRaises(raised) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+                if raised is credential_proxy_client.WorkspaceRequestError:
+                    # The status is read off the error after the close.
+                    self.assertEqual(caught.exception.status, status)
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -1082,7 +1120,7 @@ class TestCallerCredential(SubmittedPayloadTestCase):
             return RecordingResponse(b"{}")
 
         stderr = io.StringIO()
-        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token"}
+        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token", "KUBECONFIG": ""}
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stderr", new=stderr):
@@ -1154,7 +1192,9 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual("a.b.next", sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_no_header_outside_a_task_or_after_it(self):
-        sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        sent = self.run_shim(
+            ["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": ""}
+        )
         self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
         # The adapter removed the file at the task's end: no task, no header,
         # and the broker answers local-only commands only.
@@ -2259,6 +2299,108 @@ class TestShimEntryRouting(unittest.TestCase):
         self.assertIn("invalid choice", refused.stderr)
 
 
+class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
+    """The images install a launcher that imports the client as a module, so
+    the client starts from bytecode the build compiled. Every case of
+    `TestShimEntryRouting` runs again here through the launcher, laid out as
+    the images lay it out; the cases below compare it with the single file."""
+
+    LAUNCHER = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "credential-proxy-exec.py"
+
+    def setUp(self):
+        super().setUp()
+        self.single = self.root / "single" / "credential-proxy-exec"
+        self.single.parent.mkdir()
+        self.shim.rename(self.single)
+        (self.root / "kubectl").unlink()
+        (self.single.parent / "gcloud").symlink_to(self.single)
+        libexec = self.root.resolve() / "libexec"
+        libexec.mkdir()
+        self.launcher = libexec / "credential-proxy-exec"
+        shutil.copy(self.LAUNCHER, self.launcher)
+        self.module = libexec / "credential_proxy_client.py"
+        shutil.copy(credential_proxy_client.__file__, self.module)
+        # The same bare environment as `run_shim`: a PYTHONPYCACHEPREFIX or
+        # PYTHONOPTIMIZE of the caller's would put the bytecode where the shim
+        # does not look.
+        subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", "--invalidation-mode", "unchecked-hash", str(self.module)],
+            env={"PATH": os.environ["PATH"]}, check=True, capture_output=True, timeout=60,
+        )
+        self.bytecode = libexec / "__pycache__" / f"credential_proxy_client.{sys.implementation.cache_tag}.pyc"
+        self.assertTrue(self.bytecode.is_file())
+        # As the sandbox image links it: a name on PATH, to the launcher's name
+        # in another folder, to the launcher.
+        self.shim.symlink_to(self.launcher)
+        for name in ("kubectl", "gcloud"):
+            (self.root / name).symlink_to(self.shim)
+
+    def both(self, flags, name, args, environ):
+        """The same command through the single file and through the launcher."""
+        return [
+            self.run_shim([*flags, str(folder / name), *args], {"PYTHONDONTWRITEBYTECODE": "1", **environ})
+            for folder in (self.single.parent, self.root)
+        ]
+
+    def test_the_client_is_loaded_from_the_bytecode_the_build_compiled(self):
+        completed = self.run_shim(
+            ["-v", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr[-2000:])
+        self.assertIn(f"code object from {str(self.bytecode)!r}", completed.stderr)
+
+    def test_the_bytecode_is_loaded_without_a_look_at_the_source(self):
+        """`unchecked-hash`: no stat and no hash of the source at a start. The
+        price is that an edit of the module does nothing until it is compiled
+        again."""
+        with open(self.module, "a") as source:
+            source.write("\nraise SystemExit(99)\n")
+        completed = self.run_shim([str(self.root / "kubectl"), "get", "pods"], {"CREDENTIAL_PROXY_URL": self.live})
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+
+    def test_without_the_bytecode_the_launcher_still_runs_the_client(self):
+        shutil.rmtree(self.bytecode.parent)
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertFalse(self.bytecode.parent.exists(), "and it writes none")
+
+    def test_it_answers_as_the_single_file_does(self):
+        cases = {
+            "a tool name with no broker": ([], "gcloud", ["config", "get-value", "project"], {}),
+            "a tool name": ([], "gcloud", ["config", "get-value", "project"], {"CREDENTIAL_PROXY_URL": self.live}),
+            "the help": ([], "credential-proxy-exec", ["--help"], {}),
+            "the explicit form": ([], "credential-proxy-exec", ["--endpoint", self.live, "kubectl", "get", "pods"], {}),
+            "a tool that is not supported": ([], "credential-proxy-exec", ["--endpoint", self.live, "rm", "-rf", "/"], {}),
+            "an unreachable endpoint": ([], "credential-proxy-exec", ["--endpoint", self.closed, "kubectl", "get", "pods"], {}),
+            "the kubectl wrapper's isolated call": (["-I"], "credential-proxy-exec", ["--ensure-kubectl-context", "get", "pods"], {}),
+        }
+        for label, (flags, name, args, environ) in cases.items():
+            with self.subTest(label):
+                single, launched = self.both(flags, name, args, environ)
+                self.assertEqual(
+                    (single.returncode, single.stdout, single.stderr),
+                    (launched.returncode, launched.stdout, launched.stderr),
+                )
+
+    def test_stdin_reaches_the_broker_as_it_does_from_the_single_file(self):
+        for folder in (self.single.parent, self.root):
+            completed = subprocess.run(
+                [sys.executable, str(folder / "credential-proxy-exec"), "--endpoint", self.live, "kubectl", "apply", "-f", "-"],
+                env={"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home")},
+                input="kind: ConfigMap\n", capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+        single, launched = self.requests[-2:]
+        self.assertEqual("kind: ConfigMap\n", launched["stdin"])
+        self.assertEqual(single["stdin"], launched["stdin"])
+        self.assertEqual(single["argv"], launched["argv"])
+
+
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
 class TestRealShellCommandLines(unittest.TestCase):
     """The shell pin through real processes, not a patched ancestry.
@@ -2762,6 +2904,78 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual(1, len(broker.requests))
         self.assertEqual("argv is required", err.strip())
 
+    def held_refusal(self, status, body, headers=None):
+        """An HTTPError the test keeps hold of, and its body. Held, the error is not
+        collected, so a body that reads as closed was closed by the shim and not by the
+        interpreter."""
+        stream = body if isinstance(body, io.BytesIO) else io.BytesIO(
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
+        error = urllib.error.HTTPError("http://broker.invalid/v1/exec", status, "refused", headers or {}, stream)
+        self.addCleanup(error.close)
+        return error, stream
+
+    def run_shim_over(self, replies):
+        """The shim over `replies`, each an HTTPError it raises or a reply body it reads."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=replies), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_printed_refusal_is_closed_and_its_text_was_read_first(self):
+        error, stream = self.held_refusal(400, {"error": "argv is required"})
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertEqual("argv is required", err.strip())
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_with_no_json_body_is_closed(self):
+        error, stream = self.held_refusal(500, b"<html>internal error</html>")
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("credential proxy error (HTTP 500): non-JSON response", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_whose_body_drops_is_closed(self):
+        error, stream = self.held_refusal(503, BodyThatDrops())
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("the connection dropped while the refusal was read", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_each_retried_refusal_is_closed_and_its_retry_after_still_sets_the_wait(self):
+        # Five 429s: four waits, then the throttling line. The status and the
+        # Retry-After header are read off each error after it is closed.
+        held = [self.held_refusal(429, PRESSURE, {"Retry-After": "4"}) for _ in range(5)]
+        code, _, err = self.run_shim_over([error for error, _ in held])
+        self.assertEqual(1, code)
+        self.assertEqual(4, len(self.sleeps))
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+        self.assertIn("gave up after 5 attempts (HTTP 429)", err.strip().splitlines()[-1])
+        self.assertEqual([True] * 5, [stream.closed for _, stream in held], "the shim left a refusal open")
+
+    def test_a_refusal_that_is_retried_into_a_reply_is_closed(self):
+        error, stream = self.held_refusal(503, BUSY_SLOT)
+        code, out, err = self.run_shim_over([error, io.BytesIO(json.dumps(OK).encode())])
+        self.assertEqual(0, code, err)
+        self.assertEqual(OK["stdout"], out)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_the_status_headers_and_payload_stay_on_a_closed_refusal(self):
+        error, stream = self.held_refusal(429, PRESSURE, {"Retry-After": "4"})
+        payload = credential_proxy_client._refusal_payload(error)
+        self.assertTrue(stream.closed)
+        self.assertEqual(PRESSURE, payload)
+        self.assertEqual(PRESSURE, error.shim_payload)
+        self.assertFalse(error.shim_dropped)
+        self.assertEqual(429, error.code)
+        self.assertEqual("4", error.headers.get("Retry-After"))
+
 
 class RetryScheduleTest(unittest.TestCase):
     """The delay and the refusal filter, without a server."""
@@ -3084,6 +3298,95 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         text = self.worker_kubeconfig.read_text(encoding="utf-8")
         self.assertIn(f"current-context: {self.TARGET_CTX}", text)
         self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+
+class KubeconfigLockOwnerTest(unittest.TestCase):
+    """Only the kubeconfig's owner makes the lock beside it. A caller that does
+    not own the file cannot change it, and a lock that root made is one the
+    agent user cannot open: its later merges stopped without a word."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.PROXY_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        self.lock = self.root / "..kubeconfig.lock"
+        self.record = self.root / "..kubeconfig.contexts-registered"
+
+    def merge(self, path=None, as_uid=None):
+        """One merge of TARGET_CTX; returns what it wrote to stderr."""
+        stderr = io.StringIO()
+        uid = os.geteuid() if as_uid is None else as_uid
+        with patch.object(credential_proxy_client.os, "geteuid", return_value=uid), \
+                patch.object(credential_proxy_client.sys, "stderr", stderr):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                path or self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        return stderr.getvalue()
+
+    def test_a_caller_that_does_not_own_the_kubeconfig_makes_no_lock(self):
+        before = self.kubeconfig.read_bytes()
+        self.assertEqual("", self.merge(as_uid=os.geteuid() + 1), "refused, which is no failure to report")
+        self.assertEqual([self.kubeconfig.name], sorted(p.name for p in self.root.iterdir()))
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_the_owners_merge_after_a_run_by_another_caller_registers_and_records(self):
+        self.merge(as_uid=os.geteuid() + 1)
+        self.assertEqual("", self.merge())
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", self.kubeconfig.read_text(encoding="utf-8"))
+        self.assertEqual(os.geteuid(), self.lock.stat().st_uid)
+        self.assertEqual([self.TARGET_CTX], [line.split(" ", 1)[0] for line in self.record.read_text(encoding="utf-8").splitlines()])
+
+    def test_a_kubeconfig_that_is_not_a_regular_file_gets_no_lock(self):
+        cases = {"missing": self.root / "missing" / "config", "a folder": self.root / "folder" / "config"}
+        cases["missing"].parent.mkdir()
+        cases["a folder"].mkdir(parents=True)
+        link = self.root / "linked" / "config"
+        link.parent.mkdir()
+        link.symlink_to(self.kubeconfig)
+        cases["a symlink"] = link
+        before = self.kubeconfig.read_bytes()
+        for label, path in cases.items():
+            with self.subTest(label):
+                self.assertEqual("", self.merge(path=path))
+                self.assertEqual([], [p.name for p in path.parent.iterdir() if p.name != path.name])
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_an_owner_who_cannot_open_the_lock_is_told(self):
+        """A folder under the lock's name: no caller can open that, root included."""
+        self.lock.mkdir()
+        before = self.kubeconfig.read_bytes()
+        said = self.merge()
+        self.assertEqual(1, len(said.splitlines()), said)
+        self.assertTrue(said.startswith("credential proxy: "), said)
+        for part in (str(self.lock), f"(owned by uid {os.geteuid()})", self.TARGET_CTX, str(self.kubeconfig)):
+            with self.subTest(part):
+                self.assertIn(part, said)
+        self.assertEqual(before, self.kubeconfig.read_bytes(), "nothing is merged without the lock")
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a file whatever its mode")
+    def test_a_lock_the_owner_has_no_right_to_open_is_reported_too(self):
+        """What a root run left before the owner check came first, as near as a test gets:
+        a lock file the caller cannot open."""
+        self.lock.touch(mode=0o000)
+        self.assertIn(f"{self.lock} (owned by uid {os.geteuid()}): Permission denied", self.merge())
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes to a folder whatever its mode")
+    def test_a_lock_that_cannot_be_made_names_no_owner(self):
+        self.root.chmod(0o500)
+        self.addCleanup(self.root.chmod, 0o700)
+        self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
 
 
 class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):

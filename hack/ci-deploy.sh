@@ -108,6 +108,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
+# The namespace whose events the k8s event watcher does not forward on an eval
+# install (spec.harness.eventWatcher.alertExclude, a namespace rule on every
+# cluster). bench/tf/prebuilt/kcc-stalled-declaration plants a
+# ContainerNodePool there that Config Connector holds at DependencyNotFound
+# for the whole run. DependencyNotFound is on the watcher's reason list, so
+# without this rule an event on the object opens an incident and a triage card
+# in the middle of the case, and the card can stay for later cases on the same
+# install. The stall watch has its own opt-out, an annotation the stack sets.
+# Equal to the stack's kcc_namespace; tests/test_ci_deploy_mode_next.py holds
+# the two equal.
+readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -394,6 +406,16 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
+# The NATS StatefulSet mode: next renders, and the claims its
+# volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
+# (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
+# claim left by an earlier lease pins its server to the old disk's zone, where
+# topology spread can leave it unschedulable (#5658); 5b″ and 6b delete such
+# claims while no StatefulSet owns them. The delete is bounded like the
+# teardown's.
+readonly A2A_NATS_STATEFULSET_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+readonly A2A_NATS_CLAIM_NAME_RE="^persistentvolumeclaim/data-${A2A_NATS_STATEFULSET_NAME}-[0-9]+\$"
+readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the main nightly's
@@ -422,7 +444,19 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane ci-kube-agents-eval-nightly-slack"
+
+# The Slack lane's nightly (EVAL_SLACK_LANE=1 on ci-kube-agents-eval-nightly-slack,
+# beside EVAL_MODE_NEXT=1): the install gets Slack through the eval Slack app, and
+# hack/ci-eval-pr.sh runs hack/slack-lane/run.sh in place of the matrix. The app's
+# tokens, the CI channel and the test user's member id live in Secret Manager in
+# SLACK_LANE_SECRETS_PROJECT, where the runner reads the GitLab pair too; with any
+# of them unreadable the install keeps Slack off and the lane logs its skip.
+readonly SLACK_LANE_SECRETS_PROJECT="${SLACK_LANE_SECRETS_PROJECT:-kube-agents-prow}"
+readonly SLACK_LANE_BOT_TOKEN_SECRET="slack-eval-bot-token"
+readonly SLACK_LANE_APP_TOKEN_SECRET="slack-eval-app-token"
+readonly SLACK_LANE_CHANNEL_SECRET="slack-eval-channel-id"
+readonly SLACK_LANE_TEST_USER_SECRET="slack-eval-test-user-id"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -474,6 +508,14 @@ readonly WEB_CONSOLE_DIAG_LOG_LINES=100
 # status on its next pass, which the agent Deployment's status moving starts.
 # A read that returns no phase spends one of them too and never passes.
 readonly WEB_CONSOLE_CR_ATTEMPTS=12
+# Compatibility shim (the CI lane piece removes this phase): the operator
+# renders the NATS bus from its first pass, and on an Autopilot pool a server
+# can wait for a node past the reads above. A Degraded whose Ready reason is
+# PodUnschedulable on a bus pod is transient for this many more reads,
+# WEB_CONSOLE_POLL_SECONDS apart (ten minutes); after them it fails as any
+# other Degraded. The pod pattern is the bus StatefulSet's (a2aNATSName).
+readonly WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS=120
+readonly WEB_CONSOLE_BUS_POD_RE='Pod [^ ]*-a2a-nats-[0-9]+ '
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
 # the second for every relayed pull. The route is the stockout investigator's
@@ -523,6 +565,11 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
+# nats-server debug logging on the bus (k8s-operator a2aNATSDebugEnvVar): on for
+# the lane only, so a failing run's bus logs carry the meta group's raft votes,
+# terms and peer updates (#5708). Debug, never trace: trace logs payloads.
+readonly A2A_NATS_DEBUG_ENV_VAR="A2A_NATS_DEBUG"
+readonly A2A_NATS_DEBUG_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -1112,6 +1159,52 @@ export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
+# ─── 2a. The Slack lane's Slack (EVAL_SLACK_LANE=1) ──────────────────────────
+# Slack on, through the eval app, with Google Chat off so Slack holds the A2A
+# gateway; the CI channel as the home channel; the test user on the allowlist
+# and on operator.slackTestUsers, so the gateway reads its user-token posts as
+# its own. The tokens reach Helm as --set-file from a 0700 directory, never on
+# argv, removed beside the sandbox key once the release is in. Any secret
+# unreadable: Slack stays off, the error's class (not found, permission denied)
+# is logged, and hack/ci-eval-pr.sh, which checks the installed CR, skips the
+# lane. Empty on every other run.
+SLACK_LANE_HELM_ARGS=()
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    echo "ERROR: EVAL_SLACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane's test user reaches a turn only through the A2A gateway's Slack adapter, which only next renders." >&2
+    exit 1
+  fi
+  SLACK_LANE_DIR="$(mktemp -d)"
+  chmod 700 "${SLACK_LANE_DIR}"
+  slack_lane_missing=()
+  for slack_lane_secret in "${SLACK_LANE_BOT_TOKEN_SECRET}" "${SLACK_LANE_APP_TOKEN_SECRET}" "${SLACK_LANE_CHANNEL_SECRET}" "${SLACK_LANE_TEST_USER_SECRET}"; do
+    slack_lane_value="$(gcloud secrets versions access latest --secret="${slack_lane_secret}" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>"${SLACK_LANE_DIR}/err" | tr -d '[:space:]')" || slack_lane_value=""
+    if [ -z "${slack_lane_value}" ]; then
+      # gcloud's error names the failure, never the value: NOT_FOUND until the
+      # secret exists, PERMISSION_DENIED while the runner lacks the grant.
+      slack_lane_missing+=("${slack_lane_secret} ($(grep -oE 'NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED' "${SLACK_LANE_DIR}/err" | head -n 1 || true))")
+      continue
+    fi
+    printf '%s' "${slack_lane_value}" >"${SLACK_LANE_DIR}/${slack_lane_secret}"
+  done
+  unset slack_lane_value
+  if [ "${#slack_lane_missing[@]}" -gt 0 ]; then
+    echo "Slack lane: ${slack_lane_missing[*]} not readable in ${SLACK_LANE_SECRETS_PROJECT}; installing without Slack, and the lane will skip"
+  else
+    SLACK_LANE_CHANNEL="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_CHANNEL_SECRET}")"
+    SLACK_LANE_TEST_USER="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_TEST_USER_SECRET}")"
+    SLACK_LANE_HELM_ARGS=(
+      --set "platformAgent.integration.slack.enabled=true"
+      --set-file "platformAgent.credentials.data.SLACK_BOT_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_BOT_TOKEN_SECRET}"
+      --set-file "platformAgent.credentials.data.SLACK_APP_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_APP_TOKEN_SECRET}"
+      --set-string "platformAgent.integration.slack.homeChannel=${SLACK_LANE_CHANNEL}"
+      --set-string "platformAgent.integration.slack.allowedUsers[0]=${SLACK_LANE_TEST_USER}"
+      --set-string "operator.slackTestUsers[0]=${SLACK_LANE_TEST_USER}"
+    )
+    echo "Slack lane: Slack on through the eval app, home channel ${SLACK_LANE_CHANNEL}, test user ${SLACK_LANE_TEST_USER} allowed and listed in operator.slackTestUsers"
+  fi
+fi
+
 # ─── 2b. GitOps Repository for This Run ───────────────────────────────────────
 # Every GitHub-writing eval scenario begins by reading the registered repositories
 # out of the gitops-state ConfigMap — the fleet-audit streams do it in `audit_report.py
@@ -1191,6 +1284,16 @@ gitops_repo_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1242,6 +1345,16 @@ gitlab_project_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1908,6 +2021,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # The A2A door, for the card-wait stopped ask (above).
     --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
     --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
+    # The bus's debug logging, for #5708 (above).
+    --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
+    --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
   )
 fi
 
@@ -2197,6 +2313,47 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-s
 kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
 echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 
+# ─── 5b″. Delete NATS claims no StatefulSet owns ───────────────────────────
+# Teardown deletes them (hack/ci-teardown.sh Step 6), but a pool project that
+# already holds one, or a run killed before its teardown, would fail this
+# deploy's NATS gate on it. With no StatefulSet the claims are unowned and
+# unmounted; with one, they are its data and stay. Never fatal: a failure here
+# leaves the run where it was, and the NATS gate reports it.
+#
+# Called twice. Here it takes claims a teardown left. A next-mode run killed
+# before its teardown leaves its StatefulSet standing, so this call skips;
+# 5c's install then renders mode today, cleanupA2A deletes the StatefulSet and
+# keeps its claims (WhenDeleted: Retain), and 6b's flip back to next would
+# bind them. 6b calls it again before that flip, once the StatefulSet is gone.
+delete_orphaned_nats_claims() {
+  local sts claims
+  if ! sts="$(kubectl get statefulset "${A2A_NATS_STATEFULSET_NAME}" -n "${NAMESPACE}" \
+    --ignore-not-found -o name 2>&1)"; then
+    echo "WARNING: could not check for statefulset/${A2A_NATS_STATEFULSET_NAME} (${sts}); leaving any NATS claims in place."
+    return 0
+  fi
+  if [ -n "${sts}" ]; then
+    echo "statefulset/${A2A_NATS_STATEFULSET_NAME} exists; leaving its claims in place."
+    return 0
+  fi
+  if ! claims="$(kubectl get persistentvolumeclaims -n "${NAMESPACE}" -o name 2>&1)"; then
+    echo "WARNING: could not list claims in ${NAMESPACE} (${claims}); leaving any NATS claims in place."
+    return 0
+  fi
+  claims="$(grep -E "${A2A_NATS_CLAIM_NAME_RE}" <<<"${claims}" || true)"
+  if [ -z "${claims}" ]; then
+    return 0
+  fi
+  while IFS= read -r claim; do
+    echo "WARNING: ${claim} outlived its StatefulSet (a previous lease left it, #5658); deleting it."
+    if ! kubectl delete -n "${NAMESPACE}" "${claim}" --ignore-not-found \
+      --timeout="${A2A_NATS_CLAIM_DELETE_TIMEOUT}"; then
+      echo "WARNING: could not delete ${claim}; the NATS server that mounts it may not schedule."
+    fi
+  done <<<"${claims}"
+}
+delete_orphaned_nats_claims
+
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
@@ -2216,6 +2373,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     "${FORGE_ARGS[@]}" \
     "${GITHUB_MINTER_ARGS[@]}" \
+    ${SLACK_LANE_HELM_ARGS[@]+"${SLACK_LANE_HELM_ARGS[@]}"} \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
     --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \
@@ -2240,6 +2398,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
     --set-string "platformAgent.deployment.env[3].value=off" \
+    --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
@@ -2293,6 +2452,7 @@ rm -f "${HELM_INSTALL_OUT}"
 # A failed install leaves the directory behind in a pod prow destroys with the
 # lease, and nothing uploads it — /logs/artifacts is the only path off this box.
 rm -rf "${SANDBOX_KEY_DIR}"
+if [ -n "${SLACK_LANE_DIR:-}" ]; then rm -rf -- "${SLACK_LANE_DIR}"; fi
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
@@ -2311,6 +2471,56 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   kubectl get pods -n "${NAMESPACE}" || true
   kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
   exit 1
+fi
+
+# The gateway's second roll on a fresh install (#5962). The operator adds the
+# bridge sidecar to the agent pod only once it has recorded the bus
+# provisioned (a2aBridgeInPod), a reconcile or two after the provisioning
+# Job, so the rollout above can pass on the first ReplicaSet and the gateway
+# then restarts under whatever check runs next (the web console's, below).
+# Wait for the template to carry the bridge, then for that rollout, as step
+# 6b does for the mode upgrade. Not a gate: an operator that renders no
+# bridge (one before the A2A stack always rendered) never adds it, and that
+# is not this deploy's failure, so the wait is skipped (no callout
+# Deployment) or ends, and the deploy carries on.
+# Once the operator renders the bridge from the first pass, the template
+# already carries it and this costs one read.
+BRIDGE_ROLL_START=$SECONDS
+bridge_in_template=false
+bridge_polls="${MODE_NEXT_GENERATION_ATTEMPTS}"
+# No callout Deployment means this operator rendered no A2A stack, and so no
+# bridge: skip the wait rather than spend its whole budget. Only a NotFound
+# says that; a read that fails any other way waits, since skipping on a
+# transient API error would bring back the restart this wait is for. (The
+# operator holds the gateway until the callout serves, so by the rollout
+# above an operator that renders the stack has created the callout.)
+callout_read="$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -n "${NAMESPACE}" -o name 2>&1)" || {
+  case "${callout_read}" in
+    *NotFound*) bridge_polls=0 ;;
+  esac
+}
+for ((poll = 0; poll < bridge_polls; poll++)); do
+  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
+    *" ${BRIDGE_SIDECAR_NAME} "*)
+      bridge_in_template=true
+      break
+      ;;
+  esac
+  sleep "${MODE_NEXT_POLL_SECONDS}"
+done
+if [ "${bridge_in_template}" = true ]; then
+  if ! kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: ${AGENT_DEPLOYMENT_NAME} rollout with the ${BRIDGE_SIDECAR_NAME} sidecar failed"
+    kubectl describe "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" || true
+    kubectl get pods -n "${NAMESPACE}" || true
+    kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
+    exit 1
+  fi
+  echo "✓ ${AGENT_DEPLOYMENT_NAME} rolled out with the ${BRIDGE_SIDECAR_NAME} sidecar ($((SECONDS - BRIDGE_ROLL_START))s after the first rollout)"
+elif [ "${bridge_polls}" -eq 0 ]; then
+  echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar: there is no second roll to wait for"
+else
+  echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} sidecar after $((SECONDS - BRIDGE_ROLL_START))s (bus not provisioned yet?); carrying on without the second-roll wait"
 fi
 
 # The shell sandbox is the other half of the agent: everything the model runs
@@ -2492,12 +2702,25 @@ gate_web_console() {
   # gate_cr_not_degraded; phase and pair keep the last read that answered,
   # so a window that ends unread fails on that answer, or, with none, as
   # unread.
-  for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
+  local reads=0 bus_wait=0
+  while :; do
+    reads=$((reads + 1))
     read_pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
     if [ -n "${read_pair%%$'\t'*}" ]; then
       pair="${read_pair}"
       phase="${pair%%$'\t'*}"
       [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    fi
+    if [ "${reads}" -ge "${WEB_CONSOLE_CR_ATTEMPTS}" ]; then
+      # Past the window, only a bus server still waiting for a node earns
+      # more reads (the shim above); anything else is judged now.
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [[ "${pair#*$'\t'}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] \
+        && [[ "${pair}" =~ ${WEB_CONSOLE_BUS_POD_RE} ]] && [ "${bus_wait}" -lt "${WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS}" ]; then
+        bus_wait=$((bus_wait + 1))
+        [ "${bus_wait}" -eq 1 ] && echo "${PLATFORM_AGENT_CR_NAME} is Degraded while a NATS server waits for a node (${pair#*$'\t'}); waiting up to $((WEB_CONSOLE_BUS_SCHEDULE_ATTEMPTS * WEB_CONSOLE_POLL_SECONDS))s more for it to schedule"
+      else
+        break
+      fi
     fi
     sleep "${WEB_CONSOLE_POLL_SECONDS}"
   done
@@ -2542,7 +2765,11 @@ gate_web_console today
 # created, so the refusal #2077 guarded against cannot arise. The bridge
 # enters the agent pod only once the bus is provisioned (BusProvisioned), so
 # the agent Deployment rolls twice: once for the mode upgrade and once, after
-# the Job, for the bridge. The step gates both rolls. Then the step ends on the bridge's own word that it is
+# the Job, for the bridge. The step gates both rolls. On an operator that
+# renders the A2A stack from its first pass whatever the mode, both rolls
+# already happened before step 6's web console check, which waits for the
+# second (#5962), so here the bridge is in the template on the first read and
+# both gates pass at once. Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
@@ -2948,6 +3175,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # Claims a killed next-mode lease left, which 5c's flip to today released
+  # from their StatefulSet but kept (5b″ says why), before next binds them.
+  delete_orphaned_nats_claims
   # The mode and the session cap in one values document, so the first render
   # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
   # the budget that Job measures, which counts the rendered bridge's workers,
@@ -2957,6 +3187,10 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
   # shellcheck disable=SC2059
   printf -v MODE_NEXT_HELM_VALUES "${MODE_NEXT_HELM_VALUES_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
+  # Compatibility shim (the CI lane piece removes the flip): an operator whose
+  # CRD defaults spec.mode to next rendered the stack in step 5, and the
+  # upgrade below rolls the agent Deployment only when it changes the mode.
+  MODE_BEFORE="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.mode}' 2>/dev/null || true)"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   # --reuse-values keeps everything step 5 set (the images, the credentials,
   # the operator's extraEnv) and adds the document on stdin, which is JSON and
@@ -2965,7 +3199,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   printf '%s\n' "${MODE_NEXT_HELM_VALUES}" | helm upgrade "${HELM_RELEASE_NAME}" ./charts/kube-agents \
     --namespace "${NAMESPACE}" --reuse-values --values - \
     --wait --timeout "${MODE_NEXT_HELM_TIMEOUT}"
-  wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
+  if [ "${MODE_BEFORE}" = "next" ]; then
+    echo "spec.mode read next before the upgrade (the CRD defaults it), so the agent Deployment is not owed a roll"
+  else
+    wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
+  fi
   echo "managed .env now reads:"
   # Whole, not grepped for the mode key: the key is named in exactly two
   # places by design (tests/test_mode_grep.py), and this script is not one.

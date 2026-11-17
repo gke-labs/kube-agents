@@ -2961,6 +2961,11 @@ def _execute_slack(prompt: str) -> AgentResult:
     except (slack.SlackAPIError, OSError) as exc:
         return _infra_failure(f"slack: {exc}")
     timing = exchange.timing()
+    then_text = os.environ.get(slack.THEN_ENV, "").strip()
+    if then_text and exchange.outcome == "settled":
+        timing.update(_slack_then(turn, exchange, then_text, timeout))
+    elif then_text:
+        timing["slack_then_outcome"] = f"skipped: the first turn's outcome was {exchange.outcome}"
     slack.write_timing(timing)
     if timing["slack_post_to_answer_s"] is not None:
         _write_turn_timing(timing["slack_post_to_answer_s"])
@@ -2985,6 +2990,24 @@ def _execute_slack(prompt: str) -> AgentResult:
             **timing,
         },
     )
+
+
+def _slack_then(turn: Any, first: Any, text: str, timeout: float) -> dict[str, Any]:
+    """The lane's second turn (BENCH_SLACK_THEN) in the first ask's thread, as slack_then_* timing.
+
+    Not graded: the case grades the first turn. What it records is whether the
+    thread took the reply (a follow-up answered, a typed choice continued the
+    work), how fast, and the reply's own reaction.
+    """
+    try:
+        then = turn.follow_up(first, text, timeout)
+    except (slack.SlackAPIError, OSError) as exc:
+        return {"slack_then_outcome": f"error: {exc}"}
+    out: dict[str, Any] = {"slack_then_" + k.removeprefix("slack_"): v for k, v in then.timing().items()}
+    out["slack_then_outcome"] = then.outcome
+    out["slack_then_posts"] = len(then.posts)
+    out["slack_then_reaction"] = then.reaction or None
+    return out
 
 
 def _slack_report(posts: list[dict[str, Any]]) -> str:

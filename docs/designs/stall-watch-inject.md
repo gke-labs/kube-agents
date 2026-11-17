@@ -240,6 +240,12 @@ started in the sandbox, and without the wrapper a few timeouts would leave more 
 than `SCAN_WORKERS` admits; the grace keeps the local timeout first, so a timed-out hop still
 reads as one.
 
+A cluster whose listing leaves no namespace to watch (none, or only system, excluded or exempt
+ones) asks for no kind, so the watch makes no `kubectl api-resources` call and no wildcard
+discovery there. The cluster still counts as read, with 0 namespaces, so its open alerts close
+as cleared or excluded, and a failing `kubectl api-resources` cannot hold them open. Its
+discovery record stays as it was until the cluster has a namespace to watch again.
+
 Clusters are read `SCAN_WORKERS` (four) at a time once the listing is in. The bound is the
 broker's: it admits eight commands at once, the shell role is interactive there and admitted
 while fewer than all but one slot are taken, so seven, and four of those seven leaves three for
@@ -317,7 +323,9 @@ can end it); and the same ledger rows whichever path read them. `Parallel` holds
 flight at once and checks the width, that
 the ledger a parallel sweep leaves matches a serial one's, that clusters no worker had started when
 the budget ran out are the resume point, and that a lost sandbox on one worker is one sweep
-failure. `test_stall_report.py`'s `ClusterMode` drives the cluster mode over recorded kubectl
+failure. `EmptyCluster` checks that a cluster with no namespace to watch gets its listing and no other
+call, that its open alerts still close as excluded, and that a failing kinds call cannot make it
+unreadable. `test_stall_report.py`'s `ClusterMode` drives the cluster mode over recorded kubectl
 output, two raw pages of Deployments without item kinds, a chunked Gateway listing, Warning events
 and name-only referent listings, and asserts each namespace's findings equal, byte for byte, what
 the namespace path gives from the same objects; and a cut chunked reply, a cut raw page halved and

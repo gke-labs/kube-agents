@@ -14,6 +14,9 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import email.message
+import types
 import re
 import textwrap
 import unittest
@@ -355,8 +358,7 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
 
     The first is darkness: with the operator's flag unset, the rendered object
     set contains no inject Service, no inject env on the gateway and no inject
-    NetworkPolicy. The same rule `mode: next` follows, and asserted the same
-    way -- audited rather than commented. The operator's own tests assert the
+    NetworkPolicy -- audited rather than commented. The operator's own tests assert the
     rendered objects; what this adds is that the flag cannot come from a
     `PlatformAgent`, which is a cross-module claim about where the switch
     lives.
@@ -473,6 +475,56 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
+        # A report credential (#5619) is the one task credential with no
+        # target. Its verdict is task_credential's, pinned by the golden
+        # fixtures in the Python suite (that module needs `cryptography`, which
+        # this suite doesn't import); this is the handler's gate on what an
+        # admitted one may reach, driven through _admit_task with a gate that
+        # admits a stand-in for it.
+        cp = h.credential_proxy
+        report_task = types.SimpleNamespace(report_only=True)
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        class AdmitsAReportCredential:
+            def admit(self, principal, token):
+                return dataclasses.replace(principal, task=report_task, task_target=None)
+
+        def admit(method: str, path: str) -> tuple[bool, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = email.message.Message()
+            handler.headers[cp.TASK_CREDENTIAL_HEADER] = "a-report-credential"
+            handler.command, handler.path = method, path
+            handler.profile_gate = AdmitsAReportCredential()
+            replies: list = []
+            handler._json = lambda status, body: replies.append((status, body))
+            return handler._admit_task(principal), replies
+
+        for method, path in (
+            ("POST", "/v1/exec"),
+            ("POST", h.mcp_policy.MCP_RELAY_PREFIX + "gke"),
+            ("GET", cp.API_RELAY_PREFIX + "projects/proj-a"),
+            ("POST", "/v1/vcs/issue-view"),
+            ("GET", "/v1/a-route-added-later"),
+            ("PUT", "/v1/audit-reports/a/%2e%2e/latest"),
+        ):
+            with self.subTest(method=method, path=path):
+                admitted, replies = admit(method, path)
+                self.assertFalse(admitted)
+                self.assertEqual(cp.RULE_REPORT_CREDENTIAL_ROUTE, replies[0][1]["rule"])
+        admitted, replies = admit("GET", "/v1/audit-reports/compliance-audit/acme%2Fgitops/latest")
+        self.assertTrue(admitted, replies)
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            with self.subTest(pattern=pattern.pattern):
+                self.assertIn(method, ("GET", "PUT", "DELETE"))
+                self.assertTrue(pattern.pattern.startswith(cp.AUDIT_REPORTS_PREFIX), pattern.pattern)
+        # The MCP relay, which the gate already closes, reads it as no task too.
+        decision, _ = cp.mcp_relay_decision(
+            dataclasses.replace(principal, task=report_task), "developer_knowledge",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_documents"}},
+        )
+        self.assertFalse(decision.allowed)
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
@@ -663,7 +715,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
 
 
 class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
-    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    """A3 on the gateway's Slack backend: the allowlist is the
     admission gate, and the principal is either the IdP identity the admin's
     map joins to the member id, or the member id Slack asserted, qualified
     `slack:`.  The map is an override and not a gate, so three things carry
@@ -731,9 +783,10 @@ RBAC_GROUP = "rbac.authorization.k8s.io"
 #
 #   system:auth-delegator  built-in: tokenreviews/create and
 #                          subjectaccessreviews/create, both of which only ask
-#                          the API server questions. Bound to the mode: next
-#                          auth callout's ServiceAccount so it can validate the
-#                          tokens bus clients present.
+#                          the API server questions. Bound to the auth
+#                          callout's ServiceAccount so it can validate the
+#                          tokens bus clients present (C5 pins that binding's
+#                          name and subject).
 #
 # `view` is deliberately NOT here. The operator held bind over it until #387
 # removed the rule, and leaving the name behind would make re-adding that grant
@@ -1795,11 +1848,9 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         The Tier CRD (#3659) is for cluster administrators alone, so:
 
-          - no Role or ClusterRole in the `spec.mode: today` goldens, in the
-            `spec.mode: next` golden or in the chart's own templates names
-            `tiers`, by name or by a wildcard group, resource or subresource,
-            at any verb. Next mode reads tiers through an operator-rendered
-            ConfigMap, so none of its workload roles needs them either;
+          - no Role or ClusterRole in the goldens or in the chart's own
+            templates names `tiers`, by name or by a wildcard group, resource
+            or subresource, at any verb;
           - the operator's RBAC, on both delivery paths (role.yaml plus the
             leader-election Role for kustomize, operator-rbac.yaml for the
             chart), reads tiers and writes their status, and nothing more,
@@ -1812,11 +1863,11 @@ class A4DelegationAttenuates(unittest.TestCase):
         resources and verbs: a templated field would leave the predicate
         reading a placeholder.
 
-        The next golden renders the A2A gateway's and the auth callout's
-        Roles (buildA2AGatewayRole, buildA2ACalloutRole), and the dispatcher's
-        once it renders by default. Not covered yet, because no golden renders
-        them: the scope publisher's Role (buildScopePublisherRole), the A2A
-        MCP server's, and the dispatcher's Jobs Role in the profile namespace.
+        The goldens render the whole stack, so the read covers the A2A
+        gateway's and callout's Roles (buildA2AGatewayRole,
+        buildA2ACalloutRole) beside the tier roles. Not covered: the scope
+        publisher's Role (buildScopePublisherRole), rendered only while its
+        Job may run, and the dispatcher roles; no golden carries either.
         """
         def reaches_tiers(rule: dict) -> set[str]:
             """The tier resources a rule reaches, wildcards included."""
@@ -1860,15 +1911,15 @@ class A4DelegationAttenuates(unittest.TestCase):
                          if isinstance(d, dict))
 
         product_roles = []
-        goldens = dict(h.golden_documents(), golden_next=h.yaml_documents("golden_next"))
+        goldens = dict(h.golden_documents(), golden_settled=h.yaml_documents("golden_settled"))
         for name, documents in goldens.items():
             for kind in ("Role", "ClusterRole"):
                 product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
-        # The next golden is read for the A2A roles in it: losing them would
-        # leave this checking the base roles today's goldens already cover.
-        next_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_next"}
+        # The settled golden is read for the A2A roles in it: losing them would
+        # leave this checking the base roles alone.
+        settled_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_settled"}
         for a2a_role in ("platformagent-a2a-gateway", "platformagent-a2a-callout"):
-            self.assertIn(a2a_role, next_roles, "the next golden no longer renders the A2A roles A4 reads")
+            self.assertIn(a2a_role, settled_roles, "the settled golden no longer renders the A2A roles A4 reads")
         # The chart's own roles (the web console's, the cleanup hook's). A
         # template that declares a role and won't parse fails here rather than
         # being skipped, since a skipped role is an unchecked one.

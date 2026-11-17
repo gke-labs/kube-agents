@@ -141,7 +141,6 @@ _TOOL_MUTATE_VERBS = {
                "abandon", "cancel", "start", "stop", "suspend", "resume",
                "write", "publish", "cp", "rm", "mv", "call", "untag",
                "add-metadata", "add-iam-policy-binding", "get-credentials"},
-    "gsutil": {"cp", "mv", "rm", "rsync", "mb", "rb", "setmeta", "acl", "iam"},
     "gh": {"create", "delete", "edit", "close", "merge", "comment", "clone"},
     "helm": {"install", "upgrade", "uninstall", "rollback", "delete"},
     "bq": {"insert", "mk", "rm", "update", "cp", "load"},
@@ -245,9 +244,6 @@ _TOOL_FLAGS_WITH_VALUE = {
         "-f", "--values",
         "--revision",
     }),
-    "gsutil": frozenset({
-        "-o", "-h", "-b",
-    }),
     "bq": frozenset({
         "--project_id", "--dataset_id", "--location",
         "--format",
@@ -313,7 +309,6 @@ _TOOL_READ_VERBS = {
         # and networking reads; a cron prompt that spells them is a read here too.
         "get-serial-port-output", "get-status", "list-nodes",
     },
-    "gsutil": {"ls", "stat", "cat", "du", "hash", "ver", "version"},
     "gh": {"view", "list", "status", "diff"},
     "helm": {"list", "get", "status", "history", "show", "search", "version"},
     # 'query' omitted deliberately: `bq query` executes DML (DELETE/UPDATE/MERGE).
@@ -560,16 +555,6 @@ def _evaluate_command_tokens(
         cmd_lower = cmd.lower()
         if cmd_lower in _TOOL_READ_VERBS["helm"]:
             if any(p in _TOOL_MUTATE_VERBS["helm"] for p in pos_lower):
-                return False
-            return True
-        return False
-
-    if exe == "gsutil":
-        if not cmd:
-            return False
-        cmd_lower = cmd.lower()
-        if cmd_lower in _TOOL_READ_VERBS["gsutil"]:
-            if any(p in _TOOL_MUTATE_VERBS["gsutil"] for p in pos_lower):
                 return False
             return True
         return False

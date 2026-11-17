@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -35,9 +37,17 @@ const (
 	a2aHeldAckWait = 2 * time.Minute
 )
 
-// a2aAllProfileTiers are every tier a profile can allow, so a dropped tier's
-// durables can be found by name without listing consumers.
-var a2aAllProfileTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+// profileDurableOf parses a durable name as profile-<name>-<tier>-<kind>
+// for one profile: allowedTiers holds no hyphen, so the split is unambiguous
+// (profile a with tier b-c and profile a-b with tier c can't both exist).
+func profileDurableOf(profile, name string) bool {
+	rest, ok := strings.CutPrefix(name, "profile-"+profile+"-")
+	if !ok {
+		return false
+	}
+	tier, kind, ok := strings.Cut(rest, "-")
+	return ok && allowedTierNameRE.MatchString(tier) && slices.Contains(a2aSubmitKinds, kind)
+}
 
 // profileDurable is one durable as the operator wants it.
 type profileDurable struct {
@@ -69,10 +79,20 @@ func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
 	return out
 }
 
-// allProfileDurableNames is every durable name a profile could have.
-func allProfileDurableNames(profile string) []string {
+// profileDurableNamesFor are the durable names a profile could have at
+// tiers: one per (tier, kind). The operator finds a profile's durables by
+// name, never by listing the stream: its bus identity holds only the
+// consumer create, info and delete verbs on PROFILE_SUBMITS
+// (a2aOperatorIdentity), and a list would need the stream's info and the
+// consumer-names verb besides. A name allowedTiers couldn't list is skipped.
+func profileDurableNamesFor(profile string, tiers []string) []string {
 	var out []string
-	for _, tier := range a2aAllProfileTiers {
+	seen := map[string]bool{}
+	for _, tier := range tiers {
+		if !allowedTierNameRE.MatchString(tier) || seen[tier] {
+			continue
+		}
+		seen[tier] = true
 		for _, kind := range a2aSubmitKinds {
 			out = append(out, profileDurableName(profile, tier, kind))
 		}
@@ -183,9 +203,11 @@ func deleteDurable(ctx context.Context, js jetstream.JetStream, name string) err
 }
 
 // SyncDurables makes the profile's durables on the bus exactly want: each
-// one created or its cap updated, and every other name the profile could
-// have deleted if this operator made it. want empty deletes them all.
-func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error {
+// one created or its cap updated, and the profile's durable at every tier in
+// probe that want doesn't name deleted if this operator made it. want empty
+// deletes them all. probe is every tier the profile could have a durable at
+// (durableProbeTiers): the operator finds durables by name, not by listing.
+func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, probe []string) error {
 	nc, err := n.conn(agent)
 	if err != nil {
 		return err
@@ -196,18 +218,18 @@ func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alph
 	}
 	ctx, cancel := context.WithTimeout(ctx, cardBusTimeout)
 	defer cancel()
-	return syncDurables(ctx, js, profile, want)
+	return syncDurables(ctx, js, profile, want, probe)
 }
 
 // syncDurables is SyncDurables on a JetStream handle.
-func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable) error {
+func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable, probe []string) error {
 	keep := map[string]bool{}
 	for _, d := range want {
 		keep[d.name] = true
 	}
 	// Dropped names first: on a stream with no spare consumer slot, a tier
 	// swap needs the old tier's slots before the new tier's durables fit.
-	for _, name := range allProfileDurableNames(profile) {
+	for _, name := range profileDurableNamesFor(profile, probe) {
 		if keep[name] {
 			continue
 		}

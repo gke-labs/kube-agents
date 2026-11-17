@@ -905,6 +905,28 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 			t.Errorf("expected ImagePullPolicy IfNotPresent, got %v", agent.Spec.Deployment.ImagePullPolicy)
 		}
 	})
+
+	// spec.mode is deprecated: "today" named a stack no release renders any
+	// more, so the defaulter moves it, and an absent field, to "next" rather
+	// than refusing the apply; a "next" stays as it is.
+	t.Run("rewrites the retired spec.mode to next", func(t *testing.T) {
+		for name, mode := range map[string]*string{
+			"absent": nil,
+			"today":  ptr.To("today"),
+			"next":   ptr.To("next"),
+		} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Mode: mode},
+			}
+			if err := defaulter.Default(ctx, agent); err != nil {
+				t.Fatalf("%s: unexpected defaulting error: %v", name, err)
+			}
+			if agent.Spec.Mode == nil || *agent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+				t.Errorf("%s: spec.mode = %v after defaulting, want %q", name, agent.Spec.Mode, agentv1alpha1.PlatformAgentModeNext)
+			}
+		}
+	})
 }
 
 func TestPlatformAgentValidateDelete(t *testing.T) {
@@ -1292,6 +1314,7 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 // apply time with the operator's message, in both directions; an edit that
 // leaves the field as it was, a bus with no recorded count, and a create
 // pass, because the operator is the enforcement and this only refuses early.
+// spec.mode plays no part: every install runs the bus.
 func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 	agent := func(spec *int, running int32) *agentv1alpha1.PlatformAgent {
 		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
@@ -1299,11 +1322,6 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
 		}
 		pa.Status.BusReplicas = running
-		pa.Spec.Mode = ptr.To("next")
-		return pa
-	}
-	today := func(pa *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
-		pa.Spec.Mode = ptr.To("today")
 		return pa
 	}
 	for _, tc := range []struct {
@@ -1319,9 +1337,6 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
 		{"no recorded count (pruned by an older CRD)", agent(nil, 0), agent(ptr.To(1), 0), false},
 		{"a create", nil, agent(ptr.To(1), 0), false},
-		{"a flip to today with the field set to the other count", agent(nil, 3), today(agent(ptr.To(1), 3)), false},
-		{"a today CR, which keeps its count", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
-		{"from today to next with the other count: the operator decides from the claims", today(agent(nil, 1)), agent(ptr.To(3), 1), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)
@@ -1341,4 +1356,106 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "#4225") {
 		t.Errorf("ValidateUpdate of a 3 to 1 edit: %v, want the refusal", err)
 	}
+}
+
+// The operator's namespaced Role, which carries every write verb it holds on
+// a namespaced kind, is bound in the operator's namespace and in its profile
+// namespace only. A PlatformAgent anywhere else is forbidden on its first
+// Secret or Deployment write and sits Degraded/RBACIncomplete, so the webhook
+// refuses the create. An update of one that already exists is allowed with a
+// warning: refusing it would strand the object, since the controller's own
+// finalizer and annotation updates pass through this webhook too.
+func TestPlatformAgentOperatorNamespaceRule(t *testing.T) {
+	ctx := context.Background()
+	const operatorNamespace = "kubeagents-system"
+
+	newAgent := func(namespace string) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: namespace},
+			Spec:       agentv1alpha1.PlatformAgentSpec{},
+		}
+	}
+
+	t.Run("refuses a create outside the operator's namespace and names it", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{OperatorNamespace: operatorNamespace}
+		warnings, err := val.ValidateCreate(ctx, newAgent("team-a"))
+		assertFieldError(t, err, "metadata.namespace")
+		for _, want := range []string{`"kubeagents-system"`, `"team-a"`, "Role"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("expected the refusal to contain %s, got: %v", want, err)
+			}
+		}
+		if len(warnings) != 0 {
+			t.Errorf("expected no warning beside the refusal, got %v", warnings)
+		}
+	})
+
+	t.Run("allows a create in the operator's namespace", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{OperatorNamespace: operatorNamespace}
+		warnings, err := val.ValidateCreate(ctx, newAgent(operatorNamespace))
+		if err != nil {
+			t.Fatalf("unexpected refusal in the operator's namespace: %v", err)
+		}
+		if len(warnings) != 0 {
+			t.Errorf("expected no warning in the operator's namespace, got %v", warnings)
+		}
+	})
+
+	t.Run("skips the rule when the operator's namespace is unknown", func(t *testing.T) {
+		// Off the cluster (`make run`) POD_NAMESPACE is unset; the rule has no
+		// namespace to hold the object to, like the metrics rule in main.go.
+		val := &PlatformAgentCustomValidator{}
+		if _, err := val.ValidateCreate(ctx, newAgent("team-a")); err != nil {
+			t.Fatalf("unexpected refusal with no operator namespace: %v", err)
+		}
+	})
+
+	t.Run("allows an update of an agent that already lives outside it, with a warning", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{OperatorNamespace: operatorNamespace}
+		old := newAgent("team-a")
+		updated := newAgent("team-a")
+		updated.Annotations = map[string]string{PreventDeletionAnnotation: "true"}
+		warnings, err := val.ValidateUpdate(ctx, old, updated)
+		if err != nil {
+			t.Fatalf("expected the update of an existing off-namespace agent to be allowed, got: %v", err)
+		}
+		if len(warnings) != 1 {
+			t.Fatalf("expected one warning naming the namespaces, got %v", warnings)
+		}
+		for _, want := range []string{`"team-a"`, `"kubeagents-system"`, "team-a-profiles"} {
+			if !strings.Contains(warnings[0], want) {
+				t.Errorf("expected the warning to contain %s, got: %q", want, warnings[0])
+			}
+		}
+	})
+
+	t.Run("keeps the one-per-cluster rule beside it", func(t *testing.T) {
+		existingAgent := newAgent(operatorNamespace)
+		existingAgent.Name = "existing-agent"
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+		val := &PlatformAgentCustomValidator{Client: fakeClient, OperatorNamespace: operatorNamespace}
+
+		// A second agent in the right namespace is refused by the one-per-cluster rule alone.
+		_, err := val.ValidateCreate(ctx, newAgent(operatorNamespace))
+		if err == nil || !strings.Contains(err.Error(), "only one PlatformAgent is allowed per cluster") {
+			t.Fatalf("expected the one-per-cluster refusal, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "metadata.namespace") {
+			t.Errorf("the namespace rule fired in the operator's namespace: %v", err)
+		}
+
+		// A second agent in another namespace is refused by both rules, each named.
+		_, err = val.ValidateCreate(ctx, newAgent("team-a"))
+		assertFieldError(t, err, "metadata.namespace")
+		if !strings.Contains(err.Error(), "only one PlatformAgent is allowed per cluster") {
+			t.Errorf("expected the one-per-cluster refusal beside the namespace one, got: %v", err)
+		}
+
+		// The update of the one agent in the operator's namespace is untouched.
+		if _, err := val.ValidateUpdate(ctx, existingAgent, existingAgent); err != nil {
+			t.Errorf("unexpected refusal updating the existing agent: %v", err)
+		}
+	})
 }

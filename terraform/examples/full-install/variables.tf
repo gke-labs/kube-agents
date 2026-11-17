@@ -353,6 +353,20 @@ variable "github_minter_service_account_id" {
   default     = null
 }
 
+variable "github_minter_ksa_name" {
+  description = "Kubernetes ServiceAccount the GitHub token minter runs as, and the KSA half of its Workload Identity binding. The Workload Identity member is project/namespace/KSA with no cluster in it, so installs in one project that share the namespace and this name can each act as the other's minter GSA, however differently the GSAs are named. The installer gives a new install <cluster>-github-minter and records it as GITHUB_MINTER_KSA_NAME in install.env. One variable feeds both consumers, the github-minter module's ksa_name and the chart's githubMinter.ksaName, so the binding and the pod cannot name different KSAs. The default is the name both used before this variable existed, so an install that never sets it does not move. Distinct names stop accidental cross-use only: anyone who can create a ServiceAccount in this namespace on any cluster in the project can still create one by this name, so the boundary between installs that must not trust each other is a project of their own."
+  type        = string
+  nullable    = false
+  default     = "kubeagents-github-minter"
+
+  # A label, as agent_ksa_name is: the value is interpolated into the Workload
+  # Identity member string.
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.github_minter_ksa_name))
+    error_message = "github_minter_ksa_name must be a DNS-1123 label: lowercase letters, digits and hyphens, 1-63 characters, starting and ending with a letter or digit."
+  }
+}
+
 variable "litellm_service_account_id" {
   description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
   type        = string
@@ -389,7 +403,7 @@ variable "image_pull_secrets" {
 }
 
 variable "third_party_image_registry" {
-  description = "Registry prefix for the images this project does not build (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight). Empty leaves them on their upstream registries; set it to mirror third-party images."
+  description = "Registry prefix for the images this project does not build (cert-manager, LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight). Empty leaves them on their upstream registries; set it to mirror third-party images."
   type        = string
   default     = ""
 }
@@ -710,7 +724,7 @@ variable "slack_home_channel_name" {
 }
 
 variable "slack_home_channel_policy" {
-  description = "\"auto\" (also empty) or \"manual\". Under platform_agent_mode next with Slack on the gateway (Google Chat not enabled) and slack_home_channel empty, \"auto\" lets the A2A gateway make the channel of the first top-level mention of the agent the home channel; \"manual\" leaves slack_home_channel alone to decide. A set slack_home_channel wins under either. Only used when enable_slack is true."
+  description = "\"auto\" (also empty) or \"manual\". With Slack on the gateway (Google Chat not enabled) and slack_home_channel empty, \"auto\" lets the A2A gateway make the channel of the first top-level mention of the agent the home channel; \"manual\" leaves slack_home_channel alone to decide. A set slack_home_channel wins under either. Only used when enable_slack is true."
   type        = string
   default     = ""
   validation {
@@ -1055,18 +1069,6 @@ variable "enable_drift_detector" {
   description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
   type        = bool
   default     = false
-}
-
-variable "platform_agent_mode" {
-  description = "The PlatformAgent's spec.mode: \"today\", the previous stack kept as a rollback, or \"next\", which puts the NATS bus and the A2A gateway in front of the agent and is what install.sh records on a first install (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
-  type        = string
-  default     = "today"
-  nullable    = false
-
-  validation {
-    condition     = contains(["today", "next"], var.platform_agent_mode)
-    error_message = "platform_agent_mode must be \"today\" or \"next\", the PlatformAgent CRD's spec.mode enum."
-  }
 }
 
 variable "platform_agent_storage_size" {

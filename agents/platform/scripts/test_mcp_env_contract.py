@@ -238,6 +238,19 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
             self.assertIn(name, env, f"platform_control's env block does not pass {name}")
             self.assertEqual(env[name], "${%s}" % name)
 
+    def test_platform_control_is_handed_the_kube_proxy_sign(self):
+        """gke_endpoint skips the endpoint probe when a KUBE_PROXY_ENVS variable
+        names the kube-api proxy. The gateway container carries
+        KUBE_PROXY_IN_USE_URL for that; platform_control's switch_kube_context
+        sees it only if its env block passes it."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import gke_endpoint
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        name = "KUBE_PROXY_IN_USE_URL"
+        self.assertIn(name, gke_endpoint.KUBE_PROXY_ENVS)
+        self.assertEqual(env.get(name), "${%s}" % name)
+
     def test_each_local_python_server_declares_what_it_reads(self):
         merged = merged_config()
         checked = 0
@@ -310,6 +323,23 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
         env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
         for name in (chat_notify.BUS_URL_ENV, chat_notify.BUS_USER_ENVS[0], chat_notify.BUS_CA_ENV):
             self.assertIn(name, env, f"platform_control's env block does not pass {name}, which `a2a notify` reads")
+            self.assertEqual(env[name], "${%s}" % name)
+
+    def test_the_notify_platform_entries_track_what_chat_notify_reads(self):
+        """Both notify-platform lists reach the child.
+
+        `routed_platforms()` reads `A2A_NOTIFY_PLATFORM` and
+        `gateway_platforms()` reads `A2A_NOTIFY_CONVERSATIONS`, each a
+        comma-separated list of platform names. Without the second, the child
+        reads no gateway platform, so `routed_platforms()` never derives Slack
+        from a learned home channel and the post goes through Hermes instead.
+        """
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import chat_notify
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in (chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV):
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}, which chat_notify reads")
             self.assertEqual(env[name], "${%s}" % name)
 
 

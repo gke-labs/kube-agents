@@ -131,7 +131,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -155,8 +155,10 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `writes_alone` is for a case that requests no pull request but whose wrong answer may open one
 the reply never names: the lane runs it alone in its second phase and marks the write
 safeguard's window exclusive, so any write in the window is charged to it
-(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
-ignores the key.
+(`bench/kube_agents_bench/lane.py`). A case whose stack writes a file to the default branch of
+the GitOps repository uses it too, so that no other unit sees the file and the repository reset
+runs before each of its units. A bare YAML boolean, `false` by default; devops-bench ignores
+the key.
 
 `requested_pull_requests` is for a case that opens more pull requests by design than its checks
 grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
@@ -184,8 +186,7 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the five it
-starts. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
@@ -435,9 +436,10 @@ newest, per repository store) or during it. An audit whose stores need no URL (a
 open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
-`cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
+`cron/executions.db` in the agent pod (with no state file, the install's own first run when the stack
+chose it, which it records in `.bench-oobe-own.json`; with neither, an error), and passes when the stage's `.oobe_audits_fired` lists each
 of the five first-run audits as marked due and each has a run claimed since the stage marked it
-that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended. `oobe_audits_ended`, beside it, reads the same records and fails when a run the stage marked due ended in a state other than completed.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
 workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
 `min_folded` of them were folded into its newest admitted incident, which must be newer than the
@@ -588,8 +590,8 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
 job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
-`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
-runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+`EVAL_TIER=certification`, every case whose task file carries the bare line `suite: certification`. A case
+runs because a file names it or its task file carries that line; other cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
@@ -615,8 +617,8 @@ for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
-The one exception is a case with `suite: certification` in its task file: it registers in
-`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+The one exception is a case with the bare line `suite: certification` in its task file: that
+line is its registration (with `certification_part: N` for a section other than 1), it runs only under `EVAL_TIER=certification`, and never
 in the presubmit or nightly files
 ([`bench/README.md`](../../bench/README.md#certification-suite)).
 

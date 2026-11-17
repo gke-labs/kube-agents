@@ -19,7 +19,7 @@ Load and sizing measurements of the harness at fleet scale, as opposed to answer
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
-- `kube_agents_bench/oobe.py` — the `oobe_audits_started` verifier, in its own module and published the same way: reads the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
+- `kube_agents_bench/oobe.py` — the `oobe_audits_started` and `oobe_audits_ended` verifiers, in their own module and published the same way: they read the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
 - `kube_agents_bench/discovery.py` — reads the onboarding discovery sweep off the agent pod for the `bootstrap_fanout` verifier: the sweep's board rows and the Cluster Agent profiles beside them, in one `kubectl exec`.
 - `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, the raw file's findings block and the hand-off's board state for `bootstrap_handoff`, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, for `bootstrap_report_criticals` the report and the worker's scores there, for `bootstrap_report_posture` the report there, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
 - `kube_agents_bench/findings.py` — reads the install's findings queue for the `findings_item_state` verifier: one `kubectl exec` into the agent container that calls the Session KV server's `GET /v1/findings` on the pod's loopback.
@@ -101,7 +101,7 @@ The harness reaches the agent through one of three doors, selected by `AGENT_TRA
 
 - `api` (the default): `kubectl port-forward` to `svc/platform-agent` and `POST /v1/responses`, followed by status turns on the same conversation while delegated cards settle. This door is identical under `spec.mode: today` and `spec.mode: next`, so a run through it says nothing about the next stack.
 - `inject`: the prompt is `POST`ed to the A2A gateway's inject door, which enters `handleInbound` like a message from any chat backend — routing, the session record, `startTask`, the bus, and the relay posting the reply back. The harness port-forwards the inject Service (`<cr>-a2a-inject`, port 8099), or, when the gateway's Lease (`<cr>-a2a-gateway`, `AGENT_GATEWAY_LEASE`) names a holder the inject Service selects, that pod, read again on every respawn so a standby's 503 is retried against the replica serving the door. It awaits the terminal of the task the POST returned — a task id in that reply means the submission reached the bus, because the door answers only once the gateway's publish has returned. What it grades is what the conversation received, which is what a customer would have read.
-- `slack`: advisory, for the Slack lane only ([`hack/slack-lane/run.sh`](../hack/slack-lane/run.sh)). A test user mentions the install's bot in a CI channel with `chat.postMessage` and a user token, Slack delivers it over Socket Mode, and [`slack_transport.py`](kube_agents_bench/slack_transport.py) reads the thread back until the turn settles: a bot reply, the bot's in-flight reaction on the ask gone, and the thread unchanged for 15 seconds. It grades the report the thread delivered, built as the other doors build theirs: the router's first content post, then a `Result of delegated task slack-<ts>:` section per later card post (`Question from delegated task` when it carries buttons), with status lines and notes left out. It carries no trajectory or tokens, so a case that checks a worker's tool calls cannot pass through it, and writes the post-to-reaction, post-to-ack and post-to-answer seconds to `BENCH_SLACK_TIMING_FILE`. It needs `BENCH_SLACK_USER_TOKEN` (`xoxp-` or `xoxe.xoxp-`), `BENCH_SLACK_CHANNEL_ID` and `BENCH_SLACK_BOT_USER_ID`, and an install that lists the test user in `operator.slackTestUsers`; missing any of them is infrastructure, never graded. A missing `operator.slackTestUsers` entry shows only as no bot reply within `AGENT_SLACK_TIMEOUT` (600 s unset), which is infrastructure too. A blocked (⏸️) or failed (❌) reaction on the ask ends the turn like a removed one.
+- `slack`: advisory, for the Slack lane only ([`hack/slack-lane/run.sh`](../hack/slack-lane/run.sh)). A test user mentions the install's bot in a CI channel with `chat.postMessage` and a user token, Slack delivers it over Socket Mode, and [`slack_transport.py`](kube_agents_bench/slack_transport.py) reads the thread back until the turn settles: a bot reply, the bot's in-flight reaction on the ask gone, and the thread unchanged for 15 seconds. It grades the report the thread delivered, built as the other doors build theirs: the router's first content post, then a `Result of delegated task slack-<ts>:` section per later card post (`Question from delegated task` when it carries buttons), with status lines and notes left out. It carries no trajectory or tokens, so a case that checks a worker's tool calls cannot pass through it, and writes the post-to-reaction, post-to-ack and post-to-answer seconds to `BENCH_SLACK_TIMING_FILE`. It needs `BENCH_SLACK_USER_TOKEN` (`xoxp-` or `xoxe.xoxp-`), `BENCH_SLACK_CHANNEL_ID` and `BENCH_SLACK_BOT_USER_ID`, and an install that lists the test user in `operator.slackTestUsers`; missing any of them is infrastructure, never graded. A missing `operator.slackTestUsers` entry shows only as no bot reply within `AGENT_SLACK_TIMEOUT` (600 s unset), which is infrastructure too. A blocked (⏸️) or failed (❌) reaction on the ask ends the turn like a removed one. With `BENCH_SLACK_THEN` set, the transport sends it as a reply in the ask's thread once the first turn settles, under its own `AGENT_SLACK_TIMEOUT` (a follow-up, or a typed answer to a question: Slack's Web API cannot press a button), and records that turn as `slack_then_*` beside the first turn's timing. The case grades the first turn's reply, though its checks run after the second turn.
 
 The door is rendered only when the operator itself was deployed with `A2A_INJECT_BACKEND=true`, it listens on the gateway pod's loopback (so the port-forward is the only way in, and the Service exists to give it a name), and every request to it carries a bearer token — see the test-backend section of [`spec-chatops-gateway.md`](../docs/designs/spec-chatops-gateway.md). Export it the way the presubmit exports the agent's own key:
 
@@ -171,22 +171,24 @@ Thresholds are named environment variables, all with the documented default: `EV
 ## Certification suite
 
 The certification suite is the set of cases behind the certified-capabilities page. It has its
-own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
-`hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
-`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
-and no pull request and no nightly runs a case named there. A certification case is an ordinary
-case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
-`scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
-outside the roster, and the script refuses an entry that is also in `presubmit-cases.txt` or
-`nightly-cases.txt`, so one case holds one record on one lane. The roster starts with cases of its own; a nightly case
-joins it in a later change by moving its line out of the nightly file, and until then the page
-certifies a nightly case from its nightly record. The blocking roster is a subset of
+own lane and no roster file: a certification case is an ordinary case under `bench/tasks/<id>/`
+whose `task.yaml` carries the bare line `suite: certification`, and that line is its registration.
+`EVAL_TIER=certification` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
+order (a section other than 1 is the bare line `certification_part: N`; `EVAL_CERTIFICATION_PART=N`
+runs one section, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
+and no pull request and no nightly runs a case carrying the line. The lane greps for the two lines,
+so `scripts/validate_bench_cases.py` refuses any other spelling of them (a quoted value, a trailing
+comment), a suite case that a roster file also names, and a parked case (`FIXTURE_NOT_READY`,
+`KNOWN_UNREGISTERED`) that carries the line, so one case holds one record on one lane and a case
+pull request edits no shared file. The suite starts with cases of its own; a nightly case joins it in
+a later change by adding the line and dropping its nightly entry, and until then the page certifies
+a nightly case from its nightly record. The blocking roster is a subset of
 the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
 the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
 `expected_fail: true` that passes every repetition, which says its marker is stale. A case the
-suite declares as a known gap carries that marker and names its gap issue in the roster's reason
-block. The lane's record is its logs bucket, read by the page per case and release: the tier is
+suite declares as a known gap carries that marker and names its gap issue in its task file's
+header comment, beside the capability row it grades. The lane's record is its logs bucket, read by the page per case and release: the tier is
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
@@ -228,15 +230,15 @@ validator check lands with the first stack that needs it:
    (an appended gentler entry fails it), taken from the dry run of rule 5; never a replica count
    on an autoscaled Deployment.
 8. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
-   labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
-   only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
+   labels: every Kubernetes object, a GKE cluster's or node pool's GCE resource labels (`--labels`
+   at create, not only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
    labels (a network, a subnetwork, a backend service, a health check, a service attachment)
    carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
    on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
    start and end against the host cluster's webhook configurations, node readiness rules,
-   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes addresses, subnets,
-   networks and alert policies today; forwarding rules, service attachments, backend services,
-   health checks and clusters wait on a sibling change to that script and its sweeper role.
+   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
+   rules, service attachments, backend services, health checks, addresses, subnets, networks and
+   alert policies every hour.
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.

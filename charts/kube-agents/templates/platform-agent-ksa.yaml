@@ -6,7 +6,8 @@ are set — the Workload Identity case — the operator creates and manages the
 KSA itself. The chart therefore provides the KSA only in the former case, so
 exactly one owner exists either way.
 */}}
-{{- if and .Values.platformAgent.enabled .Values.platformAgent.security.serviceAccountName (not .Values.platformAgent.security.serviceAccountAnnotations) }}
+{{- $saAnnotations := include "kube-agents.nonEmptyStringMap" .Values.platformAgent.security.serviceAccountAnnotations }}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.security.serviceAccountName (not $saAnnotations) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
