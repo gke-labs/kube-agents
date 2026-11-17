@@ -167,6 +167,12 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
+	// systemMetadataStorageSize is the request of the namespace's system-metadata
+	// claim, and the floor for small PersistentVolumeClaims the operator renders.
+	// Hyperdisk Balanced (hyperdisk-balanced), the default StorageClass on C3-only
+	// GKE clusters, rejects CreateVolume below 4 GB with HTTP 400 InvalidArgument
+	// rather than rounding up, leaving unbound 1Gi claims permanently Pending.
+	systemMetadataStorageSize = "4Gi"
 	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
 	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
 	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
@@ -2622,7 +2628,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("1Gi"),
+					corev1.ResourceStorage: resource.MustParse(systemMetadataStorageSize),
 				},
 			},
 		},
@@ -3408,7 +3414,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 		kept = extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar ||
+				e.Name == agentv1alpha1.GoogleCloudUniverseDomainEnv || e.Name == agentv1alpha1.CloudSDKUniverseDomainEnv ||
+				e.Name == agentv1alpha1.KubeProxyUniverseDomainEnv || strings.HasPrefix(e.Name, agentv1alpha1.CloudSDKEndpointOverridesEnvPrefix) {
 				continue
 			}
 			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
@@ -3634,6 +3642,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  enabledProfilesEnvVar,
 			Value: strings.Join(opts.enabledProfiles, ","),
+		})
+	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
 		})
 	}
 	// The Hermes Google Chat and Slack platforms are off: the gateway holds
@@ -4671,6 +4685,12 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
+		})
+	}
 	// The rules reach the watcher as a file from a ConfigMap, which the
 	// watcher reads again every minute, so a change to the list applies
 	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
@@ -4934,6 +4954,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	)
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  agentv1alpha1.GoogleCloudUniverseDomainEnv,
+			Value: universe,
+		})
+	}
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
 		// `tokenFile` rather than `--token`, since the kubelet rotates the
@@ -5244,13 +5270,16 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// in the render would fail to say so.
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
+		agentv1alpha1.GoogleCloudUniverseDomainEnv,
+		agentv1alpha1.CloudSDKUniverseDomainEnv,
+		agentv1alpha1.KubeProxyUniverseDomainEnv,
 	} {
 		reserved[name] = struct{}{}
 	}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {
-		if _, found := reserved[env.Name]; !found {
+		if _, found := reserved[env.Name]; !found && !agentv1alpha1.IsSensitiveEnvVar(env.Name) {
 			result = append(result, env)
 		}
 	}
@@ -6776,32 +6805,51 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // actually calls the forge, is not covered by it; how the broker's egress should
 // be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	universe := effectiveUniverseDomain(agent)
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
-		"googleapis.com",
-		"*.googleapis.com",
-		"accounts.google.com",
-		"*.gstatic.com",
-		// GKE DNS-based control plane endpoints. get-credentials prefers these
-		// over the IP endpoint wherever a cluster publishes one that accepts
-		// external traffic, so the kubeconfig names a Google frontend rather
-		// than an address in apiCIDRs. Without this the pod authenticates
-		// against the control plane it can no longer reach: rule 6 covers the
-		// IP endpoints only, and FQDN mode is exactly when the blanket
-		// 0.0.0.0/0:443 rule is withheld.
-		//
-		// A pattern wildcard spans one label and no dots, so the two-label
-		// form is what actually matches an endpoint: the hostname is
-		// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
-		// wildcard in this list needs exactly one label, so nothing here
-		// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
-		"*.gke.goog",
-		"*.*.gke.goog",
-		// Container & Artifact Registries (Plugin OCI images)
-		"gcr.io",
-		"*.gcr.io",
-		"pkg.dev",
-		"*.pkg.dev",
+		universe,
+		"*." + universe,
+	}
+	if isCustomUniverseDomain(universe) {
+		// In a custom universe_domain, Artifact Registry (<region>-docker.pkg.<universe>
+		// or, when universe starts with "apis-", <region>-docker.pkg-<suffix>) and GKE
+		// DNS control-plane endpoints (<cluster>.<region>.gke.<universe> or
+		// <cluster>.<region>.gke-<suffix>) sit outside commercial pkg.dev / gke.goog.
+		patterns = append(patterns, "*.*."+universe, "*.*.*."+universe)
+		if gkeSuffix, ok := strings.CutPrefix(universe, apisUniverseDomainPrefix); ok && gkeSuffix != "" {
+			patterns = append(patterns,
+				gkeSingleWildcardHostPrefix+gkeSuffix,
+				gkeDoubleWildcardHostPrefix+gkeSuffix,
+				pkgBareHostPrefix+gkeSuffix,
+				pkgSingleWildcardHostPrefix+gkeSuffix,
+			)
+		}
+	} else {
+		patterns = append(patterns,
+			"accounts.google.com",
+			"*.gstatic.com",
+			// GKE DNS-based control plane endpoints. get-credentials prefers these
+			// over the IP endpoint wherever a cluster publishes one that accepts
+			// external traffic, so the kubeconfig names a Google frontend rather
+			// than an address in apiCIDRs. Without this the pod authenticates
+			// against the control plane it can no longer reach: rule 6 covers the
+			// IP endpoints only, and FQDN mode is exactly when the blanket
+			// 0.0.0.0/0:443 rule is withheld.
+			//
+			// A pattern wildcard spans one label and no dots, so the two-label
+			// form is what actually matches an endpoint: the hostname is
+			// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
+			// wildcard in this list needs exactly one label, so nothing here
+			// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
+			"*.gke.goog",
+			"*.*.gke.goog",
+			// Container & Artifact Registries (Plugin OCI images)
+			"gcr.io",
+			"*.gcr.io",
+			"pkg.dev",
+			"*.pkg.dev",
+		)
 	}
 	// GitOps & Source Control: derived from the forge declaration, so a forge
 	// at a customer-chosen hostname is reachable without a literal here. Kept

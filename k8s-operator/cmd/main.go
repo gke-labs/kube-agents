@@ -279,14 +279,16 @@ func main() {
 	// The namespace this pod runs in is read first: the check probes the
 	// namespaced half of the role (the Secret verbs) there. It also feeds the
 	// NetworkPolicy rule that admits the operator to the gateway's and broker's
-	// metrics ports. Both install paths set it from the Downward API; off the
+	// metrics ports, and the webhook's rule that admits a PlatformAgent in
+	// this namespace only. Both install paths set it from the Downward API; off the
 	// cluster, under `make run`, it is unset, the namespaced permissions are
-	// probed cluster-wide, the rule is not rendered, and the poller is not
-	// started: no pod IP is reachable from there, and a poller that ran anyway
+	// probed cluster-wide, the rule is not rendered, the poller is not
+	// started, and the webhook admits a PlatformAgent in any namespace: no
+	// pod IP is reachable from there, and a poller that ran anyway
 	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
 	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
 	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv)
 	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
 		// The value becomes kubernetes.io/metadata.name in the metrics rule's
@@ -296,7 +298,7 @@ func main() {
 		// would have the API server reject the policy on every reconcile. Clear
 		// it either way, so the rule is not rendered and the poller, which could
 		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
 		operatorNamespace = ""
 	}
@@ -350,6 +352,7 @@ func main() {
 		DNSClusterIPOverride:     dnsClusterIP,
 		MetadataDaemonIPOverride: metadataDaemonIP,
 		OperatorNamespace:        operatorNamespace,
+		UniverseDomainDetector:   controller.ProbeGCEUniverseDomain,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
@@ -429,7 +432,12 @@ func main() {
 			name      string
 			setupFunc func(ctrl.Manager) error
 		}{
-			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
+			// The validator holds a PlatformAgent to operatorNamespace, the
+			// namespace the write Role is bound in; empty (off the cluster)
+			// skips that rule.
+			{"PlatformAgent", func(mgr ctrl.Manager) error {
+				return agentwebhook.SetupPlatformAgentWebhookWithManager(mgr, operatorNamespace)
+			}},
 		}
 
 		for _, wh := range webhooks {

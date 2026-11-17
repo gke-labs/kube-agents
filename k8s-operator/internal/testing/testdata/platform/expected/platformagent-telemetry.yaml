@@ -329,7 +329,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 4Gi
 status: {}
 ---
 apiVersion: v1
@@ -1248,7 +1248,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 1Gi
+            storage: 4Gi
       status: {}
 status:
   availableReplicas: 0

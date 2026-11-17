@@ -30,9 +30,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from command_policy import Decision
+import credential_proxy_client
 
 # The route prefix. The server name is the one path segment after it.
 MCP_RELAY_PREFIX = "/v1/mcp/"
+DEFAULT_UNIVERSE_DOMAIN = credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
 
 # The JSON-RPC methods relayed. These are what a stateless tools-only server
 # needs: the handshake, a liveness ping, the tool list and the tool call.
@@ -110,7 +112,7 @@ GKE_K8S_TOOLS = frozenset(tool for tool in GKE_READ_TOOLS if "_k8s_" in tool)
 # match it: any spelling of a resource path segment, or a percent escape.
 RESOURCE_LIKE = re.compile(r"(?i)projects|locations|zones|clusters|%")
 CLUSTER_RESOURCE = re.compile(
-    r"projects/(?P<project>[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
+    r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
 )
 
@@ -236,9 +238,18 @@ def k8s_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[
     return clusters
 
 
-def server(name: str) -> McpServer | None:
-    """The table entry for `name`, or None."""
-    return _SERVERS_BY_NAME.get(name)
+def server(name: str, *, universe_domain: str = DEFAULT_UNIVERSE_DOMAIN) -> McpServer | None:
+    """The table entry for `name` resolved against `universe_domain`, or None."""
+    entry = _SERVERS_BY_NAME.get(name)
+    if entry is None:
+        return None
+    try:
+        host = credential_proxy_client.rewrite_google_api_host(entry.host, universe_domain)
+    except ValueError:
+        return None
+    if host == entry.host:
+        return entry
+    return McpServer(entry.name, host, entry.path, entry.tools)
 
 
 def parse(body: bytes) -> dict[str, Any] | None:
