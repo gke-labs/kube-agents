@@ -51,7 +51,7 @@ separate holder. The parent-pid fallback is a last resort — it makes the key s
 shell rather than across a session — which is why another harness should set
 `KUBE_AGENTS_LEASE_SESSION` explicitly.
 
-**Not every holder is a person.** The reconcile of `autopush`, `autopush-next` and `staging`
+**Not every holder is a person.** The reconcile of `autopush` and `staging`
 (`scripts/release/reconcile_environment.sh`) takes the same lease before it applies, under
 `KUBE_AGENTS_LEASE_SESSION=gha-<run_id>`, and defers or fails, per its lease policy, rather than
 overwriting an agent's evidence mid-run. So a lease held by `gha-…` is an automated infrastructure

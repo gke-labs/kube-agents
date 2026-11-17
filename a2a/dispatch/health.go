@@ -189,7 +189,7 @@ func (d *Dispatcher) logHealth() {
 }
 
 // Ready reports whether the dispatcher is serving: Run holds its accept and
-// lease subscriptions, and every durable the current config lists is bound.
+// lease subscriptions, and every durable the current config derives is bound.
 // When it isn't, the string says what is missing. A durable the operator
 // hasn't created yet, or one the grants don't cover, keeps it unready, so a
 // config the dispatcher can't fully serve shows on the pod and not only in
@@ -203,7 +203,7 @@ func (d *Dispatcher) Ready() (bool, string) {
 	defer d.mu.Unlock()
 	var unbound []string
 	for _, p := range cfg.Profiles {
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			if d.subs[dur.Name] == nil {
 				unbound = append(unbound, dur.Name)
 			}
