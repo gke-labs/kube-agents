@@ -2718,8 +2718,10 @@ the mcp audience, and no other caller may present it; with the list empty, nobod
 role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. On
 every install, `a2a-reports` is the A2A gateway's audit-report reader: its token is minted for
 `kubeagents-credential-proxy-a2a-reports`, it reaches `/v1/audit-reports` alone, and there only
-`GET .../latest` and `GET .../runs/{ts}` of any audit on the install's publish key
-(`no_forge%2Flocal` when there is none); listing, the run index, writes and deletes are refused. It
+`GET /v1/audit-reports/{audit_id}/publish/latest` and `GET .../publish/runs/{ts}` of any audit:
+it sends the reserved word `publish`, and the broker relays it as the install's publish key
+(`no_forge%2Flocal` when there is none). Any real key from it, listing, the run index, writes and
+deletes are refused, and no other role's `publish` is resolved. It
 is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
 other caller may present the audience, and that account may present only this audience or the
 `a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)

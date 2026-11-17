@@ -611,8 +611,10 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         # The A2A gateway's report reader (#5618) holds the a2a-reports role.
         # It reaches the audit-report store alone, and there reads one
         # finished report (latest, or one run) of any audit, on the install's
-        # publish key alone; it never lists, reads a run index, writes or
-        # deletes. The role is conferred by its own audience, to the gateway's
+        # publish key alone, which it names only as the word `publish` and the
+        # broker resolves; any real key, the publish key's own included, is
+        # refused, and the shell's or a profile's `publish` is never resolved.
+        # It never lists, reads a run index, writes or deletes. The role is conferred by its own audience, to the gateway's
         # ServiceAccount alone. Each refusal names its own rule, so a refusal
         # that only falls through to another check is not taken for this one.
         cp = h.credential_proxy
@@ -626,17 +628,21 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         )
         self.assertNotIn(cp.CALLER_ROLE_A2A_CHAT, cp.required_roles(cp.AUDIT_REPORTS_PREFIX))
         read = cp.report_read_permitted
-        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish, publish))
-        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, publish, publish))
+        word = cp.REPORT_A2A_PUBLISH_KEY
+        self.assertEqual("publish", word)
+        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, word))
+        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, word))
         for name, got, rule in (
-            ("the stream list", read(reader, None, frozenset(), cp.REPORT_ROUTE_LIST, None, publish), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
-            ("the run index", read(reader, None, frozenset(), cp.REPORT_ROUTE_RUNS, publish, publish), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+            ("the stream list", read(reader, None, frozenset(), cp.REPORT_ROUTE_LIST, None), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+            ("the run index", read(reader, None, frozenset(), cp.REPORT_ROUTE_RUNS, word), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+            ("the publish key spelled out", read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish),
+             cp.RULE_REPORT_A2A_REPORTS_KEY),
             ("a registered repository that is not the publish target",
-             read(reader, "fleet-audit", allowlist, cp.REPORT_ROUTE_LATEST, other, publish), cp.RULE_REPORT_A2A_REPORTS_KEY),
-            ("no_forge beside a publish target",
-             read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, "no_forge%2Flocal", publish), cp.RULE_REPORT_A2A_REPORTS_KEY),
-            ("no key resolved", read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish), cp.RULE_REPORT_A2A_REPORTS_KEY),
-            ("the a2a-chat role", read(cp.CALLER_ROLE_A2A_CHAT, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish, publish),
+             read(reader, "fleet-audit", allowlist, cp.REPORT_ROUTE_LATEST, other), cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("no_forge spelled out", read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, "no_forge%2Flocal"),
+             cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("no key", read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST), cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("the a2a-chat role", read(cp.CALLER_ROLE_A2A_CHAT, None, frozenset(), cp.REPORT_ROUTE_LATEST, word),
              cp.RULE_REPORT_ROLE),
         ):
             with self.subTest(name):
@@ -649,7 +655,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     frozenset({publish, other})))
 
         # Through the handler, with the install's publish key stubbed: only the
-        # two reads on it reach the store.
+        # two reads on `publish` reach the store, and the store sees the real key.
         relayed: list = []
 
         class Store:
@@ -657,10 +663,10 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 relayed.append((method, path))
                 return 200, b"{}"
 
-        def handle(method: str, path: str) -> list:
+        def handle(method: str, path: str, role: str = reader) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
             handler.command, handler.path = method, path
-            handler.principal = cp.Principal(workload="gateway", uid="u", role=reader)
+            handler.principal = cp.Principal(workload="gateway", uid="u", role=role)
             handler.report_store = Store()
             handler.report_profiles = allowlist
             replies: list = []
@@ -674,13 +680,22 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
             for audit in ("compliance-audit", "any-audit"):
                 for suffix in ("latest", f"runs/{run}"):
-                    path = f"/v1/audit-reports/{audit}/{publish}/{suffix}"
+                    path = f"/v1/audit-reports/{audit}/publish/{suffix}"
                     with self.subTest(relayed=path):
                         self.assertEqual([200], handle("GET", path))
+                        self.assertEqual(("GET", f"/v1/audit-reports/{audit}/{publish}/{suffix}"), relayed[-1])
             self.assertEqual(4, len(relayed))
+            relayed.clear()
+            # The shell's `publish` is relayed as sent, never resolved.
+            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest", cp.CALLER_ROLE_SHELL))
+            self.assertEqual([("GET", "/v1/audit-reports/compliance-audit/publish/latest")], relayed)
             relayed.clear()
             stream = f"/v1/audit-reports/compliance-audit/{publish}"
             for method, path, rule in (
+                ("GET", f"{stream}/latest", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", f"{stream}/runs/{run}", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", "/v1/audit-reports/compliance-audit/publish/runs", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("PUT", "/v1/audit-reports/compliance-audit/publish/latest", cp.RULE_REPORT_A2A_REPORTS_WRITE),
                 ("GET", "/v1/audit-reports", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
                 ("GET", f"{stream}/runs", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
                 ("GET", f"/v1/audit-reports/compliance-audit/{other}/latest", cp.RULE_REPORT_A2A_REPORTS_KEY),
@@ -695,10 +710,16 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             self.assertEqual([], relayed)
         # An install that publishes to no repository: no_forge is the one key.
         with mock.patch.object(cp, "report_publish_store_key", return_value=None):
-            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest"))
+            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest"))
+            self.assertEqual(("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest"), relayed[-1])
             self.assertEqual(
-                [(403, cp.RULE_REPORT_A2A_REPORTS_KEY)], handle("GET", f"/v1/audit-reports/compliance-audit/{publish}/latest")
+                [(403, cp.RULE_REPORT_A2A_REPORTS_KEY)], handle("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest")
             )
+        # The install's repositories unreadable: 503, nothing relayed.
+        relayed.clear()
+        with mock.patch.object(cp, "report_publish_store_key", side_effect=cp.ReportStoreUnavailable("unreadable")):
+            self.assertEqual([(503, None)], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest"))
+        self.assertEqual([], relayed)
 
         # The role comes from its own audience, for the gateway's account
         # alone (build_authenticator's map and binding); an audience that

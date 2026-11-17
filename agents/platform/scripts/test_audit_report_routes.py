@@ -674,40 +674,45 @@ class A2AReportsTest(RoutesTestCase):
         )
         self.authenticator.principal = self.a2a
 
-    def test_latest_and_one_run_on_the_publish_key_are_relayed(self):
+    def test_the_publish_word_is_relayed_as_the_publish_key(self):
+        # The listener sees the resolved key, never the word the gateway sent.
         for audit in (AUDIT, OTHER_AUDIT, "any-audit-at-all"):
             for suffix in ("latest", f"runs/{RUN}"):
-                path = f"/v1/audit-reports/{audit}/{GITOPS_KEY}/{suffix}"
+                path = f"/v1/audit-reports/{audit}/publish/{suffix}"
                 with self.subTest(path=path):
-                    self.assert_relayed("GET", path, self.request("GET", path))
+                    self.assert_relayed("GET", f"/v1/audit-reports/{audit}/{GITOPS_KEY}/{suffix}", self.request("GET", path))
 
     def test_no_forge_is_the_key_when_the_install_publishes_to_none(self):
         self.set_gitops([], None)
-        self.assert_refused(self.request("GET", f"{STREAM}/latest"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
-        self.assert_relayed("GET", f"{NO_FORGE_STREAM}/latest", self.request("GET", f"{NO_FORGE_STREAM}/latest"))
+        self.assert_relayed("GET", f"{NO_FORGE_STREAM}/latest", self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/latest"))
+        self.assert_relayed("GET", f"{NO_FORGE_STREAM}/runs/{RUN}",
+                            self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/runs/{RUN}"))
 
-    def test_a_registered_key_that_is_not_the_publish_key(self):
-        for key in ("acme%2Fterraform", "no_forge%2Flocal"):
+    def test_a_real_key_is_refused_the_publish_key_included(self):
+        for key in (GITOPS_KEY, "acme%2Fterraform", "no_forge%2Flocal"):
             for suffix in ("latest", f"runs/{RUN}"):
                 path = f"/v1/audit-reports/{AUDIT}/{key}/{suffix}"
                 with self.subTest(path=path):
                     self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+        self.set_gitops([], None)
+        self.assert_refused(self.request("GET", f"{NO_FORGE_STREAM}/latest"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
 
     def test_an_unregistered_key_or_another_spelling(self):
-        for key in ("other%2Frepo", "acme%2Fremoved", "ACME%2Fgitops", "acme%2fgitops", "github.com%2Facme%252Fgitops"):
+        for key in ("other%2Frepo", "acme%2Fremoved", "ACME%2Fgitops", "acme%2fgitops", "github.com%2Facme%252Fgitops",
+                    "PUBLISH", "Publish", "publish%2Fx", "%70ublish", "publish.", "publis"):
             for suffix in ("latest", f"runs/{RUN}"):
                 path = f"/v1/audit-reports/{AUDIT}/{key}/{suffix}"
                 with self.subTest(path=path):
                     self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
 
     def test_the_list_and_the_run_index(self):
-        for path in ("/v1/audit-reports", f"{STREAM}/runs", f"{NO_FORGE_STREAM}/runs"):
+        for path in ("/v1/audit-reports", f"{STREAM}/runs", f"{NO_FORGE_STREAM}/runs", f"/v1/audit-reports/{AUDIT}/publish/runs"):
             with self.subTest(path=path):
                 self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
 
     def test_writes_and_deletes(self):
         self.set_gitops([], None)
-        for stream in (STREAM, NO_FORGE_STREAM):
+        for stream in (STREAM, NO_FORGE_STREAM, f"/v1/audit-reports/{AUDIT}/publish"):
             for method, path in (("PUT", f"{stream}/runs/{RUN}"), ("PUT", f"{stream}/latest"), ("DELETE", f"{stream}/latest")):
                 with self.subTest(method=method, path=path):
                     self.assert_refused(self.request(method, path), credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE)
@@ -716,7 +721,33 @@ class A2AReportsTest(RoutesTestCase):
         for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
             with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
                 credential_proxy._managed_repository_cache = None
-                self.assert_refused(self.request("GET", f"{STREAM}/latest"), status=503, code="GITOPS_REPO_UNAVAILABLE")
+                self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/latest"),
+                                    status=503, code="GITOPS_REPO_UNAVAILABLE")
+
+    def test_a_refused_read_reads_no_state(self):
+        with mock.patch.object(credential_proxy, "report_publish_store_key", side_effect=AssertionError("read")) as publish:
+            self.assert_refused(self.request("GET", f"{STREAM}/latest"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+            self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/runs"),
+                                credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
+        publish.assert_not_called()
+
+    def test_the_shell_and_a_profile_sending_publish_are_not_resolved(self):
+        # The word is the a2a-reports reader's alone: another role's goes upstream
+        # as sent, where it names no stream, and the publish key is never read for it.
+        CredentialProxyHandler.report_profiles = frozenset({"auditor"})
+        for principal, token in ((self.shell, None), (self.profile, REPORT["token"])):
+            self.authenticator.principal = principal
+            for suffix in ("latest", f"runs/{RUN}"):
+                path = f"/v1/audit-reports/{AUDIT}/publish/{suffix}"
+                with self.subTest(role=principal.role, path=path), mock.patch.object(
+                    credential_proxy, "report_publish_store_key", side_effect=AssertionError("resolved")
+                ):
+                    self.assert_relayed("GET", path, self.request("GET", path, token=token))
+        # A profile write to it is the repository-key refusal, as any unregistered key.
+        self.authenticator.principal = self.profile
+        self.store.seen.clear()
+        self.assert_refused(self.request("PUT", f"/v1/audit-reports/{AUDIT}/publish/latest", token=REPORT["token"]),
+                            credential_proxy.RULE_REPORT_REPOSITORY_KEY)
 
     def test_a_task_credential_changes_nothing(self):
         # The relay's role is its audience's; a task credential confers no profile reads.
@@ -953,31 +984,37 @@ class WriteDecisionTest(unittest.TestCase):
             with self.subTest(role=role):
                 self.assertEqual(credential_proxy.RULE_REPORT_ROLE, read(role, "fleet-audit", self.ALLOW))
                 self.assertEqual(credential_proxy.RULE_REPORT_ROLE,
-                                 read(role, None, self.ALLOW, credential_proxy.REPORT_ROUTE_LATEST, GITOPS_KEY, GITOPS_KEY))
+                                 read(role, None, self.ALLOW, credential_proxy.REPORT_ROUTE_LATEST, "publish"))
 
     def test_the_a2a_reports_role(self):
         a2a = credential_proxy.CALLER_ROLE_A2A_REPORTS
         read = credential_proxy.report_read_permitted
         latest, run = credential_proxy.REPORT_ROUTE_LATEST, credential_proxy.REPORT_ROUTE_RUN
-        self.assertIsNone(read(a2a, None, frozenset(), latest, GITOPS_KEY, GITOPS_KEY))
-        self.assertIsNone(read(a2a, None, frozenset(), run, "no_forge%2Flocal", "no_forge%2Flocal"))
+        word = credential_proxy.REPORT_A2A_PUBLISH_KEY
+        self.assertEqual("publish", word)
+        self.assertIsNone(read(a2a, None, frozenset(), latest, word))
+        self.assertIsNone(read(a2a, None, frozenset(), run, word))
         cases = {
-            "the list": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_LIST, None, GITOPS_KEY),
+            "the list": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_LIST, None),
                          credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
-            "the run index": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_RUNS, GITOPS_KEY, GITOPS_KEY),
+            "the run index": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_RUNS, word),
                               credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
-            "no route": (read(a2a, None, frozenset(), None, GITOPS_KEY, GITOPS_KEY), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
-            "another key": (read(a2a, None, frozenset(), latest, "acme%2Fterraform", GITOPS_KEY),
-                            credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
-            "no readable key": (read(a2a, None, frozenset(), latest, GITOPS_KEY), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
-            "empty readable key": (read(a2a, None, frozenset(), latest, "", ""), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
-            "key not a str": (read(a2a, None, frozenset(), latest, [GITOPS_KEY], GITOPS_KEY), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
-            "an allowlisted profile is no help": (read(a2a, "fleet-audit", self.ALLOW, latest, "acme%2Fterraform", GITOPS_KEY),
+            "no route": (read(a2a, None, frozenset(), None, word), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
+            "the publish key itself": (read(a2a, None, frozenset(), latest, GITOPS_KEY), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "no_forge itself": (read(a2a, None, frozenset(), run, "no_forge%2Flocal"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "another key": (read(a2a, None, frozenset(), latest, "acme%2Fterraform"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "no key": (read(a2a, None, frozenset(), latest), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "empty key": (read(a2a, None, frozenset(), latest, ""), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "key not a str": (read(a2a, None, frozenset(), latest, [word]), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "an allowlisted profile is no help": (read(a2a, "fleet-audit", self.ALLOW, latest, "acme%2Fterraform"),
                                                   credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
         }
         for name, (got, rule) in cases.items():
             with self.subTest(name):
                 self.assertEqual(rule, got)
+        self.assertNotIn(credential_proxy.RULE_REPORT_A2A_REPORTS_KEY,
+                         (credential_proxy.RULE_REPORT_REPOSITORY_KEY, credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE,
+                          credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE))
         write = credential_proxy.report_write_permitted
         for key, publish in ((GITOPS_KEY, GITOPS_KEY), ("no_forge%2Flocal", None)):
             with self.subTest(key=key):
@@ -985,7 +1022,7 @@ class WriteDecisionTest(unittest.TestCase):
                                  write(a2a, "fleet-audit", self.trigger(), AUDIT, key, publish, self.ALLOW, frozenset({key})))
         # The a2a-chat role reads and writes nothing here.
         self.assertEqual(credential_proxy.RULE_REPORT_ROLE,
-                         read(credential_proxy.CALLER_ROLE_A2A_CHAT, None, frozenset(), latest, GITOPS_KEY, GITOPS_KEY))
+                         read(credential_proxy.CALLER_ROLE_A2A_CHAT, None, frozenset(), latest, word))
         self.assertEqual(credential_proxy.RULE_REPORT_ROLE, write(
             credential_proxy.CALLER_ROLE_A2A_CHAT, None, None, AUDIT, GITOPS_KEY, GITOPS_KEY, self.ALLOW))
 
@@ -1059,6 +1096,27 @@ class StoreKeyTest(unittest.TestCase):
                 with self.assertRaises((ValueError, AttributeError, TypeError)):
                     self.audit_report.reports_dir_for("x", repo) if isinstance(repo, str) else repo.lower()
                 self.assertIsNone(credential_proxy.report_store_key(repo))
+
+    def test_every_key_holds_an_escaped_slash_so_none_is_the_publish_word(self):
+        # The a2a-reports reader's REPORT_A2A_PUBLISH_KEY holds no %2F, so it
+        # can never be a real stream's key: every key report_store_key yields does.
+        import random
+        rng = random.Random(5619)
+        alphabet = "abcXYZ019_.-/ %:@"
+        repos = ["publish", "publish/", "/publish", "github.com/publish", "a/publish", "publish/a", "no_forge/local",
+                 "acme/gitops", "gitlab.com/a/b/c", "x.y/a/b", "..", "./a", "a/."]
+        repos += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24))) for _ in range(20000)]
+        yielded = 0
+        for repo in repos:
+            got = credential_proxy.report_store_key(repo)
+            if got is None:
+                continue
+            yielded += 1
+            with self.subTest(repo=repo):
+                self.assertIn("%2F", got)
+                self.assertNotEqual(credential_proxy.REPORT_A2A_PUBLISH_KEY, got)
+        self.assertGreater(yielded, 100)
+        self.assertNotIn("%2F", credential_proxy.REPORT_A2A_PUBLISH_KEY.upper())
 
 
 class PublishKeyTest(unittest.TestCase):

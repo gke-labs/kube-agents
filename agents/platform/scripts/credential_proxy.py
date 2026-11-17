@@ -2611,7 +2611,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # schedule's trigger binds, to the publish key (report_read_permitted,
     # report_write_permitted). The A2A gateway's report reader (#5618, the
     # a2a-reports role) reads one finished report, latest or one run, on the
-    # publish key alone, and writes nothing (report_a2a_reports_read_permitted);
+    # publish key alone, which it names as REPORT_A2A_PUBLISH_KEY and the
+    # handler resolves, and writes nothing (report_a2a_reports_read_permitted);
     # this is the one route it reaches. No trailing slash: the stream list is the prefix
     # itself, matched whole or with "/" after it (_route_matches), and the
     # handler answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match.
@@ -2885,10 +2886,19 @@ RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
 # The A2A gateway's report reader (#5618): a write, a route other than one
-# report, and a key other than the publish key are each their own refusal.
+# report, and a key segment other than REPORT_A2A_PUBLISH_KEY are each their
+# own refusal.
 RULE_REPORT_A2A_REPORTS_WRITE = "audit-report.a2a-reports-write"
 RULE_REPORT_A2A_REPORTS_ROUTE = "audit-report.a2a-reports-route"
-RULE_REPORT_A2A_REPORTS_KEY = "audit-report.a2a-reports-repository-key"
+RULE_REPORT_A2A_REPORTS_KEY = "audit-report.a2a-reports-key"
+# The one key segment the A2A gateway's report reader sends: the gateway cannot
+# compute the install's publish key, so the broker resolves this word to it
+# (report_publish_store_key, or REPORT_NO_FORGE_STORE_KEY when that yields
+# none) before relaying. Only for the a2a-reports role: the shell and a profile
+# worker sending it get it as any other key. It never names a real stream: a
+# store key from report_store_key always holds an escaped `/` (%2F), and this
+# holds none.
+REPORT_A2A_PUBLISH_KEY = "publish"
 
 # What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
 # the stream list, one stream's latest, its run index, or one run.
@@ -2956,21 +2966,20 @@ def report_route_kind(path: str) -> str | None:
     return None
 
 
-def report_a2a_reports_read_permitted(route: Any, key: Any, readable_key: Any) -> str | None:
+def report_a2a_reports_read_permitted(route: Any, key: Any) -> str | None:
     """The rule an a2a-reports read breaks, or None when the reader may read (#5618).
 
     The A2A gateway's report reader reads one finished report: ``route`` must be
     REPORT_ROUTE_LATEST or REPORT_ROUTE_RUN, never the stream list or a run
-    index. ``key`` is the request's raw store-key segment, compared whole with
-    ``readable_key``: the install's publish key (report_publish_store_key), or
-    REPORT_NO_FORGE_STORE_KEY when that yields none, resolved by the caller.
-    A registered repository that is not the publish target is refused, and a
-    ``readable_key`` that is not a non-empty str refuses every key. Any audit
-    id is read.
+    index. ``key`` is the request's raw store-key segment, and must be
+    REPORT_A2A_PUBLISH_KEY, which the handler then resolves to the install's
+    publish key. Every real store key is refused, the publish key's own
+    spelling included, so the reader never names a repository. Any audit id is
+    read.
     """
     if route not in REPORT_A2A_READ_ROUTES:
         return RULE_REPORT_A2A_REPORTS_ROUTE
-    if not isinstance(readable_key, str) or not readable_key or not isinstance(key, str) or key != readable_key:
+    if key != REPORT_A2A_PUBLISH_KEY:
         return RULE_REPORT_A2A_REPORTS_KEY
     return None
 
@@ -2981,7 +2990,6 @@ def report_read_permitted(
     allowlist: frozenset[str],
     route: Any = None,
     key: Any = None,
-    readable_key: Any = None,
 ) -> str | None:
     """The rule a read of the store breaks, or None when the caller may read.
 
@@ -2990,7 +2998,7 @@ def report_read_permitted(
       ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's,
       None when the caller presented none.
     - The a2a-reports role reads what report_a2a_reports_read_permitted allows
-      of ``route``, ``key`` and ``readable_key``; left at their defaults, nothing.
+      of ``route`` and ``key``; left at their defaults, nothing.
     - Every other role is refused.
     """
     if role == CALLER_ROLE_SHELL:
@@ -3002,7 +3010,7 @@ def report_read_permitted(
             return RULE_REPORT_PROFILE
         return None
     if role == CALLER_ROLE_A2A_REPORTS:
-        return report_a2a_reports_read_permitted(route, key, readable_key)
+        return report_a2a_reports_read_permitted(route, key)
     return RULE_REPORT_ROLE
 
 
@@ -14439,11 +14447,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         else:
             route = report_route_kind(path)
             key = segments[REPORT_STORE_KEY_SEGMENT] if len(segments) > REPORT_STORE_KEY_SEGMENT else None
-            # The publish key is read only for an a2a-reports read that could
-            # pass: the shell and profile reads never need it, and a route the
-            # reader may not use is refused without the ConfigMap read.
-            readable_key: str | None = None
-            if role == CALLER_ROLE_A2A_REPORTS and route in REPORT_A2A_READ_ROUTES:
+            rule = report_read_permitted(role, profile, self.report_profiles, route, key)
+            # The a2a-reports reader's REPORT_A2A_PUBLISH_KEY becomes the
+            # install's publish key here, once the read is permitted, so a
+            # refused read costs no ConfigMap read. No other role's key is
+            # resolved: the shell's or a profile's `publish` goes upstream as sent.
+            if rule is None and role == CALLER_ROLE_A2A_REPORTS:
                 try:
                     publish = report_publish_store_key()
                 except ReportStoreUnavailable as exc:
@@ -14457,8 +14466,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         },
                     )
                     return
-                readable_key = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY
-            rule = report_read_permitted(role, profile, self.report_profiles, route, key, readable_key)
+                segments[REPORT_STORE_KEY_SEGMENT] = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY
+                path = "/".join(segments)
         if rule is not None:
             self._log_audit_report(HTTPStatus.FORBIDDEN, rule)
             self._refuse_audit_report(

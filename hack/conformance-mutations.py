@@ -176,8 +176,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-read-any-role",
         "agents/platform/scripts/credential_proxy.py",
-        ("        return report_a2a_reports_read_permitted(route, key, readable_key)\n    return RULE_REPORT_ROLE\n",
-         "        return report_a2a_reports_read_permitted(route, key, readable_key)\n    return None\n"),
+        ("        return report_a2a_reports_read_permitted(route, key)\n    return RULE_REPORT_ROLE\n",
+         "        return report_a2a_reports_read_permitted(route, key)\n    return None\n"),
         "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
         "read the store for any role holding an allowlisted profile name, since "
         "only the shell and profile reach the route -- until a role table edit "
@@ -270,20 +270,30 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-a2a-reports-any-key",
         "agents/platform/scripts/credential_proxy.py",
-        ('    if not isinstance(readable_key, str) or not readable_key or not isinstance(key, str) or key != readable_key:\n',
-         '    if not isinstance(readable_key, str) or not readable_key or not isinstance(key, str):\n'),
+        ('    if key != REPORT_A2A_PUBLISH_KEY:\n        return RULE_REPORT_A2A_REPORTS_KEY\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_KEY\n'),
         "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
-        "let the reader read any repository key, since the gateway only asks for "
-        "the publish key -- a chat user then reads another repository's findings",
+        "let the reader send any key, since the broker swaps in the publish key "
+        "anyway -- until that swap is narrowed to the word and a chat user reads "
+        "another repository's findings by naming it",
     ),
     Mutation(
         "A3-report-a2a-reports-key-from-the-request",
         "agents/platform/scripts/credential_proxy.py",
-        ('                readable_key = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY\n',
-         '                readable_key = key\n'),
+        ('                segments[REPORT_STORE_KEY_SEGMENT] = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY\n',
+         '                segments[REPORT_STORE_KEY_SEGMENT] = key\n'),
         "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
-        "take the readable key from the request, since the listener only serves "
-        "keys it holds -- every registered repository's findings then reach chat",
+        "relay the reader's key as sent, since the listener only serves keys it "
+        "holds -- the word then reaches the store, and whichever stream it names is read",
+    ),
+    Mutation(
+        "A3-report-publish-word-for-every-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            if rule is None and role == CALLER_ROLE_A2A_REPORTS:\n',
+         '            if rule is None and key == REPORT_A2A_PUBLISH_KEY:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "resolve the word for every caller, as a convenience -- the shell and every "
+        "profile worker then gain an alias whose meaning moves with the ConfigMap",
     ),
     Mutation(
         "A3-report-a2a-chat-reaches-the-store",
