@@ -111,8 +111,8 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
       "tagPolicy": "release",
       "override": "A2A_CONSOLE_IMAGE",
-      "pulledBy": "The console server Deployment the operator renders.",
-      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
+      "pulledBy": "The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set).",
+      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus, plus /mcp and /curator for the opt-in MCP server and OKF memory curator pods (a2a/Dockerfile.console)."
     },
     {
       "name": "a2a-verifier",
@@ -171,7 +171,7 @@
       "name": "nats",
       "origin": "third-party",
       "repository": "docker.io/library/nats",
-      "tag": "2.10-alpine",
+      "tag": "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
       "override": "A2A_NATS_IMAGE",
       "pulledBy": "The NATS StatefulSet the operator renders.",
       "description": "The JetStream bus behind the A2A stack, which every install runs. The chart sets the env var from a2aBus.images.nats, under global.thirdPartyImageRegistry when that is set; the operator's compiled default is the same pin, for an operator rendered outside the chart."

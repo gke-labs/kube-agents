@@ -549,7 +549,7 @@ Helm adopts the object and rewrites its spec to the static copy in the same upgr
 Deployment, the Postgres/pgvector StatefulSet behind it, NetworkPolicies
 isolating the API pod (`hindsight-api`) and standing in for the database's
 deliberate lack of a password (`hindsight-postgresql`),
-and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
+and a `PodMonitoring` (`hindsight.podMonitoring`, `null` by default so it renders when the cluster serves `monitoring.googleapis.com/v1/PodMonitoring`). `hindsight.enabled` is a tri-state: `null` (the default)
 follows `platformAgent.harness.memory.provider`, so selecting a
 Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
 with it and everything else renders nothing; `true`/`false` override. The
@@ -717,7 +717,8 @@ series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.in
 `kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
-pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
+pods, the same `null` tri-state as `platformAgent.podMonitoring`, `litellm.podMonitoring`
+(`litellm-monitoring`), and `hindsight.podMonitoring` (`hindsight-monitoring`). `operator.metrics.enabled: false`
 binds no listener and renders neither the port, the `PodMonitoring` nor the policy.
 `<release>-operator-netpol` bounds the plain listener as the broker's and gateway's
 policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and from
@@ -907,10 +908,10 @@ canonical walkthroughs.
 
 Every install runs the A2A stack: the operator puts the NATS bus and the A2A
 gateway in front of the agent, and the chart renders the profile namespace and
-counts the stack in its quota preflight on every render. The chart renders
-`spec.mode` only when `platformAgent.mode` is set, and the operator ignores the
-value. The key, which once chose between this stack and the previous one, is
-deprecated; the schema still accepts it so an older values file renders.
+counts the stack in its quota preflight on every render. The chart writes no
+`spec.mode` on the `PlatformAgent`. `platformAgent.mode`, which once chose
+between this stack and the previous one, is deprecated: the schema still
+accepts it so an older values file renders, and the chart ignores it.
 `platformAgent.harness.tuning.maxSessions` caps the A2A session pods the
 install runs at once and renders only when set.
 
@@ -968,9 +969,12 @@ the hour, and an `env` entry for the name would override that key. It does not s
 container itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
 sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
 operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads it;
-`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
-allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
-out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+`MALLOC_ARENA_MAX` is not on the agent container's allowlist, would reach only the
+credential-proxy and `agent-api-auth` containers, and is left out.
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is left out because it has no effect on `gcloud` there: the
+credential proxy does not pass the pod's value to the commands it runs, and sets the variable
+itself for the commands its exec tier runs. Pass the file beside your own values with
+`-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
 
@@ -992,12 +996,18 @@ is canonical for the behaviour.
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
-`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+`platformAgent.harness.driftDetector`, `platformAgent.harness.universeDomain`, and
+`platformAgent.deployment.availability`
 expose the remaining PlatformAgent CR fields, so a chart install can reach every
 field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
-means zero rather than unset.
+means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
+`helm upgrade` on an install whose served `PlatformAgent` CRD predates
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+to a domain other than `googleapis.com`, the chart also sets
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
+renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
@@ -1276,11 +1286,11 @@ granted by hand.
 Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
-- **Annotations set** (the Workload Identity case): the **operator** creates
+- **Annotations set** (at least one non-null, non-empty string value — the Workload Identity case): the **operator** creates
   and manages the KSA with those annotations.
-- **No annotations**: the operator treats the named KSA as user-managed and
+- **No annotations** (empty map, `null`, or inherited keys cleared to `null` or `""` in a layered values file): the operator treats the named KSA as user-managed and
   does not create it — the **chart** renders it instead, so a default install
-  still starts.
+  still starts. (`litellm.vertex.serviceAccountAnnotations` filters `null` and `""` entries the same way.)
 
 ### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
 

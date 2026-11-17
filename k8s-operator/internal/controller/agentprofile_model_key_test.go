@@ -83,5 +83,16 @@ func TestNoProfileWorkerContainerSetsALiteralModelCredential(t *testing.T) {
 			t.Fatalf("precondition: no Job template for %s (imageVolumes %v)", profile.Name, imageVolumes)
 		}
 		check(t, "Job template", templates[profile.Name].Spec)
+		// The dispatcher builds each Job from the DispatchJobTemplate, not
+		// from the rendering, so check the template that the param holds too.
+		param, err := buildDispatchJobTemplate(agent, profile.Name, templates[profile.Name], templates[profile.Name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		held, ok := dispatchJobParamTemplate(param)
+		if !ok {
+			t.Fatalf("precondition: the DispatchJobTemplate of %s holds no pod template (imageVolumes %v)", profile.Name, imageVolumes)
+		}
+		check(t, "DispatchJobTemplate", held.Spec)
 	}
 }

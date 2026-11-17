@@ -655,11 +655,11 @@ litellm:
   # Moving a live release from operator-managed back to the static copy needs
   # a handoff first (chart README, "Handing litellm-policy back to Helm"):
   # Helm refuses to adopt an object the operator has labelled as its own.
-  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
-  # helm template/lint cannot catch its absence: a non-GKE install fails at
-  # apply time.
   networkPolicy: true
-  podMonitoring: true
+  # Tri-state, matching platformAgent.podMonitoring: null (default) renders
+  # litellm-monitoring when the cluster serves monitoring.googleapis.com/v1/PodMonitoring
+  # and nothing elsewhere; true forces it on (fails apply without the CRD); false disables.
+  podMonitoring: null
   # Redaction of every request body the gateway forwards to a provider. Off by
   # default: on, the ConfigMap also carries the shared redactor module and the
   # redaction pre-call hook, mounted beside /app/config.yaml, and the hook runs
@@ -904,8 +904,8 @@ hindsight:
   # gateway egress rule selects app: litellm / app: standalone-replay pods in
   # the release namespace).
   networkPolicy: true
-  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
-  podMonitoring: true
+  # Tri-state, matching litellm.podMonitoring and platformAgent.podMonitoring.
+  podMonitoring: null
   podDisruptionBudget:
     # Renders maxUnavailable: 1 for both store workloads. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
@@ -1008,7 +1008,7 @@ a2aBus:
   images:
     nats:
       repository: docker.io/library/nats
-      tag: "2.10-alpine"
+      tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
     natsBox:
       repository: docker.io/natsio/nats-box
       tag: "0.14.5"
@@ -1035,12 +1035,6 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
-  # Deprecated and ignored. platformAgent.mode once chose between the A2A
-  # stack and the previous one; the operator now runs every install on the
-  # A2A stack and the CRD defaults spec.mode to next. A value set here still
-  # renders spec.mode on the CR, which the webhook rewrites to next. The key
-  # goes in a later release.
-  mode: null
   telemetry:
     # The A2A gateway keeps one hashed key and a last-active time per chat
     # person for 30 days, and serves the people seen in the last 7 and 30 days
@@ -1110,8 +1104,8 @@ platformAgent:
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a
   # cluster without the CRD upgrades without setting anything. true renders
-  # them regardless and fails at apply time where the CRD is absent, the caveat
-  # litellm.podMonitoring carries; false never renders them. helm template
+  # them regardless and fails at apply time where the CRD is absent; false
+  # never renders them. helm template
   # alone has no cluster to ask: pass
   # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
   # default render.
@@ -1188,6 +1182,13 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
+    # Optional Google Cloud API universe domain (for example, a Google Cloud
+    # Dedicated sovereign domain). Leave empty to auto-detect from the GKE
+    # metadata server on operator-rendered workloads; set explicitly when
+    # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
+    # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
+    # cluster's OIDC issuer host at install time.
+    universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an
     # install pins it, so set it explicitly when it must not float with the

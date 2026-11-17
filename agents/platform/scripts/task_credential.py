@@ -14,9 +14,9 @@ and cannot import the Go package. So this is a second implementation of
     TestCredentialProxyFixtures -update-proxy-fixtures`` regenerates them) and
     verified again here by ``test_task_credential.py``, so the two verifiers
     are held to one verdict per token.
-  * Where this is stricter it says so: ``target`` is required (Go makes it
-    optional for this audience, and a proxy credential with no target confines
-    nothing), base64url must be canonical, the header must carry exactly
+  * Where this is stricter it says so: ``target`` is required except on a
+    report credential (Go makes it optional for this audience, and a proxy
+    credential with no target confines nothing; see REPORT_TIER), base64url must be canonical, the header must carry exactly
     ``typ`` and ``alg``, and a JSON ``null`` is refused where Go would read the
     zero value. Each of those is a fixture with ``go_ok`` and ``proxy_ok``
     apart.
@@ -102,11 +102,18 @@ ED25519_SIGNATURE_LENGTH = 64
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
 NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger"})
-# Every nats key but trigger is required: target is optional in Go for this
-# audience and required here (stricter), and trigger is optional in both.
-NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
+# Every nats key but target and trigger is required. Target is optional in Go
+# for this audience; here it may be absent only on a report credential (below),
+# so this is stricter than Go everywhere else. Trigger is optional in both.
+NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid"})
+# A report credential (#5619): a proxy credential with no target, which only an
+# unattended task started by a trigger may carry. A fleet audit names no
+# cluster, so it confines nothing; the broker admits it to the audit-report
+# routes alone (credential_proxy.REPORT_CREDENTIAL_ROUTES) and refuses it on
+# every other route, /v1/exec and the relays included. capability.TierUnattended.
+REPORT_TIER = "unattended"
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
-TRIGGER_CLAIMS = frozenset({"name", "origin", "stream"})
+TRIGGER_CLAIMS = frozenset({"name", "origin", "stream", "script"})
 TRIGGER_REQUIRED = frozenset({"name", "origin"})
 # taskcred.TriggerOriginBuiltin: the one origin a trigger may name today (#4685).
 TRIGGER_ORIGINS = frozenset({"builtin"})
@@ -162,6 +169,9 @@ class TaskTrigger:
     name: str
     origin: str
     stream: str = ""
+    # The profile script a built-in schedule's run executes (taskcred.Trigger's
+    # script, #5622); empty on every other trigger.
+    script: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,9 +187,15 @@ class TaskClaims:
     issued_at: int
     jti: str
     issuer: str
-    target: TaskTarget
+    # None only on a report credential: see REPORT_TIER and ``report_only``.
+    target: TaskTarget | None
     # The unattended trigger that started the task, when one did (#4685).
     trigger: TaskTrigger | None = None
+
+    @property
+    def report_only(self) -> bool:
+        """True for a report credential: no target, so no cluster to confine to."""
+        return self.target is None
 
 
 # ---------------------------------------------------------------------------
@@ -451,11 +467,20 @@ def verify(
         raise TaskCredentialError("task credential type is not a task credential")
     if _integer(nats, "version", "nats") != JWT_CLAIMS_VERSION:
         raise TaskCredentialError(f"task credential claims version is not {JWT_CLAIMS_VERSION}")
-    target_claim = nats["target"]
-    if not isinstance(target_claim, dict):
-        raise TaskCredentialError("task credential target is not an object")
-    _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
+    target_claim = None
+    if "target" in nats:
+        # Present means an object: a JSON null is refused, not read as absent.
+        target_claim = nats["target"]
+        if not isinstance(target_claim, dict):
+            raise TaskCredentialError("task credential target is not an object")
+        _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
     trigger = _trigger(nats["trigger"]) if "trigger" in nats else None
+    # Only a report credential omits the target: an unattended task that a
+    # trigger started. Anything else with no target is refused as before.
+    if target_claim is None and (_string(nats, "tier", "nats") != REPORT_TIER or trigger is None):
+        raise TaskCredentialError(
+            "task credential names no target; only an unattended task started by a trigger may omit it"
+        )
 
     audience = claims["aud"]
     if type(audience) is not str or audience != AUDIENCE:
@@ -500,7 +525,7 @@ def verify(
         issued_at=iat,
         jti=jti,
         issuer=issuer,
-        target=TaskTarget(
+        target=None if target_claim is None else TaskTarget(
             project=_target_field(_string(target_claim, "project", "nats.target"), "project"),
             location=_target_field(_string(target_claim, "location", "nats.target"), "location"),
             cluster=_target_field(_string(target_claim, "cluster", "nats.target"), "cluster"),
@@ -526,7 +551,14 @@ def _trigger(claim: Any) -> TaskTrigger:
     # prefix stripping, so nothing but schedule/<stream> can bind <stream>.
     if stream and (source != TRIGGER_SCHEDULE_SOURCE or rest != stream):
         raise TaskCredentialError("task credential trigger stream is not the trigger's own schedule name")
-    return TaskTrigger(name=name, origin=origin, stream=stream)
+    script = _string(claim, "script", "nats.trigger") if "script" in claim else ""
+    if script and not _is_label(script):
+        raise TaskCredentialError("task credential trigger script is not a DNS-1123 label")
+    # As with stream: only one schedule's trigger, schedule/<name>, names a
+    # script; a bare schedule doesn't.
+    if script and (source != TRIGGER_SCHEDULE_SOURCE or not slash):
+        raise TaskCredentialError("task credential trigger script is not on a schedule's trigger")
+    return TaskTrigger(name=name, origin=origin, stream=stream, script=script)
 
 
 # ---------------------------------------------------------------------------

@@ -147,3 +147,49 @@ func TestTriggerFromAuthority(t *testing.T) {
 		}
 	}
 }
+
+// A built-in schedule's script run (#5622): the grant binds the script with the
+// rest of the trigger, so the verifier refuses a claim naming another script,
+// naming one the grant doesn't, or naming none where the grant does.
+func TestTheVerifierMatchesTheTriggersScriptAgainstTheGrant(t *testing.T) {
+	s := newStore()
+	scripted := scheduleTrigger
+	scripted.Script = "compliance-audit"
+	grant := s.write(t, rootKey(t, gwTask), triggeredGrant(&scripted))
+	plain := scheduleTrigger
+	plainGrant := s.write(t, rootKey(t, "gw-task-3"), triggeredGrant(&plain))
+	nc := serveVerifier(t, s)
+	c := clientAs(t, nc, podA)
+	ctx := context.Background()
+
+	same := scripted
+	if err := c.CheckProfileRun(ctx, grant, "fleet-audit", TierUnattended, targetInScope, &same); err != nil {
+		t.Fatalf("the grant's own script should be permitted: %v", err)
+	}
+	other := scripted
+	other.Script = "fleet-consistency-drift"
+	mustRefuse(t, c.CheckProfileRun(ctx, grant, "fleet-audit", TierUnattended, targetInScope, &other), "trigger is not the grant's")
+	none := scheduleTrigger
+	mustRefuse(t, c.CheckProfileRun(ctx, grant, "fleet-audit", TierUnattended, targetInScope, &none), "trigger is not the grant's")
+	added := scripted
+	mustRefuse(t, c.CheckProfileRun(ctx, plainGrant, "fleet-audit", TierUnattended, targetInScope, &added), "trigger is not the grant's")
+}
+
+func TestTriggerFromAuthorityReadsAScript(t *testing.T) {
+	got, err := TriggerFromAuthority(json.RawMessage(`{"trigger":{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}}`))
+	want := scheduleTrigger
+	want.Script = "compliance-audit"
+	if err != nil || got == nil || *got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, err, want)
+	}
+	for name, raw := range map[string]string{
+		"a path":             `{"trigger":{"name":"schedule/a","origin":"builtin","script":"/opt/scripts/run.sh"}}`,
+		"a null script":      `{"trigger":{"name":"schedule/a","origin":"builtin","script":null}}`,
+		"a case-variant key": `{"trigger":{"name":"schedule/a","origin":"builtin","SCRIPT":"a"}}`,
+		"a duplicate script": `{"trigger":{"name":"schedule/a","origin":"builtin","script":"a","script":"b"}}`,
+	} {
+		if got, err := TriggerFromAuthority(json.RawMessage(raw)); err == nil {
+			t.Errorf("%s: read %+v", name, got)
+		}
+	}
+}

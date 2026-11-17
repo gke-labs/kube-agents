@@ -95,8 +95,8 @@ const (
 	a2aAuthMapShardsAnnotation = "kubeagents.x-k8s.io/a2a-authmap-shards"
 
 	// a2aAuthMapComponent is the a2aLabels component every identity-map
-	// object carries, shard or legacy, which is how the prune and the
-	// teardown find them whatever their names (deleteA2AAuthMapObjects).
+	// object carries, shard or legacy, which is how the prune finds them
+	// whatever their names (deleteA2AAuthMapObjects).
 	a2aAuthMapComponent = "authmap"
 
 	// a2aAuthMapVersionLength is how much of the content digest becomes the
@@ -276,6 +276,22 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 			// a2aDispatcherMapEntry's entry, which the ceiling measured.
 			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining))
 		}
+	}
+	if a2aCuratorEnabled() {
+		for i := range identities {
+			if identities[i].User == a2aAgentBusUser {
+				identities[i].Grants.Publish = append(identities[i].Grants.Publish, a2aCuratorOutcomesSubject, a2aMemoryQuerySubject)
+				identities[i].Grants.Subscribe = append(identities[i].Grants.Subscribe, a2aMemoryReplyAgentSubjects)
+				break
+			}
+		}
+		id := curatorIdentity(agent, agent.Namespace)
+		identities = append(identities, a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		})
 	}
 
 	// Refuse here what the callout would refuse there.

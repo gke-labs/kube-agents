@@ -1806,16 +1806,41 @@ class C1IsolationIsStructural(unittest.TestCase):
         adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
         self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
         self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+        # The adapter's entry point takes one task or a batch: a single task
+        # goes to validateDelegate, and so does every batch entry, with that
+        # entry's own text. A batch past this loop is published unchecked.
+        entry = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegateFor")
+        self.assertIn("return validateDelegate(req)", entry, "the worker-adapter no longer caps a single delegate request")
+        self.assertRegex(
+            entry,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+req\.Tasks\s*\{\s*if\s+why\s*:=\s*validateDelegate\(lib\.DelegateRequest\{[^}]*\bText:\s*\1\.Text\b[^}]*\}\);\s*why\s*!=\s*\"\"\s*\{\s*return\b",
+            "the worker-adapter no longer refuses a batch whose entry's own text fails validateDelegate",
+        )
+        # Read without comments, and pinned to the refusal: a non-empty answer
+        # is sent back to the caller and the request skipped, before publishing.
+        adapter_code = re.sub(r"//[^\n]*", "", h.text("a2a_worker_adapter"))
+        self.assertRegex(
+            adapter_code,
+            r"if\s+why\s*:=\s*validateDelegateFor\(ask\.req,[^)]*\);\s*why\s*!=\s*\"\"\s*\{\s*ask\.reply\s*<-[^\n]*\n\s*continue\b[\s\S]*?a\.publishDelegate\(ctx,\s*ask\.req\)",
+            "the worker-adapter no longer refuses a delegate request validateDelegateFor refuses, before publishing it",
+        )
 
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
         # request lib.ValidateDelegateRequest refuses, and the validator caps
-        # the single task's text and every batch entry's.
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        # Followed only by `||` or the block: an `&&` after the call (a
+        # condition on it) would validate only some requests and mint the rest.
         self.assertRegex(
             gateway,
-            r"lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil",
-            "the gateway's handleDelegateRequest no longer refuses a request lib.ValidateDelegateRequest refuses",
+            r"if\s+!parsed\s*\|\|\s*lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil\s*(?:\|\||\{)",
+            "the gateway's handleDelegateRequest no longer refuses every request lib.ValidateDelegateRequest refuses",
         )
         self.assertNotRegex(gateway, magic_number, "the gateway's handleDelegateRequest hand-spells the delegate text cap")
 
@@ -2499,6 +2524,63 @@ class C2FailClosed(unittest.TestCase):
                 window,
                 "the Authorization header is conditional on the token being "
                 "present, so a missing key degrades to an unauthenticated request",
+            )
+
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
             )
 
 

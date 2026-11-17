@@ -6,9 +6,9 @@
 # The sandbox's /usr/local/bin/kubectl wrapper runs it first and starts Python only on exit 1,
 # so a call for a registered context skips about 0.2 s of Python startup. It never reads the YAML
 # itself: it says "registered" only when Python's merge recorded, for these exact file bytes and this
-# proxy URL, CA file and token file, that it found the context current or wrote it. Anything else
-# (no record, an edited file, a symlinked or missing kubeconfig or record, an unusual argv) exits 1,
-# and Python handles the call as before.
+# proxy URL, CA file and token file, at this record version, that it found the context current or
+# wrote it. Anything else (no record, a record from another version, an edited file, a symlinked or
+# missing kubeconfig or record, an unusual argv) exits 1, and Python handles the call as before.
 set -u
 
 readonly DEFAULT_CA_FILE="/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
@@ -21,9 +21,13 @@ readonly NOT_REGISTERED=1
 readonly CONTEXT_PREFIX="gke_"
 readonly CONTEXT_SEPARATOR="_"
 readonly DEFAULT_KUBECONFIG="/.kube/config"
-# What the client hashes for the environment: the three values joined by a newline
-# (REGISTERED_MARKER_ENV_SEPARATOR in credential_proxy_client.py).
-readonly ENV_DIGEST_FORMAT='%s\n%s\n%s'
+# What the client hashes for the environment: the record version and the three values, joined by
+# a newline (REGISTERED_MARKER_VERSION and REGISTERED_MARKER_ENV_SEPARATOR in
+# credential_proxy_client.py). A record made with another version matches nothing here, so Python
+# checks the kubeconfig once more and records it again. Increase RECORD_VERSION together with the
+# client's constant, when the merge changes what it accepts as a context's current entries.
+readonly RECORD_VERSION="1"
+readonly ENV_DIGEST_FORMAT='%s\n%s\n%s\n%s'
 # Beside a kubeconfig `<dir>/<name>`, Python's record is `<dir>/.<name>.contexts-registered`
 # (REGISTERED_MARKER_NAME in credential_proxy_client.py).
 readonly MARKER_SUFFIX=".contexts-registered"
@@ -83,7 +87,8 @@ ca_file="${KUBE_PROXY_CA_FILE:-${DEFAULT_CA_FILE}}"
 token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-${DEFAULT_TOKEN_FILE}}"
 
 # Python's merge records, beside each kubeconfig it checks and under its lock, one line per context it
-# found current or wrote: `<context> <sha256 of the file> <sha256 of proxy URL, CA file and token file>`.
+# found current or wrote: `<context> <sha256 of the file> <sha256 of record version, proxy URL, CA
+# file and token file>`.
 # Only that exact line for this file's bytes and this environment says "registered": any edit to the
 # file since, or another proxy URL, CA file or token file, falls back to Python, which checks the file
 # with its own YAML reader and records the line again.
@@ -93,5 +98,5 @@ marker="${kubeconfig_dir}/.${kubeconfig_name}${MARKER_SUFFIX}"
 [ -f "${marker}" ] && [ ! -L "${marker}" ] || exit "${NOT_REGISTERED}"
 file_digest="$(sha256sum <"${kubeconfig}")" || exit "${NOT_REGISTERED}"
 # shellcheck disable=SC2059 # the format is a constant, named above
-env_digest="$(printf "${ENV_DIGEST_FORMAT}" "${proxy_url}" "${ca_file}" "${token_file}" | sha256sum)" || exit "${NOT_REGISTERED}"
+env_digest="$(printf "${ENV_DIGEST_FORMAT}" "${RECORD_VERSION}" "${proxy_url}" "${ca_file}" "${token_file}" | sha256sum)" || exit "${NOT_REGISTERED}"
 grep -Fqx -- "${context} ${file_digest%% *} ${env_digest%% *}" "${marker}"

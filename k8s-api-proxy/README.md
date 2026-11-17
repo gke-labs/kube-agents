@@ -89,6 +89,11 @@ partition needs the cache off (`Config.Cache` nil). Invalidation is not partitio
 `403` in one partition evicts that resource's entries in every partition, which costs the others
 refetches but never serves one partition another's response.
 
+Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
+(`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
+archive against the release's signed `checksums.txt`. Releases published before the pipeline built
+it carry none.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash

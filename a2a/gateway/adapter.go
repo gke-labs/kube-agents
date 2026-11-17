@@ -430,6 +430,19 @@ type DeliverableObserver interface {
 	TaskDelivered(conversation, taskID, result string)
 }
 
+// CardStopObserver is told a canceled task's card-stop result before the
+// terminal, when the executor's canceled result carries the cardStop part
+// (#5528): the gateway's text for it and the part re-encoded from the parsed
+// result (observeCardStop). Nothing else of a canceled result is handed
+// over, since a canceled turn's partial output stays away from a program's
+// caller, as DeliverableObserver keeps it to completed tasks. The relay and
+// the heal path may both tell it; a second call replaces the first.
+// Optional, like the observers above, and forwarded by the side-door
+// composite to the owning door.
+type CardStopObserver interface {
+	TaskCardStop(conversation, taskID, text string, cardStop lib.Part)
+}
+
 // InboundObserver is the optional extension an Adapter implements when it has
 // to know what became of a message it handed over, rather than only what the
 // conversation received. Every chat backend ignores both: a human reads the

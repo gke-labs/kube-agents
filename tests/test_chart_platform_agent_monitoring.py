@@ -263,7 +263,7 @@ class MonitoringShapeTest(unittest.TestCase):
     def test_kind_up_leaves_the_default_to_the_cluster(self):
         # kind serves no PodMonitoring API, so the null default renders nothing
         # there; pinning it false would hide a detection regression from the
-        # kind job. The LiteLLM switch is a plain boolean and stays pinned.
+        # kind job.
         self.assertNotIn("platformAgent.podMonitoring", _KIND_UP.read_text())
 
 
