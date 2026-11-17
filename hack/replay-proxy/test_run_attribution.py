@@ -40,7 +40,7 @@ class World:
         return self.blobs[key]
 
     def request(self, messages, fingerprint, stored=True, recorded=False, answer=None, prior=None, unstorable=(),
-                answer_hash=None):
+                answer_hash=None, exact=None, prior_exact=None):
         request_id = f"{len(self.lines) + 1:032x}"
         if stored:
             with open(os.path.join(self.root, "store", "requests", request_id + ".json"), "w") as handle:
@@ -54,6 +54,10 @@ class World:
             entry["stored_answer_hash"] = answer_hash or answer
         if prior:
             entry["prior_answer"] = list(prior)
+        if exact:
+            entry["answer_exact"] = exact
+        if prior_exact:
+            entry["prior_exact"] = prior_exact
         self.lines.append(entry)
         return entry
 

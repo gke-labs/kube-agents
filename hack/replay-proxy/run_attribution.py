@@ -18,12 +18,20 @@ so a run's A2A task is no evidence and is not read.)
 
 A request that names no card of its own (a front door's opening, which is only
 the case's prompt) is decided by evidence instead: a later request whose
-conversation went on from exactly the answer that was saved. Record mode logs
-each line's answer (`answer_variant`) and the answer the request's last
-assistant message is (`prior_answer`), both as normalizer.answer_variant
-identifies an answer in a history. A continuation attributed to one run, holding
-the request as its prefix and that answer next, proves that run got that answer
-to that request. The proof chains: a continuation with no card of its own
+conversation went on from exactly the answer that was saved (the exact chain).
+Record mode logs each line's answer as stored (`answer_exact`) and, the same
+way, the request's last assistant message under the normalization of the
+request it answered (`prior_exact`), both replay_cache.answer_exact: the text
+and tool calls, with only what a client's re-sending changes (a null text, the
+order of argument keys, ids) absorbed. A continuation attributed to one run,
+holding the request as its prefix and exactly that answer next, proves that
+run got that answer to that request. An answer that differs only in an age, a
+pid or a keyed number is a different answer here, so a passing run's
+continuation never vouches for a failing run's look-alike. Lines logged before
+these fields carry only `answer_variant` and `prior_answer`
+(normalizer.answer_variant), which are coarser: for them evidence is matched on
+those, and a card-less answer with a look-alike (same request and
+answer_variant, different stored answer) is refused. The proof chains: a continuation with no card of its own
 (a front door that reads its board before it creates a card) counts for each run
 its own answer is proven, by the same rule, to have gone on from; the answer is published when any such run passed, which is the
 design's "at least one passing run produced that same fingerprint", here for
@@ -46,9 +54,11 @@ storable line whose logged `stored_answer_hash`, the hash of the answer as store
 the alternate's name, recorded or not: it
 passes when any of them is attributed to runs that all passed, since a passing
 run produced that very answer, even when a failing run gave it first and saved
-it (Attribution.decide_alternate). A card-less line whose continuations could
-have followed another answer of the same coarse identity counts only when
-every run tied to it passed. An answer only failing runs gave never passes. A different answer to the same request is an alternate of its own,
+it (Attribution.decide_alternate). A card-less line passes only on a
+continuation carrying exactly its answer, and never while another line of the
+same request gave an answer its evidence cannot tell apart from it (the same
+`answer_exact`, or for older lines the same `answer_variant`, but a different
+stored answer). An answer only failing runs gave never passes. A different answer to the same request is an alternate of its own,
 decided by its own lines. An answer in the older layout (one per request) is
 decided by its recording line, or, when that line is left unattributed or
 ambiguous on the last call, by the other lines that sent the same request and
@@ -118,6 +128,9 @@ MESSAGES_KEY = "messages"
 SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}\Z")
 # An answer's identity in a history: [context, answer] (normalizer.answer_variant).
 ANSWER_PAIR_LENGTH = 2
+# Marks an evidence key as an exact answer (evidence_key); never a hex digest,
+# so it can't equal an answer_variant pair.
+EXACT_KEY_TAG = "exact"
 TEXT_ENCODING = "utf-8"
 
 
@@ -292,6 +305,11 @@ class Line:
     prior_answer: Optional[Tuple[str, ...]] = None
     # Whether record mode would have saved this line's answer (no unstorable reason).
     storable: bool = False
+    # The answer as a later request re-sends it (answer_exact), and the same for
+    # the request's last assistant message (prior_exact); empty on a line
+    # logged before them.
+    answer_exact: str = ""
+    prior_exact: str = ""
     # The hash of the answer as record mode stores it (stored_answer_hash):
     # the name of the alternate it saved or would have saved.
     stored_hash: str = ""
@@ -314,7 +332,16 @@ class Line:
             prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
             storable=entry.get(F.UNSTORABLE) == [],
             stored_hash=str(entry.get(F.STORED_ANSWER_HASH) or ""),
+            answer_exact=str(entry.get(F.ANSWER_EXACT) or ""),
+            prior_exact=str(entry.get(F.PRIOR_EXACT) or ""),
         )
+
+
+def evidence_key(exact: str, variant: Optional[Tuple[str, ...]]) -> Optional[Tuple[str, ...]]:
+    """What continuation evidence is matched on: the exact answer, or for a line logged before it, its answer_variant."""
+    if exact:
+        return (EXACT_KEY_TAG, exact)
+    return variant
 
 
 def _pair(value: Any) -> Optional[Tuple[str, ...]]:
@@ -445,8 +472,10 @@ class Attribution:
         for run in runs:
             for run_id in run.ids:
                 self.by_id.setdefault(run_id, set()).add(run.key)
-        # Continuations by the answer they went on from: (build, answer pair) ->
-        # [(the continuation's prefix keys, a run proven for it)]. A continuation
+        # Continuations by the answer they went on from: (build, evidence key)
+        # -> [(the continuation's prefix keys, a run proven for it)]. The key is
+        # the continuation's prior_exact (evidence_key), or for a line logged
+        # before it, its prior_answer. A continuation
         # counts for the run its own cards name, or, with no card, for each run
         # proven to have gone on from its own answer. Lines are taken longest
         # first, so every continuation of a request is in before the request.
@@ -468,16 +497,22 @@ class Attribution:
                 if own is None or own[1] or own[0]:
                     continue
                 proven = self._went_on_from(line)
-            if line.prior_answer is not None:
+            key = evidence_key(line.prior_exact, line.prior_answer)
+            if key is not None:
                 for each in sorted(proven):
-                    self.went_on.setdefault((line.build, line.prior_answer), []).append((line.chain, each))
+                    self.went_on.setdefault((line.build, key), []).append((line.chain, each))
 
     def _went_on_from(self, line: Line) -> Set[str]:
-        """The runs proven for continuations that hold `line`'s request and went on from its answer."""
+        """The runs proven for continuations that hold `line`'s request and went on from exactly its answer.
+
+        Matched on answer_exact (the exact chain); a line logged before it on
+        answer_variant.
+        """
         evidence: Set[str] = set()
-        if line.answer_variant is not None:
+        key = evidence_key(line.answer_exact, line.answer_variant)
+        if key is not None:
             depth = len(line.chain)
-            for chain, run in self.went_on.get((line.build, line.answer_variant), []):
+            for chain, run in self.went_on.get((line.build, key), []):
                 if len(chain) > depth and chain[depth - 1] == line.chain[-1]:
                     evidence.add(run)
         return evidence
@@ -570,25 +605,22 @@ class Attribution:
         served is that passing run's answer.
 
         A producer with no card of its own is decided by the continuations
-        that went on from its answer, matched by answer_variant, which is
-        coarser than the stored hash (it renames ages, pids and keyed numbers
-        the request never held). When another line of the same request gave
-        an answer with the same answer_variant but a different stored hash,
-        those continuations could have followed either answer, so the
-        producer passes only if every run tied to it passed
-        (_ambiguous_evidence). An answer only failing runs gave never passes.
-        With no PASS, a producer still pending keeps it pending; otherwise the
-        first producer's decision stands.
+        that went on from exactly its answer (_went_on_from: answer_exact
+        against each continuation's prior_exact), so a passing run's
+        continuation proves only the answer it carries. When another line of
+        the same request gave an answer that evidence cannot tell from this
+        one (_look_alike), a card-less producer is refused: no continuation
+        could say which of the two it followed. An answer only failing runs
+        gave never passes. With no PASS, a producer still pending keeps it
+        pending; otherwise the first producer's decision stands.
         """
         decisions = []
         for line in producers:
             if not line.storable:
                 continue
             found = self.decide(line)
-            if found.decision == PASS and self._ambiguous_evidence(line):
-                tied = self._tied_runs(line)
-                if self._any_failed(tied):
-                    found = Decision(FAIL, tuple(sorted(tied)))
+            if found.decision == PASS and self._look_alike(line):
+                found = Decision(AMBIGUOUS, found.runs)
             decisions.append(found)
         passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
         if any(found.decision == PASS for found in decisions):
@@ -597,18 +629,21 @@ class Attribution:
             return Decision(PENDING)
         return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
 
-    def _ambiguous_evidence(self, line: Line) -> bool:
-        """Whether a card-less line's continuation evidence could belong to a different stored answer.
+    def _look_alike(self, line: Line) -> bool:
+        """Whether a card-less line's evidence could belong to a different stored answer.
 
         True when the line has no card of its own and another line of its
-        build and request gave an answer with the same answer_variant but a
-        different stored hash.
+        build and request gave an answer with the same evidence key
+        (answer_exact, or answer_variant for a line logged before it) but a
+        different stored answer.
         """
         own = self._own(line)
         if own is None or own[0] or own[1]:
             return False
-        return any(other.answer_variant == line.answer_variant and other.stored_hash != line.stored_hash
-                   for other in self.by_fingerprint.get((line.build, line.fingerprint), []))
+        key = evidence_key(line.answer_exact, line.answer_variant)
+        return key is not None and any(
+            evidence_key(other.answer_exact, other.answer_variant) == key and other.stored_hash != line.stored_hash
+            for other in self.by_fingerprint.get((line.build, line.fingerprint), []))
 
     def _tied_runs(self, line: Line) -> Set[str]:
         """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,

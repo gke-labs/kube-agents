@@ -320,6 +320,79 @@ class PublishTest(unittest.TestCase):
         self.publisher.publish(final=True)
         self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", self.bucket.objects())
 
+    # Exact-chain evidence: two front doors sent one request; the failing rep
+    # answered x, the passing rep a look-alike y (same answer_variant "V", so
+    # an age or a number apart), each with its own answer_exact.
+    X, Y, EX, EY = "1" * 64, "2" * 64, "e1" * 32, "e2" * 32
+
+    def lookalike_openings(self, exact=True):
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.X, exact=exact and self.EX)
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.Y, exact=exact and self.EY)
+        self.alternate(1, self.X)
+        self.alternate(1, self.Y)
+
+    def continuation(self, card, answer, fingerprint, exact=True, stored=True):
+        self.world.request(front({"role": "assistant", "content": "went on"}, *created(card)), fingerprint,
+                           stored=stored, prior=(f"ctx-{fp(1)}", "V"), prior_exact=exact and answer)
+
+    def published(self, answer):
+        return f"replay-cache/{VERSION}/alts/{fp(1)}-{answer}.json" in self.bucket.objects()
+
+    def test_a_failing_reps_cardless_lookalike_with_no_continuation_is_not_published(self):
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.lookalike_openings()
+        self.continuation("t_22222222", self.EY, fp(3))  # only the passing rep went on, from exactly y
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertFalse(self.published(self.X), "no continuation carries x")
+        self.assertTrue(self.published(self.Y))
+
+    def test_a_failing_reps_continuation_whose_text_is_missing_proves_nothing(self):
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.lookalike_openings()
+        self.continuation("t_11111111", self.EX, fp(2), stored=False)
+        self.continuation("t_22222222", self.EY, fp(3))
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertFalse(self.published(self.X))
+        self.assertTrue(self.published(self.Y))
+
+    def test_an_interval_pass_with_the_failing_rep_ungraded_publishes_only_the_passing_answer(self):
+        self.world.run("case-a", 2, "pass", ["t_22222222"])  # rep 1 still running
+        self.lookalike_openings()
+        self.continuation("t_11111111", self.EX, fp(2))
+        self.continuation("t_22222222", self.EY, fp(3))
+        self.write_logs()
+        report = self.publisher.publish(final=False)
+        self.assertFalse(self.published(self.X))
+        self.assertTrue(self.published(self.Y))
+        self.assertEqual(report["decisions"], {"pending": 1, "pass": 1})
+
+    def test_a_cardless_answer_a_failing_and_a_passing_rep_gave_identically_goes_up_on_the_exact_chain(self):
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.X, exact=self.EX)
+        self.world.request(front(), fp(1), answer="V", answer_hash=self.X, exact=self.EX)
+        self.alternate(1, self.X)
+        self.continuation("t_11111111", self.EX, fp(2))
+        self.continuation("t_22222222", self.EX, fp(3))
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertTrue(self.published(self.X))
+
+    def test_lines_without_exact_fields_refuse_a_cardless_lookalike_group(self):
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.lookalike_openings(exact=False)
+        self.continuation("t_22222222", None, fp(3), exact=False)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertFalse(self.published(self.X), "the coarse evidence can't say which answer rep 2 followed")
+        self.assertFalse(self.published(self.Y))
+        self.assertEqual(report["decisions"], {"ambiguous": 2})
+
     def test_the_same_answer_from_failing_reps_only_stays(self):
         a = "a" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])

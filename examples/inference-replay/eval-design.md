@@ -718,7 +718,10 @@ run, and the run to pass or fail, and copy only the passing ones. A front door's
 names no card at all, only the case's prompt, and the board reads before its first card name none
 either. Each is matched through the requests that came after it: an answer is copied when a chain
 of requests, each going on from exactly the answer before it, reaches a request naming a passing
-run's card.
+run's card. "Exactly" is the answer as stored, compared the way the agent sends it back (an empty
+text and a missing one are the same, and so are tool-call arguments with their keys in another
+order), so an answer that differs from a passing run's only in an age or a number is never vouched
+for by that run's requests.
 
 **Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
 often answer the same request differently. If the cache kept only the first answer to each request,

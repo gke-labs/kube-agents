@@ -19,7 +19,9 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
   storable line whose `stored_answer_hash` is that name,
   recorded or not, is attributed to runs that passed
   (run_attribution.Attribution.decide_alternate): runs that give the same
-  answer save it once, and the run that saved it may have failed. An answer
+  answer save it once, and the run that saved it may have failed. A line with
+  no card of its own counts only through a later request that went on from
+  exactly its answer (`prior_exact` equal to its `answer_exact`). An answer
   only failing runs gave stays here. The key already holds the normalizer
   version, the LiteLLM config checksum and image, so answers no other run
   could hit cost space only; the version prefix lets a reader fetch only its
