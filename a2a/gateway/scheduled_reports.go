@@ -183,6 +183,21 @@ func isScheduleConversation(key string) bool {
 	return strings.HasPrefix(key, triggerConversationPrefix+lib.TriggerSourceSchedule+"/")
 }
 
+// scheduledStatusFor is a new record's status for delivery d and whether the
+// run was clean.
+func scheduledStatusFor(d *lib.ScheduleDelivery, silent bool) string {
+	switch {
+	case d == nil:
+		return scheduledNoDelivery
+	case d.Mode == lib.ScheduleDeliveryLocal:
+		return scheduledLocal
+	case d.SilentWhenClean && silent:
+		return scheduledSilent
+	default:
+		return scheduledPosting
+	}
+}
+
 // scheduledReportFrom is the seam a run's report comes from: today the
 // task's result text (or, for a run that did not complete, the notice the
 // conversation would have read), clean when it is exactly [SILENT]. A
@@ -283,14 +298,6 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		TaskID: taskID, Profile: ref.Addressee, FinishedAt: g.scheduleClock().UTC(),
 		State: s.Status.State, Silent: silent, Text: truncateReport(text),
 	}
-	// A builtin audit's completed run reads its report from the store,
-	// ahead of the result text; anything short of this run's falls back.
-	if s.Status.State == lib.StateCompleted {
-		if stored := g.storedReportFor(ctx, ref, []any{"taskId", taskID, "conversation", rec.Key}); stored != nil {
-			report.Text, report.Silent, report.Chat, report.Source = truncateReport(stored.Text), stored.Silent, stored.Card, scheduledSourceStore
-			silent = stored.Silent
-		}
-	}
 	if ref.Requester != nil {
 		report.TriggerName = ref.Requester.Subject
 	}
@@ -301,16 +308,7 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	if d == nil {
 		d = rec.Delivery
 	}
-	switch {
-	case d == nil:
-		report.Status = scheduledNoDelivery
-	case d.Mode == lib.ScheduleDeliveryLocal:
-		report.Status = scheduledLocal
-	case d.SilentWhenClean && silent:
-		report.Status = scheduledSilent
-	default:
-		report.Status = scheduledPosting
-	}
+	report.Status = scheduledStatusFor(d, silent)
 	// One resolution for the writer here and the status reader
 	// (scheduledRunStatus), so the reader finds this record.
 	report.JobKey = scheduledRunJobKey(rec, taskID)
@@ -327,6 +325,15 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 		// kept, or given up on. Nothing is posted again.
 		g.log.Debug("scheduled report already settled", append(logArgs, "status", have.Status)...)
 		return false
+	}
+	if have == nil && s.Status.State == lib.StateCompleted {
+		// A builtin audit's completed run reads its report from the store,
+		// ahead of the result text, on its first try only: a redelivery
+		// keeps the record's. Anything short of this run's falls back.
+		if stored := g.storedReportFor(ctx, ref, logArgs); stored != nil {
+			report.Text, report.Silent, report.Chat, report.Source = truncateReport(stored.Text), stored.Silent, stored.Card, scheduledSourceStore
+			report.Status = scheduledStatusFor(d, stored.Silent)
+		}
 	}
 	if have != nil {
 		report = *have

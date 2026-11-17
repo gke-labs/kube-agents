@@ -40,12 +40,17 @@ func (f *fakeReportStore) calls() []string {
 	return append([]string(nil), f.asked...)
 }
 
-// storedEnvelope is an envelope as finish writes it, decoded as the relay
-// decodes the broker's answer.
+// storedEnvelope is a scheduled run's envelope as finish writes it, started
+// when it finished, decoded as the relay decodes the broker's answer.
 func storedEnvelope(t *testing.T, auditID string, finished time.Time, report string) *reportEnvelope {
 	t.Helper()
-	raw := fmt.Sprintf(`{"audit_id":%q,"repo":"acme/gitops","finished_at":%q,"status":"OK","new_ids":["a"],%s}`,
-		auditID, finished.Format(time.RFC3339Nano), report)
+	return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"repo":"acme/gitops","started_at":%q,"finished_at":%q,"scheduled":true,"status":"OK","new_ids":["a"],%s}`,
+		auditID, finished.Format(time.RFC3339Nano), finished.Format(time.RFC3339Nano), report))
+}
+
+// envelopeOf decodes raw as the relay decodes the broker's answer.
+func envelopeOf(t *testing.T, raw string) *reportEnvelope {
+	t.Helper()
 	var env reportEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
 		t.Fatal(err)
@@ -135,6 +140,15 @@ func TestAStoredReportThatIsNotTheRunsFallsBackToItsResult(t *testing.T) {
 		"an empty text": func(id string) (*reportEnvelope, error) {
 			return storedEnvelope(t, id, now, `"report":{"schema":"kube-agents.report/v1","text":"  "}`), nil
 		},
+		"an on-demand run's": func(id string) (*reportEnvelope, error) {
+			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":%q,"finished_at":%q,"scheduled":false,%s}`, id, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), storedReportJSON)), nil
+		},
+		"a run started before this one": func(id string) (*reportEnvelope, error) {
+			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":%q,"finished_at":%q,"scheduled":true,%s}`, id, now.Add(-time.Hour).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), storedReportJSON)), nil
+		},
+		"no started_at": func(id string) (*reportEnvelope, error) {
+			return envelopeOf(t, fmt.Sprintf(`{"audit_id":%q,"started_at":null,"finished_at":%q,"scheduled":true,%s}`, id, now.Format(time.RFC3339Nano), storedReportJSON)), nil
+		},
 	}
 	for name, answer := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -215,6 +229,9 @@ func TestTheBrokerReaderAsksForThePublishKeyWithAFreshToken(t *testing.T) {
 		seen = append(seen, r.Method+" "+r.URL.EscapedPath()+" "+r.Header.Get("Authorization"))
 		st, b := status, body
 		mu.Unlock()
+		if st == http.StatusTemporaryRedirect {
+			w.Header().Set("Location", "/elsewhere")
+		}
 		w.WriteHeader(st)
 		_, _ = io.WriteString(w, b)
 	}))
@@ -240,11 +257,13 @@ func TestTheBrokerReaderAsksForThePublishKeyWithAFreshToken(t *testing.T) {
 	if _, err := s.latest(context.Background(), "compliance-audit"); !errors.Is(err, errReportStoreMissing) {
 		t.Fatalf("404 = %v, want errReportStoreMissing", err)
 	}
-	mu.Lock()
-	status = http.StatusForbidden
-	mu.Unlock()
-	if _, err := s.latest(context.Background(), "compliance-audit"); err == nil || errors.Is(err, errReportStoreMissing) {
-		t.Fatalf("403 = %v, want a failure", err)
+	for _, st := range []int{http.StatusForbidden, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusTemporaryRedirect} {
+		mu.Lock()
+		status = st
+		mu.Unlock()
+		if _, err := s.latest(context.Background(), "compliance-audit"); err == nil || errors.Is(err, errReportStoreMissing) {
+			t.Fatalf("%d = %v, want a failure", st, err)
+		}
 	}
 	mu.Lock()
 	status, body = http.StatusOK, `{"audit_id":"`+strings.Repeat("x", reportStoreBodyMax)+`"}`
@@ -257,6 +276,9 @@ func TestTheBrokerReaderAsksForThePublishKeyWithAFreshToken(t *testing.T) {
 	want := []string{
 		"GET /v1/audit-reports/compliance-audit/publish/latest Bearer tok-1",
 		"GET /v1/audit-reports/compliance-audit/publish/latest Bearer tok-2",
+	}
+	if len(seen) != 8 {
+		t.Fatalf("%d requests, want 8 (a redirect is not followed)", len(seen))
 	}
 	for i, w := range want {
 		if seen[i] != w {
@@ -279,5 +301,49 @@ func TestNoBrokerReaderWithoutItsURLAndToken(t *testing.T) {
 	}
 	if _, err := newBrokerReportStore("http://127.0.0.1:1", empty).latest(context.Background(), "compliance-audit"); err == nil || !strings.Contains(err.Error(), "empty") {
 		t.Fatalf("empty token = %v", err)
+	}
+}
+
+// TestASilentStoredReportNeedsNoText: a clean run's report may carry no
+// text; it is silent, not the model's chatter, and a null card is no card.
+func TestASilentStoredReportNeedsNoText(t *testing.T) {
+	t.Parallel()
+	g := &Gateway{scheduleClock: time.Now, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	g.reportStore = &fakeReportStore{answer: func(id string) (*reportEnvelope, error) {
+		return storedEnvelope(t, id, time.Now().UTC(), `"report":{"schema":"kube-agents.report/v1","card":null,"text":"","silent":true}`), nil
+	}}
+	got := g.storedReportFor(context.Background(), TaskRef{TriggerOrigin: lib.TriggerOriginBuiltin, TriggerStream: "compliance-audit", StartedAt: time.Now().Add(-time.Minute)}, nil)
+	if got == nil || !got.Silent || got.Text != scheduledSilentMarker || len(got.Card) != 0 {
+		t.Fatalf("read %+v, want a silent report with no card", got)
+	}
+}
+
+// TestARetriedScheduledPostKeepsItsFirstStoredReport: the store is read on
+// the run's first try only; a retry posts the record's report, not what
+// the store holds by then.
+func TestARetriedScheduledPostKeepsItsFirstStoredReport(t *testing.T) {
+	t.Parallel()
+	tr := startTriggerRig(t, nil)
+	tr.g.scheduledRetry = 100 * time.Millisecond
+	home := &fakeHomeReporter{home: "C0HOME", fail: func(call int) bool { return call == 1 }}
+	tr.g.setHomeReporters(home)
+	var mu sync.Mutex
+	reads := 0
+	store := &fakeReportStore{answer: func(id string) (*reportEnvelope, error) {
+		mu.Lock()
+		reads++
+		n := reads
+		mu.Unlock()
+		return storedEnvelope(t, id, time.Now().UTC(), fmt.Sprintf(`"report":{"schema":"kube-agents.report/v1","text":"read %d"}`, n)), nil
+	}}
+	tr.g.reportStore = store
+	taskID := runScheduled(t, tr, goodScheduleSubmit(), "Two findings.", nil)
+	rep := waitForScheduledReport(t, tr.rig, "compliance-audit", taskID, "the posted record", func(r *ScheduledReport) bool { return r.Status == scheduledPosted })
+	posts := home.calls()
+	if len(posts) != 2 || posts[0] != "read 1" || posts[1] != "read 1" || rep.Text != "read 1" {
+		t.Fatalf("posted %q, record %q; want the first read both times", posts, rep.Text)
+	}
+	if asked := store.calls(); len(asked) != 1 {
+		t.Fatalf("read the store %d times, want once", len(asked))
 	}
 }

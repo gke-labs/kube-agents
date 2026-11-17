@@ -74,7 +74,13 @@ type reportStoreReader interface {
 type reportEnvelope struct {
 	AuditID    string `json:"audit_id"`
 	FinishedAt string `json:"finished_at"`
-	Report     *struct {
+	// StartedAt is when the run that wrote it opened, null when finish read
+	// no record of it; Scheduled is finish --scheduled. An on-demand run of
+	// the same audit writes the same stream, so these tie it to a scheduled
+	// run that started no earlier than this one.
+	StartedAt *string `json:"started_at"`
+	Scheduled bool    `json:"scheduled"`
+	Report    *struct {
 		Schema string          `json:"schema"`
 		Card   json.RawMessage `json:"card,omitempty"`
 		Text   string          `json:"text"`
@@ -100,7 +106,12 @@ func newBrokerReportStore(base, tokenFile string) reportStoreReader {
 	if base == "" || tokenFile == "" {
 		return nil
 	}
-	return brokerReportStore{base: base, tokenFile: tokenFile, client: &http.Client{Timeout: reportStoreTimeout}}
+	return brokerReportStore{base: base, tokenFile: tokenFile, client: &http.Client{
+		Timeout: reportStoreTimeout,
+		// A redirect is an answer, not followed: the token goes to the
+		// broker's URL and nowhere else.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 func (s brokerReportStore) latest(ctx context.Context, auditID string) (*reportEnvelope, error) {
@@ -159,9 +170,10 @@ func readReportStoreToken(path string) (string, error) {
 
 // storedReportFor is ref's run's report from the store, or nil to fall back
 // to the trailing message. Only a builtin schedule's run reads, by its own
-// stream, and only an envelope of that stream that finished after the run
-// started is its report: latest may still be an earlier run's when this
-// one's store write failed.
+// stream, and only a scheduled run's envelope of that stream that started
+// no earlier than this run is its report: latest may still be an earlier
+// run's when this one's store write failed, and an on-demand run of the same
+// audit writes the same stream.
 func (g *Gateway) storedReportFor(ctx context.Context, ref TaskRef, logArgs []any) *storedReport {
 	if g.reportStore == nil || ref.TriggerOrigin != lib.TriggerOriginBuiltin || ref.TriggerStream == "" {
 		return nil
@@ -182,6 +194,9 @@ func (g *Gateway) storedReportFor(ctx context.Context, ref TaskRef, logArgs []an
 		return nil
 	}
 	out := &storedReport{Text: env.Report.Text, Silent: env.Report.Silent}
+	if out.Silent && strings.TrimSpace(out.Text) == "" {
+		out.Text = scheduledSilentMarker
+	}
 	if card := env.Report.Card; len(card) > 0 && !bytes.Equal(bytes.TrimSpace(card), []byte("null")) {
 		if len(card) <= reportStoreCardMax {
 			out.Card = card
@@ -200,15 +215,29 @@ func (g *Gateway) envelopeMismatch(env *reportEnvelope, ref TaskRef) string {
 	if env.Report == nil || env.Report.Schema != reportStoreSchema {
 		return "no " + reportStoreSchema + " report"
 	}
-	if strings.TrimSpace(env.Report.Text) == "" {
+	if strings.TrimSpace(env.Report.Text) == "" && !env.Report.Silent {
 		return "an empty report"
+	}
+	if !env.Scheduled {
+		return "an on-demand run's envelope"
+	}
+	if ref.StartedAt.IsZero() {
+		return "no recorded start for the run"
+	}
+	floor := ref.StartedAt.Add(-reportStoreSkew)
+	if env.StartedAt == nil {
+		return "no started_at"
+	}
+	started, err := time.Parse(time.RFC3339Nano, *env.StartedAt)
+	if err != nil || started.Before(floor) {
+		return "an earlier run's envelope"
 	}
 	finished, err := time.Parse(time.RFC3339Nano, env.FinishedAt)
 	if err != nil {
 		return "no finished_at"
 	}
-	if ref.StartedAt.IsZero() || finished.Before(ref.StartedAt.Add(-reportStoreSkew)) {
-		return "an earlier run's envelope"
+	if finished.Before(started) {
+		return "a finished_at before its started_at"
 	}
 	if finished.After(g.scheduleClock().Add(reportStoreSkew)) {
 		return "a finished_at in the future"
