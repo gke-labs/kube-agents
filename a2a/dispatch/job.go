@@ -68,7 +68,12 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.kind, h.taskID); err != nil {
 			log.Warn("delete the task's Job", "err", err)
 		}
-		d.breakers.expired(snap, h.profile, h.tier, d.now())
+		// The breaker guards the tier's runner. At an unattended tier that is
+		// Job mode; a permit-carrying task's Job at any other tier is not that
+		// tier's warm pool, so its failure doesn't hold back the pool's tasks.
+		if h.unattended {
+			d.breakers.expired(snap, h.profile, h.tier, d.now())
+		}
 		d.endUnstarted(ctx, log, del, h.key(), lib.StateFailed, &refusal{ReasonNoWorker, detail})
 		d.release(h, ctx.Err() == nil)
 		return lib.LeaseRecord{}, "", true, nil
@@ -256,11 +261,22 @@ func (d *Dispatcher) jobAdmitted() {
 // permit-carrying task at any tier may have one (#5646), or the config no
 // longer lists the profile, so its tier's mode can't be told and a delete,
 // which is no error for a Job that was never made, is the safe answer.
+//
+// Under Job mode (the config carries jobLabels: some profile has a template)
+// any task may have a Job, a permit-carrying one at any tier (#5646), whatever
+// its profile's template says now: a reference lost since the Job was
+// launched mustn't leave it. The delete is no error for a Job never made.
+// Without Job mode the dispatcher holds no Jobs Role, and the operator's
+// teardown removes the Jobs.
 func (d *Dispatcher) mayHaveJob(hk holdKey) bool {
 	if d.cfg.unattended(hk.tier) {
 		return true
 	}
-	prof, ok := profileOf(d.src.Config(), hk.profile)
+	snap := d.src.Config()
+	if len(snap.JobLabels) > 0 {
+		return true
+	}
+	prof, ok := profileOf(snap, hk.profile)
 	return !ok || d.cfg.jobPossible(prof, hk.tier)
 }
 
