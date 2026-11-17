@@ -14,7 +14,8 @@ import (
 // dispatcher marks every task it holds at that (profile, tier) and wakes its
 // hold, which ends it at once: canceled with ReasonTierEnded, the worker told
 // to abandon it, the submission tombstoned and acked, and its Job deleted
-// after the hold. There is no executor grace, as a stop has: the executor
+// after the hold. A task whose Job is still starting is ended the same way
+// by runJob, its Job deleted there (#6134). There is no executor grace, as a stop has: the executor
 // hears a requester's stop on the stop subject, and nothing publishes one
 // here. The breaker doesn't count it: an administrator's end is no worker
 // loss.

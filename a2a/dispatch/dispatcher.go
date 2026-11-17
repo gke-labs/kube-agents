@@ -139,7 +139,8 @@ type holding struct {
 	stopRequested bool
 	stopc         chan struct{}
 	// tierEnded is an administrator ending the drain of this task's tier
-	// (syncEndingTiers, #5850): the hold ends the task at once.
+	// (syncEndingTiers, #5850): the hold ends the task at once, and so does
+	// runJob for a task whose Job is still starting (#6134).
 	tierEnded bool
 
 	renewals chan renewal
@@ -869,7 +870,8 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
-			// The Job path ended the task itself (no worker): it no
+			// The Job path ended the task itself (no worker, or its tier
+			// ended while the Job started): it no
 			// longer waits.
 			d.clearWaiting(hk)
 			return
