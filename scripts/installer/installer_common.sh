@@ -17,8 +17,8 @@
 # none of them inline, and a point of use reads its DEFAULT_* key rather than
 # repeating the value. The exception is a fallback that deliberately differs
 # from the fresh-install default because it describes an install that already
-# exists -- `${ENABLE_GVISOR:-false}` here and in install.sh's control panel,
-# each with the argument beside it. Precedence is
+# exists -- ENABLE_GVISOR, which resolve_existing_install_gvisor reads from the
+# live cluster for both this file and install.sh's control panel. Precedence is
 # install.defaults.env → an exported environment variable → install.env → a flag.
 # install.env is sourced with `set -a`, which is what puts it above the export.
 #
@@ -720,7 +720,7 @@ openai_compatible_cidr_refusal() {
   fi
   if [[ "$address" == *:* ]]; then
     local groups
-    if ! groups="$(ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
+    if ! groups="$(trap - ERR; ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
       printf "'%s' is not an IPv6 CIDR" "$cidr"
       return 0
     fi
@@ -823,7 +823,7 @@ validate_openai_compatible_inputs() {
     return 1
   fi
   local host_port host port
-  if ! host_port="$(openai_compatible_url_host_port "$api_base")"; then
+  if ! host_port="$(trap - ERR; openai_compatible_url_host_port "$api_base")"; then
     # Not echoed: the userinfo this refuses may be the key itself.
     print_error "OPENAI_COMPATIBLE_API_BASE is not an http:// or https:// URL with a host, an optional port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}, and no userinfo, query or fragment before the path (a key belongs in OPENAI_COMPATIBLE_API_KEY)."
     return 1
@@ -984,7 +984,7 @@ render_footprint_summary() {
     echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
     return 1
   fi
-  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  probe_dir="$(trap - ERR; mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
   # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
@@ -1009,7 +1009,7 @@ render_footprint_summary() {
     set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
   fi
   local rendered rc=0
-  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rendered="$(trap - ERR; helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
   rm -rf "$probe_dir"
   if [ "$rc" -ne 0 ]; then
     printf '%s\n' "$rendered" >&2
@@ -1060,8 +1060,8 @@ print_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
   namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
   notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
-  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
-  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+  err_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(trap - ERR; render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
     if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
       print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
@@ -3376,7 +3376,7 @@ enable_scope_selector_apis() {
   [ -n "$(scope_selector_apis)" ] || return 0
   local project="${1:-${PROJECT_ID:-}}" missing rc=0 reason
   reason="$(scope_selector_apis_reason)"
-  missing="$(scope_selector_apis_missing "$project")" || rc=$?
+  missing="$(trap - ERR; scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     missing="$(scope_selector_apis)"
     print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan reads when it ${reason}, and which is idempotent..."
@@ -4143,6 +4143,43 @@ check_service_account_ownership() {
   return 1
 }
 
+# Whether the install this state records runs the agent sandboxed, for
+# resolve_existing_install_gvisor when install.env is silent. Prints true when
+# the state holds the gVisor node pool (Standard) or the agent release renders
+# runtimeClassName gvisor (Autopilot's sandbox, which has no pool), false when
+# it holds the release without either, and nothing when there is no state to
+# read or no release in it: the caller decides what an unknown means.
+tf_state_runs_gvisor() {
+  local state
+  state=$(tf_state_read "$@") || return 0
+  printf '%s' "$state" | python3 -c '
+import json, re, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+release = None
+for res in doc.get("resources", []):
+    if res.get("mode") != "managed" or not res.get("instances"):
+        continue
+    if res.get("type") == "google_container_node_pool" and res.get("name") == "gvisor":
+        print("true")
+        sys.exit(0)
+    if res.get("type") == "helm_release" and res.get("name") == "kube_agents":
+        release = res
+if release is None:
+    sys.exit(0)
+values = (release["instances"][0].get("attributes") or {}).get("values") or []
+# The composition\x27s own document is the first; a later one is
+# extra_helm_values, where a runtimeClassName can belong to something else
+# (the shell sandbox). Within it, only the one under availability counts, and
+# the match stops at the next top-level key.
+pattern = re.compile(r"availability[\"\x27]?\s*:(?:(?!\n\S).)*?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b", re.S)
+first = values[0] if values and isinstance(values[0], str) else ""
+print("true" if pattern.search(first) else "false")
+'
+}
+
 # The image tag this install's Terraform state RECORDS, which is not the tag
 # the cluster is serving: the redeploy workflows move the running tag with
 # `helm upgrade` and never run Terraform. A drift plan needs this one, or every
@@ -4673,6 +4710,76 @@ is_existing_cluster_network_policy_satisfied() {
 }
 
 
+# What ENABLE_GVISOR means for an install that already exists, read the same
+# way by every caller that re-renders one: the Terraform variables below and
+# install.sh's control panel. A set, non-empty ENABLE_GVISOR wins, from
+# install.env, the environment or a flag. With no key, the answer is what the
+# cluster runs, not a default: install.sh defaults a fresh install ON, and a
+# fallback of false here planned the destruction of a Standard install's
+# gVisor pool on the next upgrade whenever its install.env lacked the line.
+# The Terraform state answers first, for both shapes: the gVisor pool on
+# Standard, the agent release's runtimeClassName on Autopilot. With no state,
+# Standard lists its node pools; Autopilot has none to list and keeps the
+# sandbox, since a fresh install defaults it on and only an explicit
+# ENABLE_GVISOR="false" may turn it off. A cluster that does not exist yet has nothing
+# to read; install.sh exports its own default before reaching here, and
+# uninstall.sh exports false, so neither falls through to the probe.
+# Prints true or false on stdout; everything it says goes to stderr.
+resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mode]
+  local project="$1" cluster="$2" location="$3" mode="${4:-}"
+  if [ -n "${ENABLE_GVISOR:-}" ]; then
+    printf '%s' "$ENABLE_GVISOR"
+    return 0
+  fi
+  # The Terraform state first: it is what the apply will diff against, and it
+  # answers for both shapes (the pool on Standard, the release's
+  # runtimeClassName on Autopilot).
+  local recorded
+  recorded="$(tf_state_runs_gvisor "$project" "$cluster")"
+  if [ "$recorded" = "true" ]; then
+    print_info "install.env has no ENABLE_GVISOR; this install's Terraform state runs the agent sandboxed (gVisor), so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+    return 0
+  fi
+  # A state that holds the release and no sandbox answers for either shape: a
+  # live pool it does not record is not this install's to plan around.
+  if [ "$recorded" = "false" ]; then
+    printf 'false'
+    return 0
+  fi
+  if [ -z "$mode" ]; then
+    local autopilot
+    autopilot="$(trap - ERR; gcloud container clusters describe "$cluster" --location "$location" \
+      --project "$project" --format="value(autopilot.enabled)" 2>/dev/null || true)"
+    case "${autopilot//[[:space:]]/}" in
+      True|true) mode="autopilot" ;;
+      *) mode="standard" ;;
+    esac
+  fi
+  if [ "$mode" = "autopilot" ]; then
+    # No state to read. Autopilot has no pool to list, and a fresh install
+    # defaults the sandbox on (install.defaults.env DEFAULT_ENABLE_GVISOR), so
+    # the sandbox stays on: only an explicit ENABLE_GVISOR="false" turns it off.
+    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read or records no release, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
+    printf 'true'
+    return 0
+  fi
+  local pool="${GVISOR_POOL_NAME:-$DEFAULT_GVISOR_POOL_NAME}" pools rc=0
+  pools="$(trap - ERR; gcloud container node-pools list --cluster "$cluster" --location "$location" \
+    --project "$project" --format="value(name)" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    print_warning "install.env has no ENABLE_GVISOR, and the node pools of '${cluster}' could not be listed to tell whether it runs the gVisor pool '${pool}'. Reading it as off; the apply refuses to destroy a gVisor pool it finds in state. Add ENABLE_GVISOR=\"true\" or \"false\" to install.env to say which." >&2
+    printf 'false'
+    return 0
+  fi
+  if grep -Fxq "$pool" <<<"$pools"; then
+    print_info "install.env has no ENABLE_GVISOR; cluster '${cluster}' runs the gVisor pool '${pool}', so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
 # generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
@@ -4857,8 +4964,10 @@ write_tfvars_from_state() {
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
   # re-creatable infrastructure. Every other key the generator defaults --
-  # ENABLE_GVISOR, ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the
-  # rest -- names something Terraform can build again; this one names the
+  # ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the rest -- names
+  # something Terraform can build again (ENABLE_GVISOR, also read from the live
+  # install, does so for the sandbox rather than for data:
+  # resolve_existing_install_gvisor); this one names the
   # hindsight-postgresql StatefulSet and the volume holding the database. So it
   # is the one the generator goes and asks the cluster about when nobody told
   # it, rather than taking the project default.
@@ -5029,23 +5138,19 @@ write_tfvars_from_state() {
   # module for one there fails the plan. Deriving both from the probed
   # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
-  # The fallback stays false even though a fresh install now defaults to the
-  # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
-  # calling this function, so the fallback here
-  # never decides a new install — it only decides the callers that read an
-  # install that already exists. uninstall.sh is the one that matters:
-  # install.env is optional there, and the documented `curl … | bash` teardown
-  # runs from a fresh clone that has none. Defaulting on for that caller would
-  # let the Autopilot version-floor check below abort a destroy, leaving an
-  # install with no working way to remove itself.
-  #
-  # The fallback only reaches the teardown that has no install.env, which is not
-  # the ordinary one — a teardown from the checkout that installed loads an
-  # install.env saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
-  # itself before calling this, and the comment there is where that argument
-  # lives. Do not read the fallback as protecting the teardown on its own.
-  local gvisor_node_pool="false" agent_runtime_class=""
-  if is_truthy "${ENABLE_GVISOR:-false}"; then
+  # With no ENABLE_GVISOR, an existing cluster's own state decides
+  # (resolve_existing_install_gvisor, above), never a default in either
+  # direction. A cluster this run creates has none to read: install.sh exports
+  # its default before calling this, so the false below decides only a caller
+  # that brings neither, and uninstall.sh exports false itself so the
+  # Autopilot version-floor check below can never abort a teardown.
+  local gvisor_node_pool="false" agent_runtime_class="" gvisor_intent="false"
+  if [ "$cluster_exists" = "true" ]; then
+    gvisor_intent="$(resolve_existing_install_gvisor "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$cluster_mode")"
+  elif [ -n "${ENABLE_GVISOR:-}" ]; then
+    gvisor_intent="$ENABLE_GVISOR"
+  fi
+  if is_truthy "$gvisor_intent"; then
     agent_runtime_class="gvisor"
     if [ "$cluster_mode" = "standard" ]; then
       gvisor_node_pool="true"
@@ -5178,7 +5283,7 @@ write_tfvars_from_state() {
       return 1
     fi
     if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
-      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+      redaction_rules="$(trap - ERR; hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
     fi
   fi
   # The scoped service account pool, for the same reason: a misspelt switch

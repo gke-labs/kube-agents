@@ -50,7 +50,30 @@ const (
 	memoryLimitCallEnvArg    = "operatorMemoryLimitEnv"
 	memoryLimitCallShareArg  = "operatorMemoryLimitFraction"
 	managerConstructorCall   = "ctrl.NewManager"
+	// The webhook's namespace rule reaches the validator through this one
+	// call's second argument. Every webhook test builds the validator by
+	// hand, so a call that passed "" or another name would switch the rule
+	// off on every install with every suite green.
+	webhookSetupCall           = "agentwebhook.SetupPlatformAgentWebhookWithManager"
+	webhookSetupArgs           = "mgr, operatorNamespace"
+	webhookSetupNamespaceIdent = "operatorNamespace"
 )
+
+func TestMainHandsTheWebhookTheOperatorNamespace(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, mainSourceFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", mainSourceFile, err)
+	}
+	pos, args := callSite(file, webhookSetupCall)
+	if !pos.IsValid() {
+		t.Fatalf("%s does not call %s: the PlatformAgent webhook is not registered", mainSourceFile, webhookSetupCall)
+	}
+	if args != webhookSetupArgs {
+		t.Errorf("%s calls %s(%s), want (%s): the validator holds a PlatformAgent to the namespace in %s, and any other value or an empty one admits it anywhere",
+			mainSourceFile, webhookSetupCall, args, webhookSetupArgs, webhookSetupNamespaceIdent)
+	}
+}
 
 // The soft memory limit is the manager's one defence between "the cache
 // outgrew the limit" and the OOM killer, and like the two lines above it
