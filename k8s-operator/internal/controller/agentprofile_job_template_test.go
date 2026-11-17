@@ -167,7 +167,17 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if ref.Name != dispatchJobTemplatePrefix+"tse" {
 		t.Errorf("the config names %s, want the policy's param for tse", ref.Name)
 	}
-	inConfig := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)["tse"]
+	// The reconcile rendered the install's task-signing key into the
+	// template; render the comparison with the same one.
+	var signing corev1.Secret
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-a2a-task-signing-key"}, &signing); err != nil {
+		t.Fatalf("the task-signing Secret: %v", err)
+	}
+	key, ok := readA2ATaskSigningKey(&signing)
+	if !ok {
+		t.Fatal("the task-signing Secret doesn't read back")
+	}
+	inConfig := dispatchJobTemplates(agent, profiles, false, key.Public)["tse"]
 	if strings.Contains(cm.Data[a2aDispatchConfigKey], "containers") {
 		t.Error("the dispatch config carries a pod template; it should name the param instead")
 	}
