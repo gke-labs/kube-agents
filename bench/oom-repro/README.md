@@ -8,7 +8,8 @@ large fleet from KWOK (Kubernetes WithOut Kubelet) nodes. A KWOK node is a real 
 real GKE cluster, but no virtual machine runs it. The fleet therefore costs little, and the agent
 reads it as it reads a large fleet.
 
-The test reproduces three failures at the operator's default memory limits:
+On the builds that the table below names, the test reproduces three failures at the operator's
+default memory limits:
 
 - The sandbox shell runs the agents' terminals, scripts and `kubectl`. It is OOMKilled when an
   audit lists every Pod of two large clusters at the same time.
@@ -17,16 +18,19 @@ The test reproduces three failures at the operator's default memory limits:
 - The event watcher sends cluster Events to the agent. It is OOMKilled at start-up when it reads
   the Events of several large clusters at the same time.
 
+Later builds change how the audit and the event watcher read these lists. The test has not run
+against those changes.
+
 No CI job runs this test, and the nightly evaluation does not include it. You run it by hand
 against an install and a GCP project of your own.
 
 ## What it reproduces
 
-| Container (default limit)                                      | Build                           | Trigger                                                                                       | Share of memory at the kill                                                                         | Tickets                    |
-| -------------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------- |
-| `shell` (2 CPU, 2 GiB)                                         | with the Kubernetes API proxy   | `compliance-audit` and the agents' own reads list every Pod of two large clusters             | `kubectl get … -A` lists 94 to 98 %, other 2 to 6 %                                                 | #2045                      |
-| `envoy-credential-proxy` (2 CPU, 2 GiB)                        | before the Kubernetes API proxy | `compliance-audit` lists `deploy,sts,ds,cronjob,pod -A -o json` on two large clusters at once | `kubectl` children 91 %, the credential broker (`credential_proxy.py`) 4 %, Envoy 4 %, `hermes` 1 % | #2045, #2324, #2652, #4315 |
-| `agent-api-auth`, the event watcher's container (1 CPU, 2 GiB) | both                            | start-up reads four clusters of 400,000 Events each                                           | `k8s-event-watcher` 97 %, the API authenticator (`credential_proxy.py` in that role) 3 %            | #2648, #4512               |
+| Container (default limit)                                      | Build                                            | Trigger                                                                                       | Share of memory at the kill                                                                         | Tickets                    |
+| -------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------- |
+| `shell` (2 CPU, 2 GiB)                                         | with the Kubernetes API proxy, before `a2c9ad52` | `compliance-audit` and the agents' own reads list every Pod of two large clusters             | `kubectl get … -A` lists 94 to 98 %, other 2 to 6 %                                                 | #2045                      |
+| `envoy-credential-proxy` (2 CPU, 2 GiB)                        | before the Kubernetes API proxy                  | `compliance-audit` lists `deploy,sts,ds,cronjob,pod -A -o json` on two large clusters at once | `kubectl` children 91 %, the credential broker (`credential_proxy.py`) 4 %, Envoy 4 %, `hermes` 1 % | #2045, #2324, #2652, #4315 |
+| `agent-api-auth`, the event watcher's container (1 CPU, 2 GiB) | `fb56483b`                                       | start-up reads four clusters of 400,000 Events each                                           | `k8s-event-watcher` 97 %, the API authenticator (`credential_proxy.py` in that role) 3 %            | #2648, #4512               |
 
 The shares are of the summed RSS (resident memory) of the container's processes in the killed
 pod's last sample. The harness's reports:
@@ -43,6 +47,12 @@ pod's last sample. The harness's reports:
   harness, which did not yet write the `Samples:` line.
 - [`evidence/watcher-main-fb56483b.md`](evidence/watcher-main-fb56483b.md): the event watcher, on
   `fb56483b`. OOMKilled 3 times in about 2 minutes, during its initial Event lists.
+
+Two later commits on `main` change these triggers. From `c77c32e0`, the event watcher lists Events
+in pages of 500 on a control plane without a watch-list stream. From `a2c9ad52`, the
+compliance-audit collector reads each kind in pages of 500, not in one
+`deploy,sts,ds,cronjob,pod -A -o json` list. The harness has not run `watcher` on a build with the
+first, or `proxy` on a build with the second.
 
 The evidence fleet had two full clusters of about 2,900 KWOK nodes and 80,000 Pods each and two
 Events-only clusters, first built by hand for this test and then grown to
@@ -94,7 +104,8 @@ carries them. Then it starts the trigger and waits for `--kills` OOMKills of tha
 `--seconds`. At the end it puts the container's resources (and the runtime class) back as they were
 and writes `report.md`: the samples it took, the kills, and for each kill the share of each process
 class in the killed pod's last sample. The sampler's own memory is reported beside the shares, not
-in them. A run with no samples writes its report and then ends with an error, so a run that watched
+in them. Each sample keeps the command line of each process over 4 MiB, so a credential passed as an
+argument is written under `--out`; the default `oom-repro-out` is git-ignored. A run with no samples writes its report and then ends with an error, so a run that watched
 nothing is not read as zero kills. Two failed renewals of the
 lease in a row stop the scenario, which then restores. Ctrl-C, `SIGTERM`, `SIGHUP` and a failed trigger also
 restore, and still write the report. If a run is killed some other way, restore the spec from `platformagent-before.json`. The
@@ -114,7 +125,9 @@ hour after `events`.
 The agent pod runs under gVisor on an install made with `install.sh` or the chart's defaults. gVisor applies one memory limit to the whole
 sandbox, not one limit per container, and in a run outside the harness the event watcher passed its
 2 GiB limit under gVisor without being killed. `--runc` removes the runtime class for the scenario,
-so the container's own limit applies, as it does on runc.
+so the container's own limit applies, as it does on runc. The agent pod runs without gVisor's
+isolation until the scenario restores the runtime class. A run killed some other way leaves it
+without gVisor until you restore the spec from `platformagent-before.json`.
 
 ## Fleet notes
 
