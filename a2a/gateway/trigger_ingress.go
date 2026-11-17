@@ -182,7 +182,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	// minted can't be minted again. Such an attempt was never recorded, so
 	// never published (the run is recorded before its publish): the next
 	// attempt's task id is safe to use.
-	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream}
+	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
 	var run TriggerRun
 	for attempt := 0; ; attempt++ {
 		taskID := triggerTaskID(s.IdempotencyKey, attempt)
@@ -231,7 +231,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 // run already recorded (pending) on rec.
 func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s lib.TriggerSubmit, route *profileRoute, run TriggerRun) lib.TriggerSubmitReply {
 	taskID := run.Task
-	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream}
+	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
 	authority := Authority{
 		Requester: AuthorityRequester{
 			Principal:  g.ps.Hash("trigger:" + s.Trigger.Name),

@@ -133,6 +133,12 @@ type TriggerClaim struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
+	// Script names the profile script a built-in schedule's run executes in
+	// place of a model turn (#5622): one of the profile's spec.scripts, by
+	// name, never a path. Empty for a prompt run. The gateway mints it into
+	// the task's grant and authority, and the dispatcher resolves it against
+	// the profile's allowlist at admission.
+	Script string `json:"script,omitempty"`
 }
 
 // Bounds on a submission, the AgentSchedule CRD's own: what the reconciler
@@ -154,10 +160,7 @@ func ValidateTriggerSubmit(source string, s TriggerSubmit) error {
 	if source != TriggerSourceSchedule {
 		return fmt.Errorf("trigger source %q is not %q, the one source that submits", source, TriggerSourceSchedule)
 	}
-	// No script yet: a submission carries none until TriggerSubmit gains it
-	// (the script-run work, after this ingress), so the claim is checked as
-	// a prompt run's.
-	if err := ValidateTrigger(s.Trigger.Name, s.Trigger.Origin, s.Trigger.Stream, ""); err != nil {
+	if err := ValidateTrigger(s.Trigger.Name, s.Trigger.Origin, s.Trigger.Stream, s.Trigger.Script); err != nil {
 		return err
 	}
 	src, name, _ := strings.Cut(s.Trigger.Name, "/")

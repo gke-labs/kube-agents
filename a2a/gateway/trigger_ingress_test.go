@@ -187,6 +187,51 @@ func TestATriggerSubmissionStartsATaskWithTheTriggerBound(t *testing.T) {
 	}
 }
 
+// A submission naming a profile script carries it into both the grant and
+// the authority the envelope claims, which is what the dispatcher checks
+// against the profile's allowlist and the worker against its credential
+// (#5622).
+func TestATriggerSubmissionsScriptIsMintedIntoTheGrantAndTheAuthority(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "compliance-audit"
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil || reply.TaskID == "" {
+		t.Fatalf("reply = %+v", reply)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var env lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	want := capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || *claimed != want {
+		t.Fatalf("authority trigger = %+v, %v; want %+v", claimed, err, want)
+	}
+	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil || !present {
+		t.Fatalf("authority grant: %+v, %v, %v", ref, present, err)
+	}
+	if entry := readCapEntry(t, tr.url, ref); entry.Trigger == nil || *entry.Trigger != want {
+		t.Errorf("grant trigger = %+v, want %+v", entry.Trigger, want)
+	}
+}
+
+// A script that is a path, not a name, is refused before anything is minted.
+func TestATriggerSubmissionWithAScriptPathIsRefused(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "/opt/kube-agents/scripts/compliance_audit.py"
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused == nil || reply.Refused.Reason != lib.TriggerRefusedInvalid || reply.TaskID != "" {
+		t.Fatalf("reply = %+v, want refused %s", reply, lib.TriggerRefusedInvalid)
+	}
+	if n := len(tr.submissions()); n != 0 {
+		t.Errorf("%d submission(s) published for a refused trigger", n)
+	}
+}
+
 // TestARepeatedTriggerSubmissionIsTheSameRun: the same idempotency key
 // answers with the same task and starts nothing, and spends no rate budget;
 // a new key is a new run.
