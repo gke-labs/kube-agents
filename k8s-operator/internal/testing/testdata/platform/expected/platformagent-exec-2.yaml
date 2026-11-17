@@ -1526,6 +1526,10 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: AUDIT_REPORT_STORE_URL
+              value: http://platformagent-report-store.kubeagents-system.svc:8700
+            - name: AUDIT_REPORT_STORE_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/audit-report-store/token
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -1582,6 +1586,9 @@ spec:
               readOnly: true
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/audit-report-store
+              name: audit-report-store-ksa
               readOnly: true
       dnsConfig:
         options:
@@ -1651,6 +1658,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - name: audit-report-store-ksa
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-audit-report-store
+                  expirationSeconds: 3600
+                  path: token
 status: {}
 ---
 apiVersion: policy/v1
@@ -2766,6 +2781,12 @@ spec:
                   name: platformagent-event-watcher-alert-exclude
             - name: WATCHER_ALERT_EXCLUDE_FILE
               value: /etc/kube-agents/event-watcher/rules.json
+            - name: AUDIT_REPORT_STORE_ENABLED
+              value: "1"
+            - name: AUDIT_REPORT_STORE_ALLOWED_SUBJECT
+              value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent
+            - name: AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX
+              value: platformagent-credential-proxy-
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2792,6 +2813,8 @@ spec:
               name: proxy-api
             - containerPort: 9095
               name: event-metrics
+            - containerPort: 8700
+              name: report-store
           readinessProbe:
             failureThreshold: 3
             initialDelaySeconds: 5
@@ -3160,6 +3183,14 @@ spec:
         - port: 9119
           protocol: TCP
     - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+      ports:
+        - port: 8700
+          protocol: TCP
+    - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
@@ -3199,6 +3230,35 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-report-store
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: report-store
+      port: 8700
+      protocol: TCP
+      targetPort: report-store
+  selector:
+    app: platformagent-gateway
+  type: ClusterIP
+status:
+  loadBalancer: {}
 ---
 apiVersion: v1
 data:
