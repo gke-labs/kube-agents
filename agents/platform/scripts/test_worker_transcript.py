@@ -1361,6 +1361,257 @@ class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestStoreFamilyReadKeepsItsVerdict(unittest.TestCase):
+    """The secret-store family patterns read a long command again from each
+    tool name, and the `ssm` and `vault` ones from each of their own words
+    too (#6209). The one-pass read must give the same verdict as they did."""
+
+    # The family patterns and their named-lists patterns before #6209, in
+    # the order of `SECRET_STORE_FAMILIES`, kept here ONLY as the reference
+    # for equal output. Five of the family patterns cost quadratic time or
+    # more (the `ssm` one cubic); nothing but these tests uses them.
+    OLD_FAMILIES = (
+        (r"(?i)\bgcloud\b[^|&;]*?\bsecrets\s+((?:versions\s+)?\S+)", r"(?i)^(?:list|describe|versions\s+(?:list|describe))\b"),
+        (r"(?i)\baws\b[^|&;]*?\bsecretsmanager\s+(\S+)", r"(?i)^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b"),
+        (r"(?i)\baws\b[^|&;]*?\bssm\s+(?:\S+\s+)*?((?:get|describe)-parameters?\S*)", r"(?i)^describe-parameters\b"),
+        (r"(?i)\baz\b[^|&;]*?\bkeyvault\s+secret\s+(\S+)", r"(?i)^(?:list|list-versions|list-deleted)\b"),
+        (r"(?i)(?:^|[\s('\"`/])vault\s+(?:\S+\s+)*?((?:kv|read)\b(?:\s+\S+)?)", r"(?i)^kv\s+(?:list|metadata)\b"),
+        (r"(?i)(?:^|[\s('\"`/])sops\s+(\S+)", r"(?i)^(?:-e|--encrypt|encrypt|updatekeys|-v|--version)\b"),
+    )
+    # Per family: four of its words (the built strings use these; the first
+    # names the family in the subtests), then more of its words, spellings in
+    # another case (one with a letter outside ASCII that folds to the
+    # family's: U+017F for `s`, U+212A for `k`), and words that only look
+    # like the family's.
+    FAMILY_UNITS = (
+        ["gcloud", "secrets", "versions", "list", "access", "describe", "GCLOUD", "Secrets", "LIST", "\u017fecrets", "gcloud-x", "xsecrets", "secretsx"],
+        ["aws", "secretsmanager", "list-secrets", "get-secret-value", "get-resource-policy", "AWS", "SecretsManager", "LIST-SECRETS", "\u017fecretsmanager", "awsx", "secretsmanagers"],
+        ["aws", "ssm", "get-parameter", "describe-parameters", "get-parameters-by-path", "SSM", "Get-Parameter", "DESCRIBE-PARAMETERS", "\u017f\u017fm", "ssmx", "xget-parameter"],
+        ["az", "keyvault", "secret", "list", "show", "list-versions", "AZ", "KeyVault", "LIST", "\u212aeyvault", "azx", "keyvaults", "secrets"],
+        ["vault", "kv", "read", "list", "get", "metadata", "VAULT", "KV", "Read", "\u212av", "kv-v2", "kvx", "xvault", "vaultx"],
+        ["sops", "-e", "-d", "--version", "encrypt", "SOPS", "-E", "--VERSION", "\u017fops", "sopsx", "xsops", "f.yaml"],
+    )
+    # What stands between the words: blanks of several kinds, the three
+    # separators, the characters a command word may follow, and other text.
+    BETWEEN_UNITS = [" ", "  ", "\n", "\t", "\r", "\x0c", "\x85", "\xa0", "\u2028", ";", "|", "&", "x", "-", "'", '"', "/", "(", "`", "=", "é"]
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+
+        cls.re = re
+        cls.old_families = [(re.compile(family), re.compile(named_lists)) for family, named_lists in cls.OLD_FAMILIES]
+        cls.never = re.compile(r"(?!)")
+
+    def setUp(self):
+        self.addCleanup(setattr, worker_transcript, "SECRET_STORE_FAMILIES", worker_transcript.SECRET_STORE_FAMILIES)
+        self.families = worker_transcript.SECRET_STORE_FAMILIES
+
+    def _strings(self, index, short, count, seed):
+        """Every string of up to `short` units; every string of a tool name
+        or none and three of the family's words with gaps between them, as
+        written, in upper case and in title case; then `count` longer random
+        ones."""
+        import itertools
+        import random
+
+        words = self.FAMILY_UNITS[index]
+        units = words + self.BETWEEN_UNITS
+        for length in range(short + 1):
+            for combo in itertools.product(units, repeat=length):
+                yield "".join(combo)
+        for combo in itertools.product(
+            [words[0] + " ", words[0], ""], [" ", " x ", ";", "\n", ""], words[:4], [" ", "\t ", "\x0c", "  x ", ";"], words[:4], [" ", "\n"], words[:4]
+        ):
+            text = "".join(combo)
+            yield text
+            yield text.upper()
+            yield text.title()
+        rng = random.Random(seed)
+        weighted = words * 3 + self.BETWEEN_UNITS + [" "] * 12
+        for _ in range(count):
+            yield "".join(rng.choice(weighted) for _ in range(rng.randint(short + 1, 40)))
+
+    def _reads(self, index, text, named_lists=None):
+        """The read's verdict on `text` with only family `index` in the
+        table, with its own named-lists pattern or with `named_lists` in its
+        place. The loop sits inside the function, so the tests read its
+        captures through the verdict; the depth is the limit, so no quoted
+        script is read."""
+        family = self.families[index]
+        if named_lists is not None:
+            family = family[:3] + (named_lists,) + family[4:]
+        worker_transcript.SECRET_STORE_FAMILIES = (family,)
+        return worker_transcript._simple_command_reads_a_secret(text, worker_transcript.MAX_NESTED_COMMAND_DEPTH)
+
+    def _differences(self, index, text):
+        """What the one-pass read of family `index` reads on `text` that the
+        old patterns did not, or the reverse. Four verdicts pin the set of
+        captures and the named lists: the real verdict against the old
+        family pattern and the old named-lists pattern; then, with the
+        named-lists pattern replaced, one that matches nothing (some
+        capture), one that fails for a single capture (that capture is
+        read), and one that matches the old captures only (a capture the
+        old pattern had not)."""
+        re = self.re
+        old_family, old_named_lists = self.old_families[index]
+        captures = [match.group(1) for match in old_family.finditer(text)]
+        found = []
+        if self._reads(index, text) != any(not old_named_lists.match(capture) for capture in captures):
+            found.append("the verdict")
+        if self._reads(index, text, self.never) != bool(captures):
+            found.append("some capture")
+        for capture in set(captures):
+            if not self._reads(index, text, re.compile(r"(?!%s\Z)" % re.escape(capture), re.DOTALL)):
+                found.append("capture %r is not read" % capture)
+        if captures and self._reads(index, text, re.compile(r"(?:%s)\Z" % "|".join(map(re.escape, set(captures))), re.DOTALL)):
+            found.append("a capture the old pattern had not")
+        return found, captures
+
+    def test_each_family_reads_what_the_old_pattern_read(self):
+        for index, words in enumerate(self.FAMILY_UNITS):
+            with self.subTest(family=words[0], index=index):
+                with_capture = 0
+                for text in self._strings(index, short=2, count=4000, seed=6209 + index):
+                    found, captures = self._differences(index, text)
+                    self.assertEqual(found, [], "%r, old captures %r" % (text, captures))
+                    with_capture += bool(captures)
+                # The strings must reach the read: many of them hold a capture.
+                self.assertGreater(with_capture, 300)
+
+    def test_the_read_keeps_the_cases_that_shaped_it(self):
+        for command, want in (
+            # Every mention on the command is read: a list, then a value read.
+            ('echo "$(gcloud secrets list) $(gcloud secrets versions access latest --secret=db)"', True),
+            ('echo "$(gcloud secrets list) $(gcloud secrets describe db)"', False),
+            ('echo "$(aws secretsmanager list-secrets) $(aws secretsmanager get-secret-value --secret-id db)"', True),
+            # A separator between the tool name and the family word: the tool name no longer counts.
+            ('echo "aws secretsmanager get-secret-value --secret-id db"', True),
+            ('echo "aws; secretsmanager get-secret-value --secret-id db"', False),
+            ('echo "gcloud | secrets versions access latest"', False),
+            ('echo "az & keyvault secret show --name db"', False),
+            ('echo "aws; ssm get-parameter --name db"', False),
+            # Behind `ssm`, the words may stand past a separator.
+            ('aws ssm --region "a;b" get-parameter --name db', True),
+            ('aws ssm --region "a;b" describe-parameters', False),
+            # Behind a read, the tool name must be met again.
+            ("aws secretsmanager list-secrets secretsmanager get-secret-value", False),
+            ("aws secretsmanager list-secrets aws secretsmanager get-secret-value", True),
+            # The words that were read are not read again as a tool name.
+            ("gcloud secrets list-gcloud secrets versions access latest", False),
+            ("gcloud secrets list gcloud secrets versions access latest", True),
+            # The start of the words takes no more than itself: the tool name behind it in the same word counts.
+            ("echo get-parameters/aws ssm get-parameter --name db", True),
+            ("echo get-parameters/aws ssm describe-parameters", False),
+            # The gate has a blank behind it, of any kind.
+            ("aws ssm-agent get-parameter", False),
+            ("aws ssm\x0cget-parameter --name db", True),
+            ("aws ssm --region r get-parameters-by-path --path /", True),
+            ("az keyvault secret show --name db --vault-name v", True),
+            ("az keyvault  secret\tlist-versions --name db", False),
+            ("az keyvault secrets show --name db", False),
+            # `vault` as a command word, then `kv` or `read` as a word behind its flags.
+            ("vault -namespace=p kv get secret/db", True),
+            ("vault kv metadata get secret/db", False),
+            ("vault kv list secret/ vault read secret/db", True),
+            ("kubectl get pods -n vault", False),
+            ("vault status", False),
+            ("/usr/local/bin/sops secrets.enc.yaml", True),
+            ("sops -d secrets.enc.yaml", True),
+            ("sops -e secrets.yaml", False),
+            # The capture is two words after `versions`, and one when no word follows it.
+            ("gcloud secrets versions list db", False),
+            ("gcloud secrets versions describe 3 --secret=db", False),
+            ("gcloud secrets versions", True),
+            # Each part and each named list is read in any case.
+            ("gcloud SECRETS versions access latest", True),
+            ("gcloud secrets LIST", False),
+            ("aws ssm Get-Parameter --name db", True),
+            ("aws secretsmanager Get-Resource-Policy --secret-id db", False),
+            ("az keyvault secret SHOW --name db", True),
+            ("vault KV get secret/db", True),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(worker_transcript.command_reads_a_secret(command), want)
+
+    def test_the_read_calls_no_python_function(self):
+        # The pass is written inside `_simple_command_reads_a_secret`, so a
+        # command that a family decides is read with no Python call below
+        # that function. A function or a generator of its own for the pass
+        # would put the read one frame deeper, and a step nested to the
+        # recursion limit would then fail one level sooner than before.
+        import sys
+
+        for command in (
+            "gcloud secrets versions access latest",
+            "aws secretsmanager get-secret-value --secret-id db",
+            "aws ssm get-parameter --name db",
+            "az keyvault secret show --name db",
+            "vault kv get secret/db",
+            "sops -d secrets.enc.yaml",
+        ):
+            with self.subTest(command=command):
+                calls = []
+
+                def note(frame, event, arg):
+                    if event == "call":
+                        calls.append(frame.f_code.co_name)
+
+                sys.setprofile(note)
+                try:
+                    verdict = worker_transcript._simple_command_reads_a_secret(command, 0)
+                finally:
+                    sys.setprofile(None)
+                self.assertTrue(verdict)
+                self.assertEqual(calls, ["_simple_command_reads_a_secret"])
+
+    def test_a_run_of_store_words_reads_in_linear_time(self):
+        # The whole detector on 8 KB of `aws ssm`. The old `ssm` pattern was
+        # cubic and needs 14 s of CPU time here; the one-pass read needs
+        # 0.004 s. The bound is on CPU time, as in the other linear-time
+        # tests of this file, and the command is no longer than this on
+        # purpose: the rest of the detector reads a longer command slowly
+        # under the coverage job in CI, which runs this file about 5 times
+        # slower than a developer's machine. The longer commands are in the
+        # next test, on the read of one simple command. The command starts
+        # with the family's words, which count for nothing there, so that
+        # the pass runs: a command with no start of the words is not passed
+        # over at all.
+        import time
+
+        command = "echo get-parameter " + "aws ssm " * 1000
+        start = time.process_time()
+        self.assertFalse(worker_transcript.command_reads_a_secret(command))
+        self.assertLess(time.process_time() - start, 1.0)
+        self.assertTrue(worker_transcript.command_reads_a_secret(command + "get-parameter --name db"))
+
+    def test_a_run_of_store_words_costs_the_family_read_linear_time(self):
+        # The read of one simple command, on commands of 4 KB to 120 KB that
+        # repeat a store's words. The one-pass read needs at most 0.03 s of
+        # CPU time under the coverage job's tracer. On the first five
+        # commands the old patterns need 2 s to 9 s; the last command
+        # repeats two tool names, and each of the three old patterns that
+        # start from them needs about 4 s on it. So the 1 s bound has a
+        # wide margin on a slow runner, a quadratic form fails on a fast
+        # one, and a run that fails stays near a minute. Each command starts
+        # with the family's words, which count for nothing there, so that
+        # the pass runs.
+        import time
+
+        for command in (
+            "secretsmanager " + "aws " * 15000,
+            "x get-parameter " + "aws ssm " * 500,
+            "secrets " + "gcloud " * 15000,
+            "az keyvault " * 10000,
+            "x kv " + "vault x " * 12000,
+            "secrets secretsmanager keyvault x get-parameter " + "gh az aws oc " * 8000,
+        ):
+            with self.subTest(command=command[:20]):
+                start = time.process_time()
+                worker_transcript._simple_command_reads_a_secret(command, worker_transcript.MAX_NESTED_COMMAND_DEPTH)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
