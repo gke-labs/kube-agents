@@ -1230,3 +1230,51 @@ def test_the_report_reads_the_token_file(env, github, capsys, monkeypatch, tmp_p
     token_file.write_text("", encoding="utf-8")
     assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == github_writes.EXIT_UNREADABLE
     assert f"BENCH_GITHUB_TOKEN_FILE names {token_file}, which was refused" in capsys.readouterr().err
+
+
+def test_a_rate_limited_listing_is_named_as_the_limit_not_a_permission():
+    """#6105: the grader used to report the shared installation's limit as
+    "needs `pull_requests: read`". A rate-limit 403 now says it is a limit; a
+    permission 403 still names the permission."""
+    limited = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "API rate limit exceeded for installation ID 1."}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        limited.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "rate-limited" in str(exc.value)
+    assert "pull_requests: read" not in str(exc.value)
+    refused = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "Resource not accessible by integration"}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        refused.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "pull_requests: read" in str(exc.value)
+
+
+def test_a_rate_limited_branch_listing_raises_instead_of_reading_as_no_grant():
+    """A branch listing answered with a rate limit used to read as "cannot
+    list refs" (None) and let the check carry on blind; it now raises, named
+    as the limit. A permission 403 still reads as None."""
+    limited = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "API rate limit exceeded for installation ID 1."}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        limited.branches_under("o/r", "fix")
+    assert "rate-limited" in str(exc.value)
+    with pytest.raises(github_writes.GitHubUnreadable):
+        limited.branch_tip_date("o/r", "fix-1")
+    refused = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "Resource not accessible by integration"}), 1.0)
+    assert refused.branches_under("o/r", "fix") is None
+
+
+def test_a_limit_marked_only_in_its_headers_is_a_limit_to_the_client():
+    """The client reads the read's headers as the read path's wait does: a
+    403 whose body names no limit but whose headers say no budget is left
+    raises on a branch listing, named as the limit, instead of reading as
+    "cannot list refs"."""
+    def transport(url, tok, timeout):
+        verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+        return 403, {"message": "Forbidden"}
+
+    client = github_writes.GitHubClient("t", transport, 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        client.branches_under("o/r", "fix")
+    assert "rate-limited" in str(exc.value)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        client.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
+    assert "rate-limited" in str(exc.value)
+    verifiers._last_forge_error_headers.set(None)
