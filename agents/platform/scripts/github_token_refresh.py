@@ -37,9 +37,13 @@ import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
 
-# A URL's userinfo, the part between "<scheme>://" and "@": it can carry a
-# credential, so nothing this script logs keeps it.
-_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#@]+@")
+# A URL's userinfo, the part between "<scheme>://" and the last "@" before
+# the path, query or fragment, where a URL parser ends it: it can carry a
+# credential, so nothing this script logs keeps it. Greedy, so an "@" inside
+# the userinfo can't leave the rest of it behind.
+# No word-boundary anchor, so a scheme glued to the text before it is still
+# found, and a bounded scheme keeps the scan linear on long lines.
+_URL_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,30}://)[^\s/?#]*@")
 
 
 def redact_url(text: str) -> str:
@@ -48,14 +52,21 @@ def redact_url(text: str) -> str:
 
 
 def redact_remote(remote: str) -> str:
-    """A git remote as it may be logged: redact_url, then, in any word that is
-    not a URL, everything before its last "@". A remote that did not parse may
-    carry a credential in a shape no URL grammar names."""
+    """A git remote (or part of one) as it may be logged: in every word,
+    everything before its last "@" is masked, keeping a "<scheme>://" prefix.
+
+    Stricter than redact_url, for a value that came from outside the script
+    and may not have parsed: a credential in a shape no URL grammar names still
+    ends before an "@". Costs only an scp remote's user name ("git").
+    """
 
     def word(token: str) -> str:
-        if "://" in token or "@" not in token:
+        cut = token.find("://")
+        prefix = token[: cut + 3] if cut >= 0 else ""
+        rest = token[len(prefix) :]
+        if "@" not in rest:
             return token
-        return "[REDACTED]@" + token.rsplit("@", 1)[1]
+        return prefix + "[REDACTED]@" + rest.rsplit("@", 1)[1]
 
     return re.sub(r"\S+", lambda m: word(m.group(0)), redact_url(remote))
 
@@ -391,7 +402,7 @@ def github_repo_from_remote(url: str) -> str | None:
         log(f"Ignoring git remote: '{redact_remote(url)}' names no host.")
         return None
     if not ref.is_github:
-        log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
+        log(f"Ignoring git remote: host '{redact_remote(ref.host)}' is not a GitHub host.")
         return None
     if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
         log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")

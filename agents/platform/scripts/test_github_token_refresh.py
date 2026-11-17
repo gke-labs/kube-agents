@@ -124,6 +124,12 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             f"https://{secret}@github.com/%zz",
             f"https://user:{secret}@gitlab.com/gke-labs/kube-agents.git",
             f"ssh://{secret}@example.com/repo",
+            f"https://u:{secret}@more@github.com/gke-labs/kube-agents.git",
+            f"https://u:p@{secret}@github.com/%zz",
+            f"x_https://u:{secret}@github.com/%zz",
+            f"9https://{secret}@github.com/o/r/x/y",
+            f"https://u:a/{secret}@github.com/o/r",
+            f"git@{secret}@gitlab.example:o/r.git",
             f"https://user:{secret}@",
             f"not a url user:{secret}@ http://u:{secret}@h/x",
         ):
@@ -139,6 +145,11 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             github_token_refresh.redact_url("fetch https://a:b@github.com/o/r and ssh://tok@h/x"),
             "fetch https://[REDACTED]@github.com/o/r and ssh://[REDACTED]@h/x",
         )
+        # The userinfo ends at the last "@" before the path, as a URL parser reads it.
+        self.assertEqual(
+            github_token_refresh.redact_url("https://u:p@ss@github.com/o/r"),
+            "https://[REDACTED]@github.com/o/r",
+        )
         # A URL without userinfo, and an scp-style remote, are left as they are.
         for text in ("https://github.com/o/r.git", "git@github.com:o/r.git"):
             self.assertEqual(github_token_refresh.redact_url(text), text)
@@ -148,6 +159,8 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual(redact("tok:secret@host:o/r"), "[REDACTED]@host:o/r")
         self.assertEqual(redact("https://a:b@github.com/o/r"), "https://[REDACTED]@github.com/o/r")
         self.assertEqual(redact("/srv/git/kube-agents.git"), "/srv/git/kube-agents.git")
+        self.assertEqual(redact("https://u:a/b@github.com/o/r"), "https://[REDACTED]@github.com/o/r")
+        self.assertEqual(redact("x_https://u:p@github.com"), "x_https://[REDACTED]@github.com")
 
     def test_log_redacts_whatever_its_caller_formatted(self):
         err = io.StringIO()
