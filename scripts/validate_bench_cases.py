@@ -56,6 +56,10 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 # its rule rather than a second one.
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
+# The [bench:profile ...] directive's parser (#5945), loaded by path so a case's
+# directive is held to the shape the harness reads.
+PROFILE_HOOK_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "profile_hook.py"
+PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
@@ -953,6 +957,37 @@ def _strings_outside_prompt(node: Any, path: str, out: list[tuple[str, str]]) ->
         out.append((path, node))
 
 
+def profile_hook_reader() -> Any:
+    """profile_hook, loaded once. Registered in sys.modules before it runs:
+    its dataclass looks its own module up there."""
+    if PROFILE_HOOK_MODULE_NAME in sys.modules:
+        return sys.modules[PROFILE_HOOK_MODULE_NAME]
+    spec = importlib.util.spec_from_file_location(PROFILE_HOOK_MODULE_NAME, PROFILE_HOOK_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{PROFILE_HOOK_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PROFILE_HOOK_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile_directive(spec: dict[str, Any], problems: list[str]) -> None:
+    """A prompt that opens with [bench:profile ...] parses as the harness reads
+    it (profile_hook). A malformed one errors every run before the agent sees
+    the ask, which a lint catches far cheaper."""
+    prompt = spec.get("prompt")
+    if not isinstance(prompt, str):
+        return
+    hook = profile_hook_reader()
+    if hook.PROFILE_DIRECTIVE in prompt and not hook.is_profile_ask(prompt):
+        problems.append(f"prompt: {hook.PROFILE_DIRECTIVE} ...] must open the prompt, or it reaches the agent as text")
+        return
+    try:
+        hook.parse(prompt)
+    except ValueError as exc:
+        problems.append(f"prompt: {exc}")
+
+
 def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
     """Every `{{FLEET_CLUSTER_*:<role>}}` in the prompt is well-formed, names a
     role the case lists in `fixtures:`, and (unless parked) a catalogue role.
@@ -1400,6 +1435,7 @@ def validate_case(
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
     _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
+    _profile_directive(spec, problems)
 
     # The suite. The bare line `suite: certification` is the registration on
     # the certification lane: hack/ci-eval-pr.sh greps for that exact line,

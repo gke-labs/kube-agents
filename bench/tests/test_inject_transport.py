@@ -4583,3 +4583,44 @@ def test_a_cancel_settle_adopted_off_the_stream_still_carries_the_usage(
 
     assert any("did not reach a terminal state" in e for e in result.errors)
     assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)
+
+
+def test_a_profile_directive_addresses_the_opening_turn_to_that_profile(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """[bench:profile ...] sends the opening turn to the named profile with its
+    parameters (#5945), and the directive itself never reaches the agent."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run(
+        "[bench:profile name=cluster project=p1 location=us-east1 cluster=prod] what's failing in kube-system"
+    )
+
+    opening = stub_gateway.submissions[0]
+    assert opening["profile"] == "cluster"
+    assert opening["parameters"] == {"project": "p1", "location": "us-east1", "cluster": "prod"}
+    assert opening["text"] == "what's failing in kube-system"
+
+
+def test_a_prompt_without_the_directive_sends_no_profile(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("what's failing in kube-system")
+
+    assert "profile" not in stub_gateway.submissions[0]
+    assert "parameters" not in stub_gateway.submissions[0]
+
+
+def test_a_malformed_profile_directive_errors_and_sends_nothing(stub_gateway: _StubGatewayServer) -> None:
+    result = KubeAgentsHarness().run("[bench:profile project=p1] no name given")
+
+    assert result.errors and "name= is required" in result.errors[0]
+    assert stub_gateway.submissions == []
+
+
+def test_the_api_transport_refuses_a_profile_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the inject door can address a profile; over api the directive would
+    reach the agent as text and be graded, so the run errors instead."""
+    monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_API)
+    result = KubeAgentsHarness().run("[bench:profile name=cluster project=p1 location=l cluster=c] ask")
+    assert result.errors and "needs AGENT_TRANSPORT=inject" in result.errors[0]
