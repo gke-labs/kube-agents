@@ -457,7 +457,9 @@ leave open:
   Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
-  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
+  addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,

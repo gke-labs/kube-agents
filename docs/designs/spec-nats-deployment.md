@@ -926,7 +926,9 @@ bridge's grants name. The operator renders the list into the callout's
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+addressee. The callout also refuses the pod name `p`, the marker of a profile task's six-token
+supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`, #5301), as defence in depth:
+no session grant reaches a six-token subject today, and gateway-minted names carry hyphens. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
 sets, which leaves the bridge unable to publish its own events because its grants still
 name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
 a narrowed pod named after a profile would be handed that profile's task subjects, so
