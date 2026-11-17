@@ -33,9 +33,9 @@ SHARED_START = "<!-- shared:reading-start -->"
 SHARED_END = "<!-- shared:reading-end -->"
 FLEET_FIXTURES = REPO_ROOT / "docs/designs/fleet-fixtures.yaml"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
-LEEWAY_VERSION = "v0.1.5"
+LEEWAY_VERSION = "v0.1.6"
 
-# leeway v0.1.5 (go-steer/leeway@349045c), pkg/leeway: the strings a report
+# leeway v0.1.6 (go-steer/leeway@547f65a; pkg/leeway unchanged since v0.1.5), pkg/leeway: the strings a report
 # carries in these fields. The kind inventory is frozen by leeway's schema;
 # the rest changes only with a leeway release.
 VOCABULARY = {

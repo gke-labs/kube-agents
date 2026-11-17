@@ -43,9 +43,12 @@ Which clusters. Target clusters are resolved on the agent pod:
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
 and routes Kubernetes object reads through the sandbox's `kubectl`
 `credential-proxy` shim (`CREDENTIAL_PROXY_URL`). `leeway_watch.py` invokes
-`leeway report --topology-tier-c-signals --parallelism 2` in the sandbox
-through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
-document from stdout.
+`leeway report --topology-tier-c-signals --parallelism 2 --timeout <n>s` in the
+sandbox through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
+document from stdout. `--timeout` is leeway's per-cluster deadline (its own
+default is one minute, which a ~6k-pod cluster already reaches); it is sized
+so every cluster in the call can use its share of the call's sandbox timeout
+(`cluster_timeout_seconds`).
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -175,7 +178,17 @@ LEEWAY_EXECUTABLE = "leeway"
 LEEWAY_REPORT_SUBCOMMAND = "report"
 TIER_C_FLAG = "--topology-tier-c-signals"
 PARALLELISM_FLAG = "--parallelism"
-PARALLELISM_VALUE = "2"
+PARALLELISM = 2
+PARALLELISM_VALUE = str(PARALLELISM)
+CLUSTER_TIMEOUT_FLAG = "--timeout"
+CLUSTER_TIMEOUT_FORMAT = "{seconds}s"
+# leeway's own `--timeout` default (`DefaultClusterTimeout`), kept as the floor
+# so a short call never gives a cluster less than leeway would on its own.
+MIN_CLUSTER_TIMEOUT_SECONDS = 60
+# Held back from the call's sandbox timeout for leeway's start-up and report
+# assembly, so the per-cluster deadline fires before the sandbox kills the call.
+LEEWAY_OVERHEAD_SECONDS = 30
+CLUSTER_SEPARATOR = ","
 CLUSTERS_FLAG = "--clusters"
 LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project")
 LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
@@ -511,9 +524,33 @@ def order_by_least_recent(items: list[str], stamps: dict[str, Any]) -> list[str]
 # --- sandbox execution -------------------------------------------------------
 
 
+def cluster_timeout_seconds(call_timeout: int, cluster_count: int) -> int:
+    """leeway's per-cluster `--timeout` for a call of `cluster_count` clusters.
+
+    leeway reads `PARALLELISM` clusters at a time, so the call runs in
+    `ceil(cluster_count / PARALLELISM)` waves; each wave gets an equal share of
+    the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`. A slow cluster
+    then ends as a per-cluster `error` row instead of the sandbox killing the
+    whole call and discarding the clusters that finished.
+    """
+    waves = math.ceil(max(cluster_count, 1) / PARALLELISM)
+    return max(MIN_CLUSTER_TIMEOUT_SECONDS, (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves)
+
+
 def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Run `leeway report --topology-tier-c-signals --parallelism 2 <flag> <value>` in the sandbox."""
-    argv = [LEEWAY_EXECUTABLE, LEEWAY_REPORT_SUBCOMMAND, TIER_C_FLAG, PARALLELISM_FLAG, PARALLELISM_VALUE, flag, value]
+    """Run `leeway report --topology-tier-c-signals --parallelism 2 --timeout <n>s <flag> <value>` in the sandbox."""
+    per_cluster = cluster_timeout_seconds(timeout, len(value.split(CLUSTER_SEPARATOR)))
+    argv = [
+        LEEWAY_EXECUTABLE,
+        LEEWAY_REPORT_SUBCOMMAND,
+        TIER_C_FLAG,
+        PARALLELISM_FLAG,
+        PARALLELISM_VALUE,
+        CLUSTER_TIMEOUT_FLAG,
+        CLUSTER_TIMEOUT_FORMAT.format(seconds=per_cluster),
+        flag,
+        value,
+    ]
     try:
         completed = sandbox_exec.run(argv, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:

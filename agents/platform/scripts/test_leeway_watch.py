@@ -1464,6 +1464,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "870s",
                     "--clusters",
                     "p1/us-central1/c1,p1/us-east1/c2",
                 ]
@@ -1503,6 +1505,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "870s",
                     "--clusters",
                     "p1/us-east1-b/east,p1/us-west1/west",
                 ],
@@ -1560,6 +1564,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "870s",
                     "--clusters",
                     "p1/us-central1/c1,p2/us-east1/c2",
                 ]
@@ -1635,6 +1641,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "870s",
                     "--clusters",
                     "p-scoped/us-central1/c-included",
                 ]
@@ -1673,6 +1681,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "870s",
                     "--clusters",
                     "p1/us-central1/c-ok",
                 ]
@@ -1700,6 +1710,56 @@ class DiscoveryTests(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("failed", output)
         self.assertIn("ScopeRenderUnreadable: unreadable json", output)
+
+
+class ClusterTimeoutTests(unittest.TestCase):
+    def test_one_wave_gets_the_whole_call_less_overhead(self) -> None:
+        # Two clusters read in parallel finish in one wave.
+        self.assertEqual(watch.cluster_timeout_seconds(900, 1), 870)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 2), 870)
+
+    def test_waves_split_the_call(self) -> None:
+        self.assertEqual(watch.cluster_timeout_seconds(900, 3), 435)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 10), 174)
+
+    def test_never_below_leeways_own_default(self) -> None:
+        self.assertEqual(watch.cluster_timeout_seconds(900, 100), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(60, 1), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
+
+    def test_run_passes_the_timeout_sized_to_the_call(self) -> None:
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p/l/a", "status": "ok"}]))
+
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run):
+            watch.run_leeway_report(watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c", timeout=300)
+
+        argv = seen_argv[0]
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "135s")
+        self.assertEqual(argv[-2:], [watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c"])
+
+    def test_budget_cut_call_shrinks_the_cluster_timeout(self) -> None:
+        # Late in the tick the call's timeout is the remaining budget, and the
+        # per-cluster deadline follows it down.
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "p1/us-central1/c1", watch.PROJECTS_ENV: ""},
+            clear=False,
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), mock.patch.object(
+            watch.time, "monotonic", return_value=0.0
+        ):
+            watch.sweep_fleet({}, T0, deadline=200.0)
+
+        argv = seen_argv[0]
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "170s")
 
 
 class RosterTest(unittest.TestCase):
