@@ -11,7 +11,9 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -84,9 +86,17 @@ class SharedReportFilesTest(unittest.TestCase):
                 self.assertEqual(own[variable], "/a/file/of/the/test.json")
 
     def test_a_sourced_script_whose_command_fails_writes_the_file_of_this_process(self):
+        # uninstall.sh takes its lock also when it is only sourced, on one fixed file under /tmp.
+        # A stand-in flock keeps this test off that lock, so that it cannot meet a run of
+        # tests/test_uninstall_script.py or a real uninstall.
+        bin_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(bin_dir.cleanup)
+        flock = pathlib.Path(bin_dir.name) / "flock"
+        flock.write_text("#!/usr/bin/env bash\nexit 0\n")
+        flock.chmod(flock.stat().st_mode | stat.S_IEXEC)
         for variable, script in _SCRIPT_OF_VARIABLE.items():
             with self.subTest(script=script):
-                env = get_isolated_test_env()
+                env = get_isolated_test_env(bin_dir=bin_dir.name)
                 # Three checks before the run. Without the variable, with the real folder in it,
                 # or with a script that reads another variable, the run would replace the report
                 # of a real run.
@@ -95,6 +105,7 @@ class SharedReportFilesTest(unittest.TestCase):
                 self._assert_the_script_reads(variable)
                 report.unlink(missing_ok=True)
                 body = (
+                    'echo "flock=$(command -v flock)"\n'
                     f'source "{_INSTALLER_COMMON}"\n'
                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_REPO_ROOT / script}"\n'
                     "false\n"
@@ -103,6 +114,7 @@ class SharedReportFilesTest(unittest.TestCase):
                     ["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT), timeout=60
                 )
                 self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+                self.assertIn(f"flock={flock}\n", proc.stdout, "the script would take the real lock")
                 self.assertEqual(json.loads(report.read_text())["status"], "FAILED", proc.stderr + proc.stdout)
 
 
