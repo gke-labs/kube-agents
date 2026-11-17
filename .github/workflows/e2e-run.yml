@@ -143,9 +143,8 @@ jobs:
           # owner/repo against GITHUB_ORG.
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-          # gchat_agent_test.py's wait for the reply: 300s, as
-          # autopush-next-e2e-gchat.yml gives it, because the readiness gate
-          # does not cover the first turn's cold start.
+          # gchat_agent_test.py's wait for the reply: 300s, because the
+          # readiness gate does not cover the first turn's cold start.
           TEST_TIMEOUT_SEC: "300"
         run: ./scripts/release/execute_e2e_tests.sh
 

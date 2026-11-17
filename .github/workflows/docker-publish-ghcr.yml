@@ -281,6 +281,21 @@ jobs:
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-cluster:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-cluster:${{ github.sha }}
 
+      # The GKE Support Agent's persona image: the persona directory is the
+      # build context, and the image's /files is what a profile worker pod
+      # mounts at /persona.
+      - name: Build and Push TSE Persona (GHCR)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build-persona-tse
+        with:
+          context: agents/tse/persona
+          file: a2a/Dockerfile.persona-tse
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-tse:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-tse:${{ github.sha }}
+
       - name: Build and Push A2A Auth Callout (GHCR)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-authcallout
@@ -370,6 +385,7 @@ jobs:
           A2A_GATEWAY_DIGEST: ${{ steps.build-a2a-gateway.outputs.digest }}
           A2A_WORKER_DIGEST: ${{ steps.build-a2a-worker.outputs.digest }}
           PERSONA_CLUSTER_DIGEST: ${{ steps.build-persona-cluster.outputs.digest }}
+          PERSONA_TSE_DIGEST: ${{ steps.build-persona-tse.outputs.digest }}
           A2A_AUTHCALLOUT_DIGEST: ${{ steps.build-a2a-authcallout.outputs.digest }}
           A2A_CONSOLE_DIGEST: ${{ steps.build-a2a-console.outputs.digest }}
           A2A_VERIFIER_DIGEST: ${{ steps.build-a2a-verifier.outputs.digest }}
@@ -387,6 +403,7 @@ jobs:
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-gateway@$A2A_GATEWAY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-worker@$A2A_WORKER_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-cluster@$PERSONA_CLUSTER_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-tse@$PERSONA_TSE_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-authcallout@$A2A_AUTHCALLOUT_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-console@$A2A_CONSOLE_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-verifier@$A2A_VERIFIER_DIGEST"

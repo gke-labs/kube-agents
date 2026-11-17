@@ -4232,13 +4232,15 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
   echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
   echo "     24h TTL will." >&2
-  echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+  echo "  3. once TASKS is back, the operator restarts the clients holding a durable consumer" >&2
+  echo "     on it, if it saw the stream missing on three five-minute polls in a row. After a" >&2
+  echo "     quicker fix (deleted and recreated inside 15 minutes), restart them yourself:" >&2
   echo "       kubectl rollout restart deployment/` + a2aGatewayName(agent) + ` -n ` + agent.Namespace + `" >&2
   echo "     and, where a Hermes bridge sidecar runs, the agent workload ` + agent.Name + `-gateway" >&2
   echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
   echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
   echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
-  echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+  echo "     ends the subscription with nothing logged. Without a restart the gateway goes on" >&2
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
@@ -5112,6 +5114,22 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// (the builder above renders the one replica it runs before then).
 	n += a2aGatewayStandbyPods(agent)
 	return n
+}
+
+// sessionQuantity is one of the session pod's resolved requests (request
+// true) or limits, as the gateway's env carries it.
+func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name corev1.ResourceName) string {
+	var override *corev1.ResourceRequirements
+	if limits := agentTuning(agent); limits != nil {
+		override = limits.SessionResources
+	}
+	resolved := agentv1alpha1.ResolveSessionResources(override)
+	set := resolved.Limits
+	if request {
+		set = resolved.Requests
+	}
+	q := set[name]
+	return q.String()
 }
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
@@ -6065,7 +6083,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, the operator restarts the clients that held a durable consumer on it, provided it saw the stream missing on three five-minute polls in a row; after a quicker fix (inside 15 minutes), restart them yourself: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so without a restart there is a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -6880,6 +6898,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The session pod's requests and limits (#2371), always all four,
+		// resolved per key over the defaults (ResolveSessionResources), so
+		// the rendered Deployment states what the gateway will request.
+		{Name: "A2A_SESSION_CPU_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceMemory)},
+		{Name: "A2A_SESSION_CPU_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceMemory)},
 		// The relay binds the durable the provision Job created (#4173).
 		{Name: a2aGatewayRelayPrecreatedEnvVar, Value: "true"},
 		// The busy notice's threshold, rendered explicitly
@@ -7360,6 +7385,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
+	r.noteA2ABusSingleServer(ctx, agent)
 	// A count change (a migration's phase moving the bus between one server
 	// and three) leaves streams that are not there until the migration puts
 	// them back, so the provisioned-once record no longer describes the

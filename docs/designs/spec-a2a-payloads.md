@@ -238,7 +238,9 @@ admit.
 `name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` (the only origin
 today, since a user's schedule runs at its creator's tier and carries no trigger), and `stream` is
 the report stream the grant binds, absent when it binds none. A stream is only ever the
-schedule's own name: `schedule/<stream>`, nothing else. The block is read strictly: a key twice,
+schedule's own name: `schedule/<stream>`, nothing else. `script`, absent on a prompt run, names
+the profile script a built-in schedule's run executes (#5622): a DNS-1123 label, never a path,
+and only on a `schedule/<name>` trigger. The block is read strictly: a key twice,
 a key that matches `trigger` or one of its fields only under case folding, or a null inside the
 trigger is refused. The gateway writes it
 on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
