@@ -544,7 +544,7 @@ def empty_record() -> dict:
     lists stay empty here: the GitLab path deletes no file a stack planted, and
     the one stack that plants one writes to GitHub only."""
     return {
-        "open_before": 0, "kept_open": [], "labelled": [], "closed": [], "unclosed": [],
+        "open_before": 0, "kept_open": [], "labelled": [], "closed": [], "unclosed": [], "rate_limited": [], "unexplained_after": [],
         "branches_before": 0, "deleted": [], "undeleted": [], "kept_branches": [],
         "stack_files_deleted": [], "stack_files_undeleted": [], "stack_files_kept": [],
         "open_after": None, "branches_after": None, "clean": False,

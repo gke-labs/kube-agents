@@ -501,7 +501,7 @@ class RetryTest(unittest.TestCase):
 
     def run_with(self, api):
         pauses = []
-        with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", pauses.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", pauses.append), mock.patch.object(helper, "limited_until", 0.0), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             record = helper.reset(REPO, PROJECT, BUILD, "lease", "tok", False)
         return record, pauses
 
@@ -538,6 +538,29 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(helper.retry_after(urllib.error.HTTPError("u", 429, "L", {"Retry-After": "999"}, io.BytesIO(b""))), helper.sweep.RETRY_AFTER_MAX_SECONDS)
         self.assertEqual(helper.retry_after(_http_error(429)), helper.sweep.RETRY_AFTER_DEFAULT_SECONDS)
 
+    def test_a_limit_with_no_retry_after_waits_for_its_reset_bounded(self):
+        # #6105: GitHub's primary limit names only the second it resets at.
+        def limited(headers):
+            return urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0", **headers}, io.BytesIO(b""))
+
+        with mock.patch.object(helper, "clock", lambda: 1000.0):
+            self.assertEqual(helper.limit_wait(limited({"X-RateLimit-Reset": "1030"})), 31)
+            self.assertIsNone(helper.limit_wait(limited({"X-RateLimit-Reset": "99999"})), "a wait that ends still limited is not waited")
+            self.assertEqual(helper.limit_wait(limited({"X-RateLimit-Reset": "900"})), 1)
+            self.assertEqual(helper.limit_wait(limited({"Retry-After": "7", "X-RateLimit-Reset": "1100"})), 7)
+            self.assertEqual(helper.limit_wait(limited({})), helper.sweep.RETRY_AFTER_DEFAULT_SECONDS)
+
+    def test_a_limit_that_outlasts_its_waits_fails_the_later_calls_at_once(self):
+        # Once one call met a limit that would not clear, the rest of the
+        # reset does not wait the same window again under the unit's locks.
+        limited = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "4000"}, io.BytesIO(b""))
+        github = FakeGitHub(pulls=[pull(1), pull(2)], fail={("PATCH", 1): limited, ("PATCH", 2): limited})
+        with mock.patch.object(helper, "clock", lambda: 1000.0):
+            record, pauses = self.run_with(github)
+        self.assertEqual((record["unclosed"], record["rate_limited"]), ([1, 2], ["#1", "#2"]))
+        self.assertNotIn(helper.sweep.RETRY_AFTER_MAX_SECONDS, pauses)
+        self.assertTrue(set(pauses) <= {helper.WRITE_PAUSE_SECONDS}, pauses)
+
     def test_a_403_marked_only_in_its_body_waits_the_default(self):
         # The body is read once and kept on the exception, so the mark is
         # still there when the wait is chosen: GitHub's shape with no header.
@@ -567,7 +590,7 @@ class MainTest(unittest.TestCase):
     def run_main(self, github, *args, token="tok"):
         out, err = io.StringIO(), io.StringIO()
         env = {helper.TOKEN_ENV: token} if token else {}
-        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(helper.ledgers, "api", github), mock.patch.object(helper, "pause", lambda s: None), redirect_stdout(out), redirect_stderr(err):
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(helper.ledgers, "api", github), mock.patch.object(helper, "pause", lambda s: None), mock.patch.object(helper, "limited_until", 0.0), redirect_stdout(out), redirect_stderr(err):
             if not token:
                 os.environ.pop(helper.TOKEN_ENV, None)
             rc = helper.main(["--repo", REPO, "--project", PROJECT, "--build", BUILD, *args])
@@ -601,6 +624,32 @@ class MainTest(unittest.TestCase):
         self.assertFalse(record["clean"])
         self.assertIn("403", record["error"])
         self.assertEqual(record["scope"], "lease")
+
+    def test_a_limit_the_waits_outlast_exits_as_infrastructure(self):
+        # #6105: 75 is the eval's LEDGER_MINT_RETRYABLE, which records the
+        # repetition as infrastructure; a refusal beside the limit stays 1.
+        limited = urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0"}, io.BytesIO(b""))
+        shell = (REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
+        self.assertIn(f"\nLEDGER_MINT_RETRYABLE={helper.RATE_LIMITED_EXIT}\n", shell)
+
+        def listing_limited(method, path, token, body=None):
+            raise limited
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "lease.json"
+            rc, _, err = self.run_main(listing_limited, "--record", str(path))
+            record = json.loads(path.read_text())
+        self.assertEqual(rc, helper.RATE_LIMITED_EXIT)
+        self.assertIn("rate limited", record["error"])
+        self.assertNotIn("token's reach, not an empty", err)
+
+        rc, _, _ = self.run_main(FakeGitHub(pulls=[pull(1)], fail={("PATCH", 1): limited}))
+        self.assertEqual(rc, helper.RATE_LIMITED_EXIT)
+        rc, _, _ = self.run_main(FakeGitHub(pulls=[pull(1), pull(2)], fail={("PATCH", 1): limited, ("PATCH", 2): _http_error(403)}))
+        self.assertEqual(rc, 1)
+        # A leftover no failed write explains is the reset's fault, not the limit's.
+        rc, _, _ = self.run_main(FakeGitHub(pulls=[pull(1)], branches=["b"], stubborn=["b"], fail={("PATCH", 1): limited}))
+        self.assertEqual(rc, 1)
 
     def test_a_missing_token_a_guard_and_a_fault_each_have_their_code(self):
         self.assertEqual(self.run_main(FakeGitHub(), token="")[0], 2)
@@ -662,6 +711,8 @@ STUB_HELPER = textwrap.dedent(
     import json, os, sys
     print("HELPER argv=" + json.dumps(sys.argv[1:]))
     print("HELPER token=" + os.environ.get("AGENT_PULLS_RESET_TOKEN", ""))
+    if os.environ.get("HELPER_RC") == "75":
+        print("ERROR: GitHub stayed rate limited past the waits (403) on o/r; infrastructure", file=sys.stderr)
     sys.exit(int(os.environ.get("HELPER_RC", "0")))
     """
 )
@@ -713,7 +764,7 @@ class ResetStepTest(unittest.TestCase):
                 lifted("fleet_context_value"),
                 lifted("reset_agent_pulls"),
                 f'reset_agent_pulls "{label}"',
-                'echo "RC=$?"',
+                'rc=$?; echo "RC=$rc"; echo "LAST=${AGENT_PULLS_RESET_LAST_FAILURE:-}"; echo "WHY=${AGENT_PULLS_RESET_INFRA_REASON:-}"',
             ]
         )
         return run_bash(body, {"HELPER_RC": str(helper_rc)})
@@ -765,6 +816,15 @@ class ResetStepTest(unittest.TestCase):
         self.assertIn("does not run on a repository this could not clean", result.stderr)
         self.assertNotIn("HELPER", result.stdout)
         self.assertIn("RC=1", result.stdout)
+
+    def test_a_helper_still_rate_limited_returns_the_retryable_code_with_its_error(self):
+        result = self.run_step("lease", helper_rc=75)
+        self.assertIn("RC=75", result.stdout, result.stderr)
+        self.assertIn("LAST=ERROR: GitHub stayed rate limited past the waits", result.stdout)
+        self.assertIn("WHY=the repository reset stayed rate limited", result.stdout)
+        plain = self.run_step("lease", helper_rc=1)
+        self.assertIn("RC=1", plain.stdout)
+        self.assertIn("WHY=\n", plain.stdout)
 
     def test_a_helper_that_finds_the_repository_not_clean_fails_closed(self):
         result = self.run_step("lease", helper_rc=1)

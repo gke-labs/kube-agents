@@ -100,6 +100,16 @@ describe = sweep.boskos_pool.describe
 # limit waits what it asks instead (retry_after). Any other 4xx is the
 # request's fault and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
+# GitHub's primary limit names no Retry-After, only the epoch second it resets
+# at; concurrent smoke runs share one App installation's hourly budget and
+# drain it for minutes (#6105), so a limit with no Retry-After waits for that
+# reset, as bounded as the sweep's Retry-After (RETRY_AFTER_MAX_SECONDS).
+RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
+# A limit that outlasted the waits exits EX_TEMPFAIL, the value the eval's
+# LEDGER_MINT_RETRYABLE carries in hack/ci-eval-pr.sh, so the unit records its
+# repetition as infrastructure rather than as a missing run. Every other
+# failure stays 1 (not clean) or 2 (refused).
+RATE_LIMITED_EXIT = 75
 RETRYABLE_STATUS_FLOOR = 500
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
@@ -138,6 +148,7 @@ RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 pause = time.sleep
+clock = time.time
 ResetError = ledgers.ResetError
 
 
@@ -145,6 +156,39 @@ def transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= RETRYABLE_STATUS_FLOOR
     return isinstance(exc, (OSError, http.client.HTTPException))
+
+
+def _reset_at(exc: urllib.error.HTTPError) -> int | None:
+    headers = getattr(exc, "headers", None) or {}
+    try:
+        return int(str(headers.get(RATELIMIT_RESET_HEADER)).strip())
+    except ValueError:
+        return None
+
+
+def limit_wait(exc: urllib.error.HTTPError) -> int | None:
+    """Seconds to wait out a marked limit: Retry-After (the sweep's reading),
+    else until X-RateLimit-Reset, else the default. None when the reset is
+    further off than RETRY_AFTER_MAX_SECONDS: a wait would end still limited."""
+    headers = getattr(exc, "headers", None) or {}
+    reset_at = _reset_at(exc)
+    if headers.get(sweep.RETRY_AFTER_HEADER) is not None or reset_at is None:
+        return retry_after(exc)
+    # One second past the reset, so the call lands in the new window.
+    seconds = reset_at - int(clock()) + 1
+    return None if seconds > sweep.RETRY_AFTER_MAX_SECONDS else max(1, seconds)
+
+
+# Until when (clock()) a limit that outlasted its waits stays assumed: every
+# call after it fails at once rather than waiting again for the same window,
+# as the sweep stops sweeping. The per-unit reset holds the unit's locks.
+limited_until = 0.0
+
+
+def _latch(exc: urllib.error.HTTPError) -> None:
+    global limited_until
+    reset_at = _reset_at(exc)
+    limited_until = max(limited_until, float(reset_at) if reset_at is not None else clock() + sweep.RETRY_AFTER_MAX_SECONDS)
 
 
 def call(method: str, path: str, token: str, body: dict | None = None):
@@ -157,10 +201,14 @@ def call(method: str, path: str, token: str, body: dict | None = None):
             # exception (boskos_pool.error_body), so the answer is the same
             # for the log line and the record afterwards.
             limited = isinstance(exc, urllib.error.HTTPError) and is_rate_limited(exc)
-            if delay is None or not (limited or transient(exc)):
-                raise
             if limited:
-                delay = retry_after(exc)
+                wait = limit_wait(exc) if clock() >= limited_until else None
+                if delay is None or wait is None:
+                    _latch(exc)
+                    raise
+                delay = wait
+            elif delay is None or not transient(exc):
+                raise
             print(f"  {method} {path} answered {describe(exc)}; trying again in {delay}s", file=sys.stderr)
             pause(delay)
     raise AssertionError("unreachable")
@@ -281,6 +329,21 @@ def planted_stack_files(kcc_cluster: str = "") -> tuple[str, ...]:
     return (*PLANTED_STACK_FILES, KCC_DECLARATION_PATH.format(cluster=kcc_cluster or DEFAULT_KCC_CLUSTER))
 
 
+def _note_limit(record: dict, exc: BaseException, what: str) -> None:
+    if isinstance(exc, urllib.error.HTTPError) and is_rate_limited(exc):
+        record["rate_limited"].append(what)
+
+
+def only_rate_limited(record: dict) -> bool:
+    """Not clean, every write that failed failed on a limit the waits
+    outlasted, and the read-back found nothing those writes do not explain:
+    GitHub's weather, not a repository that will not come clean."""
+    failed = len(record["unclosed"]) + len(record["undeleted"]) + len(record["stack_files_undeleted"])
+    return (
+        not record["clean"] and failed > 0 and len(record["rate_limited"]) == failed and not record["unexplained_after"]
+    )
+
+
 def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
     """What a call reports, before anything is read: the caller writes it on
     every exit, so the reset that faulted is the one with a record too."""
@@ -299,6 +362,10 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
         "labelled": [],
         "closed": [],
         "unclosed": [],
+        # Each write above or below that failed on a limit the waits outlasted.
+        "rate_limited": [],
+        # What the read-back still found that no failed write explains.
+        "unexplained_after": [],
         "branches_before": 0,
         "deleted": [],
         "undeleted": [],
@@ -353,6 +420,7 @@ def reset(
         except CALL_FAULTS as exc:
             print(f"  #{number} did not close ({describe(exc)})", file=sys.stderr)
             record["unclosed"].append(number)
+            _note_limit(record, exc, f"#{number}")
             heads_in_use |= _branches_in_use(pull, repo)
             continue
         record["closed"].append(number)
@@ -376,6 +444,7 @@ def reset(
         except CALL_FAULTS as exc:
             print(f"  branch {name} was not deleted ({describe(exc)})", file=sys.stderr)
             record["undeleted"].append(name)
+            _note_limit(record, exc, name)
             continue
         record["deleted"].append(name)
     # A file a killed stack unit left on the default branch (planted_stack_files).
@@ -401,6 +470,7 @@ def reset(
         except CALL_FAULTS as exc:
             print(f"  {path} was not deleted ({describe(exc)})", file=sys.stderr)
             record["stack_files_undeleted"].append(path)
+            _note_limit(record, exc, path)
             continue
         record["stack_files_deleted"].append(path)
     if dry_run:
@@ -420,6 +490,11 @@ def reset(
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
     record["clean"] = not still_agent and not still_branches and not still_files
+    record["unexplained_after"] = (
+        [f"#{number}" for number in still_agent if number not in record["unclosed"]]
+        + [name for name in still_branches if name not in record["undeleted"]]
+        + [path for path in still_files if path not in record["stack_files_undeleted"]]
+    )
     record["finished_at"] = time.strftime(ISO_UTC_FORMAT, time.gmtime(time.time()))
     print(
         f"closed {len(record['closed'])} pull request(s) and deleted {len(record['deleted'])} branch(es) in {repo} {scope}; "
@@ -480,12 +555,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except limited as exc:
-        # GitLab's limit, reported as the GitHub path reports its HTTPError:
-        # in the record and on stderr, and the repository is not clean.
+        # GitLab's limit: in the record and on stderr, and the repository is
+        # not clean. The GitHub App's shared budget (#6105) is what exits
+        # RATE_LIMITED_EXIT; a GitLab limit is the agent token's own.
         record["error"] = str(exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except urllib.error.HTTPError as exc:
+        if is_rate_limited(exc):
+            record["error"] = f"{forge} stayed rate limited past the waits ({describe(exc)}) on {args.repo}"
+            print(f"ERROR: {record['error']}; infrastructure, not the token's reach", file=sys.stderr)
+            return RATE_LIMITED_EXIT
         record["error"] = f"{forge} answered {describe(exc)} reading {args.repo}"
         print(
             f"ERROR: {record['error']}; a 403 or 404 here is the token's reach, not an empty repository",
@@ -503,6 +583,9 @@ def main(argv: list[str] | None = None) -> int:
             write_record(args.record, record)
     if args.dry_run:
         return 0
+    if only_rate_limited(record):
+        print(f"ERROR: {forge} stayed rate limited past the waits on {', '.join(record['rate_limited'])}; infrastructure", file=sys.stderr)
+        return RATE_LIMITED_EXIT
     return 0 if record["clean"] else 1
 
 

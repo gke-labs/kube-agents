@@ -2157,10 +2157,13 @@ probe_gitlab_ledger_path() { # <label>
 # On the GitHub forge, a mint that ran out on a transient failure returns
 # LEDGER_MINT_RETRYABLE instead of 1, with the mint's last diagnostic line in
 # AGENT_PULLS_RESET_LAST_FAILURE, so the unit can record its repetition as
-# infrastructure rather than as a missing run (record_unit_not_run). A mint
-# GitHub refused outright (a 422 for a missing grant) and a repository that
-# would not come clean both stay 1, as does a GitLab agent token that is not
-# in hand.
+# infrastructure rather than as a missing run (record_unit_not_run). So does
+# a helper that exits LEDGER_MINT_RETRYABLE because the forge stayed rate
+# limited past its waits (#6105: concurrent runs share one App installation's
+# budget), with the helper's ERROR line in AGENT_PULLS_RESET_LAST_FAILURE and
+# what happened in AGENT_PULLS_RESET_INFRA_REASON. A mint GitHub refused
+# outright (a 422 for a missing grant) and a repository that would not come
+# clean both stay 1, as does a GitLab agent token that is not in hand.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
   local label="$1" token out rc=0 slug record diagnostics mint_rc=0 kcc_cluster
   local kcc_args=()
@@ -2173,6 +2176,7 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
     return 0
   fi
   AGENT_PULLS_RESET_LAST_FAILURE=""
+  AGENT_PULLS_RESET_INFRA_REASON=""
   diagnostics="$(mktemp)"
   token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" 2>"${diagnostics}")" || mint_rc=$?
   cat "${diagnostics}" >&2
@@ -2211,6 +2215,11 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
+    if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+      AGENT_PULLS_RESET_INFRA_REASON="the repository reset stayed rate limited past its waits before launch"
+      AGENT_PULLS_RESET_LAST_FAILURE="$(printf '%s\n' "${out}" | grep '^ERROR:' | tail -n 1)"
+      return "${LEDGER_MINT_RETRYABLE}"
+    fi
     return 1
   fi
   return 0
@@ -5792,8 +5801,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
-  # was the reset's own mint running out on a transient failure, which is
-  # recorded as infrastructure, as the grading mint's is above.
+  # was the reset's own mint running out on a transient failure, or the reset
+  # staying rate limited past its waits, which is recorded as infrastructure,
+  # as the grading mint's is above.
   if [ "$(unit_phase "${name}")" = "1" ]; then
     local reset_rc=0
     reset_agent_pulls "${name} rep ${rep}" || reset_rc=$?
@@ -5801,6 +5811,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       local reset_infra=""
       if [ "${reset_rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
         reset_infra="the repository reset's token could not be minted before launch: ${AGENT_PULLS_RESET_LAST_FAILURE:-the mint printed no diagnostic}"
+        if [ -n "${AGENT_PULLS_RESET_INFRA_REASON:-}" ]; then
+          reset_infra="${AGENT_PULLS_RESET_INFRA_REASON}: ${AGENT_PULLS_RESET_LAST_FAILURE:-the helper printed no diagnostic}"
+        fi
       fi
       skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "did not run: the leased repository could not be reset" "${reset_infra}"
       return 0
