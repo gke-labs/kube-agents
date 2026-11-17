@@ -131,6 +131,9 @@ ONLY_PR_WINDOW = timedelta(hours=24)
 # the storm (the adjudicator's STORM_RUN_SIGNATURE_REPS); fewer are
 # background noise on any day.
 STORM_RUN_SIGNATURE_REPS = 5
+# A run carrying at least this many forge repetitions (one case's full set)
+# is inside a declared forge outage (health.py's FORGE_RUN_SIGNATURE_REPS).
+FORGE_RUN_SIGNATURE_REPS = 3
 # The harness's own never-ran phrasings (bench/kube_agents_bench/scoring.py),
 # the same list the adjudicator matches; before #1184 these were graded `fail`.
 STORM_REASON_RE = re.compile(
@@ -184,8 +187,15 @@ FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
 # A rung-2 block's reason: the scorer gives each errored check's reason after
 # this phrase, and a check's reason can quote a rate limit or a 429 from the
 # forge it read. The repetition was graded, and blocked, so it is a fail,
-# never a storm rep; STORM_REASON_RE is not asked about it.
+# never a storm rep; STORM_REASON_RE is not asked about it -- unless it leads
+# with FORGE_SAFEGUARD_MARKER (below).
 RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
+# A rung-2 block the scorer would have graded `infra` under
+# FORGE_UNAVAILABLE_MARKER but for an errored catastrophic safeguard leads
+# with this (bench/kube_agents_bench/forges.py, #6105): still blocked, but a
+# forge rep here, so a GitHub App rate limit is named rather than counted as
+# fails. Read out of the bench module by the tests.
+FORGE_SAFEGUARD_MARKER = "KUBE_AGENTS_FORGE_SAFEGUARD"
 
 # --- Replay errors (#2328) ---------------------------------------------------
 # A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
@@ -251,6 +261,7 @@ CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_FORGE_OUTAGE = "forge_outage"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The pod event health.py's rule 3b reads (runs[].pod_last_event).
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
@@ -300,7 +311,24 @@ DO_SETUP = "Retest. If it dies the same way again, the leased project is the sus
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
 DO_FIXTURE_DRIFT = "Nothing for the PR. A seeded-fleet fixture this case needs was out of its designed state on the leased project, so the case was not run and does not block; the reason names the role and what the scan saw."
-DO_FORGE = "Retest. A forge read failed during grading (a 5xx, a dropped connection or a rate limit), so the checks that read it were not evaluated; nothing about your change was graded."
+DO_FORGE = (
+    "Retest; if the reason names a rate limit, wait for the hourly reset first. A forge read failed during grading (a 5xx,"
+    " a dropped connection or a rate limit), so the checks that read it were not evaluated; nothing about your change was graded."
+)
+# A red run whose only unexcused repetitions are forge ones: the scorer kept
+# them on rung 2 because an errored check was a catastrophic safeguard
+# (FORGE_SAFEGUARD_MARKER). Prow's red stands; the page names why.
+FORGE_RED_HEADLINE = "The run is red: a catastrophic safeguard could not read GitHub during grading."
+FORGE_RED_LEDE = (
+    "Its checks errored on a forge read (usually the GitHub App's hourly rate limit), so the safeguard could not rule"
+    " out a forbidden write and the run stays red; nothing about your change was graded. Retest once the limit has reset."
+)
+# The same red beside cases that were graded and passed: those grades stand.
+FORGE_RED_LEDE_GRADED = (
+    "The cases graded here passed; the rest errored on a forge read (usually the GitHub App's hourly rate limit), so the"
+    " safeguard could not rule out a forbidden write and the run stays red. Retest once the limit has reset."
+)
+FORGE_OUTAGE_NOTE = " A forge outage is declared right now."
 DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
 # The outage's recovering hold: other PRs' runs are finishing, so a kill
 # arriving now may be the branch, and it holds the gate out of GREEN.
@@ -356,7 +384,8 @@ def rep_kind(rep: dict) -> str:
     A fixture rep is an `infra` one never run because a fixture it needs had
     drifted (FIXTURE_DRIFT_MARKER); not a storm either. A forge rep is an
     `infra` one whose checks errored on a forge read that failed for a while
-    (its reason leads with FORGE_UNAVAILABLE_MARKER); not a storm either.
+    (its reason leads with FORGE_UNAVAILABLE_MARKER), or a rung-2 block leading
+    with FORGE_SAFEGUARD_MARKER; not a storm either.
     A harness-declared replay error (#2328) is a graded fail, not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
@@ -367,6 +396,8 @@ def rep_kind(rep: dict) -> str:
     if result == "infra" and FIXTURE_DRIFT_MARKER in reason:
         return REP_FIXTURE
     if result == "infra" and reason.startswith(FORGE_UNAVAILABLE_MARKER):
+        return REP_FORGE
+    if result != "infra" and reason.startswith(FORGE_SAFEGUARD_MARKER):
         return REP_FORGE
     if result != "infra" and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
         return REP_FAIL
@@ -417,6 +448,7 @@ def _run_facts(run: dict) -> dict:
     counts_by_case = {}
     storm = 0
     ceiling = 0
+    forge = 0
     for task in run_tasks(run):
         counts = rep_counts(task)
         name = str(task.get("name"))
@@ -424,6 +456,7 @@ def _run_facts(run: dict) -> dict:
         outcomes[name] = outcome_of(counts)
         storm += counts["infra"]
         ceiling += counts["ceiling"]
+        forge += counts["forge"]
     started = parse_iso(run.get("started"))
     facts = {
         "outcomes": outcomes,
@@ -431,6 +464,7 @@ def _run_facts(run: dict) -> dict:
         "collapsed": {c for c, o in outcomes.items() if o == OUTCOME_FAILED},
         "storm": storm,
         "ceiling": ceiling,
+        "forge": forge,
         "started": started,
         "finished": parse_iso(run.get("finished")) or started,
     }
@@ -453,6 +487,27 @@ def ceiling_reps(run: dict) -> int:
     """Repetitions the harness stopped watching at its delegation ceiling
     (#1874); apart from `storm_reps`, never inside it."""
     return _run_facts(run)["ceiling"]
+
+
+def safeguard_blocked(run: dict) -> bool:
+    """A red run whose every non-pass, non-infra repetition is one the scorer
+    kept on rung 2 only for an errored catastrophic safeguard under a forge
+    outage (FORGE_SAFEGUARD_MARKER). Any other red repetition -- a tripped
+    safeguard, a failed check -- is a red the forge does not explain."""
+    red = [
+        str(rep.get("reason") or "")
+        for task in run_tasks(run)
+        for rep in task_reps(task)
+        if str(rep.get("result") or "").lower() not in ("pass", "infra")
+    ]
+    return str(run.get("result") or "").upper() == RUN_FAILURE and bool(red) and all(
+        reason.startswith(FORGE_SAFEGUARD_MARKER) for reason in red
+    )
+
+
+def forge_reps(run: dict) -> int:
+    """Repetitions whose checks errored on a forge read (rep_kind's `forge`)."""
+    return _run_facts(run)["forge"]
 
 
 def run_length(run: dict) -> timedelta | None:
@@ -898,6 +953,8 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The cases were not run; the fixture's drift is the infra owner's, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
+        if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded) and safeguard_blocked(run):
+            return FORGE_RED_HEADLINE, FORGE_RED_LEDE + (FORGE_OUTAGE_NOTE if incident else "") + held_note, VERDICT_RED
         if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded):
             return (
                 "Nothing was graded: every case's checks errored on a forge read that failed during grading.",
@@ -932,6 +989,8 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
             "The gate counted it green, so nothing here blocks the PR. The failures are listed for the record." + held_note,
             VERDICT_GREEN,
         )
+    if not failed and safeguard_blocked(run):
+        return FORGE_RED_HEADLINE, FORGE_RED_LEDE_GRADED + (FORGE_OUTAGE_NOTE if incident else "") + held_note, VERDICT_RED
     if not failed and str(run.get("result") or "").upper() == RUN_FAILURE:
         # Red without a collapsed gate case: an absolute rule tripped (a
         # forbidden mutation, a verifier error, an inconsistent record) or
@@ -1050,7 +1109,9 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
             lede=lede + ("" if condition != CONDITION_STORM else " A quota storm is declared right now."),
             verdict=verdict,
             cases=cases,
-            matches_incident=(condition == CONDITION_STORM and run_storm) or (condition == CONDITION_DELEGATION_CEILING and run_ceiling),
+            matches_incident=(condition == CONDITION_STORM and run_storm)
+            or (condition == CONDITION_DELEGATION_CEILING and run_ceiling)
+            or (condition == CONDITION_FORGE_OUTAGE and forge_reps(run) >= FORGE_RUN_SIGNATURE_REPS),
             setup_death=False,
             cls=None,
             do=DO_NOT_EVALUATED,
@@ -1142,6 +1203,8 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         matches = run_storm
     elif condition == CONDITION_DELEGATION_CEILING:
         matches = run_ceiling
+    elif condition == CONDITION_FORGE_OUTAGE:
+        matches = forge_reps(run) >= FORGE_RUN_SIGNATURE_REPS
     elif condition == CONDITION_SETUP_DEATHS:
         matches = False
     else:
