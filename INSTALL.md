@@ -1336,7 +1336,8 @@ absent the operator uses `platform-agent-secrets` / `API_SERVER_KEY` as an optio
 the gateway starts even before that entry exists. This step is for a first install. On an existing
 install keep the CR you have: the webhook admits one per cluster ("only one PlatformAgent is
 allowed per cluster"), so re-applying under a new name is refused, and the upgrade note in Step 2
-derives its names from whichever CR exists.
+derives its names from whichever CR exists. The webhook also admits the CR in the operator's
+namespace only (`kubeagents-system` here), where the operator's write Role is bound.
 
 ```bash
 sed -e 's/^  name: platformagent$/  name: platform-agent/' \
