@@ -281,6 +281,45 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [y]}})
 
+    def test_a_failing_cardless_answer_does_not_borrow_a_passing_continuation_of_a_lookalike(self):
+        # Two reps' front doors sent one request and answered differently in
+        # stored bytes but alike in answer_variant (an age, a pid); the
+        # continuations can't say which answer each followed.
+        x, y = "1" * 64, "2" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=x)
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=y)
+        self.world.request(front({"role": "assistant", "content": "X"}, *created("t_11111111")), fp(2),
+                           prior=(f"ctx-{fp(1)}", "V"))
+        self.world.request(front({"role": "assistant", "content": "Y"}, *created("t_22222222")), fp(3),
+                           prior=(f"ctx-{fp(1)}", "V"))
+        self.alternate(1, x)
+        self.alternate(1, y)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", objects, "only a failing rep gave x")
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{y}.json", objects,
+                         "nor can y be told apart: both stay unpublished")
+
+    def test_a_cardless_answer_two_reps_gave_identically_still_goes_up(self):
+        # The same stored answer from a failing and a passing front door: the
+        # continuations' evidence is unambiguous, so the passing one counts.
+        x = "1" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=x)
+        self.world.request(front(), fp(1), recorded=False, answer="V", answer_hash=x)
+        self.world.request(front({"role": "assistant", "content": "X"}, *created("t_11111111")), fp(2),
+                           prior=(f"ctx-{fp(1)}", "V"))
+        self.world.request(front({"role": "assistant", "content": "X"}, *created("t_22222222")), fp(3),
+                           prior=(f"ctx-{fp(1)}", "V"))
+        self.alternate(1, x)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", self.bucket.objects())
+
     def test_the_same_answer_from_failing_reps_only_stays(self):
         a = "a" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])

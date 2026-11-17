@@ -51,7 +51,7 @@ class World:
                  "recorded": recorded, "prompt_tokens": 100, "unstorable": list(unstorable)}
         if answer:
             entry["answer_variant"] = ["ctx-" + fingerprint, answer]
-            entry["answer_hash"] = answer_hash or answer
+            entry["stored_answer_hash"] = answer_hash or answer
         if prior:
             entry["prior_answer"] = list(prior)
         self.lines.append(entry)

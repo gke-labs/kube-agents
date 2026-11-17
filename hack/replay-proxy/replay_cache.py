@@ -2,9 +2,9 @@
 
 Record mode writes one file per distinct answer to a fingerprint under the
 cache directory, `alts/<fingerprint>/<answer>.json`, named by the hash of the
-answer as stored (its text and tool calls after the swap below; the proxy's
-answer_hash), so two answers that differ in what is served never share a
-name: the answer with the values its request
+answer exactly as stored, opaque ids and signatures aside (stored_hash), so
+two answers that differ in anything served never share a name: the answer
+with the values its request
 bound swapped for placeholders, its finish reason and usage, and the request's
 hashes for diagnosis. Each file is written once; a second delivery of the same
 answer finds it there and writes nothing, and a different answer to the same
@@ -36,7 +36,7 @@ import normalizer
 # (a key with no alternates), never written by record mode.
 ANSWERS_DIR = "answers"
 # Every distinct answer recorded for a fingerprint, one file each:
-# alts/<fingerprint>/<answer hash>.json (replay_proxy.answer_hash).
+# alts/<fingerprint>/<stored answer hash>.json (stored_hash).
 ALTS_DIR = "alts"
 MESSAGES_DIR = "messages"
 # Saved answers by answer-slot key, and the answers recorded for each slot context.
@@ -136,6 +136,27 @@ def stored_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Dict[
     """
     kept = {k: v for k, v in message.items() if k != REASONING_KEY}
     return normalize_answer(kept, mapping)
+
+
+def _without_opaque(value: Any, key: Optional[str] = None, in_tool_call: bool = False) -> Any:
+    """`value` with every opaque field (ids, signatures) left out, as the normalizer tells them."""
+    if isinstance(value, list):
+        return [{k: _without_opaque(v[k], k, True) for k in v if not normalizer.Normalizer.is_opaque(k, True)}
+                if key == TOOL_CALLS_KEY and isinstance(v, dict) else _without_opaque(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _without_opaque(v, k) for k, v in value.items() if not normalizer.Normalizer.is_opaque(k, False)}
+    return value
+
+
+def stored_hash(stored: Dict[str, Any]) -> str:
+    """An alternate's name: the hash of the answer exactly as stored (stored_answer), opaque fields aside.
+
+    Everything served counts (text, tool calls, thinking text, a refusal), so
+    two answers that differ in anything a client reads get different names;
+    only ids and signatures, which differ between two deliveries of the same
+    answer, are left out, so identical answers from different runs share one.
+    """
+    return normalizer.stable_hash(_without_opaque(stored))
 
 
 def answer_texts(message: Dict[str, Any]) -> List[str]:

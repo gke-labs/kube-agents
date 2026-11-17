@@ -968,14 +968,14 @@ class ShadowProxy:
         # The entry first and the slot pointer last, so a failure in between
         # never leaves a pointer to an entry that was not written. Every
         # distinct answer to the key is kept, each in a file of its own named
-        # by the line's ANSWER_HASH: the hash of the answer's text and tool
-        # calls after the same swap stored_answer makes, so two answers whose
-        # served text or actions differ never share a file. answer_variant's
-        # identity is coarser (it renames ages, pids and keyed numbers the
-        # request never held), so it must not name one. A second run's
-        # different answer is saved beside the first and the publisher keeps
-        # whichever came from passing runs.
-        saved = self.cache.save_alternate(entry[F.FINGERPRINT], entry[F.ANSWER_HASH], {
+        # by the line's STORED_ANSWER_HASH: the hash of exactly what is saved
+        # and served, opaque ids and signatures aside (replay_cache.stored_hash),
+        # so two answers that differ in anything served never share a file.
+        # answer_variant's identity is coarser (it renames ages, pids and keyed
+        # numbers the request never held), so it must not name one. A second
+        # run's different answer is saved beside the first and the publisher
+        # keeps whichever came from passing runs.
+        saved = self.cache.save_alternate(entry[F.FINGERPRINT], entry[F.STORED_ANSWER_HASH], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
             replay_cache.ENTRY_ANSWER: stored,
             replay_cache.ENTRY_FINISH_REASON: upstream.get("finish_reason"),
@@ -1205,12 +1205,12 @@ class ShadowProxy:
                 entry[F.PRIOR_ANSWER] = list(prior[0])
             # Before recording, which names the saved file by it; logged on every
             # line, saved or not, so the publisher can tie each run to the file.
-            entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
+            if stored:
+                entry[F.STORED_ANSWER_HASH] = replay_cache.stored_hash(stored)
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))
-        if F.ANSWER_HASH not in entry:
-            entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
+        entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
         entry[F.STORED] = skipped is None
         entry[F.STORE_SKIPPED] = skipped

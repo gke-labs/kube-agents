@@ -63,6 +63,9 @@ DIAG_MESSAGE_HASHES = "diag_message_hashes"
 DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
+# In record mode: replay_cache.stored_hash of the answer as it would be saved,
+# on every line with an answer, saved or not: the name of its alternate.
+STORED_ANSWER_HASH = "stored_answer_hash"
 # Why replay would not have saved the answer; empty on a served line, whose
 # answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
@@ -146,7 +149,7 @@ SERVED_VIA = "served_via"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
 # On a served line: which of the key's saved answers was served (the
-# alternate's name, the ANSWER_HASH of the line that saved it; empty for the
+# alternate's name, the STORED_ANSWER_HASH of the line that saved it; empty for the
 # older layout's single answer), and how
 # many answers the key had. Replay hands a key's answers out in turn.
 SERVED_ALTERNATE = "served_alternate"

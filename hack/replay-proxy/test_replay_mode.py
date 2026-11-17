@@ -190,10 +190,10 @@ class SeveralAnswersTest(SlotCacheCase):
         self.assertEqual(first["fingerprint"], second["fingerprint"])
         self.assertEqual((first["recorded"], second["recorded"], again["recorded"]), (True, True, False),
                          "a different answer is saved; the same answer again is not")
-        self.assertEqual((again["answer_variant"], again["answer_hash"]), (first["answer_variant"], first["answer_hash"]),
+        self.assertEqual((again["answer_variant"], again["stored_answer_hash"]), (first["answer_variant"], first["stored_answer_hash"]),
                          "an unsaved line still logs which answer it got, so the publisher can count its run")
         names = [name for name, _ in self.saved(first["fingerprint"])]
-        self.assertEqual(names, sorted([first["answer_hash"], second["answer_hash"]]))
+        self.assertEqual(names, sorted([first["stored_answer_hash"], second["stored_answer_hash"]]))
         self.assertEqual(sorted(self.contents(first["fingerprint"])), sorted([self.LOOKING["content"], self.ON_IT["content"]]))
 
     def test_answers_whose_identity_collides_but_whose_stored_text_differs_get_files_of_their_own(self):
@@ -209,12 +209,25 @@ class SeveralAnswersTest(SlotCacheCase):
             with self.subTest(body=body["messages"][0]["content"]):
                 first, second = self.recorded(body, one), self.recorded(body, other)
                 self.assertEqual(first["answer_variant"], second["answer_variant"], "the coarse identity collides")
-                self.assertNotEqual(first["answer_hash"], second["answer_hash"])
+                self.assertNotEqual(first["stored_answer_hash"], second["stored_answer_hash"])
                 self.assertEqual((first["recorded"], second["recorded"]), (True, True))
                 stored = [entry["answer"] for _, entry in self.saved(first["fingerprint"])]
                 self.assertEqual(len(stored), 2, "the second answer is not dropped onto the first's file")
                 self.assertEqual(sorted(json.dumps(a, sort_keys=True) for a in stored),
                                  sorted(json.dumps(a, sort_keys=True) for a in (one, other)))
+
+    def test_answers_differing_only_in_thinking_text_get_files_of_their_own(self):
+        # The stored file keeps thinking blocks and is served whole, so their
+        # text is part of the name; signatures are not.
+        said = [{"role": "assistant", "content": "Looking at the card.",
+                 "thinking_blocks": [{"type": "thinking", "thinking": thought, "signature": sig}]}
+                for thought, sig in (("check the card", "c2ln"), ("delete the card", "c2lo"))]
+        first, second = self.recorded(self.BODY, said[0]), self.recorded(self.BODY, said[1])
+        self.assertNotEqual(first["stored_answer_hash"], second["stored_answer_hash"])
+        self.assertEqual(len(self.saved(first["fingerprint"])), 2)
+        again = dict(said[0], thinking_blocks=[dict(said[0]["thinking_blocks"][0], signature="b3RoZXI=")])
+        self.assertEqual(self.recorded(self.BODY, again)["stored_answer_hash"], first["stored_answer_hash"],
+                         "a signature is opaque: the same answer delivered again shares the name")
 
     def test_replay_hands_the_answers_out_in_turn_and_wraps(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -1063,7 +1076,7 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(second["recorded"], "the same answer is saved once")
         self.assertEqual(len(FakeLiteLLM.calls), 2, "record mode never serves")
         (name, entry), = replay_cache.AnswerCache(self.cache_dir).answers(first["fingerprint"])
-        self.assertEqual(name, first["answer_hash"], "an alternate is named by the hash of the answer as stored")
+        self.assertEqual(name, first["stored_answer_hash"], "an alternate is named by the hash of the answer as stored")
         arguments = json.loads(entry["answer"]["tool_calls"][0]["function"]["arguments"])
         self.assertEqual(arguments, {"task_id": "⟦TASK_1⟧"})
         self.assertEqual(entry["answer"]["tool_calls"][0]["id"], "call_1__thought__c2ln", "opaque ids are kept")

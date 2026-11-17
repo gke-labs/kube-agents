@@ -42,12 +42,13 @@ Decisions, per logged request:
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
 
 A saved alternate (one distinct answer to one request) is decided by every
-storable line whose logged `answer_hash`, the hash of the answer as stored, is
+storable line whose logged `stored_answer_hash`, the hash of the answer as stored, is
 the alternate's name, recorded or not: it
 passes when any of them is attributed to runs that all passed, since a passing
 run produced that very answer, even when a failing run gave it first and saved
-it (Attribution.decide_alternate). An answer only failing runs gave never
-passes. A different answer to the same request is an alternate of its own,
+it (Attribution.decide_alternate). A card-less line whose continuations could
+have followed another answer of the same coarse identity counts only when
+every run tied to it passed. An answer only failing runs gave never passes. A different answer to the same request is an alternate of its own,
 decided by its own lines. An answer in the older layout (one per request) is
 decided by its recording line, or, when that line is left unattributed or
 ambiguous on the last call, by the other lines that sent the same request and
@@ -291,9 +292,9 @@ class Line:
     prior_answer: Optional[Tuple[str, ...]] = None
     # Whether record mode would have saved this line's answer (no unstorable reason).
     storable: bool = False
-    # The hash of the answer as record mode stores it (the proxy's answer_hash):
+    # The hash of the answer as record mode stores it (stored_answer_hash):
     # the name of the alternate it saved or would have saved.
-    answer_hash: str = ""
+    stored_hash: str = ""
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -312,7 +313,7 @@ class Line:
             answer_variant=_pair(entry.get(F.ANSWER_VARIANT)),
             prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
             storable=entry.get(F.UNSTORABLE) == [],
-            answer_hash=str(entry.get(F.ANSWER_HASH) or ""),
+            stored_hash=str(entry.get(F.STORED_ANSWER_HASH) or ""),
         )
 
 
@@ -558,26 +559,56 @@ class Attribution:
         return decision
 
     def decide_alternate(self, producers: List[Line]) -> Decision:
-        """The decision for one alternate, from every line that produced it (same request, same answer_hash).
+        """The decision for one alternate, from every line that produced it (same request, same stored hash).
 
         Record mode saves an answer once, so of several runs that gave the same
         answer only the first line says `recorded`; the later ones still
         produced it. The alternate passes when any storable producer is
-        decided PASS on its own (decide_answer, so a card-less one can take its
-        continuations' evidence): a passing run gave exactly this answer to
-        exactly this request, whichever run saved the file. A failing run that
-        gave it too does not hold it back, since what is served is that
-        passing run's answer; an answer no passing run gave never passes. With
-        no PASS, a producer still pending keeps it pending; otherwise the
+        decided PASS on its own (decide): a passing run gave exactly this
+        answer to exactly this request, whichever run saved the file. A
+        failing run that gave it too does not hold it back, since what is
+        served is that passing run's answer.
+
+        A producer with no card of its own is decided by the continuations
+        that went on from its answer, matched by answer_variant, which is
+        coarser than the stored hash (it renames ages, pids and keyed numbers
+        the request never held). When another line of the same request gave
+        an answer with the same answer_variant but a different stored hash,
+        those continuations could have followed either answer, so the
+        producer passes only if every run tied to it passed
+        (_ambiguous_evidence). An answer only failing runs gave never passes.
+        With no PASS, a producer still pending keeps it pending; otherwise the
         first producer's decision stands.
         """
-        decisions = [self.decide_answer(line) for line in producers if line.storable]
+        decisions = []
+        for line in producers:
+            if not line.storable:
+                continue
+            found = self.decide(line)
+            if found.decision == PASS and self._ambiguous_evidence(line):
+                tied = self._tied_runs(line)
+                if self._any_failed(tied):
+                    found = Decision(FAIL, tuple(sorted(tied)))
+            decisions.append(found)
         passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
         if any(found.decision == PASS for found in decisions):
             return Decision(PASS, tuple(passed))
         if any(found.decision == PENDING for found in decisions):
             return Decision(PENDING)
         return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
+
+    def _ambiguous_evidence(self, line: Line) -> bool:
+        """Whether a card-less line's continuation evidence could belong to a different stored answer.
+
+        True when the line has no card of its own and another line of its
+        build and request gave an answer with the same answer_variant but a
+        different stored hash.
+        """
+        own = self._own(line)
+        if own is None or own[0] or own[1]:
+            return False
+        return any(other.answer_variant == line.answer_variant and other.stored_hash != line.stored_hash
+                   for other in self.by_fingerprint.get((line.build, line.fingerprint), []))
 
     def _tied_runs(self, line: Line) -> Set[str]:
         """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,

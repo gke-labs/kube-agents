@@ -13,10 +13,10 @@ passing runs got and no failing run did (examples/inference-replay/eval-design.m
 What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
 - `alts/<fingerprint>-<answer>.json`: one answer to a request, flat
   (replay_cache.py nests them one directory per fingerprint), named by the
-  hash of the answer as stored (its text and tool calls after the request's
-  values are swapped for placeholders: the log line's `answer_hash`), so every
-  distinct stored answer the night's runs gave to a key has a name of its own.
-  One goes up when any storable line whose `answer_hash` is that name,
+  hash of the answer exactly as stored, opaque ids and signatures aside (the
+  log line's `stored_answer_hash`), so every distinct stored answer the
+  night's runs gave to a key has a name of its own. One goes up when any
+  storable line whose `stored_answer_hash` is that name,
   recorded or not, is attributed to runs that passed
   (run_attribution.Attribution.decide_alternate): runs that give the same
   answer save it once, and the run that saved it may have failed. An answer
@@ -47,7 +47,7 @@ produced (fetch_cache.py) and to compare verdicts (lane_report.py).
 
 Every object is written once (`gcloud storage cp --no-clobber`, and the
 recorder's grant cannot overwrite). An alternate's name is the hash of its
-stored text and tool calls, so one an earlier night wrote under the same name
+stored answer, so one an earlier night wrote under the same name
 holds the same answer to the same request; tonight's passing runs producing it is what the
 record says. An older-layout answer's name is only its key, so there the
 first night to record a key keeps it. An answer whose runs are not all graded
@@ -309,14 +309,14 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
     logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
     attribution = RA.Attribution(logs, state.store, selection.runs, final)
-    # Every line of the build that gave an answer, by (fingerprint, answer_hash),
+    # Every line of the build that gave an answer, by (fingerprint, stored_answer_hash),
     # the hash of the answer as stored and so the alternate's name: its
     # producers, recorded or not, from any pod (decide_alternate). A line counts
     # only for the file holding exactly the answer it got.
     producers: Dict[Tuple[str, str], List[RA.Line]] = {}
     for line in logs.lines:
-        if line.answer_hash:
-            producers.setdefault((line.fingerprint, line.answer_hash), []).append(line)
+        if line.stored_hash:
+            producers.setdefault((line.fingerprint, line.stored_hash), []).append(line)
     # (version, slot object, local path, answer fingerprint), in pod order:
     # decided once every pod's answers are, since two pods can each hold a
     # pointer for one slot key, each to its own answer.
