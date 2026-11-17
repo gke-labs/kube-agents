@@ -309,9 +309,9 @@ def test_restore_patch_removes_the_object_the_scenario_created():
 
 
 class FakeHost:
-    def __init__(self, fail_start=False):
+    def __init__(self):
         import threading
-        self.patches, self.fail_start = [], fail_start
+        self.patches = []
         self.context, self.namespace = "c", "n"
         self.stop = threading.Event()
 
@@ -680,3 +680,20 @@ def test_the_default_output_directory_is_git_ignored():
     from pathlib import Path
     ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text().splitlines()
     assert f"{cli.DEFAULT_OUT}/" in ignored
+
+
+def test_recorder_start_takes_only_the_watched_containers_earlier_kills(tmp_path):
+    oom = {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": "2026-11-04T16:00:00Z"}}
+    shell = pod("platform-agent-shell-0", containers=[{"name": "shell", "restartCount": 1, "lastState": oom},
+                                                      {"name": "sidecar", "restartCount": 2, "lastState": oom}])
+    shell["metadata"]["uid"] = "uid-1"
+
+    class Host:
+        def pods(self, selector):
+            return [shell]
+
+    recorder = cli.Recorder(Host(), tmp_path, cli.SHELL_SELECTOR, cli.SHELL_CONTAINER)
+    recorder.sample = recorder.poll = lambda: None  # the threads it starts do nothing
+    with recorder:
+        # The sidecar's restart count would hide the shell's next kill, at restart 2.
+        assert recorder.seen == {("platform-agent-shell-0", "uid-1"): 1}
