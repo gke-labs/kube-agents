@@ -31,7 +31,7 @@ Name why one pod cannot be placed, quote the scheduler's message, and propose th
 
    ```bash
    kubectl get namespace <namespace> -o jsonpath='{.metadata.labels}{"\n"}'
-   gcloud container clusters describe <cluster_name> --location <cluster_location> --project <project_id> --format="json(currentMasterVersion,nodePools[].name,nodePools[].config.labels,nodePools[].autoscaling)"
+   gcloud container clusters describe <cluster_name> --location <cluster_location> --project <project_id> --format="json(currentMasterVersion,nodePools[].name,nodePools[].locations,nodePools[].config.labels,nodePools[].autoscaling)"
    ```
 
 4. Read quota or claims only if the message names them:
@@ -61,7 +61,7 @@ A repeated `NotTriggerScaleUp` event with the message `Pod didn't trigger scale-
 
 - The pod names no ComputeClass: `cloud.google.com/compute-class` is not in its `nodeSelector` and not in a required `nodeAffinity` term. Both count as naming the class.
 - The namespace has no `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset` label.
-- Each node pool with autoscaling on has the class label in `config.labels`, and has fewer nodes than its autoscaling maximum.
+- Each node pool with autoscaling on has the class label in `config.labels`, and has room to grow. `autoscaling.maxNodeCount` is for each zone: compare the pool's node count with `autoscaling.totalMaxNodeCount` when it is set, else with `maxNodeCount` times the number of the pool's zones (`locations`).
 - The event is repeated. One event with no reason is not enough: the autoscaler can write one before it gives a reason, such as `1 max node group size reached`.
 
 Then:
