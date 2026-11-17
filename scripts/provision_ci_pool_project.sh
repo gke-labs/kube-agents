@@ -80,6 +80,9 @@ readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
 # binding is retried for about a minute before the step gives up.
 readonly FORGE_VM_BIND_ATTEMPTS=6
 readonly FORGE_VM_BIND_DELAY_S=10
+# The one refusal the binding retries on: IAM's answer for an account it has
+# not seen yet. Any other failure stops the step at once.
+readonly FORGE_VM_BIND_RETRY_PATTERN="does not exist"
 readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
@@ -212,6 +215,11 @@ readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 # in between the poll and the call.
 readonly HOST_OTEL_WAIT_ATTEMPTS=40
 readonly HOST_OTEL_WAIT_DELAY_S=30
+# GKE's refusal while another operation holds the cluster, the one error the
+# update retries on; the poll's filter matches the cluster's own operations and
+# its node pools' (targetLink ends in /clusters/<name> or continues with
+# /nodePools/...), since an Autopilot host creates pools after the apply.
+readonly HOST_OTEL_BUSY_PATTERN="CLUSTER_ALREADY_HAS_OPERATION"
 
 usage() {
   cat <<EOF
@@ -572,7 +580,11 @@ if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" -
 fi
 
 CLEANUP_POLICY_FILE="$(mktemp)"
-trap 'rm -f "${CLEANUP_POLICY_FILE}"' EXIT
+# The stderr of the two retried gcloud calls below (step 1.5's binding, step
+# 2.1's scope update), read back to classify the failure; per run, so two
+# provisioning runs on one host never read each other's answer.
+GCLOUD_ERR_FILE="$(mktemp)"
+trap 'rm -f "${CLEANUP_POLICY_FILE}" "${GCLOUD_ERR_FILE}"' EXIT
 cat > "${CLEANUP_POLICY_FILE}" <<'EOF'
 [
   {
@@ -723,20 +735,26 @@ if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_
   gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
 fi
 bound=false
+bind_failed=false
 for attempt in $(seq 1 "${FORGE_VM_BIND_ATTEMPTS}"); do
-  if gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null 2>/tmp/forge-vm-bind.err; then
+  if gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null 2>"${GCLOUD_ERR_FILE}"; then
     bound=true
     break
   fi
-  if ! grep -q "does not exist" /tmp/forge-vm-bind.err; then
-    cat /tmp/forge-vm-bind.err >&2
+  if ! grep -q "${FORGE_VM_BIND_RETRY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
+    bind_failed=true
     break
   fi
   echo "  ⚠ ${FORGE_VM_SA} is not visible to IAM yet (attempt ${attempt}/${FORGE_VM_BIND_ATTEMPTS}); waiting ${FORGE_VM_BIND_DELAY_S}s..."
   sleep "${FORGE_VM_BIND_DELAY_S}"
 done
 if [ "${bound}" != "true" ]; then
-  echo "FATAL: could not bind ${FORGE_VM_SA_ROLE} to ${FORGE_VM_SA} after ${FORGE_VM_BIND_ATTEMPTS} attempts." >&2
+  if [ "${bind_failed}" = "true" ]; then
+    echo "FATAL: binding ${FORGE_VM_SA_ROLE} to ${FORGE_VM_SA} failed (above)." >&2
+  else
+    echo "FATAL: ${FORGE_VM_SA} was still not visible to IAM after ${FORGE_VM_BIND_ATTEMPTS} attempts ($((FORGE_VM_BIND_ATTEMPTS * FORGE_VM_BIND_DELAY_S))s); re-run the script." >&2
+  fi
   exit 1
 fi
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
@@ -895,7 +913,7 @@ echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUS
 scope_set=false
 for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
   running="$(gcloud container operations list --project="${PROJECT_ID}" --location="${REGION}" \
-    --filter="status!=DONE AND targetLink~/clusters/${HOST_CLUSTER_NAME}\$" --format="value(name,operationType)" 2>/dev/null || true)"
+    --filter="status!=DONE AND targetLink~/clusters/${HOST_CLUSTER_NAME}(/|\$)" --format="value(name,operationType)" 2>/dev/null || true)"
   if [ -n "${running}" ]; then
     echo "  ⏳ ${HOST_CLUSTER_NAME} is running an operation (${running//$'\n'/; }); waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
     sleep "${HOST_OTEL_WAIT_DELAY_S}"
@@ -905,12 +923,12 @@ for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
       --project="${PROJECT_ID}" \
       --location="${REGION}" \
       --managed-otel-scope="${HOST_OTEL_SCOPE}" \
-      --quiet 2>/tmp/otel-scope.err; then
+      --quiet 2>"${GCLOUD_ERR_FILE}"; then
     scope_set=true
     break
   fi
-  if ! grep -q "CLUSTER_ALREADY_HAS_OPERATION" /tmp/otel-scope.err; then
-    cat /tmp/otel-scope.err >&2
+  if ! grep -q "${HOST_OTEL_BUSY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
     break
   fi
   echo "  ⏳ an operation started between the poll and the update; waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."

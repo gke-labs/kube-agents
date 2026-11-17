@@ -488,6 +488,9 @@ readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # So a refusal that names the target project is absence, which a fresh
 # project reaches on its first install; one that names another project (the
 # caller's quota project) says nothing about the target and stays unread.
+# The same grammar scripts/verify_ci_pool_project.py reads for the Gemini key
+# (GEMINI_KEY_SERVICE_DISABLED, GEMINI_KEY_DISABLED_IN); its tests pin the
+# project-extraction pattern equal to this one.
 readonly GKE_API_DISABLED_PATTERN="API has not been used in project [a-z0-9-]+ before or it is disabled|SERVICE_DISABLED"
 readonly GKE_API_DISABLED_PROJECT_PATTERN="API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
@@ -4899,7 +4902,14 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${PROJECT_NUMBER:-}"; then
+    # The refusal may name the project by number; the front doors that reach
+    # this generator before main() exports PROJECT_NUMBER (the menu, upgrade,
+    # uninstall) resolve it here, and only for a refusal of that shape.
+    local probe_number="${PROJECT_NUMBER:-}"
+    if [ -z "$probe_number" ] && grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$describe_err"; then
+      probe_number="$(trap - ERR; gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+    fi
+    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${probe_number}"; then
       # A fresh project: the Kubernetes Engine API is off, so no cluster can
       # be there, and the apply enables the API before it creates one.
       print_info "The Kubernetes Engine API is not enabled in project '${PROJECT_ID}' yet, so no cluster exists there; the apply enables it."

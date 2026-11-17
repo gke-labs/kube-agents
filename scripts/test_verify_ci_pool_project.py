@@ -573,6 +573,18 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertIn('. "${SCRIPT_DIR}/installer/min_versions.sh"', script)
         self.assertIn('version_lt "${GCLOUD_VERSION}" "${MIN_GCLOUD_VERSION}"', script)
 
+    def test_the_installer_reads_a_disabled_api_refusal_with_the_verifiers_grammar(self):
+        # Two readers of one gcloud message: the verifier's Gemini-key check and
+        # the tfvars generator's cluster probe (installer_common.sh) both take
+        # the project a SERVICE_DISABLED refusal names and compare it with the
+        # target. A gcloud rewording fixed in one and not the other would let
+        # the two disagree about the same project, so the extraction pattern is
+        # pinned equal here.
+        common = (pathlib.Path(__file__).resolve().parents[1] / "scripts" / "installer" / "installer_common.sh").read_text()
+        match = re.search(r'^readonly GKE_API_DISABLED_PROJECT_PATTERN="(.*)"$', common, re.MULTILINE)
+        self.assertIsNotNone(match, "installer_common.sh declares GKE_API_DISABLED_PROJECT_PATTERN")
+        self.assertEqual(match.group(1), checker.GEMINI_KEY_DISABLED_IN.pattern)
+
     def test_missing_seeded_cluster_fails(self):
         clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}\nseeded-a\tENCRYPTED\t\nseeded-b\tENCRYPTED\t"
         with mock.patch.object(checker, "run_cmd") as run:
