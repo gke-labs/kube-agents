@@ -372,6 +372,43 @@ class WatchHealthTest(unittest.TestCase):
             self.assertEqual(self.tick(40)["failed"], [f"{REPO}/pull/1"])
         self.assertIn("i/o timeout", self.row()["health_detail"])
 
+    def test_a_pod_that_goes_not_ready_fails_at_once_though_the_controller_counts_drop(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        # What a real controller reports: one pod NotReady, ready and available counts down to 2.
+        self.cluster.workload = deployment(ready=2, available=2)
+        self.cluster.pod_list = pods()
+        self.cluster.pod_list["items"][1]["status"]["conditions"][0]["status"] = "False"
+        self.assertEqual(self.tick(2)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("pod checkout-1 is not Ready", self.row()["health_detail"])
+
+    def test_a_new_pod_still_starting_after_a_scale_up_waits(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.workload = deployment(replicas=4, updated=4, ready=3, available=3)
+        starting = pods(restarts=(0,), ready=False)["items"][0]
+        starting["metadata"].update(name="checkout-new", uid="new")
+        self.cluster.pod_list = pods()
+        self.cluster.pod_list["items"].append(starting)
+        self.assertEqual(self.tick(2)["waiting"], [f"{REPO}/pull/1"])
+        self.assertIn("pod checkout-new is starting", self.row()["health_detail"])
+
+    def test_a_sidecar_restart_after_the_apply_fails_the_window(self):
+        def with_sidecar(restarts):
+            listed = pods()
+            for item in listed["items"]:
+                item["status"]["initContainerStatuses"] = [
+                    {"name": "proxy", "restartCount": restarts, "lastState": {}, "state": {"running": {}}}]
+            return listed
+
+        self.cluster.apps = [argo_app()]
+        self.cluster.pod_list = with_sidecar(1)
+        self.tick(1)
+        self.assertEqual(json.loads(self.row()["health_baseline"])["u0/proxy"], 1, "the baseline covers sidecars")
+        self.cluster.pod_list = with_sidecar(2)
+        self.assertEqual(self.tick(2)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("container proxy in pod checkout-0 restarted", self.row()["health_detail"])
+
     def test_a_terminating_pod_is_not_judged(self):
         self.cluster.apps = [argo_app()]
         self.tick(1)

@@ -349,26 +349,60 @@ def selects(selector: dict, labels: dict) -> bool:
 
 
 def restart_baseline(pods: dict) -> dict[str, int]:
-    """``{"<pod uid>/<container>": restartCount}`` for every container of every pod."""
+    """``{"<pod uid>/<container>": restartCount}`` for every container of every pod, sidecars and init containers included."""
     out = {}
     for pod in pods.get("items", []):
         uid = (pod.get("metadata") or {}).get("uid") or (pod.get("metadata") or {}).get("name") or ""
-        for status in (pod.get("status") or {}).get("containerStatuses") or []:
+        for status in _container_statuses(pod):
             out[f"{uid}/{status.get('name')}"] = int(status.get("restartCount") or 0)
     return out
 
 
+def _container_statuses(pod: dict) -> list[dict]:
+    """Every container's status: the app containers, and the init containers, where a native sidecar reports."""
+    status = pod.get("status") or {}
+    return list(status.get("containerStatuses") or []) + list(status.get("initContainerStatuses") or [])
+
+
 def _rolled_out(workload: dict) -> bool:
+    """Whether the controller has finished changing the pod set: the spec is observed, every pod is at the
+    current template or revision, and the count matches the spec. Readiness is not part of it; the pods are
+    judged one by one (:func:`judge_health`), so a pod that goes NotReady is red rather than "rolling out"."""
     spec, status, meta = workload.get("spec") or {}, workload.get("status") or {}, workload.get("metadata") or {}
     replicas = int(spec.get("replicas", 1) or 0)
     if int(status.get("observedGeneration") or 0) < int(meta.get("generation") or 0):
         return False
-    if workload.get("kind") == "StatefulSet":
-        if status.get("updateRevision") and status.get("currentRevision") != status.get("updateRevision"):
-            return False
-    elif int(status.get("updatedReplicas") or 0) != replicas or int(status.get("availableReplicas") or 0) != replicas:
+    if int(status.get("replicas", replicas) or 0) != replicas:
         return False
-    return int(status.get("readyReplicas") or 0) == replicas
+    if workload.get("kind") == "StatefulSet":
+        return not (status.get("updateRevision") and status.get("currentRevision") != status.get("updateRevision"))
+    return int(status.get("updatedReplicas") or 0) == replicas
+
+
+def _owned_pods(workload: dict, pods: dict) -> list[dict]:
+    # A pod being deleted (a drain, a scale-down) is no longer the workload's to judge.
+    return [pod for pod in pods.get("items", [])
+            if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")]
+
+
+def _is_ready(pod: dict) -> bool:
+    return any(c.get("type") == "Ready" and c.get("status") == "True"
+               for c in (pod.get("status") or {}).get("conditions") or [])
+
+
+def unsettled(workload: dict, pods: dict, baseline: dict[str, int]) -> str:
+    """Why the workload is not settled yet, or "": a rollout or scale under way, or a pod that did not
+    exist at the apply and is still starting (not Ready, nothing restarted). A pod that was there at the
+    apply and is not Ready is not "starting"; :func:`judge_health` fails it."""
+    if not _rolled_out(workload):
+        return "the rollout is not complete"
+    known = {key.split("/", 1)[0] for key in baseline}
+    for pod in _owned_pods(workload, pods):
+        meta = pod.get("metadata") or {}
+        if (meta.get("uid") or meta.get("name")) not in known and not _is_ready(pod) and not any(
+                int(c.get("restartCount") or 0) for c in _container_statuses(pod)):
+            return f"pod {meta.get('name') or ''} is starting"
+    return ""
 
 
 def _owned_by(pod: dict, workload: dict) -> bool:
@@ -401,20 +435,18 @@ def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: da
     as not healthy: the fix restarts no pods, so that is "not settled", and the
     reporter decides what to say.
     """
-    if not _rolled_out(workload):
-        return False, "the rollout is not complete"
-    # A pod being deleted (a drain, a scale-down) is no longer the workload's to judge.
-    items = [pod for pod in pods.get("items", [])
-             if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")]
+    reason = unsettled(workload, pods, baseline)
+    if reason:
+        return False, reason
+    items = _owned_pods(workload, pods)
     if not items:
         return False, "no pods belong to the workload"
     for pod in items:
-        meta, status = pod.get("metadata") or {}, pod.get("status") or {}
+        meta = pod.get("metadata") or {}
         name = meta.get("name") or ""
-        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions") or [])
-        if not ready:
+        if not _is_ready(pod):
             return False, f"pod {name} is not Ready"
-        for container in status.get("containerStatuses") or []:
+        for container in _container_statuses(pod):
             key = f"{meta.get('uid') or name}/{container.get('name')}"
             if int(container.get("restartCount") or 0) > baseline.get(key, 0):
                 return False, f"container {container.get('name')} in pod {name} restarted"
@@ -598,12 +630,13 @@ def watch_health(
                     baseline = None
                 if not isinstance(baseline, dict) or not all(isinstance(v, int) for v in baseline.values()):
                     raise WorkloadGone("the restart baseline is unreadable")
+                reason = unsettled(workload, pods, baseline)
                 healthy, detail = judge_health(workload, pods, baseline, applied_at)
                 samples = _healthy_samples(last) + 1
-                if not _rolled_out(workload):
+                if reason:
                     # A rollout or scale under way (an HPA, someone else's change) is not settled yet, not red;
                     # it resets the count, and HEALTH_SETTLE_LIMIT ends a wait that never settles.
-                    updates["health_detail"] = f"{NOT_SETTLED}{detail}"
+                    updates["health_detail"] = f"{NOT_SETTLED}{reason}"
                     bucket = "waiting"
                 elif not healthy:
                     # Any red reading after the apply fails the window, even one that would recover.
