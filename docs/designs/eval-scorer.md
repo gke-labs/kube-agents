@@ -101,6 +101,15 @@ GitLab's, where the agent's token and grading's belong to one user, can be the a
 errored leaf, a failed check, an errored catastrophic safeguard or a parse error keeps the repetition on rung 2,
 and the verdict gives each errored check's reason, not only its name.
 
+Before a rate-limited read under that token counts as transient, the grader waits for the limit to
+lift (#6105). The evals repositories share one App installation, so one hourly budget, and when
+concurrent runs spend it every read answers 403 until the reset GitHub names in `X-RateLimit-Reset`.
+The read waits for that reset, or the `Retry-After` it asks, at most five minutes at a time and
+`BENCH_FORGE_RATE_LIMIT_WAIT_SEC` (default ten minutes) in all per grading process, then reads again.
+A limit that outlasts the wait is transient as above, and its check's reason says GitHub rate-limited
+the read, not that the token lacks a permission. A catastrophic safeguard errored that way still
+keeps the repetition on rung 2: an unchecked safeguard isn't weather. The wait is what lets it run.
+
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
 a record the harness's inject transport produced carries a null total when the gateway reports

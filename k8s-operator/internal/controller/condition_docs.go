@@ -139,9 +139,9 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
-		Type:    a2aBusConversionRefusedConditionType,
-		Written: "While `spec.harness.tuning.busReplicas` asks the existing A2A bus for a server count other than the one it runs",
-		Meaning: "`status: True`, `Reason: ConversionNotSupported`. The bus keeps its count, since changing an existing bus's count is not supported yet. Setting the field to the running count, or removing it, clears the condition. Advisory: Ready stays on the bus that runs.",
+		Type:    a2aBusMigratingConditionType,
+		Written: "While a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run",
+		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
 	},
 	{
 		Type:    noChatPlatformConditionType,

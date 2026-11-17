@@ -117,8 +117,8 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	// A profile's template is its own param: a reference to another
 	// profile's is refused rather than followed.
 	// A hash-only reference (#5479) names the profile's own param.
-	if ref.Name != "" && ref.Name != lib.DispatchJobTemplateName(prof.Name) {
-		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, ref.Name)
+	if own := ref.NameFor(prof.Name); own != lib.DispatchJobTemplateName(prof.Name) {
+		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, own)
 	}
 	name := jobTemplateName(prof, tier)
 	raw, err := k.getTemplate(ctx, namespace, name)

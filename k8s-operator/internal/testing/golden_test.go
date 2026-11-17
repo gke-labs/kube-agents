@@ -210,8 +210,10 @@ func TestAgentsGolden(t *testing.T) {
 		},
 		{
 			// The default example CR reconciled until settled, so the golden
-			// carries what later passes add (the bridge's activity hook); the
-			// chart's footprint.yaml sums the A2A stack from this golden.
+			// carries what later passes add (the A2A gateway, once the callout
+			// serves); the chart's footprint.yaml sums the A2A stack from this
+			// golden. Its gateway pod template equals the first pass's
+			// (TestAFreshInstallRendersTheGatewayItSettlesOn).
 			name:         "PlatformAgentSettled",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-settled.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-settled.yaml"),

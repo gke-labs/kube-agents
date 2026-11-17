@@ -73,6 +73,30 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("--drop-undeclared-values applies to --upgrade-mode=operator and harness", proc.stdout)
 
+    def test_allow_node_pool_destroy_is_refused_outside_a_full_upgrade(self):
+        """Only a full upgrade runs Terraform, so only it can destroy a node pool (#5824)."""
+        for mode in ("harness", "operator"):
+            with self.subTest(mode=mode):
+                proc = self._run_upgrade_func(
+                    f"main --allow-node-pool-destroy --upgrade-mode={mode} --image-tag=0.3.0 --non-interactive"
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("--allow-node-pool-destroy applies to --upgrade-mode=full", proc.stdout)
+
+    def test_allow_node_pool_destroy_reaches_lifecycle_only_when_given(self):
+        """run_lifecycle hands the confirmation to lifecycle.sh's guard_gvisor_pool_teardown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "lifecycle.sh"
+            stub.write_text('#!/usr/bin/env bash\necho "ALLOW=${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-unset}"\n')
+            stub.chmod(0o755)
+            for flag, want in (("false", "ALLOW=unset"), ("true", "ALLOW=true")):
+                with self.subTest(flag=flag):
+                    proc = self._run_upgrade_func(
+                        f'PARAM_ALLOW_NODE_POOL_DESTROY={flag}; DEFAULT_KUBE_AGENTS_STATE_BUCKET=b; tf_state_prefix() {{ echo p; }}; '
+                        f'unset KUBEAGENTS_ALLOW_NODE_POOL_DESTROY; run_lifecycle "{tmp}" apply'
+                    )
+                    self.assertIn(want, proc.stdout, proc.stderr)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):

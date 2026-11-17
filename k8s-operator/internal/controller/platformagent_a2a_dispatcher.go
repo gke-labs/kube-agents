@@ -647,6 +647,9 @@ type a2aDrainingTier struct {
 	Tier  string    `json:"tier"`
 	Mode  string    `json:"mode"`
 	Until time.Time `json:"until"`
+	// Ending is lib.DrainingTier's (#5850): an administrator ending this
+	// drain now (endTierDrainAnnotation).
+	Ending bool `json:"ending,omitempty"`
 }
 
 type a2aDispatchDurable struct {
@@ -782,10 +785,10 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
 	}
-	drains := drainingTiersOf(p)
+	drains, ending := drainingTiersOf(p), endingTiersOf(p)
 	for _, tier := range p.AllowedTierList() {
 		if until, ok := drains[tier]; ok {
-			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
+			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until, Ending: ending[tier]})
 		}
 	}
 	// The draining tiers' durables too, so what is queued at them is read
