@@ -190,6 +190,8 @@ class SeveralAnswersTest(SlotCacheCase):
         self.assertEqual(first["fingerprint"], second["fingerprint"])
         self.assertEqual((first["recorded"], second["recorded"], again["recorded"]), (True, True, False),
                          "a different answer is saved; the same answer again is not")
+        self.assertEqual(again["answer_variant"], first["answer_variant"],
+                         "an unsaved line still logs which answer it got, so the publisher can count its run")
         names = [name for name, _ in self.saved(first["fingerprint"])]
         self.assertEqual(names, sorted([first["answer_variant"][1], second["answer_variant"][1]]))
         self.assertEqual(sorted(self.contents(first["fingerprint"])), sorted([self.LOOKING["content"], self.ON_IT["content"]]))

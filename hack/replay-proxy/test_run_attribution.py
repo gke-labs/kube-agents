@@ -39,7 +39,7 @@ class World:
                 json.dump(message, handle)
         return self.blobs[key]
 
-    def request(self, messages, fingerprint, stored=True, recorded=False, answer=None, prior=None):
+    def request(self, messages, fingerprint, stored=True, recorded=False, answer=None, prior=None, unstorable=()):
         request_id = f"{len(self.lines) + 1:032x}"
         if stored:
             with open(os.path.join(self.root, "store", "requests", request_id + ".json"), "w") as handle:
@@ -47,7 +47,7 @@ class World:
         hashes = [f"{abs(hash(json.dumps(m, sort_keys=True))) % (1 << 60):016x}" for m in messages]
         entry = {"event": "replay_shadow_request", "request_id": request_id, "fingerprint": fingerprint,
                  "job": {"build": BUILD}, "diag_settings_hash": SETTINGS, "diag_message_hashes": hashes,
-                 "recorded": recorded, "prompt_tokens": 100}
+                 "recorded": recorded, "prompt_tokens": 100, "unstorable": list(unstorable)}
         if answer:
             entry["answer_variant"] = ["ctx-" + fingerprint, answer]
         if prior:

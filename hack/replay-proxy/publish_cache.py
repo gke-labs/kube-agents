@@ -14,11 +14,11 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
 - `alts/<fingerprint>-<answer>.json`: one answer to a request, flat
   (replay_cache.py nests them one directory per fingerprint), named by the
   answer's identity, so every distinct answer the night's runs gave to a key
-  has a name of its own. One goes up only when the request that saved it
-  belongs to runs that passed, or, saved by a request no run owns, when a
-  passing run's request got that same answer and no failing run is tied to it
-  (run_attribution.Attribution.decide_answer). An answer a failing run gave and
-  no passing run did stays here. The key already holds the normalizer
+  has a name of its own. One goes up when any storable line that gave that
+  answer to that request, recorded or not, is attributed to runs that passed
+  (run_attribution.Attribution.decide_alternate): runs that give the same
+  answer save it once, and the run that saved it may have failed. An answer
+  only failing runs gave stays here. The key already holds the normalizer
   version, the LiteLLM config checksum and image, so answers no other run
   could hit cost space only; the version prefix lets a reader fetch only its
   own.
@@ -307,6 +307,12 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
     logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
     attribution = RA.Attribution(logs, state.store, selection.runs, final)
+    # Every line of the build that gave an answer, by (fingerprint, answer id):
+    # an alternate's producers, recorded or not, from any pod (decide_alternate).
+    producers: Dict[Tuple[str, str], List[RA.Line]] = {}
+    for line in logs.lines:
+        if line.answer_variant is not None:
+            producers.setdefault((line.fingerprint, line.answer_variant[1]), []).append(line)
     # (version, slot object, local path, answer fingerprint), in pod order:
     # decided once every pod's answers are, since two pods can each hold a
     # pointer for one slot key, each to its own answer.
@@ -316,21 +322,17 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
         if not version:
             continue
         recorded: Dict[str, RA.Line] = {}
-        # Each alternate's recording line: the line that wrote that answer to that key.
-        recorded_alts: Dict[Tuple[str, str], RA.Line] = {}
         for line in state.reader.load(segments).lines:
             if line.recorded:
                 recorded.setdefault(line.fingerprint, line)
-                if line.answer_variant is not None:
-                    recorded_alts.setdefault((line.fingerprint, line.answer_variant[1]), line)
         for sub in (ANSWERS, ALTS):
             for name, path in pod_files(pod_dir, sub):
                 if (version, name) in state.done:
                     continue
                 parts = alternate_parts(name)
                 fingerprint = parts[0] if parts is not None else name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
-                line = recorded_alts.get(parts) if parts is not None else recorded.get(fingerprint)
-                if line is None:
+                line = recorded.get(fingerprint) if parts is None else None
+                if (not producers.get(parts)) if parts is not None else line is None:
                     selection.count(NO_RECORDING_LINE)
                     continue
                 entry = read_json(path)
@@ -340,7 +342,10 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 if entry.get(replay_cache.ENTRY_NORMALIZER_VERSION) != version:
                     selection.count(VERSION_MISMATCH)
                     continue
-                decision = attribution.decide_answer(line).decision
+                if parts is not None:
+                    decision = attribution.decide_alternate(producers[parts]).decision
+                else:
+                    decision = attribution.decide_answer(line).decision
                 selection.count(decision)
                 if decision == RA.PASS:
                     selection.add(version, sub, name, path)

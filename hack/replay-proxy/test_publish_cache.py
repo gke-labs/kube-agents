@@ -248,6 +248,44 @@ class PublishTest(unittest.TestCase):
         slot = next(o for o in record["objects"][VERSION] if o["name"].startswith("slots/"))
         self.assertEqual(slot["target"], fp(1))
 
+    def test_the_same_answer_saved_by_a_failing_rep_goes_up_when_a_passing_rep_gave_it_too(self):
+        # Rep 1 failed and saved the shared answer first; rep 2 passed with the
+        # same answer, which record mode did not save again (recorded=false).
+        a = "a" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=False, answer=a)
+        self.alternate(1, a)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
+        self.assertEqual(report["decisions"], {"pass": 1})
+        self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [a]}})
+
+    def test_the_same_answer_from_failing_reps_only_stays(self):
+        a = "a" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "fail", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=False, answer=a)
+        self.alternate(1, a)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
+        self.assertEqual(report["decisions"], {"fail": 1})
+
+    def test_a_passing_reps_unstorable_copy_of_the_answer_is_no_evidence(self):
+        a = "a" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), answer=a, unstorable=["fallback"])
+        self.alternate(1, a)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
+
     def test_two_passing_reps_answers_both_go_up(self):
         a, b = "a" * 64, "b" * 64
         self.world.run("case-a", 1, "pass", ["t_11111111"])

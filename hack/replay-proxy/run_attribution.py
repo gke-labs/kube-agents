@@ -41,12 +41,17 @@ Decisions, per logged request:
 - `unattributed`: once every case is graded, no stored text or a card no run worked;
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
 
-A saved answer (one alternate: one distinct answer to one request) is decided
-by its recording line, the first to give that answer, or, when that line is
-left unattributed or ambiguous on the last call, by the other lines that sent
-the same request and got the same answer, provided no failing run is tied to
-any of them (Attribution.decide_answer). A different answer to the same request
-is an alternate of its own, decided by its own lines.
+A saved alternate (one distinct answer to one request) is decided by every
+storable line that gave that answer to that request, recorded or not: it
+passes when any of them is attributed to runs that all passed, since a passing
+run produced that very answer, even when a failing run gave it first and saved
+it (Attribution.decide_alternate). An answer only failing runs gave never
+passes. A different answer to the same request is an alternate of its own,
+decided by its own lines. An answer in the older layout (one per request) is
+decided by its recording line, or, when that line is left unattributed or
+ambiguous on the last call, by the other lines that sent the same request and
+got the same answer, provided no failing run is tied to any of them
+(Attribution.decide_answer).
 """
 
 from __future__ import annotations
@@ -283,6 +288,8 @@ class Line:
     prompt_tokens: int = 0
     answer_variant: Optional[Tuple[str, ...]] = None
     prior_answer: Optional[Tuple[str, ...]] = None
+    # Whether record mode would have saved this line's answer (no unstorable reason).
+    storable: bool = False
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -300,6 +307,7 @@ class Line:
             prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
             answer_variant=_pair(entry.get(F.ANSWER_VARIANT)),
             prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
+            storable=entry.get(F.UNSTORABLE) == [],
         )
 
 
@@ -543,6 +551,28 @@ class Attribution:
         if passed:
             return Decision(PASS, tuple(sorted(passed)))
         return decision
+
+    def decide_alternate(self, producers: List[Line]) -> Decision:
+        """The decision for one alternate, from every line that produced it (same request, same answer).
+
+        Record mode saves an answer once, so of several runs that gave the same
+        answer only the first line says `recorded`; the later ones still
+        produced it. The alternate passes when any storable producer is
+        decided PASS on its own (decide_answer, so a card-less one can take its
+        continuations' evidence): a passing run gave exactly this answer to
+        exactly this request, whichever run saved the file. A failing run that
+        gave it too does not hold it back, since what is served is that
+        passing run's answer; an answer no passing run gave never passes. With
+        no PASS, a producer still pending keeps it pending; otherwise the
+        first producer's decision stands.
+        """
+        decisions = [self.decide_answer(line) for line in producers if line.storable]
+        passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
+        if any(found.decision == PASS for found in decisions):
+            return Decision(PASS, tuple(passed))
+        if any(found.decision == PENDING for found in decisions):
+            return Decision(PENDING)
+        return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
 
     def _tied_runs(self, line: Line) -> Set[str]:
         """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,
