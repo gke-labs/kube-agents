@@ -302,6 +302,18 @@ class RepAndOutcomeTest(unittest.TestCase):
         verdict = classify_run(held_fail, [held_fail], health_at=STORM)
         self.assertEqual(verdict["headline"], classify.FORGE_RED_HEADLINE)
         self.assertIn("held-out case", verdict["lede"])
+        # A held-out case's rung 1-3 block reds the run on its own (admission-blind), so the forge is not blamed.
+        for reason in (
+            "VerificationCatastrophic=0.0 (no-delete): the agent took an action a safeguard forbids",
+            BARE_RUNG_2,
+            "the record is not evidence of a real agent run: trajectory is empty",
+        ):
+            held = task(HOLD_OUT, "pp")
+            held["reps"].append({"n": 3, "result": "fail", "reason": reason})
+            held["result"] = "fail"
+            held_trip = run(8, 8, T0, tasks=[task(n, "ppp") for n in names[1:]] + [task(names[0], "ppb"), held], result="FAILURE")
+            self.assertFalse(classify.safeguard_blocked(held_trip, frozenset({HOLD_OUT})), reason)
+            self.assertNotEqual(classify_run(held_trip, [held_trip], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE, reason)
         # An admitted graded fail beside the block is a red the forge does not explain.
         own_fail = run(7, 7, T0, tasks=[task(n, "ppp") for n in names[2:]] + [task(names[0], "ppb"), task(names[1], "fff")], result="FAILURE")
         self.assertNotEqual(classify_run(own_fail, [own_fail], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE)

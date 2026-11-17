@@ -196,6 +196,11 @@ RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
 # forge rep here, so a GitHub App rate limit is named rather than counted as
 # fails. Read out of the bench module by the tests.
 FORGE_SAFEGUARD_MARKER = "KUBE_AGENTS_FORGE_SAFEGUARD"
+# How the scorer words a rung 1 or rung 3 block (bench/kube_agents_bench/
+# scoring.py); with RUNG_2_ERRORED_PHRASE these mark the admission-blind
+# rungs, which red a run from a held-out case too.
+RUNG_1_FORBIDDEN_PREFIX = "VerificationCatastrophic="
+RUNG_3_NOT_REAL_PHRASE = "not evidence of a real agent run"
 
 # --- Replay errors (#2328) ---------------------------------------------------
 # A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
@@ -499,12 +504,18 @@ def _is_safeguard(rep: dict) -> bool:
     return str(rep.get("result") or "").lower() != "infra" and str(rep.get("reason") or "").startswith(FORGE_SAFEGUARD_MARKER)
 
 
+def _is_absolute_block(rep: dict) -> bool:
+    """A rung 1-3 block, read from its reason: admission-blind in the scorer."""
+    reason = str(rep.get("reason") or "")
+    return reason.startswith(RUNG_1_FORBIDDEN_PREFIX) or RUNG_2_ERRORED_PHRASE in reason or RUNG_3_NOT_REAL_PHRASE in reason
+
+
 def safeguard_blocked(run: dict, held_out: frozenset = frozenset()) -> bool:
     """A red run with a safeguard block (FORGE_SAFEGUARD_MARKER) and no other
     repetition that could red it: every non-pass, non-infra repetition of an
-    admitted case is a safeguard block. A held-out case's graded fail never
-    blocks, so it is left out (`held_out`: those case names); its safeguard
-    block still reds the run, since rung 2 is admission-blind."""
+    admitted case is a safeguard block. A held-out case's graded (rung 4) fail
+    never blocks, so it is left out (`held_out`: those case names); its rung
+    1-3 blocks still red the run, since those rungs are admission-blind."""
     if str(run.get("result") or "").upper() != RUN_FAILURE:
         return False
     blocks = 0
@@ -512,7 +523,7 @@ def safeguard_blocked(run: dict, held_out: frozenset = frozenset()) -> bool:
         for rep in task_reps(task):
             if _is_safeguard(rep):
                 blocks += 1
-            elif str(rep.get("result") or "").lower() not in ("pass", "infra") and str(task.get("name")) not in held_out:
+            elif str(rep.get("result") or "").lower() not in ("pass", "infra") and (str(task.get("name")) not in held_out or _is_absolute_block(rep)):
                 return False
     return blocks > 0
 
