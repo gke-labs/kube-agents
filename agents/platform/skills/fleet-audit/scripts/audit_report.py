@@ -1819,6 +1819,9 @@ ALL_FINDINGS_RE = re.compile(r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n
 # What an id costs the hidden delta block beyond its own length: its two
 # quotes and the comma joining it to the next.
 DELTA_SLOT_CHARS = 3
+FINDING_ID_FIELD = "id"
+LINE_JOINER = "\n"
+OMITTED_BREAKDOWN_WRAP = " ({breakdown})"
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -3640,9 +3643,9 @@ def clip_text(text: str | None, limit: int) -> str:
 
     Every free-text field is capped, not only the evidence: `title`, `impact`,
     the three `recommendation` sub-fields and `remediation.note` were uncapped,
-    and since `select_rendered_findings` guarantees at least one finding always
-    renders, a single oversized field could push the body past GitHub's limit
-    and publish nothing at all.
+    and since `split_findings_for_body` guarantees at least one finding always
+    renders in full, a single oversized field could push the body past GitHub's
+    limit and publish nothing at all.
     """
     value = publishable_text(text).strip()
     if len(value) <= limit:
@@ -12414,8 +12417,8 @@ def _ident(value: str) -> str:
     Three things at once, because all three failed on the same fields.
 
     *Clipped*, because `cluster`, `namespace` and `object` were the last
-    free-text values the renderer interpolated raw, and `select_rendered_
-    findings` always renders the first finding whatever it costs — so one
+    free-text values the renderer interpolated raw, and `split_findings_for_body`
+    always renders the first finding in full whatever it costs — so one
     oversized identifier overflowed the body and published nothing at all.
 
     *Flattened*, because a newline ends an inline code span. *Backticks
@@ -12526,8 +12529,8 @@ def _anchor_id(fid: str) -> str:
 def _index_row(finding: dict, state: str, pr_url: str | None) -> str:
     """One row of the findings index.
 
-    Shared with `index_overhead` rather than duplicated, because that estimate
-    is what reserves this table's space out of the body budget: a row that
+    Shared with `_index_prefix_costs` rather than duplicated, because that table
+    cost is what budgets this index against the body limit: a row that
     renders wider than it was measured spends budget the findings were
     promised, and the two drifting apart is not visible until a body crosses
     GitHub's limit and publishes nothing.
@@ -12547,42 +12550,37 @@ def _index_row(finding: dict, state: str, pr_url: str | None) -> str:
     )
 
 
-def index_overhead(
-    findings: list[dict],
-    states: dict[str, str],
-    pr_urls: dict[str, str],
-) -> int:
-    """What the findings index will cost, measured rather than guessed.
+def _index_prefix_costs(
+    order: list[dict],
+    states: dict[str, str] | None,
+    pr_urls: dict[str, str] | None,
+) -> list[int]:
+    """State-index cost for each fair-share prefix `order[:k]` (`0 <= k <= len(order)`).
 
-    The index is not charged to any single finding, so it has to be reserved up
-    front — but the reservation cannot know the final selection, since selection
-    is what the reservation is an input to. The rendered set is always a prefix
-    of `_fair_share_order`, and the index shows the first `MAX_DELTA_ROWS` of
-    that set in display order. A prefix of the fair-share order is not a prefix
-    of the display order, so this walks every prefix and keeps the most
-    expensive table that any of them can show. That bounds the table whatever
-    the budget later admits.
-
-    This replaced a flat per-row allowance that a real finding id had already
-    outgrown — ids run to 100 characters and a state cell carries a full pull
-    request URL, so the table could quietly cost twice what was set aside.
+    `_render_findings` shows at most `MAX_DELTA_ROWS` full rows in display
+    order, and omits the table when no full row carries a state. Charging the
+    prefix that actually renders in full avoids reserving fifty index rows on
+    an overflowing body that keeps only a handful of full blocks.
     """
-    # (display key, row cost) of the rows the index shows for the current
-    # prefix, in display order.
+    if not states:
+        return [0] * (len(order) + 1)
+    urls = pr_urls or {}
     shown: list[tuple[tuple, int]] = []
     measured = 0
-    worst = 0
-    for finding in _fair_share_order(sort_findings(findings)):
-        fid = str(finding.get("id", ""))
-        row = _index_row(finding, states.get(fid, STATE_OPEN), pr_urls.get(fid))
+    has_state = False
+    costs = [0]
+    for finding in order:
+        fid = str(finding.get(FINDING_ID_FIELD, ""))
+        if states.get(fid):
+            has_state = True
+        row = _index_row(finding, states.get(fid, STATE_OPEN), urls.get(fid))
         cost = len(row) + 1  # + the newline joining it to the next row
         bisect.insort(shown, (_display_key(finding), cost))
         measured += cost
         if len(shown) > MAX_DELTA_ROWS:
             measured -= shown.pop()[1]
-        worst = max(worst, measured)
-    # Header, separator, the blank line above, and the overflow line below.
-    return worst + INDEX_OVERHEAD_MARGIN
+        costs.append(measured + INDEX_OVERHEAD_MARGIN if has_state else 0)
+    return costs
 
 
 def _blocked_note(fid: str, pr: dict, noun: str) -> str:
@@ -12822,59 +12820,6 @@ def _fair_share_order(ordered: list[dict]) -> list[dict]:
     return out
 
 
-def select_rendered_findings(
-    findings: list[dict],
-    budget: int,
-    *,
-    states: dict[str, str] | None = None,
-    pr_urls: dict[str, str] | None = None,
-    new_ids: set[str] | None = None,
-    noun: str = DEFAULT_PROPOSAL_NOUN,
-    blocked_by: dict[str, dict] | None = None,
-    file_url: str | None = None,
-    file_ref: str = DEFAULT_FILE_REF,
-    unlinked_paths: set[str] | frozenset[str] = frozenset(),
-) -> tuple[list[dict], list[dict]]:
-    """Split the sorted findings into (rendered, omitted) against a char budget.
-
-    Selection walks the severity bands in order and stops at the first finding
-    that does not fit, so truncation only ever eats the least-severe end, and
-    criticals are structurally safe. At least one finding always renders — a
-    body with a single oversized finding is still more useful than a body with
-    none.
-
-    In each band the walk follows `_fair_share_order`, not the display order, so
-    no target gets a second row before every target in the band has one. The rendered set is
-    a prefix of that order, which `index_overhead` relies on. Both lists return
-    in display order: the fair-share order decides which findings render, never
-    where they show.
-
-    Each finding is charged for its own rendered text *and* for the slot its id
-    occupies in the hidden delta block, because that block is itself unbounded:
-    1,250 ids render over 80,000 characters of marker alone.
-    """
-    candidates = _fair_share_order(sort_findings(findings))
-    used = 0
-    fitted = 0
-    for finding in candidates:
-        cost = _full_row_cost(
-            finding,
-            states=states,
-            pr_urls=pr_urls,
-            new_ids=new_ids,
-            noun=noun,
-            blocked_by=blocked_by,
-            file_url=file_url,
-            file_ref=file_ref,
-            unlinked_paths=unlinked_paths,
-        )
-        if fitted and used + cost > budget:
-            break
-        used += cost
-        fitted += 1
-    return sort_findings(candidates[:fitted]), sort_findings(candidates[fitted:])
-
-
 def _full_row_cost(
     finding: dict,
     *,
@@ -13021,100 +12966,80 @@ def _render_listed(
 
 
 def split_findings_for_body(
-    findings: list[dict], budget: int, **render_args
+    findings: list[dict],
+    budget: int,
+    *,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+    **render_args,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Split the findings into (shown in full, listed on one line, omitted).
 
-    Band by band, most severe first. In the band where the full blocks stop
-    fitting, a name outranks a full block: the band shows as many full blocks
-    as still leave room to name the rest of it and every finding below it,
-    and when even that cannot fit, only its floor of full blocks. The
-    critical band reserves room for its own names only, so a critical never
-    loses its evidence to a less severe finding's name. Every band below is
-    names only, as many as fit, and a count for the rest. The first finding is always shown in full,
-    as `select_rendered_findings` guarantees. A listed finding's id rides the
-    delta block like a full one's, so every reader of that block treats it
-    as on the ledger.
+    Most severe first, fair-share across targets within each band. Once all
+    full blocks do not fit, a one-line row outranks a full block in every
+    severity band (critical included): the body shows as many full blocks from
+    the top down as still leave room to list every remaining finding on one
+    line, and when even one full block plus every remaining line cannot fit,
+    keeps the first finding in full and spends the rest of the budget listing
+    remaining findings down the severity bands, with a count for whatever
+    still cannot fit. State-index space (`_index_prefix_costs`) is charged
+    against the full-row prefix chosen whenever `states` carries a state. A
+    listed finding's id rides the delta block like a full one's, so every
+    reader of that block treats it as on the ledger.
     """
-    rendered, rest = select_rendered_findings(findings, budget, **render_args)
-    if not rest:
-        return rendered, [], []
     order = _fair_share_order(sort_findings(findings))
+    if not order:
+        return [], [], []
+    idx_costs = _index_prefix_costs(order, states, pr_urls)
+    full = [
+        _full_row_cost(finding, states=states, pr_urls=pr_urls, **render_args)
+        for finding in order
+    ]
+    prefix_full = [0]
+    for cost in full:
+        prefix_full.append(prefix_full[-1] + cost)
+    if prefix_full[len(order)] + idx_costs[len(order)] <= budget:
+        return sort_findings(order), [], []
     # + 1 for the newline joining each line to the one before it, and the
     # id's slot in the hidden delta block.
     line_costs = [
         len(
             render_listed_finding(
                 finding,
-                state=(render_args.get("states") or {}).get(str(finding.get("id", ""))),
-                pr_url=(render_args.get("pr_urls") or {}).get(str(finding.get("id", ""))),
+                state=(states or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+                pr_url=(pr_urls or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
             )
         )
         + 1
-        + len(str(finding.get("id", "")))
+        + len(str(finding.get(FINDING_ID_FIELD, "")))
         + DELTA_SLOT_CHARS
         for finding in order
     ]
-    # Charged once, at its widest, when the first finding is listed.
-    header = len("\n".join(_listed_header(len(order)))) + len("\n" + LISTED_SECTION_END)
-    full_rows: list[dict] = []
+    # Charged once, at its widest, when at least one finding is listed.
+    header = len(LINE_JOINER.join(_listed_header(len(order)))) + len(
+        LINE_JOINER + LISTED_SECTION_END
+    )
+    tail = [0] * (len(order) + 1)
+    for index in range(len(order) - 1, -1, -1):
+        tail[index] = tail[index + 1] + line_costs[index]
+    fitted = next(
+        (
+            count
+            for count in range(len(order) - 1, 0, -1)
+            if prefix_full[count] + idx_costs[count] + header + tail[count] <= budget
+        ),
+        1,
+    )
+    left = budget - prefix_full[fitted] - idx_costs[fitted] - header
     listed: list[dict] = []
     omitted: list[dict] = []
-    left = budget
-    start = 0
-    while start < len(order):
-        end = start
-        while end < len(order) and _severity_band(order[end]) == _severity_band(order[start]):
-            end += 1
-        band = order[start:end]
-        lines = line_costs[start:end]
-        below = sum(line_costs[end:])
-        start = end
-        if listed or omitted:
-            for finding, cost in zip(band, lines):
-                if not omitted and cost <= left:
-                    listed.append(finding)
-                    left -= cost
-                else:
-                    omitted.append(finding)
-            continue
-        full = [_full_row_cost(finding, **render_args) for finding in band]
-        tail = [0] * (len(band) + 1)
-        for index in range(len(band) - 1, -1, -1):
-            tail[index] = tail[index + 1] + lines[index]
-        floor = 0 if full_rows else 1
-        # Room kept for naming every finding below this band, when that can
-        # fit at all.
-        critical = _severity_band(band[0]) == SEVERITY_RANK["critical"]
-        reserve = 0 if critical else below
-        # Below the critical band, a name outranks a full block whether or not
-        # every name fits: when they do not, this band keeps only its floor of
-        # full blocks and the rest of the budget names as many as it can.
-        names_first = not critical and sum(full[:floor]) + header + tail[floor] + below > left
-        if not names_first and sum(full) + (header + reserve if reserve else 0) <= left:
-            full_rows += band
-            left -= sum(full)
-            continue
-        fitted = floor
-        used = sum(full[:floor])
-        # A full block costs more than the line naming the same finding, so
-        # each extra full block raises the total and the first failure is final.
-        for index in range(floor, 0 if names_first else len(band)):
-            if used + full[index] + header + tail[index + 1] + reserve > left:
-                break
-            used += full[index]
-            fitted = index + 1
-        full_rows += band[:fitted]
-        # The header is paid by the first listed row; a band its floor of full
-        # blocks used up leaves it to the next band.
-        left -= used + (header if fitted < len(band) else 0)
-        for finding, cost in zip(band[fitted:], lines[fitted:]):
-            if not omitted and cost <= left:
-                listed.append(finding)
-                left -= cost
-            else:
-                omitted.append(finding)
-    return sort_findings(full_rows), sort_findings(listed), sort_findings(omitted)
+    for finding, cost in zip(order[fitted:], line_costs[fitted:]):
+        if not omitted and cost <= left:
+            listed.append(finding)
+            left -= cost
+        else:
+            omitted.append(finding)
+    return sort_findings(order[:fitted]), sort_findings(listed), sort_findings(omitted)
 
 
 def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
@@ -13501,11 +13426,18 @@ def _render_findings(
 
     out += _render_listed(listed, states, pr_urls)
     if omitted:
+        omitted_counts = severity_counts(omitted)
+        breakdown = SUMMARY_BREAKDOWN_SEPARATOR.join(
+            SUMMARY_BREAKDOWN_PART.format(count=count, severity=severity)
+            for severity, count in omitted_counts.items()
+            if count
+        )
+        detail = OMITTED_BREAKDOWN_WRAP.format(breakdown=breakdown) if breakdown else ""
         out += [
             "",
             f"_{len(omitted)} further finding(s) are omitted from this description to "
             "stay inside GitHub's body limit. The counts in the title and in the "
-            "summary above are the true totals; the omitted findings are the "
+            f"summary above are the true totals; the omitted findings{detail} are the "
             "least severe. They are kept in full in this run's stored report; ask "
             "the agent for that report to read them._",
         ]
@@ -14325,7 +14257,7 @@ def render_issue_body(
 
     # Measure the footer with the held ids in the block and an empty rendered
     # set: each finding is separately charged for its own id slot inside
-    # select_rendered_findings. The held *rows* are not charged here — they
+    # `split_findings_for_body`. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
     # The complete id list — the document's findings and the held ids, the
@@ -14337,13 +14269,12 @@ def render_issue_body(
     all_block = all_findings_block(finding_ids(findings) + held_ids)
     overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
-    # from is never the thing the findings squeeze out.
+    # from is never the thing the findings squeeze out. The state index is
+    # charged inside `_render_findings` against the full-row prefix
+    # `split_findings_for_body` chooses rather than reserved here for fifty
+    # full rows.
     overhead += len("\n".join(_render_held_ids_only(held_entries)))
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
-    if states:
-        # The state index is one row per rendered finding, capped, and is not
-        # part of any single finding's charged cost.
-        overhead += index_overhead(findings, states, pr_urls)
 
     def select(extra: int) -> tuple[list[str], list[dict], list[dict]]:
         return _render_findings(

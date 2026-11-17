@@ -1121,16 +1121,17 @@ headroom for the trailing marker and for anything a later section appends.
   than targets, the targets late in the alphabet lose their full rows first (see the next bullet
   for the one-line tier). The body still shows the
   selected findings in display order.
-- **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
+- **A name outranks a full block.** When the full blocks do not all fit, the
   findings left over are each listed on one line — severity, title, location, id, then any fix
   state and its pull request — under
   `### Listed without detail (N)`; a 2.7 finding the shared-account shield made manual keeps the
-  shield's note on an indented line under its row. Bands are taken most severe first. A non-critical band shows as
-  many full blocks as still leave room to name the rest of it and every finding below it; the
-  critical band keeps room for its own names only, so a critical never loses its evidence to a less
-  severe finding's name. When naming everything below cannot fit even with no full blocks, a
-  non-critical band keeps only its floor of full blocks and spends the rest on names. Every band below the one where full blocks stop is names only,
-  as many as fit, then a count. A listed line is a
+  shield's note on an indented line under its row. Bands are taken most severe first, with the state
+  index charged against the full-row prefix actually shown rather than fifty rows up front. Once all
+  full blocks do not fit, every band — critical included — shows only as many full blocks from the
+  top down as still leave room to name every remaining finding below on one line. When naming
+  everything cannot fit even beside a single full block, the body keeps the first finding in full
+  and spends the rest of the budget listing remaining findings down the severity bands, then gives
+  the omitted count and per-severity breakdown for the tail. A listed line is a
   bullet, never a `####` heading, so the readers that recover a finding's detail from its heading
   (`FINDING_MARKER_RE`, the Slack card) do not take it for one. Its id rides the delta marker like a
   full row's, and `parse_finding_locations` reads its row with the full blocks, only between
@@ -1664,9 +1665,10 @@ fleet-management profile should not acquire one — so the Platform Agent's own 
 destination. The channel is the Chat Agent's, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
 ledger URL. In Slack with `KAGE_SLACK_UX` on, and in Google Chat under `spec.mode: next`, that line becomes a card built from the ledger issue:
-a headline carrying the count of the most severe findings present, up to ten critical findings or
-the top two of a lower severity when there are none (tagged new where the body marks it so), a
-count of the rest, any clusters the run did not scan, and a link to the issue; the
+a headline carrying the count of the most severe findings present, up to ten critical findings shown
+in full or the top two of a lower severity when there are none (up to the full blocks the body had
+room for, tagged new where the body marks it so), a count of the rest, any clusters the run did not
+scan, and a link to the issue; the
 issue stays the report, and the card only summarises what it already says. `silent_ok` decides
 whether the relay posts anything for a scheduled run: a `[SILENT]` answer skips delivery, so nothing
 reaches the channel. The ledger stays the record in both cases.
