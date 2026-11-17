@@ -548,6 +548,13 @@ class PreflightDecisionTest(unittest.TestCase):
             ({"requests": {"cpu": "4"}}, "sessionRequestsMemory", 4 * 1024**3),
             ({"requests": {"memory": "13Gi"}}, "sessionRequestsCpu", 2000),
             ({"requests": {"memory": "13Gi"}}, "sessionLimitsMemory", 13 * 1024**3),
+            # Just past a 1.625 GiB step: the floor rounds up on the bytes, not after
+            # truncating to MiB or millicores.
+            ({"requests": {"memory": "1665Mi"}}, "sessionRequestsCpu", 500),
+            ({"requests": {"memory": "1703937Ki"}}, "sessionRequestsCpu", 500),
+            ({"requests": {"memory": "6662Mi"}}, "sessionRequestsCpu", 1250),
+            # Exactly on a step: no extra step.
+            ({"requests": {"memory": "1664Mi"}}, "sessionRequestsCpu", 250),
         ):
             with self.subTest(override=override, key=key):
                 ratio = self._requirements(values={"platformAgent": {"harness": {"tuning": {
@@ -598,6 +605,28 @@ class PreflightDecisionTest(unittest.TestCase):
         }}}})
         for key in ("sessionRequestsCpu", "sessionLimitsCpu", "sessionRequestsMemory", "sessionLimitsMemory"):
             self.assertEqual(req[key], base[key], key)
+
+    def test_an_oversized_override_saturates_on_autopilot(self) -> None:
+        """Absurd CPU overrides saturate to the int64 ceiling rather than wrapping to a
+        small figure a quota would pass."""
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        ceiling = 2**63 - 1
+        for cpu in ("10Ei", "9G"):
+            with self.subTest(cpu=cpu):
+                req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+                    "maxSessions": 1, "sessionResources": {"requests": {"cpu": cpu}}}}}},
+                    extra_args=autopilot)
+                self.assertGreaterEqual(req["sessionRequestsCpu"], 9 * 10**12)
+                # 9G of CPU asks 9e9 GiB at 1 GiB per vCPU: past int64, so the ceiling.
+                self.assertEqual(req["sessionRequestsMemory"], ceiling)
+                self.assertLessEqual(req["sessionRequestsMemory"], ceiling)
+
+    def test_a_sub_millicore_bare_decimal_counts_as_one_millicore(self) -> None:
+        """As the operator reads it: a positive quantity, rounded up to 1m."""
+        req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+            "maxSessions": 1, "sessionResources": {"limits": {"cpu": "0.0005"}}}}}})
+        self.assertEqual(req["sessionLimitsCpu"], 1)
+        self.assertEqual(req["sessionRequestsCpu"], 1)
 
     def test_the_totals_carry_the_session_share_at_the_cap(self) -> None:
         """kube-agents.quotaCountsSessions is true: maxSessions moves every total by the
@@ -2384,7 +2413,7 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
         self.assertIn('"limits.ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
@@ -2394,7 +2423,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2756m plus one LiteLLM surge Pod's 100m.
+        # The release's 5936m, the session pods at the cap included, plus one LiteLLM surge Pod's 100m.
         self.assertIn('"cpu":"6036m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
@@ -2404,7 +2433,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        # The release's 15120Mi plus one LiteLLM surge Pod's 2Gi.
+        # The release's 18320Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 2Gi.
         self.assertIn('"memory":"20368Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
@@ -2416,7 +2445,7 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
         self.assertIn('"ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:

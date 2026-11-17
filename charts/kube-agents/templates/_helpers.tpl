@@ -1942,7 +1942,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (mulf (float64 $n) $mult) 1000.0)) -}}
 {{- end -}}
 {{- end -}}
 {{- range $unit, $mult := $decimalCores -}}
@@ -1951,14 +1951,14 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (mulf (float64 $n) $mult) 1000.0)) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $out "" -}}
 {{- if not (regexMatch $numeric $raw) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (float64 $raw) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $raw) 1000.0)) -}}
 {{- end -}}
 {{- $out -}}
 {{- end -}}
@@ -2009,7 +2009,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $n) $mult)) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $out "" -}}
@@ -2019,7 +2019,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $n) $mult)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2027,7 +2027,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $raw) -}}
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (float64 $raw) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (float64 $raw)) -}}
 {{- end -}}
 {{- $out -}}
 {{- end -}}
@@ -3840,14 +3840,16 @@ true
        equal to the requests, below this, and with bursting it keeps them, so counting the
        larger is the safe side either way, as the credential proxy's limits are counted. */ -}}
 {{- if include "kube-agents.gkeAutopilot" . -}}
-  {{- $gib := 1073741824 -}}
-  {{- $cpuReq = max (mul (div (add $cpuReq 249) 250) 250) 250 | int64 -}}
+  {{- /* In float64, rounded up and clamped like satAdd and satMul, so an oversized
+         override saturates rather than wrapping, and no step truncates before the
+         round-up. 1.625 GiB (1744830464 bytes) is one 250m step at 6.5 GiB per vCPU. */ -}}
+  {{- $cpuReq = max (include "kube-agents.clampInt64" (mulf (ceil (divf (float64 $cpuReq) 250.0)) 250.0) | int64) 250 | int64 -}}
   {{- $memReq = max $memReq 536870912 | int64 -}}
-  {{- /* At least 1 GiB per vCPU: millicores x 2^30 / 1000, split so it cannot overflow. */ -}}
-  {{- $memFloor := add (mul (div $cpuReq 1000) $gib) (div (mul (mod $cpuReq 1000) $gib) 1000) | int64 -}}
+  {{- /* At least 1 GiB per vCPU. */ -}}
+  {{- $memFloor := include "kube-agents.clampInt64" (ceil (divf (mulf (float64 $cpuReq) 1073741824.0) 1000.0)) | int64 -}}
   {{- $memReq = max $memReq $memFloor | int64 -}}
-  {{- /* At most 6.5 GiB per vCPU: CPU of at least memory / 6.5 GiB, rounded up to 250m. */ -}}
-  {{- $cpuFloor := div (add (div (mul (div $memReq 1048576) 2000) 13312) 249) 250 | mul 250 | int64 -}}
+  {{- /* At most 6.5 GiB per vCPU: CPU of at least memory / 6.5 GiB, in 250m steps. */ -}}
+  {{- $cpuFloor := include "kube-agents.clampInt64" (mulf (ceil (divf (float64 $memReq) 1744830464.0)) 250.0) | int64 -}}
   {{- $cpuReq = max $cpuReq $cpuFloor | int64 -}}
   {{- $cpuLim = max $cpuLim $cpuReq | int64 -}}
   {{- $memLim = max $memLim $memReq | int64 -}}
