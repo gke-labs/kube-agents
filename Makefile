@@ -91,7 +91,7 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
 	@./scripts/mirror_images.sh $(ARGS)
 
-images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, that the chart renders nothing off a public registry when mirrored, and that cert_manager_version matches the cert-manager pins (CI runs this).
 	@./hack/check-image-inventory.sh
 
 # Prefer an installed `prettier` over `npx prettier`, falling back to npx where

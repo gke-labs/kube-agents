@@ -257,18 +257,18 @@ not been set.
 starts there and rarely ends there. Several images keep a second copy that the file is the source
 for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
+default and a mirrored install, and what each off-by-default toggle it renders adds to each (the
+GitHub token minter, the web console, the cluster profile, Hindsight); the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
-worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
-rather than a literal. Copies it does not reach, where a stale pin passes every check:
-Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
-`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
-`charts/kube-agents/values.yaml` are unguarded; cert-manager's version is set again in
-`terraform/examples/full-install/variables.tf`, which no check reads; and the example
-fluent-bit tags in `INSTALL.md` and the commented example in
-`k8s-operator/config/manager/manager.yaml` are prose. So: bump the pin in
+worker repository; the example manifests; the kustomize integrations, which it requires to name a variable the file owns
+rather than a literal; and the `cert_manager_version` default in
+`terraform/examples/full-install/variables.tf`, with its commented copy in the tfvars example,
+against the cert-manager pins. Copies it does not reach, where a stale pin passes every check: the
+example fluent-bit tags in `INSTALL.md`, the commented example in
+`k8s-operator/config/manager/manager.yaml`, and the cert-manager example in the header comment of
+`scripts/mirror_images.sh` are prose. So: bump the pin in
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 

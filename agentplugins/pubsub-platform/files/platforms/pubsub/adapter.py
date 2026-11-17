@@ -45,8 +45,12 @@ CREDENTIAL_PROXY_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"
 # subscription the broker refuses; GCP_PROJECT_ID is a plugin's to override and is the
 # fallback for an install without the operator's variable.
 PROJECT_ID_ENVS = ("PUBSUB_RELAY_PROJECT", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
+GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+CLOUDSDK_UNIVERSE_DOMAIN_ENV = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+DEFAULT_UNIVERSE_DOMAIN = "googleapis.com"
+PUBSUB_SERVICE_PREFIX = "pubsub."
 RELAY_PREFIX = "/v1/pubsub/gcp/"
-RELAY_PUBSUB_HOST = "pubsub.googleapis.com"
+RELAY_PUBSUB_HOST = PUBSUB_SERVICE_PREFIX + DEFAULT_UNIVERSE_DOMAIN
 # One pull asks for one message. A pull is a lease: by the time the broker reads the
 # answer, Pub/Sub has delivered the batch and started its ack deadline, and the ack ids
 # are in the body, so an answer the broker cannot relay (its response cap) strands every
@@ -178,8 +182,15 @@ class PubsubRelay:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    def _pubsub_host(self) -> str:
+        for env_name in (GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+            domain = os.environ.get(env_name, "").strip().rstrip(".").lower()
+            if domain:
+                return f"{PUBSUB_SERVICE_PREFIX}{domain}"
+        return RELAY_PUBSUB_HOST
+
     def _url(self, subscription_path: str, verb: str) -> str:
-        return f"{self.base_url}{RELAY_PREFIX}{RELAY_PUBSUB_HOST}/v1/{subscription_path}{verb}"
+        return f"{self.base_url}{RELAY_PREFIX}{self._pubsub_host()}/v1/{subscription_path}{verb}"
 
     def call(self, method: str, subscription_path: str, verb: str = "", body: Optional[dict] = None,
              timeout: float = SETTLE_REQUEST_TIMEOUT_SECONDS) -> Any:
