@@ -230,17 +230,35 @@ type Service struct {
 // Answer applies the rules to one request. Split out from the subscription so
 // the rules can be tested without a bus.
 func (s *Service) Answer(ctx context.Context, subject string, data []byte) Response {
+	// The id is read first, on its own, so the two refusals below answer the
+	// request that asked too: a client that acts only on its own id would
+	// otherwise drop them, and a refusal would end as an unreachable check.
+	id := echoableRequestID(data)
 	caller, err := callerFromSubject(subject)
 	if err != nil {
-		return Response{Reason: Reason(err)}
+		return Response{Reason: Reason(err), RequestID: id}
 	}
 	var req Request
 	if err := json.Unmarshal(data, &req); err != nil || (req.RequestID != "" && !validRequestID(req.RequestID)) {
-		return Response{Reason: "the request is not well-formed"}
+		return Response{Reason: "the request is not well-formed", RequestID: id}
 	}
 	resp := s.decide(ctx, caller, req)
 	resp.RequestID = req.RequestID
 	return resp
+}
+
+// echoableRequestID is the request id in data when it is well-formed, read on
+// its own, so a request whose other fields don't decode still gets its id
+// back; "" when there is none to echo (not JSON, no id, or an id that isn't
+// what newRequestID produces).
+func echoableRequestID(data []byte) string {
+	var probe struct {
+		RequestID string `json:"requestId"`
+	}
+	if json.Unmarshal(data, &probe) != nil || !validRequestID(probe.RequestID) {
+		return ""
+	}
+	return probe.RequestID
 }
 
 // decide is Answer's verdict on a request that parsed. Answer stamps the
