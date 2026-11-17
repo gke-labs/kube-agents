@@ -679,3 +679,51 @@ func TestTheConfigWriteTimeIsTheLatestManagedFieldsEntry(t *testing.T) {
 		t.Fatal("a Secret with no managedFields gave a write time")
 	}
 }
+
+// A replacement created after the write that is still starting (no /varz
+// yet) isn't restarted again: it gets a full bound from its own creation.
+// Past that bound, still unconfirmed, it is restarted, so the wait ends.
+func TestAStartingReplacementIsNotRestartedAgain(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	written := asked.Add(time.Second)
+	created := written.Add(4 * time.Minute)
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{"one second old", created.Add(time.Second), false},
+		{"past its own bound", created.Add(a2aBusReloadBound + time.Second), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), servers: map[string]a2aBusServerRecord{}}
+			agent := a2aSingleServerTestAgent()
+			name := a2aNATSName(agent) + a2aNATSPodOrdinalSuffix
+			state.servers[name] = a2aBusServerRecord{UID: "the-old-pod", Start: t0, Loaded: t0}
+			pending := &corev1.Secret{}
+			state.stamp(pending, a2aNATSName(agent))
+			r, agent, sts, _ := a2aReloadFixture(t, "new", pending.Annotations)
+			pod := &corev1.Pod{}
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: name}, pod); err != nil {
+				t.Fatal(err)
+			}
+			pod.CreationTimestamp = metav1.NewTime(created)
+			if err := r.Delete(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			pod.ResourceVersion, pod.UID = "", "the-replacement"
+			if err := r.Create(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return written, true }
+			r.busVarz = varzOf(nil, name)
+			plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), tc.at)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (plan.restart != "") != tc.want {
+				t.Fatalf("plan = %+v, want a restart %v", plan, tc.want)
+			}
+		})
+	}
+}

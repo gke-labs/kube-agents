@@ -59,7 +59,7 @@ const (
 	// string, empty when it couldn't be read. Rolled back mid-reload, that
 	// operator then confirms or restarts the one server as it always did,
 	// rather than mistaking another shape for a moved load time.
-	a2aBusReloadBaselineAnnotation  = "kubeagents.x-k8s.io/a2a-reload-baseline"
+	a2aBusReloadBaselineAnnotation = "kubeagents.x-k8s.io/a2a-reload-baseline"
 	// a2aBusReloadServersAnnotation is the per-server record a reload is
 	// confirmed against (a2aBusServerRecord, by pod name, as JSON).
 	a2aBusReloadServersAnnotation = "kubeagents.x-k8s.io/a2a-reload-servers"
@@ -529,13 +529,20 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 		return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID, foreign: foreign}, nil
 	}
 	plan := a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID, foreign: foreign}
-	if straggler, ok := a2aBusStragglerToRestart(servers, confirmed, now); ok {
+	if straggler, ok := a2aBusStragglerToRestart(servers, confirmed, writtenAt, known, now); ok {
 		plan.restart, plan.restartUID = straggler.name, straggler.pod.UID
 		// A re-armed fold the server still answers for is the expected
 		// shape, not a failed reload; it restarts all the same.
 		plan.folded = state.rearmed[straggler.name] && readable[straggler.name] && perr == nil
 	}
 	return plan, nil
+}
+
+// a2aBusYoungReplacement reports whether pod was created after the write and
+// less than a2aBusReloadBound ago: it mounted the current Secret, and is
+// owed the time to start and answer before anything restarts it.
+func a2aBusYoungReplacement(pod *corev1.Pod, writtenAt time.Time, known bool, now time.Time) bool {
+	return a2aBusCreatedAfter(pod, writtenAt, known) && now.Sub(pod.CreationTimestamp.Time) < a2aBusReloadBound
 }
 
 // a2aBusReadyFor reports whether pod has been Ready for at least d at now,
@@ -553,8 +560,11 @@ func a2aBusReadyFor(pod *corev1.Pod, d time.Duration, now time.Time) bool {
 // the first, by ordinal, that hasn't confirmed the reload, and only when every
 // other server's pod is serving and has been Ready for
 // a2aBusReadyBeforeRestart. None qualifies while any other server is down or
-// just back, or while a scale-down is under way.
-func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool, now time.Time) (a2aBusServer, bool) {
+// just back, or while a scale-down is under way. A pod created after the
+// write (the operator's own replacement, say) is given a full
+// a2aBusReloadBound from its own creation to come up and answer before it can
+// be restarted, so a replacement still starting isn't deleted again.
+func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool, writtenAt time.Time, known bool, now time.Time) (a2aBusServer, bool) {
 	for _, s := range servers {
 		if s.extra {
 			// A scale-down is under way: the StatefulSet removes that pod
@@ -563,7 +573,7 @@ func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool,
 		}
 	}
 	for i, s := range servers {
-		if confirmed[s.name] || !s.serving() {
+		if confirmed[s.name] || !s.serving() || a2aBusYoungReplacement(s.pod, writtenAt, known, now) {
 			continue
 		}
 		others := true
