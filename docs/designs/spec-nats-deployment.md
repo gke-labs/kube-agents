@@ -57,6 +57,27 @@ with an `A2ABusConversionRefused` condition and Warning, and the admission webho
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
 
+**Amended 10/31 (#4225):** the refusal is gone, and a change between one server and three
+starts a migration that keeps the bus's data. The operator runs it as phases on
+`status.busMigration`, reported by the `A2ABusMigrating` condition, and the webhook refuses
+another `busReplicas` change while one runs.
+
+- **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
+  and scales it to one replica while the bus is still a cluster, then the bus renders one
+  server. Writes keep flowing.
+- **One to three**, by copy: writes are frozen (no workload but the migration reaches the bus; console
+  and web logins drop, and the gateway and bridge cannot publish), the operator's pods
+  snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
+  snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
+  stream, checked against the operator's policy for it before and after, and raises it to
+  three replicas.
+- **A failure** turns the run back: before the shrink, the pinned streams go back to three
+  replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
+  restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
+  A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
+  it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
+  does neither.
+
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
 leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
@@ -479,8 +500,8 @@ Layout:
   which have no validator - a side left empty beside a populated one renders an explicit
   `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
   ships, still gets no permissions block at all. A principal that must not publish cannot be
-  expressed by omission - there is no deny list in the map
-  - so it has to be left unrendered rather than rendered empty.
+  expressed by omission - the map's deny lists (#5301) only subtract from an allow and never
+  stand in for an empty one - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -831,7 +852,11 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+janitor yet. **Amended 11/16 (#5301):** the gateway has an entry too, keyed on its own
+ServiceAccount. Its grants carry deny lists, a shape the map gained for it: the only thing
+keeping its consumer-create wildcard on `TASKS` off the pre-created durables is a publish
+deny naming them. It uses the entry only at `A2A_GATEWAY_BUS_AUTH=token`; its static user
+stays until a release after that flip, so rolling back across it is the flag. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
 `a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic

@@ -678,8 +678,17 @@ func TestTheReconcileHoldsANewProfileOutOfTheDispatcherUntilTheBusHasIt(t *testi
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, shard); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(shard.Data[a2aAuthMapKey], `"a2a.tasks.auditor.*.supervisor"`) {
-		t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+	// The dispatcher's allows, not the map as a whole: the gateway's entry
+	// denies every bound profile's supervisor subjects, held ones included,
+	// as nats.conf does (#5301).
+	var heldDoc a2aAuthMapDocument
+	if err := json.Unmarshal([]byte(shard.Data[a2aAuthMapKey]), &heldDoc); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range heldDoc.Identities {
+		if id.User == a2aDispatcherUser && slices.Contains(id.Grants.Publish, "a2a.tasks.auditor.*.supervisor") {
+			t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+		}
 	}
 	config := &corev1.Secret{}
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, config); err != nil {

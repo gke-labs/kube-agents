@@ -48,6 +48,10 @@ _PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_n
 # the subshell rule.
 _FRONT_DOORS = (_INSTALL_SH, _REPO_ROOT / "upgrade.sh", _REPO_ROOT / "uninstall.sh")
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+# Where main() generates terraform.tfvars when it is handed this checkout, and
+# the two names its generator writes there.
+_CHECKOUT_COMPOSE_DIR = _REPO_ROOT / "terraform" / "examples" / "full-install"
+_GENERATED_TFVARS_NAMES = ("terraform.tfvars", "terraform.tfvars.tmp")
 
 # install.sh sources the shared helpers from the acquired workspace partway
 # through main(), so a validator that leans on one is unreachable from a bare
@@ -60,6 +64,11 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# install.sh's variable for the report file, a seam for tests, and the path a
+# real install writes, which INSTALL.md and the install skill tell an agent to
+# read.
+_INSTALL_REPORT_FILE_ENV = "KUBE_AGENTS_INSTALL_REPORT_FILE"
+_INSTALL_REPORT_DEFAULT_FILE = "/tmp/kube-agents-install-report.json"
 # What `gcloud container clusters describe` prints for a cluster that does not
 # exist, and for one it could not read.
 _GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
@@ -98,17 +107,61 @@ def _run_installer_bash(body, env, cwd=_REPO_ROOT):
 def setUpModule():
     # No test here runs the real gcloud: a gcloud call that a test leaves
     # unstubbed goes to a stand-in, and the stand-in fails the module.
-    global _NO_GCLOUD
+    global _NO_GCLOUD, _REPORT_DIR, _REPORT_ENV_BEFORE
+    # write_json_report runs for real in many tests here, by a direct call and
+    # through the ERR handler. Its report goes to a file of this run of the
+    # module. The path a real install writes is one fixed file, which two runs
+    # of this module at the same time would share. The directory first and the
+    # variable last, so that a step that fails here leaves nothing set.
+    _REPORT_DIR = tempfile.TemporaryDirectory()
     _NO_GCLOUD = no_live_gcloud.install()
+    _REPORT_ENV_BEFORE = os.environ.get(_INSTALL_REPORT_FILE_ENV)
+    os.environ[_INSTALL_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / "kube-agents-install-report.json")
 
 
 def tearDownModule():
-    _NO_GCLOUD.uninstall()
+    if _REPORT_ENV_BEFORE is None:
+        os.environ.pop(_INSTALL_REPORT_FILE_ENV, None)
+    else:
+        os.environ[_INSTALL_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
+    try:
+        _REPORT_DIR.cleanup()
+    finally:
+        _NO_GCLOUD.uninstall()
 
 
 class TestNoLiveGcloud(unittest.TestCase):
     def test_no_test_in_this_module_can_run_the_real_gcloud(self):
         no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
+
+
+def _checkout_generated_tfvars():
+    """The generated tfvars of the checkout's Terraform composition: name, time and size.
+
+    For a test that hands main() the real checkout as its repository: take
+    this before the run and give it to _assert_checkout_tfvars_untouched
+    after it. main() sources scripts/installer/installer_common.sh from the
+    repository after a driver's stubs are defined, so a stub of a function
+    that file defines does not hold. write_tfvars_from_state is one: the real
+    one then writes terraform.tfvars into the composition directory, which in
+    a developer's clone holds the generated file of a real install. A stub of
+    tf_compose_dir holds, because install.sh defines it and is not sourced
+    again: point it at a temporary directory.
+    """
+    found = {}
+    for name in _GENERATED_TFVARS_NAMES:
+        try:
+            status = (_CHECKOUT_COMPOSE_DIR / name).stat()
+        except FileNotFoundError:
+            continue
+        found[name] = (status.st_mtime_ns, status.st_size)
+    return found
+
+
+def _assert_checkout_tfvars_untouched(test, before):
+    test.assertEqual(
+        before, _checkout_generated_tfvars(), f"the run wrote tfvars into the checkout's {_CHECKOUT_COMPOSE_DIR.name}"
+    )
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -448,7 +501,12 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={
+                "HOME": str(home_dir),
+                "PATH": os.environ["PATH"],
+                # A refused checkout ends in the ERR handler, which writes the report.
+                _INSTALL_REPORT_FILE_ENV: os.environ[_INSTALL_REPORT_FILE_ENV],
+            },
             cwd=str(outside_dir),
         )
 
@@ -2786,6 +2844,11 @@ verify_local_source_ref() {
   echo "VERIFIED_IMAGE_TAG=$2"
   exit 0
 }
+# The panel reads gVisor from the live install when install.env is silent
+# (resolve_existing_install_gvisor), and it sources installer_common.sh
+# itself, so a function stub would be overwritten. An explicit value wins
+# and keeps that read off the gcloud on PATH (#5893's guard).
+export ENABLE_GVISOR="false"
 PROJECT_ID="test-project"
 PARAM_IMAGE_TAG="0.4.0"
 run_menu_system "."
@@ -2816,6 +2879,7 @@ gcloud() { return 1; }
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2867,6 +2931,7 @@ EOF
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2897,6 +2962,7 @@ PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
 CHAT_SUB_NAME="platform-agent-chat-events-sub"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -3241,12 +3307,29 @@ PARAM_GENERATE_ONLY="true"
 PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
+
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real install writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_json_report with the
+        variable unset would write that file."""
+        source = _INSTALL_SH.read_text()
+        self.assertEqual(
+            source.count(_INSTALL_REPORT_DEFAULT_FILE), 1, "install.sh names the report path in one place"
+        )
+        self.assertEqual(
+            source.count(
+                f'  local report_file="${{{_INSTALL_REPORT_FILE_ENV}:-{_INSTALL_REPORT_DEFAULT_FILE}}}"\n'
+            ),
+            1,
+            "write_json_report takes the variable, then the documented path",
+        )
+        self.assertIn(_INSTALL_REPORT_DEFAULT_FILE, (_REPO_ROOT / "INSTALL.md").read_text())
 
     def test_write_json_report_records_network_policy_enforcement(self):
         """The choice to install without enforcement outlives the terminal (#1682)."""
@@ -3257,7 +3340,7 @@ PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
 write_json_report "SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -9619,6 +9702,8 @@ class RunLifecycleApplyTrapTest(unittest.TestCase):
         self._tmp_path = pathlib.Path(tmp.name)
         self._empty_install_env = self._tmp_path / "install.env"
         self._empty_install_env.write_text("")
+        # Where _run_func sends the report: a file of this test.
+        self._report_file = self._tmp_path / "report.json"
 
     def _run_func(self, func_call, cwd=None):
         setup = f"""
@@ -9628,7 +9713,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 """
         overrides = {
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
-            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
         }
         full_env = get_isolated_test_env(overrides=overrides)
         return subprocess.run(
@@ -9659,6 +9744,59 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
 
+    def test_only_an_explicit_gvisor_off_confirms_the_pool_destroy(self):
+        # guard_gvisor_pool_teardown reads KUBEAGENTS_ALLOW_NODE_POOL_DESTROY.
+        # An explicit --enable-gvisor=false or "No" at the interview's prompt
+        # (both set PARAM_ENABLE_GVISOR_EXPLICIT) confirms it; ENABLE_GVISOR=false
+        # from install.env alone does not (#5824).
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text('#!/bin/bash\necho "ALLOW=${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-unset}"\n')
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        cases = (
+            ("export ENABLE_GVISOR=false; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=true"),
+            ("export ENABLE_GVISOR=false", "ALLOW=unset"),
+            ("export ENABLE_GVISOR=true; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=unset"),
+        )
+        for setup, want in cases:
+            with self.subTest(setup=setup):
+                proc = self._run_func(
+                    f'unset KUBEAGENTS_ALLOW_NODE_POOL_DESTROY; {setup}; run_lifecycle_apply "{repo_dir}" "{log_file}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(want, log_file.read_text())
+
+    def test_the_interviews_no_marks_gvisor_explicit(self):
+        text = _INSTALL_SH.read_text()
+        start = text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"')
+        yes_default = text[start:]
+        yes_default = yes_default[: yes_default.index("    else\n")]
+        self.assertIn('enable_gvisor="false"', yes_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', yes_default)
+        # No as the default (install.env already false), kept at the prompt:
+        # the operator affirmed it, so it confirms the destroy too.
+        no_default = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)"'):]
+        no_default = no_default[: no_default.index("    fi\n")]
+        self.assertIn("else", no_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', no_default[no_default.index("else"):])
+
+    def test_the_enable_gvisor_flag_marks_the_choice_explicit(self):
+        for flag, want in (("--enable-gvisor=false", "M=[true]"), ("--enable-gvisor=true", "M=[true]")):
+            with self.subTest(flag=flag):
+                proc = self._run_func(f'parse_args {flag}; echo "M=[${{PARAM_ENABLE_GVISOR_EXPLICIT:-}}]"')
+                self.assertIn(want, proc.stdout, proc.stderr)
+        proc = self._run_func('parse_args; echo "M=[${PARAM_ENABLE_GVISOR_EXPLICIT:-}]"')
+        self.assertIn("M=[]", proc.stdout, proc.stderr)
+
+    def test_the_control_panel_reads_gvisor_from_the_live_install(self):
+        text = _INSTALL_SH.read_text()
+        panel = text[text.index("run_menu_system() {"):]
+        panel = panel[: panel.index("\n}\n")]
+        self.assertIn('enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"', panel)
+        self.assertNotIn("${ENABLE_GVISOR:-false}", panel)
+
     def test_successful_apply_writes_log_file_and_succeeds(self):
         repo_dir = self._tmp_path / "mock-repo"
         compose_dir = repo_dir / "terraform" / "examples" / "full-install"
@@ -9685,11 +9823,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """
         lib = self._tmp_path / "helper_lib.sh"
         lib.write_text("library_probe() {\n  false\n}\n")
-        # Same file the other write_json_report tests read, removed first so
-        # the assertions below read this run's report and not the one the
-        # previous test left behind.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
 
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -9823,9 +9957,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         inherited trap in this shape, so there this asserts the contract
         without exercising the check; the unhandled case below does.
         """
-        # Same file the other write_json_report tests read.
-        report = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report.unlink(missing_ok=True)
+        report = self._report_file
         proc = self._run_func(
             "probe() { false; }\n"
             'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
@@ -9848,10 +9980,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         hand the caller a clean exit. The parent's trap then fires at the
         assignment and prints the one banner.
         """
-        # Same file the other write_json_report tests read, removed first so
-        # the report assertion reads this run's and not the previous test's.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(
             'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
             'x="$(probe)"\n'
@@ -12520,12 +12649,19 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             # default kubeconfig must not be what answers.
             kubeconfig = pathlib.Path(tmp) / "kubeconfig"
             kubeconfig.touch()
+            # The run generates terraform.tfvars; it must land here and not in
+            # the checkout (see _checkout_generated_tfvars). The stubs below of
+            # write_tfvars_from_state and check_service_account_ownership do
+            # not hold: main() sources the file that defines the real ones.
+            tf_dir = pathlib.Path(tmp) / "full-install"
+            tf_dir.mkdir()
             driver = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 "command() { return 0; }\n"
                 "require_min_gcloud_version() { return 0; }\n"
                 "require_min_terraform_version() { return 0; }\n"
                 f'acquire_source_repo() {{ printf -v "$1" "%s" "{_REPO_ROOT}"; }}\n'
+                f'tf_compose_dir() {{ echo "{tf_dir}"; }}\n'
                 "gcloud() {\n"
                 '  case "$*" in\n'
                 '    *"config get-value account"*) echo "user@example.com" ;;\n'
@@ -12543,6 +12679,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 'write_json_report() { echo "REPORT=$1"; }\n'
                 "main --dry-run -y --gcp-project-id=test-proj --gke-cluster-name=test-cluster --gcp-region=us-central1\n"
             )
+            tfvars_before = _checkout_generated_tfvars()
             proc = subprocess.run(
                 ["bash", "-c", driver],
                 capture_output=True,
@@ -12554,6 +12691,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("REPORT=DRY_RUN_SUCCESS", proc.stdout)
+            _assert_checkout_tfvars_untouched(self, tfvars_before)
 
     def test_every_toggle_refuses_an_empty_value_against_a_seed(self):
         """`--enable-slack=` with SLACK_ENABLED=true recorded is the bad case.
@@ -13596,6 +13734,7 @@ prompt_menu() {{
     3) printf -v "$var" '%s' "6" ;;
   esac
 }}
+export ENABLE_GVISOR="false"
 run_menu_system "{repo_tmp}"
 """,
                         source_common=False,
@@ -13623,6 +13762,7 @@ run_menu_system "{repo_tmp}"
                     kubeconfig = pathlib.Path(kc_dir) / "kubeconfig"
                     kubeconfig.touch()
                     flag = "--enable-stockout-investigator" if enabled else ""
+                    tfvars_before = _checkout_generated_tfvars()
                     proc = self._run_bash(
                         f"""
 command() {{ return 0; }}
@@ -13651,6 +13791,7 @@ main --dry-run -y --gcp-project-id=test-proj --gke-cluster-name=test-cluster --g
                         source_common=False,
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    _assert_checkout_tfvars_untouched(self, tfvars_before)
                     self.assertIn("GKE Stockout Investigator:", proc.stdout)
                     self.assertIn(expected, proc.stdout)
 

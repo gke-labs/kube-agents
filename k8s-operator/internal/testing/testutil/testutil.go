@@ -27,7 +27,7 @@ import (
 
 // reconcileIterations bounds a golden's reconcile loop; a settled run takes a
 // pass per step of the bring-up it waits through (the callout serving, the
-// provisioning Job completing, the bridge joining the agent pod), so it gets more.
+// provisioning Job completing), so it gets more.
 const (
 	reconcileIterations        = 5
 	settledReconcileIterations = 12
@@ -212,8 +212,9 @@ func RunGoldenTest(
 // it is given: between reconcile passes every Deployment and StatefulSet is
 // marked ready and every Job complete, so the golden is the steady state rather
 // than the first pass. Next mode needs it: the A2A gateway waits for the
-// callout to serve and the hermes bridge for the provisioning Job, so a
-// first-pass golden leaves out the pods an installed cluster runs.
+// callout to serve, so a first-pass golden leaves out the pods an installed
+// cluster runs. (The hermes bridge is in the agent pod from the first pass,
+// #5962.)
 func RunSettledGoldenTest(
 	t *testing.T,
 	inputPath, expectedPath string,
