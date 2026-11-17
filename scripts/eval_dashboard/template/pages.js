@@ -64,7 +64,7 @@ const PAGE = {
   // lost pods and deadline kills 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, forge_outage: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -645,6 +645,25 @@ function stormFacts(inc, inWindow) {
   ];
 }
 
+// The forge-outage brief's facts (#6105): the ceiling's shape over forge reps,
+// the repetitions whose checks errored on a GitHub read during grading.
+function forgeFacts(inc, inWindow) {
+  let reps = 0, forge = 0;
+  const prs = new Set();
+  for (const run of inWindow) {
+    let mine = 0;
+    for (const c of run.cases || []) { reps += repTotal(c.reps); forge += c.reps.forge || 0; mine += c.reps.forge || 0; }
+    if (mine && run.pr != null) prs.add(run.pr);
+  }
+  const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
+  const passed = graded.filter((c) => c.outcome === "passed" || c.outcome === "partial").length;
+  return [
+    fact(true, `<b>${forge} of ${reps} repetitions</b> lost their checks to a GitHub read that failed during grading, across ${plural(prs.size, "PR")}; none counted against a case.`),
+    fact(prs.size > 1, "The evals repositories share one GitHub App installation and its hourly budget, so a second PR already points at the budget, not a branch."),
+    fact(graded.length > 0, graded.length ? `What was graded mostly passed: ${passed} of ${graded.length} graded gate cases.` : "Nothing was graded in this window at all."),
+  ];
+}
+
 // The delegation-ceiling brief's facts (#1874): the storm's shape over
 // ceiling reps. `ceiling_reps` on the run doc anchors the incident's first run.
 function ceilingFacts(inc, inWindow) {
@@ -787,6 +806,12 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
     };
   }
+  if (inc.condition === "forge_outage") {
+    return {
+      head: inc.past ? "Grading could not read GitHub" : "Grading cannot read GitHub",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The GitHub App's hourly rate limit ran out, so checks that read GitHub errored; a catastrophic safeguard among them keeps a run red with nothing about the pull request graded (#6105).`,
+    };
+  }
   if (inc.condition === "deadline_kill") {
     return {
       head: inc.past ? "Runs were killed at the job deadline with nothing graded" : "Runs are being killed at the job deadline with nothing graded",
@@ -835,16 +860,20 @@ function whyTitle(inc) {
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
   if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
+  if (inc.condition === "forge_outage") return "Why we think it's GitHub, not the PRs";
   if (inc.condition === "deadline_kill") return "Why we think it's the gate, not the PRs";
   return "What the data shows";
 }
+
+// The case class that carries an infra condition's own words, for agentSawHtml.
+const INFRA_CLS = { storm: "storm", delegation_ceiling: "delegation-ceiling", forge_outage: "forge-unavailable" };
 
 function agentSawHtml(inc, inWindow) {
   const cases = new Set(inc.cases);
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.cls === (inc.condition === "storm" ? "storm" : "delegation-ceiling") && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (INFRA_CLS[inc.condition] ? c.outcome === "infra" && c.cls === INFRA_CLS[inc.condition] && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -872,7 +901,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "forge_outage" ? (r.cases || []).some((c) => (c.reps.forge || 0) > 0) : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
@@ -896,6 +925,7 @@ function beingDoneHtml(inc) {
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);
   } else if (inc.condition === "setup_deaths" && !inc.past) lines.push(`<p>Check the leased pool projects before spending another run: a stuck Helm release or a failing image pull is the usual cause. Retest once the deaths stop.</p>`);
   else if (inc.condition === "delegation_ceiling" && !inc.past) lines.push(`<p>Retest once workers are finishing again. Read <code>platform-agent-gateway.log</code> in a run's artifacts for <code>kanban dispatcher stuck</code> and <code>RESOURCE_EXHAUSTED</code> lines: a stalled dispatcher is #1879, starved workers are the quota.</p>`);
+  else if (inc.condition === "forge_outage" && !inc.past) lines.push(`<p>Retest once the GitHub App's hourly rate limit has reset; a retest before then errors the same checks. The evals repositories share one App installation's budget (#6105).</p>`);
   else if (inc.condition === "deadline_kill" && !inc.past) lines.push(`<p>Don't retest: a run started now ends the same way. Each killed run's <code>build-log.txt</code> shows how far its units got, and the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. The bot reports healthy once the newest ${PAGE.recoveryGreenRuns} runs with a verdict, green or red, are on distinct PRs and all follow the last kill.</p>`);
   if (inc.past) lines.push(`<p class="mut">This incident is over${inc.untilMs != null ? `; the gate was reported healthy again at ${esc(et(inc.untilMs))}` : ""}.</p>`);
   if (inc.stale) lines.push(`<p class="stale">The data behind this state stopped refreshing; the state is as old as the data.</p>`);
@@ -978,7 +1008,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "forge_outage" ? "grading unable to read GitHub (rate limit)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -1170,7 +1200,7 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : inc.condition === "forge_outage" ? forgeFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
   if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far. A retest is reasonable.</div>`;
@@ -1210,6 +1240,7 @@ function bannerHtml(run) {
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "deadline_kill" && h.recovering) text = `<b>Deadline-kill outage recovering ${when}</b>: runs are reaching verdicts again, so a kill now may be the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "deadline_kill") text = `<b>Runs killed at the deadline ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs reach the job timeout with no verdict, so nothing can pass; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "forge_outage") text = `<b>Grading cannot read GitHub ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: the GitHub App's hourly rate limit ran out, so checks that read GitHub error and those runs say nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
@@ -1586,7 +1617,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "forge_outage" ? "forge outage" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");

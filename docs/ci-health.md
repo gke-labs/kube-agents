@@ -664,7 +664,10 @@ when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
-  with no gate case collapsing (an absolute check, or a truncated log);
+  with no gate case collapsing (an absolute check, or a truncated log); during
+  a `forge_outage` condition the hard-failure box of a run that carries its
+  signature (three forge repetitions) also names the outage, with no repetition count; a hard failure
+  without it is left as it is;
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
   the gate is healthy and what failed passes on other pull requests' recent
