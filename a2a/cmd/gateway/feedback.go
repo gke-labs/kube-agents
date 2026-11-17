@@ -73,10 +73,15 @@ func feedbackMain(ctx context.Context, args []string, out, errOut io.Writer, log
 		log.Error("config", "err", err)
 		return err
 	}
+	natsOpts, err := gatewayNATSOptions(cfg)
+	if err != nil {
+		log.Error("nats auth", "err", err)
+		return err
+	}
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(feedbackClientName),
 		lib.WithLogger(log),
-		lib.WithNATSOptions(gatewayNATSOptions(cfg)...),
+		lib.WithNATSOptions(natsOpts...),
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)

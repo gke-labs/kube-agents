@@ -85,6 +85,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -134,7 +135,8 @@ GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 # .instances.timeout` and the `no.scale.up.in.backoff` family are the common
 # ones -- and matching them would turn an ordinary busy cluster critical.
 AUTOSCALER_LOG_ID = "container.googleapis.com/cluster-autoscaler-visibility"
-AUTOSCALER_FRESHNESS = "24h"
+AUTOSCALER_FRESHNESS_HOURS = 24
+AUTOSCALER_FRESHNESS = f"{AUTOSCALER_FRESHNESS_HOURS}h"
 AUTOSCALER_LOG_LIMIT = 1000
 AUTOSCALER_OUT_OF_RESOURCES = "scale.up.error.out.of.resources"
 AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
@@ -283,6 +285,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+import logging_reads  # noqa: E402
 # The Config Connector read that `main` adds to the manifest: this stream's
 # `manifest` fixes can edit Config Connector declarations, and `finish` says so
 # on a fix whose object Config Connector does not apply.
@@ -556,6 +559,7 @@ Run = collector_run.Run
 listing_fields = collector_run.listing_fields
 listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
+TIMEOUT_RC = collector_run.TIMEOUT_RC
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
@@ -592,6 +596,35 @@ def _record(argv_str: str, result: Run) -> dict:
         "duration_s": round(result.duration_s, 2),
         "output_sha256": output_digest(result.stdout),
     }
+
+
+def run_logging_read(
+    argv: list[str], *, run: RunFn, project: str, filter_text: str, freshness: timedelta, limit: int,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+) -> Run:
+    """One `gcloud logging read`, served by the broker's Cloud API relay when it can be.
+
+    `argv` is the `gcloud` command and the other arguments say the same read.
+    The relay answers without a `gcloud` start in the broker and returns the
+    entries `gcloud` prints, as a JSON list, so the `Run` parses the same either
+    way; when the relay does not give the whole answer, `argv` runs as before.
+    `timeout_s` bounds the read as a whole: a relay read that spends it is the
+    timeout `gcloud` would have been, and a `gcloud` run after the relay took
+    its time gets what is left.
+    """
+    started = time.monotonic()
+    try:
+        stdout = logging_reads.read_json(
+            project, logging_reads.freshness_filter(filter_text, freshness), limit, timeout_s=timeout_s
+        )
+    except logging_reads.ReadTimedOut as timed_out:
+        return Run(argv, TIMEOUT_RC, "", str(timed_out), time.monotonic() - started)
+    if stdout is not None:
+        return Run(argv, 0, stdout, "", time.monotonic() - started)
+    spent = int(time.monotonic() - started)
+    # A relay that is not there answers at once, and `gcloud` then has the whole cap.
+    # `read_json` raises once the cap is spent, so what is left here is above zero.
+    return run(argv, timeout=max(timeout_s - spent, 1)) if spent else run(argv)
 
 
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
@@ -2330,18 +2363,26 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # anything: "the autoscaler logged no stockout in 24h" is the answer this
     # check exists to give, and a clean cluster that never records the read is
     # indistinguishable from one nobody looked at.
-    logging_argv = [
-        "gcloud", "logging", "read",
+    logging_filter = (
         f'log_id("{AUTOSCALER_LOG_ID}") AND resource.labels.cluster_name="{name}" '
         f'AND resource.labels.location="{location}" '
-        f"AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)",
+        f"AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)"
+    )
+    logging_argv = [
+        "gcloud", "logging", "read", logging_filter,
         "--project", project, "--freshness", AUTOSCALER_FRESHNESS,
         "--limit", str(AUTOSCALER_LOG_LIMIT), "--format", "json",
     ]
-    entries, logging_result = run_and_gate(logging_argv, run=run)
+    entries, logging_result = run_and_gate(
+        logging_argv,
+        run=functools.partial(
+            run_logging_read, run=run, project=project, filter_text=logging_filter,
+            freshness=timedelta(hours=AUTOSCALER_FRESHNESS_HOURS), limit=AUTOSCALER_LOG_LIMIT,
+        ),
+    )
     # `entries` is None for an empty result set as well as for unparseable
     # output. gcloud prints nothing at all when nothing matched, so empty stdout
-    # at rc 0 is a clean window. Output that is there but does not parse is not:
+    # at rc 0 is a clean window (the relay's empty answer is `[]`, an empty list). Output that is there but does not parse is not:
     # the sandbox's `gcloud` shim cuts stdout at the broker's cap, says so on
     # stderr and keeps the child's exit code, and the busiest cluster's window
     # is the one that reaches the cap.

@@ -67,7 +67,7 @@ docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 docker-build-kube-proxy: ## Build the kube-proxy image.
-	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
+	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) $(VERSION_ARG) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
@@ -912,7 +912,7 @@ docs-check-prose: ## Fail when a published site page's prose is out of step with
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it (needs the full history and the release tags).
+docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it, or sits out of newest-first order (needs the full history and the release tags).
 	@python3 scripts/check_upgrade_table_releases.py
 
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).

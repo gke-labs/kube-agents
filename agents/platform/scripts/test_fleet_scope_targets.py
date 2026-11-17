@@ -705,5 +705,115 @@ class NoCallerWalksProfilesTest(unittest.TestCase):
         reader = (pathlib.Path(__file__).resolve().parent / "fleet_scope_targets.py").read_text(encoding="utf-8")
         self.assertEqual([f.split(":")[0] for f in self.walking_functions(reader)], ["profile_identities"])
 
+    def _board_under_trap(self, render, rows=(), clusters=None, management="mgmt"):
+        """The Home tab's board under next, with a trap on every read of the
+        Cluster Agent profiles (#3658): the board may walk them only for the
+        projects the scope lists live (the management and explicit projects,
+        whose clusters it cannot list itself), never for a member project the
+        scope lists or unread, and not at all when no project is listed live.
+        Returns the board."""
+        import sqlite3
+        from datetime import datetime, timezone
+
+        import board_snapshot
+        import findings_queue
+        import scope_publisher
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = pathlib.Path(tmp.name)
+        profiles = home / "profiles"
+        for project, cluster in (("ghost-proj", "ghost"), ("member-a", "old"), ("mgmt", "host")):
+            directory = profiles / f"cluster-{project}-{cluster}-us-east1"
+            directory.mkdir(parents=True)
+            (directory / "config.yaml").write_text(_identity_config(project, cluster, "us-east1"), encoding="utf-8")
+        (home / "scope.json").write_text(json.dumps(render), encoding="utf-8")
+        document = _resolved(list(rows), clusters=clusters or {})
+        document["memberHash"] = scope_publisher.member_hash(render)
+        (home / "resolved-scope.json").write_text(json.dumps(document), encoding="utf-8")
+        env = {fst.SCOPE_FILE_ENV: str(home / "scope.json"), fst.RESOLVED_SCOPE_FILE_ENV: str(home / "resolved-scope.json")}
+        patched = mock.patch.dict(os.environ, env)
+        patched.start()
+        self.addCleanup(patched.stop)
+        for name in fst.MANAGEMENT_PROJECT_ENVS:
+            os.environ.pop(name, None)
+        if management:
+            os.environ["GCP_PROJECT_ID"] = management
+        live = {e.project for e in fst.list_scope_clusters(home).projects if e.status == fst.STATUS_LIST_LIVE}
+
+        real_walk = board_snapshot.cluster_identities
+        real_iterdir = pathlib.Path.iterdir
+        walking = []
+
+        def guarded_walk(profiles_dir=None, projects=None):
+            if not live:
+                raise AssertionError("walked the profiles though the scope lists no project live")
+            if projects is None or not set(projects) <= live:
+                raise AssertionError(f"walked the profiles for {projects!r}, not only the live projects {sorted(live)}")
+            walking.append(True)
+            try:
+                found = real_walk(profiles_dir, projects)
+            finally:
+                walking.pop()
+            stray = {project for project, _ in found.values()} - live
+            if stray:
+                raise AssertionError(f"the profiles walk returned clusters of {sorted(stray)}, not listed live")
+            return found
+
+        def no_stray_walk(path):
+            if path.name == "profiles" and not walking:
+                raise AssertionError(f"listed {path} outside the live-project walk")
+            return real_iterdir(path)
+
+        session = sqlite3.connect(":memory:")
+        findings_queue.init_findings_schema(session)
+        with mock.patch.object(board_snapshot, "cluster_identities", side_effect=guarded_walk), \
+                mock.patch.object(pathlib.Path, "iterdir", autospec=True, side_effect=no_stray_walk), \
+                mock.patch.object(fst, "profile_identities", side_effect=AssertionError("read a Cluster Agent profile")):
+            return board_snapshot.snapshot(session, None, datetime.now(timezone.utc), profiles, lambda: None)
+
+    MEMBERS = {"present": True, "projects": [], "folders": ["1"]}
+    MEMBER_ROWS = (("member-a", "ok"),)
+    MEMBER_CLUSTERS = {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"]]}}
+
+    def test_the_board_walks_the_profiles_only_for_projects_listed_live(self):
+        board = self._board_under_trap(self.MEMBERS, self.MEMBER_ROWS, self.MEMBER_CLUSTERS)
+        names = [row["name"] for row in board["clusters"]]
+        self.assertEqual(sorted(names), ["host", "web"])
+        self.assertNotIn("ghost", json.dumps(board))
+        self.assertNotIn("old", names)
+
+    def test_with_no_project_listed_live_the_board_never_walks_the_profiles(self):
+        board = self._board_under_trap(self.MEMBERS, self.MEMBER_ROWS, self.MEMBER_CLUSTERS, management=None)
+        self.assertEqual([row["name"] for row in board["clusters"]], ["web"])
+
+    def test_the_trap_catches_a_walk_for_a_member_project(self):
+        # Mutations: the board walking for every project the scope names, and
+        # a walk that ignores its project filter.
+        import board_snapshot
+
+        def everyone(scope):
+            return {e.project for e in scope.projects}
+
+        with mock.patch.object(board_snapshot, "live_projects", side_effect=everyone), \
+                self.assertRaisesRegex(AssertionError, "not only the live projects"):
+            self._board_under_trap(self.MEMBERS, self.MEMBER_ROWS, self.MEMBER_CLUSTERS)
+        original = board_snapshot.cluster_identities
+
+        def unfiltered(profiles_dir=None, projects=None):
+            return original(profiles_dir)
+
+        with mock.patch.object(board_snapshot, "cluster_identities", side_effect=unfiltered), \
+                self.assertRaisesRegex(AssertionError, "not listed live"):
+            self._board_under_trap(self.MEMBERS, self.MEMBER_ROWS, self.MEMBER_CLUSTERS)
+
+    def test_the_trap_catches_any_walk_when_no_project_is_listed_live(self):
+        import board_snapshot
+
+        with mock.patch.object(board_snapshot, "live_projects", return_value={"member-a"}), \
+                self.assertRaisesRegex(AssertionError, "lists no project live"):
+            self._board_under_trap(self.MEMBERS, self.MEMBER_ROWS, self.MEMBER_CLUSTERS, management=None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -252,6 +252,7 @@ AUDITS: dict[str, AuditSpec] = {
             "hpa-floors-at-one",
             "pdb-overlapping",
             "untargeted-compute-class-workload",
+            "hpa-aggressive-scaledown",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -564,7 +565,23 @@ FINISH_USAGE_HINT = (
 )
 DRAFT_USAGE_HINT = (
     "`draft` takes --audit and --manifest-file <the manifest the SOP's collector command "
-    "wrote>, and writes the findings document for `finish` to --out <findings file>."
+    "wrote>, and writes the findings document for `finish` to --out <findings file> "
+    "(the run's findings path when --out is left out)."
+)
+# `--out -` prints the document instead of writing it: for a person or a test, never for a run.
+DRAFT_STDOUT = "-"
+# What one tool call may carry while the worker fills the drafted file. A tool call's arguments do
+# not stream, so the runtime sees silence while they are written and drops the call past its stale
+# bound (agents/platform/config.yaml: 120 s, raised to 300 s for the large prompt an audit has by
+# this step). A slow writer, 25 tokens a second, writes this much in under half of that bound.
+DRAFT_FILL_CALL_CHARS = 12000
+DRAFT_FILL_HINT = (
+    "Fill each finding's `recommendation` and `remediation` in that file, in place: a short "
+    "script that loads the file, sets the fields and writes it back, or one `patch` for one "
+    f"finding's fields. Keep every tool call under about {DRAFT_FILL_CALL_CHARS} characters. "
+    "Never send the document, or a block of its findings, through a tool call (write_file, "
+    "patch, a heredoc, execute_code): a call that large is dropped before it completes and "
+    "the audit files nothing."
 )
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
@@ -1228,6 +1245,7 @@ CHECK_PHRASES = {
     "hpa-floors-at-one": "{object} can scale down to one replica",
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
+    "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -3950,14 +3968,14 @@ def next_steps(audit_id: str, findings_path: str) -> list[str]:
     return [
         f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
         "the way it says, recording each check and its command in checks_run as it completes.",
-        f"Write the findings document at {findings_path}"
-        + (
-            f", starting it with {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
-            f"--manifest-file {manifest_path_for(audit_id)}"
+        (
+            f"Run {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
+            f"--manifest-file {manifest_path_for(audit_id)}: it writes the findings document to "
+            f"{findings_path}. {DRAFT_FILL_HINT}"
             if audit_id in COLLECTOR_AUDITS
-            else ""
+            else f"Write the findings document at {findings_path}."
         )
-        + f". Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
+        + f" Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
         f"Run {finish}. Its output and exit codes are in "
         f"{skill_path(REFERENCES_DIR_NAME, FINISH_REFERENCE)}.",
     ]
@@ -22563,12 +22581,36 @@ def handle_draft(args: argparse.Namespace) -> None:
     """Write the findings document `draft_findings` builds from a manifest."""
     validate_audit_id(args.audit)
     manifest = load_manifest(args.manifest_file, args.audit, command="draft")
-    text = json.dumps(draft_findings(manifest, args.audit), indent=2) + "\n"
-    if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        log(f"draft: wrote {args.out}; fill each finding's recommendation and remediation")
-    else:
+    document = draft_findings(manifest, args.audit)
+    text = json.dumps(document, indent=2) + "\n"
+    if args.out == DRAFT_STDOUT:
         sys.stdout.write(text)
+        return
+    out = Path(args.out or findings_path_for(args.audit))
+    if not args.overwrite and _draft_would_erase(out, text):
+        raise SystemExit(
+            f"draft: {out} holds content a second draft would erase: fields you filled, or the draft of "
+            "another manifest. Go on to `finish`, or pass --overwrite to start the document again."
+        )
+    out.write_text(text, encoding="utf-8")
+    log(f"draft: wrote {out}: {len(document['findings'])} findings, each with an empty recommendation. {DRAFT_FILL_HINT}")
+
+
+def _draft_would_erase(path: Path, fresh: str) -> bool:
+    """Whether `path` holds anything other than the document `fresh`, the text this draft would write.
+
+    The worker fills the drafted file in place, in any field: a recommendation, a remediation,
+    `declared`, `resolved_because`, a scope note. So any difference is content a second draft
+    would erase. `start` removes the stream's findings file, so what is there is this run's work.
+    """
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        return json.loads(existing) != json.loads(fresh)
+    except ValueError:
+        return bool(existing.strip())
 
 
 def handle_grep(args: argparse.Namespace) -> None:
@@ -27551,15 +27593,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     draft_parser = subparsers.add_parser(
         "draft",
-        help="Write a findings document from the collector manifest: scope, "
-        "checks_run, and one finding per candidate with its evidence. The "
-        "recommendation fields are left empty and each remediation `manual`, "
-        "for you to fill before `finish`.",
+        help="Write the findings document from the collector manifest to the run's "
+        "findings path: scope, checks_run, and one finding per candidate with its "
+        "evidence. The recommendation fields are left empty and each remediation "
+        "`manual`, for you to fill in that file before `finish`.",
     )
     draft_parser.usage_hint = DRAFT_USAGE_HINT
     draft_parser.add_argument("--audit", required=True, help="Audit id.")
     draft_parser.add_argument("--manifest-file", required=True, help="The manifest the collector wrote.")
-    draft_parser.add_argument("--out", default=None, help="Write the document here rather than to stdout.")
+    draft_parser.add_argument(
+        "--out",
+        default=None,
+        help="Write the document here rather than to the run's findings path; `-` prints it instead.",
+    )
+    draft_parser.add_argument(
+        "--overwrite", action="store_true", help="Replace a findings document that differs from a fresh draft."
+    )
 
     list_parser = subparsers.add_parser(
         "list",

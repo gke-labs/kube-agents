@@ -303,14 +303,21 @@ func TestTheRefusalNamesTheIdentityMapUser(t *testing.T) {
 
 	for _, name := range users {
 		t.Run(name, func(t *testing.T) {
-			if slices.Contains(static, name) {
+			// The gateway is static and mapped for a bounded window
+			// (#5301); its password and its token are keyed apart.
+			if slices.Contains(static, name) && name != "gateway" {
 				t.Fatalf("%q is both a static principal and a map user; the rendered config serves it twice", name)
 			}
 			_, err := authorizeToken(svc, reservedPodToken(name))
 			if err == nil {
 				t.Fatalf("a narrowed pod named %q was authorized; it would hold %s's inbox", name, name)
 			}
-			if !strings.Contains(err.Error(), "the name of an identity-map user") || !strings.Contains(err.Error(), `"`+name+`"`) {
+			reason := "the name of an identity-map user"
+			if name == "gateway" {
+				// Static too, and that check runs first.
+				reason = "the name of a static principal"
+			}
+			if !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), `"`+name+`"`) {
 				t.Errorf("refused for the wrong reason: %v", err)
 			}
 		})

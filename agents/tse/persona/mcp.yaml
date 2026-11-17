@@ -1,0 +1,13 @@
+# The credential broker's MCP relay applies its own tool policy
+# (agents/platform/scripts/mcp_policy.py), and a profile worker reaches only
+# what PROFILE_SERVER_TOOLS gives it: developer_knowledge's two document reads.
+# The gke server stays out of this persona, because the relay has no per-task
+# target check, so a profile worker is refused it; kubectl and gcloud reach the
+# task's target through the broker instead. answer_query stays out too: its
+# small daily quota is shared by every agent of an install.
+servers:
+  developer_knowledge:
+    broker: developer_knowledge
+    include:
+      - search_documents
+      - get_documents
