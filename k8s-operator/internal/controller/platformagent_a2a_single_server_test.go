@@ -63,7 +63,7 @@ func singleServerReconciler(t *testing.T, objs ...client.Object) (*PlatformAgent
 	return &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: rec}, cl, rec
 }
 
-const wantSingleServerEvent = "Normal A2ABusSingleServer the A2A bus runs one NATS server, so a node drain or upgrade takes it down for about 2 minutes; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
+const wantSingleServerEvent = "Normal A2ABusSingleServer the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
 
 // One Event for a bus pod first seen Running, word for word, and none on the
 // passes after it while the same pod runs.
@@ -124,10 +124,10 @@ func TestAThreeServerBusGetsNoSingleServerEvent(t *testing.T) {
 	}
 }
 
-// A migration under way is the conversion the Event points to: no Event.
+// A migration in flight is the conversion the Event points to: no Event.
 func TestASingleServerBusMidMigrationGetsNoEvent(t *testing.T) {
 	agent := singleServerAgent(1)
-	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Phase: string(busMigrationFreezing)}
 	r, _, rec := singleServerReconciler(t, agent, singleServerBusPod(agent, "uid-1", corev1.PodRunning))
 	r.noteA2ABusSingleServer(context.Background(), agent)
 	if got := singleServerEvents(rec); len(got) != 0 {
@@ -149,5 +149,53 @@ func TestAnOperatorRestartWritesTheSingleServerEventOnceMore(t *testing.T) {
 	restarted.noteA2ABusSingleServer(ctx, agent)
 	if got := singleServerEvents(rec); len(got) != 1 {
 		t.Fatalf("after a restart: events %q, want exactly one", got)
+	}
+}
+
+// A run that ended stays on the status: a bus that came down to one server
+// (Done), or whose move to three was abandoned or failed, still gets it.
+func TestASingleServerBusAfterAnEndedMigrationGetsTheEvent(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationDone, busMigrationAbandoned, busMigrationFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			agent := singleServerAgent(1)
+			agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Phase: string(phase)}
+			r, _, rec := singleServerReconciler(t, agent, singleServerBusPod(agent, "uid-1", corev1.PodRunning))
+			r.noteA2ABusSingleServer(context.Background(), agent)
+			if got := singleServerEvents(rec); len(got) != 1 || got[0] != wantSingleServerEvent {
+				t.Fatalf("after a %s run: events %q, want one", phase, got)
+			}
+		})
+	}
+}
+
+// A pod already terminating, though still Running, is on its way out: the
+// Event waits for its replacement.
+func TestATerminatingSingleServerBusPodGetsNoEvent(t *testing.T) {
+	agent := singleServerAgent(1)
+	pod := singleServerBusPod(agent, "uid-1", corev1.PodRunning)
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+	pod.Finalizers = []string{"kubeagents.test/hold"}
+	r, _, rec := singleServerReconciler(t, agent, pod)
+	r.noteA2ABusSingleServer(context.Background(), agent)
+	if got := singleServerEvents(rec); len(got) != 0 {
+		t.Fatalf("a terminating pod wrote %q, want none", got)
+	}
+}
+
+// A bus that went to three servers and back is a new episode, even on the
+// same pod: the three-server pass dropped the record.
+func TestAReturnToOneServerIsANewEpisode(t *testing.T) {
+	agent := singleServerAgent(1)
+	r, _, rec := singleServerReconciler(t, agent, singleServerBusPod(agent, "uid-1", corev1.PodRunning))
+	ctx := context.Background()
+	r.noteA2ABusSingleServer(ctx, agent)
+	singleServerEvents(rec)
+	agent.Status.BusReplicas = 3
+	r.noteA2ABusSingleServer(ctx, agent)
+	agent.Status.BusReplicas = 1
+	r.noteA2ABusSingleServer(ctx, agent)
+	if got := singleServerEvents(rec); len(got) != 1 {
+		t.Fatalf("back to one server: events %q, want one", got)
 	}
 }

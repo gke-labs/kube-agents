@@ -114,10 +114,12 @@ has been provisioned. It doesn't repair a server that drops out of a running bus
 **Amended 11/17 (#6147): a one-server bus says it is not highly available.** On `busReplicas: 1` the operator
 writes a Normal `A2ABusSingleServer` Event once per episode: each bus pod first seen Running under a new UID,
 and once per operator start (an in-memory record per agent, so a restart or leader failover repeats it once,
-which is accepted). The Event names the two-minute outage a drain or upgrade causes and links the conversion
+which is accepted). The Event names the outage a drain or upgrade causes, typically about two minutes and longer after
+a node scale-down, and links the conversion
 to three servers. Ready and Degraded are untouched, and none is written mid-migration. The lone pod gets no
-PodDisruptionBudget and no `safe-to-evict: "false"`: on GKE Autopilot that annotation holds scale-down and
-node auto-upgrade for at least seven days (#6040), and the operator can't tell Autopilot from Standard.
+PodDisruptionBudget and no `safe-to-evict: "false"`. #6040 found that on GKE Autopilot that annotation holds
+scale-down and node auto-upgrade for at least seven days, per GKE's extended-duration Pods page, and the
+operator can't tell Autopilot from Standard.
 After a node scale-down, GCE can keep the released disk attached to the node being deleted for tens of
 minutes, so the replacement waits in `FailedAttachVolume`; on three servers the bus serves on two meanwhile.
 

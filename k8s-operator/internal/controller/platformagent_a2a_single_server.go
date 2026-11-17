@@ -35,7 +35,7 @@ const (
 	// single server is a supported shape, so Ready and Degraded stay as they
 	// are.
 	a2aBusSingleServerReason  = "A2ABusSingleServer"
-	a2aBusSingleServerMessage = "the A2A bus runs one NATS server, so a node drain or upgrade takes it down for about 2 minutes; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
+	a2aBusSingleServerMessage = "the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
 )
 
 // noteA2ABusSingleServer writes the A2ABusSingleServer Event once per
@@ -52,10 +52,12 @@ const (
 // Event for a later pass.
 func (r *PlatformAgentReconciler) noteA2ABusSingleServer(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
 	key := client.ObjectKeyFromObject(agent)
-	// Three servers, or a migration under way (it is the conversion this
+	// Three servers, or a migration in flight (it is the conversion this
 	// Event points to): nothing to say, and a later return to one server
-	// starts a new episode.
-	if a2aNATSReplicas(agent) != 1 || agent.Status.BusMigration != nil {
+	// starts a new episode. A run that ended (Done, Abandoned, Failed) stays
+	// recorded on the status, so only one not yet terminal counts.
+	run := agent.Status.BusMigration
+	if a2aNATSReplicas(agent) != 1 || (run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase))) {
 		r.singleServerBusWarned.Delete(key)
 		return
 	}

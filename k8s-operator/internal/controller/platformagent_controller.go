@@ -6113,7 +6113,8 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the A2A stack renders — one per reconcile while the exec tier is short
 // of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
 // pod per reconcile while a bus replica is not on the StatefulSet's update
-// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
+// revision (replaceStuckA2ANATSPod), and one Get of the bus pod per reconcile
+// on a one-server bus with no migration in flight (noteA2ABusSingleServer). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
