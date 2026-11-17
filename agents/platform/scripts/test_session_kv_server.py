@@ -9927,6 +9927,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "cat /proc/self/environ",
             'echo "$(env)"',
             "sh -c env arg0",
+            # another tool's token printer, and another language's print of its environment (#5803)
+            "gh auth token",
+            "kubectl create token builder",
+            "python3 -c 'import os; print(os.environ)'",
         ]
         served = [
             "kubectl get secrets -n kube-system",
@@ -9949,6 +9953,8 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "env FOO=1 python3 x.py",
             "printenv HOME",
             "kubectl get pods -n env",
+            "gh auth status",
+            "python3 -c 'import os; print(os.environ[\"HOME\"])'",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):
