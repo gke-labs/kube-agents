@@ -2777,20 +2777,17 @@ gate_web_console today
 # mode alone does not give it. The inject door's Service and token Secret are
 # waited for (the operator renders them only with the flag step 5 set on it;
 # hack/ci-eval-pr.sh reads that Secret). The bridge sidecar is the
-# operator's: it budgets it from the first next render and adds it to the
-# agent pod once the bus is provisioned, with the image and BRIDGE_CONCURRENCY
+# operator's: it budgets it and puts it in the agent pod from the first
+# render (#5962), with the image and BRIDGE_CONCURRENCY
 # step 5 set on it and the bridge's default executor
 # (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode upgrade is the only
 # change and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job
 # created, so the refusal #2077 guarded against cannot arise. The bridge
-# enters the agent pod only once the bus is provisioned (BusProvisioned), so
-# the agent Deployment rolls twice: once for the mode upgrade and once, after
-# the Job, for the bridge. The step gates both rolls. On an operator that
-# renders the A2A stack from its first pass whatever the mode, both rolls
-# already happened before step 6's web console check, which waits for the
-# second (#5962), so here the bridge is in the template on the first read and
-# both gates pass at once. Then the step ends on the bridge's own word that it is
+# waits for the bus instead of exiting, so the agent Deployment rolls once:
+# the step gates that rollout and reads the template once for the bridge,
+# failing without it, since the log loop after needs the container (#5973).
+# Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
@@ -3248,7 +3245,23 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # already carried it, and the bridge log loop below starts against a pod
   # that has the container. One read guards that; here it is a gate, since
   # the loop below needs the container.
-  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}') " in
+  # A read that fails is retried: only a read that answers without the
+  # container fails the step.
+  agent_containers=""
+  agent_read=false
+  for _ in 1 2 3; do
+    if agent_containers="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}')"; then
+      agent_read=true
+      break
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [ "${agent_read}" = false ]; then
+    echo "ERROR: could not read deployment/${AGENT_DEPLOYMENT_NAME}'s template after its rollout" >&2
+    dump_mode_next_state
+    exit 1
+  fi
+  case " ${agent_containers} " in
     *" ${BRIDGE_SIDECAR_NAME} "*) ;;
     *)
       echo "ERROR: deployment/${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} container after its rollout; the operator renders it from the first render (#5962)" >&2

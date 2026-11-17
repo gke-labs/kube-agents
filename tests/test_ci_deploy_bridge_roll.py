@@ -132,5 +132,82 @@ class BridgeFromTheFirstRolloutTest(unittest.TestCase):
         self.assertNotIn("MODE_NEXT_GENERATION_ATTEMPTS", check, "step 6b no longer polls for the bridge")
 
 
+_6B_START = "  agent_containers=\"\"\n  agent_read=false"
+_6B_END = "after the mode switch\"\n"
+
+_6B_STUB = r"""#!/bin/bash
+echo "$*" >> "$STATE/calls"
+case "$*" in
+  "get deployment/platform-agent-gateway"*jsonpath*)
+    n=$(cat "$STATE/fails")
+    if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$STATE/fails"; echo "Unable to connect" >&2; exit 1; fi
+    if [ -f "$STATE/bridge" ]; then echo "platform-agent fluent-bit hermes-bridge"; else echo "platform-agent fluent-bit"; fi ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+class Step6bBridgeReadTest(unittest.TestCase):
+    """Step 6b's one read, run: a template without the bridge stops the deploy
+    with the state dumped, a failed read is retried, and one that never
+    answers stops it as unreadable rather than as a missing bridge."""
+
+    def _run(self, *, bridge: bool, fails: int = 0):
+        text = _CI_DEPLOY.read_text()
+        start = text.index(_6B_START)
+        block = text[start : text.index(_6B_END, start) + len(_6B_END)]
+        with tempfile.TemporaryDirectory() as d:
+            state = pathlib.Path(d)
+            (state / "bin").mkdir()
+            kubectl = state / "bin" / "kubectl"
+            kubectl.write_text(_6B_STUB)
+            kubectl.chmod(0o755)
+            if bridge:
+                (state / "bridge").write_text("")
+            (state / "fails").write_text(str(fails))
+            (state / "calls").write_text("")
+            script = "\n".join(
+                [
+                    "set -euo pipefail",
+                    'NAMESPACE="kubeagents-system"',
+                    'AGENT_DEPLOYMENT_NAME="platform-agent-gateway"',
+                    'BRIDGE_SIDECAR_NAME="hermes-bridge"',
+                    "MODE_NEXT_POLL_SECONDS=0",
+                    "MODE_NEXT_START=$SECONDS",
+                    'dump_mode_next_state() { echo DUMPED; }',
+                    block,
+                    "echo DONE",
+                ]
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                env={"PATH": f"{state / 'bin'}:/usr/bin:/bin", "STATE": str(state)}, timeout=60, check=False,
+            )
+            return proc, (state / "calls").read_text().splitlines()
+
+    def test_the_bridge_present_passes(self):
+        proc, calls = self._run(bridge=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DONE", proc.stdout)
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_a_missing_bridge_stops_the_deploy_with_the_state_dumped(self):
+        proc, _ = self._run(bridge=False)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("DUMPED", proc.stdout)
+        self.assertIn("has no hermes-bridge container", proc.stderr)
+
+    def test_a_failed_read_is_retried(self):
+        proc, calls = self._run(bridge=True, fails=2)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(calls), 3, calls)
+
+    def test_a_template_never_read_is_unreadable_not_missing(self):
+        proc, _ = self._run(bridge=True, fails=9)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("could not read", proc.stderr)
+        self.assertNotIn("has no hermes-bridge", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,8 +38,8 @@ TASKS stream's consumer budget from the CR's maxSessions and from the bridge
 workers the pod runs, creates the stream at the larger of that budget and a
 floor of 64, never edits a stream that exists, and refuses a later render
 whose budget the live stream cannot hold. The operator budgets the bridge from
-the first next render, with the concurrency step 5 sets on it, and adds it to
-the agent pod once the bus is provisioned, so the mode change, a `helm upgrade`
+the first next render, with the concurrency step 5 sets on it, and puts it in
+the agent pod from the first render (#5962), so the mode change, a `helm upgrade`
 that sets platformAgent.mode, is the only change and the one provision Job
 already counts the bridge's workers. That change still carries a maxSessions sized so that
 budget fits the floor, computed from four constants copied from the
