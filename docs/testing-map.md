@@ -35,6 +35,11 @@ second job's whole purpose; it replaced two workflows that ran only `tests/` and
 on that interpreter. It is not a required check, so it holds no merge, but a red on `main` fails the
 workflow run and files a main-broken issue like any other job in it.
 
+**The installer test files also run on bash 3.2.** `installer-tests-bash-floor.yml` runs
+`make test-python`, narrowed to the installer test files, on the macOS runner with `/bin/bash` 3.2
+first on `PATH`, when a pull request or a push to `main` changes a file those tests read. It is not
+a required check.
+
 **`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
 The difference is who supplies the failure and who owns the environment.
 
