@@ -1219,21 +1219,32 @@ The pod template's config hash leaves out the per-profile gateway deny, on one s
 on a cluster alike, so an AgentProfile added, removed or done draining changes the config
 Secret and not the template: every server is reloaded, and none is restarted or rolled.
 Every other config change still rolls the bus. The operator records the reload it asked for
-on the Secret, with the `config_load_time` it read from each server just before writing,
-read by pod IP (a Service answers from whichever server it picks, and the per-pod names
-under the routes Service don't resolve). It confirms the reload when every server's value
-has moved, and a server whose pod started after the write runs it from the start. A server
-it can't read, or whose value hasn't moved, hasn't loaded the config: the reload stays
-pending, and so does the profile hold below, until every server is confirmed. A pod at an
-ordinal past what the StatefulSet asks for (a scale-down under way) keeps it pending too. A config written while a reload is still
+on the Secret, with each server's pod UID, `start` and `config_load_time` read from its
+`/varz` just before writing, by pod IP (a Service answers from whichever server it picks,
+and the per-pod names under the routes Service don't resolve), and only from a server whose
+`server_name` is its pod's. A server on the same pod and start confirms when its load time
+has moved. A server restarted in place (a new `start`) reloads whatever file the kubelet last
+synced, which can be the old one, so it confirms only when a load time later than its start
+arrives, or when it started more than the kubelet's sync window (90 seconds: the sync period
+plus the Secret cache's lag) after the write. A new pod confirms when the API server created
+it after the write, by the live Secret's last managedFields time. nats-server 2.10 serves no
+config digest to compare instead. A server it can't read, or can't show holds the newest
+write, hasn't loaded the config: the reload stays pending, and so does the profile hold
+below, until every server is confirmed. A pod at an ordinal past what the StatefulSet asks
+for (a scale-down under way), or under a server's name but not the StatefulSet's (a Warning
+names it), keeps it pending too. The single-server path an earlier operator shipped took any
+moved load time as the reload, a restart included; this closes that on one server as on
+three. For a rolled-back operator, the key it reads keeps its old shape: pod -0's load time
+alone. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
 restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
 kubelet write, so a restarted wait usually sees no further move, and nothing the server
 reports says whether the newest write was in the one it saw. If the value hasn't moved
 within three minutes, or can't be read, the operator deletes that server's pod so it restarts
-onto the new config: one server per pass, only while every other server is Ready, so a
-cluster keeps quorum, and never a pod that started after the write. The pending record stays
-until the restarted server is read on the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+onto the new config: one server per pass, only once every other server has been Ready for
+30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. The fresh
+pod mounts the current Secret, so its creation after the write confirms it, and the pending
+record stays until it is read. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
 restart is kept even then: confirming by the absence of a move would admit a profile whose
 deny the server might not hold. The kubelet takes up to about a minute to write
