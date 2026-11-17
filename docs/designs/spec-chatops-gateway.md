@@ -3087,7 +3087,10 @@ is a whole conversation to the bridge's incident lookup (never spliced), as a Sl
 thread is looked up by the `(thread, thread)` row the relay stores for it, so a reply under a Teams home
 alert or report finds the stored report, as on Slack and Chat. The rolling
 status line edits its own activity through the one PUT the passthrough admits, an update of an
-activity at its id (Bot Framework's updateActivity), never the activities collection. The
+activity at its id (Bot Framework's updateActivity), never the activities collection; the update
+carries the card and no `summary`, because Teams renders an updated activity that has one as
+that text in a plain bubble and drops the card (the 11-17 live test, settled by two PUTs of the
+same card with and without the field). The
 adapter answers `LineAnswerer` and `WholeLineAnswerer` for every Teams conversation: a
 completed task's direct answer that fits one piece is edited onto that line, so the ask gets
 one card rather than a card holding ✅ alone above a second (the 11-17 live test showed the

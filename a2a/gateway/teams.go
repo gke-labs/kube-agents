@@ -718,6 +718,12 @@ func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
 	}
 	activity := teamsFitActivity(text, a.adaptiveCards, teamsMaxActivityBytes)
 	activity["id"] = messageID
+	// No summary on an update: Teams renders an updated activity that carries
+	// one as that text, in a plain bubble, and drops the card (seen on every
+	// edited line in the 11-17 live test; the same card PUT without the field
+	// kept its frame, with it lost it). The preview the summary feeds is the
+	// chat list's, which the original post already set.
+	delete(activity, "summary")
 	payload, err := json.Marshal(map[string]any{
 		"serviceUrl": a.serviceURLFor(convID),
 		"endpoint":   teamsConversationsPath + convID + teamsActivitiesSuffix + "/" + messageID,

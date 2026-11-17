@@ -249,6 +249,17 @@ func TestTeamsEditNotifyMessageEditsInPlace(t *testing.T) {
 	if len(relay.apiCall) != 2 || relay.apiCall[0]["method"] != http.MethodPut || relay.apiCall[0]["endpoint"] != "v3/conversations/"+home+";messageid=1794603936403/activities/act-9" || relay.apiCall[1]["endpoint"] != "v3/conversations/"+home+"/activities/act-7" {
 		t.Fatalf("api calls %v", relay.apiCall)
 	}
+	// An update carries the card and no summary: with one, Teams renders the
+	// summary's text in a plain bubble and drops the card (the 11-17 live test).
+	for i, call := range relay.apiCall {
+		payload, _ := call["payload"].(map[string]any)
+		if _, has := payload["summary"]; has {
+			t.Fatalf("update %d carries a summary: %v", i, payload)
+		}
+		if _, has := payload["attachments"]; !has {
+			t.Fatalf("update %d carries no card: %v", i, payload)
+		}
+	}
 }
 
 // TestTeamsAnswersOnItsLine: with no reaction and no Working… status the
