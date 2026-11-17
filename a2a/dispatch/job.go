@@ -78,6 +78,22 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		return lib.LeaseRecord{}, "", false, err
 	}
 	h.lease, h.renew = seconds(snap.LeaseSeconds), seconds(snap.RenewSeconds)
+	// A tier an administrator ended (#5850) while the task's Job was still
+	// coming up: the task ends canceled tier-ended, as a held one does
+	// (endTierHeld), not failed no-worker when the Job never gets a worker
+	// (the tier's ServiceAccount goes at the shortened end). Its Job is
+	// deleted and its submission tombstoned before the terminal, as for any
+	// task no worker held; the breaker doesn't count it (#6134).
+	tierEndedJob := func() (lib.LeaseRecord, string, bool, error) {
+		log.Info("an administrator ended this tier's drain while its Job was starting; ending the task", "tier", h.tier)
+		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+			log.Warn("delete the task's Job", "err", err)
+		}
+		d.endUnstarted(ctx, log, del, h.key(), lib.StateCanceled,
+			&refusal{ReasonTierEnded, fmt.Sprintf("an administrator ended tier %s's drain on profile %s", h.tier, h.profile)})
+		d.release(h, ctx.Err() == nil)
+		return lib.LeaseRecord{}, "", true, nil
+	}
 	stoppedJob := func() (lib.LeaseRecord, string, bool, error) {
 		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
 			log.Warn("delete the stopped task's Job", "err", err)
@@ -90,6 +106,9 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	d.mu.Unlock()
 	if stopped {
 		return stoppedJob()
+	}
+	if d.tierEndedOn(h) {
+		return tierEndedJob()
 	}
 	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID)
 	if err != nil {
@@ -112,6 +131,9 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		d.mu.Unlock()
 		if stopped {
 			return stoppedJob()
+		}
+		if d.tierEndedOn(h) {
+			return tierEndedJob()
 		}
 		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.taskID)
 		pollErr = err
