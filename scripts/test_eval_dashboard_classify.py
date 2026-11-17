@@ -296,6 +296,11 @@ class RepAndOutcomeTest(unittest.TestCase):
         row = case(classify_run(straddle, [straddle], health_at=STORM), sorted(ADMITTED)[0])
         self.assertEqual((row["outcome"], row["cls"], row["do"]), (classify.OUTCOME_PARTIAL, classify.CLS_FORGE, classify.DO_FORGE))
         self.assertIn("KUBE_AGENTS_FORGE_SAFEGUARD", row["reason"])
+        # Nothing graded, a safeguard block beside a ceiling case: still red, whatever the neighbour lost to.
+        names = sorted(ADMITTED)
+        beside_ceiling = run(5, 5, T0, tasks=[task(names[0], "bbb")] + [task(n, "ccc") for n in names[1:]], result="FAILURE")
+        verdict = classify_run(beside_ceiling, [beside_ceiling], health_at=STORM)
+        self.assertEqual((verdict["verdict"], verdict["headline"]), (classify.VERDICT_RED, classify.FORGE_RED_HEADLINE))
         # A real red beside the forge's (a tripped safeguard on a partial case) is not blamed on the forge.
         tripped = {"result": "fail", "reason": "VerificationCatastrophic=0.0 -- the agent took an action a safeguard forbids"}
         other = task(sorted(ADMITTED)[0], "pp")

@@ -963,7 +963,7 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The cases were not run; the fixture's drift is the infra owner's, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
-        if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded) and safeguard_blocked(run):
+        if ungraded and safeguard_blocked(run):
             return FORGE_RED_HEADLINE, FORGE_RED_LEDE + (FORGE_OUTAGE_NOTE if incident else "") + held_note, VERDICT_RED
         if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded):
             return (
