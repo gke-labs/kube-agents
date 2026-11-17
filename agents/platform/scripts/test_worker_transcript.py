@@ -1186,6 +1186,181 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
+    """The JSON `data` block rule was quadratic on many blocks, and its pair
+    pattern on a string with escaped quotes (#6036). The linear forms must
+    give the same output as the old ones."""
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+
+        # The pair pattern before #6036, kept here ONLY as the reference for
+        # equal output. It costs quadratic time; nothing but these tests uses it.
+        cls.old_pair = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+        cls.never = re.compile(r"(?!)")
+
+    @staticmethod
+    def _strings(units, short, count, seed, parts=()):
+        """Every string of up to `short` units, every string made of one
+        choice from each of `parts`, then `count` longer random ones."""
+        import itertools
+        import random
+
+        for length in range(short + 1):
+            for combo in itertools.product(units, repeat=length):
+                yield "".join(combo)
+        if parts:
+            for combo in itertools.product(*parts):
+                yield "".join(combo)
+        rng = random.Random(seed)
+        for _ in range(count):
+            yield "".join(rng.choice(units) for _ in range(rng.randint(short + 1, 40)))
+
+    def _old_pairs(self, body):
+        return self.old_pair.sub(lambda p: p.group(1) + MARKER + p.group(3), body)
+
+    @staticmethod
+    def _new_pairs(body):
+        # As the block rule uses the pattern: a match with no pair is left as it is.
+        return worker_transcript.JSON_PAIR_RE.sub(
+            lambda p: p.group(0) if p.group(1) is None else p.group(1) + MARKER + p.group(3), body
+        )
+
+    def _old_blocks(self, text):
+        """The JSON block step before #6036, kept ONLY as the reference: the
+        nearest opener line and the marker are looked for again, from the
+        text's start, for each block. It reads the text the YAML step leaves
+        (`scrub_secret_blocks` with the JSON step off)."""
+        with mock.patch.object(worker_transcript, "JSON_SECRET_BLOCK_RE", self.never):
+            joined = worker_transcript.scrub_secret_blocks(REDACTOR, text)
+
+        def mask(m):
+            if worker_transcript.JSON_STRING_DATA_KEY_QUOTED not in m.group(1):
+                document_start = 0
+                for opener in worker_transcript.JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined, 0, m.start() + 1):
+                    document_start = opener.start()
+                if not worker_transcript.JSON_MANIFEST_MARKER_RE.search(joined, document_start, m.start()):
+                    return m.group(0)
+            return m.group(1) + self._old_pairs(m.group(2)) + m.group(3)
+
+        return worker_transcript.JSON_SECRET_BLOCK_RE.sub(mask, joined)
+
+    def test_the_pair_rule_masks_what_the_old_form_masked(self):
+        units = ['"', "\\", ":", "a", " ", "\t", "\n", "\r", "\r\n", ",", '\\"', "\\\\", "\\\n", "é"]
+        # A key, a separator and a value in each form, so that each string
+        # can hold a pair, a string that opens no pair, or one that does not close.
+        parts = (
+            ["", "x ", '"p":"q",', '"', '\\"', "\\"],
+            ['"k"', '"k\\"k"', '"\\\\"', '"é"', '"k', "k", '""', '"k\\\n"'],
+            [":", " : ", "\t:\n", "", " "],
+            ['"v"', '"v\\"v"', '"v', '"v\\', '"v\\\n"', "v", '"', '"\\"\\"\\"'],
+            ["", ",", ', "n":"m"', "\n", '"'],
+        )
+        for body in self._strings(units, 4, 20000, 6036, parts):
+            self.assertEqual(self._new_pairs(body), self._old_pairs(body), repr(body))
+
+    def test_the_block_rule_masks_what_the_old_form_masked(self):
+        units = [
+            '"data":{', '"stringData":{', "}", "{", '"a":"b"', '"kind":', '"apiVersion" :', "\n", "\r\n", " ", "\t", ",", '"', "\\", '\\"',
+            ":", "x", "\n{", "\n  {", "\n\t{", "data:", "\n  a: b", "kind: Secret", "é", '"data":\n{', '"data" :\n  {',
+        ]
+        # Lines before the block, an opener line or none, a marker or none, a
+        # block, and what follows it, so that each string holds a block.
+        parts = (
+            ["", '{"kind":"x"}\n', 'log "kind": 1\n', "x\n", '{"level":"info"}\n'],
+            ["", "{", "  {", "\t{", "x{", '{"a":{'],
+            ["", '"kind":"Secret",', '"apiVersion" : "v1",\n', '"kind"', '"kind":', "'kind':"],
+            ['"data":{', '"data" : {', '"stringData":{', '"Data":{', '"data":', '"data":\n{', '"data" :\n\t{'],
+            ['"a":"b"', '"a":"b\\"c","d":"e"', "", '"a":"b', '"a" "b":"c"'],
+            ["}", "", "}}", '},"kind":"y","data":{"z":"w"}}', '}\n{"data":{"n":"m"}}'],
+        )
+        for text in self._strings(units, 3, 20000, 6036, parts):
+            self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), self._old_blocks(text), repr(text))
+
+    def test_the_block_rule_keeps_the_cases_that_shaped_it(self):
+        # A marker that ends exactly where the block starts counts; an opener
+        # line starts a new document, and a marker before it does not count;
+        # two blocks in one document; a block before the first opener line; a
+        # marker after the block does not count; a block's own brace at a
+        # line's start opens no document; and the pair rule on escaped quotes,
+        # on a value the text cuts short, and on strings that open no pair.
+        for text, want in (
+            ('{"kind":"data":{"a":"b"}}', '{"kind":"data":{"a":"' + MARKER + '"}}'),
+            ('{"kind":"Secret"}\n{"level":"info","data":{"a":"b"}}', '{"kind":"Secret"}\n{"level":"info","data":{"a":"b"}}'),
+            (
+                '{"kind":"ConfigMap","data":{"a":"b"},"more":"x","data":{"c":"d"}}',
+                '{"kind":"ConfigMap","data":{"a":"' + MARKER + '"},"more":"x","data":{"c":"' + MARKER + '"}}',
+            ),
+            ('x "kind": 1 "data":{"a":"b"}\n{"data":{"c":"d"}}', 'x "kind": 1 "data":{"a":"' + MARKER + '"}\n{"data":{"c":"d"}}'),
+            ('{"data":{"a":"b"},"kind":"x"}', '{"data":{"a":"b"},"kind":"x"}'),
+            (
+                '{"level":"info","data":{"a":"b"}}\n{"apiVersion":"v1",\n "data":{"c":"d"}}\n{"data":{"e":"f"}}',
+                '{"level":"info","data":{"a":"b"}}\n{"apiVersion":"v1",\n "data":{"c":"' + MARKER + '"}}\n{"data":{"e":"f"}}',
+            ),
+            ('  {"apiVersion":"v1"}\n"data":{"a":"b"}', '  {"apiVersion":"v1"}\n"data":{"a":"' + MARKER + '"}'),
+            (
+                'log {"kind":"x"} "data":{"a":"b"}\nnext "data":{"c":"d"}',
+                'log {"kind":"x"} "data":{"a":"' + MARKER + '"}\nnext "data":{"c":"' + MARKER + '"}',
+            ),
+            ('{"kind":"Secret",\n"data":\n{"a":"b"}}', '{"kind":"Secret",\n"data":\n{"a":"' + MARKER + '"}}'),
+            ('x "kind": 1\n  "data" :\n\t{"a":"b"}', 'x "kind": 1\n  "data" :\n\t{"a":"' + MARKER + '"}'),
+            ('"stringData":{"a":"b\\"c","d":"e"}', '"stringData":{"a":"' + MARKER + '","d":"' + MARKER + '"}'),
+            ('"stringData":{"a":"b', '"stringData":{"a":"' + MARKER),
+            (
+                '"stringData":{"a" "b": "c", "d":"e\\\n", "f":"g"}',
+                '"stringData":{"a" "b": "' + MARKER + '", "d":"e\\\n", "f":"' + MARKER + '"}',
+            ),
+            ('"stringData":{"\\"\\"\\"" x "k":"v"}', '"stringData":{"\\"\\"\\"" x "k":"' + MARKER + '"}'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), want)
+
+    def test_many_blocks_scrub_in_linear_time(self):
+        # The whole scrub. Each text took seconds on the old forms (1.3 s to
+        # 2.6 s) and takes at most 0.04 s of CPU time on the new ones. The
+        # bound is on CPU time, and the texts are no larger than this on
+        # purpose: the coverage job in CI runs this file about 5 times slower
+        # than a developer's machine, which leaves the 1 s bound a margin of
+        # about 5. The longer texts are in the next test, on the rule alone.
+        import time
+
+        for text in (
+            '"data":{}\n' * 8000,
+            '"stringData":{' + '\\"' * 16000,
+            '{"kind":"Secret",\n"data":{' + '\\"' * 16000,
+            '"stringData":{"' + '\\"' * 16000 + '" x',
+        ):
+            with self.subTest(text=text[:30]):
+                start = time.process_time()
+                out = _scrub("tool_result", text)
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(out, text)
+
+    def test_many_blocks_cost_the_block_rule_linear_time(self):
+        # The rule alone, on texts of 60 KB to 380 KB. The new forms need a
+        # few milliseconds of CPU time; the old forms need 6 s or more. So
+        # the 1 s bound has a wide margin on a slow runner, and a quadratic
+        # form fails on a fast one.
+        import time
+
+        for name, read, text in (
+            ("blocks with no opener line", lambda text: worker_transcript.scrub_secret_blocks(REDACTOR, text), '"data":{}\n' * 20000),
+            (
+                "JSON lines, a block in each",
+                lambda text: worker_transcript.scrub_secret_blocks(REDACTOR, text),
+                '{"level":"info","msg":"sync ok","data":{"n":1}}\n' * 8000,
+            ),
+            ("pairs, a string that does not close", self._new_pairs, '\\"' * 30000),
+            ("pairs, a string that opens no pair", self._new_pairs, '"' + '\\"' * 30000 + '" x'),
+            ("pairs, a string that stops at a backslash", self._new_pairs, '"' + '\\"' * 30000 + "\\\n"),
+        ):
+            with self.subTest(cmd=name):
+                start = time.process_time()
+                read(text)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
