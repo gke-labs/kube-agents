@@ -218,7 +218,10 @@ readonly HOST_OTEL_WAIT_DELAY_S=30
 # GKE's refusal while another operation holds the cluster, the one error the
 # update retries on; the poll's filter matches the cluster's own operations and
 # its node pools' (targetLink ends in /clusters/<name> or continues with
-# /nodePools/...), since an Autopilot host creates pools after the apply.
+# /nodePools/...), since an Autopilot host creates pools after the apply. The
+# regex operand is quoted inside the filter: gcloud's filter lexer ends an
+# unquoted operand at "(", which would turn the alternation into a second,
+# always-false term and match nothing.
 readonly HOST_OTEL_BUSY_PATTERN="CLUSTER_ALREADY_HAS_OPERATION"
 
 usage() {
@@ -913,7 +916,7 @@ echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUS
 scope_set=false
 for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
   running="$(gcloud container operations list --project="${PROJECT_ID}" --location="${REGION}" \
-    --filter="status!=DONE AND targetLink~/clusters/${HOST_CLUSTER_NAME}(/|\$)" --format="value(name,operationType)" 2>/dev/null || true)"
+    --filter="status!=DONE AND targetLink~'/clusters/${HOST_CLUSTER_NAME}(/|\$)'" --format="value(name,operationType)" 2>/dev/null || true)"
   if [ -n "${running}" ]; then
     echo "  ⏳ ${HOST_CLUSTER_NAME} is running an operation (${running//$'\n'/; }); waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
     sleep "${HOST_OTEL_WAIT_DELAY_S}"
