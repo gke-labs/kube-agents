@@ -44,29 +44,30 @@ import (
 // subject the dispatcher already listens on.
 //
 // What every server has loaded is read from objects that already exist, so it
-// survives an operator restart:
+// survives an operator restart. Every server reloads in place, one server or
+// a cluster alike (planA2ABusReload confirms it server by server). The config
+// Secret carries the profile list it renders, and while any server may still
+// run an earlier config (a reload not yet confirmed on every server, or a
+// restart or roll unfinished) it also carries the profiles that earlier
+// config had (a2aBusPreviousProfilesAnnotation). The loaded set is the two
+// lists' intersection until every server is on the new config.
 //
-//   - On a cluster every profile change rolls the servers
-//     (a2aConfigRolloutHash), and the pod template carries the profile list it
-//     was rendered with (a2aConfigProfilesAnnotation). Each server runs one
-//     StatefulSet revision, recorded in its controller-revision-hash label, and
-//     a server still to be created will run status.updateRevision. The loaded
-//     set is the profiles every one of those revisions lists.
-//   - A single server reloads in place (planA2ABusReload). The config Secret
-//     carries the profile list it renders, and while the server may still run
-//     an earlier config (a reload pending, or a restart or roll unfinished) it
-//     also carries the profiles that earlier config had
-//     (a2aBusPreviousProfilesAnnotation). The loaded set is the two lists'
-//     intersection until the server is on the new config.
+// An earlier operator rolled a cluster onto every profile change instead, and
+// recorded the list on the pod template (a2aConfigProfilesAnnotation), so
+// each StatefulSet revision carries the list its servers loaded. While any
+// revision a server runs, or the update revision, still carries one (an
+// upgrade's roll unfinished), the loaded set is also narrowed to the profiles
+// every such revision lists, so the hold can't release on the new path's word
+// alone before the servers have left the old one.
 //
 // A profile is held only on its way in. One the dispatch config already lists
 // live, or whose card is already on the directory, stays where it is, so a
 // bus that can't be read for a moment never pulls a working profile.
 const (
 	// a2aConfigProfilesAnnotation lists the profiles whose config entry a
-	// render of the bus config carries: sorted, comma-separated. It rides a
-	// cluster's pod template, so every StatefulSet revision records it, and
-	// the config Secret.
+	// render of the bus config carries: sorted, comma-separated. It rides the
+	// config Secret. An earlier operator also put it on a cluster's pod
+	// template, which StatefulSet revisions from that time still carry.
 	a2aConfigProfilesAnnotation = "kubeagents.x-k8s.io/a2a-config-profiles"
 
 	// a2aBusPreviousProfilesAnnotation is on a single server's config Secret
@@ -139,19 +140,6 @@ func intersectProfileSets(a, b map[string]bool) map[string]bool {
 	return out
 }
 
-// annotateA2ABusProfiles puts the bus config's profile list on a cluster's
-// pod template. A single server's template leaves it out: there the list
-// reaches the server by a reload, and a template change would restart it.
-func annotateA2ABusProfiles(agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, profiles []string) {
-	if a2aNATSReplicas(agent) <= 1 {
-		return
-	}
-	if sts.Spec.Template.Annotations == nil {
-		sts.Spec.Template.Annotations = map[string]string{}
-	}
-	sts.Spec.Template.Annotations[a2aConfigProfilesAnnotation] = encodeA2AConfigProfiles(profiles)
-}
-
 // a2aBusLoadedProfiles is what every bus server has loaded, read through
 // reader (uncached: the Secret, StatefulSet, pods and ControllerRevisions are
 // all outside the manager's cache). With no bus StatefulSet there is no
@@ -175,13 +163,16 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 	}
 	var loaded map[string]bool
 	if err == nil {
-		// A cluster by the render or by what runs: a bus converting to one
-		// server is read as the cluster it still is, since a single
-		// server's Secret list from the cluster's time was never confirmed.
-		if a2aBusRenderedAsCluster(agent, sts) || a2aBusRunsAsCluster(sts) {
-			loaded, err = a2aClusterLoadedProfiles(ctx, reader, sts)
-		} else {
-			loaded, err = a2aServerLoadedProfiles(ctx, reader, agent)
+		loaded, err = a2aServerLoadedProfiles(ctx, reader, agent)
+	}
+	if err == nil {
+		// An upgrade from the rolling operator: while a revision still
+		// carries its list, the servers on it loaded only that.
+		var revision map[string]bool
+		var carries bool
+		revision, carries, err = a2aRevisionLoadedProfiles(ctx, reader, sts)
+		if err == nil && carries {
+			loaded = intersectProfileSets(loaded, revision)
 		}
 	}
 	if apierrors.IsForbidden(err) {
@@ -193,31 +184,15 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 	return loadedNames(loaded), nil
 }
 
-// a2aBusRenderedAsCluster reports whether the bus is rendered as a cluster:
-// by the server count recorded in status, or, with none recorded, by the
-// shape the live StatefulSet's template was rendered for, as
-// resolveA2ABusReplicas does before it renders. The AgentProfile reconciler
-// reads the CR as stored, never resolved, and a served CRD that prunes
-// status.busReplicas, or a pass before the first status write, leaves no
-// record; the default count would then read a single server as a cluster.
-func a2aBusRenderedAsCluster(agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) bool {
-	if r := agent.Status.BusReplicas; r == 1 || r == 3 {
-		return r > 1
-	}
-	return a2aNATSRenderedReplicas(sts) > 1
-}
-
-// a2aBusRunsAsCluster reports whether the live StatefulSet asks for, or
-// still runs, more than one server.
-func a2aBusRunsAsCluster(sts *appsv1.StatefulSet) bool {
-	return (sts.Spec.Replicas != nil && *sts.Spec.Replicas > 1) || sts.Status.Replicas > 1
-}
-
-// a2aClusterLoadedProfiles reads a cluster's loaded set off its revisions:
-// every revision a server runs, and the update revision any server yet to
-// be created will run. A server pod with no revision label, or a revision
-// that is missing, not the StatefulSet's, or doesn't decode, loads nothing.
-func a2aClusterLoadedProfiles(ctx context.Context, reader client.Reader, sts *appsv1.StatefulSet) (map[string]bool, error) {
+// a2aRevisionLoadedProfiles reads what the StatefulSet's revisions say the
+// servers loaded: every revision a server runs, and the update revision any
+// server yet to be created will run. carries reports whether any of them
+// records a profile list (an earlier operator's pod template); with none,
+// the revisions say nothing and the config Secret alone answers. A server pod
+// the StatefulSet doesn't control, or with no revision label, or a revision
+// that is missing, not the StatefulSet's, or doesn't decode, loads nothing
+// (carries, and an empty set).
+func a2aRevisionLoadedProfiles(ctx context.Context, reader client.Reader, sts *appsv1.StatefulSet) (map[string]bool, bool, error) {
 	revisions := map[string]bool{}
 	if sts.Status.UpdateRevision != "" {
 		revisions[sts.Status.UpdateRevision] = true
@@ -232,37 +207,40 @@ func a2aClusterLoadedProfiles(ctx context.Context, reader client.Reader, sts *ap
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, err
+			return nil, false, err
 		}
 		// A bus pod this StatefulSet doesn't control (left by an earlier
 		// one, or orphaned) runs a config nothing here records.
 		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
-			return map[string]bool{}, nil
+			return map[string]bool{}, true, nil
 		}
 		revision := pod.Labels[appsv1.ControllerRevisionHashLabelKey]
 		if revision == "" {
-			return map[string]bool{}, nil
+			return map[string]bool{}, true, nil
 		}
 		revisions[revision] = true
 	}
 	if len(revisions) == 0 {
-		return map[string]bool{}, nil
+		return nil, false, nil
 	}
 	var loaded map[string]bool
 	for name := range revisions {
 		rev := &appsv1.ControllerRevision{}
 		if err := reader.Get(ctx, types.NamespacedName{Name: name, Namespace: sts.Namespace}, rev); err != nil {
 			if apierrors.IsNotFound(err) {
-				return map[string]bool{}, nil
+				return map[string]bool{}, true, nil
 			}
-			return nil, err
+			return nil, false, err
 		}
 		if !metav1.IsControlledBy(rev, sts) {
-			return map[string]bool{}, nil
+			return map[string]bool{}, true, nil
 		}
-		names, ok := controllerRevisionProfiles(rev)
+		names, listed, ok := controllerRevisionProfiles(rev)
 		if !ok {
-			return map[string]bool{}, nil
+			return map[string]bool{}, true, nil
+		}
+		if !listed {
+			continue
 		}
 		if loaded == nil {
 			loaded = names
@@ -270,19 +248,20 @@ func a2aClusterLoadedProfiles(ctx context.Context, reader client.Reader, sts *ap
 			loaded = intersectProfileSets(loaded, names)
 		}
 	}
-	return loaded, nil
+	return loaded, loaded != nil, nil
 }
 
 // controllerRevisionProfiles reads the profile list off a StatefulSet
 // revision: its data is the pod template the revision stamps pods from, as a
-// patch to spec.template. A revision rendered before the list was recorded
-// carries none, and loads nothing.
-func controllerRevisionProfiles(rev *appsv1.ControllerRevision) (map[string]bool, bool) {
+// patch to spec.template. listed reports whether the template records a list
+// at all (only an earlier operator's cluster template does); ok, whether the
+// data decoded.
+func controllerRevisionProfiles(rev *appsv1.ControllerRevision) (names map[string]bool, listed, ok bool) {
 	raw := rev.Data.Raw
 	if len(raw) == 0 && rev.Data.Object != nil {
 		var err error
 		if raw, err = json.Marshal(rev.Data.Object); err != nil {
-			return nil, false
+			return nil, false, false
 		}
 	}
 	var data struct {
@@ -295,9 +274,10 @@ func controllerRevisionProfiles(rev *appsv1.ControllerRevision) (map[string]bool
 		} `json:"spec"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, false
+		return nil, false, false
 	}
-	return decodeA2AConfigProfiles(data.Spec.Template.Metadata.Annotations[a2aConfigProfilesAnnotation]), true
+	value, listed := data.Spec.Template.Metadata.Annotations[a2aConfigProfilesAnnotation]
+	return decodeA2AConfigProfiles(value), listed, true
 }
 
 // a2aServerLoadedProfiles reads a single server's loaded set off its config
@@ -336,11 +316,11 @@ func a2aServerLoadedFrom(ctx context.Context, reader client.Reader, agent *agent
 	return loaded, nil
 }
 
-// a2aSingleBusSettledOn reports whether a single server can only be running
+// a2aSingleBusSettledOn reports whether every bus server can only be running
 // the config Secret as it is now: the StatefulSet has observed its template
-// and rolled every replica onto it, and the server pod is not terminating (a
-// pod deleted for a failed reload still serves its old config until it
-// exits). No StatefulSet, or no pod, runs nothing older. When hash is given,
+// and rolled every replica onto it, and no server pod is terminating (a pod
+// deleted for a failed reload still serves its old config until it exits).
+// No StatefulSet, or no pod, runs nothing older. When hash is given,
 // the live pod template must also carry it: a StatefulSet still on an
 // earlier template has a roll to come, however settled it reads.
 func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent, hash string) (bool, error) {
@@ -362,17 +342,19 @@ func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *age
 		(sts.Status.CurrentRevision != "" && sts.Status.CurrentRevision != sts.Status.UpdateRevision) {
 		return false, nil
 	}
-	pod := &corev1.Pod{}
-	if err := reader.Get(ctx, types.NamespacedName{Name: sts.Name + a2aNATSPodOrdinalSuffix, Namespace: sts.Namespace}, pod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return true, nil
+	for i := range int(replicas) {
+		pod := &corev1.Pod{}
+		if err := reader.Get(ctx, types.NamespacedName{Name: sts.Name + "-" + strconv.Itoa(i), Namespace: sts.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
 		}
-		return false, err
+		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil {
+			return false, nil
+		}
 	}
-	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
-		return false, nil
-	}
-	return pod.DeletionTimestamp == nil, nil
+	return true, nil
 }
 
 // a2aBusPodsLeft reports whether any bus pod name is taken, by whatever
@@ -390,20 +372,15 @@ func a2aBusPodsLeft(ctx context.Context, reader client.Reader, agent *agentv1alp
 	return false, nil
 }
 
-// stampA2ABusPreviousProfiles records on config, a single server's config
-// Secret about to be applied, the profiles the server is known to have
-// loaded, for as long as it may run an earlier config: from the pass that
+// stampA2ABusPreviousProfiles records on config, the bus's config Secret
+// about to be applied, the profiles every server is known to have loaded, for as long as it may run an earlier config: from the pass that
 // changes the config until a pending reload is confirmed and the server is
 // settled on it. planA2ABusReload runs first, so config already carries any
 // reload it stamped. sts is the StatefulSet this pass is about to apply: while
 // its template differs from the live one, a roll is coming (or an earlier
 // pass's apply of it failed), so the live StatefulSet reading as settled says
-// nothing yet and the record stays. A cluster records nothing here: its
-// revisions say it.
+// nothing yet and the record stays. One server and a cluster alike.
 func (r *PlatformAgentReconciler) stampA2ABusPreviousProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent, config *corev1.Secret, sts *appsv1.StatefulSet) error {
-	if a2aNATSReplicas(agent) > 1 {
-		return nil
-	}
 	live := &corev1.Secret{}
 	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: config.Name, Namespace: config.Namespace}, live); err != nil {
 		return client.IgnoreNotFound(err)
