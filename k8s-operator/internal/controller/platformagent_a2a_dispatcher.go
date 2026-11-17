@@ -219,6 +219,12 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 	for _, p := range profiles {
 		perProfile = append(perProfile,
 			"a2a.tasks."+p+".*.supervisor",
+			// The six-token form (lib.ProfileSupervisorSubject, #5301),
+			// named per profile, never a wildcard over the profile token:
+			// the dispatch config's profileSupervisorForm picks which form
+			// the dispatcher writes, and both are granted through the
+			// upgrade window.
+			"a2a.tasks.p."+p+".*.supervisor",
 			// A stop record's catch-up read after a restart, by subject.
 			"$JS.API.DIRECT.GET."+a2aDispatchStopStream+"."+a2aDispatchStopPrefix+p+".*",
 		)

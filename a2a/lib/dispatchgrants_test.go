@@ -33,6 +33,7 @@ func TestDispatcherGrantsSpellTodaysSubjects(t *testing.T) {
 			"$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-unattended-child",
 			"$JS.ACK.PROFILE_SUBMITS.profile-cluster-unattended-child.>",
 			"a2a.tasks.cluster.*.supervisor",
+			"a2a.tasks.p.cluster.*.supervisor",
 			"$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.cluster.*",
 		},
 		Subscribe: []string{"a2a.stop.cluster.*"},
