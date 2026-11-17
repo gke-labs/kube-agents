@@ -138,6 +138,11 @@ breaking change (`type!:` or a `BREAKING CHANGE:` footer), as a rollback to an o
 usually does, and names each one; `--plan` only warns. Show the user the named commits and get
 their consent before re-running with `--allow-breaking-downgrade`.
 
+A full upgrade also stops before the apply when it would destroy the gVisor node pool
+(`ENABLE_GVISOR` resolving to `false` on a Standard install that runs one). Never add
+`--allow-node-pool-destroy` on your own: it is for a user who has said they want the sandbox off.
+Otherwise set `ENABLE_GVISOR="true"` in `install.env`.
+
 A GitLab, Gitea or Bitbucket install needs nothing extra. The upgrade reads the forge, host, repository and Secret names
 from `install.env`, needs no token and no CA file, and keeps both Secrets. On Google Cloud Dedicated / Sovereign Cloud (`UNIVERSE_DOMAIN` in `install.env`, or `--universe-domain` on the command line), `upgrade.sh` configures child `gcloud` and Terraform calls for that universe automatically (partitioned `<partition>:<slug>` project IDs map the state bucket to `<partition>-<slug>-kube-agents-tfstate`).
 
