@@ -171,8 +171,8 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	rendered := dispatchJobTemplates(agent, profiles, false)
 	params := map[string]struct{ profile, tier string }{
 		dispatchJobTemplatePrefix + "tse":                  {"tse", agentv1alpha1.AgentProfileTierUnattended},
-		dispatchJobTierTemplatePrefix + "tse-read":         {"tse", agentv1alpha1.AgentProfileTierRead},
-		dispatchJobTierTemplatePrefix + "reader-read":      {"reader", agentv1alpha1.AgentProfileTierRead},
+		dispatchJobTierTemplatePrefix + "tse.read":         {"tse", agentv1alpha1.AgentProfileTierRead},
+		dispatchJobTierTemplatePrefix + "reader.read":      {"reader", agentv1alpha1.AgentProfileTierRead},
 	}
 	var accounts []string
 	for name, want := range params {
@@ -243,7 +243,7 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the param outlived the profile's unattended tier: %v", err)
 	}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTierTemplatePrefix + "tse-read"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTierTemplatePrefix + "tse.read"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
 		t.Errorf("the read tier's param went with the unattended tier: %v", err)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
@@ -395,7 +395,7 @@ func TestRenderedDispatchJobFixture(t *testing.T) {
 	hash := dispatchJobTemplatesHash(templates["tse"])
 	for path, name := range map[string]string{
 		dispatchJobParamFixturePath:     dispatchJobTemplatePrefix + "tse",
-		dispatchJobReadParamFixturePath: dispatchJobTierTemplatePrefix + "tse-read",
+		dispatchJobReadParamFixturePath: dispatchJobTierTemplatePrefix + "tse.read",
 	} {
 		param, err := buildDispatchJobTemplate(agent, name, hash, templates["tse"][name])
 		if err != nil {

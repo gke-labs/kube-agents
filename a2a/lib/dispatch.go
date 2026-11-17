@@ -422,16 +422,18 @@ const dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
 func DispatchJobTemplateName(profile string) string { return dispatchJobTemplatePrefix + profile }
 
 // dispatchJobTierTemplatePrefix is a (profile, tier)'s DispatchJobTemplate
-// name, less "<profile>-<tier>": the operator's dispatchJobTierTemplatePrefix,
+// name, less "<profile>.<tier>": the operator's dispatchJobTierTemplatePrefix,
 // which must stay the same string. Not the profile prefix, so no tier's name
-// can be another profile's unattended-mode one.
+// can be another profile's unattended-mode one; and a dot between the two,
+// which neither can hold (both are subject tokens), so no two pairs share a
+// name.
 const dispatchJobTierTemplatePrefix = "kube-agents-dispatch-job-tier-"
 
 // DispatchJobTierTemplateName is the DispatchJobTemplate that holds profile's
 // Job template at tier, for a tier other than its unattended-mode one, when
 // its reference is PerTier (#5646).
 func DispatchJobTierTemplateName(profile, tier string) string {
-	return dispatchJobTierTemplatePrefix + profile + "-" + tier
+	return dispatchJobTierTemplatePrefix + profile + "." + tier
 }
 
 // NameFor is the DispatchJobTemplate r names for profile: its Name when it

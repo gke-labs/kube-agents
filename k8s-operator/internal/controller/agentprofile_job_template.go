@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"sort"
@@ -57,8 +58,11 @@ const (
 	dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
 	// dispatchJobTierTemplatePrefix names a profile's DispatchJobTemplate for
 	// any other tier, where permit-carrying tasks run in their own one-pod
-	// Job (#5646): kube-agents-dispatch-job-tier-<profile>-<tier>. Its own
-	// prefix, so no tier's param is another profile's unattended-mode one.
+	// Job (#5646): kube-agents-dispatch-job-tier-<profile>.<tier>. Its own
+	// prefix, so no tier's param is another profile's unattended-mode one,
+	// and a dot between the two, which neither can hold (a profile name is a
+	// dot-free label by the CRD's rule and resolveOneAgentProfile's check; a
+	// tier is a subject token), so no two pairs share a name.
 	// lib.DispatchJobTierTemplateName must stay the same.
 	dispatchJobTierTemplatePrefix = "kube-agents-dispatch-job-tier-"
 	// dispatchJobParamProfileAnnotation and dispatchJobParamTierAnnotation
@@ -67,6 +71,15 @@ const (
 	// policy requires every param label on every Job.
 	dispatchJobParamProfileAnnotation = "kubeagents.x-k8s.io/dispatch-profile"
 	dispatchJobParamTierAnnotation    = "kubeagents.x-k8s.io/dispatch-tier"
+	// dispatchJobParamDefaultedByAnnotation is the API server version whose
+	// dry run defaulted the param's template: a param whose rendering, labels
+	// and defaulting server are all current is left as it is, without a
+	// fresh dry run or apply.
+	dispatchJobParamDefaultedByAnnotation = "kubeagents.x-k8s.io/dispatch-defaulted-by"
+	// dispatchJobParamDigestAnnotation is a digest of the template the param
+	// was written with, so a param whose template was edited since is written
+	// again rather than left as current.
+	dispatchJobParamDigestAnnotation = "kubeagents.x-k8s.io/dispatch-param-digest"
 	// dispatchJobIndexName is the index DispatchJobTemplate, which the policy tells
 	// apart by this name. The templates' prefix keeps a profile named
 	// "index" from taking it.
@@ -258,7 +271,7 @@ func dispatchJobParamName(p *agentv1alpha1.AgentProfile, tier string) string {
 	if tier == unattendedTierOf(p) {
 		return dispatchJobTemplatePrefix + p.Name
 	}
-	return dispatchJobTierTemplatePrefix + p.Name + "-" + tier
+	return dispatchJobTierTemplatePrefix + p.Name + "." + tier
 }
 
 // dispatchJobTemplates is each profile's Job templates, by profile name: one
@@ -268,18 +281,12 @@ func dispatchJobParamName(p *agentv1alpha1.AgentProfile, tier string) string {
 // admitted at it, each in its own one-pod Job (#5646). A draining tier has
 // none, so no new Job starts there (#5638). A profile whose worker would
 // never schedule (profileWorkerToolsProblem) gets none, as it gets no pool;
-// dispatchJobToolsProblems says why. Neither does a profile one of whose
-// params' names another profile's would also take (a profile "a" at tier
-// "b-c" and a profile "a-b" at tier "c"): the policy holds a Job to the
-// param by its ServiceAccount, so a shared name would leave one of them
-// running from the other's template.
+// dispatchJobToolsProblems says why.
 func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]profileJobTemplates {
 	if !dispatcherJobPolicyRendered() {
 		return nil
 	}
 	out := map[string]profileJobTemplates{}
-	owner := map[string]string{}
-	clash := map[string]bool{}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
@@ -289,19 +296,11 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		}
 		set := profileJobTemplates{}
 		for _, tier := range dispatchJobTiersOf(p, res) {
-			name := dispatchJobParamName(p, tier)
-			if prev, ok := owner[name]; ok && prev != p.Name {
-				clash[prev], clash[p.Name] = true, true
-			}
-			owner[name] = p.Name
-			set[name] = buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
+			set[dispatchJobParamName(p, tier)] = buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
 		}
 		if len(set) > 0 {
 			out[p.Name] = set
 		}
-	}
-	for name := range clash {
-		delete(out, name)
 	}
 	return out
 }
@@ -363,22 +362,52 @@ func dispatchJobParamLabels(agent *agentv1alpha1.PlatformAgent) map[string]strin
 // (defaultedJobTemplate), stamped with hash, its profile's
 // dispatchJobTemplatesHash.
 func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, name, hash string, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
+	return buildDispatchJobTemplateBy(agent, name, hash, "", defaulted)
+}
+
+// buildDispatchJobTemplateBy is buildDispatchJobTemplate stamped with the
+// version of the API server whose dry run defaulted it ("" for unknown).
+func buildDispatchJobTemplateBy(agent *agentv1alpha1.PlatformAgent, name, hash, server string, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
 	raw, err := json.Marshal(defaulted)
 	if err != nil {
 		return nil, err
+	}
+	annotations := map[string]string{
+		dispatchJobTemplateHashAnnotation: hash,
+		dispatchJobParamProfileAnnotation: defaulted.Labels[agentProfileNameLabel],
+		dispatchJobParamTierAnnotation:    defaulted.Labels[agentProfileTierLabel],
+	}
+	if server != "" {
+		annotations[dispatchJobParamDefaultedByAnnotation] = server
+		annotations[dispatchJobParamDigestAnnotation] = dispatchJobParamDigest(raw)
 	}
 	return &agentv1alpha1.DispatchJobTemplate{
 		TypeMeta: metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent),
-			Annotations: map[string]string{
-				dispatchJobTemplateHashAnnotation: hash,
-				dispatchJobParamProfileAnnotation: defaulted.Labels[agentProfileNameLabel],
-				dispatchJobParamTierAnnotation:    defaulted.Labels[agentProfileTierLabel],
-			},
+			Annotations: annotations,
 		},
 		Spec: agentv1alpha1.DispatchJobTemplateSpec{Template: &runtime.RawExtension{Raw: raw}},
 	}, nil
+}
+
+// dispatchJobParamCurrent is whether pt, the live param, already holds
+// want's rendering as the operator writes it: this agent's labels and only
+// them, the profile's hash, its (profile, tier), and a template defaulted by
+// server, the API server serving now. Then its dry run and apply would
+// change nothing, and are skipped. An unknown server never matches, so a
+// param is re-defaulted after an API server upgrade.
+func dispatchJobParamCurrent(pt *agentv1alpha1.DispatchJobTemplate, agent *agentv1alpha1.PlatformAgent, want *corev1.PodTemplateSpec, hash, server string) bool {
+	a := pt.Annotations
+	if pt.Spec.Template == nil || a[dispatchJobParamDigestAnnotation] != dispatchJobParamDigest(pt.Spec.Template.Raw) {
+		return false
+	}
+	// An unknown server ("") never matches: a param written with one carries
+	// its version, and one written without carries no digest.
+	return agentLabelsMark(pt, agent) && maps.Equal(pt.Labels, dispatchJobParamLabels(agent)) &&
+		a[dispatchJobTemplateHashAnnotation] == hash && a[dispatchJobParamDefaultedByAnnotation] == server &&
+		a[dispatchJobParamProfileAnnotation] == want.Labels[agentProfileNameLabel] &&
+		a[dispatchJobParamTierAnnotation] == want.Labels[agentProfileTierLabel]
 }
 
 // dispatchJobTemplateResource is the DispatchJobTemplate CRD's plural, as an
@@ -588,12 +617,22 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	live := map[string]*agentv1alpha1.DispatchJobTemplate{}
+	for i := range existing.Items {
+		live[existing.Items[i].Name] = &existing.Items[i]
+	}
+	server := r.apiServerVersion()
 	for _, name := range names {
+		// A get, a dry run and an apply per param per pass, every tier's: a
+		// param already current costs none of them.
+		if pt := live[name]; pt != nil && dispatchJobParamCurrent(pt, agent, want[name], hashes[name], server) {
+			continue
+		}
 		defaulted, err := r.defaultedJobTemplate(ctx, ns, name, want[name])
 		if err != nil {
 			return err
 		}
-		param, err := buildDispatchJobTemplate(agent, name, hashes[name], defaulted)
+		param, err := buildDispatchJobTemplateBy(agent, name, hashes[name], server, defaulted)
 		if err != nil {
 			return err
 		}
@@ -614,6 +653,35 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 		}
 	}
 	return nil
+}
+
+// dispatchJobParamDigest is a param template's digest, over its JSON as
+// stored.
+func dispatchJobParamDigest(raw []byte) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	canonical, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])[:dispatchJobTemplateHashLength]
+}
+
+// apiServerVersion is the API server's git version, or "" when it can't be
+// read (no discovery client, or an error), which makes every param be
+// defaulted and applied again.
+func (r *PlatformAgentReconciler) apiServerVersion() string {
+	if r.DiscoveryClient == nil {
+		return ""
+	}
+	ver, err := r.DiscoveryClient.ServerVersion()
+	if err != nil || ver == nil {
+		return ""
+	}
+	return ver.GitVersion
 }
 
 // applyDispatchJobParam writes want, unless a DispatchJobTemplate of its name

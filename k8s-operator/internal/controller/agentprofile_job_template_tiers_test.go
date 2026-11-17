@@ -10,8 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"context"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/version"
+	fakediscovery "k8s.io/client-go/discovery/fake"
+	clienttesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -72,9 +81,9 @@ func TestEveryLiveTierHasItsOwnJobTemplate(t *testing.T) {
 	}
 	got := dispatchJobTemplates(agent, profiles, false)
 	want := map[string][]string{
-		"reader":    {dispatchJobTierTemplatePrefix + "reader-read"},
-		"tse":       {dispatchJobTemplatePrefix + "tse", dispatchJobTierTemplatePrefix + "tse-read"},
-		"narrowing": {dispatchJobTierTemplatePrefix + "narrowing-read"},
+		"reader":    {dispatchJobTierTemplatePrefix + "reader.read"},
+		"tse":       {dispatchJobTemplatePrefix + "tse", dispatchJobTierTemplatePrefix + "tse.read"},
+		"narrowing": {dispatchJobTierTemplatePrefix + "narrowing.read"},
 	}
 	for i := range profiles {
 		p := &profiles[i]
@@ -94,12 +103,11 @@ func TestEveryLiveTierHasItsOwnJobTemplate(t *testing.T) {
 	}
 }
 
-// Two profiles whose params would share a name (a profile "a" at a Tier
-// resource "b-c", and a profile "a-b" at "c") get no templates at all: the
-// policy holds a Job to a param by its ServiceAccount, so one of them would
-// run from the other's template. Their permit-carrying tasks are refused
-// change-needs-job; every other profile keeps its own.
-func TestProfilesWhoseParamNamesCollideGetNoJobTemplates(t *testing.T) {
+// No two (profile, tier) pairs share a param name: the dot between them is
+// in neither (a profile "a" at a Tier resource "b-c", and a profile "a-b" at
+// "c", would otherwise both be ...-a-b-c), so the policy never holds one's
+// Jobs to the other's template.
+func TestNoTwoProfileTierPairsShareAParamName(t *testing.T) {
 	withDispatcher(t)
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
@@ -108,20 +116,12 @@ func TestProfilesWhoseParamNamesCollideGetNoJobTemplates(t *testing.T) {
 		p.Spec.Identity.ServiceAccountName = "a-own"
 	})
 	ab := testAgentProfile(agent.Namespace, "a-b", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"c"} })
-	profiles := []agentv1alpha1.AgentProfile{a, ab, testAgentProfile(agent.Namespace, "reader")}
-	if dispatchJobParamName(&profiles[0], "b-c") != dispatchJobParamName(&profiles[1], "c") {
-		t.Fatal("precondition: the two params' names don't collide")
+	if x, y := dispatchJobParamName(&a, "b-c"), dispatchJobParamName(&ab, "c"); x == y {
+		t.Fatalf("(a, b-c) and (a-b, c) share the param %s", x)
 	}
-	resolved := resolveAgentProfileIdentities(agent, profiles)
-	if resolved["a"].refused != nil || resolved["a-b"].refused != nil {
-		t.Skipf("the identity resolver refuses one of them already: %v / %v", resolved["a"].refused, resolved["a-b"].refused)
-	}
-	got := dispatchJobTemplates(agent, profiles, false)
-	if got["a"] != nil || got["a-b"] != nil {
-		t.Errorf("colliding profiles kept templates: a %v, a-b %v", paramsOf(got["a"]), paramsOf(got["a-b"]))
-	}
-	if got["reader"] == nil {
-		t.Error("an uninvolved profile lost its template")
+	got := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{a, ab}, false)
+	if len(got["a"]) != 1 || len(got["a-b"]) != 1 {
+		t.Errorf("rendered a %v, a-b %v, want one template each", paramsOf(got["a"]), paramsOf(got["a-b"]))
 	}
 }
 
@@ -134,7 +134,7 @@ func TestTheProfilesHashMovesWithAnyTiersTemplate(t *testing.T) {
 	agent := a2aTestAgent()
 	p := unattendedProfile(agent, "tse")
 	before := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{p}, false)["tse"]
-	read := dispatchJobTierTemplatePrefix + "tse-read"
+	read := dispatchJobTierTemplatePrefix + "tse.read"
 	changed := profileJobTemplates{}
 	for name, tmpl := range before {
 		changed[name] = tmpl.DeepCopy()
@@ -151,5 +151,75 @@ func TestTheProfilesHashMovesWithAnyTiersTemplate(t *testing.T) {
 	}
 	if ref := dispatchJobTemplateRef("tse", nil); ref != nil {
 		t.Errorf("a profile with no template has ref %+v", ref)
+	}
+}
+
+// A param already current (its rendering, labels and defaulting API server)
+// costs no dry run and no apply on the next pass: with a template per tier
+// that is two calls per param per pass saved. A param whose template was
+// edited, or an API server upgrade, has it defaulted and written again.
+func TestACurrentParamIsNotDefaultedOrAppliedAgain(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	policy, binding := shippedDispatcherJobPolicy(t)
+	var dryRuns, applies int
+	ssa := fakeServerSideApplyInterceptors()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if pt, ok := obj.(*agentv1alpha1.DispatchJobTemplate); ok && isDispatchJobTemplateParam(pt.Name) {
+					applies++
+				}
+				return ssa.Patch(ctx, cl, obj, patch, opts...)
+			},
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.PodTemplate); ok {
+					dryRuns++
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+		}).Build()
+	disco := &fakediscovery.FakeDiscovery{Fake: &clienttesting.Fake{}, FakedServerVersion: &version.Info{GitVersion: "v1.36.0"}}
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme, DiscoveryClient: disco}
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse"), testAgentProfile(agent.Namespace, "reader")}
+	pass := func(step string) (int, int) {
+		t.Helper()
+		dryRuns, applies = 0, 0
+		if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+			t.Fatalf("%s: %v / %v", step, err, profileErr)
+		}
+		return dryRuns, applies
+	}
+	if d, a := pass("first"); d != 3 || a != 3 {
+		t.Fatalf("first pass: %d dry runs, %d applies, want 3 and 3 (three params)", d, a)
+	}
+	if d, a := pass("again"); d != 0 || a != 0 {
+		t.Errorf("a pass with every param current: %d dry runs, %d applies, want none", d, a)
+	}
+	// An edited template is written again.
+	var pt agentv1alpha1.DispatchJobTemplate
+	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: dispatchJobTierTemplatePrefix + "reader.read"}
+	if err := c.Get(ctx, key, &pt); err != nil {
+		t.Fatal(err)
+	}
+	pt.Spec.Template.Raw = []byte(`{"spec":{"containers":[{"name":"x","image":"evil"}]}}`)
+	if err := c.Update(ctx, &pt); err != nil {
+		t.Fatal(err)
+	}
+	if d, a := pass("edited"); d != 1 || a != 1 {
+		t.Errorf("one edited param: %d dry runs, %d applies, want 1 and 1", d, a)
+	}
+	// Another API server defaults again.
+	disco.FakedServerVersion = &version.Info{GitVersion: "v1.37.0"}
+	if d, a := pass("upgraded"); d != 3 || a != 3 {
+		t.Errorf("after an API server upgrade: %d dry runs, %d applies, want 3 and 3", d, a)
+	}
+	// An unknown server always defaults.
+	r.DiscoveryClient = nil
+	if d, a := pass("unknown"); d != 3 || a != 3 {
+		t.Errorf("with no API server version: %d dry runs, %d applies, want 3 and 3", d, a)
 	}
 }
