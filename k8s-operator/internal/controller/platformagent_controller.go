@@ -547,6 +547,11 @@ type PlatformAgentReconciler struct {
 	// Cleared by an echo that carries the field, and when the CR is deleted;
 	// a restart of the operator after the CRD is applied clears it too.
 	prunedBusMigrationStatus sync.Map
+	// singleServerBusWarned holds, per CR, the UID of the one-server bus pod
+	// the A2ABusSingleServer Event last named (noteA2ABusSingleServer), so
+	// the Event is written once per pod, not on every pass. Cleared when the
+	// bus is not one server, and when the CR is deleted.
+	singleServerBusWarned sync.Map
 	// prunedObservedVersion records, per CR, when a status write was last
 	// seen to come back without status.observedVersion: an operator rolled
 	// ahead of the CRD that adds the field. While fresh, updateStatusReady
@@ -5625,6 +5630,7 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusMigrationStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.singleServerBusWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))

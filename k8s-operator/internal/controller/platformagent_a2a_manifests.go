@@ -7360,6 +7360,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
+	r.noteA2ABusSingleServer(ctx, agent)
 	// A count change (a migration's phase moving the bus between one server
 	// and three) leaves streams that are not there until the migration puts
 	// them back, so the provisioned-once record no longer describes the
